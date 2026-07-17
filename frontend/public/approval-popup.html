@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>审批提醒</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --warning: #d97706;
+      --danger: #dc2626;
+      --text: #111827;
+      --muted: #6b7280;
+      --subtle: #9ca3af;
+      --border: #d1d5db;
+      --surface-muted: #f4f5f7;
+    }
+    * { box-sizing: border-box; }
+    html, body, #app { width: 100%; height: 100%; margin: 0; }
+    body { color: var(--text); background: transparent; overflow: hidden; }
+    button { font: inherit; }
+    button:focus-visible { outline: 2px solid rgba(37, 99, 235, 0.4); outline-offset: 2px; }
+    .notice { height: calc(100% - 16px); display: flex; flex-direction: column; margin: 8px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: #fff; box-shadow: 0 14px 38px rgba(17, 24, 39, 0.2), 0 2px 8px rgba(17, 24, 39, 0.08); }
+    .notice-header { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid #e5e7eb; }
+    .app-mark { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; color: #fff; background: #111827; font-size: 12px; font-weight: 700; }
+    .source { min-width: 0; flex: 1; }
+    .source strong, .source span { display: block; }
+    .source strong { font-size: 12px; font-weight: 600; }
+    .source span { margin-top: 1px; color: var(--muted); font-size: 10px; }
+    .queue { padding: 2px 7px; border-radius: 4px; color: #4b5563; background: var(--surface-muted); font-size: 10px; font-weight: 500; white-space: nowrap; }
+    .notice-body { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 12px; padding: 15px 14px 13px; }
+    .type-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 8px; color: #b45309; background: #fffbeb; }
+    .type-icon.upload { color: #1d4ed8; background: #eff6ff; }
+    .type-icon svg { width: 20px; height: 20px; }
+    .type-row { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+    .type-label { color: var(--warning); font-size: 10px; font-weight: 600; }
+    .request-id { min-width: 0; overflow: hidden; color: var(--subtle); font-family: Consolas, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+    h1 { margin: 0; overflow: hidden; font-size: 15px; font-weight: 600; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+    .description { height: 36px; margin: 5px 0 0; overflow: hidden; color: var(--muted); font-size: 11px; line-height: 18px; }
+    .countdown { padding: 0 14px 12px; }
+    .countdown-meta { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; color: var(--muted); font-size: 10px; }
+    .countdown-meta strong { color: var(--warning); font-weight: 600; }
+    .countdown.urgent .countdown-meta strong { color: var(--danger); }
+    .progress { height: 3px; overflow: hidden; border-radius: 2px; background: #e5e7eb; }
+    .progress span { height: 100%; display: block; width: 100%; border-radius: inherit; background: var(--warning); transition: width 0.9s linear; }
+    .countdown.urgent .progress span { background: var(--danger); }
+    .error { margin: 0 14px 10px; padding: 7px 9px; border: 1px solid #fecaca; border-radius: 6px; color: #b91c1c; background: #fef2f2; font-size: 10px; }
+    .actions { display: flex; align-items: center; gap: 8px; margin-top: auto; padding: 11px 14px 13px; border-top: 1px solid #e5e7eb; }
+    button { min-height: 30px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 5px 11px; border: 1px solid var(--border); border-radius: 6px; color: #374151; background: #fff; font-size: 11px; font-weight: 500; cursor: pointer; }
+    button:hover { border-color: #9ca3af; color: var(--text); background: #f9fafb; }
+    button.primary { margin-left: auto; border-color: var(--primary); color: #fff; background: var(--primary); }
+    button.primary:hover { border-color: var(--primary-hover); background: var(--primary-hover); }
+    button.text { padding: 5px 4px; border-color: transparent; color: var(--muted); background: transparent; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .empty { height: calc(100% - 16px); display: grid; place-items: center; margin: 8px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: #fff; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
+    let approvals = [];
+    let busy = false;
+    let errorMessage = '';
+
+    if (!invoke && new URLSearchParams(location.search).has('preview')) {
+      approvals = [{
+        id: 'apr-preview-001',
+        request_type: 'remote_connect',
+        title: '远程连接：一号展厅中控机',
+        description: 'Dashboard 请求通过 ToDesk 连接当前设备，请确认请求来源后再允许操作。',
+        timeout_seconds: 30,
+        remaining_seconds: 18,
+      }];
+    }
+
+    const icons = {
+      remote: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect width="18" height="12" x="3" y="4" rx="2"/><path d="M8 20h8M12 16v4M8 10h8M13 7l3 3-3 3"/></svg>',
+      upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/></svg>',
+    };
+
+    function render() {
+      const root = document.getElementById('app');
+      if (!approvals.length) {
+        root.innerHTML = '<div class="empty" role="status">请求已处理，窗口即将关闭</div>';
+        return;
+      }
+
+      const current = approvals[0];
+      const remaining = Math.max(0, Number(current.remaining_seconds ?? current.timeout_seconds ?? 30));
+      const total = Math.max(1, Number(current.timeout_seconds || 30));
+      const percent = Math.max(0, Math.min(100, (remaining / total) * 100));
+      const isRemote = current.request_type === 'remote_connect';
+      root.innerHTML = `
+        <section class="notice" aria-labelledby="approval-title">
+          <header class="notice-header">
+            <div class="app-mark" aria-hidden="true">P</div>
+            <div class="source"><strong>项目看板 Agent</strong><span>敏感操作需要你的确认</span></div>
+            ${approvals.length > 1 ? `<span class="queue">1 / ${approvals.length}</span>` : ''}
+          </header>
+          <div class="notice-body">
+            <div class="type-icon ${isRemote ? '' : 'upload'}" aria-hidden="true">${isRemote ? icons.remote : icons.upload}</div>
+            <div>
+              <div class="type-row"><span class="type-label">${escapeHtml(labelForType(current.request_type))}</span><span class="request-id">${escapeHtml(current.id)}</span></div>
+              <h1 id="approval-title" title="${escapeHtml(current.title || '')}">${escapeHtml(current.title || '有新的审批请求')}</h1>
+              <p class="description">${escapeHtml(current.description || '请确认是否允许执行此操作。')}</p>
+            </div>
+          </div>
+          <div class="countdown ${remaining <= 8 ? 'urgent' : ''}">
+            <div class="countdown-meta"><span>超时后自动拒绝</span><strong>剩余 ${remaining} 秒</strong></div>
+            <div class="progress" aria-hidden="true"><span style="width:${percent}%"></span></div>
+          </div>
+          ${errorMessage ? `<div class="error" role="alert">${escapeHtml(errorMessage)}</div>` : ''}
+          <footer class="actions">
+            <button type="button" class="text" data-action="open-main" ${busy ? 'disabled' : ''}>查看详情</button>
+            <button type="button" data-action="deny" ${busy ? 'disabled' : ''}>拒绝</button>
+            <button type="button" class="primary" data-action="approve" ${busy ? 'disabled' : ''}>${busy ? '处理中...' : '允许操作'}</button>
+          </footer>
+        </section>`;
+    }
+
+    function labelForType(type) {
+      if (type === 'remote_connect') return '远程连接请求';
+      if (type === 'upload_code') return '代码上传请求';
+      if (type === 'upload_placeholder') return '占位上传请求';
+      return '操作审批';
+    }
+
+    function escapeHtml(value) {
+      return String(value || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+    }
+
+    async function refresh() {
+      if (!invoke || busy) return;
+      try {
+        const next = await invoke('get_pending_approvals');
+        approvals = Array.isArray(next) ? next : [];
+        errorMessage = '';
+      } catch (error) {
+        errorMessage = typeof error === 'string' ? error : '无法刷新审批状态';
+      }
+      render();
+    }
+
+    async function respond(approved) {
+      const current = approvals[0];
+      if (!current || !invoke || busy) return;
+      busy = true;
+      errorMessage = '';
+      render();
+      try {
+        await invoke('respond_approval', { id: current.id, approved });
+        approvals = approvals.slice(1);
+      } catch (error) {
+        errorMessage = typeof error === 'string' ? error : '审批处理失败，请打开主窗口重试';
+      } finally {
+        busy = false;
+        render();
+        await refresh();
+      }
+    }
+
+    document.addEventListener('click', event => {
+      const target = event.target.closest('[data-action]');
+      if (!target) return;
+      const action = target.getAttribute('data-action');
+      if (action === 'approve') void respond(true);
+      if (action === 'deny') void respond(false);
+      if (action === 'open-main' && invoke && !busy) void invoke('show_main_window');
+    });
+
+    render();
+    void refresh();
+    window.setInterval(refresh, 1000);
+  </script>
+</body>
+</html>

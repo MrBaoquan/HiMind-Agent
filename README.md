@@ -1,0 +1,77 @@
+# Project Dashboard Agent
+
+Rust 实现的 Windows Agent 最小原型。
+
+## 本地应用服务
+
+Windows 桌面使用时优先运行本地应用服务模式：
+
+```powershell
+cargo build --release
+.\target\release\project-dashboard-agent.exe --local-app --local-port 18181
+```
+
+该模式会启动系统托盘图标和 `http://127.0.0.1:18181` 本地服务，并同时启动 Dashboard worker 轮询。Dashboard Web 通过该服务调用 Windows 原生文件夹选择、打开所在文件夹、唤起远控客户端和后续内网登录状态反馈；任务领取、扫描和打包由同一个托盘进程中的 worker 完成。
+
+本地服务当前接口：
+
+1. `GET /health`：本地服务、原生文件夹选择、打开文件夹、远控客户端唤起和登录状态能力。
+2. `GET /pick-folder`：打开 Windows 原生文件夹选择器。
+3. `GET /open-folder?path=`：调用 Windows Explorer 打开指定路径。
+4. `POST /remote-connect`：接收一次性远控工具、设备码、验证码，复制设备码并唤起本机向日葵或 ToDesk；可通过 `PROJECT_DASHBOARD_SUNLOGIN_CLI` / `PROJECT_DASHBOARD_SUNLOGIN_ARGS` 或 `PROJECT_DASHBOARD_TODESK_CLI` / `PROJECT_DASHBOARD_TODESK_ARGS` 配置厂商 CLI 模板。
+5. `GET /login-status`：返回本机 Agent 是否已保存可复用的内网登录。
+6. `POST /login`：由 Dashboard 本地 Agent 卡片提交内网账号密码，保存到本机当前用户配置。
+7. `POST /logout`：清除本机 Agent 已保存的内网登录。
+8. `GET /open-login`：打开内网页面，供用户手工查看或确认登录状态。
+9. `GET /capabilities`：返回 Capability Gateway 已注册的内置能力描述、风险等级和参数 Schema。
+10. `POST /capabilities/invoke`：通过 Capability Gateway 调用受控能力，当前已接入健康状态、登录状态、打开文件夹、插件列表、插件 Manifest 查询和已声明插件能力调用。
+11. `GET /plugins`：扫描 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/` 并返回本机插件 Registry 状态。
+12. `GET /plugins/manifest?plugin_id=`：返回指定插件的 Manifest、能力和权限摘要。
+13. `POST /plugins/install|update|uninstall|enable|disable`：已预留本地接口，当前在 Distribution 策略与制品校验接入前返回 `not_implemented`。
+
+Agent 主窗口已提供“本机插件”页：左侧选择当前设备已安装插件，右侧查看该插件的本机状态、错误、功能页面、权限和已注册能力，并可打开独立插件窗口、创建桌面快捷方式或打开插件目录；页面通过 Tauri 命令直接读取本机注册表和 Gateway，避免主窗口 WebView 再 fetch 自身 `127.0.0.1` 服务。安装、升级、启停、卸载、回滚和版本策略统一由 Dashboard 组织控制面负责，不在 Agent 主窗口重复提供占位入口。
+
+Agent 主窗口前端采用 React + TypeScript + Vite：`frontend/src/` 按 Shell、通用组件、页面和服务层组织，生产构建输出到 `frontend/dist` 并由 Tauri 打包。界面使用 Lucide 标准图标和适配 `900 × 640` 默认窗口的紧凑桌面控制台布局；低于 `740px` 时侧栏收为图标栏，本机插件页采用列表/详情主从布局，日志在自身容器内滚动。
+
+通知反馈分为两级：主窗口普通操作结果使用右上角最多 4 条的自动消失通知；手动审批通过独立 `390 × 280` 置顶窗口处理。审批接口会返回 `remaining_seconds`，由 Rust 按真实请求存活时间计算，弹窗与主窗口审批列表均据此显示剩余时间，避免轮询刷新后倒计时重置。
+
+本地 HTTP 已按 ADR 0022 启用 Origin/Host 信任边界：浏览器默认只能从当前 `--api` 的 Dashboard Origin 调用，响应不再返回通配 CORS；无 Origin 的本机脚本保持兼容。额外可信 Dashboard Origin 通过 `PROJECT_DASHBOARD_AGENT_ALLOWED_ORIGINS` 配置。自更新下载必须与当前 Dashboard API 同源，并在替换前验证完整 SHA-256。
+
+本机已提供示例插件 `demo-multi-cap`（位于 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/demo-multi-cap`），声明 `demo.echo`、`demo.time`、`demo.stats` 三项能力，用于验证一个插件对应一组能力、能力合并到 Gateway 和通过 `/capabilities/invoke` 调用的端到端链路。
+
+从仓库根目录可直接执行：
+
+```powershell
+./scripts/start.ps1
+```
+
+## Worker 调试模式
+
+```powershell
+cargo run -- --api http://localhost:8080
+```
+
+连接 Docker runtime Dashboard：
+
+```powershell
+cargo run -- --api http://localhost:18080
+```
+
+常驻模式会持续心跳并拉取任务。如果 Dashboard runtime 重启导致旧 Agent ID 失效，Agent 会自动重新注册并继续运行。
+
+只执行一次心跳和任务轮询：
+
+```powershell
+cargo run -- --api http://localhost:8080 --once
+```
+
+runtime 单轮调试：
+
+```powershell
+cargo run -- --api http://localhost:18080 --once
+```
+
+默认扫描根目录：
+
+1. F:\U3DProjects
+2. F:\Project Released Files
