@@ -1,7 +1,7 @@
 {
-  "productName": "项目看板 Agent",
+  "productName": "HiMind Agent",
   "version": "0.2.0",
-  "identifier": "com.project-dashboard.agent",
+  "identifier": "com.himind.agent",
   "build": {
     "frontendDist": "frontend/dist"
   },
@@ -9,7 +9,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "项目看板 Agent",
+        "title": "HiMind Agent",
         "width": 900,
         "height": 640,
         "visible": false,

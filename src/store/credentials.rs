@@ -65,7 +65,7 @@ pub(crate) fn unity_editor_environment_path() -> Option<String> {
     [
         "unity_art_editor",
         "uniart_ediotr",
-        "PROJECT_DASHBOARD_UNITY_EDITOR",
+        "HIMIND_UNITY_EDITOR",
     ]
     .into_iter()
     .find_map(|name| {
@@ -236,21 +236,21 @@ fn inner_admin_base() -> String {
 
 fn inner_admin_credentials_path() -> Result<PathBuf, Box<dyn Error>> {
     let local_app_data = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(local_app_data).join("project-dashboard-agent");
+    let dir = PathBuf::from(local_app_data).join("HiMindAgent");
     fs::create_dir_all(&dir)?;
     Ok(dir.join("inner-admin-credentials.json"))
 }
 
 fn svn_connections_path() -> Result<PathBuf, Box<dyn Error>> {
     let local_app_data = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(local_app_data).join("project-dashboard-agent");
+    let dir = PathBuf::from(local_app_data).join("HiMindAgent");
     fs::create_dir_all(&dir)?;
     Ok(dir.join("svn-connections.json"))
 }
 
 fn editor_settings_path() -> Result<PathBuf, Box<dyn Error>> {
     let local_app_data = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(local_app_data).join("project-dashboard-agent");
+    let dir = PathBuf::from(local_app_data).join("HiMindAgent");
     fs::create_dir_all(&dir)?;
     Ok(dir.join("editor-settings.json"))
 }

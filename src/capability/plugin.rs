@@ -92,7 +92,7 @@ pub(crate) fn plugin_registry_dir() -> PathBuf {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
-        .join("ProjectDashboardAgent")
+        .join("HiMindAgent")
         .join("plugins")
 }
 

@@ -1,4 +1,4 @@
-# Project Dashboard Agent
+# HiMind Agent
 
 Rust 实现的 Windows Agent 最小原型。
 
@@ -8,7 +8,7 @@ Windows 桌面使用时优先运行本地应用服务模式：
 
 ```powershell
 cargo build --release
-.\target\release\project-dashboard-agent.exe --local-app --local-port 18181
+.\target\release\himind-agent.exe --local-app --local-port 18181
 ```
 
 该模式会启动系统托盘图标和 `http://127.0.0.1:18181` 本地服务，并同时启动 Dashboard worker 轮询。Dashboard Web 通过该服务调用 Windows 原生文件夹选择、打开所在文件夹、唤起远控客户端和后续内网登录状态反馈；任务领取、扫描和打包由同一个托盘进程中的 worker 完成。
@@ -18,7 +18,7 @@ cargo build --release
 1. `GET /health`：本地服务、原生文件夹选择、打开文件夹、远控客户端唤起和登录状态能力。
 2. `GET /pick-folder`：打开 Windows 原生文件夹选择器。
 3. `GET /open-folder?path=`：调用 Windows Explorer 打开指定路径。
-4. `POST /remote-connect`：接收一次性远控工具、设备码、验证码，复制设备码并唤起本机向日葵或 ToDesk；可通过 `PROJECT_DASHBOARD_SUNLOGIN_CLI` / `PROJECT_DASHBOARD_SUNLOGIN_ARGS` 或 `PROJECT_DASHBOARD_TODESK_CLI` / `PROJECT_DASHBOARD_TODESK_ARGS` 配置厂商 CLI 模板。
+4. `POST /remote-connect`：接收一次性远控工具、设备码、验证码，复制设备码并唤起本机向日葵或 ToDesk；可通过 `HIMIND_SUNLOGIN_CLI` / `HIMIND_SUNLOGIN_ARGS` 或 `HIMIND_TODESK_CLI` / `HIMIND_TODESK_ARGS` 配置厂商 CLI 模板。
 5. `GET /login-status`：返回本机 Agent 是否已保存可复用的内网登录。
 6. `POST /login`：由 Dashboard 本地 Agent 卡片提交内网账号密码，保存到本机当前用户配置。
 7. `POST /logout`：清除本机 Agent 已保存的内网登录。
@@ -35,7 +35,7 @@ Agent 主窗口前端采用 React + TypeScript + Vite：`frontend/src/` 按 Shel
 
 通知反馈分为两级：主窗口普通操作结果使用右上角最多 4 条的自动消失通知；手动审批通过独立 `390 × 280` 置顶窗口处理。审批接口会返回 `remaining_seconds`，由 Rust 按真实请求存活时间计算，弹窗与主窗口审批列表均据此显示剩余时间，避免轮询刷新后倒计时重置。
 
-本地 HTTP 已按 ADR 0022 启用 Origin/Host 信任边界：浏览器默认只能从当前 `--api` 的 Dashboard Origin 调用，响应不再返回通配 CORS；无 Origin 的本机脚本保持兼容。额外可信 Dashboard Origin 通过 `PROJECT_DASHBOARD_AGENT_ALLOWED_ORIGINS` 配置。自更新下载必须与当前 Dashboard API 同源，并在替换前验证完整 SHA-256。
+本地 HTTP 已按 ADR 0022 启用 Origin/Host 信任边界：浏览器默认只能从当前 `--api` 的 Dashboard Origin 调用，响应不再返回通配 CORS；无 Origin 的本机脚本保持兼容。额外可信 Dashboard Origin 通过 `HIMIND_AGENT_ALLOWED_ORIGINS` 配置。自更新下载必须与当前 Dashboard API 同源，并在替换前验证完整 SHA-256。
 
 本机已提供示例插件 `demo-multi-cap`（位于 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/demo-multi-cap`），声明 `demo.echo`、`demo.time`、`demo.stats` 三项能力，用于验证一个插件对应一组能力、能力合并到 Gateway 和通过 `/capabilities/invoke` 调用的端到端链路。
 

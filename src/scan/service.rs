@@ -109,9 +109,9 @@ fn scan_target_key(targets: &[ScanTarget]) -> String {
 }
 
 fn scan_cache_path(root_type: &str, root: &Path, max_depth: usize, target_key: &str) -> PathBuf {
-    let cache_dir = env::var("PROJECT_DASHBOARD_SCAN_CACHE")
+    let cache_dir = env::var("HIMIND_SCAN_CACHE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| env::temp_dir().join("project-dashboard-agent-cache"));
+        .unwrap_or_else(|_| env::temp_dir().join("himind-agent-cache"));
     let key = sanitize_file_name(&format!(
         "{}-{}-{}-{}",
         root_type,

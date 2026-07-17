@@ -1,18 +1,18 @@
 [package]
-name = "project-dashboard-agent"
+name = "himind-agent"
 version = "0.2.0"
 edition = "2021"
-default-run = "project-dashboard-agent"
+default-run = "himind-agent"
 
 [features]
 mcp-console = []
 
 [[bin]]
-name = "project-dashboard-agent"
+name = "himind-agent"
 path = "src/main.rs"
 
 [[bin]]
-name = "project-dashboard-agent-mcp"
+name = "himind-agent-mcp"
 path = "src/main.rs"
 required-features = ["mcp-console"]
 
@@ -30,5 +30,7 @@ zip = "0.6"
 rfd = "0.15"
 raw-window-handle = "0.6"
 sha2 = "0.10"
+base64 = "0.22"
+rsa = { version = "0.9", features = ["sha2"] }
 url = "2"
 quick-xml = { version = "0.39", features = ["serialize"] }

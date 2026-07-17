@@ -36,4 +36,7 @@ pub struct LocalAgentUpdateRequest {
     pub download_url: Option<String>,
     pub version: Option<String>,
     pub sha256: Option<String>,
+    pub signature: Option<String>,
+    pub signature_key_id: Option<String>,
+    pub signature_algorithm: Option<String>,
 }

@@ -144,7 +144,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
     let _tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
-        .tooltip("项目看板 Agent")
+        .tooltip("HiMind Agent")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
                 show_main_window(app);

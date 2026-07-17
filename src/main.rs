@@ -95,7 +95,7 @@ impl Options {
         let mut local_app = false;
         let mut local_port = 18181;
         let enrollment_token =
-            env::var("PROJECT_DASHBOARD_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
+            env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
 
         let args: Vec<String> = env::args().collect();
         let mut i = 1;

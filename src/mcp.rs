@@ -69,7 +69,7 @@ fn handle_request(
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "project-dashboard-agent", "version": VERSION }
+            "serverInfo": { "name": "himind-agent", "version": VERSION }
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {

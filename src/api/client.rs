@@ -70,11 +70,21 @@ pub fn load_or_register(
 ) -> Result<AgentState, Box<dyn Error>> {
     if state_path.exists() {
         let content = fs::read_to_string(state_path)?;
-        let state = serde_json::from_str::<AgentState>(&content)?;
+        let mut state = serde_json::from_str::<AgentState>(&content)?;
+        if state.device_id.trim().is_empty() {
+            state.device_id = load_or_create_device_id(state_path)?;
+            fs::write(state_path, serde_json::to_string_pretty(&state)?)?;
+        }
         if !state.agent_id.trim().is_empty()
             && !state.credential.trim().is_empty()
             && matches!(
-                heartbeat(client, api_base, &state.agent_id, &state.credential),
+                heartbeat(
+                    client,
+                    api_base,
+                    &state.agent_id,
+                    &state.device_id,
+                    &state.credential
+                ),
                 Ok(true)
             )
         {
@@ -98,7 +108,7 @@ pub fn register_agent(
 ) -> Result<AgentState, Box<dyn Error>> {
     if enrollment_token.trim().is_empty() {
         return Err(
-            "PROJECT_DASHBOARD_AGENT_ENROLLMENT_TOKEN is required for first enrollment".into(),
+            "HIMIND_AGENT_ENROLLMENT_TOKEN is required for first enrollment".into(),
         );
     }
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-agent".to_string());
@@ -157,12 +167,14 @@ pub fn heartbeat(
     client: &Client,
     api_base: &str,
     agent_id: &str,
+    device_id: &str,
     credential: &str,
 ) -> Result<bool, Box<dyn Error>> {
     let response = client
         .post(format!("{}/api/agent/heartbeat", api_base))
         .json(&json!({
             "agent_id": agent_id,
+            "device_id": device_id,
             "status": "online",
         }))
         .header("Authorization", agent_authorization(agent_id, credential))

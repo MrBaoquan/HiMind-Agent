@@ -1,5 +1,9 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use reqwest::blocking::Client;
 use reqwest::Url;
+use rsa::pkcs8::DecodePublicKey;
+use rsa::{Pss, RsaPublicKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -52,6 +56,10 @@ pub(crate) fn trigger_local_agent_update(
     let expected_sha256 = payload.sha256.as_deref().unwrap_or_default().trim();
     validate_sha256(expected_sha256)?;
     let staged_file = download_agent_package(&download_url, expected_sha256)?;
+    if let Err(error) = verify_agent_package_signature(&staged_file, payload) {
+        let _ = std::fs::remove_file(&staged_file);
+        return Err(error);
+    }
     schedule_agent_replace_and_restart(&staged_file, &exe, options)?;
 
     thread::spawn(move || {
@@ -133,7 +141,7 @@ fn download_agent_package(
         .map(|value| value.as_millis())
         .unwrap_or_default();
     let staged_path =
-        env::temp_dir().join(format!("project-dashboard-agent-update-{timestamp}.exe"));
+        env::temp_dir().join(format!("himind-agent-update-{timestamp}.exe"));
     let mut file = File::create(&staged_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -175,6 +183,77 @@ fn validate_update_download_url(api_base: &str, download_url: &str) -> Result<()
 fn validate_sha256(value: &str) -> Result<(), Box<dyn Error>> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("Agent 更新必须提供合法的 SHA-256 摘要".into());
+    }
+    Ok(())
+}
+
+fn verify_agent_package_signature(
+    staged_executable: &Path,
+    payload: &LocalAgentUpdateRequest,
+) -> Result<(), Box<dyn Error>> {
+    let signature = payload.signature.as_deref().unwrap_or_default().trim();
+    let key_id = payload
+        .signature_key_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    let algorithm = payload
+        .signature_algorithm
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    let require_signed = env::var("HIMIND_REQUIRE_SIGNED_UPDATES")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+    validate_signature_metadata(signature, key_id, algorithm, require_signed)?;
+    if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
+        return Ok(());
+    }
+    let trusted_dir = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR")
+        .ok_or("未配置 Agent 更新受信公钥目录")?;
+    let public_key_path = PathBuf::from(trusted_dir).join(format!("{key_id}.pem"));
+    verify_rsa_pss_sha256(
+        staged_executable,
+        &std::fs::read_to_string(public_key_path)?,
+        signature,
+    )
+}
+
+fn verify_rsa_pss_sha256(
+    artifact_path: &Path,
+    public_key_pem: &str,
+    signature_base64: &str,
+) -> Result<(), Box<dyn Error>> {
+    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)?;
+    let signature_bytes = BASE64_STANDARD.decode(signature_base64)?;
+    let digest = Sha256::digest(std::fs::read(artifact_path)?);
+    public_key
+        .verify(Pss::new::<Sha256>(), &digest, &signature_bytes)
+        .map_err(|_| "Agent 更新包签名验证失败".into())
+}
+
+fn validate_signature_metadata(
+    signature: &str,
+    key_id: &str,
+    algorithm: &str,
+    require_signed: bool,
+) -> Result<(), Box<dyn Error>> {
+    if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
+        return if require_signed {
+            Err("Agent 更新策略要求签名，但更新包未提供签名".into())
+        } else {
+            Ok(())
+        };
+    }
+    if signature.is_empty() || key_id.is_empty() || algorithm != "rsa-pss-sha256" {
+        return Err("Agent 更新签名元数据不完整或算法不受支持".into());
+    }
+    if key_id.len() > 64
+        || !key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("Agent 更新签名 key ID 无效".into());
     }
     Ok(())
 }
@@ -233,11 +312,11 @@ fn powershell_escape_single_quoted(value: &str) -> String {
 pub(crate) fn local_agent_executable_metadata() -> Value {
     match env::current_exe() {
         Ok(path) => json!({
-            "name": path.file_name().map(|item| item.to_string_lossy().to_string()).unwrap_or_else(|| "project-dashboard-agent.exe".to_string()),
+            "name": path.file_name().map(|item| item.to_string_lossy().to_string()).unwrap_or_else(|| "himind-agent.exe".to_string()),
             "path": path.to_string_lossy().to_string(),
         }),
         Err(_) => json!({
-            "name": "project-dashboard-agent.exe",
+            "name": "himind-agent.exe",
             "path": Value::Null,
         }),
     }
@@ -275,27 +354,27 @@ pub(crate) fn create_plugin_view_shortcut(
         .unwrap_or_else(|| Path::new("."))
         .to_string_lossy()
         .to_string();
-    let description = format!("项目看板插件: {title}");
+    let description = format!("HiMind 插件: {title}");
     let script = r#"
 $shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($env:PROJECT_DASHBOARD_SHORTCUT_PATH)
-$shortcut.TargetPath = $env:PROJECT_DASHBOARD_SHORTCUT_TARGET
-$shortcut.Arguments = $env:PROJECT_DASHBOARD_SHORTCUT_ARGUMENTS
-$shortcut.WorkingDirectory = $env:PROJECT_DASHBOARD_SHORTCUT_WORKING_DIRECTORY
-$shortcut.Description = $env:PROJECT_DASHBOARD_SHORTCUT_DESCRIPTION
+$shortcut = $shell.CreateShortcut($env:HIMIND_SHORTCUT_PATH)
+$shortcut.TargetPath = $env:HIMIND_SHORTCUT_TARGET
+$shortcut.Arguments = $env:HIMIND_SHORTCUT_ARGUMENTS
+$shortcut.WorkingDirectory = $env:HIMIND_SHORTCUT_WORKING_DIRECTORY
+$shortcut.Description = $env:HIMIND_SHORTCUT_DESCRIPTION
 $shortcut.Save()
 "#;
     let output = run_hidden_powershell_with_env(
         script,
         &[
-            ("PROJECT_DASHBOARD_SHORTCUT_PATH", &shortcut_path),
-            ("PROJECT_DASHBOARD_SHORTCUT_TARGET", &target_path),
-            ("PROJECT_DASHBOARD_SHORTCUT_ARGUMENTS", &arguments),
+            ("HIMIND_SHORTCUT_PATH", &shortcut_path),
+            ("HIMIND_SHORTCUT_TARGET", &target_path),
+            ("HIMIND_SHORTCUT_ARGUMENTS", &arguments),
             (
-                "PROJECT_DASHBOARD_SHORTCUT_WORKING_DIRECTORY",
+                "HIMIND_SHORTCUT_WORKING_DIRECTORY",
                 &working_directory,
             ),
-            ("PROJECT_DASHBOARD_SHORTCUT_DESCRIPTION", &description),
+            ("HIMIND_SHORTCUT_DESCRIPTION", &description),
         ],
     )?;
     if !output.status.success() {
@@ -314,7 +393,7 @@ fn sanitize_shortcut_name(value: &str) -> String {
         .collect();
     let sanitized = sanitized.trim().trim_end_matches('.');
     if sanitized.is_empty() {
-        "项目看板插件".to_string()
+        "HiMind 插件".to_string()
     } else {
         sanitized.to_string()
     }
@@ -391,8 +470,8 @@ fn quote_cmd_arg(value: &str) -> String {
 fn read_auto_start_command() -> Result<Option<String>, Box<dyn Error>> {
     let output = run_hidden_powershell(
         r#"
-$path = $env:PROJECT_DASHBOARD_AUTO_START_REG_PATH
-$name = $env:PROJECT_DASHBOARD_AUTO_START_VALUE_NAME
+$path = $env:HIMIND_AUTO_START_REG_PATH
+$name = $env:HIMIND_AUTO_START_VALUE_NAME
 $item = Get-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
 if ($null -eq $item) {
     exit 2
@@ -418,13 +497,13 @@ if ([string]::IsNullOrWhiteSpace($value)) {
 fn write_auto_start_command(launch_command: &str) -> Result<(), Box<dyn Error>> {
     let output = run_hidden_powershell(
         r#"
-$path = $env:PROJECT_DASHBOARD_AUTO_START_REG_PATH
-$name = $env:PROJECT_DASHBOARD_AUTO_START_VALUE_NAME
-$command = $env:PROJECT_DASHBOARD_AUTO_START_COMMAND
+$path = $env:HIMIND_AUTO_START_REG_PATH
+$name = $env:HIMIND_AUTO_START_VALUE_NAME
+$command = $env:HIMIND_AUTO_START_COMMAND
 New-Item -Path $path -Force | Out-Null
 New-ItemProperty -Path $path -Name $name -Value $command -PropertyType String -Force | Out-Null
 "#,
-        &[("PROJECT_DASHBOARD_AUTO_START_COMMAND", launch_command)],
+        &[("HIMIND_AUTO_START_COMMAND", launch_command)],
     )?;
 
     if !output.status.success() {
@@ -437,8 +516,8 @@ New-ItemProperty -Path $path -Name $name -Value $command -PropertyType String -F
 fn remove_auto_start_command() -> Result<(), Box<dyn Error>> {
     let output = run_hidden_powershell(
         r#"
-$path = $env:PROJECT_DASHBOARD_AUTO_START_REG_PATH
-$name = $env:PROJECT_DASHBOARD_AUTO_START_VALUE_NAME
+$path = $env:HIMIND_AUTO_START_REG_PATH
+$name = $env:HIMIND_AUTO_START_VALUE_NAME
 Remove-ItemProperty -Path $path -Name $name -ErrorAction SilentlyContinue
 "#,
         &[],
@@ -472,8 +551,8 @@ fn run_hidden_powershell(
             &script,
         ])
         .creation_flags(CREATE_NO_WINDOW)
-        .env("PROJECT_DASHBOARD_AUTO_START_REG_PATH", AUTO_START_REG_PATH)
-        .env("PROJECT_DASHBOARD_AUTO_START_VALUE_NAME", AUTO_START_VALUE);
+        .env("HIMIND_AUTO_START_REG_PATH", AUTO_START_REG_PATH)
+        .env("HIMIND_AUTO_START_VALUE_NAME", AUTO_START_VALUE);
 
     for (key, value) in extra_env {
         command.env(key, value);
@@ -538,7 +617,7 @@ pub(crate) fn capture_browser_page_text(source_url: &str) -> Result<Value, Box<d
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Microsoft.VisualBasic
 
-$url = $env:PROJECT_DASHBOARD_CAPTURE_URL
+$url = $env:HIMIND_CAPTURE_URL
 $candidates = @(
     @{ name = 'Edge'; path = Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe' },
     @{ name = 'Edge'; path = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe' },
@@ -630,7 +709,7 @@ if ([string]::IsNullOrWhiteSpace($text)) {
             script,
         ])
         .creation_flags(CREATE_NO_WINDOW)
-        .env("PROJECT_DASHBOARD_CAPTURE_URL", source_url)
+        .env("HIMIND_CAPTURE_URL", source_url)
         .output()?;
 
     if !output.status.success() {
@@ -765,7 +844,7 @@ fn resolve_project_launcher(folder: &Path, engine: &str) -> (Option<String>, Opt
     if engine == "unreal" {
         let project_file = first_file_with_extension(folder, "uproject")
             .map(|value| value.to_string_lossy().to_string());
-        let launcher = std::env::var("PROJECT_DASHBOARD_UNREAL_EDITOR")
+        let launcher = std::env::var("HIMIND_UNREAL_EDITOR")
             .ok()
             .filter(|value| Path::new(value).is_file())
             .or_else(find_unreal_editor);
@@ -895,7 +974,7 @@ pub(crate) fn launch_remote_connection(
     }
 
     Err(remote_connect_error(&format!(
-        "remote client not found; configure PROJECT_DASHBOARD_{}_CLI or install the client ({last_error})",
+        "remote client not found; configure HIMIND_{}_CLI or install the client ({last_error})",
         remote_env_prefix(&vendor)?
     )))
 }
@@ -907,8 +986,8 @@ fn launch_remote_connection_from_env(
     label: &str,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let prefix = remote_env_prefix(vendor)?;
-    let cli_var = format!("PROJECT_DASHBOARD_{prefix}_CLI");
-    let args_var = format!("PROJECT_DASHBOARD_{prefix}_ARGS");
+    let cli_var = format!("HIMIND_{prefix}_CLI");
+    let args_var = format!("HIMIND_{prefix}_ARGS");
     let cli = match env::var(&cli_var) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => return Ok(None),
@@ -991,9 +1070,9 @@ fn try_auto_fill_remote_connection(
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Microsoft.VisualBasic
 
-$pidValue = [int]$env:PROJECT_DASHBOARD_REMOTE_TARGET_PID
-$code = $env:PROJECT_DASHBOARD_REMOTE_CODE
-$password = $env:PROJECT_DASHBOARD_REMOTE_PASSWORD
+$pidValue = [int]$env:HIMIND_REMOTE_TARGET_PID
+$code = $env:HIMIND_REMOTE_CODE
+$password = $env:HIMIND_REMOTE_PASSWORD
 $deadline = (Get-Date).AddSeconds(12)
 $process = $null
 
@@ -1043,12 +1122,12 @@ exit 0
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .env(
-            "PROJECT_DASHBOARD_REMOTE_TARGET_PID",
+            "HIMIND_REMOTE_TARGET_PID",
             process_id.to_string(),
         )
-        .env("PROJECT_DASHBOARD_REMOTE_VENDOR", vendor)
-        .env("PROJECT_DASHBOARD_REMOTE_CODE", code)
-        .env("PROJECT_DASHBOARD_REMOTE_PASSWORD", password)
+        .env("HIMIND_REMOTE_VENDOR", vendor)
+        .env("HIMIND_REMOTE_CODE", code)
+        .env("HIMIND_REMOTE_PASSWORD", password)
         .status()?;
     Ok(status.success())
 }
@@ -1060,6 +1139,9 @@ fn remote_connect_error(message: &str) -> Box<dyn Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::rand_core::OsRng;
+    use rsa::RsaPrivateKey;
 
     #[test]
     fn accepts_same_origin_update_url() {
@@ -1094,6 +1176,48 @@ mod tests {
         assert!(validate_sha256("").is_err());
         assert!(validate_sha256(&"z".repeat(64)).is_err());
         assert!(validate_sha256(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn validates_update_signature_metadata() {
+        assert!(validate_signature_metadata("", "", "", false).is_ok());
+        assert!(validate_signature_metadata("", "", "", true).is_err());
+        assert!(
+            validate_signature_metadata("c2ln", "release-2026", "rsa-pss-sha256", true).is_ok()
+        );
+        assert!(validate_signature_metadata("c2ln", "../escape", "rsa-pss-sha256", true).is_err());
+        assert!(
+            validate_signature_metadata("c2ln", "release-2026", "rsa-v1_5-sha256", true).is_err()
+        );
+    }
+
+    #[test]
+    fn verifies_rsa_pss_update_signature_and_rejects_tampering() {
+        let root = std::env::temp_dir().join(format!(
+            "project-dashboard-signature-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("agent.exe");
+        std::fs::write(&artifact, b"signed agent artifact").unwrap();
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        let digest = Sha256::digest(std::fs::read(&artifact).unwrap());
+        let signature = private_key
+            .sign_with_rng(&mut rng, Pss::new::<Sha256>(), &digest)
+            .unwrap();
+        let public_pem = public_key.to_public_key_pem(LineEnding::LF).unwrap();
+        assert!(
+            verify_rsa_pss_sha256(&artifact, &public_pem, &BASE64_STANDARD.encode(&signature))
+                .is_ok()
+        );
+        std::fs::write(&artifact, b"tampered agent artifact").unwrap();
+        assert!(
+            verify_rsa_pss_sha256(&artifact, &public_pem, &BASE64_STANDARD.encode(&signature))
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

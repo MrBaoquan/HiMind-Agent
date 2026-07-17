@@ -14,7 +14,7 @@ pub(crate) fn inner_admin_base() -> String {
 pub(crate) fn inner_admin_client() -> Result<Client, Box<dyn Error>> {
     Ok(Client::builder()
         .cookie_store(true)
-        .user_agent("project-dashboard-agent/0.1")
+        .user_agent("himind-agent/0.1")
         .build()?)
 }
 

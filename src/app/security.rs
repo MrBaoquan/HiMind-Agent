@@ -13,7 +13,7 @@ impl LocalRequestSecurity {
         if let Some(origin) = normalized_origin(dashboard_base) {
             allowed_origins.insert(origin);
         }
-        if let Ok(configured) = env::var("PROJECT_DASHBOARD_AGENT_ALLOWED_ORIGINS") {
+        if let Ok(configured) = env::var("HIMIND_AGENT_ALLOWED_ORIGINS") {
             for value in configured.split(',') {
                 if let Some(origin) = normalized_origin(value.trim()) {
                     allowed_origins.insert(origin);

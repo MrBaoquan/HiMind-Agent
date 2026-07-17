@@ -48,6 +48,7 @@ pub(crate) fn run_loop(
     let heartbeat_client = client.clone();
     let heartbeat_options = options.clone();
     let heartbeat_agent_id = state.agent_id.clone();
+    let heartbeat_device_id = state.device_id.clone();
     let heartbeat_credential = state.credential.clone();
     let heartbeat_interval = options.interval_seconds.max(1);
     let heartbeat_thread = thread::spawn(move || {
@@ -56,6 +57,7 @@ pub(crate) fn run_loop(
                 &heartbeat_client,
                 &heartbeat_options.api_base,
                 &heartbeat_agent_id,
+                &heartbeat_device_id,
                 &heartbeat_credential,
             ) {
                 Ok(true) => set_status(&heartbeat_status, true, &heartbeat_agent_id, ""),

@@ -231,7 +231,7 @@ pub(crate) fn get_agent_capabilities(
         interval_seconds: 10,
         local_app: true,
         local_port: state.port,
-        enrollment_token: std::env::var("PROJECT_DASHBOARD_AGENT_ENROLLMENT_TOKEN")
+        enrollment_token: std::env::var("HIMIND_AGENT_ENROLLMENT_TOKEN")
             .unwrap_or_default(),
         agent_credential: Arc::new(std::sync::RwLock::new(String::new())),
     };
@@ -324,7 +324,7 @@ pub(crate) fn invoke_plugin_view_capability(
         interval_seconds: 10,
         local_app: true,
         local_port: state.port,
-        enrollment_token: std::env::var("PROJECT_DASHBOARD_AGENT_ENROLLMENT_TOKEN")
+        enrollment_token: std::env::var("HIMIND_AGENT_ENROLLMENT_TOKEN")
             .unwrap_or_default(),
         agent_credential: Arc::new(std::sync::RwLock::new(String::new())),
     };
