@@ -26,8 +26,8 @@ use crate::app::system::{
     launch_remote_connection, open_url, trigger_local_agent_update,
 };
 use crate::app::types::{
-    BrowserTextCaptureRequest, EngineeringSyncRequest, LocalAgentUpdateRequest, LocalLoginRequest,
-    ProjectWorkspaceRequest, RemoteConnectRequest,
+    AgentEnrollmentRequest, BrowserTextCaptureRequest, EngineeringSyncRequest,
+    LocalAgentUpdateRequest, LocalLoginRequest, ProjectWorkspaceRequest, RemoteConnectRequest,
 };
 use crate::capability::service::CapabilityGateway;
 use crate::capability::types::{CapabilityInvokeRequest, InvocationContext};
@@ -200,6 +200,14 @@ fn handle_local_http(
         .find("\r\n\r\n")
         .map(|index| &request_bytes[index + 4..])
         .unwrap_or(&[]);
+    if method == "POST" && path == "/enroll" && response_origin.is_none() {
+        return write_local_response(
+            &mut stream,
+            403,
+            &json!({ "error": "browser origin is required" }).to_string(),
+            "application/json",
+        );
+    }
     if let Some(operation) = local_operation(method, &path) {
         let ticket = crate::app::security::header_value(&request, "x-himind-local-ticket")
             .unwrap_or_default();
@@ -244,6 +252,56 @@ fn handle_local_http(
     }
     let gateway = CapabilityGateway::new(options.clone(), Arc::clone(&worker_status));
     match (method, path.as_str()) {
+        ("POST", "/enroll") => {
+            let payload: AgentEnrollmentRequest = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "error": format!("invalid enrollment payload: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            if payload.enrollment_token.trim().is_empty() {
+                return write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "error": "enrollment token is required" }).to_string(),
+                    "application/json",
+                );
+            }
+            match crate::api::client::register_agent(
+                &Client::builder()
+                    .timeout(std::time::Duration::from_secs(20))
+                    .build()?,
+                &options.api_base,
+                &options.state_path,
+                crate::VERSION,
+                &payload.enrollment_token,
+            ) {
+                Ok(state) => {
+                    options.set_agent_credential(&state.credential);
+                    if let Ok(mut status) = worker_status.lock() {
+                        status.dashboard_agent_id = state.agent_id.clone();
+                        status.dashboard_worker_error = "正在完成连接".to_string();
+                    }
+                    write_local_response(
+                        &mut stream,
+                        200,
+                        &json!({ "ok": true, "status": "registered", "agent_id": state.agent_id }).to_string(),
+                        "application/json",
+                    )
+                }
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "status": "failed", "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
         ("GET", "/health") => {
             write_local_response(
                 &mut stream,

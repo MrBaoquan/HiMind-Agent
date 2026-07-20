@@ -7,6 +7,11 @@ pub struct LocalLoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AgentEnrollmentRequest {
+    pub enrollment_token: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct BrowserTextCaptureRequest {
     pub source_url: String,
 }

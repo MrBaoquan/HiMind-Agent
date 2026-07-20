@@ -105,9 +105,7 @@ pub fn register_agent(
     enrollment_token: &str,
 ) -> Result<AgentState, Box<dyn Error>> {
     if enrollment_token.trim().is_empty() {
-        return Err(
-            "PROJECT_DASHBOARD_AGENT_ENROLLMENT_TOKEN is required for first enrollment".into(),
-        );
+        return Err("HIMIND_AGENT_ENROLLMENT_TOKEN is required for first enrollment".into());
     }
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-agent".to_string());
     let device_id = load_or_create_device_id(state_path)?;
