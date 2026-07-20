@@ -7,6 +7,13 @@ pub struct LocalWorkerStatus {
     pub dashboard_worker_error: String,
     pub local_service_online: bool,
     pub local_service_error: String,
+    pub distribution_update_available: bool,
+    pub distribution_update_version: String,
+    pub distribution_update_url: String,
+    pub distribution_update_sha256: String,
+    pub distribution_update_signature: String,
+    pub distribution_update_signature_key_id: String,
+    pub distribution_update_signature_algorithm: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

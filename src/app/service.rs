@@ -82,6 +82,13 @@ pub(crate) fn run_local_app(options: Options) -> Result<(), Box<dyn Error>> {
         dashboard_worker_error: "正在连接 Dashboard 任务 Worker".to_string(),
         local_service_online: false,
         local_service_error: String::new(),
+        distribution_update_available: false,
+        distribution_update_version: String::new(),
+        distribution_update_url: String::new(),
+        distribution_update_sha256: String::new(),
+        distribution_update_signature: String::new(),
+        distribution_update_signature_key_id: String::new(),
+        distribution_update_signature_algorithm: String::new(),
     }));
 
     start_background_services(&options, Arc::clone(&worker_status), None)?;
@@ -295,7 +302,7 @@ fn handle_local_http(
                     "application/json",
                 );
             }
-            if let Err(error) = verify_local_agent_ticket(
+            let principal = match verify_local_agent_ticket(
                 &Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
                 &options.api_base,
                 agent_id,
@@ -303,15 +310,18 @@ fn handle_local_http(
                 &payload.capability_id,
                 &options.agent_credential(),
             ) {
-                return write_local_response(
-                    &mut stream,
-                    403,
-                    &json!({ "error": format!("local Agent ticket rejected: {error}") }).to_string(),
-                    "application/json",
-                );
-            }
+                Ok(principal) => principal,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        403,
+                        &json!({ "error": format!("local Agent ticket rejected: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
             match gateway.invoke(
-                &InvocationContext::local_http(),
+                &InvocationContext::dashboard_user(&principal.user_id, &principal.session_id_hash),
                 &payload.capability_id,
                 payload.input,
             ) {

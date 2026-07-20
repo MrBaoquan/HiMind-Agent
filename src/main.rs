@@ -183,7 +183,7 @@ impl Options {
     fn from_env() -> Self {
         let mut api_base =
             env::var("DASHBOARD_API_BASE").unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let mut state_path = PathBuf::from("agent-state.json");
+        let mut state_path = default_state_path();
         let mut once = false;
         let mut interval_seconds = 10;
         let mut local_app = false;
@@ -217,6 +217,9 @@ impl Options {
             i += 1;
         }
 
+        if let Some(parent) = state_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         Self {
             api_base: api_base.trim_end_matches('/').to_string(),
             state_path,
@@ -229,6 +232,15 @@ impl Options {
             task_execution: Arc::new(RwLock::new(None)),
         }
     }
+}
+
+fn default_state_path() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("HiMindAgent")
+        .join("data")
+        .join("agent-state.json")
 }
 
 struct LeaseRenewal {

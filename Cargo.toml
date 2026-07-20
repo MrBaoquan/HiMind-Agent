@@ -12,6 +12,14 @@ name = "himind-agent"
 path = "src/main.rs"
 
 [[bin]]
+name = "himind-agent-updater"
+path = "src/updater.rs"
+
+[[bin]]
+name = "himind-agent-launcher"
+path = "src/launcher.rs"
+
+[[bin]]
 name = "himind-agent-mcp"
 path = "src/main.rs"
 required-features = ["mcp-console"]

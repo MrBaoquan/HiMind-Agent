@@ -11,6 +11,13 @@ pub(crate) fn local_worker_snapshot(status: &Arc<Mutex<LocalWorkerStatus>>) -> V
             "dashboard_worker_error": if state.dashboard_worker_error.trim().is_empty() { Value::Null } else { Value::String(state.dashboard_worker_error.clone()) },
             "local_service_online": state.local_service_online,
             "local_service_error": if state.local_service_error.trim().is_empty() { Value::Null } else { Value::String(state.local_service_error.clone()) },
+            "distribution_update_available": state.distribution_update_available,
+            "distribution_update_version": state.distribution_update_version,
+            "distribution_update_url": state.distribution_update_url,
+            "distribution_update_sha256": state.distribution_update_sha256,
+            "distribution_update_signature": state.distribution_update_signature,
+            "distribution_update_signature_key_id": state.distribution_update_signature_key_id,
+            "distribution_update_signature_algorithm": state.distribution_update_signature_algorithm,
         })
     } else {
         json!({
@@ -19,6 +26,7 @@ pub(crate) fn local_worker_snapshot(status: &Arc<Mutex<LocalWorkerStatus>>) -> V
             "dashboard_worker_error": "worker status unavailable",
             "local_service_online": false,
             "local_service_error": "worker status unavailable",
+            "distribution_update_available": false,
         })
     }
 }

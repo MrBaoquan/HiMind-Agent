@@ -25,6 +25,13 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         dashboard_worker_error: "正在连接 Dashboard 任务 Worker".to_string(),
         local_service_online: false,
         local_service_error: String::new(),
+        distribution_update_available: false,
+        distribution_update_version: String::new(),
+        distribution_update_url: String::new(),
+        distribution_update_sha256: String::new(),
+        distribution_update_signature: String::new(),
+        distribution_update_signature_key_id: String::new(),
+        distribution_update_signature_algorithm: String::new(),
     }));
     let approval_manager = Arc::new(ApprovalManager::new());
     let service_options = options.clone();

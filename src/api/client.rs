@@ -8,6 +8,14 @@ use std::time::{Duration, Instant};
 
 use super::types::{AgentResponse, AgentState, Task, TaskCancelStatus};
 
+#[derive(Debug, serde::Deserialize)]
+pub struct LocalAgentTicketPrincipal {
+    pub user_id: String,
+    pub session_id_hash: String,
+    pub agent_id: String,
+    pub capability: String,
+}
+
 const TASK_CANCELED_ERROR: &str = "task canceled by user";
 
 #[derive(Debug)]
@@ -257,14 +265,22 @@ pub fn verify_local_agent_ticket(
     ticket: &str,
     capability: &str,
     credential: &str,
-) -> Result<(), Box<dyn Error>> {
-    client
+) -> Result<LocalAgentTicketPrincipal, Box<dyn Error>> {
+    let principal = client
         .post(format!("{}/api/agent/local-ticket/verify", api_base))
         .json(&json!({ "ticket": ticket, "agent_id": agent_id, "capability": capability }))
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
-        .error_for_status()?;
-    Ok(())
+        .error_for_status()?
+        .json::<LocalAgentTicketPrincipal>()?;
+    if principal.user_id.trim().is_empty()
+        || principal.session_id_hash.trim().is_empty()
+        || principal.agent_id != agent_id
+        || principal.capability != capability
+    {
+        return Err("local Agent ticket principal is invalid".into());
+    }
+    Ok(principal)
 }
 
 fn agent_authorization(agent_id: &str, credential: &str) -> String {

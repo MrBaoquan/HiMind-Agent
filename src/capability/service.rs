@@ -336,6 +336,7 @@ impl CapabilityGateway {
         let _invocation_metadata = (
             context.source.as_str(),
             context.principal.as_str(),
+            context.session_id_hash.as_str(),
             context.request_id.as_str(),
         );
         match registration.handler {

@@ -55,12 +55,17 @@ pub(crate) fn trigger_local_agent_update(
     validate_update_download_url(&options.api_base, &download_url)?;
     let expected_sha256 = payload.sha256.as_deref().unwrap_or_default().trim();
     validate_sha256(expected_sha256)?;
-    let staged_file = download_agent_package(&download_url, expected_sha256)?;
+    let staged_file = download_agent_package(&download_url, expected_sha256, &options.state_path)?;
     if let Err(error) = verify_agent_package_signature(&staged_file, payload) {
         let _ = std::fs::remove_file(&staged_file);
         return Err(error);
     }
-    schedule_agent_replace_and_restart(&staged_file, &exe, options)?;
+    schedule_agent_replace_and_restart(
+        &staged_file,
+        &exe,
+        options,
+        payload.version.as_deref().unwrap_or_default(),
+    )?;
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
@@ -128,12 +133,27 @@ fn schedule_agent_restart(executable: &Path, options: &Options) -> Result<(), Bo
 fn download_agent_package(
     download_url: &str,
     expected_sha256: &str,
+    agent_state_path: &Path,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let mut response = Client::builder()
+    let client = Client::builder()
         .timeout(Duration::from_secs(180))
-        .build()?
-        .get(download_url)
-        .send()?;
+        .build()?;
+    let mut request = client.get(download_url);
+    if download_url.contains("/api/distribution/artifacts/") {
+        let state_path = crate::api::distribution::distribution_state_path(agent_state_path);
+        if let Ok(content) = std::fs::read_to_string(state_path) {
+            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(token) = state
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    request = request.bearer_auth(token);
+                }
+            }
+        }
+    }
+    let mut response = request.send()?;
     response.error_for_status_ref()?;
 
     let timestamp = SystemTime::now()
@@ -261,32 +281,80 @@ fn schedule_agent_replace_and_restart(
     staged_executable: &Path,
     current_executable: &Path,
     options: &Options,
+    target_version: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let working_dir = env::current_dir()?;
-    let mut arg_list = vec![
-        "'--api'".to_string(),
-        format!("'{}'", powershell_escape_single_quoted(&options.api_base)),
-        "'--local-app'".to_string(),
-        "'--local-port'".to_string(),
-        format!("'{}'", options.local_port),
+    let installed_layout = current_executable
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        == Some("current");
+    if !installed_layout {
+        return schedule_legacy_agent_replace_and_restart(
+            staged_executable,
+            current_executable,
+            options,
+        );
+    }
+    let updater = current_executable
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("himind-agent-updater.exe"))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            current_executable
+                .parent()
+                .map(|path| path.join("himind-agent-updater.exe"))
+        })
+        .ok_or("无法定位 Agent updater")?;
+    let mut arguments = vec![
+        "--api".to_string(),
+        options.api_base.clone(),
+        "--local-app".to_string(),
+        "--local-port".to_string(),
+        options.local_port.to_string(),
     ];
     if !options.state_path.as_os_str().is_empty() {
-        arg_list.push("'--state'".to_string());
-        arg_list.push(format!(
-            "'{}'",
-            powershell_escape_single_quoted(&options.state_path.to_string_lossy())
-        ));
+        arguments.push("--state".to_string());
+        arguments.push(options.state_path.to_string_lossy().to_string());
     }
+    let payload = serde_json::json!({
+        "current_executable": current_executable,
+        "staged_executable": staged_executable,
+        "api_base": options.api_base,
+        "target_version": target_version,
+        "local_port": options.local_port,
+        "state_path": options.state_path,
+        "old_pid": std::process::id(),
+        "arguments": arguments,
+    });
+    Command::new(updater)
+        .arg(payload.to_string())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(())
+}
+
+fn schedule_legacy_agent_replace_and_restart(
+    staged_executable: &Path,
+    current_executable: &Path,
+    options: &Options,
+) -> Result<(), Box<dyn Error>> {
+    let working_dir = env::current_dir()?;
+    let args = format!(
+        "'--api','{}','--local-app','--local-port','{}','--state','{}'",
+        powershell_escape_single_quoted(&options.api_base),
+        options.local_port,
+        powershell_escape_single_quoted(&options.state_path.to_string_lossy())
+    );
     let script = format!(
-        "Start-Sleep -Milliseconds 1200; Copy-Item -Force '{}' '{}'; Start-Process -FilePath '{}' -ArgumentList @({}) -WorkingDirectory '{}' -WindowStyle Hidden; Remove-Item -Force '{}' -ErrorAction SilentlyContinue",
+        "Start-Sleep -Milliseconds 900; Copy-Item -Force '{}' '{}'; Start-Process -FilePath '{}' -ArgumentList @({}) -WorkingDirectory '{}' -WindowStyle Hidden; Remove-Item -Force '{}' -ErrorAction SilentlyContinue",
         powershell_escape_single_quoted(&staged_executable.to_string_lossy()),
         powershell_escape_single_quoted(&current_executable.to_string_lossy()),
         powershell_escape_single_quoted(&current_executable.to_string_lossy()),
-        arg_list.join(", "),
+        args,
         powershell_escape_single_quoted(&working_dir.to_string_lossy()),
         powershell_escape_single_quoted(&staged_executable.to_string_lossy()),
     );
-    let mut started = false;
     for shell in ["pwsh", "powershell"] {
         if Command::new(shell)
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
@@ -294,14 +362,10 @@ fn schedule_agent_replace_and_restart(
             .spawn()
             .is_ok()
         {
-            started = true;
-            break;
+            return Ok(());
         }
     }
-    if !started {
-        return Err("无法调度 Agent 静默更新，请确认 pwsh 或 powershell 可用。".into());
-    }
-    Ok(())
+    Err("无法调度 Agent 更新，请确认 PowerShell 可用。".into())
 }
 
 fn powershell_escape_single_quoted(value: &str) -> String {

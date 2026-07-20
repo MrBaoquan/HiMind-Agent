@@ -6,6 +6,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::api::client::{heartbeat, load_or_register, poll_tasks};
+use crate::api::distribution::{
+    check_update, load_or_register as load_distribution, report_update_result,
+};
 use crate::approval::manager::ApprovalManager;
 use crate::store::types::LocalWorkerStatus;
 use crate::{execute_task, flush_report_outbox, Options, VERSION};
@@ -38,8 +41,25 @@ pub(crate) fn run_loop(
         VERSION,
         &options.enrollment_token,
     )?;
+    let distribution_state = load_distribution(
+        &client,
+        &options.api_base,
+        &crate::api::distribution::distribution_state_path(&options.state_path),
+        &std::env::var("HIMIND_DISTRIBUTION_PRODUCT_KEY")
+            .unwrap_or_else(|_| "himind-agent".to_string()),
+        &std::env::var("HIMIND_DISTRIBUTION_CLIENT_KEY")
+            .unwrap_or_else(|_| "himind-agent".to_string()),
+        VERSION,
+        &std::env::var("HIMIND_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "internal".to_string()),
+    )?;
     options.set_agent_credential(&state.credential);
     set_status(&worker_status, true, &state.agent_id, "");
+    check_distribution_update(
+        &client,
+        &options,
+        worker_status.as_ref(),
+        distribution_state.as_ref(),
+    );
     flush_report_outbox(&client, &options, &state.agent_id);
     crate::app::plugin_manager::flush_status_outbox(&options, &state.agent_id);
 
@@ -65,6 +85,12 @@ pub(crate) fn run_loop(
                     crate::app::plugin_manager::flush_status_outbox(
                         &heartbeat_options,
                         &heartbeat_agent_id,
+                    );
+                    check_distribution_update(
+                        &heartbeat_client,
+                        &heartbeat_options,
+                        heartbeat_status.as_ref(),
+                        distribution_state.as_ref(),
                     );
                 }
                 Ok(false) => {
@@ -162,5 +188,41 @@ fn set_status(
             state.dashboard_agent_id = agent_id.to_string();
             state.dashboard_worker_error = error.to_string();
         }
+    }
+}
+
+fn check_distribution_update(
+    client: &Client,
+    options: &Options,
+    status: Option<&Arc<Mutex<LocalWorkerStatus>>>,
+    distribution_state: Option<&crate::api::distribution::DistributionState>,
+) {
+    let Some(state) = distribution_state else {
+        return;
+    };
+    let Ok(update) = check_update(client, &options.api_base, state) else {
+        return;
+    };
+    if let Some(shared) = status {
+        if let Ok(mut value) = shared.lock() {
+            value.distribution_update_available = update.has_update;
+            value.distribution_update_version = update.version.clone();
+            value.distribution_update_url = update.download_url.clone();
+            value.distribution_update_sha256 = update.sha256.clone();
+            value.distribution_update_signature = update.signature.clone();
+            value.distribution_update_signature_key_id = update.signature_key_id.clone();
+            value.distribution_update_signature_algorithm = update.signature_algorithm.clone();
+        }
+    }
+    if update.has_update {
+        let _ = report_update_result(
+            client,
+            &options.api_base,
+            state,
+            "update_available",
+            VERSION,
+            &update.version,
+            "update is available and awaits user confirmation",
+        );
     }
 }

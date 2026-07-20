@@ -2,7 +2,9 @@
 
 Rust 实现的 Windows Agent 最小原型。
 
-## 本地应用服务
+## 安装与本地应用服务
+
+正式安装使用 Tauri NSIS 用户级安装器，安装根目录固定为 `%LOCALAPPDATA%\HiMindAgent`。安装后的可执行文件位于 `current\himind-agent.exe`，状态位于 `data\agent-state.json`，更新器使用 `previous` 和 staging 目录完成切换与失败回退。不要直接运行从浏览器下载的裸 Agent 可执行文件；裸 exe 仅用于开发或诊断。
 
 Windows 桌面使用时优先运行本地应用服务模式：
 

@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
+const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Default)]
 pub(crate) struct LocalPluginStatus {
     pub current_version: String,
@@ -248,6 +250,9 @@ fn download(
     agent_id: &str,
     item: &PluginCatalogItem,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    if item.file_size == 0 || item.file_size > MAX_PLUGIN_ARCHIVE_BYTES {
+        return Err("插件制品大小无效或超过 512 MiB 限制".into());
+    }
     let api = url::Url::parse(&options.api_base)?;
     let url = url::Url::parse(&item.download_url)?;
     if api.scheme() != url.scheme()
@@ -264,19 +269,40 @@ fn download(
         )
         .send()?
         .error_for_status()?;
+    if response
+        .content_length()
+        .map(|size| size > item.file_size || size > MAX_PLUGIN_ARCHIVE_BYTES)
+        .unwrap_or(false)
+    {
+        return Err("插件制品响应大小超过发布记录".into());
+    }
     let path = env::temp_dir().join(format!("himind-plugin-{}.zip", unique_suffix()));
     let mut file = File::create(&path)?;
     let mut hasher = Sha256::new();
+    let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = response.read(&mut buffer)?;
         if count == 0 {
             break;
         }
+        total += count as u64;
+        if total > MAX_PLUGIN_ARCHIVE_BYTES || total > item.file_size {
+            let _ = fs::remove_file(&path);
+            return Err("插件制品实际大小超过发布记录".into());
+        }
         file.write_all(&buffer[..count])?;
         hasher.update(&buffer[..count]);
     }
     file.flush()?;
+    if total != item.file_size {
+        let _ = fs::remove_file(&path);
+        return Err(format!(
+            "插件制品大小校验失败，期望 {}，实际 {total}",
+            item.file_size
+        )
+        .into());
+    }
     let actual = format!("{:x}", hasher.finalize());
     if !actual.eq_ignore_ascii_case(&item.sha256) {
         let _ = fs::remove_file(&path);
@@ -342,9 +368,15 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
         }
         let version_dir = root.join("versions").join(&item.version);
         if version_dir.exists() {
-            fs::remove_dir_all(&version_dir)?;
+            let existing = fs::read(version_dir.join("checksums.sha256"))?;
+            let incoming = fs::read(staging.join("checksums.sha256"))?;
+            if existing != incoming {
+                return Err("同一插件版本已存在且内容不同，请提升版本号".into());
+            }
+            fs::remove_dir_all(&staging)?;
+        } else {
+            fs::rename(&staging, &version_dir)?;
         }
-        fs::rename(&staging, &version_dir)?;
         let next = root.join(format!("current-{}", unique_suffix()));
         copy_dir(&version_dir, &next)?;
         fs::write(

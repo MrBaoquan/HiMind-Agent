@@ -130,19 +130,17 @@ impl SkillStore {
         let staging = skill_root.join(format!("staging-{}", now_stamp()));
         copy_package_tree(package_root, &staging)?;
         let version_root = versions_root.join(expected_version);
-        let previous_version_root = skill_root.join(format!("replaced-{}", now_stamp()));
         if version_root.exists() {
-            fs::rename(&version_root, &previous_version_root)?;
-        }
-        if let Err(error) = fs::rename(&staging, &version_root) {
-            if previous_version_root.exists() && !version_root.exists() {
-                let _ = fs::rename(&previous_version_root, &version_root);
+            let existing = fs::read(version_root.join("checksums.sha256"))?;
+            let incoming = fs::read(staging.join("checksums.sha256"))?;
+            if existing != incoming {
+                let _ = fs::remove_dir_all(&staging);
+                return Err("同一 Skill 版本已存在且内容不同，请提升版本号".into());
             }
+            fs::remove_dir_all(&staging)?;
+        } else if let Err(error) = fs::rename(&staging, &version_root) {
             let _ = fs::remove_dir_all(&staging);
             return Err(error.into());
-        }
-        if previous_version_root.exists() {
-            let _ = fs::remove_dir_all(previous_version_root);
         }
         let current_pointer = SkillPointer {
             version: manifest.version.clone(),
@@ -437,6 +435,42 @@ mod tests {
         .unwrap();
         let record = store.read_skill_record(&skill_root).unwrap().unwrap();
         assert_eq!(record.manifest.version, current_version);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_different_content_for_existing_organization_version() {
+        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
+        let store = SkillStore { root: root.clone() };
+        let package = root.join("package");
+        let manifest = SkillManifest {
+            id: "com.himind.skill.immutable-test".to_string(),
+            name: "Immutable Test".to_string(),
+            version: "1.0.0".to_string(),
+            scope: SkillScope::Organization,
+            description: String::new(),
+            min_agent_version: VERSION.to_string(),
+            supported_clients: vec!["codex".to_string()],
+            capabilities: vec![],
+            plugin_dependencies: vec![],
+            risk_summary: "read_only".to_string(),
+            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
+        };
+        write_skill_package(&package, &manifest, "# First").unwrap();
+        fs::write(package.join("checksums.sha256"), "first package checksums").unwrap();
+        store
+            .install_organization_package(&package, &manifest.id, &manifest.version)
+            .unwrap();
+        write_skill_package(&package, &manifest, "# Changed").unwrap();
+        fs::write(
+            package.join("checksums.sha256"),
+            "changed package checksums",
+        )
+        .unwrap();
+        let error = store
+            .install_organization_package(&package, &manifest.id, &manifest.version)
+            .unwrap_err();
+        assert!(error.to_string().contains("内容不同"));
         let _ = fs::remove_dir_all(root);
     }
 }

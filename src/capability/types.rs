@@ -39,6 +39,7 @@ impl InvocationSource {
 pub(crate) struct InvocationContext {
     pub source: InvocationSource,
     pub principal: String,
+    pub session_id_hash: String,
     pub request_id: String,
 }
 
@@ -47,8 +48,18 @@ impl InvocationContext {
         Self {
             source,
             principal: principal.into(),
+            session_id_hash: String::new(),
             request_id: next_request_id(),
         }
+    }
+
+    pub(crate) fn dashboard_user(user_id: &str, session_id_hash: &str) -> Self {
+        let mut context = Self::new(
+            InvocationSource::LocalHttp,
+            format!("dashboard-user:{}", user_id.trim()),
+        );
+        context.session_id_hash = session_id_hash.trim().to_string();
+        context
     }
 
     pub(crate) fn local_http() -> Self {
@@ -91,6 +102,15 @@ mod tests {
         assert_eq!(first.source.as_str(), "local_http");
         assert_eq!(first.principal, "local-dashboard");
         assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[test]
+    fn dashboard_user_context_carries_verified_principal() {
+        let context = InvocationContext::dashboard_user("usr_123", "session_hash");
+
+        assert_eq!(context.source, InvocationSource::LocalHttp);
+        assert_eq!(context.principal, "dashboard-user:usr_123");
+        assert_eq!(context.session_id_hash, "session_hash");
     }
 
     #[test]

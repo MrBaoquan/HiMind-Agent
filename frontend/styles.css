@@ -153,6 +153,9 @@
 .skill-editor-grid input, .skill-editor-grid textarea, .skill-editor-grid select { width: 100%; min-width: 0; border: 1px solid var(--border-strong); border-radius: 5px; padding: 7px 8px; color: var(--text); background: var(--surface); font: inherit; font-size: 11px; resize: vertical; }
 .skill-editor-grid input, .skill-editor-grid select { height: 32px; }
 .skill-editor-grid input:focus, .skill-editor-grid textarea:focus, .skill-editor-grid select:focus { border-color: #2563eb; outline: 2px solid rgba(37, 99, 235, .12); }
+.skill-editor-advanced { grid-column: 1 / -1; border-top: 1px solid var(--border); padding-top: 10px; }
+.skill-editor-advanced summary { cursor: pointer; color: var(--text-muted); font-size: 11px; font-weight: 600; }
+.skill-editor-advanced[open] summary { margin-bottom: 10px; }
 .skill-editor-readme { font-family: Consolas, monospace !important; line-height: 1.5; }
 .skill-plan-dialog { width: min(600px, calc(100vw - 30px)); }
 .skill-plan-summary { display: grid; gap: 3px; padding: 10px; border-left: 3px solid #059669; background: #ecfdf5; }
