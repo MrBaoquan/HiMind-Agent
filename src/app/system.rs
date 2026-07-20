@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::app::types::{LocalAgentUpdateRequest, RemoteConnectRequest};
+use crate::api::types::AgentState;
 use crate::store::credentials::{configured_unity_editor_path, unity_editor_environment_path};
 use crate::Options;
 
@@ -149,6 +150,17 @@ fn download_agent_package(
                     .filter(|value| !value.is_empty())
                 {
                     request = request.bearer_auth(token);
+                }
+            }
+        }
+    } else if download_url.contains("/api/agent-package/latest/update") {
+        if let Ok(content) = std::fs::read_to_string(agent_state_path) {
+            if let Ok(state) = serde_json::from_str::<AgentState>(&content) {
+                if !state.agent_id.trim().is_empty() && !state.credential.trim().is_empty() {
+                    request = request.header(
+                        "Authorization",
+                        format!("Agent {}:{}", state.agent_id, state.credential),
+                    );
                 }
             }
         }
