@@ -62,18 +62,14 @@ pub(crate) fn save_local_unity_editor_path(path: &str) -> Result<Value, Box<dyn 
 }
 
 pub(crate) fn unity_editor_environment_path() -> Option<String> {
-    [
-        "unity_art_editor",
-        "uniart_ediotr",
-        "HIMIND_UNITY_EDITOR",
-    ]
-    .into_iter()
-    .find_map(|name| {
-        env::var(name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
+    ["unity_art_editor", "uniart_ediotr", "HIMIND_UNITY_EDITOR"]
+        .into_iter()
+        .find_map(|name| {
+            env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 pub(crate) fn local_login_status_value() -> &'static str {

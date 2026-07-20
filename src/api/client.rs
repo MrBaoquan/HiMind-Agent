@@ -70,21 +70,11 @@ pub fn load_or_register(
 ) -> Result<AgentState, Box<dyn Error>> {
     if state_path.exists() {
         let content = fs::read_to_string(state_path)?;
-        let mut state = serde_json::from_str::<AgentState>(&content)?;
-        if state.device_id.trim().is_empty() {
-            state.device_id = load_or_create_device_id(state_path)?;
-            fs::write(state_path, serde_json::to_string_pretty(&state)?)?;
-        }
+        let state = serde_json::from_str::<AgentState>(&content)?;
         if !state.agent_id.trim().is_empty()
             && !state.credential.trim().is_empty()
             && matches!(
-                heartbeat(
-                    client,
-                    api_base,
-                    &state.agent_id,
-                    &state.device_id,
-                    &state.credential
-                ),
+                heartbeat(client, api_base, &state.agent_id, &state.credential),
                 Ok(true)
             )
         {
@@ -108,7 +98,7 @@ pub fn register_agent(
 ) -> Result<AgentState, Box<dyn Error>> {
     if enrollment_token.trim().is_empty() {
         return Err(
-            "HIMIND_AGENT_ENROLLMENT_TOKEN is required for first enrollment".into(),
+            "PROJECT_DASHBOARD_AGENT_ENROLLMENT_TOKEN is required for first enrollment".into(),
         );
     }
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-agent".to_string());
@@ -167,14 +157,12 @@ pub fn heartbeat(
     client: &Client,
     api_base: &str,
     agent_id: &str,
-    device_id: &str,
     credential: &str,
 ) -> Result<bool, Box<dyn Error>> {
     let response = client
         .post(format!("{}/api/agent/heartbeat", api_base))
         .json(&json!({
             "agent_id": agent_id,
-            "device_id": device_id,
             "status": "online",
         }))
         .header("Authorization", agent_authorization(agent_id, credential))
@@ -197,7 +185,7 @@ pub fn poll_tasks(
 ) -> Result<Vec<Task>, Box<dyn Error>> {
     let tasks = client
         .get(format!("{}/api/agent/tasks/poll", api_base))
-        .query(&[("agent_id", agent_id)])
+        .query(&[("agent_id", agent_id), ("wait", "25")])
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
         .error_for_status()?
@@ -215,6 +203,8 @@ pub fn report_task(
     detail: &str,
     result: Option<Value>,
     error: Option<String>,
+    execution_id: &str,
+    lease_id: &str,
     credential: &str,
 ) -> Result<(), Box<dyn Error>> {
     client
@@ -226,7 +216,51 @@ pub fn report_task(
             "detail": detail,
             "result": result.unwrap_or_else(|| json!({})),
             "error": error.unwrap_or_default(),
+            "execution_id": execution_id,
+            "lease_id": lease_id,
         }))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
+pub fn renew_task_lease(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    task_id: &str,
+    execution_id: &str,
+    lease_id: &str,
+    credential: &str,
+) -> Result<(), Box<dyn Error>> {
+    client
+        .post(format!(
+            "{}/api/agent/tasks/{}/lease/renew",
+            api_base, task_id
+        ))
+        .json(&json!({
+            "agent_id": agent_id,
+            "execution_id": execution_id,
+            "lease_id": lease_id,
+        }))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
+pub fn verify_local_agent_ticket(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    ticket: &str,
+    capability: &str,
+    credential: &str,
+) -> Result<(), Box<dyn Error>> {
+    client
+        .post(format!("{}/api/agent/local-ticket/verify", api_base))
+        .json(&json!({ "ticket": ticket, "agent_id": agent_id, "capability": capability }))
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
         .error_for_status()?;

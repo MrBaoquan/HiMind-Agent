@@ -25,6 +25,12 @@ pub struct Task {
     pub task_type: String,
     pub detail: Option<String>,
     pub payload: Option<Value>,
+    #[serde(default)]
+    pub execution_id: String,
+    #[serde(default)]
+    pub lease_id: String,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

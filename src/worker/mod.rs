@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::api::client::{heartbeat, load_or_register, poll_tasks};
 use crate::approval::manager::ApprovalManager;
 use crate::store::types::LocalWorkerStatus;
-use crate::{execute_task, Options, VERSION};
+use crate::{execute_task, flush_report_outbox, Options, VERSION};
 
 struct HeartbeatLoop {
     stop: Arc<AtomicBool>,
@@ -40,6 +40,8 @@ pub(crate) fn run_loop(
     )?;
     options.set_agent_credential(&state.credential);
     set_status(&worker_status, true, &state.agent_id, "");
+    flush_report_outbox(&client, &options, &state.agent_id);
+    crate::app::plugin_manager::flush_status_outbox(&options, &state.agent_id);
 
     println!("agent {} connected to {}", state.agent_id, options.api_base);
     let heartbeat_stop = Arc::new(AtomicBool::new(false));
@@ -48,7 +50,6 @@ pub(crate) fn run_loop(
     let heartbeat_client = client.clone();
     let heartbeat_options = options.clone();
     let heartbeat_agent_id = state.agent_id.clone();
-    let heartbeat_device_id = state.device_id.clone();
     let heartbeat_credential = state.credential.clone();
     let heartbeat_interval = options.interval_seconds.max(1);
     let heartbeat_thread = thread::spawn(move || {
@@ -57,10 +58,15 @@ pub(crate) fn run_loop(
                 &heartbeat_client,
                 &heartbeat_options.api_base,
                 &heartbeat_agent_id,
-                &heartbeat_device_id,
                 &heartbeat_credential,
             ) {
-                Ok(true) => set_status(&heartbeat_status, true, &heartbeat_agent_id, ""),
+                Ok(true) => {
+                    set_status(&heartbeat_status, true, &heartbeat_agent_id, "");
+                    crate::app::plugin_manager::flush_status_outbox(
+                        &heartbeat_options,
+                        &heartbeat_agent_id,
+                    );
+                }
                 Ok(false) => {
                     set_status(
                         &heartbeat_status,
@@ -109,7 +115,6 @@ pub(crate) fn run_loop(
         if options.once {
             break;
         }
-        thread::sleep(Duration::from_secs(options.interval_seconds));
     }
 
     Ok(())

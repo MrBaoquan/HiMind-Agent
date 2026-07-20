@@ -1,3 +1,4 @@
+use reqwest::blocking::Client;
 use serde_json::json;
 use std::error::Error;
 use std::fs;
@@ -14,10 +15,12 @@ use raw_window_handle::{
 #[cfg(windows)]
 use std::num::NonZeroIsize;
 
+use crate::api::client::verify_local_agent_ticket;
 use crate::app::http::{
     local_tree_json, query_param, set_response_origin, split_target, write_local_response,
 };
 use crate::app::security::LocalRequestSecurity;
+use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
     capture_browser_page_text, inspect_project_workspace, launch_project_workspace,
     launch_remote_connection, open_url, trigger_local_agent_update,
@@ -190,6 +193,48 @@ fn handle_local_http(
         .find("\r\n\r\n")
         .map(|index| &request_bytes[index + 4..])
         .unwrap_or(&[]);
+    if let Some(operation) = local_operation(method, &path) {
+        let ticket = crate::app::security::header_value(&request, "x-himind-local-ticket")
+            .unwrap_or_default();
+        if ticket.is_empty() {
+            return write_local_response(
+                &mut stream,
+                401,
+                &json!({ "error": "local Agent ticket is required" }).to_string(),
+                "application/json",
+            );
+        }
+        let snapshot = local_worker_snapshot(&worker_status);
+        let agent_id = snapshot
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if agent_id.is_empty() || options.agent_credential().is_empty() {
+            return write_local_response(
+                &mut stream,
+                503,
+                &json!({ "error": "Dashboard Agent is not authenticated" }).to_string(),
+                "application/json",
+            );
+        }
+        if let Err(error) = verify_local_agent_ticket(
+            &Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            &options.api_base,
+            agent_id,
+            ticket,
+            operation,
+            &options.agent_credential(),
+        ) {
+            return write_local_response(
+                &mut stream,
+                403,
+                &json!({ "error": format!("local Agent ticket rejected: {error}") }).to_string(),
+                "application/json",
+            );
+        }
+    }
     let gateway = CapabilityGateway::new(options.clone(), Arc::clone(&worker_status));
     match (method, path.as_str()) {
         ("GET", "/health") => {
@@ -229,6 +274,42 @@ fn handle_local_http(
                     )
                 }
             };
+            if payload.ticket.trim().is_empty() {
+                return write_local_response(
+                    &mut stream,
+                    401,
+                    &json!({ "error": "local Agent ticket is required" }).to_string(),
+                    "application/json",
+                );
+            }
+            let snapshot = local_worker_snapshot(&worker_status);
+            let agent_id = snapshot
+                .get("dashboard_agent_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if agent_id.is_empty() || options.agent_credential().is_empty() {
+                return write_local_response(
+                    &mut stream,
+                    503,
+                    &json!({ "error": "Dashboard Agent is not authenticated" }).to_string(),
+                    "application/json",
+                );
+            }
+            if let Err(error) = verify_local_agent_ticket(
+                &Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
+                &options.api_base,
+                agent_id,
+                &payload.ticket,
+                &payload.capability_id,
+                &options.agent_credential(),
+            ) {
+                return write_local_response(
+                    &mut stream,
+                    403,
+                    &json!({ "error": format!("local Agent ticket rejected: {error}") }).to_string(),
+                    "application/json",
+                );
+            }
             match gateway.invoke(
                 &InvocationContext::local_http(),
                 &payload.capability_id,
@@ -615,6 +696,69 @@ fn handle_local_http(
             &json!({ "error": "not found" }).to_string(),
             "application/json",
         ),
+    }
+}
+
+fn local_operation(method: &str, path: &str) -> Option<&'static str> {
+    match (method, path) {
+        ("GET" | "POST", "/pick-folder") => Some("local.file.pick_folder"),
+        ("GET" | "POST", "/pick-files") => Some("local.file.pick_files"),
+        ("POST", "/stage-file") => Some("local.file.stage"),
+        ("GET", "/tree") => Some("local.file.tree"),
+        ("GET", "/plugins") => Some("local.plugin.list"),
+        ("GET", "/plugins/manifest") => Some("local.plugin.manifest"),
+        (
+            "POST",
+            "/plugins/install" | "/plugins/update" | "/plugins/uninstall" | "/plugins/enable"
+            | "/plugins/disable",
+        ) => Some("local.plugin.manage"),
+        ("GET" | "POST", "/open-folder") => Some("local.file.open_folder"),
+        ("POST", "/workspace-status") => Some("local.workspace.inspect"),
+        ("POST", "/open-project") => Some("local.workspace.open"),
+        ("POST", "/remote-connect") => Some("local.remote.connect"),
+        ("GET", "/login-status") => Some("local.inner_admin.login_status"),
+        ("GET", "/engineering-projects") => Some("local.inner_admin.projects"),
+        ("POST", "/engineering-exhibits") => Some("local.inner_admin.exhibits"),
+        ("POST", "/extract-web-text") => Some("local.browser.extract_text"),
+        ("GET" | "POST", "/open-login") => Some("local.inner_admin.open_login"),
+        ("POST", "/login") => Some("local.inner_admin.login"),
+        ("POST", "/logout") => Some("local.inner_admin.logout"),
+        ("POST", "/update-agent") => Some("local.agent.update"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod local_operation_tests {
+    use super::local_operation;
+
+    #[test]
+    fn maps_sensitive_local_routes_to_stable_operations() {
+        assert_eq!(
+            local_operation("POST", "/remote-connect"),
+            Some("local.remote.connect")
+        );
+        assert_eq!(
+            local_operation("POST", "/plugins/update"),
+            Some("local.plugin.manage")
+        );
+        assert_eq!(
+            local_operation("GET", "/login-status"),
+            Some("local.inner_admin.login_status")
+        );
+    }
+
+    #[test]
+    fn leaves_discovery_and_preflight_routes_public() {
+        assert_eq!(local_operation("GET", "/health"), None);
+        assert_eq!(local_operation("GET", "/capabilities"), None);
+        assert_eq!(local_operation("OPTIONS", "/remote-connect"), None);
+    }
+
+    #[test]
+    fn does_not_authorize_wrong_http_methods() {
+        assert_eq!(local_operation("GET", "/remote-connect"), None);
+        assert_eq!(local_operation("POST", "/login-status"), None);
     }
 }
 

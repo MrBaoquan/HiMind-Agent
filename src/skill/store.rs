@@ -1,0 +1,442 @@
+use crate::skill::manifest::{
+    load_skill_manifest, validate_skill_package_root, write_skill_package,
+};
+use crate::skill::resolver::compare_versions;
+use crate::skill::types::{SkillManifest, SkillPointer, SkillRecord, SkillScope};
+use crate::VERSION;
+use std::collections::HashSet;
+use std::env;
+use std::error::Error;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone)]
+struct SkillSeed {
+    manifest: SkillManifest,
+    readme: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SkillStore {
+    root: PathBuf,
+}
+
+impl SkillStore {
+    pub(crate) fn new() -> Self {
+        Self::with_root(skill_store_root())
+    }
+
+    pub(crate) fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn bootstrap_builtin_skills(&self) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(self.root.join("builtin"))?;
+        fs::create_dir_all(self.root.join("managed"))?;
+        fs::create_dir_all(self.root.join("user"))?;
+        fs::create_dir_all(self.root.join("rendered"))?;
+        for seed in builtin_skill_seeds() {
+            self.ensure_seed(&seed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn list_records(&self) -> Result<Vec<SkillRecord>, Box<dyn Error>> {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        for scope_root in [
+            self.root.join("builtin"),
+            self.root.join("managed"),
+            self.root.join("user"),
+        ] {
+            if !scope_root.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(scope_root)?.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if let Some(record) = self.read_skill_record(&path)? {
+                    if seen.insert(record.manifest.id.clone()) {
+                        items.push(record);
+                    }
+                }
+            }
+        }
+        items.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
+        Ok(items)
+    }
+
+    pub(crate) fn get_record(&self, skill_id: &str) -> Result<Option<SkillRecord>, Box<dyn Error>> {
+        for scope_root in [
+            self.root.join("builtin"),
+            self.root.join("managed"),
+            self.root.join("user"),
+        ] {
+            let scope_skill_root = scope_root.join(skill_id);
+            if !scope_skill_root.exists() {
+                continue;
+            }
+            if let Some(record) = self.read_skill_record(&scope_skill_root)? {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn rendered_skill_root(&self, client_id: &str, skill_id: &str) -> PathBuf {
+        self.root.join("rendered").join(client_id).join(skill_id)
+    }
+
+    pub(crate) fn skill_version_dir(
+        &self,
+        scope: &SkillScope,
+        skill_id: &str,
+        version: &str,
+    ) -> PathBuf {
+        self.scope_root(scope)
+            .join(skill_id)
+            .join("versions")
+            .join(version)
+    }
+
+    pub(crate) fn skill_root_for_scope(&self, scope: &SkillScope, skill_id: &str) -> PathBuf {
+        self.scope_root(scope).join(skill_id)
+    }
+
+    pub(crate) fn install_organization_package(
+        &self,
+        package_root: &Path,
+        expected_id: &str,
+        expected_version: &str,
+    ) -> Result<SkillRecord, Box<dyn Error>> {
+        self.bootstrap_builtin_skills()?;
+        let manifest = validate_skill_package_root(package_root)?;
+        if manifest.scope != SkillScope::Organization {
+            return Err("商城 Skill 必须使用 organization scope".into());
+        }
+        if manifest.id != expected_id || manifest.version != expected_version {
+            return Err("Skill Manifest ID 或版本与发布记录不一致".into());
+        }
+        let skill_root = self.skill_root_for_scope(&SkillScope::Organization, expected_id);
+        let versions_root = skill_root.join("versions");
+        fs::create_dir_all(&versions_root)?;
+        let staging = skill_root.join(format!("staging-{}", now_stamp()));
+        copy_package_tree(package_root, &staging)?;
+        let version_root = versions_root.join(expected_version);
+        let previous_version_root = skill_root.join(format!("replaced-{}", now_stamp()));
+        if version_root.exists() {
+            fs::rename(&version_root, &previous_version_root)?;
+        }
+        if let Err(error) = fs::rename(&staging, &version_root) {
+            if previous_version_root.exists() && !version_root.exists() {
+                let _ = fs::rename(&previous_version_root, &version_root);
+            }
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error.into());
+        }
+        if previous_version_root.exists() {
+            let _ = fs::remove_dir_all(previous_version_root);
+        }
+        let current_pointer = SkillPointer {
+            version: manifest.version.clone(),
+            path: format!("versions/{}", manifest.version),
+            updated_at: now_stamp(),
+        };
+        let current_path = skill_root.join("current.json");
+        if current_path.exists() {
+            if let Ok(existing) = fs::read(&current_path) {
+                fs::write(skill_root.join("previous.json"), existing)?;
+            }
+        }
+        fs::write(&current_path, serde_json::to_vec_pretty(&current_pointer)?)?;
+        self.read_skill_record(&skill_root)?
+            .ok_or_else(|| "Skill 安装后无法从 Store 读取".into())
+    }
+
+    fn scope_root(&self, scope: &SkillScope) -> PathBuf {
+        match scope {
+            SkillScope::Builtin => self.root.join("builtin"),
+            SkillScope::Organization => self.root.join("managed"),
+            SkillScope::User => self.root.join("user"),
+        }
+    }
+
+    fn ensure_seed(&self, seed: &SkillSeed) -> Result<(), Box<dyn Error>> {
+        let skill_root = self.skill_root_for_scope(&seed.manifest.scope, &seed.manifest.id);
+        let current = skill_root.join("current.json");
+        if current.exists() {
+            let existing = self.read_skill_record(&skill_root)?;
+            if let Some(record) = existing {
+                if record.manifest.version == seed.manifest.version {
+                    return Ok(());
+                }
+            }
+        }
+        self.write_versioned_skill(&seed.manifest, seed.readme)
+    }
+
+    fn write_versioned_skill(
+        &self,
+        manifest: &SkillManifest,
+        readme: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let skill_root = self.skill_root_for_scope(&manifest.scope, &manifest.id);
+        let version_dir = skill_root.join("versions").join(&manifest.version);
+        fs::create_dir_all(&version_dir)?;
+        write_skill_package(&version_dir, manifest, readme)?;
+
+        let current_pointer = SkillPointer {
+            version: manifest.version.clone(),
+            path: format!("versions/{}", manifest.version),
+            updated_at: now_stamp(),
+        };
+        let current_path = skill_root.join("current.json");
+        if current_path.exists() {
+            let previous_path = skill_root.join("previous.json");
+            if let Ok(existing) = fs::read_to_string(&current_path) {
+                let _ = fs::write(&previous_path, existing);
+            }
+        }
+        fs::create_dir_all(&skill_root)?;
+        fs::write(&current_path, serde_json::to_vec_pretty(&current_pointer)?)?;
+        Ok(())
+    }
+
+    fn read_skill_record(&self, skill_root: &Path) -> Result<Option<SkillRecord>, Box<dyn Error>> {
+        let current_path = skill_root.join("current.json");
+        let previous_path = skill_root.join("previous.json");
+        let current_pointer = read_pointer(&current_path)?;
+        let previous_pointer = read_pointer(&previous_path)?;
+        let version_root = if let Some(pointer) = current_pointer.clone() {
+            skill_root.join(pointer.path)
+        } else if let Some(latest) = latest_version_dir(skill_root)? {
+            latest
+        } else {
+            return Ok(None);
+        };
+        if !version_root.exists() {
+            return Ok(None);
+        }
+        let manifest = load_skill_manifest(&version_root)?;
+        let previous_version = previous_pointer.map(|pointer| pointer.version);
+        Ok(Some(SkillRecord {
+            manifest,
+            root: skill_root.to_path_buf(),
+            version_root,
+            current: current_pointer.is_some(),
+            previous_version,
+        }))
+    }
+}
+
+fn copy_package_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(target)?;
+    for entry in walkdir::WalkDir::new(source) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(source)?;
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn skill_store_root() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("HiMindAgent")
+        .join("skills")
+}
+
+fn read_pointer(path: &Path) -> Result<Option<SkillPointer>, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)?;
+    let pointer: SkillPointer = serde_json::from_str(content.trim_start_matches('\u{feff}'))?;
+    Ok(Some(pointer))
+}
+
+fn latest_version_dir(skill_root: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let versions_root = skill_root.join("versions");
+    if !versions_root.exists() {
+        return Ok(None);
+    }
+    let mut latest: Option<(String, PathBuf)> = None;
+    for entry in fs::read_dir(versions_root)?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(version_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .map(|(current, _)| {
+                compare_versions(version_name, current) == std::cmp::Ordering::Greater
+            })
+            .unwrap_or(true)
+        {
+            latest = Some((version_name.to_string(), path));
+        }
+    }
+    Ok(latest.map(|(_, path)| path))
+}
+
+fn now_stamp() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| format!("{}-{}", value.as_millis(), sequence))
+        .unwrap_or_else(|_| format!("0-{}", sequence))
+}
+
+fn builtin_skill_seeds() -> Vec<SkillSeed> {
+    vec![SkillSeed {
+        manifest: SkillManifest {
+            id: "com.himind.skill.environment-doctor".to_string(),
+            name: "Environment Doctor".to_string(),
+            version: VERSION.to_string(),
+            scope: SkillScope::Builtin,
+            description: "Read-only environment checks for Codex and other AI clients.".to_string(),
+            min_agent_version: VERSION.to_string(),
+            supported_clients: vec!["codex".to_string()],
+            capabilities: vec![
+                crate::skill::types::SkillCapabilityDependency {
+                    id: "system.health".to_string(),
+                    required: true,
+                    min_version: Some("1.0.0".to_string()),
+                    max_version: None,
+                    provider: Some("agent".to_string()),
+                },
+                crate::skill::types::SkillCapabilityDependency {
+                    id: "plugin.list".to_string(),
+                    required: true,
+                    min_version: Some("1.0.0".to_string()),
+                    max_version: None,
+                    provider: Some("agent".to_string()),
+                },
+                crate::skill::types::SkillCapabilityDependency {
+                    id: "inner_admin.login_status".to_string(),
+                    required: false,
+                    min_version: Some("1.0.0".to_string()),
+                    max_version: None,
+                    provider: Some("agent".to_string()),
+                },
+            ],
+            plugin_dependencies: vec![],
+            risk_summary: "read_only".to_string(),
+            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
+        },
+        readme: r#"# Environment Doctor
+
+Use this skill to inspect the local HiMind Agent environment before attempting Codex-driven work.
+
+## When to use
+
+- Check whether the Agent is online.
+- Inspect available capabilities.
+- Confirm plugin and login-state readiness.
+
+## Output
+
+- Summaries only.
+- No write actions.
+- No credentials.
+
+## Never do
+
+- Do not install plugins.
+- Do not change Agent settings.
+- Do not emit secrets or tokens.
+"#,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstraps_builtin_skill_seed() {
+        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
+        let store = SkillStore { root: root.clone() };
+        store.bootstrap_builtin_skills().unwrap();
+        let records = store.list_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].manifest.id,
+            "com.himind.skill.environment-doctor"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prefers_current_pointer_over_latest_version() {
+        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
+        let store = SkillStore { root: root.clone() };
+        let skill_root = store.skill_root_for_scope(&SkillScope::Builtin, "demo.skill");
+        let current_version = "2.0.0";
+        let previous_version = "1.0.0";
+        let current_manifest = SkillManifest {
+            id: "demo.skill".to_string(),
+            name: "Demo".to_string(),
+            version: current_version.to_string(),
+            scope: SkillScope::Builtin,
+            description: String::new(),
+            min_agent_version: "0.2.0".to_string(),
+            supported_clients: vec!["codex".to_string()],
+            capabilities: vec![],
+            plugin_dependencies: vec![],
+            risk_summary: String::new(),
+            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
+        };
+        let previous_manifest = SkillManifest {
+            version: previous_version.to_string(),
+            ..current_manifest.clone()
+        };
+        write_skill_package(
+            &skill_root.join("versions").join(current_version),
+            &current_manifest,
+            "# Demo",
+        )
+        .unwrap();
+        write_skill_package(
+            &skill_root.join("versions").join(previous_version),
+            &previous_manifest,
+            "# Demo",
+        )
+        .unwrap();
+        fs::create_dir_all(&skill_root).unwrap();
+        fs::write(
+            skill_root.join("current.json"),
+            serde_json::to_vec_pretty(&SkillPointer {
+                version: current_version.to_string(),
+                path: format!("versions/{current_version}"),
+                updated_at: now_stamp(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let record = store.read_skill_record(&skill_root).unwrap().unwrap();
+        assert_eq!(record.manifest.version, current_version);
+        let _ = fs::remove_dir_all(root);
+    }
+}

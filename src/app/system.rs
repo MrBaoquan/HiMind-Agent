@@ -140,8 +140,7 @@ fn download_agent_package(
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis())
         .unwrap_or_default();
-    let staged_path =
-        env::temp_dir().join(format!("himind-agent-update-{timestamp}.exe"));
+    let staged_path = env::temp_dir().join(format!("himind-agent-update-{timestamp}.exe"));
     let mut file = File::create(&staged_path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -209,8 +208,8 @@ fn verify_agent_package_signature(
     if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
         return Ok(());
     }
-    let trusted_dir = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR")
-        .ok_or("未配置 Agent 更新受信公钥目录")?;
+    let trusted_dir =
+        env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").ok_or("未配置 Agent 更新受信公钥目录")?;
     let public_key_path = PathBuf::from(trusted_dir).join(format!("{key_id}.pem"));
     verify_rsa_pss_sha256(
         staged_executable,
@@ -219,7 +218,7 @@ fn verify_agent_package_signature(
     )
 }
 
-fn verify_rsa_pss_sha256(
+pub(crate) fn verify_rsa_pss_sha256(
     artifact_path: &Path,
     public_key_pem: &str,
     signature_base64: &str,
@@ -232,7 +231,7 @@ fn verify_rsa_pss_sha256(
         .map_err(|_| "Agent 更新包签名验证失败".into())
 }
 
-fn validate_signature_metadata(
+pub(crate) fn validate_signature_metadata(
     signature: &str,
     key_id: &str,
     algorithm: &str,
@@ -370,10 +369,7 @@ $shortcut.Save()
             ("HIMIND_SHORTCUT_PATH", &shortcut_path),
             ("HIMIND_SHORTCUT_TARGET", &target_path),
             ("HIMIND_SHORTCUT_ARGUMENTS", &arguments),
-            (
-                "HIMIND_SHORTCUT_WORKING_DIRECTORY",
-                &working_directory,
-            ),
+            ("HIMIND_SHORTCUT_WORKING_DIRECTORY", &working_directory),
             ("HIMIND_SHORTCUT_DESCRIPTION", &description),
         ],
     )?;
@@ -1121,10 +1117,7 @@ exit 0
             script,
         ])
         .creation_flags(CREATE_NO_WINDOW)
-        .env(
-            "HIMIND_REMOTE_TARGET_PID",
-            process_id.to_string(),
-        )
+        .env("HIMIND_REMOTE_TARGET_PID", process_id.to_string())
         .env("HIMIND_REMOTE_VENDOR", vendor)
         .env("HIMIND_REMOTE_CODE", code)
         .env("HIMIND_REMOTE_PASSWORD", password)

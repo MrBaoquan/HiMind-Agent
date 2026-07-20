@@ -25,9 +25,11 @@ pub(crate) fn write_local_response(
     let status_text = match status {
         200 => "OK",
         204 => "No Content",
+        401 => "Unauthorized",
         403 => "Forbidden",
         400 => "Bad Request",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "OK",
     };
     let cors_headers = RESPONSE_ORIGIN.with(|current| {
@@ -36,7 +38,7 @@ pub(crate) fn write_local_response(
             .as_deref()
             .map(|origin| {
                 format!(
-                    "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Upload-Id, X-File-Name, X-Upload-Final\r\n"
+                    "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Upload-Id, X-File-Name, X-Upload-Final, X-HiMind-Local-Ticket\r\n"
                 )
             })
             .unwrap_or_default()

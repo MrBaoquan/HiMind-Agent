@@ -8,7 +8,10 @@ use serde_json::{json, Value};
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 
 mod api;
 mod app;
@@ -17,6 +20,7 @@ mod capability;
 mod mcp;
 mod remote;
 mod scan;
+mod skill;
 mod store;
 mod svn;
 mod upload;
@@ -28,6 +32,7 @@ use approval::manager::ApprovalManager;
 use approval::types::RequestType;
 use remote::sync::execute_sync_exhibits;
 use scan::service::execute_scan;
+use store::outbox::{list_reports, remove_report, store_report, TaskReportRecord};
 use svn::service::{
     apply_project_acl, create_exhibit_repository_path, create_repository,
     initialize_exhibit_repository_with_cancel, preview_project_acl,
@@ -53,7 +58,17 @@ fn main() {
         std::process::exit(1);
     }
     let options = Options::from_env();
-    if cfg!(feature = "mcp-console") || env::args().any(|argument| argument == "--mcp") {
+    if let Some(arguments) = skill_cli_arguments() {
+        if let Err(error) = run_skill_cli(&options, &arguments) {
+            eprintln!("skill command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = plugin_cli_arguments() {
+        if let Err(error) = run_plugin_cli(&options, &arguments) {
+            eprintln!("plugin command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if cfg!(feature = "mcp-console") || env::args().any(|argument| argument == "--mcp") {
         if let Err(error) = mcp::run(options) {
             eprintln!("agent mcp failed: {error}");
             std::process::exit(1);
@@ -69,6 +84,84 @@ fn main() {
     }
 }
 
+fn plugin_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "plugin")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn skill_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "skill")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_skill_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    skill::cli::run(options, arguments)
+}
+
+fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let state: api::types::AgentState =
+        serde_json::from_str(&std::fs::read_to_string(&options.state_path)?)?;
+    options.set_agent_credential(&state.credential);
+    match arguments.first().map(String::as_str) {
+        Some("list") => println!("{}", capability::plugin::registry_json()?),
+        Some("install") if arguments.len() == 2 => {
+            app::plugin_manager::install(options, &state.agent_id, &arguments[1])?
+        }
+        Some("uninstall") if arguments.len() == 2 => {
+            app::plugin_manager::uninstall(&arguments[1])?
+        }
+        Some("rollback") if arguments.len() == 2 => {
+            app::plugin_manager::rollback(&arguments[1])?
+        }
+        Some("enable") if arguments.len() == 2 => {
+            app::plugin_manager::set_enabled(&arguments[1], true)?
+        }
+        Some("disable") if arguments.len() == 2 => {
+            app::plugin_manager::set_enabled(&arguments[1], false)?
+        }
+        Some("invoke") if arguments.len() == 3 => {
+            let input_path = arguments[2].strip_prefix('@').unwrap_or(&arguments[2]);
+            let raw_input = if std::path::Path::new(input_path).is_file() {
+                std::fs::read_to_string(input_path)?
+            } else {
+                arguments[2].clone()
+            };
+            let input = serde_json::from_str::<Value>(&raw_input)?;
+            let gateway = capability::service::CapabilityGateway::new(
+                options.clone(),
+                Arc::new(std::sync::Mutex::new(store::types::LocalWorkerStatus::default())),
+            );
+            println!(
+                "{}",
+                gateway.invoke(
+                    &capability::types::InvocationContext::new(
+                        capability::types::InvocationSource::Cli,
+                        "local-cli",
+                    ),
+                    &arguments[1],
+                    input,
+                )?
+            );
+        }
+        _ => {
+            return Err("usage: himind-agent plugin <list|install|uninstall|enable|disable|rollback|invoke> [plugin-id|capability-id json]".into())
+        }
+    }
+    if let Some(plugin_id) = arguments.get(1).filter(|_| {
+        matches!(
+            arguments.first().map(String::as_str),
+            Some("install" | "uninstall" | "enable" | "disable" | "rollback")
+        )
+    }) {
+        let action = arguments[0].as_str();
+        let _ =
+            app::plugin_manager::report_status(options, &state.agent_id, plugin_id, action, "", "");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct Options {
     api_base: String,
@@ -79,6 +172,7 @@ pub(crate) struct Options {
     local_port: u16,
     enrollment_token: String,
     agent_credential: Arc<RwLock<String>>,
+    task_execution: Arc<RwLock<Option<(String, String)>>>,
 }
 
 impl Options {
@@ -94,8 +188,7 @@ impl Options {
         let mut interval_seconds = 10;
         let mut local_app = false;
         let mut local_port = 18181;
-        let enrollment_token =
-            env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
+        let enrollment_token = env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
 
         let args: Vec<String> = env::args().collect();
         let mut i = 1;
@@ -133,7 +226,50 @@ impl Options {
             local_port,
             enrollment_token,
             agent_credential: Arc::new(RwLock::new(String::new())),
+            task_execution: Arc::new(RwLock::new(None)),
         }
+    }
+}
+
+struct LeaseRenewal {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LeaseRenewal {
+    fn start(stop: Arc<AtomicBool>, handle: thread::JoinHandle<()>) -> Self {
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for LeaseRenewal {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct TaskExecutionGuard {
+    options: Options,
+}
+
+impl TaskExecutionGuard {
+    fn start(options: &Options, execution_id: &str, lease_id: &str) -> Self {
+        options.set_task_execution(execution_id, lease_id);
+        Self {
+            options: options.clone(),
+        }
+    }
+}
+
+impl Drop for TaskExecutionGuard {
+    fn drop(&mut self) {
+        self.options.clear_task_execution();
     }
 }
 
@@ -210,6 +346,25 @@ impl Options {
             .map(|value| value.clone())
             .unwrap_or_default()
     }
+
+    pub(crate) fn set_task_execution(&self, execution_id: &str, lease_id: &str) {
+        if let Ok(mut current) = self.task_execution.write() {
+            *current = Some((execution_id.to_string(), lease_id.to_string()));
+        }
+    }
+
+    pub(crate) fn clear_task_execution(&self) {
+        if let Ok(mut current) = self.task_execution.write() {
+            *current = None;
+        }
+    }
+
+    pub(crate) fn task_execution(&self) -> Option<(String, String)> {
+        self.task_execution
+            .read()
+            .ok()
+            .and_then(|value| value.clone())
+    }
 }
 
 fn execute_task(
@@ -220,6 +375,46 @@ fn execute_task(
     approval_mgr: Option<&ApprovalManager>,
 ) -> Result<(), Box<dyn Error>> {
     println!("executing task {} ({})", task.id, task.task_type);
+    let _execution = TaskExecutionGuard::start(options, &task.execution_id, &task.lease_id);
+    let _lease_renewal = if !task.execution_id.is_empty() && !task.lease_id.is_empty() {
+        let lease_stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&lease_stop);
+        let renew_client = client.clone();
+        let renew_options = options.clone();
+        let renew_agent_id = agent_id.to_string();
+        let renew_task_id = task.id.clone();
+        let renew_execution_id = task.execution_id.clone();
+        let renew_lease_id = task.lease_id.clone();
+        Some(LeaseRenewal::start(
+            lease_stop,
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..30 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Err(error) = api::client::renew_task_lease(
+                        &renew_client,
+                        &renew_options.api_base,
+                        &renew_agent_id,
+                        &renew_task_id,
+                        &renew_execution_id,
+                        &renew_lease_id,
+                        &renew_options.agent_credential(),
+                    ) {
+                        eprintln!("task {} lease renew failed: {}", renew_task_id, error);
+                    }
+                }
+            }),
+        ))
+    } else {
+        None
+    };
     if let Some(manager) = approval_mgr {
         manager.add_log(
             "info",
@@ -482,7 +677,21 @@ pub(crate) fn report_task(
     result: Option<Value>,
     error: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    api::client::report_task(
+    let (execution_id, lease_id) = options
+        .task_execution()
+        .unwrap_or_else(|| (String::new(), String::new()));
+    let report = TaskReportRecord {
+        task_id: task_id.to_string(),
+        agent_id: agent_id.to_string(),
+        execution_id: execution_id.clone(),
+        lease_id: lease_id.clone(),
+        status: status.to_string(),
+        progress,
+        detail: detail.to_string(),
+        result: result.clone().unwrap_or_else(|| json!({})),
+        error: error.clone().unwrap_or_default(),
+    };
+    let response = api::client::report_task(
         client,
         &options.api_base,
         agent_id,
@@ -492,6 +701,58 @@ pub(crate) fn report_task(
         detail,
         result,
         error,
+        &execution_id,
+        &lease_id,
         &options.agent_credential(),
-    )
+    );
+    if let Err(report_error) = response {
+        if let Err(outbox_error) = store_report(&options.state_path, &report) {
+            eprintln!("task report failed and outbox write failed: {outbox_error}");
+        }
+        return Err(report_error);
+    }
+    Ok(())
+}
+
+fn flush_report_outbox(client: &Client, options: &Options, agent_id: &str) {
+    let reports = match list_reports(&options.state_path) {
+        Ok(reports) => reports,
+        Err(error) => {
+            eprintln!("task report outbox read failed: {error}");
+            return;
+        }
+    };
+    for (path, report) in reports {
+        if report.agent_id != agent_id {
+            continue;
+        }
+        match api::client::report_task(
+            client,
+            &options.api_base,
+            &report.agent_id,
+            &report.task_id,
+            &report.status,
+            report.progress,
+            &report.detail,
+            Some(report.result),
+            if report.error.is_empty() {
+                None
+            } else {
+                Some(report.error)
+            },
+            &report.execution_id,
+            &report.lease_id,
+            &options.agent_credential(),
+        ) {
+            Ok(()) => {
+                if let Err(error) = remove_report(&path) {
+                    eprintln!("task report outbox cleanup failed: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("task report outbox replay failed: {error}");
+                break;
+            }
+        }
+    }
 }

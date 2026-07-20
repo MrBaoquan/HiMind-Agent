@@ -37,6 +37,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         port,
         dashboard_base: options.api_base.clone(),
         state_path: options.state_path.clone(),
+        options: options.clone(),
     };
     let popup_approval_manager = Arc::clone(&state.approval_manager);
 
@@ -74,6 +75,16 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                 api.prevent_close();
                 let _ = window.hide();
             }
+            (label, WindowEvent::CloseRequested { api, .. })
+                if label.starts_with("plugin-view-") =>
+            {
+                api.prevent_close();
+                let plugin_window = window.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(20));
+                    let _ = plugin_window.destroy();
+                });
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -93,8 +104,32 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_auto_start,
             super::commands::get_agent_logs,
             super::commands::get_plugin_registry,
+            super::commands::get_plugin_catalog,
+            super::commands::install_plugin,
+            super::commands::uninstall_plugin,
+            super::commands::rollback_plugin,
+            super::commands::set_plugin_enabled,
             super::commands::get_agent_capabilities,
+            super::commands::get_skill_catalog,
+            super::commands::get_organization_skill_catalog,
+            super::commands::install_organization_skill,
+            super::commands::plan_organization_skill_install,
+            super::commands::list_skill_drafts,
+            super::commands::list_skill_submissions,
+            super::commands::save_skill_draft,
+            super::commands::test_skill_draft,
+            super::commands::confirm_skill_draft,
+            super::commands::submit_skill_draft,
+            super::commands::get_codex_skill_status,
+            super::commands::sync_codex_skills,
+            super::commands::sync_codex_skill,
+            super::commands::repair_codex_skill,
+            super::commands::uninstall_codex_skill,
+            super::commands::open_folder,
             super::commands::open_plugin_directory,
+            super::commands::register_development_plugin,
+            super::commands::unregister_development_plugin,
+            super::commands::invoke_development_plugin,
             super::commands::open_plugin_view,
             super::commands::create_plugin_view_shortcut,
             super::commands::close_plugin_view,

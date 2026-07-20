@@ -17,6 +17,17 @@ const MAX_PLUGIN_INVOCATIONS: usize = 4;
 const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PLUGIN_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_STDERR_BYTES: usize = 64 * 1024;
+const PLUGIN_FAILURE_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct PluginHealth {
+    #[serde(default)]
+    failure_count: u32,
+    #[serde(default)]
+    last_failure_at: Option<u64>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct PluginCapabilityManifest {
@@ -40,6 +51,8 @@ pub(crate) struct PluginManifest {
     pub runtime: String,
     #[serde(default)]
     pub min_agent_version: String,
+    #[serde(default = "default_plugin_governance")]
+    pub governance: String,
     #[serde(default)]
     pub capabilities: Vec<PluginCapabilityManifest>,
     #[serde(default)]
@@ -78,14 +91,23 @@ pub(crate) struct PluginRegistryItem {
     pub version: String,
     pub runtime: String,
     pub min_agent_version: String,
+    pub governance: String,
     pub status: String,
     pub enabled: bool,
     pub path: String,
+    pub development: bool,
+    pub entry: String,
+    pub entry_modified_at: Option<u64>,
+    pub entry_size: Option<u64>,
+    pub previous_version: Option<String>,
+    pub rollback_available: bool,
     pub capabilities: Vec<PluginCapabilityManifest>,
     pub permissions: Vec<String>,
     pub views: Vec<PluginViewContribution>,
     pub commands: Vec<PluginCommandContribution>,
     pub error: Option<String>,
+    pub failure_count: u32,
+    pub circuit_open: bool,
 }
 
 pub(crate) fn plugin_registry_dir() -> PathBuf {
@@ -96,22 +118,194 @@ pub(crate) fn plugin_registry_dir() -> PathBuf {
         .join("plugins")
 }
 
-pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
-    let root = plugin_registry_dir();
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
+fn development_registry_path() -> PathBuf {
+    plugin_registry_dir()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("plugin-development.json")
+}
 
-    let mut items = Vec::new();
-    for entry in fs::read_dir(&root)?.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+pub(crate) fn register_development_plugin(
+    path: &std::path::Path,
+) -> Result<String, Box<dyn Error>> {
+    register_development_plugin_at(path, &development_registry_path())
+}
+
+fn register_development_plugin_at(
+    path: &std::path::Path,
+    registry_path: &std::path::Path,
+) -> Result<String, Box<dyn Error>> {
+    let root = path.canonicalize()?;
+    let content = fs::read_to_string(root.join("plugin.json"))?;
+    let manifest = parse_plugin_manifest(content.trim_start_matches('\u{feff}'))?;
+    validate_manifest_contributions(&root, &manifest)?;
+    validate_development_entry(&root, &manifest)?;
+    let mut entries = development_plugins_at(registry_path);
+    entries.retain(|entry| entry.id != manifest.id);
+    entries.push(DevelopmentPlugin {
+        id: manifest.id.clone(),
+        path: root.to_string_lossy().to_string(),
+    });
+    write_development_plugins_at(registry_path, &entries)?;
+    Ok(manifest.id)
+}
+
+pub(crate) fn unregister_development_plugin(plugin_id: &str) -> Result<(), Box<dyn Error>> {
+    unregister_development_plugin_at(plugin_id, &development_registry_path())
+}
+
+fn unregister_development_plugin_at(
+    plugin_id: &str,
+    registry_path: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries = development_plugins_at(registry_path);
+    entries.retain(|entry| entry.id != plugin_id);
+    write_development_plugins_at(registry_path, &entries)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DevelopmentPlugin {
+    id: String,
+    path: String,
+}
+
+fn development_plugins() -> Vec<DevelopmentPlugin> {
+    development_plugins_at(&development_registry_path())
+}
+
+fn development_plugins_at(path: &std::path::Path) -> Vec<DevelopmentPlugin> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn write_development_plugins_at(
+    path: &std::path::Path,
+    entries: &[DevelopmentPlugin],
+) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(entries)?)?;
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
+    let mut items = builtin_plugin_items();
+    let root = plugin_registry_dir();
+    if root.exists() {
+        for entry in fs::read_dir(&root)?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            items.push(read_plugin_item(path, false));
         }
-        items.push(read_plugin_item(path));
+    }
+    for entry in development_plugins() {
+        items.retain(|item| item.id != entry.id);
+        items.push(read_plugin_item(PathBuf::from(entry.path), true));
     }
     items.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(items)
+}
+
+pub(crate) fn is_builtin_plugin(plugin_id: &str) -> bool {
+    matches!(
+        plugin_id,
+        "com.himind.builtin.svn" | "com.himind.builtin.smb" | "com.himind.builtin.inner-admin"
+    )
+}
+
+fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
+    vec![
+        builtin_plugin(
+            "com.himind.builtin.svn",
+            "SVN 工作区与仓库",
+            "受控 SVN 账号、工作区、建仓、模板和权限能力。",
+            &[
+                "svn.connection.list",
+                "svn.connection.test",
+                "exhibit.workspace.checkout",
+                "exhibit.workspace.status",
+                "exhibit.workspace.update",
+                "exhibit.workspace.open",
+                "exhibit.repository_path.create",
+                "exhibit.repository.initialize_template",
+                "project.repository.create",
+                "project.repository.exhibits_access.ensure",
+            ],
+            &["secret.svn.broker", "network.svn", "process.tortoisesvn"],
+        ),
+        builtin_plugin(
+            "com.himind.builtin.smb",
+            "SMB 共享资源",
+            "由 Dashboard 任务编排的受控共享目录读取与资源上传模块。",
+            &[],
+            &["fs.smb.broker", "network.internal"],
+        ),
+        builtin_plugin(
+            "com.himind.builtin.inner-admin",
+            "内网交付与上传",
+            "内网工程同步、代码预处理、分片上传和占位说明交付模块。",
+            &["inner_admin.login_status"],
+            &[
+                "secret.inner_admin.broker",
+                "network.internal",
+                "artifact.read",
+            ],
+        ),
+    ]
+}
+
+fn builtin_plugin(
+    id: &str,
+    name: &str,
+    description: &str,
+    capability_ids: &[&str],
+    permissions: &[&str],
+) -> PluginRegistryItem {
+    PluginRegistryItem {
+        id: id.to_string(),
+        name: name.to_string(),
+        version: crate::VERSION.to_string(),
+        runtime: "builtin".to_string(),
+        min_agent_version: crate::VERSION.to_string(),
+        governance: "required".to_string(),
+        status: "installed".to_string(),
+        enabled: true,
+        path: String::new(),
+        development: false,
+        entry: String::new(),
+        entry_modified_at: None,
+        entry_size: None,
+        previous_version: None,
+        rollback_available: false,
+        capabilities: capability_ids
+            .iter()
+            .map(|id| PluginCapabilityManifest {
+                id: (*id).to_string(),
+                description: description.to_string(),
+                input_schema: Value::Null,
+                risk_level: "builtin_policy".to_string(),
+            })
+            .collect(),
+        permissions: permissions
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        views: Vec::new(),
+        commands: Vec::new(),
+        error: None,
+        failure_count: 0,
+        circuit_open: false,
+    }
 }
 
 pub(crate) fn find_plugin(plugin_id: &str) -> Result<Option<PluginRegistryItem>, Box<dyn Error>> {
@@ -193,7 +387,7 @@ pub(crate) fn is_plugin_ui_navigation(url: &url::Url) -> bool {
     url.as_str() == "about:blank" || is_plugin_ui_origin(url)
 }
 
-fn read_plugin_item(path: PathBuf) -> PluginRegistryItem {
+fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
     let manifest_path = path.join("current").join("plugin.json");
     let fallback_manifest_path = path.join("plugin.json");
     let manifest_path = if manifest_path.exists() {
@@ -213,23 +407,57 @@ fn read_plugin_item(path: PathBuf) -> PluginRegistryItem {
     match manifest {
         Ok(manifest) => {
             let validation = validate_manifest_contributions(&path, &manifest);
+            let entry_metadata = development_entry_metadata(&path, &manifest.entry);
+            let governance = fs::read_to_string(path.join("current").join("policy.json"))
+                .ok()
+                .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                .and_then(|value| {
+                    value
+                        .get("governance")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| manifest.governance.clone());
+            let disabled = path.join("disabled").exists();
+            let health_root = plugin_health_root(&path, development, &manifest.id);
+            let health = read_plugin_health(&health_root);
+            let circuit_open = health.failure_count >= PLUGIN_FAILURE_THRESHOLD;
             PluginRegistryItem {
                 id: manifest.id,
                 name: manifest.name,
                 version: manifest.version,
                 runtime: manifest.runtime,
                 min_agent_version: manifest.min_agent_version,
+                governance,
                 status: validation
                     .as_ref()
-                    .map(|_| "installed".to_string())
+                    .map(|_| {
+                        if circuit_open {
+                            "failed".to_string()
+                        } else {
+                            "installed".to_string()
+                        }
+                    })
                     .unwrap_or_else(|_| "failed".to_string()),
-                enabled: validation.is_ok(),
+                enabled: validation.is_ok() && !disabled && !circuit_open,
                 path: path.to_string_lossy().to_string(),
+                development,
+                entry: manifest.entry,
+                entry_modified_at: entry_metadata.as_ref().and_then(|metadata| metadata.0),
+                entry_size: entry_metadata.map(|metadata| metadata.1),
+                previous_version: previous_plugin_version(&path),
+                rollback_available: path.join("current").join("plugin.json").exists()
+                    && path.join("previous").join("plugin.json").exists(),
                 capabilities: manifest.capabilities,
                 permissions: manifest.permissions,
                 views: manifest.contributes.views,
                 commands: manifest.contributes.commands,
-                error: validation.err().map(|error| error.to_string()),
+                error: validation
+                    .err()
+                    .map(|error| error.to_string())
+                    .or(health.last_error),
+                failure_count: health.failure_count,
+                circuit_open,
             }
         }
         Err(error) => PluginRegistryItem {
@@ -238,16 +466,50 @@ fn read_plugin_item(path: PathBuf) -> PluginRegistryItem {
             version: String::new(),
             runtime: String::new(),
             min_agent_version: String::new(),
+            governance: "optional".to_string(),
             status: "failed".to_string(),
             enabled: false,
             path: path.to_string_lossy().to_string(),
+            development,
+            entry: String::new(),
+            entry_modified_at: None,
+            entry_size: None,
+            previous_version: None,
+            rollback_available: false,
             capabilities: Vec::new(),
             permissions: Vec::new(),
             views: Vec::new(),
             commands: Vec::new(),
             error: Some(error.to_string()),
+            failure_count: 0,
+            circuit_open: false,
         },
     }
+}
+
+fn previous_plugin_version(root: &std::path::Path) -> Option<String> {
+    let content = fs::read_to_string(root.join("previous/plugin.json")).ok()?;
+    parse_plugin_manifest(&content)
+        .ok()
+        .map(|manifest| manifest.version)
+}
+
+fn development_entry_metadata(root: &std::path::Path, entry: &str) -> Option<(Option<u64>, u64)> {
+    let execution_dir = {
+        let current = root.join("current");
+        if current.join("plugin.json").exists() {
+            current
+        } else {
+            root.to_path_buf()
+        }
+    };
+    let metadata = fs::metadata(execution_dir.join(entry)).ok()?;
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64);
+    Some((modified_at, metadata.len()))
 }
 
 pub(crate) fn registry_json() -> Result<Value, Box<dyn Error>> {
@@ -261,6 +523,74 @@ pub(crate) fn registry_json() -> Result<Value, Box<dyn Error>> {
     }))
 }
 
+fn health_path(root: &std::path::Path) -> PathBuf {
+    if root.extension().and_then(|value| value.to_str()) == Some("json") {
+        root.to_path_buf()
+    } else {
+        root.join("health.json")
+    }
+}
+
+fn plugin_health_root(path: &std::path::Path, development: bool, plugin_id: &str) -> PathBuf {
+    if development {
+        development_registry_path()
+            .with_file_name("plugin-development-health")
+            .join(format!("{plugin_id}.json"))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn read_plugin_health(root: &std::path::Path) -> PluginHealth {
+    fs::read_to_string(health_path(root))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn write_plugin_health(
+    root: &std::path::Path,
+    health: &PluginHealth,
+) -> Result<(), Box<dyn Error>> {
+    let path = health_path(root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", next_request_id()));
+    fs::write(&temporary, serde_json::to_vec_pretty(health)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn record_plugin_failure(root: &std::path::Path, error: &str) {
+    let mut health = read_plugin_health(root);
+    health.failure_count = health
+        .failure_count
+        .saturating_add(1)
+        .min(PLUGIN_FAILURE_THRESHOLD);
+    health.last_failure_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_secs());
+    health.last_error = Some(error.chars().take(2048).collect());
+    let _ = write_plugin_health(root, &health);
+}
+
+fn clear_plugin_health(root: &std::path::Path) {
+    let _ = fs::remove_file(health_path(root));
+}
+
+pub(crate) fn reset_plugin_health(plugin_id: &str) -> Result<(), Box<dyn Error>> {
+    let root = plugin_registry_dir().join(plugin_id);
+    clear_plugin_health(&root);
+    clear_plugin_health(
+        &development_registry_path()
+            .with_file_name("plugin-development-health")
+            .join(format!("{plugin_id}.json")),
+    );
+    Ok(())
+}
+
 pub(crate) fn invoke_plugin_capability(
     capability_id: &str,
     input: Value,
@@ -269,6 +599,7 @@ pub(crate) fn invoke_plugin_capability(
         .into_iter()
         .find(|item| {
             item.enabled
+                && item.runtime == "process-jsonrpc-stdio"
                 && item
                     .capabilities
                     .iter()
@@ -276,6 +607,26 @@ pub(crate) fn invoke_plugin_capability(
         })
         .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
 
+    invoke_plugin_capability_for_item(&plugin, capability_id, input)
+}
+
+pub(crate) fn invoke_plugin_capability_for_plugin(
+    plugin_id: &str,
+    capability_id: &str,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let plugin = scan_plugins()?
+        .into_iter()
+        .find(|item| item.id == plugin_id && item.enabled)
+        .ok_or_else(|| format!("plugin not found or unavailable: {plugin_id}"))?;
+    invoke_plugin_capability_for_item(&plugin, capability_id, input)
+}
+
+fn invoke_plugin_capability_for_item(
+    plugin: &PluginRegistryItem,
+    capability_id: &str,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
     let capability = plugin
         .capabilities
         .iter()
@@ -289,6 +640,16 @@ pub(crate) fn invoke_plugin_capability(
     }
 
     let result = invoke_plugin_process(&plugin, capability_id, input);
+    let health_root = plugin_health_root(
+        std::path::Path::new(&plugin.path),
+        plugin.development,
+        &plugin.id,
+    );
+    if result.is_ok() {
+        clear_plugin_health(&health_root);
+    } else if let Err(error) = &result {
+        record_plugin_failure(&health_root, &error.to_string());
+    }
     ACTIVE_INVOCATIONS.fetch_sub(1, Ordering::Release);
     result
 }
@@ -535,6 +896,32 @@ fn validate_manifest_contributions(
     Ok(())
 }
 
+fn validate_development_entry(
+    plugin_path: &std::path::Path,
+    manifest: &PluginManifest,
+) -> Result<(), Box<dyn Error>> {
+    if manifest.runtime != "process-jsonrpc-stdio" {
+        return Err(format!(
+            "unsupported development plugin runtime: {}",
+            manifest.runtime
+        )
+        .into());
+    }
+    if manifest.entry.trim().is_empty() {
+        return Err("development plugin entry is required".into());
+    }
+    let root = plugin_path.canonicalize()?;
+    let relative = PathBuf::from(&manifest.entry);
+    if relative.is_absolute() {
+        return Err("development plugin entry must be relative".into());
+    }
+    let entry = root.join(relative).canonicalize()?;
+    if !entry.starts_with(&root) || !entry.is_file() {
+        return Err("development plugin entry must be a file inside the project directory".into());
+    }
+    Ok(())
+}
+
 fn is_safe_resource_segment(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -574,6 +961,10 @@ fn default_risk_level() -> String {
     "read_only".to_string()
 }
 
+fn default_plugin_governance() -> String {
+    "optional".to_string()
+}
+
 fn default_view_location() -> String {
     "plugin_navigation".to_string()
 }
@@ -582,6 +973,25 @@ fn default_view_location() -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn plugin_health_opens_at_threshold_and_clears_on_success() {
+        let root = std::env::temp_dir().join(format!("agent-plugin-health-{}", next_request_id()));
+        fs::create_dir_all(&root).unwrap();
+
+        record_plugin_failure(&root, "first failure");
+        record_plugin_failure(&root, "second failure");
+        assert!(read_plugin_health(&root).failure_count < PLUGIN_FAILURE_THRESHOLD);
+
+        record_plugin_failure(&root, "third failure");
+        let health = read_plugin_health(&root);
+        assert_eq!(health.failure_count, PLUGIN_FAILURE_THRESHOLD);
+        assert!(health.last_error.as_deref() == Some("third failure"));
+
+        clear_plugin_health(&root);
+        assert_eq!(read_plugin_health(&root).failure_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn accepts_html_view_inside_plugin_root() {
@@ -596,6 +1006,7 @@ mod tests {
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
             min_agent_version: String::new(),
+            governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             contributes: PluginContributions {
@@ -626,6 +1037,7 @@ mod tests {
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
             min_agent_version: String::new(),
+            governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             contributes: PluginContributions {
@@ -660,6 +1072,7 @@ mod tests {
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
             min_agent_version: String::new(),
+            governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             contributes: PluginContributions {
@@ -731,5 +1144,58 @@ mod tests {
         });
 
         assert!(validate_input_schema(&schema, &json!({ "query": 42 })).is_err());
+    }
+
+    #[test]
+    fn registers_and_unregisters_development_plugin_without_deleting_source() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-dev-test-{}", next_request_id()));
+        let project = root.join("project");
+        let registry = root.join("plugin-development.json");
+        fs::create_dir_all(project.join("bin")).unwrap();
+        fs::write(project.join("bin/demo.exe"), "test executable").unwrap();
+        fs::write(
+            project.join("plugin.json"),
+            r#"{"id":"demo.development","name":"Demo","version":"1.0.0","runtime":"process-jsonrpc-stdio","entry":"bin/demo.exe"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            register_development_plugin_at(&project, &registry).unwrap(),
+            "demo.development"
+        );
+        assert_eq!(development_plugins_at(&registry).len(), 1);
+        let item = read_plugin_item(project.clone(), true);
+        assert_eq!(item.entry, "bin/demo.exe");
+        assert_eq!(item.entry_size, Some(15));
+        assert!(item.entry_modified_at.is_some());
+        unregister_development_plugin_at("demo.development", &registry).unwrap();
+        assert!(development_plugins_at(&registry).is_empty());
+        assert!(project.join("plugin.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_unbuilt_or_escaping_development_entry() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-dev-test-{}", next_request_id()));
+        let project = root.join("project");
+        let registry = root.join("plugin-development.json");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("plugin.json"),
+            r#"{"id":"demo.unbuilt","name":"Demo","version":"1.0.0","runtime":"process-jsonrpc-stdio","entry":"bin/missing.exe"}"#,
+        )
+        .unwrap();
+        assert!(register_development_plugin_at(&project, &registry).is_err());
+
+        fs::write(root.join("outside.exe"), "test executable").unwrap();
+        fs::write(
+            project.join("plugin.json"),
+            r#"{"id":"demo.escape","name":"Demo","version":"1.0.0","runtime":"process-jsonrpc-stdio","entry":"../outside.exe"}"#,
+        )
+        .unwrap();
+        assert!(register_development_plugin_at(&project, &registry).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

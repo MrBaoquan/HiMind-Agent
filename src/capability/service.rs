@@ -296,7 +296,10 @@ impl CapabilityGateway {
         }
 
         if let Ok(plugins) = scan_plugins() {
-            for plugin in plugins.into_iter().filter(|item| item.enabled) {
+            for plugin in plugins
+                .into_iter()
+                .filter(|item| item.enabled && item.runtime == "process-jsonrpc-stdio")
+            {
                 for capability in plugin.capabilities {
                     let capability_id = capability.id;
                     insert_registration(

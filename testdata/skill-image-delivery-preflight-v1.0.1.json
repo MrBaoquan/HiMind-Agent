@@ -1,0 +1,25 @@
+{
+  "id": "com.himind.skill.image-delivery-preflight",
+  "name": "Image Delivery Preflight",
+  "version": "1.0.1",
+  "description": "Checks image delivery readiness before optimization work begins.",
+  "min_agent_version": "0.2.0",
+  "supported_clients": ["codex"],
+  "capabilities": [
+    {
+      "id": "system.health",
+      "required": true,
+      "min_version": "1.0.0",
+      "provider": "agent"
+    }
+  ],
+  "plugin_dependencies": [
+    {
+      "plugin_id": "com.himind.image-optimizer",
+      "required": true,
+      "min_version": "1.0.0"
+    }
+  ],
+  "risk_summary": "read_only",
+  "readme": "# Image Delivery Preflight\n\n## When to use\n\nUse before image optimization or delivery work begins.\n\n## Inputs\n\n- Image source directory\n- Expected output format\n- Delivery constraints\n\n## Workflow\n\n1. Check Agent health and declared capabilities.\n2. Confirm the image optimizer plugin is installed and available.\n3. Inspect delivery constraints before any write operation.\n4. Return readiness, blockers, and the next safe action.\n\n## Output\n\nReturn a concise readiness report with passed checks and blockers.\n\n## Never do\n\n- Do not modify source images during preflight.\n- Do not bypass Capability Gateway.\n- Do not reveal credentials or tokens.\n"
+}

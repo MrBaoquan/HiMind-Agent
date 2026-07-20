@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Blocks, ClipboardCheck, FileText, LayoutDashboard, Settings } from 'lucide-react';
+import { Blocks, BookOpen, ClipboardCheck, FileText, LayoutDashboard, Settings } from 'lucide-react';
 import type { PageKey } from '../types';
 
 type ShellProps = {
@@ -14,6 +14,7 @@ const navItems = [
   { key: 'dashboard', icon: LayoutDashboard, label: '总览' },
   { key: 'approvals', icon: ClipboardCheck, label: '审批' },
   { key: 'plugins', icon: Blocks, label: '插件' },
+  { key: 'skills', icon: BookOpen, label: '技能' },
   { key: 'logs', icon: FileText, label: '日志' },
   { key: 'settings', icon: Settings, label: '设置' },
 ] satisfies { key: PageKey; icon: typeof LayoutDashboard; label: string }[];

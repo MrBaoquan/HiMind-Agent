@@ -1,7 +1,9 @@
 pub(crate) mod commands;
 pub mod http;
+pub(crate) mod plugin_manager;
 pub(crate) mod security;
 pub mod service;
+pub(crate) mod skill_manager;
 pub mod status;
 pub mod system;
 pub mod tray;

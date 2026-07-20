@@ -64,6 +64,8 @@ impl InvocationContext {
 pub(crate) struct CapabilityInvokeRequest {
     pub capability_id: String,
     #[serde(default)]
+    pub ticket: String,
+    #[serde(default)]
     pub input: Value,
 }
 
