@@ -50,6 +50,14 @@ enum CapabilityHandler {
     PluginList,
     PluginManifest,
     PluginInvoke,
+    SkillCandidateSave,
+    SkillCandidateTest,
+    SkillSubmissionSubmit,
+    SkillSubmissionStatus,
+    PluginCandidateSave,
+    PluginCandidateTest,
+    PluginSubmissionSubmit,
+    PluginSubmissionStatus,
     PluginCapability(String),
 }
 
@@ -304,6 +312,87 @@ impl CapabilityGateway {
                 }),
                 CapabilityHandler::PluginInvoke,
             ),
+            registration(
+                "extension.skill.candidate.save",
+                "保存 Skill 候选",
+                "根据结构化输入生成不可变 .hmskill 候选包并返回 SHA-256。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }, "name": { "type": "string" },
+                        "version": { "type": "string" }, "description": { "type": "string" },
+                        "min_agent_version": { "type": "string" },
+                        "supported_clients": { "type": "array", "items": { "type": "string" } },
+                        "capabilities": { "type": "array" }, "plugin_dependencies": { "type": "array" },
+                        "risk_summary": { "type": "string" }, "readme": { "type": "string" }
+                    },
+                    "required": ["id", "name", "version", "readme"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillCandidateSave,
+            ),
+            registration(
+                "extension.skill.candidate.test",
+                "测试 Skill 候选",
+                "执行 Skill 依赖预检、包校验和客户端渲染测试。",
+                "local_write",
+                authoring_identity_schema(),
+                CapabilityHandler::SkillCandidateTest,
+            ),
+            registration(
+                "extension.skill.submission.submit",
+                "提交 Skill 审核",
+                "显示本机候选包确认后，以绑定用户身份提交 Skill 审核。",
+                "network_write",
+                authoring_identity_schema(),
+                CapabilityHandler::SkillSubmissionSubmit,
+            ),
+            registration(
+                "extension.skill.submission.status",
+                "Skill 提审状态",
+                "读取当前绑定用户的 Skill 提审状态和审核意见。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::SkillSubmissionStatus,
+            ),
+            registration(
+                "extension.plugin.candidate.save",
+                "保存插件候选",
+                "校验并保存不可变 .hmpkg 候选包，返回插件身份和 SHA-256。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": { "package_path": { "type": "string" } },
+                    "required": ["package_path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::PluginCandidateSave,
+            ),
+            registration(
+                "extension.plugin.candidate.test",
+                "测试插件候选",
+                "重新解包并校验插件 Manifest、入口文件和完整性清单。",
+                "local_write",
+                authoring_identity_schema(),
+                CapabilityHandler::PluginCandidateTest,
+            ),
+            registration(
+                "extension.plugin.submission.submit",
+                "提交插件审核",
+                "显示本机候选包确认后，以绑定用户身份提交插件审核。",
+                "network_write",
+                authoring_identity_schema(),
+                CapabilityHandler::PluginSubmissionSubmit,
+            ),
+            registration(
+                "extension.plugin.submission.status",
+                "插件提审状态",
+                "读取当前绑定用户的插件提审状态和审核意见。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::PluginSubmissionStatus,
+            ),
         ];
 
         for item in builtins {
@@ -394,6 +483,18 @@ impl CapabilityGateway {
             CapabilityHandler::PluginList => registry_json(),
             CapabilityHandler::PluginManifest => self.plugin_manifest(input),
             CapabilityHandler::PluginInvoke => self.plugin_invoke(input),
+            CapabilityHandler::SkillCandidateSave => Ok(serde_json::to_value(
+                crate::skill::authoring::save(serde_json::from_value(input)?)?,
+            )?),
+            CapabilityHandler::SkillCandidateTest => self.test_skill_candidate(input),
+            CapabilityHandler::SkillSubmissionSubmit => self.submit_skill_candidate(input),
+            CapabilityHandler::SkillSubmissionStatus => self.skill_submission_status(),
+            CapabilityHandler::PluginCandidateSave => Ok(serde_json::to_value(
+                crate::plugin_authoring::save(serde_json::from_value(input)?)?,
+            )?),
+            CapabilityHandler::PluginCandidateTest => self.test_plugin_candidate(input),
+            CapabilityHandler::PluginSubmissionSubmit => self.submit_plugin_candidate(input),
+            CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
             CapabilityHandler::PluginCapability(id) => invoke_plugin_capability(&id, input),
         }
     }
@@ -485,6 +586,156 @@ impl CapabilityGateway {
         let params = input.get("input").cloned().unwrap_or_else(|| json!({}));
         invoke_plugin_capability(capability_id, params)
     }
+
+    fn test_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (id, version) = authoring_identity(&input)?;
+        let capability_facts = crate::skill::capability_facts_from_gateway(
+            &self.options,
+            Arc::clone(&self.worker_status),
+            &InvocationContext::new(
+                crate::capability::types::InvocationSource::Mcp,
+                "authoring-test",
+            ),
+        )?;
+        Ok(serde_json::to_value(crate::skill::authoring::test(
+            &id,
+            &version,
+            &capability_facts,
+        )?)?)
+    }
+
+    fn submit_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (id, version) = authoring_identity(&input)?;
+        let draft = crate::skill::authoring::read(&id, &version)?;
+        if draft.tested_at.is_none() {
+            return Err("Skill 候选包尚未完成测试".into());
+        }
+        if !confirm_submission(
+            "Skill",
+            &draft.manifest.name,
+            &version,
+            &draft.candidate_sha256,
+        ) {
+            return Err("用户取消了 Skill 提审".into());
+        }
+        if draft.confirmed_at.is_none() {
+            crate::skill::authoring::confirm(&id, &version)?;
+        }
+        let agent_id = self.load_paired_agent()?;
+        Ok(serde_json::to_value(crate::skill::authoring::submit(
+            &self.options,
+            &agent_id,
+            &id,
+            &version,
+        )?)?)
+    }
+
+    fn skill_submission_status(&self) -> Result<Value, Box<dyn Error>> {
+        let agent_id = self.load_paired_agent()?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        Ok(
+            json!({ "items": crate::api::distribution::skill_submissions(
+            &client, &self.options.api_base, &agent_id, &self.options.agent_credential()
+        )? }),
+        )
+    }
+
+    fn test_plugin_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (id, version) = authoring_identity(&input)?;
+        Ok(serde_json::to_value(crate::plugin_authoring::test(
+            &id, &version,
+        )?)?)
+    }
+
+    fn submit_plugin_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (id, version) = authoring_identity(&input)?;
+        let draft = crate::plugin_authoring::read(&id, &version)?;
+        if draft.tested_at.is_none() {
+            return Err("插件候选包尚未完成测试".into());
+        }
+        if !confirm_submission(
+            "插件",
+            &draft.manifest.name,
+            &version,
+            &draft.candidate_sha256,
+        ) {
+            return Err("用户取消了插件提审".into());
+        }
+        if draft.confirmed_at.is_none() {
+            crate::plugin_authoring::confirm(&id, &version)?;
+        }
+        let agent_id = self.load_paired_agent()?;
+        Ok(serde_json::to_value(crate::plugin_authoring::submit(
+            &self.options,
+            &agent_id,
+            &id,
+            &version,
+        )?)?)
+    }
+
+    fn plugin_submission_status(&self) -> Result<Value, Box<dyn Error>> {
+        let agent_id = self.load_paired_agent()?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        Ok(
+            json!({ "items": crate::api::distribution::plugin_submissions(
+            &client, &self.options.api_base, &agent_id, &self.options.agent_credential()
+        )? }),
+        )
+    }
+
+    fn load_paired_agent(&self) -> Result<String, Box<dyn Error>> {
+        let state: crate::api::types::AgentState =
+            serde_json::from_str(&std::fs::read_to_string(&self.options.state_path)?)?;
+        if state.agent_id.trim().is_empty() || state.credential.trim().is_empty() {
+            return Err("Agent 尚未完成 Dashboard 配对".into());
+        }
+        self.options.set_agent_credential(&state.credential);
+        Ok(state.agent_id)
+    }
+}
+
+fn authoring_identity_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "id": { "type": "string" }, "version": { "type": "string" } },
+        "required": ["id", "version"],
+        "additionalProperties": false
+    })
+}
+
+fn authoring_identity(input: &Value) -> Result<(String, String), Box<dyn Error>> {
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let version = input
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if id.is_empty() || version.is_empty() {
+        return Err("id and version are required".into());
+    }
+    Ok((id, version))
+}
+
+fn confirm_submission(kind: &str, name: &str, version: &str, sha256: &str) -> bool {
+    matches!(
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(format!("确认提交{kind}审核"))
+            .set_description(format!("名称：{name}\n版本：{version}\nSHA-256：{sha256}\n\n提交后候选制品不可变，是否继续？"))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show(),
+        rfd::MessageDialogResult::Yes
+    )
 }
 
 fn registration(
