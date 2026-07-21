@@ -130,9 +130,30 @@ pub struct SkillSubmissionStatus {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PluginSubmissionStatus {
+    pub id: String,
+    pub product_key: String,
+    pub name: String,
+    pub version: String,
+    pub status: String,
+    pub review_status: String,
+    #[serde(default)]
+    pub review_note: String,
+    pub artifact_id: String,
+    pub release_id: String,
+    pub sha256: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SkillSubmissionResponse {
     items: Vec<SkillSubmissionStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginSubmissionResponse {
+    items: Vec<PluginSubmissionStatus>,
 }
 
 pub fn plugin_catalog(
@@ -206,6 +227,50 @@ pub fn skill_submissions(
         .send()?
         .error_for_status()?
         .json::<SkillSubmissionResponse>()?
+        .items)
+}
+
+pub fn submit_plugin(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    package_path: &Path,
+    test_report: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let file_name = package_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("plugin.hmpkg")
+        .to_string();
+    let package = Part::bytes(fs::read(package_path)?)
+        .file_name(file_name)
+        .mime_str("application/vnd.himind.plugin+zip")?;
+    Ok(client
+        .post(format!("{api_base}/api/agent/plugins/submissions"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .multipart(
+            Form::new()
+                .part("file", package)
+                .text("test_report", serde_json::to_string(test_report)?),
+        )
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?)
+}
+
+pub fn plugin_submissions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<Vec<PluginSubmissionStatus>, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/plugins/submissions"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<PluginSubmissionResponse>()?
         .items)
 }
 

@@ -44,6 +44,8 @@ pub(crate) struct PluginCapabilityManifest {
 pub(crate) struct PluginManifest {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub version: String,
     #[serde(default)]
     pub entry: String,
@@ -852,7 +854,7 @@ pub(crate) fn plugin_execution_dir(plugin: &PluginRegistryItem) -> PathBuf {
     }
 }
 
-fn validate_manifest_contributions(
+pub(crate) fn validate_manifest_contributions(
     plugin_path: &std::path::Path,
     manifest: &PluginManifest,
 ) -> Result<(), Box<dyn Error>> {
@@ -896,7 +898,7 @@ fn validate_manifest_contributions(
     Ok(())
 }
 
-fn validate_development_entry(
+pub(crate) fn validate_development_entry(
     plugin_path: &std::path::Path,
     manifest: &PluginManifest,
 ) -> Result<(), Box<dyn Error>> {
@@ -953,7 +955,7 @@ fn next_request_id() -> String {
     format!("req_{millis}_{sequence}")
 }
 
-fn parse_plugin_manifest(content: &str) -> Result<PluginManifest, serde_json::Error> {
+pub(crate) fn parse_plugin_manifest(content: &str) -> Result<PluginManifest, serde_json::Error> {
     serde_json::from_str(content.trim_start_matches('\u{feff}'))
 }
 
@@ -1002,6 +1004,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
+            description: String::new(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
@@ -1033,6 +1036,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
+            description: String::new(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
@@ -1068,6 +1072,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
+            description: String::new(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),

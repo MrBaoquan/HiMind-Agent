@@ -18,6 +18,7 @@ mod app;
 mod approval;
 mod capability;
 mod mcp;
+mod plugin_authoring;
 mod remote;
 mod scan;
 mod skill;

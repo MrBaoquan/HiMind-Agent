@@ -468,7 +468,7 @@ fn compare_versions(left: &str, right: &str) -> i32 {
     0
 }
 
-fn verify_plugin_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
+pub(crate) fn verify_plugin_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     let checksum_path = root.join("checksums.sha256");
     let content = fs::read_to_string(&checksum_path).map_err(|_| "插件包缺少 checksums.sha256")?;
     let mut expected = HashMap::new();
