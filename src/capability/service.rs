@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
-    local_agent_executable_metadata, local_agent_update_supported, open_folder,
+    launch_workspace_build, local_agent_executable_metadata, local_agent_update_supported,
+    open_folder, signed_agent_updates_required, trusted_agent_update_key_ids,
 };
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, registry_json, scan_plugins,
@@ -35,6 +36,7 @@ enum CapabilityHandler {
     SystemHealth,
     InnerAdminLoginStatus,
     SystemOpenFolder,
+    WorkspaceBuild,
     SvnConnectionList,
     SvnConnectionTest,
     SvnWorkspaceCheckout,
@@ -112,6 +114,19 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SystemOpenFolder,
+            ),
+            registration(
+                "exhibit.workspace.build",
+                "构建展项工作区",
+                "仅执行展项工程 .himind 目录内固定命名的 build.ps1、build.cmd 或 build.bat。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": { "target_path": { "type": "string" } },
+                    "required": ["target_path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceBuild,
             ),
             registration(
                 "svn.connection.list",
@@ -343,6 +358,7 @@ impl CapabilityGateway {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
             CapabilityHandler::InnerAdminLoginStatus => Ok(local_login_status_json()),
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
+            CapabilityHandler::WorkspaceBuild => self.build_workspace(input),
             CapabilityHandler::SvnConnectionList => Ok(json!({ "items": list_connections()? })),
             CapabilityHandler::SvnConnectionTest => self.test_svn_connection(input),
             CapabilityHandler::SvnWorkspaceCheckout => {
@@ -395,6 +411,8 @@ impl CapabilityGateway {
             "open_project": true,
             "remote_connect": true,
             "agent_update": local_agent_update_supported(),
+            "agent_update_signature_required": signed_agent_updates_required(),
+            "agent_update_trusted_key_ids": trusted_agent_update_key_ids(),
             "executable_name": executable["name"],
             "executable_path": executable["path"],
             "login_owner": "agent",
@@ -422,6 +440,18 @@ impl CapabilityGateway {
         }
         open_folder(&folder_path)?;
         Ok(json!({ "ok": true, "path": folder_path }))
+    }
+
+    fn build_workspace(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let target_path = input
+            .get("target_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
+        if target_path.is_empty() {
+            return Err("target_path is required".into());
+        }
+        launch_workspace_build(target_path)
     }
 
     fn plugin_manifest(&self, input: Value) -> Result<Value, Box<dyn Error>> {

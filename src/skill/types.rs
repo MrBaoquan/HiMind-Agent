@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -42,16 +42,24 @@ pub(crate) struct SkillManifest {
     pub description: String,
     #[serde(default)]
     pub min_agent_version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub supported_clients: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub capabilities: Vec<SkillCapabilityDependency>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub plugin_dependencies: Vec<SkillPluginDependency>,
     #[serde(default)]
     pub risk_summary: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub contents: Vec<String>,
+}
+
+fn deserialize_null_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,13 +1,40 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_PUBLIC_KEY_PATH");
+    println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_KEY_ID");
+    write_embedded_update_key();
+
     let icon_path = Path::new("icons/icon.ico");
     if !icon_path.exists() {
         fs::create_dir_all("icons").expect("failed to create icons dir");
         fs::write(icon_path, generate_ico()).expect("failed to write icon.ico");
     }
     tauri_build::build();
+}
+
+fn write_embedded_update_key() {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is required"));
+    let public_key = std::env::var_os("HIMIND_SIGNING_PUBLIC_KEY_PATH")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let key_id = std::env::var("HIMIND_SIGNING_KEY_ID").unwrap_or_default();
+    let configured = !public_key.trim().is_empty() && !key_id.trim().is_empty();
+    fs::write(
+        out_dir.join("embedded-update-public-key.pem"),
+        if configured {
+            public_key
+        } else {
+            String::new()
+        },
+    )
+    .expect("failed to write embedded update public key");
+    fs::write(
+        out_dir.join("embedded-update-key-id.txt"),
+        if configured { key_id } else { String::new() },
+    )
+    .expect("failed to write embedded update key id");
 }
 
 fn generate_ico() -> Vec<u8> {

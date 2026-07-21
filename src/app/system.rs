@@ -12,18 +12,22 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::app::types::{LocalAgentUpdateRequest, RemoteConnectRequest};
 use crate::api::types::AgentState;
+use crate::app::types::{LocalAgentUpdateRequest, RemoteConnectRequest};
 use crate::store::credentials::{configured_unity_editor_path, unity_editor_environment_path};
 use crate::Options;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const AUTO_START_REG_PATH: &str = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTO_START_VALUE: &str = "ProjectDashboardAgent";
+const EMBEDDED_UPDATE_PUBLIC_KEY_PEM: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/embedded-update-public-key.pem"));
+const EMBEDDED_UPDATE_KEY_ID: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt"));
 
 pub(crate) fn local_agent_update_supported() -> bool {
     env::current_exe().is_ok()
@@ -56,17 +60,19 @@ pub(crate) fn trigger_local_agent_update(
     validate_update_download_url(&options.api_base, &download_url)?;
     let expected_sha256 = payload.sha256.as_deref().unwrap_or_default().trim();
     validate_sha256(expected_sha256)?;
+    let target_version = payload.version.as_deref().unwrap_or_default().trim();
+    if target_version.is_empty()
+        || crate::skill::resolver::compare_versions(target_version, crate::VERSION)
+            != std::cmp::Ordering::Greater
+    {
+        return Err("Agent 更新目标版本必须高于当前版本".into());
+    }
     let staged_file = download_agent_package(&download_url, expected_sha256, &options.state_path)?;
     if let Err(error) = verify_agent_package_signature(&staged_file, payload) {
         let _ = std::fs::remove_file(&staged_file);
         return Err(error);
     }
-    schedule_agent_replace_and_restart(
-        &staged_file,
-        &exe,
-        options,
-        payload.version.as_deref().unwrap_or_default(),
-    )?;
+    schedule_agent_replace_and_restart(&staged_file, &exe, options, target_version)?;
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
@@ -233,21 +239,42 @@ fn verify_agent_package_signature(
         .as_deref()
         .unwrap_or_default()
         .trim();
-    let require_signed = env::var("HIMIND_REQUIRE_SIGNED_UPDATES")
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false);
+    let require_signed = signed_agent_updates_required();
     validate_signature_metadata(signature, key_id, algorithm, require_signed)?;
     if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
         return Ok(());
     }
-    let trusted_dir =
-        env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").ok_or("未配置 Agent 更新受信公钥目录")?;
-    let public_key_path = PathBuf::from(trusted_dir).join(format!("{key_id}.pem"));
-    verify_rsa_pss_sha256(
-        staged_executable,
-        &std::fs::read_to_string(public_key_path)?,
-        signature,
-    )
+    let public_key = trusted_agent_update_public_key(key_id)?;
+    verify_rsa_pss_sha256(staged_executable, &public_key, signature)
+}
+
+pub(crate) fn signed_agent_updates_required() -> bool {
+    env::var("HIMIND_REQUIRE_SIGNED_UPDATES")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or_else(|_| !EMBEDDED_UPDATE_PUBLIC_KEY_PEM.trim().is_empty())
+}
+
+pub(crate) fn trusted_agent_update_key_ids() -> Vec<String> {
+    let embedded = EMBEDDED_UPDATE_KEY_ID.trim();
+    if embedded.is_empty() {
+        Vec::new()
+    } else {
+        vec![embedded.to_string()]
+    }
+}
+
+fn trusted_agent_update_public_key(key_id: &str) -> Result<String, Box<dyn Error>> {
+    if let Some(trusted_dir) = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR") {
+        let public_key_path = PathBuf::from(trusted_dir).join(format!("{key_id}.pem"));
+        if public_key_path.is_file() {
+            return Ok(std::fs::read_to_string(public_key_path)?);
+        }
+    }
+    if key_id == EMBEDDED_UPDATE_KEY_ID.trim() && !EMBEDDED_UPDATE_PUBLIC_KEY_PEM.trim().is_empty()
+    {
+        return Ok(EMBEDDED_UPDATE_PUBLIC_KEY_PEM.to_string());
+    }
+    Err(format!("未找到受信的 Agent 更新公钥：{key_id}").into())
 }
 
 pub(crate) fn verify_rsa_pss_sha256(
@@ -831,6 +858,9 @@ pub(crate) fn inspect_project_workspace(
     } else {
         (None, None)
     };
+    let build_script = path_exists
+        .then(|| find_workspace_build_script(&folder))
+        .flatten();
     let open_project_reason = if !path_exists {
         "本机工程目录不存在"
     } else if engine.is_empty() {
@@ -847,10 +877,13 @@ pub(crate) fn inspect_project_workspace(
         "engine_type": engine,
         "project_file": project_file,
         "editor_path": launcher,
+        "build_script": build_script,
         "can_open_folder": path_exists,
         "can_open_project": open_project_reason.is_empty(),
+        "can_build": build_script.is_some(),
         "open_folder_reason": if path_exists { "" } else { "本机工程目录不存在" },
         "open_project_reason": open_project_reason,
+        "build_reason": if !path_exists { "本机工程目录不存在" } else if build_script.is_none() { "需在工程的 .himind 目录配置 build.ps1、build.cmd 或 build.bat" } else { "" },
     }))
 }
 
@@ -881,6 +914,65 @@ pub(crate) fn launch_project_workspace(
     }
     command.spawn()?;
     Ok(json!({ "ok": true, "engine_type": engine, "editor_path": editor, "project_file": project }))
+}
+
+pub(crate) fn launch_workspace_build(path: &str) -> Result<Value, Box<dyn Error>> {
+    let workspace = PathBuf::from(path.trim()).canonicalize()?;
+    if !workspace.is_dir() {
+        return Err("本机工程目录不存在".into());
+    }
+    let script = find_workspace_build_script(&workspace)
+        .ok_or("需在工程的 .himind 目录配置 build.ps1、build.cmd 或 build.bat")?
+        .canonicalize()?;
+    if !script.starts_with(&workspace) {
+        return Err("构建脚本必须位于当前工程目录内".into());
+    }
+
+    let extension = script
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut command = if extension == "ps1" {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script);
+        command
+    } else if matches!(extension.as_str(), "cmd" | "bat") {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C"]).arg(&script);
+        command
+    } else {
+        return Err("不支持的构建脚本类型".into());
+    };
+    let child = command
+        .current_dir(&workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(json!({
+        "ok": true,
+        "started": true,
+        "process_id": child.id(),
+        "workspace": workspace,
+        "build_script": script,
+    }))
+}
+
+fn find_workspace_build_script(workspace: &Path) -> Option<PathBuf> {
+    ["build.ps1", "build.cmd", "build.bat"]
+        .into_iter()
+        .map(|name| workspace.join(".himind").join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn normalized_engine_type(configured: &str, folder: &Path) -> String {
@@ -1213,6 +1305,48 @@ mod tests {
     use rsa::RsaPrivateKey;
 
     #[test]
+    fn detects_only_conventional_workspace_build_scripts() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-workspace-build-script-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = root.join(".himind");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(root.join("build.ps1"), "exit 0").unwrap();
+        assert!(find_workspace_build_script(&root).is_none());
+
+        let expected = config_dir.join("build.cmd");
+        std::fs::write(&expected, "@exit /b 0").unwrap();
+        assert_eq!(find_workspace_build_script(&root), Some(expected));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_status_exposes_build_availability() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-workspace-status-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".himind")).unwrap();
+        let unavailable = inspect_project_workspace(root.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(unavailable["can_build"], false);
+
+        std::fs::write(root.join(".himind").join("build.ps1"), "exit 0").unwrap();
+        let available = inspect_project_workspace(root.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(available["can_build"], true);
+        assert!(available["build_reason"].as_str().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn accepts_same_origin_update_url() {
         assert!(validate_update_download_url(
             "http://localhost:18081",
@@ -1258,6 +1392,48 @@ mod tests {
         assert!(
             validate_signature_metadata("c2ln", "release-2026", "rsa-v1_5-sha256", true).is_err()
         );
+    }
+
+    #[test]
+    fn embedded_update_key_enables_signed_update_policy() {
+        if EMBEDDED_UPDATE_PUBLIC_KEY_PEM.trim().is_empty() {
+            assert!(EMBEDDED_UPDATE_KEY_ID.trim().is_empty());
+            return;
+        }
+        assert!(RsaPublicKey::from_public_key_pem(EMBEDDED_UPDATE_PUBLIC_KEY_PEM).is_ok());
+        assert!(!EMBEDDED_UPDATE_KEY_ID.trim().is_empty());
+        assert!(signed_agent_updates_required());
+        assert_eq!(
+            trusted_agent_update_key_ids(),
+            vec![EMBEDDED_UPDATE_KEY_ID.trim().to_string()]
+        );
+    }
+
+    #[test]
+    fn production_artifact_signature_matches_embedded_key_when_requested() {
+        let Ok(artifact_path) = std::env::var("HIMIND_TEST_SIGNED_ARTIFACT_PATH") else {
+            return;
+        };
+        let metadata_path = std::env::var("HIMIND_TEST_SIGNATURE_METADATA_PATH")
+            .expect("metadata path is required");
+        let metadata: Value = serde_json::from_str(
+            &std::fs::read_to_string(metadata_path).expect("signature metadata must be readable"),
+        )
+        .expect("signature metadata must be valid JSON");
+        let key_id = metadata["signature_key_id"]
+            .as_str()
+            .expect("signature key id is required");
+        assert_eq!(key_id, EMBEDDED_UPDATE_KEY_ID.trim());
+        assert_eq!(metadata["signature_algorithm"], "rsa-pss-sha256");
+        let public_key = trusted_agent_update_public_key(key_id).expect("key must be trusted");
+        verify_rsa_pss_sha256(
+            Path::new(&artifact_path),
+            &public_key,
+            metadata["signature"]
+                .as_str()
+                .expect("signature is required"),
+        )
+        .expect("artifact signature must verify");
     }
 
     #[test]

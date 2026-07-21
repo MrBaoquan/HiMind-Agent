@@ -310,10 +310,10 @@ fn builtin_skill_seeds() -> Vec<SkillSeed> {
     vec![SkillSeed {
         manifest: SkillManifest {
             id: "com.himind.skill.environment-doctor".to_string(),
-            name: "Environment Doctor".to_string(),
-            version: VERSION.to_string(),
+            name: "环境诊断".to_string(),
+            version: format!("{VERSION}+zh.1"),
             scope: SkillScope::Builtin,
-            description: "Read-only environment checks for Codex and other AI clients.".to_string(),
+            description: "为 Codex 和其他 AI 客户端执行只读的 Agent 环境与依赖检查。".to_string(),
             min_agent_version: VERSION.to_string(),
             supported_clients: vec!["codex".to_string()],
             capabilities: vec![
@@ -343,27 +343,27 @@ fn builtin_skill_seeds() -> Vec<SkillSeed> {
             risk_summary: "read_only".to_string(),
             contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
         },
-        readme: r#"# Environment Doctor
+        readme: r#"# 环境诊断
 
-Use this skill to inspect the local HiMind Agent environment before attempting Codex-driven work.
+在 AI 开始调用本机能力前，检查 HiMind Agent 环境是否就绪。
 
-## When to use
+## 使用场景
 
-- Check whether the Agent is online.
-- Inspect available capabilities.
-- Confirm plugin and login-state readiness.
+- 检查 Agent 是否在线。
+- 查看当前可用 Capability。
+- 确认插件和登录状态是否就绪。
 
-## Output
+## 输出
 
-- Summaries only.
-- No write actions.
-- No credentials.
+- 只返回摘要。
+- 不执行写操作。
+- 不展示凭据。
 
-## Never do
+## 禁止事项
 
-- Do not install plugins.
-- Do not change Agent settings.
-- Do not emit secrets or tokens.
+- 不安装插件。
+- 不修改 Agent 设置。
+- 不输出 Secret 或 Token。
 "#,
     }]
 }

@@ -106,6 +106,7 @@ fn launch_and_confirm(args: &UpdateArgs, executable: &Path) -> bool {
         args.local_port,
         &args.api_base,
         &args.state_path,
+        &args.target_version,
         executable,
         child.id(),
     ) {
@@ -171,6 +172,7 @@ fn wait_for_health(
     port: u16,
     api_base: &str,
     state_path: &Path,
+    target_version: &str,
     executable: &Path,
     pid: u32,
 ) -> bool {
@@ -183,13 +185,7 @@ fn wait_for_health(
         if let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).send() {
             if response.status().is_success() {
                 if let Ok(payload) = response.json::<serde_json::Value>() {
-                    if payload.get("status").and_then(|value| value.as_str()) == Some("online")
-                        && payload
-                            .get("dashboard_worker_online")
-                            .and_then(|value| value.as_bool())
-                            == Some(true)
-                        && state_path.is_file()
-                    {
+                    if health_matches_update(&payload, target_version, executable, state_path) {
                         return true;
                     }
                 }
@@ -203,6 +199,39 @@ fn wait_for_health(
     let _ = api_base;
     let _ = pid;
     false
+}
+
+fn health_matches_update(
+    payload: &serde_json::Value,
+    target_version: &str,
+    executable: &Path,
+    state_path: &Path,
+) -> bool {
+    if target_version.trim().is_empty()
+        || payload.get("status").and_then(|value| value.as_str()) != Some("online")
+        || payload
+            .get("dashboard_worker_online")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        || payload.get("version").and_then(|value| value.as_str()) != Some(target_version)
+        || !state_path.is_file()
+    {
+        return false;
+    }
+    let Some(reported_path) = payload
+        .get("executable_path")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+    match (
+        fs::canonicalize(executable),
+        fs::canonicalize(Path::new(reported_path)),
+    ) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => false,
+    }
 }
 
 fn wait_for_exit(pid: u32) -> bool {
@@ -230,7 +259,8 @@ fn terminate(pid: u32) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{restore_previous, rotate_version};
+    use super::{health_matches_update, restore_previous, rotate_version};
+    use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -254,6 +284,39 @@ mod tests {
 
         restore_previous(&current, &previous).unwrap();
         assert_eq!(fs::read(&current).unwrap(), b"old");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn health_confirmation_requires_target_version_and_executable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-health-test-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("himind-agent.exe");
+        let state = root.join("agent-state.json");
+        fs::write(&executable, b"agent").unwrap();
+        fs::write(&state, b"{}").unwrap();
+        let payload = json!({
+            "status": "online",
+            "dashboard_worker_online": true,
+            "version": "0.3.0",
+            "executable_path": executable,
+        });
+        assert!(health_matches_update(
+            &payload,
+            "0.3.0",
+            &executable,
+            &state
+        ));
+        assert!(!health_matches_update(
+            &payload,
+            "0.3.1",
+            &executable,
+            &state
+        ));
         let _ = fs::remove_dir_all(root);
     }
 }

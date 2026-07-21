@@ -48,7 +48,7 @@ export function Shell({ version, currentPage, approvalCount, onNavigate, childre
         <div className="sidebar-footer">
           <span className="status-dot success" aria-hidden="true" />
           <span>本地服务</span>
-          <span className="version">v{version || '0.2.0'}</span>
+          <span className="version">v{version || '0.3.0'}</span>
         </div>
       </aside>
       <main className="main">{children}</main>

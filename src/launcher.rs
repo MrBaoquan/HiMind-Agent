@@ -22,11 +22,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(parent) = state_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    Command::new(executable)
+    let trusted_keys = root.join("trusted-keys");
+    let mut command = Command::new(executable);
+    command
         .args(env::args().skip(1))
         .arg("--state")
         .arg(state_path)
-        .current_dir(root)
-        .spawn()?;
+        .current_dir(&root);
+    if trusted_keys.is_dir() && env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").is_none() {
+        command.env("HIMIND_TRUSTED_SIGNING_KEYS_DIR", trusted_keys);
+    }
+    if env::var_os("HIMIND_REQUIRE_SIGNED_UPDATES").is_none() {
+        command.env("HIMIND_REQUIRE_SIGNED_UPDATES", "true");
+    }
+    command.spawn()?;
     Ok(())
 }

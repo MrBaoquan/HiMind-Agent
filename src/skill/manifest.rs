@@ -192,7 +192,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let manifest = SkillManifest {
             id: "com.himind.skill.environment-doctor".to_string(),
-            name: "Environment Doctor".to_string(),
+            name: "环境诊断".to_string(),
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: "read only".to_string(),
@@ -227,7 +227,7 @@ mod tests {
     fn rejects_script_files() {
         let manifest = SkillManifest {
             id: "com.himind.skill.environment-doctor".to_string(),
-            name: "Environment Doctor".to_string(),
+            name: "环境诊断".to_string(),
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: "read only".to_string(),
@@ -240,5 +240,15 @@ mod tests {
         };
 
         assert!(validate_skill_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn accepts_null_dependency_arrays_from_legacy_packages() {
+        let manifest = parse_skill_manifest(
+            r#"{"id":"com.himind.skill.legacy","name":"历史 Skill","version":"1.0.0","scope":"organization","supported_clients":["codex"],"capabilities":null,"plugin_dependencies":null,"contents":["skill.json","SKILL.md"]}"#,
+        )
+        .unwrap();
+        assert!(manifest.capabilities.is_empty());
+        assert!(manifest.plugin_dependencies.is_empty());
     }
 }
