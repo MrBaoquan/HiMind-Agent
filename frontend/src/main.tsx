@@ -50,17 +50,24 @@ function App() {
   async function refreshPlugins() {
     setPluginsLoading(true);
     try {
-      const [registry, capabilityItems] = await Promise.all([agentApi.plugins(), agentApi.capabilities()]);
+      const [registry, capabilityItems] = await Promise.all([
+        withTimeout(agentApi.plugins(), '本机插件注册表'),
+        withTimeout(agentApi.capabilities(), '本机能力清单'),
+      ]);
       setPluginRegistry(registry);
       setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
       try {
-        const catalog = await agentApi.pluginCatalog();
+        const catalog = await withTimeout(agentApi.pluginCatalog(), '插件市场');
         setPluginCatalog(Array.isArray(catalog) ? catalog : []);
       } catch (error) {
         setPluginCatalog([]);
         console.error('Plugin catalog unavailable', error);
       }
-      await refreshSkills();
+    } catch (error) {
+      setPluginRegistry(null);
+      setCapabilities([]);
+      setPluginCatalog([]);
+      console.error('Plugin registry unavailable', error);
     } finally {
       setPluginsLoading(false);
     }
@@ -68,11 +75,11 @@ function App() {
 
   async function refreshSkills() {
     const [catalogResult, statusResult, marketResult, draftsResult, submissionsResult] = await Promise.allSettled([
-      agentApi.skillCatalog(),
-      agentApi.codexSkillStatus(),
-      agentApi.organizationSkillCatalog(),
-      agentApi.skillDrafts(),
-      agentApi.skillSubmissions(),
+      withTimeout(agentApi.skillCatalog(), '本地 Skill 目录'),
+      withTimeout(agentApi.codexSkillStatus(), 'Codex Skill 状态'),
+      withTimeout(agentApi.organizationSkillCatalog(), '组织 Skill 商城'),
+      withTimeout(agentApi.skillDrafts(), '本地 Skill 草稿'),
+      withTimeout(agentApi.skillSubmissions(), 'Skill 提交记录'),
     ]);
     const errors: string[] = [];
     if (catalogResult.status === 'fulfilled') {
@@ -102,13 +109,19 @@ function App() {
   }
 
   async function refreshAll() {
-    await refreshStatus();
-    await refreshApprovals();
-    await refreshSettings();
-    await refreshLogin();
-    await refreshSvnConnections();
-    await refreshPlugins();
-    await refreshLogs();
+    const results = await Promise.allSettled([
+      refreshStatus(),
+      refreshApprovals(),
+      refreshSettings(),
+      refreshLogin(),
+      refreshSvnConnections(),
+      refreshPlugins(),
+      refreshSkills(),
+      refreshLogs(),
+    ]);
+    for (const result of results) {
+      if (result.status === 'rejected') throw result.reason;
+    }
   }
 
   useEffect(() => {
@@ -214,6 +227,22 @@ function App() {
       {content}
     </Shell>
   );
+}
+
+function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 12000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(`${label}读取超时（${timeoutMs / 1000} 秒）`)), timeoutMs);
+    promise.then(
+      value => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
