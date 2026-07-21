@@ -7,7 +7,7 @@ use crate::store::plugin_outbox::{
     list as list_statuses, remove as remove_status, store as store_status, PluginStatusRecord,
 };
 use crate::Options;
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, Url};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -87,9 +87,22 @@ fn send_status(options: &Options, record: &PluginStatusRecord) -> Result<(), Box
     if record.agent_id.is_empty() || credential.is_empty() {
         return Err("Agent 尚未完成 Dashboard 配对".into());
     }
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let mut client_builder = Client::builder().timeout(std::time::Duration::from_secs(10));
+    if Url::parse(&options.api_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .map(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|address| address.is_loopback())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build()?;
     report_plugin_status(
         &client,
         &options.api_base,
