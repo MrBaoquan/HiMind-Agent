@@ -39,7 +39,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("invalid staged Agent executable".into());
     }
     let root = installation_root(&current);
-    if !staged.starts_with(&root) && staged.parent() != Some(env::temp_dir().as_path()) {
+    if !staged_path_allowed(&staged, &root) {
         return Err("staged Agent executable is outside the installation root".into());
     }
     if !wait_for_exit(args.old_pid) {
@@ -168,6 +168,15 @@ fn installation_root(executable: &Path) -> PathBuf {
     }
 }
 
+fn staged_path_allowed(staged: &Path, installation_root: &Path) -> bool {
+    if staged.starts_with(installation_root) {
+        return true;
+    }
+    let temp_dir = env::temp_dir();
+    let canonical_temp = fs::canonicalize(&temp_dir).unwrap_or(temp_dir);
+    staged.parent() == Some(canonical_temp.as_path())
+}
+
 fn wait_for_health(
     port: u16,
     api_base: &str,
@@ -259,7 +268,7 @@ fn terminate(pid: u32) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{health_matches_update, restore_previous, rotate_version};
+    use super::{health_matches_update, restore_previous, rotate_version, staged_path_allowed};
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -285,6 +294,25 @@ mod tests {
         restore_previous(&current, &previous).unwrap();
         assert_eq!(fs::read(&current).unwrap(), b"old");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_canonicalized_temp_staging_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let staged_path =
+            std::env::temp_dir().join(format!("himind-agent-update-path-test-{unique}.exe"));
+        fs::write(&staged_path, b"agent").unwrap();
+        let staged = fs::canonicalize(&staged_path).unwrap();
+        let unrelated_root = staged
+            .parent()
+            .unwrap()
+            .join(format!("himind-agent-installation-{unique}"));
+
+        assert!(staged_path_allowed(&staged, &unrelated_root));
+        let _ = fs::remove_file(staged_path);
     }
 
     #[test]
