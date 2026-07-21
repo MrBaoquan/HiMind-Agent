@@ -22,6 +22,7 @@ function App() {
   const [loginState, setLoginState] = useState<LoginState | null>(null);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [pluginRegistry, setPluginRegistry] = useState<PluginRegistry | null>(null);
+  const [pluginsLoading, setPluginsLoading] = useState(true);
   const [capabilities, setCapabilities] = useState<CapabilityItem[]>([]);
   const [pluginCatalog, setPluginCatalog] = useState<import('./services/agentApi').PluginCatalogItem[]>([]);
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogResponse | null>(null);
@@ -47,17 +48,22 @@ function App() {
   async function refreshLogs() { setLogs(await agentApi.logs()); }
   async function refreshSvnConnections() { setSvnConnections((await agentApi.svnConnections()).items || []); }
   async function refreshPlugins() {
-    const [registry, capabilityItems] = await Promise.all([agentApi.plugins(), agentApi.capabilities()]);
-    setPluginRegistry(registry);
-    setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
+    setPluginsLoading(true);
     try {
-      const catalog = await agentApi.pluginCatalog();
-      setPluginCatalog(Array.isArray(catalog) ? catalog : []);
-    } catch (error) {
-      setPluginCatalog([]);
-      console.error('Plugin catalog unavailable', error);
+      const [registry, capabilityItems] = await Promise.all([agentApi.plugins(), agentApi.capabilities()]);
+      setPluginRegistry(registry);
+      setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
+      try {
+        const catalog = await agentApi.pluginCatalog();
+        setPluginCatalog(Array.isArray(catalog) ? catalog : []);
+      } catch (error) {
+        setPluginCatalog([]);
+        console.error('Plugin catalog unavailable', error);
+      }
+      await refreshSkills();
+    } finally {
+      setPluginsLoading(false);
     }
-    await refreshSkills();
   }
 
   async function refreshSkills() {
@@ -155,7 +161,7 @@ function App() {
   const content = (() => {
     if (page === 'dashboard') return <DashboardPage status={status} approvals={approvals} settings={settings} loginState={loginState} onOpenDashboard={() => run(agentApi.openDashboard)} onOpenAgentDirectory={() => run(agentApi.openAgentDirectory)} onOpenSettings={() => setPage('settings')} />;
     if (page === 'approvals') return <ApprovalsPage approvals={approvals} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} />;
-      if (page === 'plugins') return <PluginsPage registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} onRefresh={() => run(refreshPlugins)} onInstall={(pluginId) => run(async () => { await agentApi.installPlugin(pluginId); await refreshPlugins(); }, '插件已安装', '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); }, enabled ? '插件已启用' : '插件已停用', enabled ? '启用插件失败' : '停用插件失败')} onOpenDirectory={() => run(agentApi.openPluginDirectory)} onRegisterDevelopment={() => run(async () => { const pluginId = await agentApi.registerDevelopmentPlugin(); await refreshPlugins(); notify('success', `已加载开发插件：${pluginId}`); }, undefined, '加载本地插件工程失败')} onUnregisterDevelopment={(pluginId) => run(async () => { await agentApi.unregisterDevelopmentPlugin(pluginId); await refreshPlugins(); }, '已移除开发插件注册', '移除开发插件失败')} onInvokeDevelopment={agentApi.invokeDevelopmentPlugin} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
+      if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} onRefresh={() => run(refreshPlugins)} onInstall={(pluginId) => run(async () => { await agentApi.installPlugin(pluginId); await refreshPlugins(); }, '插件已安装', '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); }, enabled ? '插件已启用' : '插件已停用', enabled ? '启用插件失败' : '停用插件失败')} onOpenDirectory={() => run(agentApi.openPluginDirectory)} onRegisterDevelopment={() => run(async () => { const pluginId = await agentApi.registerDevelopmentPlugin(); await refreshPlugins(); notify('success', `已加载开发插件：${pluginId}`); }, undefined, '加载本地插件工程失败')} onUnregisterDevelopment={(pluginId) => run(async () => { await agentApi.unregisterDevelopmentPlugin(pluginId); await refreshPlugins(); }, '已移除开发插件注册', '移除开发插件失败')} onInvokeDevelopment={agentApi.invokeDevelopmentPlugin} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}
       status={skillStatus}

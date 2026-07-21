@@ -59,7 +59,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   const [planLoading, setPlanLoading] = useState(false);
   const items = status?.items || [];
 	const installedById = useMemo(() => new Map(items.map(item => [item.record.manifest.id, item])), [items]);
-	const localItems = useMemo(() => items.filter(item => view === 'mine' ? item.record.manifest.scope === 'user' : ['installed', 'outdated', 'modified'].includes(item.client_state)), [items, view]);
+	const localItems = useMemo(() => items.filter(item => view === 'mine' ? item.record.manifest.scope === 'user' : item.client_state !== 'not_installed'), [items, view]);
 	const visibleMarket = useMemo(() => {
 	  const normalized = query.trim().toLowerCase();
 	  return marketplace.filter(item => !normalized || [item.skill_id, item.name, item.description, item.author_name, ...item.capability_ids].join(' ').toLowerCase().includes(normalized));
@@ -129,9 +129,9 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
           <div className="skill-browser-tools">
             <label className="skill-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索 Skill" /></label>
 			<div className="skill-filter" role="tablist" aria-label="Skill 来源">
-			  <button className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>组织商城 <span>{marketplace.length}</span></button>
-			  <button className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{installedCount}</span></button>
-			  <button className={view === 'mine' ? 'active' : ''} onClick={() => setView('mine')}>我的 Skill <span>{drafts.length}</span></button>
+			  <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>组织商城 <span>{marketplace.length}</span></button>
+			  <button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>本机状态 <span>{installedCount}</span></button>
+			  <button role="tab" aria-selected={view === 'mine'} className={view === 'mine' ? 'active' : ''} onClick={() => setView('mine')}>我的 Skill <span>{drafts.length}</span></button>
             </div>
           </div>
           <div className="skill-browser-list">
@@ -196,7 +196,7 @@ function DraftDetail({ item, submission, busyAction, onEdit, onTest, onConfirm, 
       {item.confirmed_at && canRevise ? <button className="btn btn-primary" disabled={busy} onClick={() => onSubmit(manifest.id, manifest.version)}><Send size={15} />提交审核</button> : null}
     </div></header>
     <p className="skill-detail-description">{manifest.description || '暂无用途说明。'}</p>
-	{submission?.review_note ? <div className={`skill-detail-notice ${submission.status === 'approved' ? 'modified' : ''}`}><CircleAlert size={16} /><div><strong>审核意见</strong><span>{submission.review_note}</span></div></div> : null}
+	{submission?.review_note ? <div className={`skill-detail-notice ${submission.status === 'approved' ? 'modified' : ''}`}><CircleAlert size={16} /><div><strong>审核意见</strong><span>{normalizeReviewNote(submission.review_note)}</span></div></div> : null}
     <div className="skill-authoring-pipeline"><DraftStage complete label="内容已保存" /><DraftStage complete={Boolean(item.tested_at)} label="Codex 已部署" /><DraftStage complete={Boolean(item.confirmed_at)} label="测试已确认" /><DraftStage complete={Boolean(item.submitted_at)} label="已提交审核" /></div>
     <div className="skill-detail-meta"><div><span>候选版本</span><strong>v{manifest.version}</strong></div><div><span>测试时间</span><strong>{formatAuthoringTime(item.tested_at)}</strong></div><div><span>插件依赖</span><strong>{manifest.plugin_dependencies?.length || 0}</strong></div><div><span>风险</span><strong>{riskLabel(manifest.risk_summary)}</strong></div></div>
     <section className="skill-detail-section"><div className="skill-section-title"><div><ShieldCheck size={16} /><strong>插件依赖</strong></div><span>{manifest.plugin_dependencies?.length || 0}</span></div><div className="skill-dependency-list">{(manifest.plugin_dependencies || []).map(dependency => <div key={dependency.plugin_id}><span className="status-dot success" /><code>{dependency.plugin_id}</code><span>{dependency.required ? '必需' : '可选'}</span><strong>{dependency.min_version ? `>= v${dependency.min_version}` : '任意版本'}</strong></div>)}{!manifest.plugin_dependencies?.length ? <span className="skill-section-empty">无需关联插件</span> : null}</div></section>
@@ -267,7 +267,8 @@ function stateTone(state: CodexSkillStatusItem['client_state']) { if (state === 
 function statePill(state: CodexSkillStatusItem['client_state']): 'success' | 'warn' | 'danger' { if (state === 'installed') return 'success'; if (state === 'outdated' || state === 'modified' || state === 'not_installed') return 'warn'; return 'danger'; }
 function targetModeLabel(mode?: CodexSkillStatusResponse['target_mode']) { if (mode === 'configured') return '已配置目标'; if (mode === 'detected') return '已检测本机目录'; if (mode === 'preview') return '预览模式'; return '等待检测'; }
 function scopeLabel(scope: string) { if (scope === 'builtin') return '系统内置'; if (scope === 'organization') return '组织商城'; if (scope === 'user') return '我的 Skill'; return scope || '--'; }
-function riskLabel(value?: string) { if (!value) return '未声明'; if (value === 'read_only') return '只读'; return value; }
+function riskLabel(value?: string) { return ({ read_only: '只读', local_action: '本地操作', network_write: '网络写入', approval_required: '需要审批' } as Record<string, string>)[value || ''] || (value ? '未分类风险' : '未声明'); }
+function normalizeReviewNote(value: string) { return /\?{3,}|�/.test(value) ? '审核意见数据无法正常解码，请重新提交中文审核意见。' : value; }
 function formatSyncedAt(value?: string | null) { if (!value) return '尚未同步'; const milliseconds = Number.parseInt(value.split('-')[0], 10); return Number.isFinite(milliseconds) ? new Date(milliseconds).toLocaleString('zh-CN', { hour12: false }) : value; }
 function draftKey(draft?: AuthoringSkillDraft) { return draft ? `${draft.manifest.id}@${draft.manifest.version}` : ''; }
 function draftState(draft: AuthoringSkillDraft, submission?: SkillSubmissionStatus): { label: string; tone: 'success' | 'warn' | 'neutral' | 'danger' } { if (submission?.status === 'approved') return { label: '已上架', tone: 'success' }; if (submission?.status === 'changes_requested') return { label: '需修改', tone: 'warn' }; if (submission?.status === 'rejected') return { label: '已拒绝', tone: 'danger' }; if (draft.submitted_at) return { label: '审核中', tone: 'success' }; if (draft.confirmed_at) return { label: '可提交', tone: 'success' }; if (draft.tested_at) return { label: '待确认', tone: 'warn' }; return { label: '草稿', tone: 'neutral' }; }
