@@ -45,6 +45,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         dashboard_base: options.api_base.clone(),
         state_path: options.state_path.clone(),
         options: options.clone(),
+        dashboard_authorization: Arc::new(Mutex::new(
+            crate::app::identity::DashboardAuthorizationFlow::default(),
+        )),
     };
     let popup_approval_manager = Arc::clone(&state.approval_manager);
 
@@ -96,6 +99,16 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         })
         .invoke_handler(tauri::generate_handler![
             super::commands::get_agent_status,
+            super::commands::get_dashboard_identity_status,
+            super::commands::start_dashboard_authorization,
+            super::commands::get_dashboard_authorization_progress,
+            super::commands::cancel_dashboard_authorization,
+            super::commands::open_dashboard_authorization_page,
+            super::commands::revoke_dashboard_authorization,
+            super::commands::get_ai_integration_overview,
+            super::commands::configure_ai_client,
+            super::commands::remove_ai_client_configuration,
+            super::commands::test_mcp_connection,
             super::commands::get_pending_approvals,
             super::commands::respond_approval,
             super::commands::get_approval_settings,
@@ -112,6 +125,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_agent_logs,
             super::commands::get_plugin_registry,
             super::commands::get_plugin_catalog,
+            super::commands::plan_plugin_install,
             super::commands::install_plugin,
             super::commands::uninstall_plugin,
             super::commands::rollback_plugin,
@@ -122,12 +136,22 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::install_organization_skill,
             super::commands::plan_organization_skill_install,
             super::commands::list_skill_drafts,
+            super::commands::list_plugin_drafts,
+            super::commands::import_plugin_candidate,
+            super::commands::create_plugin_revision,
+            super::commands::test_plugin_draft,
+            super::commands::confirm_plugin_draft,
+            super::commands::list_plugin_submissions,
+            super::commands::submit_plugin_draft,
             super::commands::list_skill_submissions,
             super::commands::save_skill_draft,
+            super::commands::create_skill_revision,
             super::commands::test_skill_draft,
             super::commands::confirm_skill_draft,
             super::commands::submit_skill_draft,
             super::commands::get_codex_skill_status,
+            super::commands::get_skill_sync_settings,
+            super::commands::set_skill_sync_mode,
             super::commands::sync_codex_skills,
             super::commands::sync_codex_skill,
             super::commands::repair_codex_skill,
@@ -181,7 +205,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
 
     let menu = Menu::with_items(handle, &[&open_item, &status_item, &quit_item])?;
 
-    let icon = make_tray_icon();
+    let icon = make_tray_icon()?;
 
     let _tray = TrayIconBuilder::new()
         .icon(icon)
@@ -446,23 +470,18 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn make_tray_icon() -> tauri::image::Image<'static> {
-    let width: u32 = 32;
-    let height: u32 = 32;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            let inside = x > 4 && x < 27 && y > 4 && y < 27;
-            let accent = x > 9 && x < 23 && y > 9 && y < 23;
-            let (r, g, b, a) = if accent {
-                (37u8, 99u8, 235u8, 255u8)
-            } else if inside {
-                (8u8, 145u8, 178u8, 255u8)
-            } else {
-                (0u8, 0u8, 0u8, 0u8)
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
+fn make_tray_icon() -> tauri::Result<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(include_bytes!("../../icons/himind-tray.png"))
+}
+
+#[cfg(test)]
+mod tray_icon_tests {
+    use super::make_tray_icon;
+
+    #[test]
+    fn embedded_tray_icon_is_valid_rgba() {
+        let icon = make_tray_icon().expect("embedded tray icon should decode");
+        assert_eq!((icon.width(), icon.height()), (64, 64));
+        assert_eq!(icon.rgba().len(), 64 * 64 * 4);
     }
-    tauri::image::Image::new_owned(rgba, width, height)
 }

@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::app::status::local_worker_snapshot;
@@ -58,6 +59,7 @@ enum CapabilityHandler {
     PluginCandidateTest,
     PluginSubmissionSubmit,
     PluginSubmissionStatus,
+    SoftwareDistributionPublish,
     PluginCapability(String),
 }
 
@@ -215,7 +217,7 @@ impl CapabilityGateway {
                 "exhibit.repository_path.create",
                 "创建展项 SVN 目录",
                 "使用本机个人 SVN 凭据在项目仓库的 trunk/exhibits 下创建固定展项 ID 目录。",
-                "network_write",
+                "admin_action",
                 json!({
                     "type": "object",
                     "properties": {
@@ -232,7 +234,7 @@ impl CapabilityGateway {
                 "exhibit.repository.initialize_template",
                 "初始化展项工程模板",
                 "从受控 Unity 或 Unreal 模板初始化固定展项目录，并应用模板中的 SVN 忽略属性。",
-                "network_write",
+                "admin_action",
                 json!({
                     "type": "object",
                     "properties": {
@@ -325,7 +327,8 @@ impl CapabilityGateway {
                         "min_agent_version": { "type": "string" },
                         "supported_clients": { "type": "array", "items": { "type": "string" } },
                         "capabilities": { "type": "array" }, "plugin_dependencies": { "type": "array" },
-                        "risk_summary": { "type": "string" }, "readme": { "type": "string" }
+                        "risk_summary": { "type": "string" }, "readme": { "type": "string" },
+                        "files": { "type": "object", "additionalProperties": { "type": "string" } }
                     },
                     "required": ["id", "name", "version", "readme"],
                     "additionalProperties": false
@@ -393,6 +396,26 @@ impl CapabilityGateway {
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::PluginSubmissionStatus,
             ),
+            registration(
+                "software.distribution.release.publish",
+                "发布软件版本",
+                "使用 Agent 内部短时委托身份创建软件产品、上传制品并发布版本；AI 和插件均无法读取凭据。",
+                "network_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": {"type":"string"}, "artifact_path": {"type":"string"},
+                        "product_id": {"type":"string"}, "product_name": {"type":"string"}, "version": {"type":"string"},
+                        "channel": {"type":"string"}, "platform": {"type":"string"}, "architecture": {"type":"string"},
+                        "package_type": {"type":"string", "enum":["directory-zip","apk","unity-addressables","content"]},
+                        "release_notes": {"type":"string"}, "mandatory": {"type":"boolean"},
+                        "rollout_percent": {"type":"integer", "minimum":1, "maximum":100}, "confirmed": {"type":"boolean"}
+                    },
+                    "required": ["workspace_root","artifact_path","product_id","product_name","version","platform","architecture","package_type","confirmed"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SoftwareDistributionPublish,
+            ),
         ];
 
         for item in builtins {
@@ -433,6 +456,16 @@ impl CapabilityGateway {
         capability_id: &str,
         input: Value,
     ) -> Result<Value, Box<dyn Error>> {
+        if is_svn_admin_capability(capability_id)
+            && context.source != crate::capability::types::InvocationSource::DashboardWorker
+        {
+            return Err(
+                "SVN management capabilities are restricted to Dashboard Worker tasks".into(),
+            );
+        }
+        if let Some(scope) = required_platform_scope(capability_id) {
+            crate::api::oauth::platform_access_token(&self.options, scope)?;
+        }
         let registration = self
             .registry()?
             .remove(capability_id)
@@ -495,6 +528,7 @@ impl CapabilityGateway {
             CapabilityHandler::PluginCandidateTest => self.test_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionSubmit => self.submit_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
+            CapabilityHandler::SoftwareDistributionPublish => self.publish_software_release(input),
             CapabilityHandler::PluginCapability(id) => invoke_plugin_capability(&id, input),
         }
     }
@@ -587,6 +621,40 @@ impl CapabilityGateway {
         invoke_plugin_capability(capability_id, params)
     }
 
+    fn publish_software_release(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let mut request = serde_json::from_value::<
+            crate::api::distribution::SoftwareReleasePublishRequest,
+        >(input)?;
+        if !request.confirmed {
+            return Err("发布软件版本前必须获得用户明确确认".into());
+        }
+        request.product_id = request.product_id.trim().to_ascii_lowercase();
+        request.channel = request.channel.trim().to_ascii_lowercase();
+        request.platform = request.platform.trim().to_ascii_lowercase();
+        request.architecture = request.architecture.trim().to_ascii_lowercase();
+        request.package_type = request.package_type.trim().to_ascii_lowercase();
+        validate_distribution_publish_request(&request)?;
+        request.artifact_path =
+            canonical_workspace_file(&request.workspace_root, &request.artifact_path)?
+                .to_string_lossy()
+                .to_string();
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::RELEASE_MANAGE_SCOPE,
+        )?;
+        let agent_id = crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10 * 60))
+            .build()?;
+        crate::api::distribution::publish_software_release(
+            &client,
+            &self.options.api_base,
+            &agent_id,
+            &access.token,
+            &request,
+        )
+    }
+
     fn test_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
         let (id, version) = authoring_identity(&input)?;
         let capability_facts = crate::skill::capability_facts_from_gateway(
@@ -632,12 +700,16 @@ impl CapabilityGateway {
 
     fn skill_submission_status(&self) -> Result<Value, Box<dyn Error>> {
         let agent_id = self.load_paired_agent()?;
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
+        )?;
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         Ok(
             json!({ "items": crate::api::distribution::skill_submissions(
-            &client, &self.options.api_base, &agent_id, &self.options.agent_credential()
+            &client, &self.options.api_base, &agent_id, &access.token
         )? }),
         )
     }
@@ -677,25 +749,38 @@ impl CapabilityGateway {
 
     fn plugin_submission_status(&self) -> Result<Value, Box<dyn Error>> {
         let agent_id = self.load_paired_agent()?;
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
+        )?;
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         Ok(
             json!({ "items": crate::api::distribution::plugin_submissions(
-            &client, &self.options.api_base, &agent_id, &self.options.agent_credential()
+            &client, &self.options.api_base, &agent_id, &access.token
         )? }),
         )
     }
 
     fn load_paired_agent(&self) -> Result<String, Box<dyn Error>> {
-        let state: crate::api::types::AgentState =
-            serde_json::from_str(&std::fs::read_to_string(&self.options.state_path)?)?;
+        let state = crate::api::client::load_agent_state(&self.options.state_path)?;
         if state.agent_id.trim().is_empty() || state.credential.trim().is_empty() {
             return Err("Agent 尚未完成 Dashboard 配对".into());
         }
         self.options.set_agent_credential(&state.credential);
         Ok(state.agent_id)
     }
+}
+
+fn is_svn_admin_capability(capability_id: &str) -> bool {
+    matches!(
+        capability_id,
+        "project.repository.create"
+            | "project.repository.exhibits_access.ensure"
+            | "exhibit.repository_path.create"
+            | "exhibit.repository.initialize_template"
+    )
 }
 
 fn authoring_identity_schema() -> Value {
@@ -738,6 +823,66 @@ fn confirm_submission(kind: &str, name: &str, version: &str, sha256: &str) -> bo
     )
 }
 
+fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
+    match capability_id {
+        "extension.skill.submission.submit"
+        | "extension.skill.submission.status"
+        | "extension.plugin.submission.submit"
+        | "extension.plugin.submission.status" => Some(crate::api::oauth::CREATIVE_SUBMIT_SCOPE),
+        "software.distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
+        _ => None,
+    }
+}
+
+fn validate_distribution_publish_request(
+    request: &crate::api::distribution::SoftwareReleasePublishRequest,
+) -> Result<(), Box<dyn Error>> {
+    fn stable_identifier(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    }
+    if !stable_identifier(&request.product_id)
+        || !stable_identifier(&request.channel)
+        || !stable_identifier(&request.platform)
+        || !stable_identifier(&request.architecture)
+    {
+        return Err("软件产品、渠道、平台或架构标识无效".into());
+    }
+    if request.product_name.trim().is_empty() || request.version.trim().is_empty() {
+        return Err("product_name 和 version 不能为空".into());
+    }
+    if !(1..=100).contains(&request.rollout_percent) {
+        return Err("rollout_percent 必须在 1 到 100 之间".into());
+    }
+    if !matches!(
+        request.package_type.as_str(),
+        "directory-zip" | "apk" | "unity-addressables" | "content"
+    ) {
+        return Err("不支持的 package_type".into());
+    }
+    Ok(())
+}
+
+fn canonical_workspace_file(workspace_root: &str, target: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let root = Path::new(workspace_root).canonicalize()?;
+    let requested = Path::new(target);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    }
+    .canonicalize()?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        return Err("制品必须是 workspace_root 内的普通文件".into());
+    }
+    Ok(candidate)
+}
+
 fn registration(
     id: &str,
     name: &str,
@@ -778,6 +923,15 @@ fn insert_registration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svn_admin_capabilities_are_worker_only() {
+        assert!(is_svn_admin_capability("project.repository.create"));
+        assert!(is_svn_admin_capability(
+            "exhibit.repository.initialize_template"
+        ));
+        assert!(!is_svn_admin_capability("exhibit.workspace.checkout"));
+    }
 
     #[test]
     fn rejects_duplicate_capability_ids() {

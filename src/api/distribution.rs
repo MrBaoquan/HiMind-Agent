@@ -14,6 +14,35 @@ pub struct DistributionState {
     pub token: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SoftwareReleasePublishRequest {
+    pub workspace_root: String,
+    pub artifact_path: String,
+    pub product_id: String,
+    pub product_name: String,
+    pub version: String,
+    #[serde(default = "default_stable_channel")]
+    pub channel: String,
+    pub platform: String,
+    pub architecture: String,
+    pub package_type: String,
+    #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
+    pub mandatory: bool,
+    #[serde(default = "default_full_rollout")]
+    pub rollout_percent: i64,
+    pub confirmed: bool,
+}
+
+fn default_stable_channel() -> String {
+    "stable".to_string()
+}
+
+fn default_full_rollout() -> i64 {
+    100
+}
+
 #[derive(Debug, Deserialize)]
 struct RegistrationResponse {
     id: String,
@@ -42,6 +71,12 @@ pub struct PluginCatalogItem {
     pub plugin_id: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub review_status: String,
     pub governance: String,
     pub version: String,
     pub release_notes: String,
@@ -58,6 +93,30 @@ pub struct PluginCatalogItem {
     #[serde(default)]
     pub signature_algorithm: String,
     pub download_url: String,
+    #[serde(default = "default_marketplace_source")]
+    pub source: String,
+    #[serde(default = "default_optional_assignment")]
+    pub assignment: String,
+    #[serde(default = "default_user_management")]
+    pub management: String,
+    #[serde(default = "default_prompt_mode")]
+    pub install_mode: String,
+    #[serde(default)]
+    pub organization_reason: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default = "default_true")]
+    pub allow_disable: bool,
+    #[serde(default = "default_true")]
+    pub allow_uninstall: bool,
+    #[serde(default)]
+    pub capability_ids: Vec<String>,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub view_count: usize,
+    #[serde(default)]
+    pub plugin_dependencies: Vec<SkillPluginDependency>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -66,6 +125,8 @@ pub struct SkillCatalogItem {
     pub name: String,
     pub description: String,
     pub author_name: String,
+    #[serde(default)]
+    pub categories: Vec<String>,
     pub version: String,
     pub release_notes: String,
     pub min_agent_version: String,
@@ -83,6 +144,99 @@ pub struct SkillCatalogItem {
     pub signature_key_id: String,
     pub signature_algorithm: String,
     pub download_url: String,
+    #[serde(default = "default_marketplace_source")]
+    pub source: String,
+    #[serde(default = "default_optional_assignment")]
+    pub assignment: String,
+    #[serde(default = "default_user_management")]
+    pub management: String,
+    #[serde(default = "default_prompt_mode")]
+    pub install_mode: String,
+    #[serde(default)]
+    pub organization_reason: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default = "default_true")]
+    pub allow_disable: bool,
+    #[serde(default = "default_true")]
+    pub allow_uninstall: bool,
+}
+
+fn default_marketplace_source() -> String {
+    "marketplace".to_string()
+}
+fn default_optional_assignment() -> String {
+    "optional".to_string()
+}
+fn default_user_management() -> String {
+    "user_managed".to_string()
+}
+fn default_prompt_mode() -> String {
+    "prompt".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionDesiredState {
+    pub generation: String,
+    #[serde(default = "default_reconcile_interval")]
+    pub reconcile_interval_seconds: u64,
+    #[serde(default)]
+    pub items: Vec<ExtensionDesiredItem>,
+}
+
+fn default_reconcile_interval() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionDesiredItem {
+    pub product_id: String,
+    pub asset_key: String,
+    pub asset_kind: String,
+    pub name: String,
+    pub desired_state: String,
+    #[serde(default)]
+    pub desired_version: String,
+    #[serde(default = "default_true")]
+    pub desired_enabled: bool,
+    pub intent: String,
+    pub management: String,
+    pub install_mode: String,
+    #[serde(default)]
+    pub assignment_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default = "default_true")]
+    pub allow_disable: bool,
+    #[serde(default = "default_true")]
+    pub allow_uninstall: bool,
+    #[serde(default)]
+    pub on_scope_exit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionReconcileReport {
+    pub generation: String,
+    pub items: Vec<ExtensionReconcileItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionReconcileItem {
+    pub asset_key: String,
+    pub asset_kind: String,
+    pub desired_version: String,
+    pub installed_version: String,
+    pub enabled: bool,
+    pub status: String,
+    pub phase: String,
+    pub install_source: String,
+    pub assignment_id: String,
+    pub target_clients: serde_json::Value,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -186,11 +340,41 @@ pub fn skill_catalog(
         .items)
 }
 
-pub fn submit_skill(
+pub fn extension_desired_state(
     client: &Client,
     api_base: &str,
     agent_id: &str,
     credential: &str,
+) -> Result<ExtensionDesiredState, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/extensions/desired-state"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<ExtensionDesiredState>()?)
+}
+
+pub fn report_extension_reconcile(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    report: &ExtensionReconcileReport,
+) -> Result<(), Box<dyn Error>> {
+    client
+        .post(format!("{api_base}/api/agent/extensions/reconcile-result"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .json(report)
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
+pub fn submit_skill(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
     package_path: &Path,
     test_report: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -204,7 +388,9 @@ pub fn submit_skill(
         .mime_str("application/vnd.himind.skill+zip")?;
     Ok(client
         .post(format!("{api_base}/api/agent/skills/submissions"))
-        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
         .multipart(
             Form::new()
                 .part("file", package)
@@ -219,11 +405,13 @@ pub fn skill_submissions(
     client: &Client,
     api_base: &str,
     agent_id: &str,
-    credential: &str,
+    access_token: &str,
 ) -> Result<Vec<SkillSubmissionStatus>, Box<dyn Error>> {
     Ok(client
         .get(format!("{api_base}/api/agent/skills/submissions"))
-        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
         .send()?
         .error_for_status()?
         .json::<SkillSubmissionResponse>()?
@@ -234,7 +422,7 @@ pub fn submit_plugin(
     client: &Client,
     api_base: &str,
     agent_id: &str,
-    credential: &str,
+    access_token: &str,
     package_path: &Path,
     test_report: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -248,7 +436,9 @@ pub fn submit_plugin(
         .mime_str("application/vnd.himind.plugin+zip")?;
     Ok(client
         .post(format!("{api_base}/api/agent/plugins/submissions"))
-        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
         .multipart(
             Form::new()
                 .part("file", package)
@@ -263,15 +453,159 @@ pub fn plugin_submissions(
     client: &Client,
     api_base: &str,
     agent_id: &str,
-    credential: &str,
+    access_token: &str,
 ) -> Result<Vec<PluginSubmissionStatus>, Box<dyn Error>> {
     Ok(client
         .get(format!("{api_base}/api/agent/plugins/submissions"))
-        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
         .send()?
         .error_for_status()?
         .json::<PluginSubmissionResponse>()?
         .items)
+}
+
+pub fn publish_software_release(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    request: &SoftwareReleasePublishRequest,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let products = client
+        .get(format!("{api_base}/api/distribution/products"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .query(&[
+            ("product_key", request.product_id.as_str()),
+            ("page_size", "200"),
+        ])
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?;
+    let product_exists = products["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .any(|item| item["product_key"] == request.product_id)
+        })
+        .unwrap_or(false);
+    if !product_exists {
+        client
+            .post(format!("{api_base}/api/distribution/products"))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .json(&json!({
+                "product_key": request.product_id,
+                "name": request.product_name,
+                "description": "由 HiMind 软件分发能力创建",
+                "default_channel": request.channel,
+                "update_mode": "self_update",
+                "product_type": "desktop_app",
+                "active": true
+            }))
+            .send()?
+            .error_for_status()?;
+    }
+
+    let release_workspace = client
+        .get(format!("{api_base}/api/distribution/releases"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .query(&[
+            ("product_key", request.product_id.as_str()),
+            ("page_size", "200"),
+        ])
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?;
+    let channel_id = release_workspace["channels"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["channel_key"] == request.channel)
+                .and_then(|item| item["id"].as_str())
+        })
+        .ok_or_else(|| format!("Dashboard channel not found: {}", request.channel))?
+        .to_string();
+
+    let file_name = Path::new(&request.artifact_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("artifact file name is invalid")?
+        .to_string();
+    let artifact_part = Part::file(&request.artifact_path)?.file_name(file_name);
+    let artifact = client
+        .post(format!("{api_base}/api/distribution/artifacts"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .query(&[("product_key", request.product_id.as_str())])
+        .multipart(
+            Form::new()
+                .text("version", request.version.clone())
+                .text("platform", request.platform.clone())
+                .text("architecture", request.architecture.clone())
+                .text("package_type", request.package_type.clone())
+                .part("file", artifact_part),
+        )
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?;
+    let artifact_id = artifact["id"]
+        .as_str()
+        .ok_or("Dashboard artifact response is missing id")?;
+
+    let release = client
+        .post(format!("{api_base}/api/distribution/releases"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .query(&[("product_key", request.product_id.as_str())])
+        .json(&json!({
+            "channel_id": channel_id,
+            "artifact_id": artifact_id,
+            "version": request.version,
+            "release_notes": request.release_notes,
+            "mandatory": request.mandatory,
+            "rollout_percent": request.rollout_percent
+        }))
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?;
+    let release_id = release["id"]
+        .as_str()
+        .ok_or("Dashboard release response is missing id")?;
+
+    let published = client
+        .post(format!(
+            "{api_base}/api/distribution/releases/{release_id}/publish"
+        ))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?;
+    Ok(json!({
+        "product_id": request.product_id,
+        "artifact": artifact,
+        "release": published,
+        "status": "published"
+    }))
+}
+
+fn ai_client_id() -> String {
+    std::env::var("HIMIND_AI_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "himind-agent".to_string())
 }
 
 pub fn report_plugin_status(
@@ -423,8 +757,15 @@ pub fn report_update_result(
 
 #[cfg(test)]
 mod tests {
-    use super::distribution_state_path;
+    use super::{distribution_state_path, publish_software_release, SoftwareReleasePublishRequest};
+    use reqwest::blocking::Client;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn distribution_state_uses_a_separate_file() {
@@ -432,5 +773,118 @@ mod tests {
             distribution_state_path(Path::new("agent-state.json")),
             Path::new("agent-state.distribution.json")
         );
+    }
+
+    #[test]
+    fn software_release_publish_uses_brokered_dashboard_sequence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&requests);
+        let responses = [
+            r#"{"items":[]}"#,
+            r#"{"id":"product-mediaresolver"}"#,
+            r#"{"channels":[{"id":"channel-stable","channel_key":"stable"}]}"#,
+            r#"{"id":"artifact-mediaresolver"}"#,
+            r#"{"id":"release-mediaresolver"}"#,
+            r#"{"id":"release-mediaresolver","status":"published"}"#,
+        ];
+        let server = thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let count = stream.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..count]);
+                    if let Some(header_end) = buffer.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        let header_text = String::from_utf8_lossy(&buffer[..header_end + 4]);
+                        let content_length = header_text
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    value.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buffer).to_string());
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "himind-release-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("MediaResolver.zip");
+        fs::write(&artifact, b"media-resolver-package").unwrap();
+        let request = SoftwareReleasePublishRequest {
+            workspace_root: root.to_string_lossy().to_string(),
+            artifact_path: artifact.to_string_lossy().to_string(),
+            product_id: "com.himind.media-resolver".to_string(),
+            product_name: "MediaResolver".to_string(),
+            version: "1.0.0".to_string(),
+            channel: "stable".to_string(),
+            platform: "windows".to_string(),
+            architecture: "x64".to_string(),
+            package_type: "directory-zip".to_string(),
+            release_notes: "Broker test".to_string(),
+            mandatory: false,
+            rollout_percent: 100,
+            confirmed: true,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let result = publish_software_release(
+            &client,
+            &format!("http://{address}"),
+            "agent-test",
+            "secret-access-token",
+            &request,
+        )
+        .unwrap();
+        server.join().unwrap();
+        let _ = fs::remove_file(&artifact);
+        let _ = fs::remove_dir(&root);
+        assert_eq!(result["status"], "published");
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 6);
+        let request_lines = captured
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(request_lines[0].starts_with("GET /api/distribution/products"));
+        assert!(request_lines[1].starts_with("POST /api/distribution/products"));
+        assert!(request_lines[2].starts_with("GET /api/distribution/releases"));
+        assert!(request_lines[3].starts_with("POST /api/distribution/artifacts"));
+        assert!(request_lines[4].starts_with("POST /api/distribution/releases"));
+        assert!(
+            request_lines[5].contains("/api/distribution/releases/release-mediaresolver/publish")
+        );
+        assert!(captured.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer secret-access-token")));
     }
 }

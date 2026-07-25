@@ -36,6 +36,10 @@ pub(crate) struct SkillPluginDependency {
 pub(crate) struct SkillManifest {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
+    pub categories: Vec<String>,
     pub version: String,
     pub scope: SkillScope,
     #[serde(default)]
@@ -77,8 +81,14 @@ pub(crate) struct SkillReceipt {
     pub source_root: String,
     pub rendered_root: String,
     pub rendered_at: String,
+    #[serde(default = "default_render_mode")]
+    pub render_mode: String,
     pub files: Vec<String>,
     pub checksums: BTreeMap<String, String>,
+}
+
+fn default_render_mode() -> String {
+    "copy".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

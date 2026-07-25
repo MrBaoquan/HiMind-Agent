@@ -193,6 +193,8 @@ mod tests {
         let manifest = SkillManifest {
             id: "com.himind.skill.environment-doctor".to_string(),
             name: "环境诊断".to_string(),
+            author: String::new(),
+            categories: vec![],
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: "read only".to_string(),
@@ -228,6 +230,8 @@ mod tests {
         let manifest = SkillManifest {
             id: "com.himind.skill.environment-doctor".to_string(),
             name: "环境诊断".to_string(),
+            author: String::new(),
+            categories: vec![],
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: "read only".to_string(),

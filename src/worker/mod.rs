@@ -18,6 +18,20 @@ struct HeartbeatLoop {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+struct ExtensionReconcileLoop {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ExtensionReconcileLoop {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl Drop for HeartbeatLoop {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -34,13 +48,33 @@ pub(crate) fn run_loop(
 ) -> Result<(), Box<dyn Error>> {
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     set_status(&worker_status, false, "", "正在连接 Dashboard 任务 Worker");
-    let state = load_or_register(
+    let mut state = load_or_register(
         &client,
         &options.api_base,
         &options.state_path,
         VERSION,
         &options.enrollment_token,
     )?;
+    if crate::api::client::agent_credential_rotation_due(&state) {
+        state = match crate::api::client::rotate_agent_credential(
+            &client,
+            &options.api_base,
+            &options.state_path,
+            &state,
+        ) {
+            Ok(rotated) => rotated,
+            Err(error) => {
+                eprintln!("Agent credential rotation deferred: {error}");
+                load_or_register(
+                    &client,
+                    &options.api_base,
+                    &options.state_path,
+                    VERSION,
+                    &options.enrollment_token,
+                )?
+            }
+        };
+    }
     let distribution_state = load_distribution(
         &client,
         &options.api_base,
@@ -53,6 +87,7 @@ pub(crate) fn run_loop(
         &std::env::var("HIMIND_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "internal".to_string()),
     )?;
     options.set_agent_credential(&state.credential);
+    crate::api::oauth::cache_registration_access(&options, &state);
     set_status(&worker_status, true, &state.agent_id, "");
     check_distribution_update(
         &client,
@@ -70,10 +105,43 @@ pub(crate) fn run_loop(
     let heartbeat_client = client.clone();
     let heartbeat_options = options.clone();
     let heartbeat_agent_id = state.agent_id.clone();
-    let heartbeat_credential = state.credential.clone();
+    let mut heartbeat_agent_state = state.clone();
     let heartbeat_interval = options.interval_seconds.max(1);
     let heartbeat_thread = thread::spawn(move || {
         while !heartbeat_stop_for_thread.load(Ordering::Relaxed) {
+            if crate::api::client::agent_credential_rotation_due(&heartbeat_agent_state) {
+                heartbeat_agent_state = match crate::api::client::rotate_agent_credential(
+                    &heartbeat_client,
+                    &heartbeat_options.api_base,
+                    &heartbeat_options.state_path,
+                    &heartbeat_agent_state,
+                ) {
+                    Ok(rotated) => rotated,
+                    Err(error) => {
+                        eprintln!("Agent credential rotation deferred: {error}");
+                        match load_or_register(
+                            &heartbeat_client,
+                            &heartbeat_options.api_base,
+                            &heartbeat_options.state_path,
+                            VERSION,
+                            &heartbeat_options.enrollment_token,
+                        ) {
+                            Ok(recovered) => recovered,
+                            Err(recovery_error) => {
+                                set_status(
+                                    &heartbeat_status,
+                                    false,
+                                    &heartbeat_agent_id,
+                                    &format!("Dashboard Agent 凭据轮换恢复失败：{recovery_error}"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                };
+                heartbeat_options.set_agent_credential(&heartbeat_agent_state.credential);
+            }
+            let heartbeat_credential = heartbeat_options.agent_credential();
             match heartbeat(
                 &heartbeat_client,
                 &heartbeat_options.api_base,
@@ -122,13 +190,36 @@ pub(crate) fn run_loop(
         handle: Some(heartbeat_thread),
     };
 
+    let reconcile_stop = Arc::new(AtomicBool::new(false));
+    let reconcile_stop_for_thread = Arc::clone(&reconcile_stop);
+    let reconcile_options = options.clone();
+    let reconcile_agent_id = state.agent_id.clone();
+    let reconcile_thread = thread::spawn(move || {
+        let mut generation = String::new();
+        while !reconcile_stop_for_thread.load(Ordering::Relaxed) {
+            if let Err(error) = crate::app::extension_reconciler::reconcile(
+                &reconcile_options,
+                &reconcile_agent_id,
+                &mut generation,
+            ) {
+                eprintln!("extension reconcile failed: {error}");
+            }
+            for _ in 0..30 {
+                if reconcile_stop_for_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
+    let _extension_reconcile_loop = ExtensionReconcileLoop {
+        stop: reconcile_stop,
+        handle: Some(reconcile_thread),
+    };
+
     loop {
-        let tasks = poll_tasks(
-            &client,
-            &options.api_base,
-            &state.agent_id,
-            &state.credential,
-        )?;
+        let credential = options.agent_credential();
+        let tasks = poll_tasks(&client, &options.api_base, &state.agent_id, &credential)?;
         for task in tasks {
             execute_task(
                 &client,

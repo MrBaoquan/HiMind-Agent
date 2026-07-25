@@ -1,6 +1,6 @@
 use crate::skill::manifest::validate_skill_id;
 use crate::skill::resolver::{CapabilityFact, SkillReadiness};
-use crate::skill::store::SkillStore;
+use crate::skill::store::{SkillStore, SKILL_SYNC_MODE_SYMLINK};
 use crate::skill::types::{SkillReceipt, SkillRecord};
 use serde::Serialize;
 use serde_json::json;
@@ -36,6 +36,7 @@ pub(crate) fn status_json(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let store = SkillStore::new();
     store.bootstrap_builtin_skills()?;
+    let sync_mode = store.sync_mode()?;
     let target = resolve_target(&store);
     let records = store.list_records()?;
     let items = records
@@ -49,34 +50,8 @@ pub(crate) fn status_json(
         "target_configured": target.configured,
         "target_exists": target.root.exists(),
         "target_mode": target_mode(&target),
+        "sync_mode": sync_mode,
         "items": items,
-    }))
-}
-
-pub(crate) fn sync_one_json(
-    skill_id: &str,
-    agent_version: &str,
-    capability_facts: &[CapabilityFact],
-) -> Result<serde_json::Value, Box<dyn Error>> {
-    validate_skill_id(skill_id)?;
-    let store = SkillStore::new();
-    store.bootstrap_builtin_skills()?;
-    let target = resolve_target(&store);
-    let record = store
-        .get_record(skill_id)?
-        .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
-    let readiness =
-        SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, "codex");
-    if readiness.state == "blocked" {
-        return Err(format!("Skill is blocked: {}", readiness.reasons.join(", ")).into());
-    }
-    let outcome = render_skill(&target.root, &record)?;
-    Ok(json!({
-        "client_id": "codex",
-        "target_root": target.root.to_string_lossy().to_string(),
-        "target_source": target.source,
-        "target_configured": target.configured,
-        "rendered": outcome,
     }))
 }
 
@@ -213,6 +188,7 @@ fn skill_status_entry(
     capability_facts: &[CapabilityFact],
     record: SkillRecord,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let sync_mode = SkillStore::new().sync_mode()?;
     let readiness =
         SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, "codex");
     let render_root = target_root.join(&record.manifest.id);
@@ -226,7 +202,9 @@ fn skill_status_entry(
     let receipt_ok = receipt
         .as_ref()
         .map(|receipt| {
-            modified_files.is_empty() && validate_rendered_skill(&current_dir, receipt).is_ok()
+            receipt.render_mode == sync_mode
+                && modified_files.is_empty()
+                && validate_rendered_skill(&current_dir, receipt).is_ok()
         })
         .unwrap_or(false);
     let client_state = if readiness.state == "blocked" {
@@ -278,6 +256,7 @@ fn target_mode(target: &CodexTarget) -> &'static str {
 }
 
 fn render_skill(target_root: &Path, record: &SkillRecord) -> Result<RenderOutcome, Box<dyn Error>> {
+    let sync_mode = SkillStore::new().sync_mode()?;
     let render_root = target_root.join(&record.manifest.id);
     let current_dir = render_root.join("current");
     let previous_dir = render_root.join("previous");
@@ -292,6 +271,7 @@ fn render_skill(target_root: &Path, record: &SkillRecord) -> Result<RenderOutcom
         if existing.version == record.manifest.version
             && existing.skill_id == record.manifest.id
             && existing.source_root == record.version_root.to_string_lossy()
+            && existing.render_mode == sync_mode
             && existing.checksums == checksums
         {
             let _ = fs::remove_dir_all(&staging_dir);
@@ -315,7 +295,7 @@ fn render_skill(target_root: &Path, record: &SkillRecord) -> Result<RenderOutcom
         )?;
     }
 
-    copy_skill_tree(&record.version_root, &staging_dir)?;
+    copy_skill_tree(&record.version_root, &staging_dir, &sync_mode)?;
     let receipt = SkillReceipt {
         skill_id: record.manifest.id.clone(),
         version: record.manifest.version.clone(),
@@ -323,6 +303,7 @@ fn render_skill(target_root: &Path, record: &SkillRecord) -> Result<RenderOutcom
         source_root: record.version_root.to_string_lossy().to_string(),
         rendered_root: current_dir.to_string_lossy().to_string(),
         rendered_at: unique_stamp(),
+        render_mode: sync_mode,
         files: rendered_files.clone(),
         checksums,
     };
@@ -359,7 +340,10 @@ fn uninstall_skill(
     let current_dir = render_root.join("current");
     let previous_dir = render_root.join("previous");
     if !render_root.exists() {
-        return Err(format!("Codex skill not installed: {skill_id}").into());
+        return Ok(json!({
+            "skill_id": skill_id,
+            "removed": false,
+        }));
     }
     if current_dir.exists() {
         let receipt = read_receipt(&current_dir)?;
@@ -452,7 +436,11 @@ fn codex_default_candidates(store: &SkillStore) -> Vec<(String, PathBuf)> {
     candidates
 }
 
-fn copy_skill_tree(source_root: &Path, target_root: &Path) -> Result<(), Box<dyn Error>> {
+fn copy_skill_tree(
+    source_root: &Path,
+    target_root: &Path,
+    mode: &str,
+) -> Result<(), Box<dyn Error>> {
     if target_root.exists() {
         fs::remove_dir_all(target_root)?;
     }
@@ -476,7 +464,11 @@ fn copy_skill_tree(source_root: &Path, target_root: &Path) -> Result<(), Box<dyn
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(entry.path(), destination)?;
+        if mode == SKILL_SYNC_MODE_SYMLINK {
+            symlink_file(entry.path(), &destination)?;
+        } else {
+            fs::copy(entry.path(), destination)?;
+        }
     }
     Ok(())
 }
@@ -485,7 +477,7 @@ fn collect_rendered_files(root: &Path, exclude_name: &str) -> Result<Vec<String>
     let mut files = Vec::new();
     for entry in WalkDir::new(root) {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !(entry.file_type().is_file() || entry.path().is_file()) {
             continue;
         }
         let relative = entry
@@ -509,7 +501,7 @@ fn compute_checksums(
     let mut items = BTreeMap::new();
     for entry in WalkDir::new(root) {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !(entry.file_type().is_file() || entry.path().is_file()) {
             continue;
         }
         let relative = entry
@@ -529,6 +521,37 @@ fn compute_checksums(
 fn checksum_file(path: &Path) -> Result<String, Box<dyn Error>> {
     let data = fs::read(path)?;
     Ok(format!("{:x}", Sha256::digest(&data)))
+}
+
+fn symlink_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(source, destination).map_err(|error| {
+            format!(
+                "cannot create Skill file symlink {} -> {}: {error}; enable Windows Developer Mode or use copy mode",
+                destination.display(),
+                source.display()
+            )
+            .into()
+        })
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, destination).map_err(|error| {
+            format!(
+                "cannot create Skill file symlink {} -> {}: {error}",
+                destination.display(),
+                source.display()
+            )
+            .into()
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = source;
+        let _ = destination;
+        Err("Skill symlink mode is not supported on this platform".into())
+    }
 }
 
 fn read_receipt(root: &Path) -> Result<SkillReceipt, Box<dyn Error>> {
@@ -611,6 +634,8 @@ mod tests {
         let manifest = SkillManifest {
             id: "demo.skill".to_string(),
             name: "Demo".to_string(),
+            author: String::new(),
+            categories: vec![],
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: String::new(),

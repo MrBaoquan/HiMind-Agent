@@ -1,4 +1,4 @@
-export type PageKey = 'dashboard' | 'approvals' | 'plugins' | 'skills' | 'settings' | 'logs';
+export type PageKey = 'dashboard' | 'ai' | 'approvals' | 'plugins' | 'skills' | 'settings' | 'logs';
 
 export type UiMessage = {
     id: number;

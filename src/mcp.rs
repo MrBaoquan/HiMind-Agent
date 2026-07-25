@@ -8,6 +8,9 @@ use crate::capability::types::{InvocationContext, InvocationSource};
 use crate::store::types::LocalWorkerStatus;
 use crate::{Options, VERSION};
 
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
 pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
@@ -74,13 +77,13 @@ fn handle_request(
 ) -> Result<Value, Box<dyn Error>> {
     match method {
         "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": negotiate_protocol_version(&params),
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "himind-agent", "version": VERSION }
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let context = InvocationContext::new(InvocationSource::Mcp, "mcp-client");
+            let context = mcp_invocation_context();
             let tools = gateway
                 .list_capabilities(&context)?
                 .into_iter()
@@ -103,7 +106,7 @@ fn handle_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let context = InvocationContext::new(InvocationSource::Mcp, "mcp-client");
+            let context = mcp_invocation_context();
             match gateway.invoke(&context, name, arguments) {
                 Ok(result) => Ok(json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result)? }],
@@ -120,9 +123,51 @@ fn handle_request(
     }
 }
 
+fn negotiate_protocol_version(params: &Value) -> &'static str {
+    let requested = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|version| *version == requested)
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+}
+
+fn mcp_invocation_context() -> InvocationContext {
+    let client_id = std::env::var("HIMIND_AI_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "mcp-client".to_string());
+    InvocationContext::new(InvocationSource::Mcp, format!("ai-client:{client_id}"))
+}
+
 fn write_message(writer: &mut impl Write, value: &Value) -> Result<(), Box<dyn Error>> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::negotiate_protocol_version;
+    use serde_json::json;
+
+    #[test]
+    fn initialize_uses_a_supported_requested_protocol_version() {
+        assert_eq!(
+            negotiate_protocol_version(&json!({ "protocolVersion": "2024-11-05" })),
+            "2024-11-05"
+        );
+    }
+
+    #[test]
+    fn initialize_falls_back_to_the_latest_supported_protocol_version() {
+        assert_eq!(
+            negotiate_protocol_version(&json!({ "protocolVersion": "future-version" })),
+            "2025-11-25"
+        );
+    }
 }

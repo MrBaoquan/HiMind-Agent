@@ -214,7 +214,7 @@ export function SkillsPage({
 
       <div className="skill-footer-note">
         <span className="status-dot success" />
-        <span>Skill 只负责说明和编排，真正的执行仍然走 Capability Gateway。</span>
+        <span>AI 只会调用 Skill 声明的功能，实际操作由 HiMind Agent 统一检查。</span>
       </div>
     </div>
   );

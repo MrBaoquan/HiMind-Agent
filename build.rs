@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_PUBLIC_KEY_PATH");
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_KEY_ID");
+    println!("cargo:rerun-if-changed=icons/icon.ico");
     write_embedded_update_key();
 
     let icon_path = Path::new("icons/icon.ico");

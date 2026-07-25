@@ -1,22 +1,42 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import '../styles.css';
 import { NotificationCenter } from './components/Common';
 import { Shell } from './components/Shell';
 import { ApprovalsPage } from './pages/ApprovalsPage';
+import { AiConnectionsPage } from './pages/AiConnectionsPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { LogsPage } from './pages/LogsPage';
 import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AgentStatus, type ApprovalItem, type ApprovalSettings, type CapabilityItem, type CodexSkillStatusResponse, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringSkillDraft, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AgentStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type CapabilityItem, type CodexSkillStatusResponse, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
 
+function friendlyConnectionError(error: unknown, fallback: string) {
+  const detail = formatError(error, fallback).toLowerCase();
+  if (detail.includes('备份并重建')) return '原连接文件格式有误，请选择“备份并重建”。';
+  if (detail.includes('permission denied') || detail.includes('access is denied') || detail.includes('拒绝访问')) return '无法修改连接信息，请关闭对应 AI 工具后重试。';
+  if (detail.includes('toml') || detail.includes('json') || detail.includes('mcpservers')) return '连接文件内容有误，请备份后重建。';
+  return fallback;
+}
+
+function authorizationFailure(progress: DashboardAuthorizationProgress) {
+  if (progress.state === 'denied') return '你暂未同意授权，可以重新发起。';
+  if (progress.state === 'expired') return '确认已超时，请重新发起。';
+  return '未能完成工作台账号授权，请检查网络后重试。';
+}
+
 function App() {
   const [page, setPage] = useState<PageKey>('dashboard');
   const [status, setStatus] = useState<AgentStatus | null>(null);
+  const [dashboardIdentity, setDashboardIdentity] = useState<DashboardIdentityStatus | null>(null);
+  const [dashboardAuthorization, setDashboardAuthorization] = useState<DashboardAuthorizationProgress | null>(null);
+  const [aiIntegration, setAiIntegration] = useState<AiIntegrationOverview | null>(null);
+  const [mcpTestResult, setMcpTestResult] = useState<McpConnectionTestResult | null>(null);
+  const [aiOperation, setAiOperation] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [settings, setSettings] = useState<ApprovalSettings | null>(null);
   const [loginState, setLoginState] = useState<LoginState | null>(null);
@@ -25,6 +45,9 @@ function App() {
   const [pluginsLoading, setPluginsLoading] = useState(true);
   const [capabilities, setCapabilities] = useState<CapabilityItem[]>([]);
   const [pluginCatalog, setPluginCatalog] = useState<import('./services/agentApi').PluginCatalogItem[]>([]);
+  const [pluginDrafts, setPluginDrafts] = useState<AuthoringPluginDraft[]>([]);
+  const [pluginSubmissions, setPluginSubmissions] = useState<PluginSubmissionStatus[]>([]);
+  const [pluginOperation, setPluginOperation] = useState<string | null>(null);
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogResponse | null>(null);
   const [skillStatus, setSkillStatus] = useState<CodexSkillStatusResponse | null>(null);
   const [organizationSkills, setOrganizationSkills] = useState<OrganizationSkillCatalogItem[]>([]);
@@ -42,6 +65,8 @@ function App() {
   const [svnDraft, setSvnDraft] = useState<SvnConnectionInput>({ username: '', password: '' });
 
   async function refreshStatus() { setStatus(await agentApi.status()); }
+  async function refreshDashboardIdentity() { setDashboardIdentity(await agentApi.dashboardIdentity()); }
+  async function refreshAiIntegration() { setAiIntegration(await agentApi.aiIntegration()); }
   async function refreshApprovals() { setApprovals(await agentApi.approvals()); }
   async function refreshSettings() { setSettings(await agentApi.settings()); }
   async function refreshLogin() { setLoginState(await agentApi.login()); }
@@ -63,6 +88,12 @@ function App() {
         setPluginCatalog([]);
         console.error('Plugin catalog unavailable', error);
       }
+      const [draftsResult, submissionsResult] = await Promise.allSettled([
+        agentApi.pluginDrafts(),
+        agentApi.pluginSubmissions(),
+      ]);
+      setPluginDrafts(draftsResult.status === 'fulfilled' ? draftsResult.value || [] : []);
+      setPluginSubmissions(submissionsResult.status === 'fulfilled' ? submissionsResult.value || [] : []);
     } catch (error) {
       setPluginRegistry(null);
       setCapabilities([]);
@@ -111,6 +142,8 @@ function App() {
   async function refreshAll() {
     const results = await Promise.allSettled([
       refreshStatus(),
+      refreshDashboardIdentity(),
+      refreshAiIntegration(),
       refreshApprovals(),
       refreshSettings(),
       refreshLogin(),
@@ -129,8 +162,57 @@ function App() {
     const timer = window.setInterval(() => {
       Promise.all([refreshStatus(), refreshApprovals(), refreshLogin()]).catch(console.error);
     }, 5000);
-    return () => window.clearInterval(timer);
+    const identityTimer = window.setInterval(() => refreshDashboardIdentity().catch(console.error), 30000);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(identityTimer);
+    };
   }, []);
+
+  useEffect(() => {
+    if (page !== 'plugins' && page !== 'skills') return;
+    const refreshCurrentPage = () => {
+      if (document.visibilityState === 'hidden') return;
+      const operation = page === 'plugins' ? refreshPlugins() : refreshSkills();
+      operation.catch(console.error);
+    };
+    const timer = window.setInterval(refreshCurrentPage, 15000);
+    window.addEventListener('focus', refreshCurrentPage);
+    document.addEventListener('visibilitychange', refreshCurrentPage);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshCurrentPage);
+      document.removeEventListener('visibilitychange', refreshCurrentPage);
+    };
+  }, [page]);
+
+  useEffect(() => {
+    if (dashboardAuthorization?.state !== 'starting' && dashboardAuthorization?.state !== 'pending') return;
+    let stopped = false;
+    const timer = window.setInterval(async () => {
+      if (stopped) return;
+      try {
+        const progress = await agentApi.dashboardAuthorizationProgress();
+        setDashboardAuthorization(progress);
+        if (progress.state === 'authorized') {
+          stopped = true;
+          window.clearInterval(timer);
+          await Promise.all([refreshDashboardIdentity(), refreshAiIntegration()]);
+          notify('success', progress.user_name ? `已登录工作台账号：${progress.user_name}` : '工作台账号授权成功');
+        } else if (['denied', 'expired', 'failed', 'canceled'].includes(progress.state)) {
+          stopped = true;
+          window.clearInterval(timer);
+          if (progress.state !== 'canceled') notify('error', authorizationFailure(progress));
+        }
+      } catch (error) {
+        console.error(error);
+      }
+    }, 1000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [dashboardAuthorization?.state]);
 
   function dismissNotification(id: number) {
     setMessages(current => current.filter(item => item.id !== id));
@@ -165,6 +247,121 @@ function App() {
     }
   }
 
+  async function runPluginOperation(key: string, action: () => Promise<string>, fallback: string) {
+    if (pluginOperation) return;
+    setPluginOperation(key);
+    try {
+      notify('success', await action());
+    } catch (error) {
+      notify('error', formatError(error, fallback));
+    } finally {
+      setPluginOperation(null);
+    }
+  }
+
+  const availablePlugins = useMemo(() => {
+    const merged = new Map(pluginCatalog.map(item => [item.plugin_id, item]));
+    for (const item of pluginRegistry?.items || []) {
+      if (!item.development && merged.has(item.id)) continue;
+      merged.set(item.id, {
+        plugin_id: item.id,
+        name: item.name || item.id,
+        description: item.description || (item.development ? '本机开发候选插件' : '本机插件'),
+        author_name: item.author_name,
+        categories: [],
+        governance: item.governance || 'optional',
+        version: item.version || '0.0.0',
+        release_notes: '',
+        min_agent_version: item.min_agent_version || '',
+        file_size: item.entry_size || 0,
+        sha256: '',
+        source: item.development ? 'development' : 'system',
+        capability_ids: (item.capabilities || []).map(capability => capability.id),
+        permissions: item.permissions || [],
+        view_count: item.views?.length || 0,
+      });
+    }
+    return Array.from(merged.values());
+  }, [pluginCatalog, pluginRegistry]);
+
+  async function startDashboardAuthorization() {
+    if (aiOperation) return;
+    setAiOperation('identity');
+    try {
+      setDashboardAuthorization(await agentApi.startDashboardAuthorization());
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '无法打开工作台登录授权，请检查网络后重试。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
+  async function cancelDashboardAuthorization() {
+    try {
+      setDashboardAuthorization(await agentApi.cancelDashboardAuthorization());
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '暂时无法取消登录授权，请稍后重试。'));
+    }
+  }
+
+  async function revokeDashboardAuthorization() {
+    if (aiOperation) return;
+    setAiOperation('identity');
+    try {
+      await agentApi.revokeDashboardAuthorization();
+      setDashboardAuthorization(null);
+      await refreshDashboardIdentity();
+      notify('success', '已取消工作台账号授权');
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '暂时无法取消工作台账号授权，请稍后重试。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
+  async function configureAiClient(clientId: string, resetInvalid = false) {
+    if (aiOperation) return;
+    setAiOperation(`configure:${clientId}`);
+    try {
+      const result = await agentApi.configureAiClient(clientId, resetInvalid);
+      await refreshAiIntegration();
+      notify('success', result.changed ? `${result.client.name} 连接信息已写入，请重启客户端` : `${result.client.name} 连接信息已是最新`);
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '连接失败，请关闭对应 AI 工具后重试。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
+  async function removeAiClientConfiguration(clientId: string) {
+    if (aiOperation) return;
+    setAiOperation(`remove:${clientId}`);
+    try {
+      const result = await agentApi.removeAiClientConfiguration(clientId);
+      await refreshAiIntegration();
+      notify('success', result.changed ? `已断开 ${result.client.name}` : `${result.client.name} 当前未连接`);
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '断开连接失败，请关闭对应 AI 工具后重试。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
+  async function testMcpConnection() {
+    if (aiOperation) return;
+    setAiOperation('test');
+    setMcpTestResult(null);
+    try {
+      const result = await agentApi.testMcpConnection();
+      setMcpTestResult(result);
+      notify('success', `本机服务正常，可提供 ${result.capability_count} 项功能`);
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '本机服务检查失败，请重新启动 HiMind Agent。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
   function openLoginModal() {
     setLoginUsername(current => current || loginState?.account || '');
     setLoginPassword('');
@@ -172,15 +369,44 @@ function App() {
   }
 
   const content = (() => {
-    if (page === 'dashboard') return <DashboardPage status={status} approvals={approvals} settings={settings} loginState={loginState} onOpenDashboard={() => run(agentApi.openDashboard)} onOpenAgentDirectory={() => run(agentApi.openAgentDirectory)} onOpenSettings={() => setPage('settings')} />;
+    if (page === 'dashboard') return <DashboardPage
+      status={status}
+      approvals={approvals}
+      settings={settings}
+      loginState={loginState}
+      identity={dashboardIdentity}
+      authorization={dashboardAuthorization}
+      identityBusy={aiOperation === 'identity'}
+      onOpenDashboard={() => run(agentApi.openDashboard)}
+      onOpenAgentDirectory={() => run(agentApi.openAgentDirectory)}
+      onOpenSettings={() => setPage('settings')}
+      onStartAuthorization={startDashboardAuthorization}
+      onCancelAuthorization={cancelDashboardAuthorization}
+      onOpenAuthorization={() => run(agentApi.openDashboardAuthorizationPage)}
+      onRefreshIdentity={() => run(refreshDashboardIdentity)}
+      onRevokeAuthorization={revokeDashboardAuthorization}
+    />;
+    if (page === 'ai') return <AiConnectionsPage
+      identity={dashboardIdentity}
+      integration={aiIntegration}
+      testResult={mcpTestResult}
+      busyAction={aiOperation}
+      onOpenAccount={() => setPage('dashboard')}
+      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshAiIntegration()]); })}
+      onConfigure={configureAiClient}
+      onRemove={removeAiClientConfiguration}
+      onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
+      onTest={testMcpConnection}
+    />;
     if (page === 'approvals') return <ApprovalsPage approvals={approvals} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} />;
-      if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} onRefresh={() => run(refreshPlugins)} onInstall={(pluginId) => run(async () => { await agentApi.installPlugin(pluginId); await refreshPlugins(); }, '插件已安装', '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); }, enabled ? '插件已启用' : '插件已停用', enabled ? '启用插件失败' : '停用插件失败')} onOpenDirectory={() => run(agentApi.openPluginDirectory)} onRegisterDevelopment={() => run(async () => { const pluginId = await agentApi.registerDevelopmentPlugin(); await refreshPlugins(); notify('success', `已加载开发插件：${pluginId}`); }, undefined, '加载本地插件工程失败')} onUnregisterDevelopment={(pluginId) => run(async () => { await agentApi.unregisterDevelopmentPlugin(pluginId); await refreshPlugins(); }, '已移除开发插件注册', '移除开发插件失败')} onInvokeDevelopment={agentApi.invokeDevelopmentPlugin} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
+      if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} drafts={pluginDrafts} submissions={pluginSubmissions} busyAction={pluginOperation} onRefresh={() => run(refreshPlugins)} onPlanInstall={agentApi.planPluginInstall} onInstall={(pluginId) => run(async () => { await agentApi.installPlugin(pluginId); await refreshPlugins(); }, '插件已安装', '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); }, '插件已回滚', '回滚插件失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); }, enabled ? '插件已启用' : '插件已停用', '更新插件状态失败')} onOpenDirectory={() => run(agentApi.openPluginDirectory)} onRegisterDevelopment={() => run(async () => { const pluginId = await agentApi.registerDevelopmentPlugin(); await refreshPlugins(); notify('success', `已加载开发插件：${pluginId}`); }, undefined, '加载本地插件工程失败')} onImportCandidate={() => runPluginOperation('import', async () => { const draft = await agentApi.importPluginCandidate(); await refreshPlugins(); return `已导入并加载开发候选：${draft.manifest.name}`; }, '导入插件候选失败')} onCreateRevision={(pluginId, version) => runPluginOperation(`revision:${pluginId}`, async () => { const draft = await agentApi.createPluginRevision(pluginId, version); await refreshPlugins(); return `已创建 ${draft.manifest.name} v${draft.manifest.version}，请重新测试`; }, '创建插件新版本失败')} onTestDraft={(pluginId, version) => runPluginOperation(`test:${pluginId}`, async () => { await agentApi.testPluginDraft(pluginId, version); await refreshPlugins(); return '插件候选已部署到运行时并通过完整性测试'; }, '插件候选测试失败')} onConfirmDraft={(pluginId, version) => runPluginOperation(`confirm:${pluginId}`, async () => { await agentApi.confirmPluginDraft(pluginId, version); await refreshPlugins(); return '已确认插件候选测试通过'; }, '确认插件测试失败')} onSubmitDraft={(pluginId, version) => runPluginOperation(`submit:${pluginId}`, async () => { await agentApi.submitPluginDraft(pluginId, version); await refreshPlugins(); return '插件已提交 HiMind 工作台审核'; }, '提交插件审核失败')} onUnregisterDevelopment={(pluginId) => run(async () => { await agentApi.unregisterDevelopmentPlugin(pluginId); await refreshPlugins(); }, '已移除开发插件注册', '移除开发插件失败')} onInvokeDevelopment={agentApi.invokeDevelopmentPlugin} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}
       status={skillStatus}
       error={skillError}
       marketplace={organizationSkills}
       marketplaceError={skillMarketError}
+	  availablePlugins={availablePlugins}
       drafts={skillDrafts}
       submissions={skillSubmissions}
       busyAction={skillOperation}
@@ -188,13 +414,25 @@ function App() {
       onSyncAll={() => runSkillOperation('sync-all', async () => {
         const result = await agentApi.syncCodexSkills();
         await refreshSkills();
-        return `同步完成：${result.rendered.length} 个成功，${result.skipped.length} 个跳过，${result.blocked.length} 个阻止`;
-      }, '同步 Codex Skill 失败')}
+        const copilot = result.clients?.['github-copilot'];
+        const workbuddy = result.clients?.workbuddy;
+        const rendered = result.rendered.length + (copilot?.rendered.length || 0) + (workbuddy?.rendered.length || 0);
+        const skipped = result.skipped.length + (copilot?.skipped.length || 0) + (workbuddy?.skipped.length || 0);
+        const blocked = result.blocked.length + (copilot?.blocked.length || 0) + (workbuddy?.blocked.length || 0);
+        return `客户端同步完成：${rendered} 个成功，${skipped} 个跳过，${blocked} 个阻止`;
+      }, '同步客户端 Skill 失败')}
       onSyncSkill={(skillId) => runSkillOperation(`sync:${skillId}`, async () => {
         const result = await agentApi.syncCodexSkill(skillId);
         await refreshSkills();
         return result.rendered.state === 'skipped' ? 'Skill 已是最新版本' : `已安装 ${result.rendered.skill_id}`;
       }, '安装 Skill 失败')}
+      syncMode={skillStatus?.sync_mode || 'copy'}
+      onSetSyncMode={(mode: SkillSyncSettings['mode']) => runSkillOperation('sync-mode', async () => {
+        await agentApi.setSkillSyncMode(mode);
+        await agentApi.syncCodexSkills();
+        await refreshSkills();
+        return mode === 'symlink' ? '已切换为软链接并完成同步' : '已切换为复制文件并完成同步';
+      }, '同步方式更新失败')}
       onPlanMarketplace={agentApi.planOrganizationSkillInstall}
       onInstallMarketplace={(skillId, optionalPluginIds) => runSkillOperation(`market:${skillId}`, async () => {
         const result = await agentApi.installOrganizationSkill(skillId, optionalPluginIds);
@@ -202,9 +440,10 @@ function App() {
         return `已从组织商城安装 ${result.record.manifest.name} v${result.record.manifest.version}`;
       }, '商城 Skill 安装失败')}
       onSaveDraft={async (input) => { const result = await agentApi.saveSkillDraft(input); await refreshSkills(); return result; }}
-      onTestDraft={(skillId, version) => runSkillOperation(`test:${skillId}`, async () => { await agentApi.testSkillDraft(skillId, version); await refreshSkills(); return '已部署到 Codex，请完成实际对话测试'; }, 'Skill 本地测试失败')}
+      onCreateRevision={(skillId, version) => runSkillOperation(`revision:${skillId}`, async () => { const draft = await agentApi.createSkillRevision(skillId, version); await refreshSkills(); return `已创建 ${draft.manifest.name} v${draft.manifest.version}，请重新测试`; }, '创建 Skill 新版本失败')}
+      onTestDraft={(skillId, version) => runSkillOperation(`test:${skillId}`, async () => { await agentApi.testSkillDraft(skillId, version); await refreshSkills(); return '已部署到声明的 AI 客户端，请完成实际对话测试'; }, 'Skill 本地测试失败')}
       onConfirmDraft={(skillId, version) => runSkillOperation(`confirm:${skillId}`, async () => { await agentApi.confirmSkillDraft(skillId, version); await refreshSkills(); return '已确认本地测试通过'; }, '确认测试失败')}
-      onSubmitDraft={(skillId, version) => runSkillOperation(`submit:${skillId}`, async () => { await agentApi.submitSkillDraft(skillId, version); await refreshSkills(); return '已提交 Dashboard 审核'; }, '提交 Skill 审核失败')}
+      onSubmitDraft={(skillId, version) => runSkillOperation(`submit:${skillId}`, async () => { await agentApi.submitSkillDraft(skillId, version); await refreshSkills(); return '已提交 HiMind 工作台审核'; }, '提交 Skill 审核失败')}
       onRepair={(skillId) => runSkillOperation(`repair:${skillId}`, async () => {
         const result = await agentApi.repairCodexSkill(skillId, true);
         await refreshSkills();
@@ -214,7 +453,7 @@ function App() {
         const result = await agentApi.uninstallCodexSkill(skillId);
         await refreshSkills();
         return result.removed.removed ? `已卸载 ${result.removed.skill_id}` : `未卸载 ${result.removed.skill_id}`;
-      }, '卸载 Codex Skill 失败')}
+      }, '卸载客户端 Skill 失败')}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path), '目录已打开', '打开目录失败')}
     />;
     if (page === 'settings') return <SettingsPage settings={settings} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存到当前 Agent', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除当前 Agent 保存的内网凭据', '清除内网凭据失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={() => run(agentApi.testSvnConnection, undefined, '测试 SVN 连接失败')} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} />;
@@ -222,7 +461,7 @@ function App() {
   })();
 
   return (
-    <Shell version={status?.version} currentPage={page} approvalCount={approvals.length} onNavigate={setPage}>
+    <Shell currentPage={page} approvalCount={approvals.length} identity={dashboardIdentity} onNavigate={setPage}>
       <NotificationCenter messages={messages} onClose={dismissNotification} />
       {content}
     </Shell>

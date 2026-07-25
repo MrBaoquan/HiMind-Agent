@@ -1,14 +1,17 @@
 use crate::api::distribution::{
     plugin_catalog, report_plugin_status, PluginCatalogItem, PluginStatusReport,
+    SkillPluginDependency,
 };
 use crate::app::system::{validate_signature_metadata, verify_rsa_pss_sha256};
 use crate::capability::plugin::{is_builtin_plugin, plugin_registry_dir, PluginManifest};
+use crate::skill::resolver::compare_versions;
 use crate::store::plugin_outbox::{
     list as list_statuses, remove as remove_status, store as store_status, PluginStatusRecord,
 };
 use crate::Options;
 use reqwest::{blocking::Client, Url};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
@@ -26,6 +29,27 @@ pub(crate) struct LocalPluginStatus {
     pub previous_version: String,
     pub enabled: bool,
     pub status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PluginDependencyAction {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub plugin_description: String,
+    pub required: bool,
+    pub current_version: String,
+    pub target_version: String,
+    pub action: String,
+    pub reason: String,
+    pub requested_by: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PluginInstallPlan {
+    pub plugin: PluginCatalogItem,
+    pub dependency_actions: Vec<PluginDependencyAction>,
+    pub blocked_reasons: Vec<String>,
+    pub ready: bool,
 }
 
 pub(crate) fn local_status(plugin_id: &str) -> LocalPluginStatus {
@@ -157,6 +181,14 @@ fn manifest_version(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+pub(crate) fn local_display_name(plugin_id: &str) -> Option<String> {
+    let root = plugin_root(plugin_id).ok()?;
+    let content = fs::read_to_string(root.join("current/plugin.json")).ok()?;
+    let manifest =
+        serde_json::from_str::<PluginManifest>(content.trim_start_matches('\u{feff}')).ok()?;
+    (!manifest.name.trim().is_empty()).then_some(manifest.name)
+}
+
 pub(crate) fn install(
     options: &Options,
     agent_id: &str,
@@ -165,15 +197,422 @@ pub(crate) fn install(
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
-    let item = catalog_item(&client, options, agent_id, plugin_id)?;
+    let credential = options.agent_credential();
+    let catalog = plugin_catalog(&client, &options.api_base, agent_id, &credential)?;
+    let plan = build_install_plan(&catalog, plugin_id)?;
+    if !plan.ready {
+        return Err(format!("插件安装计划被阻止：{}", plan.blocked_reasons.join("；")).into());
+    }
+    let root_before = local_status(plugin_id);
+    let mut changes = Vec::new();
+    for action in &plan.dependency_actions {
+        if !action.required || !matches!(action.action.as_str(), "install" | "update") {
+            continue;
+        }
+        let item = catalog
+            .iter()
+            .find(|item| item.plugin_id == action.plugin_id)
+            .ok_or_else(|| format!("依赖插件未上架：{}", action.plugin_name))?;
+        let before = local_status(&action.plugin_id);
+        if let Err(error) = install_catalog_item(&client, options, agent_id, item) {
+            compensate_plugin_changes(&changes);
+            return Err(error);
+        }
+        changes.push((action.plugin_id.clone(), before));
+    }
+    if let Err(error) = install_catalog_item(&client, options, agent_id, &plan.plugin) {
+        compensate_plugin_changes(&changes);
+        return Err(error);
+    }
+    let dependency_owner = format!("plugin:{plugin_id}");
+    let dependency_ids = plan
+        .dependency_actions
+        .iter()
+        .filter(|action| action.required)
+        .map(|action| action.plugin_id.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = set_owner_references(&dependency_owner, &dependency_ids) {
+        compensate_plugin_changes(&[(plugin_id.to_string(), root_before)]);
+        compensate_plugin_changes(&changes);
+        return Err(format!("记录插件依赖失败：{error}").into());
+    }
+    Ok(())
+}
+
+pub(crate) fn plan_install(
+    options: &Options,
+    agent_id: &str,
+    plugin_id: &str,
+) -> Result<PluginInstallPlan, Box<dyn Error>> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let catalog = plugin_catalog(
+        &client,
+        &options.api_base,
+        agent_id,
+        &options.agent_credential(),
+    )?;
+    build_install_plan(&catalog, plugin_id)
+}
+
+pub(crate) fn plan_dependency_set(
+    options: &Options,
+    agent_id: &str,
+    dependencies: &[SkillPluginDependency],
+    root_name: &str,
+) -> Result<(Vec<PluginDependencyAction>, Vec<String>), Box<dyn Error>> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let catalog_items = plugin_catalog(
+        &client,
+        &options.api_base,
+        agent_id,
+        &options.agent_credential(),
+    )?;
+    let catalog = catalog_items
+        .iter()
+        .map(|item| (item.plugin_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut actions = Vec::new();
+    let mut action_indexes = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut blocked_reasons = Vec::new();
+    for dependency in dependencies {
+        resolve_dependency(
+            dependency,
+            root_name,
+            true,
+            &catalog,
+            &mut visiting,
+            &mut action_indexes,
+            &mut actions,
+            &mut blocked_reasons,
+        );
+    }
+    blocked_reasons.sort();
+    blocked_reasons.dedup();
+    Ok((actions, blocked_reasons))
+}
+
+fn install_catalog_item(
+    client: &Client,
+    options: &Options,
+    agent_id: &str,
+    item: &PluginCatalogItem,
+) -> Result<(), Box<dyn Error>> {
     if item.governance == "blocked" {
-        return Err("该插件已被组织策略禁止安装".into());
+        return Err(format!("插件 {} 已被组织策略禁止安装", item.name).into());
     }
     ensure_agent_version_supported(&item.min_agent_version)?;
-    let archive = download(&client, options, agent_id, &item)?;
-    let result = install_archive(&archive, &item);
+    let archive = download(client, options, agent_id, item)?;
+    let result = install_archive(&archive, item);
     let _ = fs::remove_file(archive);
     result
+}
+
+fn build_install_plan(
+    catalog: &[PluginCatalogItem],
+    plugin_id: &str,
+) -> Result<PluginInstallPlan, Box<dyn Error>> {
+    let plugin = catalog
+        .iter()
+        .find(|item| item.plugin_id == plugin_id)
+        .cloned()
+        .ok_or_else(|| "插件未上架或当前不可用".to_string())?;
+    let mut blocked_reasons = Vec::new();
+    if plugin.governance == "blocked" {
+        blocked_reasons.push(format!("{} 已被组织禁止使用", plugin.name));
+    }
+    if let Err(error) = ensure_agent_version_supported(&plugin.min_agent_version) {
+        blocked_reasons.push(error.to_string());
+    }
+    let catalog_by_id = catalog
+        .iter()
+        .map(|item| (item.plugin_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut actions = Vec::new();
+    let mut action_indexes = HashMap::new();
+    let mut visiting = HashSet::from([plugin_id.to_string()]);
+    for dependency in &plugin.plugin_dependencies {
+        resolve_dependency(
+            dependency,
+            &plugin.name,
+            true,
+            &catalog_by_id,
+            &mut visiting,
+            &mut action_indexes,
+            &mut actions,
+            &mut blocked_reasons,
+        );
+    }
+    blocked_reasons.sort();
+    blocked_reasons.dedup();
+    Ok(PluginInstallPlan {
+        plugin,
+        dependency_actions: actions,
+        ready: blocked_reasons.is_empty(),
+        blocked_reasons,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_dependency(
+    dependency: &SkillPluginDependency,
+    requested_by: &str,
+    parent_required: bool,
+    catalog: &HashMap<String, &PluginCatalogItem>,
+    visiting: &mut HashSet<String>,
+    action_indexes: &mut HashMap<String, usize>,
+    actions: &mut Vec<PluginDependencyAction>,
+    blocked_reasons: &mut Vec<String>,
+) {
+    let required = parent_required && dependency.required;
+    if visiting.contains(&dependency.plugin_id) {
+        if required {
+            blocked_reasons.push(format!("检测到插件循环依赖：{}", dependency.plugin_id));
+        }
+        return;
+    }
+    if let Some(index) = action_indexes.get(&dependency.plugin_id).copied() {
+        if required {
+            actions[index].required = true;
+        }
+        let Some(item) = catalog.get(&dependency.plugin_id).copied() else {
+            if required {
+                blocked_reasons.push(format!("缺少必需插件 {}", dependency.plugin_id));
+            }
+            return;
+        };
+        if required && item.governance == "blocked" {
+            blocked_reasons.push(format!("{} 已被组织禁止使用", item.name));
+        }
+        if required {
+            if let Err(error) = ensure_agent_version_supported(&item.min_agent_version) {
+                blocked_reasons.push(format!("{}：{error}", item.name));
+            }
+        }
+        let minimum = dependency.min_version.trim();
+        if !minimum.is_empty() && compare_versions(&item.version, minimum) == Ordering::Less {
+            if required {
+                blocked_reasons.push(format!("{} 的可用版本低于要求 v{}", item.name, minimum));
+            }
+            return;
+        }
+        let local = local_status(&dependency.plugin_id);
+        if !minimum.is_empty()
+            && !local.current_version.is_empty()
+            && compare_versions(&local.current_version, minimum) == Ordering::Less
+            && item.governance != "blocked"
+        {
+            actions[index].action = "update".to_string();
+            actions[index].reason = "升级到所需版本".to_string();
+        }
+        return;
+    }
+    let Some(item) = catalog.get(&dependency.plugin_id).copied() else {
+        if required {
+            blocked_reasons.push(format!("缺少必需插件 {}", dependency.plugin_id));
+        }
+        action_indexes.insert(dependency.plugin_id.clone(), actions.len());
+        actions.push(PluginDependencyAction {
+            plugin_id: dependency.plugin_id.clone(),
+            plugin_name: dependency.plugin_id.clone(),
+            plugin_description: String::new(),
+            required,
+            current_version: String::new(),
+            target_version: String::new(),
+            action: "unavailable".to_string(),
+            reason: "插件未上架".to_string(),
+            requested_by: requested_by.to_string(),
+        });
+        return;
+    };
+    visiting.insert(dependency.plugin_id.clone());
+    for child in &item.plugin_dependencies {
+        resolve_dependency(
+            child,
+            &item.name,
+            required,
+            catalog,
+            visiting,
+            action_indexes,
+            actions,
+            blocked_reasons,
+        );
+    }
+    visiting.remove(&dependency.plugin_id);
+    let local = local_status(&dependency.plugin_id);
+    let minimum = dependency.min_version.trim();
+    let local_satisfied = !local.current_version.is_empty()
+        && (minimum.is_empty()
+            || compare_versions(&local.current_version, minimum) != Ordering::Less);
+    let (action, reason) = if item.governance == "blocked" {
+        if required {
+            blocked_reasons.push(format!("{} 已被组织禁止使用", item.name));
+        }
+        ("blocked", "组织策略禁止安装")
+    } else if let Err(error) = ensure_agent_version_supported(&item.min_agent_version) {
+        if required {
+            blocked_reasons.push(format!("{}：{error}", item.name));
+        }
+        ("blocked", "当前 Agent 版本不满足要求")
+    } else if !minimum.is_empty() && compare_versions(&item.version, minimum) == Ordering::Less {
+        if required {
+            blocked_reasons.push(format!("{} 的可用版本低于要求 v{}", item.name, minimum));
+        }
+        ("blocked", "可用版本不满足最低要求")
+    } else if local_satisfied {
+        ("satisfied", "本机版本已满足")
+    } else if local.current_version.is_empty() {
+        ("install", "安装所需插件")
+    } else {
+        ("update", "升级到所需版本")
+    };
+    action_indexes.insert(dependency.plugin_id.clone(), actions.len());
+    actions.push(PluginDependencyAction {
+        plugin_id: dependency.plugin_id.clone(),
+        plugin_name: item.name.clone(),
+        plugin_description: item.description.clone(),
+        required,
+        current_version: local.current_version,
+        target_version: item.version.clone(),
+        action: action.to_string(),
+        reason: reason.to_string(),
+        requested_by: requested_by.to_string(),
+    });
+}
+
+fn compensate_plugin_changes(changes: &[(String, LocalPluginStatus)]) {
+    for (plugin_id, before) in changes.iter().rev() {
+        let current = local_status(plugin_id);
+        if before.current_version.is_empty() {
+            let _ = remove_for_policy(plugin_id);
+        } else if current.current_version != before.current_version {
+            let _ = rollback(plugin_id);
+        }
+        if !before.enabled {
+            let _ = set_enabled(plugin_id, false);
+        }
+    }
+}
+
+fn dependency_references_at(root: &Path) -> Result<HashSet<String>, Box<dyn Error>> {
+    let path = root.join("dependency-references.json");
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    Ok(serde_json::from_slice::<Vec<String>>(&fs::read(path)?)?
+        .into_iter()
+        .collect())
+}
+
+fn add_dependency_reference_at(root: &Path, owner: &str) -> Result<(), Box<dyn Error>> {
+    if !root.exists() {
+        return Err("依赖插件尚未安装".into());
+    }
+    let mut references = dependency_references_at(root)?;
+    references.insert(owner.to_string());
+    let mut values = references.into_iter().collect::<Vec<_>>();
+    values.sort();
+    fs::write(
+        root.join("dependency-references.json"),
+        serde_json::to_vec_pretty(&values)?,
+    )?;
+    Ok(())
+}
+
+fn owner_dependency_ids_in(registry: &Path, owner: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(registry) else {
+        return Vec::new();
+    };
+    let mut result = entries
+        .flatten()
+        .filter_map(|entry| {
+            dependency_references_at(&entry.path())
+                .ok()
+                .filter(|references| references.contains(owner))
+                .map(|_| entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    result.sort();
+    result
+}
+
+pub(crate) fn owner_dependency_ids(owner: &str) -> Vec<String> {
+    owner_dependency_ids_in(&plugin_registry_dir(), owner)
+}
+
+fn remove_owner_references_from(registry: &Path, owner: &str) {
+    let Ok(entries) = fs::read_dir(registry) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(mut references) = dependency_references_at(&entry.path()) else {
+            continue;
+        };
+        if !references.remove(owner) {
+            continue;
+        }
+        let path = entry.path().join("dependency-references.json");
+        if references.is_empty() {
+            let _ = fs::remove_file(path);
+        } else {
+            let mut values = references.into_iter().collect::<Vec<_>>();
+            values.sort();
+            let _ = fs::write(path, serde_json::to_vec_pretty(&values).unwrap_or_default());
+        }
+    }
+}
+
+pub(crate) fn remove_owner_references(owner: &str) {
+    remove_owner_references_from(&plugin_registry_dir(), owner);
+}
+
+fn set_owner_references_in(
+    registry: &Path,
+    owner: &str,
+    plugin_ids: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let previous = owner_dependency_ids_in(registry, owner);
+    remove_owner_references_from(registry, owner);
+    let mut unique_ids = plugin_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    unique_ids.sort();
+    for plugin_id in unique_ids {
+        if let Err(error) = add_dependency_reference_at(&registry.join(&plugin_id), owner) {
+            remove_owner_references_from(registry, owner);
+            for previous_id in &previous {
+                let _ = add_dependency_reference_at(&registry.join(previous_id), owner);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn set_owner_references(
+    owner: &str,
+    plugin_ids: &[String],
+) -> Result<(), Box<dyn Error>> {
+    for plugin_id in plugin_ids {
+        let _ = plugin_root(plugin_id)?;
+    }
+    set_owner_references_in(&plugin_registry_dir(), owner, plugin_ids)
+}
+
+fn ensure_plugin_not_referenced(root: &Path) -> Result<(), Box<dyn Error>> {
+    let references = dependency_references_at(root)?;
+    if references.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("该插件仍被 {} 个 Skill 或插件使用", references.len()).into())
+    }
 }
 
 pub(crate) fn rollback(plugin_id: &str) -> Result<(), Box<dyn Error>> {
@@ -211,9 +650,52 @@ pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
     if matches!(governance.as_str(), "required" | "managed") {
         return Err("核心或组织管理插件不允许卸载".into());
     }
+    ensure_plugin_not_referenced(&root)?;
     if root.exists() {
         fs::remove_dir_all(root)?;
     }
+    remove_owner_references(&format!("plugin:{plugin_id}"));
+    Ok(())
+}
+
+pub(crate) fn remove_for_policy(plugin_id: &str) -> Result<(), Box<dyn Error>> {
+    if is_builtin_plugin(plugin_id) {
+        return Err("内置系统扩展不能由分发策略移除".into());
+    }
+    let root = plugin_root(plugin_id)?;
+    ensure_plugin_not_referenced(&root)?;
+    if root.exists() {
+        fs::remove_dir_all(root)?;
+    }
+    remove_owner_references(&format!("plugin:{plugin_id}"));
+    Ok(())
+}
+
+pub(crate) fn apply_effective_policy(
+    plugin_id: &str,
+    governance: &str,
+    source: &str,
+    assignment_id: &str,
+    reason: &str,
+    allow_disable: bool,
+    allow_uninstall: bool,
+) -> Result<(), Box<dyn Error>> {
+    let root = plugin_root(plugin_id)?;
+    let current = root.join("current");
+    if !current.exists() {
+        return Ok(());
+    }
+    fs::write(
+        current.join("policy.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "governance": governance,
+            "source": source,
+            "assignment_id": assignment_id,
+            "reason": reason,
+            "allow_disable": allow_disable,
+            "allow_uninstall": allow_uninstall,
+        }))?,
+    )?;
     Ok(())
 }
 
@@ -394,7 +876,17 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
         copy_dir(&version_dir, &next)?;
         fs::write(
             next.join("policy.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({"governance": item.governance}))?,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "governance": item.governance,
+                "source": item.source,
+                "assignment": item.assignment,
+                "management": item.management,
+                "install_mode": item.install_mode,
+                "assignment_id": "",
+                "reason": item.organization_reason,
+                "allow_disable": item.allow_disable,
+                "allow_uninstall": item.allow_uninstall,
+            }))?,
         )?;
         let current = root.join("current");
         let previous = root.join("previous");
@@ -446,7 +938,7 @@ fn ensure_agent_version_supported(minimum: &str) -> Result<(), Box<dyn Error>> {
     if minimum.is_empty() {
         return Ok(());
     }
-    if compare_versions(crate::VERSION, minimum) < 0 {
+    if compare_versions(crate::VERSION, minimum) == Ordering::Less {
         return Err(format!(
             "当前 Agent {} 不满足插件最低版本 {}",
             crate::VERSION,
@@ -455,30 +947,6 @@ fn ensure_agent_version_supported(minimum: &str) -> Result<(), Box<dyn Error>> {
         .into());
     }
     Ok(())
-}
-
-fn compare_versions(left: &str, right: &str) -> i32 {
-    let parse = |value: &str| {
-        value
-            .split(['.', '-', '+'])
-            .take(3)
-            .map(|part| part.parse::<u64>().unwrap_or(0))
-            .collect::<Vec<_>>()
-    };
-    let left = parse(left);
-    let right = parse(right);
-    for index in 0..3 {
-        match left
-            .get(index)
-            .unwrap_or(&0)
-            .cmp(right.get(index).unwrap_or(&0))
-        {
-            std::cmp::Ordering::Less => return -1,
-            std::cmp::Ordering::Greater => return 1,
-            std::cmp::Ordering::Equal => {}
-        }
-    }
-    0
 }
 
 pub(crate) fn verify_plugin_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -588,9 +1056,12 @@ fn unique_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_versions, flush_status_outbox, report_status, rollback_root, set_enabled,
-        uninstall, verify_plugin_checksums,
+        add_dependency_reference_at, build_install_plan, compare_versions,
+        dependency_references_at, ensure_plugin_not_referenced, flush_status_outbox,
+        owner_dependency_ids_in, remove_owner_references_from, report_status, rollback_root,
+        set_enabled, set_owner_references_in, uninstall, verify_plugin_checksums,
     };
+    use crate::api::distribution::{PluginCatalogItem, SkillPluginDependency};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Read, Write};
@@ -601,6 +1072,240 @@ mod tests {
     fn builtin_plugins_cannot_be_disabled_or_uninstalled() {
         assert!(set_enabled("com.himind.builtin.svn", false).is_err());
         assert!(uninstall("com.himind.builtin.smb").is_err());
+    }
+
+    fn dependency(plugin_id: &str, required: bool, min_version: &str) -> SkillPluginDependency {
+        SkillPluginDependency {
+            plugin_id: plugin_id.to_string(),
+            required,
+            min_version: min_version.to_string(),
+        }
+    }
+
+    fn catalog_plugin(
+        plugin_id: &str,
+        name: &str,
+        version: &str,
+        dependencies: Vec<SkillPluginDependency>,
+    ) -> PluginCatalogItem {
+        PluginCatalogItem {
+            plugin_id: plugin_id.to_string(),
+            name: name.to_string(),
+            description: format!("{name} description"),
+            author_name: "测试团队".to_string(),
+            categories: vec!["开发工具".to_string()],
+            review_status: "approved".to_string(),
+            governance: "optional".to_string(),
+            version: version.to_string(),
+            release_notes: String::new(),
+            min_agent_version: String::new(),
+            channel: "stable".to_string(),
+            artifact_id: format!("artifact-{plugin_id}"),
+            file_name: format!("{plugin_id}.hmpkg"),
+            file_size: 1,
+            sha256: "0".repeat(64),
+            signature: String::new(),
+            signature_key_id: String::new(),
+            signature_algorithm: String::new(),
+            download_url: "http://localhost/plugin".to_string(),
+            source: "marketplace".to_string(),
+            assignment: "optional".to_string(),
+            management: "user_managed".to_string(),
+            install_mode: "prompt".to_string(),
+            organization_reason: String::new(),
+            managed: false,
+            allow_disable: true,
+            allow_uninstall: true,
+            capability_ids: Vec::new(),
+            permissions: Vec::new(),
+            view_count: 0,
+            plugin_dependencies: dependencies,
+        }
+    }
+
+    #[test]
+    fn plans_transitive_dependencies_in_install_order() {
+        let leaf_id = "com.himind.test.plan.leaf";
+        let middle_id = "com.himind.test.plan.middle";
+        let root_id = "com.himind.test.plan.root";
+        let catalog = vec![
+            catalog_plugin(leaf_id, "基础能力", "1.0.0", Vec::new()),
+            catalog_plugin(
+                middle_id,
+                "组合能力",
+                "1.0.0",
+                vec![dependency(leaf_id, true, "1.0.0")],
+            ),
+            catalog_plugin(
+                root_id,
+                "桌面工具",
+                "1.0.0",
+                vec![dependency(middle_id, true, "1.0.0")],
+            ),
+        ];
+
+        let plan = build_install_plan(&catalog, root_id).unwrap();
+
+        assert!(plan.ready, "{:?}", plan.blocked_reasons);
+        assert_eq!(
+            plan.dependency_actions
+                .iter()
+                .map(|action| action.plugin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![leaf_id, middle_id]
+        );
+        assert!(plan
+            .dependency_actions
+            .iter()
+            .all(|action| action.action == "install"));
+    }
+
+    #[test]
+    fn blocks_required_cycles_and_unsatisfied_versions() {
+        let root_id = "com.himind.test.plan.cycle-root";
+        let child_id = "com.himind.test.plan.cycle-child";
+        let catalog = vec![
+            catalog_plugin(
+                root_id,
+                "循环入口",
+                "1.0.0",
+                vec![dependency(child_id, true, "2.0.0")],
+            ),
+            catalog_plugin(
+                child_id,
+                "循环依赖",
+                "1.0.0",
+                vec![dependency(root_id, true, "1.0.0")],
+            ),
+        ];
+
+        let plan = build_install_plan(&catalog, root_id).unwrap();
+
+        assert!(!plan.ready);
+        assert!(plan
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.contains("循环依赖")));
+        assert!(plan
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.contains("低于要求")));
+    }
+
+    #[test]
+    fn optional_missing_dependency_does_not_block_install() {
+        let root_id = "com.himind.test.plan.optional-root";
+        let missing_id = "com.himind.test.plan.optional-missing";
+        let catalog = vec![catalog_plugin(
+            root_id,
+            "可选能力工具",
+            "1.0.0",
+            vec![dependency(missing_id, false, "1.0.0")],
+        )];
+
+        let plan = build_install_plan(&catalog, root_id).unwrap();
+
+        assert!(plan.ready);
+        assert_eq!(plan.dependency_actions.len(), 1);
+        assert!(!plan.dependency_actions[0].required);
+        assert_eq!(plan.dependency_actions[0].action, "unavailable");
+    }
+
+    #[test]
+    fn updates_dependency_references_atomically_and_blocks_removal() {
+        let registry = std::env::temp_dir().join(format!(
+            "himind-plugin-reference-test-{}",
+            super::unique_suffix()
+        ));
+        let first = registry.join("com.himind.test.reference.first");
+        let second = registry.join("com.himind.test.reference.second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        add_dependency_reference_at(&second, "plugin:other").unwrap();
+
+        let owner = "skill:com.himind.skill.reference-test";
+        set_owner_references_in(
+            &registry,
+            owner,
+            &[
+                "com.himind.test.reference.first".to_string(),
+                "com.himind.test.reference.second".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            owner_dependency_ids_in(&registry, owner),
+            vec![
+                "com.himind.test.reference.first".to_string(),
+                "com.himind.test.reference.second".to_string()
+            ]
+        );
+        assert!(ensure_plugin_not_referenced(&first).is_err());
+
+        set_owner_references_in(
+            &registry,
+            owner,
+            &["com.himind.test.reference.second".to_string()],
+        )
+        .unwrap();
+        assert!(dependency_references_at(&first).unwrap().is_empty());
+        assert_eq!(dependency_references_at(&second).unwrap().len(), 2);
+
+        let failed = set_owner_references_in(
+            &registry,
+            owner,
+            &["com.himind.test.reference.missing".to_string()],
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            owner_dependency_ids_in(&registry, owner),
+            vec!["com.himind.test.reference.second".to_string()]
+        );
+
+        remove_owner_references_from(&registry, owner);
+        remove_owner_references_from(&registry, "plugin:other");
+        assert!(ensure_plugin_not_referenced(&second).is_ok());
+        let _ = fs::remove_dir_all(registry);
+    }
+
+    #[test]
+    fn applies_strongest_version_constraint_across_dependency_paths() {
+        let shared_id = "com.himind.test.plan.shared";
+        let first_id = "com.himind.test.plan.first";
+        let second_id = "com.himind.test.plan.second";
+        let root_id = "com.himind.test.plan.constraints-root";
+        let catalog = vec![
+            catalog_plugin(shared_id, "共享能力", "1.5.0", Vec::new()),
+            catalog_plugin(
+                first_id,
+                "低版本路径",
+                "1.0.0",
+                vec![dependency(shared_id, true, "1.0.0")],
+            ),
+            catalog_plugin(
+                second_id,
+                "高版本路径",
+                "1.0.0",
+                vec![dependency(shared_id, true, "2.0.0")],
+            ),
+            catalog_plugin(
+                root_id,
+                "约束测试工具",
+                "1.0.0",
+                vec![
+                    dependency(first_id, true, "1.0.0"),
+                    dependency(second_id, true, "1.0.0"),
+                ],
+            ),
+        ];
+
+        let plan = build_install_plan(&catalog, root_id).unwrap();
+
+        assert!(!plan.ready);
+        assert!(plan
+            .blocked_reasons
+            .iter()
+            .any(|reason| reason.contains("共享能力") && reason.contains("v2.0.0")));
     }
 
     #[test]
@@ -627,10 +1332,19 @@ mod tests {
 
     #[test]
     fn compares_agent_versions_for_plugin_minimum_gate() {
-        assert!(compare_versions("0.2.0", "0.1.9") > 0);
-        assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
-        assert!(compare_versions("0.2.0", "0.3.0") < 0);
-        assert_eq!(compare_versions("0.2.0-beta.1", "0.2.0"), 0);
+        assert_eq!(
+            compare_versions("0.2.0", "0.1.9"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("0.2.0", "0.2.0"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(compare_versions("0.2.0", "0.3.0"), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare_versions("0.2.0-beta.1", "0.2.0"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
@@ -675,6 +1389,7 @@ mod tests {
             local_port: 18181,
             enrollment_token: String::new(),
             agent_credential: Arc::new(RwLock::new("credential".to_string())),
+            platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
         };
 

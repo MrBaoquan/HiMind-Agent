@@ -82,7 +82,7 @@ export function SettingsPage({
   const configured = loginState.status === 'credentials_configured';
   return (
     <>
-      <PageHeader title="设置" description="管理本机凭据、审批策略与 Windows 启动行为。" />
+      <PageHeader title="设置" description="管理本机账号、操作确认和启动设置。" />
       <div className="settings-layout">
         <section className="card settings-section">
           <div className="card-header"><span>内网账号</span><Pill kind={configured ? 'success' : 'warn'}>{configured ? '已配置' : '待配置'}</Pill></div>
@@ -92,7 +92,7 @@ export function SettingsPage({
               <div><span>当前账号</span><strong>{loginState.account || '未保存账号'}</strong></div>
               <button className="btn" onClick={onOpenLoginModal}>{configured ? '更新凭据' : '配置账号'}</button>
             </div>
-            <div className="security-note compact"><ShieldCheck size={16} /><span>凭据加密保存在本机，不会写入 Dashboard 数据库或日志。</span></div>
+            <div className="security-note compact"><ShieldCheck size={16} /><span>账号信息已加密保存在本机，不会写入 HiMind 工作台或日志。</span></div>
           </div>
         </section>
         <section className="card settings-section">
@@ -105,7 +105,7 @@ export function SettingsPage({
                 <div className="actions-row"><button className="btn" onClick={onTestSvnConnection}>测试</button><button className="btn" onClick={onOpenSvnModal}>更新账号</button><button className="btn btn-danger-quiet" onClick={onRemoveSvnConnection}>清除</button></div>
               </div>
             </div> : <div className="account-row"><div className="account-icon"><Database size={17} /></div><div><span>公司 SVN</span><strong>尚未配置个人账号</strong></div><button className="btn btn-primary" onClick={onOpenSvnModal}>配置账号</button></div>}
-            <div className="security-note compact"><ShieldCheck size={16} /><span>密码仅保存在当前 Windows 用户的本地加密存储中，不会发送给 Dashboard 或 MCP。</span></div>
+            <div className="security-note compact"><ShieldCheck size={16} /><span>密码只保存在当前 Windows 用户的本地加密存储中，不会发送给 HiMind 工作台或 AI 工具。</span></div>
           </div>
         </section>
         <section className="card settings-section">
@@ -135,7 +135,7 @@ export function SettingsPage({
         <section className="card settings-section">
           <div className="card-header">系统启动</div>
           <div className="card-body setting-list">
-            <SettingRow title="开机自启" description="Windows 登录后自动启动 Agent"><label className="toggle"><input type="checkbox" checked={settings.auto_start} onChange={event => onAutoStartChange(event.target.checked)} /><span className="slider"></span></label></SettingRow>
+            <SettingRow title="开机自启" description="登录 Windows 后自动启动 HiMind Agent"><label className="toggle"><input type="checkbox" checked={settings.auto_start} onChange={event => onAutoStartChange(event.target.checked)} /><span className="slider"></span></label></SettingRow>
           </div>
         </section>
       </div>

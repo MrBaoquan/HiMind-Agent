@@ -291,14 +291,14 @@ fn stored_inner_admin_account() -> Option<String> {
     }
 }
 
-fn protect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
+pub(crate) fn protect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
     run_powershell_script(
         r#"$plain = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $plain -AsPlainText -Force; ConvertFrom-SecureString $secure"#,
         secret,
     )
 }
 
-fn unprotect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
+pub(crate) fn unprotect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
     run_powershell_script(
         r#"$encrypted = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $encrypted; $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }"#,
         secret,

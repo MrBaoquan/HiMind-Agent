@@ -59,7 +59,12 @@ fn main() {
         std::process::exit(1);
     }
     let options = Options::from_env();
-    if let Some(arguments) = skill_cli_arguments() {
+    if let Some(arguments) = auth_cli_arguments() {
+        if let Err(error) = run_auth_cli(&options, &arguments) {
+            eprintln!("auth command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = skill_cli_arguments() {
         if let Err(error) = run_skill_cli(&options, &arguments) {
             eprintln!("skill command failed: {error}");
             std::process::exit(1);
@@ -85,6 +90,71 @@ fn main() {
     }
 }
 
+fn auth_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "auth")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_auth_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments.first().map(String::as_str) {
+        Some("login") => {
+            let authorization = api::oauth::begin_device_authorization(options)?;
+            println!("Open {}", authorization.verification_uri_complete);
+            println!("Verification page: {}", authorization.verification_uri);
+            println!("Authorization code: {}", authorization.user_code);
+            let _ = app::system::open_url(&authorization.verification_uri_complete);
+            let access = api::oauth::wait_for_device_authorization(options, &authorization)?;
+            println!(
+                "Agent {} is authorized as Dashboard user {} with scopes: {}",
+                access.agent_id, access.user_id, access.scope
+            );
+        }
+        Some("status") => {
+            let access = api::oauth::platform_access_token(options, api::oauth::PROFILE_SCOPE)?;
+            println!(
+                "Agent {} represents Dashboard user {} with scopes: {}",
+                access.agent_id, access.user_id, access.scope
+            );
+        }
+        Some("logout") => {
+            api::oauth::revoke_authorization(options)?;
+            println!("Delegated Dashboard authorization revoked");
+        }
+        Some("logout-local") => {
+            api::oauth::clear_authorization(&options.state_path)?;
+            if let Ok(mut cache) = options.platform_access.write() {
+                *cache = None;
+            }
+            println!("Local delegated authorization removed without server revocation");
+        }
+        Some("rotate-device") => {
+            let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+            let state = api::client::load_or_register(
+                &client,
+                &options.api_base,
+                &options.state_path,
+                VERSION,
+                &options.enrollment_token,
+            )?;
+            let rotated = api::client::rotate_agent_credential(
+                &client,
+                &options.api_base,
+                &options.state_path,
+                &state,
+            )?;
+            options.set_agent_credential(&rotated.credential);
+            println!("Agent {} device credential rotated", rotated.agent_id);
+        }
+        _ => {
+            return Err(
+                "usage: himind-agent auth <login|status|logout|logout-local|rotate-device>".into(),
+            )
+        }
+    }
+    Ok(())
+}
+
 fn plugin_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "plugin")?;
@@ -102,8 +172,7 @@ fn run_skill_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn 
 }
 
 fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let state: api::types::AgentState =
-        serde_json::from_str(&std::fs::read_to_string(&options.state_path)?)?;
+    let state = api::client::load_agent_state(&options.state_path)?;
     options.set_agent_credential(&state.credential);
     match arguments.first().map(String::as_str) {
         Some("list") => println!("{}", capability::plugin::registry_json()?),
@@ -173,6 +242,7 @@ pub(crate) struct Options {
     local_port: u16,
     enrollment_token: String,
     agent_credential: Arc<RwLock<String>>,
+    platform_access: Arc<RwLock<Option<api::oauth::AgentAccessToken>>>,
     task_execution: Arc<RwLock<Option<(String, String)>>>,
 }
 
@@ -230,6 +300,7 @@ impl Options {
             local_port,
             enrollment_token,
             agent_credential: Arc::new(RwLock::new(String::new())),
+            platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
         }
     }

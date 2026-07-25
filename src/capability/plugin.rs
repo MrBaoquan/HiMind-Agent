@@ -44,6 +44,8 @@ pub(crate) struct PluginCapabilityManifest {
 pub(crate) struct PluginManifest {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_plugin_author")]
+    pub author: String,
     #[serde(default)]
     pub description: String,
     pub version: String,
@@ -60,7 +62,18 @@ pub(crate) struct PluginManifest {
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(default)]
+    pub plugin_dependencies: Vec<PluginDependencyManifest>,
+    #[serde(default)]
     pub contributes: PluginContributions,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct PluginDependencyManifest {
+    pub plugin_id: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub min_version: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -90,6 +103,8 @@ pub(crate) struct PluginCommandContribution {
 pub(crate) struct PluginRegistryItem {
     pub id: String,
     pub name: String,
+    pub author_name: String,
+    pub description: String,
     pub version: String,
     pub runtime: String,
     pub min_agent_version: String,
@@ -105,6 +120,7 @@ pub(crate) struct PluginRegistryItem {
     pub rollback_available: bool,
     pub capabilities: Vec<PluginCapabilityManifest>,
     pub permissions: Vec<String>,
+    pub plugin_dependencies: Vec<PluginDependencyManifest>,
     pub views: Vec<PluginViewContribution>,
     pub commands: Vec<PluginCommandContribution>,
     pub error: Option<String>,
@@ -121,6 +137,9 @@ pub(crate) fn plugin_registry_dir() -> PathBuf {
 }
 
 fn development_registry_path() -> PathBuf {
+    if let Some(path) = env::var_os("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY") {
+        return PathBuf::from(path);
+    }
     plugin_registry_dir()
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -204,7 +223,7 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
     if root.exists() {
         for entry in fs::read_dir(&root)?.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            if !is_plugin_install_directory(&path) {
                 continue;
             }
             items.push(read_plugin_item(path, false));
@@ -216,6 +235,12 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
     }
     items.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(items)
+}
+
+fn is_plugin_install_directory(path: &std::path::Path) -> bool {
+    path.is_dir()
+        && (path.join("plugin.json").is_file()
+            || path.join("current").join("plugin.json").is_file())
 }
 
 pub(crate) fn is_builtin_plugin(plugin_id: &str) -> bool {
@@ -276,6 +301,8 @@ fn builtin_plugin(
     PluginRegistryItem {
         id: id.to_string(),
         name: name.to_string(),
+        author_name: "马宝全".to_string(),
+        description: description.to_string(),
         version: crate::VERSION.to_string(),
         runtime: "builtin".to_string(),
         min_agent_version: crate::VERSION.to_string(),
@@ -302,6 +329,7 @@ fn builtin_plugin(
             .iter()
             .map(|value| (*value).to_string())
             .collect(),
+        plugin_dependencies: Vec::new(),
         views: Vec::new(),
         commands: Vec::new(),
         error: None,
@@ -427,6 +455,8 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             PluginRegistryItem {
                 id: manifest.id,
                 name: manifest.name,
+                author_name: manifest.author,
+                description: manifest.description,
                 version: manifest.version,
                 runtime: manifest.runtime,
                 min_agent_version: manifest.min_agent_version,
@@ -452,6 +482,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                     && path.join("previous").join("plugin.json").exists(),
                 capabilities: manifest.capabilities,
                 permissions: manifest.permissions,
+                plugin_dependencies: manifest.plugin_dependencies,
                 views: manifest.contributes.views,
                 commands: manifest.contributes.commands,
                 error: validation
@@ -465,6 +496,8 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
         Err(error) => PluginRegistryItem {
             id: default_id.clone(),
             name: default_id,
+            author_name: "未知作者".to_string(),
+            description: String::new(),
             version: String::new(),
             runtime: String::new(),
             min_agent_version: String::new(),
@@ -480,6 +513,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             rollback_available: false,
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            plugin_dependencies: Vec::new(),
             views: Vec::new(),
             commands: Vec::new(),
             error: Some(error.to_string()),
@@ -963,8 +997,16 @@ fn default_risk_level() -> String {
     "read_only".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_plugin_governance() -> String {
     "optional".to_string()
+}
+
+fn default_plugin_author() -> String {
+    "未知作者".to_string()
 }
 
 fn default_view_location() -> String {
@@ -975,6 +1017,21 @@ fn default_view_location() -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn ignores_registry_support_directories_without_plugin_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-scan-test-{}", next_request_id()));
+        let candidates = root.join("candidates");
+        let installed = root.join("com.himind.example").join("current");
+        fs::create_dir_all(&candidates).unwrap();
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("plugin.json"), "{}").unwrap();
+
+        assert!(!is_plugin_install_directory(&candidates));
+        assert!(is_plugin_install_directory(installed.parent().unwrap()));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn plugin_health_opens_at_threshold_and_clears_on_success() {
@@ -1004,6 +1061,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
+            author: "测试作者".to_string(),
             description: String::new(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
@@ -1012,6 +1070,7 @@ mod tests {
             governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
@@ -1036,6 +1095,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
+            author: "测试作者".to_string(),
             description: String::new(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
@@ -1044,6 +1104,7 @@ mod tests {
             governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
@@ -1072,6 +1133,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
+            author: "测试作者".to_string(),
             description: String::new(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
@@ -1080,6 +1142,7 @@ mod tests {
             governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),

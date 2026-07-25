@@ -3,13 +3,55 @@ use crate::skill::manifest::{
 };
 use crate::skill::resolver::compare_versions;
 use crate::skill::types::{SkillManifest, SkillPointer, SkillRecord, SkillScope};
-use crate::VERSION;
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SkillManagementPolicy {
+    #[serde(default = "default_skill_management")]
+    pub management: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub assignment_id: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default = "default_policy_true")]
+    pub allow_uninstall: bool,
+}
+
+fn default_skill_management() -> String {
+    "user_managed".to_string()
+}
+
+fn default_policy_true() -> bool {
+    true
+}
+
+pub(crate) const SKILL_SYNC_MODE_COPY: &str = "copy";
+pub(crate) const SKILL_SYNC_MODE_SYMLINK: &str = "symlink";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SkillSyncSettings {
+    #[serde(default = "default_skill_sync_mode")]
+    pub mode: String,
+}
+
+fn default_skill_sync_mode() -> String {
+    SKILL_SYNC_MODE_COPY.to_string()
+}
+
+pub(crate) fn normalize_skill_sync_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        SKILL_SYNC_MODE_COPY => Some(SKILL_SYNC_MODE_COPY),
+        SKILL_SYNC_MODE_SYMLINK => Some(SKILL_SYNC_MODE_SYMLINK),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SkillSeed {
@@ -35,13 +77,67 @@ impl SkillStore {
         &self.root
     }
 
+    pub(crate) fn sync_settings(&self) -> Result<SkillSyncSettings, Box<dyn Error>> {
+        let path = self.root.join("sync-settings.json");
+        if !path.exists() {
+            return Ok(SkillSyncSettings {
+                mode: default_skill_sync_mode(),
+            });
+        }
+        let content = fs::read_to_string(path)?;
+        let mut settings: SkillSyncSettings =
+            serde_json::from_str(content.trim_start_matches('\u{feff}'))?;
+        settings.mode = normalize_skill_sync_mode(&settings.mode)
+            .unwrap_or(SKILL_SYNC_MODE_COPY)
+            .to_string();
+        Ok(settings)
+    }
+
+    pub(crate) fn sync_mode(&self) -> Result<String, Box<dyn Error>> {
+        Ok(self.sync_settings()?.mode)
+    }
+
+    pub(crate) fn set_sync_mode(&self, mode: &str) -> Result<SkillSyncSettings, Box<dyn Error>> {
+        let mode = normalize_skill_sync_mode(mode).ok_or_else(|| {
+            format!("unsupported Skill sync mode: {mode}; expected copy or symlink")
+        })?;
+        fs::create_dir_all(&self.root)?;
+        let settings = SkillSyncSettings {
+            mode: mode.to_string(),
+        };
+        fs::write(
+            self.root.join("sync-settings.json"),
+            serde_json::to_vec_pretty(&settings)?,
+        )?;
+        Ok(settings)
+    }
+
     pub(crate) fn bootstrap_builtin_skills(&self) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(self.root.join("builtin"))?;
         fs::create_dir_all(self.root.join("managed"))?;
         fs::create_dir_all(self.root.join("user"))?;
         fs::create_dir_all(self.root.join("rendered"))?;
+        self.retire_removed_skills()?;
         for seed in builtin_skill_seeds() {
             self.ensure_seed(&seed)?;
+        }
+        Ok(())
+    }
+
+    fn retire_removed_skills(&self) -> Result<(), Box<dyn Error>> {
+        for skill_id in retired_skill_ids() {
+            for scope in ["builtin", "managed", "user"] {
+                let skill_root = self.root.join(scope).join(skill_id);
+                if skill_root.exists() {
+                    fs::remove_dir_all(skill_root)?;
+                }
+            }
+            for client in ["codex", "github-copilot", "workbuddy"] {
+                let rendered_root = self.root.join("rendered").join(client).join(skill_id);
+                if rendered_root.exists() {
+                    fs::remove_dir_all(rendered_root)?;
+                }
+            }
         }
         Ok(())
     }
@@ -88,6 +184,54 @@ impl SkillStore {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) fn remove_organization_skill(&self, skill_id: &str) -> Result<bool, Box<dyn Error>> {
+        if skill_id.is_empty()
+            || !skill_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("Skill ID 无效".into());
+        }
+        let root = self.skill_root_for_scope(&SkillScope::Organization, skill_id);
+        let existed = root.exists();
+        if existed {
+            fs::remove_dir_all(&root)?;
+        }
+        for client in ["codex", "github-copilot", "workbuddy"] {
+            let rendered = self.rendered_skill_root(client, skill_id);
+            if rendered.exists() {
+                fs::remove_dir_all(rendered)?;
+            }
+        }
+        Ok(existed)
+    }
+
+    pub(crate) fn apply_management_policy(
+        &self,
+        skill_id: &str,
+        policy: &SkillManagementPolicy,
+    ) -> Result<(), Box<dyn Error>> {
+        let root = self.skill_root_for_scope(&SkillScope::Organization, skill_id);
+        if !root.exists() {
+            return Ok(());
+        }
+        fs::write(root.join("policy.json"), serde_json::to_vec_pretty(policy)?)?;
+        Ok(())
+    }
+
+    pub(crate) fn management_policy(
+        &self,
+        skill_id: &str,
+    ) -> Result<Option<SkillManagementPolicy>, Box<dyn Error>> {
+        let path = self
+            .skill_root_for_scope(&SkillScope::Organization, skill_id)
+            .join("policy.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
     }
 
     pub(crate) fn rendered_skill_root(&self, client_id: &str, skill_id: &str) -> PathBuf {
@@ -307,65 +451,14 @@ fn now_stamp() -> String {
 }
 
 fn builtin_skill_seeds() -> Vec<SkillSeed> {
-    vec![SkillSeed {
-        manifest: SkillManifest {
-            id: "com.himind.skill.environment-doctor".to_string(),
-            name: "环境诊断".to_string(),
-            version: format!("{VERSION}+zh.1"),
-            scope: SkillScope::Builtin,
-            description: "为 Codex 和其他 AI 客户端执行只读的 Agent 环境与依赖检查。".to_string(),
-            min_agent_version: VERSION.to_string(),
-            supported_clients: vec!["codex".to_string()],
-            capabilities: vec![
-                crate::skill::types::SkillCapabilityDependency {
-                    id: "system.health".to_string(),
-                    required: true,
-                    min_version: Some("1.0.0".to_string()),
-                    max_version: None,
-                    provider: Some("agent".to_string()),
-                },
-                crate::skill::types::SkillCapabilityDependency {
-                    id: "plugin.list".to_string(),
-                    required: true,
-                    min_version: Some("1.0.0".to_string()),
-                    max_version: None,
-                    provider: Some("agent".to_string()),
-                },
-                crate::skill::types::SkillCapabilityDependency {
-                    id: "inner_admin.login_status".to_string(),
-                    required: false,
-                    min_version: Some("1.0.0".to_string()),
-                    max_version: None,
-                    provider: Some("agent".to_string()),
-                },
-            ],
-            plugin_dependencies: vec![],
-            risk_summary: "read_only".to_string(),
-            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
-        },
-        readme: r#"# 环境诊断
+    Vec::new()
+}
 
-在 AI 开始调用本机能力前，检查 HiMind Agent 环境是否就绪。
-
-## 使用场景
-
-- 检查 Agent 是否在线。
-- 查看当前可用 Capability。
-- 确认插件和登录状态是否就绪。
-
-## 输出
-
-- 只返回摘要。
-- 不执行写操作。
-- 不展示凭据。
-
-## 禁止事项
-
-- 不安装插件。
-- 不修改 Agent 设置。
-- 不输出 Secret 或 Token。
-"#,
-    }]
+pub(crate) fn retired_skill_ids() -> &'static [&'static str] {
+    &[
+        "com.himind.skill.environment-doctor",
+        "com.himind.skill.image-delivery-preflight",
+    ]
 }
 
 #[cfg(test)]
@@ -373,16 +466,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstraps_builtin_skill_seed() {
+    fn retires_removed_builtin_skill_seed() {
         let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
         let store = SkillStore { root: root.clone() };
+        let retired_builtin = root
+            .join("builtin")
+            .join("com.himind.skill.environment-doctor");
+        let retired_managed = root
+            .join("managed")
+            .join("com.himind.skill.image-delivery-preflight");
+        fs::create_dir_all(&retired_builtin).unwrap();
+        fs::create_dir_all(&retired_managed).unwrap();
+        fs::write(retired_builtin.join("legacy.txt"), "retired").unwrap();
+        fs::write(retired_managed.join("legacy.txt"), "retired").unwrap();
         store.bootstrap_builtin_skills().unwrap();
         let records = store.list_records().unwrap();
-        assert_eq!(records.len(), 1);
+        assert!(records.is_empty());
+        assert!(!retired_builtin.exists());
+        assert!(!retired_managed.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mode_defaults_to_copy_and_persists_supported_values() {
+        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
+        let store = SkillStore { root: root.clone() };
+        assert_eq!(store.sync_mode().unwrap(), SKILL_SYNC_MODE_COPY);
         assert_eq!(
-            records[0].manifest.id,
-            "com.himind.skill.environment-doctor"
+            store.set_sync_mode(SKILL_SYNC_MODE_SYMLINK).unwrap().mode,
+            SKILL_SYNC_MODE_SYMLINK
         );
+        assert_eq!(store.sync_mode().unwrap(), SKILL_SYNC_MODE_SYMLINK);
+        assert!(store.set_sync_mode("junction").is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -396,6 +511,8 @@ mod tests {
         let current_manifest = SkillManifest {
             id: "demo.skill".to_string(),
             name: "Demo".to_string(),
+            author: String::new(),
+            categories: vec![],
             version: current_version.to_string(),
             scope: SkillScope::Builtin,
             description: String::new(),
@@ -446,10 +563,12 @@ mod tests {
         let manifest = SkillManifest {
             id: "com.himind.skill.immutable-test".to_string(),
             name: "Immutable Test".to_string(),
+            author: String::new(),
+            categories: vec![],
             version: "1.0.0".to_string(),
             scope: SkillScope::Organization,
             description: String::new(),
-            min_agent_version: VERSION.to_string(),
+            min_agent_version: crate::VERSION.to_string(),
             supported_clients: vec!["codex".to_string()],
             capabilities: vec![],
             plugin_dependencies: vec![],

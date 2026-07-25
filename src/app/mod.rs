@@ -1,5 +1,8 @@
+pub(crate) mod ai_clients;
 pub(crate) mod commands;
+pub(crate) mod extension_reconciler;
 pub mod http;
+pub(crate) mod identity;
 pub(crate) mod plugin_manager;
 pub(crate) mod security;
 pub mod service;

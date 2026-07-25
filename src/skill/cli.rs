@@ -1,7 +1,8 @@
 use crate::capability::types::{InvocationContext, InvocationSource};
 use crate::skill::resolver::CapabilityFact;
 use crate::skill::{
-    catalog_json, codex_status_json, codex_sync_json, codex_sync_one_json, codex_uninstall_json,
+    catalog_json, client_status_json, client_sync_json, sync_record_to_supported_clients,
+    uninstall_supported_clients_json,
 };
 use crate::{Options, VERSION};
 use std::error::Error;
@@ -14,11 +15,11 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         }
         Some("status") => {
             let capability_facts = capability_facts_for_cli(options)?;
-            print_json(codex_status_json(VERSION, &capability_facts)?)?
+            print_json(client_status_json(VERSION, &capability_facts)?)?
         }
         Some("sync") => {
             let capability_facts = capability_facts_for_cli(options)?;
-            print_json(codex_sync_json(VERSION, &capability_facts)?)?
+            print_json(client_sync_json(VERSION, &capability_facts)?)?
         }
 		Some("market") => {
 			let state = paired_agent_state(options)?;
@@ -31,11 +32,15 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
 			let (catalog_item, record) =
 				crate::app::skill_manager::install(options, &state.agent_id, &arguments[1])?;
 			let capability_facts = capability_facts_for_cli(options)?;
-			let codex = codex_sync_one_json(&arguments[1], VERSION, &capability_facts)?;
+			let clients =
+				sync_record_to_supported_clients(&record, VERSION, &capability_facts)?;
 			print_json(serde_json::json!({
 				"catalog_item": catalog_item,
 				"record": record,
-				"codex": codex,
+				"codex": clients.get("codex"),
+				"github_copilot": clients.get("github-copilot"),
+				"workbuddy": clients.get("workbuddy"),
+				"clients": clients,
 			}))?
 		}
         Some("author") if arguments.get(1).map(String::as_str) == Some("list") => {
@@ -90,7 +95,7 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             )?)?)?
         }
         Some("uninstall") if arguments.len() == 2 => {
-            print_json(codex_uninstall_json(&arguments[1])?)?
+            print_json(uninstall_supported_clients_json(&arguments[1])?)?
         }
         _ => {
             return Err(
@@ -102,8 +107,7 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
 }
 
 fn paired_agent_state(options: &Options) -> Result<crate::api::types::AgentState, Box<dyn Error>> {
-    let state: crate::api::types::AgentState =
-        serde_json::from_str(&std::fs::read_to_string(&options.state_path)?)?;
+    let state = crate::api::client::load_agent_state(&options.state_path)?;
     options.set_agent_credential(&state.credential);
     Ok(state)
 }

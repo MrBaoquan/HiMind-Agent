@@ -39,6 +39,8 @@ Agent 主窗口前端采用 React + TypeScript + Vite：`frontend/src/` 按 Shel
 
 本地 HTTP 已按 ADR 0022 启用 Origin/Host 信任边界：浏览器默认只能从当前 `--api` 的 Dashboard Origin 调用，响应不再返回通配 CORS；无 Origin 的本机脚本保持兼容。额外可信 Dashboard Origin 通过 `HIMIND_AGENT_ALLOWED_ORIGINS` 配置。自更新下载必须与当前 Dashboard API 同源，并在替换前验证完整 SHA-256。
 
+Agent 的 Dashboard 用户身份使用 OAuth 设备授权和轮换 refresh token，不依赖浏览器持续在线。设备 credential 与 refresh token 通过当前 Windows 用户 DPAPI 保护，access token 只保存在内存；设备 credential 默认每 30 天自动轮换。主窗口会显示当前 Dashboard 代表用户，并提供浏览器设备授权、撤销和在线验证。“AI 接入”页首批支持 Codex、GitHub Copilot 与 WorkBuddy 的 MCP 配置、备份合并和连接自检，客户端通过 `himind-agent.exe --mcp` 连接，并使用非敏感 `HIMIND_AI_CLIENT_ID` 标识调用来源。MCP 配置不得写入 Dashboard session、Agent credential 或 OAuth token。完整流程、CLI 和安全边界见 [Agent 身份、OAuth 与外部 AI 接入](../docs/agent-identity-and-oauth.md)。
+
 本机已提供示例插件 `demo-multi-cap`（位于 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/demo-multi-cap`），声明 `demo.echo`、`demo.time`、`demo.stats` 三项能力，用于验证一个插件对应一组能力、能力合并到 Gateway 和通过 `/capabilities/invoke` 调用的端到端链路。
 
 从仓库根目录可直接执行：

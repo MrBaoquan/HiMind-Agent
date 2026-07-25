@@ -55,7 +55,7 @@ export function EmptyState({ icon: Icon, title, text }: { icon: LucideIcon; titl
   );
 }
 
-export function Pill({ kind, children }: { kind: 'success' | 'warn' | 'danger'; children: ReactNode }) {
+export function Pill({ kind, children }: { kind: 'success' | 'warn' | 'danger' | 'neutral'; children: ReactNode }) {
   return <span className={`pill ${kind}`}>{children}</span>;
 }
 

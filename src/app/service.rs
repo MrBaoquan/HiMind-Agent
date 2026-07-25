@@ -283,6 +283,7 @@ fn handle_local_http(
             ) {
                 Ok(state) => {
                     options.set_agent_credential(&state.credential);
+                    crate::api::oauth::cache_registration_access(&options, &state);
                     if let Ok(mut status) = worker_status.lock() {
                         status.dashboard_agent_id = state.agent_id.clone();
                         status.dashboard_worker_error = "正在完成连接".to_string();

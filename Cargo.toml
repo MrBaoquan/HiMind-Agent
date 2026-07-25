@@ -28,7 +28,7 @@ required-features = ["mcp-console"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "cookies"] }
 serde = { version = "1", features = ["derive"] }
@@ -42,3 +42,5 @@ base64 = "0.22"
 rsa = { version = "0.9", features = ["sha2"] }
 url = "2"
 quick-xml = { version = "0.39", features = ["serialize"] }
+fs4 = "0.13"
+toml_edit = "0.22"

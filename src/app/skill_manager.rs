@@ -1,9 +1,9 @@
-use crate::api::distribution::{plugin_catalog, skill_catalog, SkillCatalogItem};
+use crate::api::distribution::{skill_catalog, SkillCatalogItem};
 use crate::app::plugin_manager;
 use crate::app::system::{validate_signature_metadata, verify_rsa_pss_sha256};
 use crate::skill::manifest::{validate_relative_package_path, validate_skill_package_root};
 use crate::skill::resolver::compare_versions;
-use crate::skill::store::SkillStore;
+use crate::skill::store::{SkillManagementPolicy, SkillStore};
 use crate::skill::types::SkillRecord;
 use crate::Options;
 use reqwest::blocking::Client;
@@ -20,15 +20,7 @@ use zip::ZipArchive;
 
 const MAX_SKILL_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct SkillPluginInstallAction {
-    pub plugin_id: String,
-    pub required: bool,
-    pub current_version: String,
-    pub target_version: String,
-    pub action: String,
-    pub reason: String,
-}
+pub(crate) type SkillPluginInstallAction = plugin_manager::PluginDependencyAction;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SkillInstallPlan {
@@ -74,60 +66,12 @@ pub(crate) fn plan_install(
         .build()?;
     let item = catalog_item(&client, options, agent_id, skill_id)?;
     ensure_supported(&item)?;
-    let plugins = plugin_catalog(&client, &options.api_base, agent_id, &credential)?;
-    let mut plugin_actions = Vec::new();
-    let mut blocked_reasons = Vec::new();
-    for dependency in &item.plugin_dependencies {
-        let local = plugin_manager::local_status(&dependency.plugin_id);
-        let available = plugins
-            .iter()
-            .find(|plugin| plugin.plugin_id == dependency.plugin_id);
-        let minimum = dependency.min_version.trim();
-        let satisfied = !local.current_version.is_empty()
-            && (minimum.is_empty()
-                || compare_versions(&local.current_version, minimum) != Ordering::Less);
-        let (action, target_version, reason) = if satisfied {
-            ("satisfied", local.current_version.clone(), "本机版本已满足")
-        } else if let Some(plugin) = available {
-            if plugin.governance == "blocked" {
-                if dependency.required {
-                    blocked_reasons.push(format!("插件 {} 被组织策略阻止", dependency.plugin_id));
-                }
-                ("blocked", plugin.version.clone(), "组织策略阻止安装")
-            } else if !minimum.is_empty()
-                && compare_versions(&plugin.version, minimum) == Ordering::Less
-            {
-                if dependency.required {
-                    blocked_reasons.push(format!(
-                        "插件 {} 商城版本 {} 低于要求 {}",
-                        dependency.plugin_id, plugin.version, minimum
-                    ));
-                }
-                ("blocked", plugin.version.clone(), "商城版本不满足最低要求")
-            } else if local.current_version.is_empty() {
-                ("install", plugin.version.clone(), "安装 Skill 必需的插件")
-            } else {
-                (
-                    "update",
-                    plugin.version.clone(),
-                    "升级到 Skill 要求的插件版本",
-                )
-            }
-        } else {
-            if dependency.required {
-                blocked_reasons.push(format!("商城缺少必需插件 {}", dependency.plugin_id));
-            }
-            ("unavailable", String::new(), "插件未上架")
-        };
-        plugin_actions.push(SkillPluginInstallAction {
-            plugin_id: dependency.plugin_id.clone(),
-            required: dependency.required,
-            current_version: local.current_version,
-            target_version,
-            action: action.to_string(),
-            reason: reason.to_string(),
-        });
-    }
+    let (plugin_actions, blocked_reasons) = plugin_manager::plan_dependency_set(
+        options,
+        agent_id,
+        &item.plugin_dependencies,
+        &item.name,
+    )?;
     Ok(SkillInstallPlan {
         skill: item,
         plugin_actions,
@@ -146,14 +90,26 @@ pub(crate) fn install_with_dependencies(
     if !plan.ready {
         return Err(format!("Skill 安装计划被阻止: {}", plan.blocked_reasons.join(", ")).into());
     }
+    let mut plugin_changes = Vec::new();
+    let mut selected_plugin_ids = Vec::new();
     for action in &plan.plugin_actions {
         let selected = action.required
             || selected_optional_plugins
                 .iter()
                 .any(|plugin_id| plugin_id == &action.plugin_id);
-        if selected && matches!(action.action.as_str(), "install" | "update") {
-            plugin_manager::install(options, agent_id, &action.plugin_id)?;
+        if !selected || !matches!(action.action.as_str(), "install" | "update") {
+            if selected {
+                selected_plugin_ids.push(action.plugin_id.clone());
+            }
+            continue;
         }
+        selected_plugin_ids.push(action.plugin_id.clone());
+        let before = plugin_manager::local_status(&action.plugin_id);
+        if let Err(error) = plugin_manager::install(options, agent_id, &action.plugin_id) {
+            compensate_plugin_changes(&plugin_changes);
+            return Err(error);
+        }
+        plugin_changes.push((action.plugin_id.clone(), before));
     }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(180))
@@ -162,20 +118,52 @@ pub(crate) fn install_with_dependencies(
     ensure_supported(&item)?;
     let archive = download(&client, options, agent_id, &item)?;
     let staging = env::temp_dir().join(format!("himind-skill-unpack-{}", unique_suffix()));
+    let owner = format!("skill:{skill_id}");
+    let previous_references = plugin_manager::owner_dependency_ids(&owner);
+    if let Err(error) = plugin_manager::set_owner_references(&owner, &selected_plugin_ids) {
+        let _ = fs::remove_file(&archive);
+        compensate_plugin_changes(&plugin_changes);
+        return Err(format!("记录 Skill 插件依赖失败：{error}").into());
+    }
     let result = (|| {
         extract_archive(&archive, &staging)?;
         verify_checksums(&staging)?;
         verify_declared_contents(&staging)?;
-        let record = SkillStore::new().install_organization_package(
-            &staging,
+        let store = SkillStore::new();
+        let record = store.install_organization_package(&staging, &item.skill_id, &item.version)?;
+        store.apply_management_policy(
             &item.skill_id,
-            &item.version,
+            &SkillManagementPolicy {
+                management: item.management.clone(),
+                source: item.source.clone(),
+                assignment_id: String::new(),
+                reason: item.organization_reason.clone(),
+                allow_uninstall: item.allow_uninstall,
+            },
         )?;
         Ok((item.clone(), record))
     })();
     let _ = fs::remove_file(archive);
     let _ = fs::remove_dir_all(staging);
+    if result.is_err() {
+        let _ = plugin_manager::set_owner_references(&owner, &previous_references);
+        compensate_plugin_changes(&plugin_changes);
+    }
     result
+}
+
+fn compensate_plugin_changes(changes: &[(String, plugin_manager::LocalPluginStatus)]) {
+    for (plugin_id, before) in changes.iter().rev() {
+        let current = plugin_manager::local_status(plugin_id);
+        if before.current_version.is_empty() {
+            let _ = plugin_manager::remove_for_policy(plugin_id);
+        } else if current.current_version != before.current_version {
+            let _ = plugin_manager::rollback(plugin_id);
+        }
+        if !before.enabled {
+            let _ = plugin_manager::set_enabled(plugin_id, false);
+        }
+    }
 }
 
 fn catalog_item(
@@ -195,12 +183,12 @@ fn catalog_item(
 }
 
 fn ensure_supported(item: &SkillCatalogItem) -> Result<(), Box<dyn Error>> {
-    if !item
-        .supported_clients
-        .iter()
-        .any(|client| client.eq_ignore_ascii_case("codex"))
-    {
-        return Err("该 Skill 当前不支持 Codex".into());
+    if !item.supported_clients.iter().any(|client| {
+        client.eq_ignore_ascii_case("codex")
+            || client.eq_ignore_ascii_case("github-copilot")
+            || client.eq_ignore_ascii_case("workbuddy")
+    }) {
+        return Err("该 Skill 当前不支持本机已实现的 AI 客户端适配器".into());
     }
     if !item.min_agent_version.trim().is_empty()
         && compare_versions(crate::VERSION, &item.min_agent_version) == Ordering::Less

@@ -7,22 +7,8 @@ Add-Type -AssemblyName System.Drawing
 
 $outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
-
-function New-RoundedPath {
-    param(
-        [System.Drawing.RectangleF]$Bounds,
-        [float]$Radius
-    )
-
-    $diameter = $Radius * 2
-    $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
-    $path.AddArc($Bounds.X, $Bounds.Y, $diameter, $diameter, 180, 90)
-    $path.AddArc($Bounds.Right - $diameter, $Bounds.Y, $diameter, $diameter, 270, 90)
-    $path.AddArc($Bounds.Right - $diameter, $Bounds.Bottom - $diameter, $diameter, $diameter, 0, 90)
-    $path.AddArc($Bounds.X, $Bounds.Bottom - $diameter, $diameter, $diameter, 90, 90)
-    $path.CloseFigure()
-    return $path
-}
+$brandIconPath = Join-Path $PSScriptRoot "..\icons\himind-app.png"
+$script:BrandIcon = [System.Drawing.Image]::FromFile([System.IO.Path]::GetFullPath($brandIconPath))
 
 function Draw-AgentMark {
     param(
@@ -32,30 +18,7 @@ function Draw-AgentMark {
         [float]$Size
     )
 
-    $background = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml("#2563EB"))
-    $mark = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::White)
-    $accent = [System.Drawing.SolidBrush]::new([System.Drawing.ColorTranslator]::FromHtml("#35C3D7"))
-    $path = New-RoundedPath -Bounds ([System.Drawing.RectangleF]::new($X, $Y, $Size, $Size)) -Radius ($Size * 0.2)
-
-    try {
-        $Graphics.FillPath($background, $path)
-        $barWidth = $Size * 0.14
-        $barHeight = $Size * 0.52
-        $top = $Y + ($Size - $barHeight) / 2
-        $left = $X + $Size * 0.27
-        $right = $X + $Size * 0.59
-        $crossY = $Y + $Size * 0.43
-        $crossWidth = $Size * 0.46
-        $Graphics.FillRectangle($mark, $left, $top, $barWidth, $barHeight)
-        $Graphics.FillRectangle($mark, $right, $top, $barWidth, $barHeight)
-        $Graphics.FillRectangle($mark, $left, $crossY, $crossWidth, $barWidth)
-        $Graphics.FillEllipse($accent, $X + $Size * 0.72, $Y + $Size * 0.16, $Size * 0.12, $Size * 0.12)
-    } finally {
-        $path.Dispose()
-        $background.Dispose()
-        $mark.Dispose()
-        $accent.Dispose()
-    }
+    $Graphics.DrawImage($script:BrandIcon, $X, $Y, $Size, $Size)
 }
 
 function New-InstallerBitmap {
@@ -162,7 +125,7 @@ function New-AgentIconPng {
     try {
         $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $graphics.Clear([System.Drawing.Color]::Transparent)
-        Draw-AgentMark -Graphics $graphics -X ($Size * 0.06) -Y ($Size * 0.06) -Size ($Size * 0.88)
+        Draw-AgentMark -Graphics $graphics -X 0 -Y 0 -Size $Size
         $stream = [System.IO.MemoryStream]::new()
         $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
         return ,$stream.ToArray()
@@ -202,6 +165,7 @@ try {
 } finally {
     $writer.Dispose()
     $iconStream.Dispose()
+    $script:BrandIcon.Dispose()
 }
 
 Write-Host "Installer assets generated: $outputPath"
