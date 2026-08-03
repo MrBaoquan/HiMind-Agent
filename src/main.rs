@@ -40,7 +40,7 @@ use store::outbox::{
 };
 use svn::service::{
     apply_project_acl, clone_exhibit_repository, create_exhibit_repository_path, create_repository,
-    ensure_project_exhibits_access, import_local_exhibit,
+    ensure_project_exhibits_access, import_local_exhibit_with_cancel_and_progress,
     initialize_exhibit_repository_with_cancel, preview_project_acl,
 };
 use svn::types::{
@@ -51,7 +51,7 @@ use svn::types::{
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
 
-pub(crate) const VERSION: &str = "0.3.2";
+pub(crate) const VERSION: &str = "0.3.3";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginViewLaunch {
@@ -759,15 +759,26 @@ fn execute_task(
                 agent_id,
                 &task.id,
                 "running",
-                35,
-                "Agent 正在导入本地展项工程并建立工作副本",
+                8,
+                "Agent 正在预检本地展项工程",
                 None,
                 None,
             )?;
             let request = serde_json::from_value::<ImportLocalExhibitRequest>(
                 task.payload.clone().unwrap_or_else(|| json!({})),
             )?;
-            import_local_exhibit(request)
+            let mut cancel_guard = TaskCancelGuard::new();
+            let mut check_cancel = || cancel_guard.check(client, options, agent_id, &task.id);
+            let mut report_progress = |progress: i32, detail: &str| {
+                report_task(
+                    client, options, agent_id, &task.id, "running", progress, detail, None, None,
+                )
+            };
+            import_local_exhibit_with_cancel_and_progress(
+                request,
+                &mut check_cancel,
+                &mut report_progress,
+            )
         }
         "agent_run" => runtime::execute(client, options, agent_id, &task),
         "project_acl_preview" => {

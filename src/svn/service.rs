@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -5,10 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use url::Url;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::store::credentials::{
@@ -31,6 +34,15 @@ const SVN_SERVICE_URL: &str = "http://svn.andcrane.com/repo";
 const UNITY_TEMPLATE_URL: &str = "http://svn.andcrane.com/repo/UNIArtTemplate";
 const UNREAL_TEMPLATE_ROOT_URL: &str = "http://svn.andcrane.com/repo/repo_UETemplates";
 const TEMPLATE_MARKER_FILE: &str = ".himind-template.json";
+const MIGRATION_PROPERTY_NAMES: [&str; 7] = [
+    "svn:ignore",
+    "svn:externals",
+    "svn:mime-type",
+    "svn:eol-style",
+    "svn:keywords",
+    "svn:executable",
+    "svn:needs-lock",
+];
 
 pub(crate) fn bootstrap_svn_credentials() -> Result<bool, Box<dyn Error>> {
     let username = std::env::var("SVN_USERNAME").unwrap_or_default();
@@ -344,9 +356,15 @@ pub(crate) fn clone_exhibit_repository(
     }))
 }
 
-pub(crate) fn import_local_exhibit(
+pub(crate) fn import_local_exhibit_with_cancel_and_progress<F, P>(
     request: ImportLocalExhibitRequest,
-) -> Result<Value, Box<dyn Error>> {
+    cancel: &mut F,
+    progress: &mut P,
+) -> Result<Value, Box<dyn Error>>
+where
+    F: FnMut() -> Result<(), Box<dyn Error>>,
+    P: FnMut(i32, &str) -> Result<(), Box<dyn Error>>,
+{
     let project_id = normalize_repository_name(&request.project_id)?;
     let exhibit_id = normalize_repository_name(&request.exhibit_id)?;
     let source = absolute_path(&request.source_path)?;
@@ -354,10 +372,18 @@ pub(crate) fn import_local_exhibit(
     if !source.is_dir() {
         return Err("source_path must be an existing directory".into());
     }
-    if source.join(".svn").is_dir() {
-        return Err("existing SVN working copies must use repository clone mode".into());
-    }
 
+    cancel()?;
+    progress(12, "正在检查本地工程和旧 SVN 工作副本")?;
+    let source_is_working_copy = source.join(".svn").is_dir();
+    let snapshot = if source_is_working_copy {
+        snapshot_migration_metadata(&source, false)?
+    } else {
+        MigrationMetadataSnapshot::default()
+    };
+    let transformed_paths = migration_transform_paths(&snapshot.properties);
+
+    progress(22, "本地工程预检完成，正在创建目标展项仓库")?;
     create_exhibit_repository_path(CreateExhibitRepositoryPathRequest {
         project_id: project_id.clone(),
         exhibit_id: exhibit_id.clone(),
@@ -375,49 +401,142 @@ pub(crate) fn import_local_exhibit(
     let working_copy = temp_root.join("target");
     std::fs::create_dir_all(&temp_root)?;
     let result = (|| -> Result<Value, Box<dyn Error>> {
-        run_svn_authenticated(
+        cancel()?;
+        progress(32, "目标展项仓库已就绪，正在检出临时工作副本")?;
+        run_svn_authenticated_cancelable(
             [
                 "checkout".to_string(),
+                "--ignore-externals".to_string(),
                 repository_url.clone(),
                 working_copy.to_string_lossy().to_string(),
             ],
             &connection.username,
             &password,
+            cancel,
         )?;
-        copy_migration_tree(&source, &working_copy)?;
+        let target_was_empty = !working_copy_contains_content(&working_copy)?;
+
+        progress(45, "正在复制当前工程文件并保留本地修改")?;
+        let source_summary = copy_migration_tree(
+            &source,
+            &working_copy,
+            &snapshot.external_roots,
+            &transformed_paths,
+        )?;
+        cancel()?;
+        apply_migration_directory_properties(&working_copy, &snapshot.properties)?;
         run_svn_in_directory(
             &working_copy,
             ["add", "--force", "--parents", "--depth", "infinity", "."],
         )?;
-        run_svn_authenticated(
+        add_previously_versioned_paths(&working_copy, &snapshot.versioned_paths)?;
+        progress(58, "正在恢复 SVN 忽略规则、文件属性和外部依赖")?;
+        apply_migration_properties(&working_copy, &snapshot.properties)?;
+        let pending_change_count = svn_status_change_count(&working_copy)?;
+        if !target_was_empty && pending_change_count > 0 {
+            return Err("target exhibit repository already contains different content; refusing to overwrite it".into());
+        }
+        if pending_change_count > 0 {
+            progress(70, "正在提交工程到目标展项仓库")?;
+            run_svn_authenticated_cancelable(
+                [
+                    "commit".to_string(),
+                    working_copy.to_string_lossy().to_string(),
+                    "-m".to_string(),
+                    format!("Import local exhibit {exhibit_id}"),
+                ],
+                &connection.username,
+                &password,
+                cancel,
+            )?;
+        }
+
+        progress(80, "目标仓库提交完成，正在校验文件和版本")?;
+        run_svn_authenticated_cancelable(
             [
-                "commit".to_string(),
+                "update".to_string(),
+                "--ignore-externals".to_string(),
                 working_copy.to_string_lossy().to_string(),
-                "-m".to_string(),
-                format!("Import local exhibit {exhibit_id}"),
             ],
             &connection.username,
             &password,
+            cancel,
         )?;
-        run_svn_authenticated(
-            [
-                "checkout".to_string(),
-                "--force".to_string(),
-                repository_url.clone(),
-                source.to_string_lossy().to_string(),
-            ],
-            &connection.username,
-            &password,
-        )?;
-        let revision = svn_item(&source, "revision")?;
+        let target_summary =
+            migration_tree_summary(&working_copy, &snapshot.external_roots, &transformed_paths)?;
+        if source_summary != target_summary {
+            return Err("target exhibit repository verification failed before switching the local workspace".into());
+        }
+
+        let mut backup = if source_is_working_copy {
+            progress(88, "目标仓库已验证，正在安全接管原工程目录")?;
+            Some(WorkingCopyAdminBackup::create(&source)?)
+        } else {
+            None
+        };
+        let switch_result = (|| -> Result<String, Box<dyn Error>> {
+            run_svn_authenticated_cancelable(
+                [
+                    "checkout".to_string(),
+                    "--force".to_string(),
+                    "--ignore-externals".to_string(),
+                    repository_url.clone(),
+                    source.to_string_lossy().to_string(),
+                ],
+                &connection.username,
+                &password,
+                cancel,
+            )?;
+            progress(96, "正在验证原目录的新 SVN 关联")?;
+            let switched_url = svn_item(&source, "url")?;
+            if switched_url.trim_end_matches('/') != repository_url.trim_end_matches('/') {
+                return Err("local workspace switched to an unexpected SVN repository".into());
+            }
+            let switched_summary =
+                migration_tree_summary(&source, &snapshot.external_roots, &transformed_paths)?;
+            if source_summary != switched_summary {
+                return Err(
+                    "local workspace verification failed after switching SVN metadata".into(),
+                );
+            }
+            svn_item(&source, "revision")
+        })();
+        let revision = match switch_result {
+            Ok(revision) => revision,
+            Err(error) => {
+                if let Some(backup) = backup.as_mut() {
+                    restore_adopted_workspace(
+                        backup,
+                        &working_copy,
+                        &source,
+                        &snapshot.external_roots,
+                        &transformed_paths,
+                    )?;
+                } else {
+                    let partial_admin = source.join(".svn");
+                    if partial_admin.exists() {
+                        std::fs::remove_dir_all(partial_admin)?;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let Some(backup) = backup.as_mut() {
+            backup.retain();
+        }
         Ok(json!({
             "ok": true,
             "imported": true,
+            "adopted_existing_working_copy": source_is_working_copy,
             "project_id": project_id,
             "exhibit_id": exhibit_id,
             "repository_url": repository_url,
             "workspace_path": source,
-            "revision": revision.trim().parse::<u64>().unwrap_or_default()
+            "revision": revision.trim().parse::<u64>().unwrap_or_default(),
+            "preserved_property_count": snapshot.properties.len(),
+            "external_count": snapshot.external_count,
+            "external_local_checkout_count": snapshot.external_local_checkout_count,
+            "backup_retained": source_is_working_copy
         }))
     })();
     let _ = std::fs::remove_dir_all(&temp_root);
@@ -646,11 +765,60 @@ fn copy_template_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn copy_migration_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+#[derive(Debug, Clone)]
+struct MigrationTreeSummary {
+    file_count: u64,
+    digest: String,
+}
+
+impl PartialEq for MigrationTreeSummary {
+    fn eq(&self, other: &Self) -> bool {
+        // Keyword and EOL properties legitimately rewrite bytes on checkout; the digest
+        // marks those paths while still checking every path and every stable file's bytes.
+        self.file_count == other.file_count && self.digest == other.digest
+    }
+}
+
+impl Eq for MigrationTreeSummary {}
+
+#[derive(Debug, Clone)]
+struct MigrationProperty {
+    relative_path: PathBuf,
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Default)]
+struct MigrationMetadataSnapshot {
+    properties: Vec<MigrationProperty>,
+    versioned_paths: Vec<PathBuf>,
+    external_roots: Vec<PathBuf>,
+    external_count: u64,
+    external_local_checkout_count: u64,
+    external_local_revision_count: u64,
+    external_status_counts: BTreeMap<String, u64>,
+}
+
+fn copy_migration_tree(
+    source: &Path,
+    target: &Path,
+    external_roots: &[PathBuf],
+    transformed_paths: &BTreeSet<PathBuf>,
+) -> Result<MigrationTreeSummary, Box<dyn Error>> {
+    let mut fingerprint = Sha256::new();
+    let mut file_count = 0_u64;
     for item in WalkDir::new(source)
         .follow_links(false)
+        .sort_by_file_name()
         .into_iter()
-        .filter_entry(|entry| !is_migration_excluded(entry))
+        .filter_entry(|entry| {
+            !is_migration_excluded(entry)
+                && entry
+                    .path()
+                    .strip_prefix(source)
+                    .ok()
+                    .is_none_or(|relative| !path_is_within_roots(relative, external_roots))
+        })
     {
         let entry = item?;
         let relative = entry.path().strip_prefix(source)?;
@@ -664,10 +832,102 @@ fn copy_migration_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            update_migration_digest(
+                &mut fingerprint,
+                relative,
+                entry.path(),
+                transformed_paths.contains(relative),
+            )?;
+            file_count += 1;
             std::fs::copy(entry.path(), destination)?;
         }
     }
+    Ok(MigrationTreeSummary {
+        file_count,
+        digest: format!("{:x}", fingerprint.finalize()),
+    })
+}
+
+fn migration_tree_summary(
+    source: &Path,
+    external_roots: &[PathBuf],
+    transformed_paths: &BTreeSet<PathBuf>,
+) -> Result<MigrationTreeSummary, Box<dyn Error>> {
+    let mut fingerprint = Sha256::new();
+    let mut file_count = 0_u64;
+    for item in WalkDir::new(source)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            !is_migration_excluded(entry)
+                && entry
+                    .path()
+                    .strip_prefix(source)
+                    .ok()
+                    .is_none_or(|relative| !path_is_within_roots(relative, external_roots))
+        })
+    {
+        let entry = item?;
+        let relative = entry.path().strip_prefix(source)?;
+        if relative.as_os_str().is_empty()
+            || !entry.file_type().is_file()
+            || entry.file_type().is_symlink()
+        {
+            continue;
+        }
+        update_migration_digest(
+            &mut fingerprint,
+            relative,
+            entry.path(),
+            transformed_paths.contains(relative),
+        )?;
+        file_count += 1;
+    }
+    Ok(MigrationTreeSummary {
+        file_count,
+        digest: format!("{:x}", fingerprint.finalize()),
+    })
+}
+
+fn update_migration_digest(
+    fingerprint: &mut Sha256,
+    relative: &Path,
+    file: &Path,
+    transformed: bool,
+) -> Result<(), Box<dyn Error>> {
+    fingerprint.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+    fingerprint.update([0]);
+    if transformed {
+        fingerprint.update([1]);
+        return Ok(());
+    }
+    fingerprint.update([0]);
+    let mut input = std::fs::File::open(file)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        fingerprint.update(&buffer[..read]);
+    }
+    fingerprint.update([0]);
     Ok(())
+}
+
+fn migration_transform_paths(properties: &[MigrationProperty]) -> BTreeSet<PathBuf> {
+    properties
+        .iter()
+        .filter(|property| matches!(property.name.as_str(), "svn:keywords" | "svn:eol-style"))
+        .map(|property| property.relative_path.clone())
+        .collect()
+}
+
+fn path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| !root.as_os_str().is_empty() && (path == root || path.starts_with(root)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,8 +948,564 @@ struct SvnPropertyTarget {
 struct SvnProperty {
     #[serde(rename = "@name")]
     name: String,
+    #[serde(rename = "@encoding", default)]
+    encoding: String,
     #[serde(rename = "$text", default)]
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SvnStatusDocument {
+    #[serde(rename = "target", default)]
+    targets: Vec<SvnStatusTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SvnStatusTarget {
+    #[serde(rename = "entry", default)]
+    entries: Vec<SvnStatusEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SvnStatusEntry {
+    #[serde(rename = "@path")]
+    path: String,
+    #[serde(rename = "wc-status")]
+    status: SvnWorkingCopyStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct SvnWorkingCopyStatus {
+    #[serde(rename = "@item")]
+    item: String,
+}
+
+fn snapshot_migration_metadata(
+    source: &Path,
+    probe_externals: bool,
+) -> Result<MigrationMetadataSnapshot, Box<dyn Error>> {
+    let output = run_svn_in_directory(
+        source,
+        ["proplist", "--xml", "--verbose", "--recursive", "."],
+    )?;
+    let parsed: SvnProperties = quick_xml::de::from_str(&output)?;
+    let repository_root = svn_item(source, "repos-root-url").unwrap_or_default();
+    let source_url = svn_item(source, "url").unwrap_or_default();
+    let mut snapshot = MigrationMetadataSnapshot::default();
+
+    for target in parsed.targets {
+        let relative_path = migration_property_relative_path(source, &target.path)?;
+        if relative_path.components().any(|component| {
+            is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+        }) {
+            continue;
+        }
+        for property in target.properties {
+            if !MIGRATION_PROPERTY_NAMES.contains(&property.name.as_str()) {
+                continue;
+            }
+            let mut value = decode_svn_property_value(&property)?;
+            if property.name == "svn:externals" {
+                let property_url =
+                    svn_item(&source.join(&relative_path), "url").unwrap_or_else(|_| {
+                        append_url_path(&source_url, &relative_path)
+                            .unwrap_or_else(|| source_url.clone())
+                    });
+                let normalized = normalize_external_property(
+                    source,
+                    &relative_path,
+                    &property_url,
+                    &repository_root,
+                    &value,
+                    probe_externals,
+                )?;
+                value = normalized.value;
+                snapshot.external_roots.extend(normalized.local_roots);
+                snapshot.external_count += normalized.external_count;
+                snapshot.external_local_checkout_count += normalized.local_checkout_count;
+                snapshot.external_local_revision_count += normalized.local_revision_count;
+                for (status, count) in normalized.status_counts {
+                    *snapshot.external_status_counts.entry(status).or_default() += count;
+                }
+            }
+            snapshot.properties.push(MigrationProperty {
+                relative_path: relative_path.clone(),
+                name: property.name,
+                value,
+            });
+        }
+    }
+    snapshot.external_roots.sort();
+    snapshot.external_roots.dedup();
+    snapshot.versioned_paths =
+        snapshot_migration_versioned_paths(source, &snapshot.external_roots)?;
+    Ok(snapshot)
+}
+
+fn decode_svn_property_value(property: &SvnProperty) -> Result<String, Box<dyn Error>> {
+    if property.encoding.is_empty() {
+        return Ok(property.value.clone());
+    }
+    if property.encoding != "base64" {
+        return Err(format!("unsupported SVN property encoding: {}", property.encoding).into());
+    }
+    let encoded = property
+        .value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let bytes = BASE64_STANDARD.decode(encoded)?;
+    match String::from_utf8(bytes) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            let (value, had_errors) = encoding_rs::GBK.decode_without_bom_handling(&bytes);
+            if had_errors {
+                return Err("SVN property is neither valid UTF-8 nor valid GBK text".into());
+            }
+            Ok(value.into_owned())
+        }
+    }
+}
+
+fn snapshot_migration_versioned_paths(
+    source: &Path,
+    external_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let output = run_svn_in_directory(
+        source,
+        ["status", "--xml", "--verbose", "--ignore-externals", "."],
+    )?;
+    let status: SvnStatusDocument = quick_xml::de::from_str(&output)?;
+    let mut paths = BTreeSet::new();
+    for entry in status.targets.into_iter().flat_map(|target| target.entries) {
+        if matches!(
+            entry.status.item.as_str(),
+            "unversioned" | "ignored" | "external" | "none"
+        ) {
+            continue;
+        }
+        let relative = migration_property_relative_path(source, &entry.path)?;
+        if relative.as_os_str().is_empty()
+            || path_is_within_roots(&relative, external_roots)
+            || relative.components().any(|component| {
+                is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+            })
+        {
+            continue;
+        }
+        paths.insert(relative);
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn migration_property_relative_path(
+    source: &Path,
+    target_path: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let path = PathBuf::from(target_path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(source)?.to_path_buf()
+    } else {
+        path.strip_prefix(".").unwrap_or(&path).to_path_buf()
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err("SVN property target escapes the migration source".into());
+    }
+    Ok(relative)
+}
+
+#[derive(Debug, Default)]
+struct NormalizedExternalProperty {
+    value: String,
+    local_roots: Vec<PathBuf>,
+    external_count: u64,
+    local_checkout_count: u64,
+    local_revision_count: u64,
+    status_counts: BTreeMap<String, u64>,
+}
+
+fn normalize_external_property(
+    source: &Path,
+    property_relative: &Path,
+    property_url: &str,
+    repository_root: &str,
+    value: &str,
+    probe_externals: bool,
+) -> Result<NormalizedExternalProperty, Box<dyn Error>> {
+    let mut result = NormalizedExternalProperty::default();
+    let mut output_lines = Vec::new();
+    for line in value.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            output_lines.push(line.to_string());
+            continue;
+        }
+        let mut tokens = split_external_tokens(trimmed)?;
+        let Some((url_index, local_index)) = external_url_and_local_indexes(&tokens) else {
+            output_lines.push(line.to_string());
+            *result
+                .status_counts
+                .entry("definition_unknown".to_string())
+                .or_default() += 1;
+            continue;
+        };
+        let Some(local_relative) =
+            resolve_external_local_path(property_relative, &tokens[local_index])
+        else {
+            return Err("svn:externals local path escapes the migration source".into());
+        };
+        result.external_count += 1;
+        result.local_roots.push(local_relative.clone());
+
+        let local_path = source.join(&local_relative);
+        let local_url = if local_path.exists() {
+            let url = svn_item(&local_path, "url").ok();
+            if url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                result.local_checkout_count += 1;
+            }
+            let revision = svn_item(&local_path, "revision").unwrap_or_default();
+            if !revision.trim().is_empty() {
+                result.local_revision_count += 1;
+            }
+            url
+        } else {
+            None
+        };
+        let local_checkout_available = local_url.as_ref().is_some_and(|url| !url.trim().is_empty());
+        let peg_revision = external_peg_revision(&tokens[url_index]);
+        let definition_url = peg_revision
+            .and_then(|revision| tokens[url_index].strip_suffix(&format!("@{revision}")))
+            .unwrap_or(&tokens[url_index]);
+        let normalized_url = local_url
+            .filter(|url| !url.trim().is_empty())
+            .or_else(|| normalize_external_url(definition_url, property_url, repository_root));
+        if let Some(mut url) = normalized_url {
+            if let Some(peg_revision) = peg_revision {
+                url.push('@');
+                url.push_str(peg_revision);
+            }
+            tokens[url_index] = url;
+        }
+        if probe_externals {
+            let status = tokens
+                .get(url_index)
+                .map(|url| probe_svn_remote(url, Duration::from_secs(4)))
+                .unwrap_or_else(|| "definition_unknown".to_string());
+            *result.status_counts.entry(status).or_default() += 1;
+        } else if local_checkout_available {
+            *result
+                .status_counts
+                .entry("local_checkout_available".to_string())
+                .or_default() += 1;
+        } else {
+            *result
+                .status_counts
+                .entry("local_checkout_missing".to_string())
+                .or_default() += 1;
+        }
+        output_lines.push(
+            tokens
+                .into_iter()
+                .map(|token| quote_external_token(&token))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    result.value = output_lines.join("\n");
+    if value.ends_with('\n') {
+        result.value.push('\n');
+    }
+    Ok(result)
+}
+
+fn split_external_tokens(line: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if quote.is_some() {
+        return Err("svn:externals contains an unterminated quoted value".into());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+fn external_url_and_local_indexes(tokens: &[String]) -> Option<(usize, usize)> {
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "-r" || token == "--revision" {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("-r") || token.starts_with("--revision=") {
+            index += 1;
+            continue;
+        }
+        positional.push(index);
+        index += 1;
+    }
+    if positional.len() != 2 {
+        return None;
+    }
+    let first = positional[0];
+    let second = positional[1];
+    if is_external_url_token(&tokens[first]) {
+        Some((first, second))
+    } else if is_external_url_token(&tokens[second]) {
+        Some((second, first))
+    } else {
+        None
+    }
+}
+
+fn is_external_url_token(value: &str) -> bool {
+    value.contains("://")
+        || value.starts_with("^/")
+        || value.starts_with("//")
+        || value.starts_with('/')
+        || value.starts_with("../")
+        || value.starts_with("./")
+}
+
+fn external_peg_revision(value: &str) -> Option<&str> {
+    let (_, revision) = value.rsplit_once('@')?;
+    (!revision.is_empty()
+        && revision
+            .chars()
+            .all(|character| character.is_ascii_digit() || character.is_ascii_alphabetic()))
+    .then_some(revision)
+}
+
+fn resolve_external_local_path(property_relative: &Path, value: &str) -> Option<PathBuf> {
+    let local = Path::new(value);
+    if local.is_absolute() {
+        return None;
+    }
+    let mut resolved = PathBuf::new();
+    for component in property_relative.components().chain(local.components()) {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => resolved.push(value),
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return None;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn normalize_external_url(
+    value: &str,
+    property_url: &str,
+    repository_root: &str,
+) -> Option<String> {
+    if Url::parse(value).is_ok() {
+        return Some(value.to_string());
+    }
+    if let Some(suffix) = value.strip_prefix("^/") {
+        return Some(format!(
+            "{}/{}",
+            repository_root.trim_end_matches('/'),
+            suffix
+        ));
+    }
+    let base = Url::parse(property_url).ok()?;
+    if value.starts_with("//") {
+        return Some(format!("{}:{value}", base.scheme()));
+    }
+    if value.starts_with('/') {
+        let host = base.host_str()?;
+        let authority = match base.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        return Some(format!("{}://{}{}", base.scheme(), authority, value));
+    }
+    let mut directory_url = property_url.trim_end_matches('/').to_string();
+    directory_url.push('/');
+    Url::parse(&directory_url)
+        .ok()?
+        .join(value)
+        .ok()
+        .map(|url| url.to_string())
+}
+
+fn append_url_path(base: &str, path: &Path) -> Option<String> {
+    let mut url = Url::parse(&format!("{}/", base.trim_end_matches('/'))).ok()?;
+    for component in path.components() {
+        if let Component::Normal(value) = component {
+            url.path_segments_mut().ok()?.push(value.to_str()?);
+        }
+    }
+    Some(url.to_string())
+}
+
+fn quote_external_token(value: &str) -> String {
+    if value.chars().any(char::is_whitespace) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn apply_migration_properties(
+    working_copy: &Path,
+    properties: &[MigrationProperty],
+) -> Result<(), Box<dyn Error>> {
+    for property in properties {
+        if !working_copy.join(&property.relative_path).exists() {
+            return Err(format!(
+                "SVN property target was not copied: {}",
+                property.relative_path.display()
+            )
+            .into());
+        }
+    }
+    run_migration_propset_batches(working_copy, properties.iter())
+}
+
+fn apply_migration_directory_properties(
+    working_copy: &Path,
+    properties: &[MigrationProperty],
+) -> Result<(), Box<dyn Error>> {
+    let directory_properties = properties
+        .iter()
+        .filter(|property| working_copy.join(&property.relative_path).is_dir())
+        .collect::<Vec<_>>();
+    let targets = directory_properties
+        .iter()
+        .filter(|property| !property.relative_path.as_os_str().is_empty())
+        .map(|property| property.relative_path.to_string_lossy().to_string())
+        .collect::<BTreeSet<_>>();
+    run_svn_target_batches(
+        working_copy,
+        &["add", "--force", "--parents", "--depth", "empty"],
+        targets.into_iter(),
+    )?;
+    run_migration_propset_batches(working_copy, directory_properties.into_iter())
+}
+
+fn add_previously_versioned_paths(
+    working_copy: &Path,
+    versioned_paths: &[PathBuf],
+) -> Result<(), Box<dyn Error>> {
+    let targets = versioned_paths
+        .iter()
+        .filter(|relative| working_copy.join(relative).exists())
+        .map(|relative| relative.to_string_lossy().to_string());
+    run_svn_target_batches(
+        working_copy,
+        &["add", "--force", "--no-ignore", "--parents"],
+        targets,
+    )
+}
+
+fn run_migration_propset_batches<'a, I>(
+    working_copy: &Path,
+    properties: I,
+) -> Result<(), Box<dyn Error>>
+where
+    I: IntoIterator<Item = &'a MigrationProperty>,
+{
+    let mut groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for property in properties {
+        let target = if property.relative_path.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            property.relative_path.to_string_lossy().to_string()
+        };
+        groups
+            .entry((property.name.clone(), property.value.clone()))
+            .or_default()
+            .push(target);
+    }
+    for ((name, value), targets) in groups {
+        run_svn_target_batches(
+            working_copy,
+            &["propset", &name, &value],
+            targets.into_iter(),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_svn_target_batches<I, S>(
+    working_copy: &Path,
+    prefix: &[&str],
+    targets: I,
+) -> Result<(), Box<dyn Error>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    const MAX_ARGUMENT_CHARS: usize = 20_000;
+    let prefix_length = prefix.iter().map(|value| value.len() + 3).sum::<usize>();
+    let mut arguments = prefix
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    let mut argument_length = prefix_length;
+    for target in targets {
+        let target = target.into();
+        let next_length = target.len() + 3;
+        if arguments.len() > prefix.len() && argument_length + next_length > MAX_ARGUMENT_CHARS {
+            run_svn_in_directory_owned(
+                working_copy,
+                std::mem::replace(
+                    &mut arguments,
+                    prefix.iter().map(|value| value.to_string()).collect(),
+                ),
+            )?;
+            argument_length = prefix_length;
+        }
+        argument_length += next_length;
+        arguments.push(target);
+    }
+    if arguments.len() > prefix.len() {
+        run_svn_in_directory_owned(working_copy, arguments)?;
+    }
+    Ok(())
 }
 
 fn migrate_template_ignore_properties(
@@ -902,6 +1718,154 @@ fn run_svn_in_directory_owned(
             .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn svn_status_change_count(working_copy: &Path) -> Result<usize, Box<dyn Error>> {
+    let output = run_svn_in_directory(working_copy, ["status", "--xml"])?;
+    Ok(output.matches("<entry").count())
+}
+
+fn probe_svn_remote(url: &str, timeout: Duration) -> String {
+    let Some(executable) = find_svn_executable() else {
+        return "temporarily_unreachable".to_string();
+    };
+    let child = Command::new(executable)
+        .args(["info", url, "--non-interactive"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let Ok(mut child) = child else {
+        return "temporarily_unreachable".to_string();
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = match child.wait_with_output() {
+                    Ok(output) => output,
+                    Err(_) => return "temporarily_unreachable".to_string(),
+                };
+                if output.status.success() {
+                    return "reachable".to_string();
+                }
+                return classify_svn_remote_error(&String::from_utf8_lossy(&output.stderr));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "temporarily_unreachable".to_string();
+            }
+            Err(_) => return "temporarily_unreachable".to_string(),
+        }
+    }
+}
+
+fn classify_svn_remote_error(message: &str) -> String {
+    let value = message.to_ascii_lowercase();
+    if value.contains("e170001")
+        || value.contains("e215004")
+        || value.contains("e220004")
+        || value.contains("authorization failed")
+        || value.contains("authentication failed")
+        || value.contains("forbidden")
+        || value.contains("401")
+        || value.contains("403")
+    {
+        "authorization_unknown".to_string()
+    } else if value.contains("e160013")
+        || value.contains("path not found")
+        || value.contains("not found in revision")
+        || value.contains("does not exist")
+    {
+        "missing".to_string()
+    } else {
+        "temporarily_unreachable".to_string()
+    }
+}
+
+struct WorkingCopyAdminBackup {
+    source: PathBuf,
+    backup: PathBuf,
+    active: bool,
+}
+
+impl WorkingCopyAdminBackup {
+    fn create(source: &Path) -> Result<Self, Box<dyn Error>> {
+        let admin = source.join(".svn");
+        if !admin.is_dir() {
+            return Err("source is not an SVN working copy".into());
+        }
+        let parent = source.parent().ok_or("source directory has no parent")?;
+        let backup_root = parent.join(".himind-svn-backups");
+        std::fs::create_dir_all(&backup_root)?;
+        let _ = Command::new("attrib.exe")
+            .args(["+H", backup_root.to_string_lossy().as_ref()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        let source_name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("workspace");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let backup = backup_root.join(format!(
+            "{}-{}-{}-svn",
+            source_name,
+            std::process::id(),
+            timestamp
+        ));
+        std::fs::rename(&admin, &backup)?;
+        Ok(Self {
+            source: source.to_path_buf(),
+            backup,
+            active: true,
+        })
+    }
+
+    fn rollback(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.active {
+            return Ok(());
+        }
+        let current = self.source.join(".svn");
+        if current.exists() {
+            std::fs::remove_dir_all(&current)?;
+        }
+        std::fs::rename(&self.backup, &current)?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn retain(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for WorkingCopyAdminBackup {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.rollback();
+        }
+    }
+}
+
+fn restore_adopted_workspace(
+    backup: &mut WorkingCopyAdminBackup,
+    verified_working_copy: &Path,
+    source: &Path,
+    external_roots: &[PathBuf],
+    transformed_paths: &BTreeSet<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    backup.rollback()?;
+    copy_migration_tree(
+        verified_working_copy,
+        source,
+        external_roots,
+        transformed_paths,
+    )?;
+    Ok(())
 }
 
 fn svn_item(working_copy: &Path, item: &str) -> Result<String, Box<dyn Error>> {
@@ -1271,6 +2235,12 @@ pub(crate) fn scan_migration_source(
         return Err("target_path must be an existing directory".into());
     }
 
+    let is_svn = target.join(".svn").is_dir();
+    let snapshot = if is_svn {
+        snapshot_migration_metadata(&target, true)?
+    } else {
+        MigrationMetadataSnapshot::default()
+    };
     let mut fingerprint = Sha256::new();
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
@@ -1281,7 +2251,14 @@ pub(crate) fn scan_migration_source(
         .follow_links(false)
         .sort_by_file_name()
         .into_iter();
-    for item in walker.filter_entry(|entry| !is_migration_excluded(entry)) {
+    for item in walker.filter_entry(|entry| {
+        !is_migration_excluded(entry)
+            && entry
+                .path()
+                .strip_prefix(&target)
+                .ok()
+                .is_none_or(|relative| !path_is_within_roots(relative, &snapshot.external_roots))
+    }) {
         let entry = item?;
         if entry.path() == target || entry.file_type().is_dir() {
             continue;
@@ -1324,11 +2301,12 @@ pub(crate) fn scan_migration_source(
         }
     }
 
-    let is_svn = target.join(".svn").is_dir();
     let mut repository_url = String::new();
     let mut revision = String::new();
     let mut change_count = 0_u64;
-    let mut blocking_reasons: Vec<String> = Vec::new();
+    let blocking_reasons: Vec<String> = Vec::new();
+    let mut old_remote_status = "not_applicable".to_string();
+    let mut warnings = Vec::new();
     if is_svn {
         let status = workspace_status_path(&target)?;
         repository_url = status["repository_url"]
@@ -1337,8 +2315,37 @@ pub(crate) fn scan_migration_source(
             .to_string();
         revision = status["revision"].as_str().unwrap_or_default().to_string();
         change_count = status["change_count"].as_u64().unwrap_or_default();
-        if change_count > 0 {
-            blocking_reasons.push("SVN 工作副本存在未提交变更，请先提交或清理后再迁移".to_string());
+        old_remote_status = probe_svn_remote(&repository_url, Duration::from_secs(5));
+        match old_remote_status.as_str() {
+            "missing" => {
+                warnings.push("旧 SVN 地址已失效；仍可使用当前本地内容接管新仓库".to_string())
+            }
+            "temporarily_unreachable" => warnings
+                .push("旧 SVN 当前不可达；不会阻断本地工程接管，但请留意外部依赖".to_string()),
+            "authorization_unknown" => {
+                warnings.push("无法确认旧 SVN 访问权限；不会阻断本地工程接管".to_string())
+            }
+            _ => {}
+        }
+        let unavailable_externals = snapshot
+            .external_status_counts
+            .get("missing")
+            .copied()
+            .unwrap_or_default()
+            + snapshot
+                .external_status_counts
+                .get("temporarily_unreachable")
+                .copied()
+                .unwrap_or_default()
+            + snapshot
+                .external_status_counts
+                .get("authorization_unknown")
+                .copied()
+                .unwrap_or_default();
+        if unavailable_externals > 0 {
+            warnings.push(format!(
+                "有 {unavailable_externals} 个外部依赖当前无法确认可重新检出；本地 external 目录将保留"
+            ));
         }
     }
 
@@ -1352,13 +2359,24 @@ pub(crate) fn scan_migration_source(
         "total_bytes": total_bytes,
         "excluded_count": excluded_count,
         "change_count": change_count,
+        "old_remote_status": old_remote_status,
+        "external_count": snapshot.external_count,
+        "external_local_checkout_count": snapshot.external_local_checkout_count,
+        "external_local_revision_count": snapshot.external_local_revision_count,
+        "external_status_counts": snapshot.external_status_counts,
+        "preserved_property_count": snapshot.properties.len(),
         "engine_type": if unity { "Unity3D" } else if unreal { "Unreal Engine" } else { "unknown" },
         "blocking_reasons": blocking_reasons,
+        "warnings": warnings,
     }))
 }
 
 fn is_migration_excluded(entry: &DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    is_migration_excluded_name(entry.file_name().to_string_lossy().as_ref())
+}
+
+fn is_migration_excluded_name(value: &str) -> bool {
+    let name = value.to_ascii_lowercase();
     matches!(
         name.as_str(),
         ".svn"
@@ -1824,6 +2842,125 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_external_urls_and_preserves_revision_options() {
+        let source =
+            std::env::temp_dir().join(format!("himind-external-normalize-{}", std::process::id()));
+        std::fs::create_dir_all(source.join("Packages")).unwrap();
+        let result = normalize_external_property(
+            &source,
+            Path::new("Packages"),
+            "http://legacy.example/repo/project/Packages",
+            "http://legacy.example/repo",
+            "libs/core -r42 ^/shared/core\n../common \"Common Lib\"\n",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.external_count, 2);
+        assert!(result
+            .local_roots
+            .contains(&PathBuf::from("Packages/libs/core")));
+        assert!(result
+            .local_roots
+            .contains(&PathBuf::from("Packages/Common Lib")));
+        assert!(result
+            .value
+            .contains("libs/core -r42 http://legacy.example/repo/shared/core"));
+        assert!(result
+            .value
+            .contains("http://legacy.example/repo/project/common \"Common Lib\""));
+
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[test]
+    fn parses_quoted_external_tokens_and_peg_revisions() {
+        assert_eq!(
+            split_external_tokens("-r 12 \"http://example/repo/My Lib@12\" 'Local Lib'").unwrap(),
+            vec!["-r", "12", "http://example/repo/My Lib@12", "Local Lib"]
+        );
+        assert_eq!(
+            external_peg_revision("http://example/repo/lib@123"),
+            Some("123")
+        );
+        assert_eq!(external_peg_revision("http://user@example/repo/lib"), None);
+    }
+
+    #[test]
+    fn migration_tree_skips_generated_and_external_directories() {
+        let root =
+            std::env::temp_dir().join(format!("himind-migration-tree-{}", std::process::id()));
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(source.join("Assets")).unwrap();
+        std::fs::create_dir_all(source.join("Library")).unwrap();
+        std::fs::create_dir_all(source.join("Packages/External")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("Assets/Main.unity"), "scene").unwrap();
+        std::fs::write(source.join("Library/cache.bin"), "cache").unwrap();
+        std::fs::write(
+            source.join("Packages/External/dependency.txt"),
+            "dependency",
+        )
+        .unwrap();
+
+        let summary = copy_migration_tree(
+            &source,
+            &target,
+            &[PathBuf::from("Packages/External")],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(summary.file_count, 1);
+        assert!(target.join("Assets/Main.unity").is_file());
+        assert!(!target.join("Library").exists());
+        assert!(!target.join("Packages/External").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_copy_admin_backup_restores_on_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-svn-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let source = root.join("project");
+        std::fs::create_dir_all(source.join(".svn")).unwrap();
+        std::fs::write(source.join(".svn/wc.db"), "old metadata").unwrap();
+        {
+            let _backup = WorkingCopyAdminBackup::create(&source).unwrap();
+            assert!(!source.join(".svn").exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(source.join(".svn/wc.db")).unwrap(),
+            "old metadata"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn classifies_remote_probe_failures_without_exposing_details() {
+        assert_eq!(
+            classify_svn_remote_error("svn: E170001: Authentication failed"),
+            "authorization_unknown"
+        );
+        assert_eq!(
+            classify_svn_remote_error("svn: E160013: path not found"),
+            "missing"
+        );
+        assert_eq!(
+            classify_svn_remote_error("svn: E170013: unable to connect"),
+            "temporarily_unreachable"
+        );
+    }
+
+    #[test]
     fn rejects_unmanaged_acl_paths_and_non_user_entries() {
         assert!(validate_managed_acl_paths(&["/trunk/shared".to_string()]).is_err());
         assert!(validate_desired_acl_entries(
@@ -1895,5 +3032,33 @@ Develop.meta
         assert_eq!(properties.targets[0].properties[0].value, "Library\nTemp\n");
         assert_eq!(properties.targets[1].path, "Assets");
         assert_eq!(properties.targets[1].properties[0].name, "svn:ignore");
+    }
+
+    #[test]
+    fn decodes_legacy_gbk_base64_svn_properties() {
+        let property = SvnProperty {
+            name: "svn:externals".to_string(),
+            encoding: "base64".to_string(),
+            value: "Y29tLnBhcmZ1bC5jb2xsYWJodWIvye7b2r/GvLy53Q==".to_string(),
+        };
+        assert_eq!(
+            decode_svn_property_value(&property).unwrap(),
+            "com.parful.collabhub/深圳科技馆"
+        );
+    }
+
+    #[test]
+    fn parses_verbose_status_paths_without_external_entries() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status><target path=".">
+<entry path="."><wc-status item="normal" revision="1" /></entry>
+<entry path="Assets/Main.unity"><wc-status item="modified" revision="1" /></entry>
+<entry path="Packages/External"><wc-status item="external" /></entry>
+<entry path="Temp/cache"><wc-status item="ignored" /></entry>
+</target></status>"#;
+        let parsed: SvnStatusDocument = quick_xml::de::from_str(xml).unwrap();
+        assert_eq!(parsed.targets[0].entries.len(), 4);
+        assert_eq!(parsed.targets[0].entries[1].status.item, "modified");
+        assert_eq!(parsed.targets[0].entries[2].status.item, "external");
     }
 }
