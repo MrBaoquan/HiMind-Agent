@@ -17,8 +17,8 @@ use crate::capability::types::InvocationContext;
 use crate::remote::client::inner_admin_base;
 use crate::skill::{catalog_json, codex_repair_json};
 use crate::store::credentials::{
-    clear_local_inner_admin_credentials, local_login_status_json,
-    save_local_inner_admin_credentials,
+    clear_local_inner_admin_credentials, local_login_status_json, local_unity_editor_settings,
+    save_local_inner_admin_credentials, save_local_unity_editor_path,
 };
 use crate::store::types::LocalWorkerStatus;
 use crate::{Options, VERSION};
@@ -31,6 +31,28 @@ pub(crate) struct AgentState {
     pub state_path: PathBuf,
     pub options: Options,
     pub dashboard_authorization: Arc<Mutex<crate::app::identity::DashboardAuthorizationFlow>>,
+}
+
+fn dashboard_agent_user_client(
+    state: &AgentState,
+    required_scope: &str,
+) -> Result<(String, String, reqwest::blocking::Client), String> {
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if agent_id.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let access = crate::api::oauth::platform_access_token(&state.options, required_scope)
+        .map_err(|error| error.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    Ok((agent_id, access.token, client))
 }
 
 #[tauri::command]
@@ -105,7 +127,7 @@ pub(crate) fn get_ai_integration_overview(
 }
 
 #[tauri::command]
-pub(crate) fn configure_ai_client(
+pub(crate) fn register_ai_client_mcp_server(
     state: State<'_, AgentState>,
     client_id: String,
     reset_invalid: Option<bool>,
@@ -118,20 +140,21 @@ pub(crate) fn configure_ai_client(
     .map_err(|error| error.to_string())?;
     state
         .approval_manager
-        .add_log("info", &format!("已配置 AI 客户端 MCP 接入: {client_id}"));
+        .add_log("info", &format!("已注册 AI 客户端 MCP 服务: {client_id}"));
     Ok(result)
 }
 
 #[tauri::command]
-pub(crate) fn remove_ai_client_configuration(
+pub(crate) fn unregister_ai_client_mcp_server(
     state: State<'_, AgentState>,
     client_id: String,
 ) -> Result<crate::app::ai_clients::AiClientConfigurationResult, String> {
     let result = crate::app::ai_clients::remove_configuration(&state.options, &client_id)
         .map_err(|error| error.to_string())?;
-    state
-        .approval_manager
-        .add_log("info", &format!("已移除 AI 客户端 MCP 接入: {client_id}"));
+    state.approval_manager.add_log(
+        "info",
+        &format!("已取消注册 AI 客户端 MCP 服务: {client_id}"),
+    );
     Ok(result)
 }
 
@@ -172,6 +195,62 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
         "local_service_error": worker["local_service_error"],
         "pending_approvals": pending.len(),
     }))
+}
+
+#[tauri::command]
+pub(crate) fn get_agent_update_status(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
+    crate::app::update_manager::load(&state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn check_agent_update(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::update_manager::check_now(&options).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn download_agent_update(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::update_manager::download(&options).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn cancel_agent_update_download(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
+    crate::app::update_manager::cancel_download(&state.state_path)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_agent_update_preferences(
+    auto_check: bool,
+    auto_download: bool,
+    state: State<'_, AgentState>,
+) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
+    crate::app::update_manager::set_preferences(&state.state_path, auto_check, auto_download)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn install_agent_update(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
+    crate::app::update_manager::install(&state.options).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -216,7 +295,43 @@ pub(crate) fn get_approval_settings(
         "rules": settings.rules,
         "timeout_seconds": settings.timeout_seconds,
         "auto_start": auto_start,
+        "editors": local_unity_editor_settings().map_err(|error| error.to_string())?,
     }))
+}
+
+#[tauri::command]
+pub(crate) fn get_remote_execution_settings(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::remote_execution::RemoteExecutionSettings, String> {
+    crate::app::remote_execution::load(&state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn save_remote_execution_settings(
+    state: State<'_, AgentState>,
+    settings: crate::app::remote_execution::RemoteExecutionSettings,
+    full_access_confirmed: Option<bool>,
+) -> Result<crate::app::remote_execution::RemoteExecutionSettings, String> {
+    let current =
+        crate::app::remote_execution::load(&state.state_path).map_err(|error| error.to_string())?;
+    let entering_full_access = settings.access_mode
+        == crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS
+        && (current.access_mode != crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS
+            || (!current.enabled && settings.enabled));
+    if entering_full_access && full_access_confirmed != Some(true) {
+        return Err("启用完全访问此电脑必须在本机明确确认".to_string());
+    }
+    crate::app::remote_execution::save(&state.state_path, &settings)
+        .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        if settings.enabled {
+            "已更新远程任务设置"
+        } else {
+            "已关闭远程任务"
+        },
+    );
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -295,6 +410,12 @@ pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub(crate) fn quit_agent(app: AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) fn set_auto_start(
     state: State<'_, AgentState>,
     enabled: bool,
@@ -318,6 +439,33 @@ pub(crate) fn set_auto_start(
 }
 
 #[tauri::command]
+pub(crate) fn pick_unity_editor() -> Result<serde_json::Value, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("选择 Unity 编辑器")
+        .add_filter("Unity 编辑器", &["exe"])
+        .pick_file()
+        .map(|value| value.to_string_lossy().to_string());
+    Ok(json!({ "path": path }))
+}
+
+#[tauri::command]
+pub(crate) fn save_unity_editor(
+    path: String,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let settings = save_local_unity_editor_path(&path).map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        if path.trim().is_empty() {
+            "Unity 编辑器已恢复为工作流默认值"
+        } else {
+            "Unity 编辑器本机覆盖已更新"
+        },
+    );
+    Ok(settings)
+}
+
+#[tauri::command]
 pub(crate) fn get_agent_logs(
     state: State<'_, AgentState>,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -332,6 +480,50 @@ pub(crate) fn get_agent_logs(
             })
         })
         .collect())
+}
+
+#[tauri::command]
+pub(crate) fn get_svn_connections() -> Result<serde_json::Value, String> {
+    let items = crate::svn::service::list_connections().map_err(|error| error.to_string())?;
+    Ok(json!({ "items": items }))
+}
+
+#[tauri::command]
+pub(crate) fn save_svn_connection(
+    request: crate::svn::types::SaveSvnConnectionRequest,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let connection =
+        crate::svn::service::save_connection(request).map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!("已保存公司 SVN 凭据: {}", connection.username),
+    );
+    Ok(json!({ "connection": connection }))
+}
+
+#[tauri::command]
+pub(crate) fn remove_svn_connection(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let removed = crate::svn::service::remove_connection().map_err(|error| error.to_string())?;
+    if removed {
+        state
+            .approval_manager
+            .add_log("info", "已删除公司 SVN 凭据");
+    }
+    Ok(json!({ "removed": removed }))
+}
+
+#[tauri::command]
+pub(crate) fn test_svn_connection(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let result = crate::svn::service::test_connection().map_err(|error| error.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", "公司 SVN 连接验证成功");
+    Ok(result)
 }
 
 #[tauri::command]
@@ -384,12 +576,267 @@ pub(crate) fn list_skill_drafts() -> Result<Vec<crate::skill::authoring::Authori
 }
 
 #[tauri::command]
+pub(crate) fn list_extension_projects(
+) -> Result<Vec<crate::extension_projects::ExtensionProject>, String> {
+    crate::extension_projects::list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn open_extension_project() -> Result<crate::extension_projects::ExtensionProject, String>
+{
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择 HiMind 插件或技能项目")
+        .pick_folder()
+    else {
+        return Err("已取消打开扩展项目".to_string());
+    };
+    crate::extension_projects::register(&path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn associate_extension_project(
+    input: crate::extension_projects::AssociateExtensionProjectInput,
+) -> Result<crate::extension_projects::ExtensionProject, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择协作项目的本地目录")
+        .pick_folder()
+    else {
+        return Err("已取消关联扩展项目".to_string());
+    };
+    crate::extension_projects::associate(&path, input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn create_extension_project(
+    input: crate::extension_projects::CreateExtensionProjectInput,
+    state: State<'_, AgentState>,
+) -> Result<crate::extension_projects::ExtensionProject, String> {
+    let identity = crate::app::identity::identity_status(&state.options);
+    if !identity.authorized || identity.user_name.trim().is_empty() {
+        return Err("请先授权 HiMind 工作台账号，再新建扩展项目".to_string());
+    }
+    let Some(parent) = rfd::FileDialog::new()
+        .set_title("选择项目保存位置")
+        .pick_folder()
+    else {
+        return Err("已取消新建扩展项目".to_string());
+    };
+    crate::extension_projects::create(&parent, input, &identity.user_name)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn build_extension_project(
+    project_id: String,
+) -> Result<crate::extension_projects::ExtensionCandidate, String> {
+    crate::extension_projects::build(&project_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn remove_extension_project(project_id: String) -> Result<(), String> {
+    crate::extension_projects::remove(&project_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_extension_collaboration_projects(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::AgentExtensionProject>, String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
+    crate::api::distribution::extension_projects(&client, &state.dashboard_base, &agent_id, &token)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn update_extension_project_source(
+    project_id: String,
+    input: crate::extension_projects::ExtensionProjectSourceInput,
+    sync_remote: Option<bool>,
+    state: State<'_, AgentState>,
+) -> Result<crate::extension_projects::ExtensionProject, String> {
+    let project = crate::extension_projects::get(&project_id).map_err(|error| error.to_string())?;
+    if sync_remote.unwrap_or(true) {
+        let (agent_id, token, client) =
+            dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
+        crate::api::distribution::upsert_extension_source(
+            &client,
+            &state.dashboard_base,
+            &agent_id,
+            &token,
+            &project,
+            &input,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    crate::extension_projects::update_source(&project_id, input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_extension_collaboration(
+    product_key: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::api::distribution::ExtensionCollaboration, String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
+    crate::api::distribution::extension_collaboration(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+        &product_key,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_extension_collaborator_options(
+    product_key: String,
+    query: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::ExtensionCollaboratorOption>, String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
+    crate::api::distribution::extension_collaborator_options(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+        &product_key,
+        query.as_deref().unwrap_or_default(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn invite_extension_collaborator(
+    product_key: String,
+    user_id: String,
+    role: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::api::distribution::ExtensionCollaborationMember, String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
+    crate::api::distribution::invite_extension_collaborator(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+        &product_key,
+        &user_id,
+        &role,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn update_extension_collaborator(
+    product_key: String,
+    user_id: String,
+    role: String,
+    state: State<'_, AgentState>,
+) -> Result<(), String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
+    crate::api::distribution::update_extension_collaborator(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+        &product_key,
+        &user_id,
+        &role,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn delete_extension_collaborator(
+    product_key: String,
+    user_id: String,
+    state: State<'_, AgentState>,
+) -> Result<(), String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
+    crate::api::distribution::delete_extension_collaborator(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+        &product_key,
+        &user_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_extension_collaboration_invitations(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::ExtensionCollaborationInvitation>, String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
+    crate::api::distribution::extension_collaboration_invitations(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn respond_extension_collaboration_invitation(
+    invitation_id: String,
+    action: String,
+    state: State<'_, AgentState>,
+) -> Result<(), String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
+    crate::api::distribution::respond_extension_collaboration_invitation(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &token,
+        &invitation_id,
+        &action,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_skill_candidate(
+    revision_of_version: Option<String>,
+    parent_submission_id: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<crate::skill::authoring::AuthoringDraft, String> {
+    let identity = crate::app::identity::identity_status(&state.options);
+    if !identity.authorized || identity.user_name.trim().is_empty() {
+        return Err("请先授权 HiMind 工作台账号，再导入 Skill 候选".to_string());
+    }
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择 HiMind Skill 候选包")
+        .add_filter("HiMind Skill 包", &["hmskill"])
+        .pick_file()
+    else {
+        return Err("已取消选择 Skill 候选包".to_string());
+    };
+    crate::skill::authoring::import_package(crate::skill::authoring::SkillPackageInput {
+        package_path: path,
+        revision_of_version,
+        parent_submission_id,
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn list_plugin_drafts() -> Result<Vec<crate::plugin_authoring::PluginDraft>, String> {
     crate::plugin_authoring::list().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub(crate) fn import_plugin_candidate() -> Result<crate::plugin_authoring::PluginDraft, String> {
+pub(crate) fn import_plugin_candidate(
+    revision_of_version: Option<String>,
+    parent_submission_id: Option<String>,
+) -> Result<crate::plugin_authoring::PluginDraft, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("选择 HiMind 插件候选包")
         .add_filter("HiMind 插件包", &["hmpkg"])
@@ -397,8 +844,12 @@ pub(crate) fn import_plugin_candidate() -> Result<crate::plugin_authoring::Plugi
     else {
         return Err("已取消选择插件候选包".to_string());
     };
-    crate::plugin_authoring::save(crate::plugin_authoring::PluginDraftInput { package_path: path })
-        .map_err(|error| error.to_string())
+    crate::plugin_authoring::save(crate::plugin_authoring::PluginDraftInput {
+        package_path: path,
+        revision_of_version,
+        parent_submission_id,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -438,11 +889,9 @@ pub(crate) fn list_plugin_submissions(
     if agent_id.is_empty() {
         return Err("Agent 尚未完成 Dashboard 配对".to_string());
     }
-    let access = crate::api::oauth::platform_access_token(
-        &state.options,
-        crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
-    )
-    .map_err(|error| error.to_string())?;
+    let access =
+        crate::api::oauth::platform_access_token(&state.options, crate::api::oauth::PROFILE_SCOPE)
+            .map_err(|error| error.to_string())?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -493,11 +942,9 @@ pub(crate) fn list_skill_submissions(
     if agent_id.is_empty() {
         return Err("Agent 尚未完成 Dashboard 配对".to_string());
     }
-    let access = crate::api::oauth::platform_access_token(
-        &state.options,
-        crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
-    )
-    .map_err(|error| error.to_string())?;
+    let access =
+        crate::api::oauth::platform_access_token(&state.options, crate::api::oauth::PROFILE_SCOPE)
+            .map_err(|error| error.to_string())?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -513,8 +960,14 @@ pub(crate) fn list_skill_submissions(
 
 #[tauri::command]
 pub(crate) fn save_skill_draft(
-    input: crate::skill::authoring::SkillDraftInput,
+    mut input: crate::skill::authoring::SkillDraftInput,
+    state: State<'_, AgentState>,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
+    let identity = crate::app::identity::identity_status(&state.options);
+    if !identity.authorized || identity.user_name.trim().is_empty() {
+        return Err("请先授权 HiMind 工作台账号，再保存 Skill 候选".to_string());
+    }
+    input.author = identity.user_name;
     crate::skill::authoring::save(input).map_err(|error| error.to_string())
 }
 
@@ -587,6 +1040,7 @@ fn confirm_authoring_submission(kind: &str, name: &str, version: &str, sha256: &
 #[tauri::command]
 pub(crate) fn install_organization_skill(
     skill_id: String,
+    version: Option<String>,
     optional_plugin_ids: Option<Vec<String>>,
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
@@ -599,6 +1053,7 @@ pub(crate) fn install_organization_skill(
         &state.options,
         &agent_id,
         &skill_id,
+        version.as_deref(),
         optional_plugin_ids.as_deref().unwrap_or_default(),
     )
     .map_err(|error| error.to_string())?;
@@ -619,6 +1074,7 @@ pub(crate) fn install_organization_skill(
 #[tauri::command]
 pub(crate) fn plan_organization_skill_install(
     skill_id: String,
+    version: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<crate::app::skill_manager::SkillInstallPlan, String> {
     let agent_id = local_worker_snapshot(&state.worker_status)
@@ -626,8 +1082,41 @@ pub(crate) fn plan_organization_skill_install(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::app::skill_manager::plan_install(&state.options, &agent_id, &skill_id)
-        .map_err(|error| error.to_string())
+    crate::app::skill_manager::plan_install(
+        &state.options,
+        &agent_id,
+        &skill_id,
+        version.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_skill_versions(
+    skill_id: String,
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
+    let snapshot = local_worker_snapshot(&state.worker_status);
+    let agent_id = snapshot
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let credential = state.options.agent_credential();
+    if agent_id.is_empty() || credential.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::distribution::skill_versions(
+        &client,
+        &state.dashboard_base,
+        agent_id,
+        &credential,
+        &skill_id,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -769,23 +1258,58 @@ pub(crate) fn get_plugin_catalog(
 }
 
 #[tauri::command]
+pub(crate) fn get_plugin_versions(
+    plugin_id: String,
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
+    let snapshot = local_worker_snapshot(&state.worker_status);
+    let agent_id = snapshot
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let credential = state.options.agent_credential();
+    if agent_id.is_empty() || credential.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::distribution::plugin_versions(
+        &client,
+        &state.dashboard_base,
+        agent_id,
+        &credential,
+        &plugin_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn plan_plugin_install(
     state: State<'_, AgentState>,
     plugin_id: String,
+    version: Option<String>,
 ) -> Result<crate::app::plugin_manager::PluginInstallPlan, String> {
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    crate::app::plugin_manager::plan_install(&state.options, agent_id, &plugin_id)
-        .map_err(|error| error.to_string())
+    crate::app::plugin_manager::plan_install(
+        &state.options,
+        agent_id,
+        &plugin_id,
+        version.as_deref(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub(crate) fn install_plugin(
     state: State<'_, AgentState>,
     plugin_id: String,
+    version: Option<String>,
 ) -> Result<(), String> {
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
@@ -793,7 +1317,12 @@ pub(crate) fn install_plugin(
         .unwrap_or_default()
         .to_string();
     let previous = crate::app::plugin_manager::local_status(&plugin_id).current_version;
-    let result = crate::app::plugin_manager::install(&state.options, &agent_id, &plugin_id);
+    let result = crate::app::plugin_manager::install(
+        &state.options,
+        &agent_id,
+        &plugin_id,
+        version.as_deref(),
+    );
     let report_error = result
         .as_ref()
         .err()
@@ -1044,6 +1573,7 @@ pub(crate) fn invoke_plugin_view_capability(
         interval_seconds: 10,
         local_app: true,
         local_port: state.port,
+        reenroll: false,
         enrollment_token: std::env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default(),
         agent_credential: Arc::new(std::sync::RwLock::new(String::new())),
         platform_access: Arc::new(std::sync::RwLock::new(None)),

@@ -1,5 +1,5 @@
 use crate::api::distribution::{
-    plugin_catalog, report_plugin_status, PluginCatalogItem, PluginStatusReport,
+    plugin_catalog, plugin_versions, report_plugin_status, PluginCatalogItem, PluginStatusReport,
     SkillPluginDependency,
 };
 use crate::app::system::{validate_signature_metadata, verify_rsa_pss_sha256};
@@ -193,13 +193,15 @@ pub(crate) fn install(
     options: &Options,
     agent_id: &str,
     plugin_id: &str,
+    version: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
     let credential = options.agent_credential();
     let catalog = plugin_catalog(&client, &options.api_base, agent_id, &credential)?;
-    let plan = build_install_plan(&catalog, plugin_id)?;
+    let plugin = requested_catalog_item(&client, options, agent_id, plugin_id, version, &catalog)?;
+    let plan = build_install_plan_for_item(&catalog, plugin)?;
     if !plan.ready {
         return Err(format!("插件安装计划被阻止：{}", plan.blocked_reasons.join("；")).into());
     }
@@ -243,6 +245,7 @@ pub(crate) fn plan_install(
     options: &Options,
     agent_id: &str,
     plugin_id: &str,
+    version: Option<&str>,
 ) -> Result<PluginInstallPlan, Box<dyn Error>> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -253,7 +256,42 @@ pub(crate) fn plan_install(
         agent_id,
         &options.agent_credential(),
     )?;
-    build_install_plan(&catalog, plugin_id)
+    let plugin = requested_catalog_item(&client, options, agent_id, plugin_id, version, &catalog)?;
+    build_install_plan_for_item(&catalog, plugin)
+}
+
+fn requested_catalog_item(
+    client: &Client,
+    options: &Options,
+    agent_id: &str,
+    plugin_id: &str,
+    version: Option<&str>,
+    catalog: &[PluginCatalogItem],
+) -> Result<PluginCatalogItem, Box<dyn Error>> {
+    let latest = catalog
+        .iter()
+        .find(|item| item.plugin_id == plugin_id)
+        .cloned()
+        .ok_or_else(|| "插件未上架或当前不可用".to_string())?;
+    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(latest);
+    };
+    if latest.version == version {
+        return Ok(latest);
+    }
+    if latest.management != "user_managed" || latest.managed {
+        return Err("该插件由组织管理，不能切换版本".into());
+    }
+    plugin_versions(
+        client,
+        &options.api_base,
+        agent_id,
+        &options.agent_credential(),
+        plugin_id,
+    )?
+    .into_iter()
+    .find(|item| item.version == version)
+    .ok_or_else(|| format!("插件版本 v{version} 不可用").into())
 }
 
 pub(crate) fn plan_dependency_set(
@@ -321,6 +359,13 @@ fn build_install_plan(
         .find(|item| item.plugin_id == plugin_id)
         .cloned()
         .ok_or_else(|| "插件未上架或当前不可用".to_string())?;
+    build_install_plan_for_item(catalog, plugin)
+}
+
+fn build_install_plan_for_item(
+    catalog: &[PluginCatalogItem],
+    plugin: PluginCatalogItem,
+) -> Result<PluginInstallPlan, Box<dyn Error>> {
     let mut blocked_reasons = Vec::new();
     if plugin.governance == "blocked" {
         blocked_reasons.push(format!("{} 已被组织禁止使用", plugin.name));
@@ -334,7 +379,7 @@ fn build_install_plan(
         .collect::<HashMap<_, _>>();
     let mut actions = Vec::new();
     let mut action_indexes = HashMap::new();
-    let mut visiting = HashSet::from([plugin_id.to_string()]);
+    let mut visiting = HashSet::from([plugin.plugin_id.clone()]);
     for dependency in &plugin.plugin_dependencies {
         resolve_dependency(
             dependency,
@@ -1056,10 +1101,10 @@ fn unique_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_dependency_reference_at, build_install_plan, compare_versions,
-        dependency_references_at, ensure_plugin_not_referenced, flush_status_outbox,
-        owner_dependency_ids_in, remove_owner_references_from, report_status, rollback_root,
-        set_enabled, set_owner_references_in, uninstall, verify_plugin_checksums,
+        add_dependency_reference_at, build_install_plan, build_install_plan_for_item,
+        compare_versions, dependency_references_at, ensure_plugin_not_referenced,
+        flush_status_outbox, owner_dependency_ids_in, remove_owner_references_from, report_status,
+        rollback_root, set_enabled, set_owner_references_in, uninstall, verify_plugin_checksums,
     };
     use crate::api::distribution::{PluginCatalogItem, SkillPluginDependency};
     use sha2::{Digest, Sha256};
@@ -1098,6 +1143,7 @@ mod tests {
             governance: "optional".to_string(),
             version: version.to_string(),
             release_notes: String::new(),
+            published_at: String::new(),
             min_agent_version: String::new(),
             channel: "stable".to_string(),
             artifact_id: format!("artifact-{plugin_id}"),
@@ -1121,6 +1167,35 @@ mod tests {
             view_count: 0,
             plugin_dependencies: dependencies,
         }
+    }
+
+    #[test]
+    fn selected_version_uses_its_own_dependencies() {
+        let root_id = "com.himind.test.versioned-root";
+        let latest_dependency = "com.himind.test.latest-dependency";
+        let previous_dependency = "com.himind.test.previous-dependency";
+        let catalog = vec![
+            catalog_plugin(latest_dependency, "最新依赖", "1.0.0", Vec::new()),
+            catalog_plugin(previous_dependency, "旧版依赖", "1.0.0", Vec::new()),
+            catalog_plugin(
+                root_id,
+                "版本化插件",
+                "2.0.0",
+                vec![dependency(latest_dependency, true, "1.0.0")],
+            ),
+        ];
+        let selected = catalog_plugin(
+            root_id,
+            "版本化插件",
+            "1.0.0",
+            vec![dependency(previous_dependency, true, "1.0.0")],
+        );
+
+        let plan = build_install_plan_for_item(&catalog, selected).unwrap();
+
+        assert_eq!(plan.plugin.version, "1.0.0");
+        assert_eq!(plan.dependency_actions.len(), 1);
+        assert_eq!(plan.dependency_actions[0].plugin_id, previous_dependency);
     }
 
     #[test]
@@ -1387,6 +1462,7 @@ mod tests {
             interval_seconds: 10,
             local_app: false,
             local_port: 18181,
+            reenroll: false,
             enrollment_token: String::new(),
             agent_credential: Arc::new(RwLock::new("credential".to_string())),
             platform_access: Arc::new(RwLock::new(None)),

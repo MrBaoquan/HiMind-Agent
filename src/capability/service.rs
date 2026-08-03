@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
-    launch_workspace_build, local_agent_executable_metadata, local_agent_update_supported,
-    open_folder, signed_agent_updates_required, trusted_agent_update_key_ids,
+    launch_workspace_build, local_agent_executable_metadata, open_folder,
+    signed_agent_updates_required, trusted_agent_update_key_ids,
 };
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, registry_json, scan_plugins,
@@ -18,12 +18,12 @@ use crate::store::types::LocalWorkerStatus;
 use crate::svn::service::{
     checkout_workspace, create_exhibit_repository_path, create_repository,
     ensure_project_exhibits_access, initialize_exhibit_repository, list_connections,
-    open_workspace, test_connection, update_workspace, workspace_status,
+    open_workspace, scan_migration_source, test_connection, update_workspace, workspace_status,
 };
 use crate::svn::types::{
     CreateExhibitRepositoryPathRequest, CreateRepositoryRequest,
-    EnsureProjectExhibitsAccessRequest, InitializeExhibitRepositoryRequest, SvnCheckoutRequest,
-    SvnWorkspaceRequest,
+    EnsureProjectExhibitsAccessRequest, InitializeExhibitRepositoryRequest,
+    MigrationSourceScanRequest, SvnCheckoutRequest, SvnWorkspaceRequest,
 };
 use crate::{Options, VERSION};
 
@@ -35,6 +35,7 @@ pub(crate) struct CapabilityGateway {
 #[derive(Clone)]
 enum CapabilityHandler {
     SystemHealth,
+    AuthoringIdentity,
     InnerAdminLoginStatus,
     SystemOpenFolder,
     WorkspaceBuild,
@@ -42,6 +43,7 @@ enum CapabilityHandler {
     SvnConnectionTest,
     SvnWorkspaceCheckout,
     SvnWorkspaceStatus,
+    MigrationSourceScan,
     SvnWorkspaceUpdate,
     SvnWorkspaceOpen,
     SvnRepositoryCreate,
@@ -60,6 +62,11 @@ enum CapabilityHandler {
     PluginSubmissionSubmit,
     PluginSubmissionStatus,
     SoftwareDistributionPublish,
+    DashboardContextResolve,
+    DashboardProjectContext,
+    DashboardExhibitContext,
+    DashboardMyWorkSummary,
+    DashboardKnowledgeSearch,
     PluginCapability(String),
 }
 
@@ -96,6 +103,14 @@ impl CapabilityGateway {
     fn registry(&self) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
         let mut registry = BTreeMap::new();
         let builtins = [
+            registration(
+                "extension.authoring.identity",
+                "扩展创作身份",
+                "返回当前已授权的 HiMind 工作台创作者身份，用于生成插件和 Skill Manifest。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::AuthoringIdentity,
+            ),
             registration(
                 "system.health",
                 "Agent 健康状态",
@@ -188,6 +203,19 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnWorkspaceStatus,
             ),
             registration(
+                "exhibit.migration_source.scan",
+                "扫描历史展项工程",
+                "只读扫描本机历史工程，返回规模、引擎、来源仓库和指纹，不返回绝对路径。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "target_path": { "type": "string" } },
+                    "required": ["target_path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::MigrationSourceScan,
+            ),
+            registration(
                 "exhibit.workspace.update",
                 "更新展项工作区",
                 "使用本机 SVN 连接更新指定工作副本。",
@@ -241,7 +269,7 @@ impl CapabilityGateway {
                         "project_id": { "type": "string" },
                         "exhibit_id": { "type": "string" },
                         "engine_type": { "type": "string", "enum": ["Unity3D", "Unreal Engine"] },
-                        "template_id": { "type": "string", "enum": ["unity-default", "unreal-default"] }
+                        "template_id": { "type": "string", "enum": ["unity-uniart", "unreal-blank-4.27", "unreal-blank-5.3", "unreal-blank-5.4", "unreal-blank-5.5", "unreal-picoxr-5.3", "unreal-picoxr-5.5"] }
                     },
                     "required": ["project_id", "exhibit_id", "engine_type", "template_id"],
                     "additionalProperties": false
@@ -317,20 +345,16 @@ impl CapabilityGateway {
             registration(
                 "extension.skill.candidate.save",
                 "保存 Skill 候选",
-                "根据结构化输入生成不可变 .hmskill 候选包并返回 SHA-256。",
+                "校验并原样保存不可变 .hmskill 候选包，返回 Skill 身份和 SHA-256。",
                 "local_write",
                 json!({
                     "type": "object",
                     "properties": {
-                        "id": { "type": "string" }, "name": { "type": "string" },
-                        "version": { "type": "string" }, "description": { "type": "string" },
-                        "min_agent_version": { "type": "string" },
-                        "supported_clients": { "type": "array", "items": { "type": "string" } },
-                        "capabilities": { "type": "array" }, "plugin_dependencies": { "type": "array" },
-                        "risk_summary": { "type": "string" }, "readme": { "type": "string" },
-                        "files": { "type": "object", "additionalProperties": { "type": "string" } }
+                        "package_path": { "type": "string" },
+                        "revision_of_version": { "type": "string" },
+                        "parent_submission_id": { "type": "string" }
                     },
-                    "required": ["id", "name", "version", "readme"],
+                    "required": ["package_path"],
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SkillCandidateSave,
@@ -366,7 +390,11 @@ impl CapabilityGateway {
                 "local_write",
                 json!({
                     "type": "object",
-                    "properties": { "package_path": { "type": "string" } },
+                    "properties": {
+                        "package_path": { "type": "string" },
+                        "revision_of_version": { "type": "string" },
+                        "parent_submission_id": { "type": "string" }
+                    },
                     "required": ["package_path"],
                     "additionalProperties": false
                 }),
@@ -415,6 +443,76 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SoftwareDistributionPublish,
+            ),
+            dashboard_business_registration(
+                "context.resolve",
+                "解析项目业务上下文",
+                "按项目名、展项名或 IP 解析当前用户可见的稳定业务实体。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "query":{"type":"string"},
+                        "project_id":{"type":"string"},
+                        "entity_types":{"type":"array","items":{"type":"string","enum":["project","exhibit"]}}
+                    },
+                    "required":["query"],
+                    "additionalProperties":false
+                }),
+                CapabilityHandler::DashboardContextResolve,
+            ),
+            dashboard_business_registration(
+                "project.context.get",
+                "项目全景",
+                "读取当前用户可见的项目、展项、需求和健康度聚合事实。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{"project_id":{"type":"string"}},
+                    "required":["project_id"],
+                    "additionalProperties":false
+                }),
+                CapabilityHandler::DashboardProjectContext,
+            ),
+            dashboard_business_registration(
+                "exhibit.context.get",
+                "展项全景",
+                "读取展项 IP、设备、成员、需求和最近推进事件。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{"exhibit_id":{"type":"string"}},
+                    "required":["exhibit_id"],
+                    "additionalProperties":false
+                }),
+                CapabilityHandler::DashboardExhibitContext,
+            ),
+            dashboard_business_registration(
+                "work.my_summary",
+                "我的工作摘要",
+                "读取当前用户负责或关注的项目、展项和需求摘要。",
+                "read_only",
+                json!({"type":"object","additionalProperties":false}),
+                CapabilityHandler::DashboardMyWorkSummary,
+            ),
+            dashboard_knowledge_registration(
+                "knowledge.search.v1",
+                "知识检索",
+                "检索当前用户允许外部 AI 工具访问的知识空间，返回原文片段、稳定引用和 Trace ID；不调用 HiMind 模型。",
+                "read_only",
+                json!({
+                    "type":"object",
+                    "properties":{
+                        "query":{"type":"string","maxLength":2000},
+                        "space_ids":{"type":"array","items":{"type":"string"}},
+                        "project_id":{"type":"string"},
+                        "exhibit_id":{"type":"string"},
+                        "top_k":{"type":"integer","minimum":1,"maximum":20}
+                    },
+                    "required":["query"],
+                    "additionalProperties":false
+                }),
+                CapabilityHandler::DashboardKnowledgeSearch,
             ),
         ];
 
@@ -478,6 +576,7 @@ impl CapabilityGateway {
         );
         match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
+            CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
             CapabilityHandler::InnerAdminLoginStatus => Ok(local_login_status_json()),
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
             CapabilityHandler::WorkspaceBuild => self.build_workspace(input),
@@ -488,6 +587,9 @@ impl CapabilityGateway {
             }
             CapabilityHandler::SvnWorkspaceStatus => {
                 workspace_status(serde_json::from_value::<SvnWorkspaceRequest>(input)?)
+            }
+            CapabilityHandler::MigrationSourceScan => {
+                scan_migration_source(serde_json::from_value::<MigrationSourceScanRequest>(input)?)
             }
             CapabilityHandler::SvnWorkspaceUpdate => {
                 update_workspace(serde_json::from_value::<SvnWorkspaceRequest>(input)?)
@@ -516,9 +618,7 @@ impl CapabilityGateway {
             CapabilityHandler::PluginList => registry_json(),
             CapabilityHandler::PluginManifest => self.plugin_manifest(input),
             CapabilityHandler::PluginInvoke => self.plugin_invoke(input),
-            CapabilityHandler::SkillCandidateSave => Ok(serde_json::to_value(
-                crate::skill::authoring::save(serde_json::from_value(input)?)?,
-            )?),
+            CapabilityHandler::SkillCandidateSave => self.save_skill_candidate(input),
             CapabilityHandler::SkillCandidateTest => self.test_skill_candidate(input),
             CapabilityHandler::SkillSubmissionSubmit => self.submit_skill_candidate(input),
             CapabilityHandler::SkillSubmissionStatus => self.skill_submission_status(),
@@ -529,6 +629,21 @@ impl CapabilityGateway {
             CapabilityHandler::PluginSubmissionSubmit => self.submit_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
             CapabilityHandler::SoftwareDistributionPublish => self.publish_software_release(input),
+            CapabilityHandler::DashboardContextResolve => {
+                crate::api::dashboard_business::resolve_context(&self.options, input)
+            }
+            CapabilityHandler::DashboardProjectContext => {
+                crate::api::dashboard_business::project_context(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitContext => {
+                crate::api::dashboard_business::exhibit_context(&self.options, input)
+            }
+            CapabilityHandler::DashboardMyWorkSummary => {
+                crate::api::dashboard_business::my_work_summary(&self.options)
+            }
+            CapabilityHandler::DashboardKnowledgeSearch => {
+                crate::api::dashboard_business::search_knowledge(&self.options, input)
+            }
             CapabilityHandler::PluginCapability(id) => invoke_plugin_capability(&id, input),
         }
     }
@@ -545,7 +660,6 @@ impl CapabilityGateway {
             "open_folder": true,
             "open_project": true,
             "remote_connect": true,
-            "agent_update": local_agent_update_supported(),
             "agent_update_signature_required": signed_agent_updates_required(),
             "agent_update_trusted_key_ids": trusted_agent_update_key_ids(),
             "executable_name": executable["name"],
@@ -561,6 +675,32 @@ impl CapabilityGateway {
             "capabilities": self.list_capabilities(context).map(|items| items.len()).unwrap_or_default(),
             "local_port": self.options.local_port,
         })
+    }
+
+    fn current_authoring_identity(&self) -> Result<Value, Box<dyn Error>> {
+        let identity = crate::app::identity::identity_status(&self.options);
+        if !identity.authorized
+            || identity.user_id.trim().is_empty()
+            || identity.user_name.trim().is_empty()
+        {
+            return Err("请先在 HiMind Agent 中授权工作台账号".into());
+        }
+        Ok(json!({
+            "user_id": identity.user_id,
+            "user_name": identity.user_name,
+            "online_verified": identity.online_verified,
+            "scopes": identity.scopes
+        }))
+    }
+
+    fn save_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let identity = crate::app::identity::identity_status(&self.options);
+        if !identity.authorized || identity.user_name.trim().is_empty() {
+            return Err("请先在 HiMind Agent 中授权工作台账号".into());
+        }
+        Ok(serde_json::to_value(
+            crate::skill::authoring::import_package(serde_json::from_value(input)?)?,
+        )?)
     }
 
     fn open_folder(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -830,6 +970,10 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         | "extension.plugin.submission.submit"
         | "extension.plugin.submission.status" => Some(crate::api::oauth::CREATIVE_SUBMIT_SCOPE),
         "software.distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
+        "context.resolve" | "project.context.get" | "exhibit.context.get" | "work.my_summary" => {
+            Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
+        }
+        "knowledge.search.v1" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
         _ => None,
     }
 }
@@ -905,6 +1049,32 @@ fn registration(
     }
 }
 
+fn dashboard_business_registration(
+    id: &str,
+    name: &str,
+    description: &str,
+    risk_level: &str,
+    input_schema: Value,
+    handler: CapabilityHandler,
+) -> CapabilityRegistration {
+    let mut item = registration(id, name, description, risk_level, input_schema, handler);
+    item.descriptor.source = "plugin:com.himind.dashboard-business".to_string();
+    item
+}
+
+fn dashboard_knowledge_registration(
+    id: &str,
+    name: &str,
+    description: &str,
+    risk_level: &str,
+    input_schema: Value,
+    handler: CapabilityHandler,
+) -> CapabilityRegistration {
+    let mut item = registration(id, name, description, risk_level, input_schema, handler);
+    item.descriptor.source = "plugin:com.himind.knowledge".to_string();
+    item
+}
+
 fn insert_registration(
     registry: &mut BTreeMap<String, CapabilityRegistration>,
     registration: CapabilityRegistration,
@@ -967,5 +1137,45 @@ mod tests {
         let error = insert_registration(&mut registry, item).unwrap_err();
 
         assert_eq!(error.to_string(), "capability id is required");
+    }
+
+    #[test]
+    fn dashboard_business_capabilities_report_the_builtin_plugin_provider() {
+        let item = dashboard_business_registration(
+            "exhibit.context.get",
+            "展项全景",
+            "读取展项事实",
+            "read_only",
+            json!({}),
+            CapabilityHandler::DashboardExhibitContext,
+        );
+        assert_eq!(
+            item.descriptor.source,
+            "plugin:com.himind.dashboard-business"
+        );
+    }
+
+    #[test]
+    fn dashboard_business_capabilities_use_business_scope_not_model_scope() {
+        assert_eq!(
+            required_platform_scope("context.resolve"),
+            Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
+        );
+        assert_ne!(
+            required_platform_scope("context.resolve"),
+            Some(crate::api::oauth::AI_CONVERSATION_SCOPE)
+        );
+    }
+
+    #[test]
+    fn knowledge_search_uses_knowledge_scope_not_model_scope() {
+        assert_eq!(
+            required_platform_scope("knowledge.search.v1"),
+            Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE)
+        );
+        assert_ne!(
+            required_platform_scope("knowledge.search.v1"),
+            Some(crate::api::oauth::AI_CONVERSATION_SCOPE)
+        );
     }
 }

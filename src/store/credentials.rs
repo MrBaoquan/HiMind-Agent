@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use super::types::{StoredInnerAdminCredentials, StoredSvnConnection};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const UNITY_EDITOR_WORKFLOW_ENV: &str = "unity_art_editor";
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct LocalEditorSettings {
@@ -18,15 +19,17 @@ struct LocalEditorSettings {
 
 pub(crate) fn local_unity_editor_settings() -> Result<Value, Box<dyn Error>> {
     let saved = load_local_editor_settings()?.unity_editor_path;
+    let workflow_default_path = unity_editor_environment_path().unwrap_or_default();
     let (path, source) = if !saved.trim().is_empty() {
         (saved, "agent")
-    } else if let Some(path) = unity_editor_environment_path() {
-        (path, "environment")
+    } else if !workflow_default_path.is_empty() {
+        (workflow_default_path.clone(), "environment")
     } else {
-        (String::new(), "automatic")
+        (String::new(), "unset")
     };
     Ok(json!({
         "unity_editor_path": path,
+        "workflow_default_path": workflow_default_path,
         "source": source,
         "valid": !path.is_empty() && PathBuf::from(&path).is_file()
     }))
@@ -62,14 +65,10 @@ pub(crate) fn save_local_unity_editor_path(path: &str) -> Result<Value, Box<dyn 
 }
 
 pub(crate) fn unity_editor_environment_path() -> Option<String> {
-    ["unity_art_editor", "uniart_ediotr", "HIMIND_UNITY_EDITOR"]
-        .into_iter()
-        .find_map(|name| {
-            env::var(name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+    env::var(UNITY_EDITOR_WORKFLOW_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn local_login_status_value() -> &'static str {

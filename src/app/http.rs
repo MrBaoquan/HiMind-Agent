@@ -29,6 +29,8 @@ pub(crate) fn write_local_response(
         403 => "Forbidden",
         400 => "Bad Request",
         404 => "Not Found",
+        409 => "Conflict",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
     };
@@ -38,7 +40,7 @@ pub(crate) fn write_local_response(
             .as_deref()
             .map(|origin| {
                 format!(
-                    "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Upload-Id, X-File-Name, X-Upload-Final, X-HiMind-Local-Ticket\r\n"
+                    "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Upload-Id, X-File-Name, X-Target-Dir, X-Relative-Path, X-Upload-Offset, X-Upload-Size, X-Upload-Final, X-Conflict-Policy, X-HiMind-Local-Ticket\r\n"
                 )
             })
             .unwrap_or_default()

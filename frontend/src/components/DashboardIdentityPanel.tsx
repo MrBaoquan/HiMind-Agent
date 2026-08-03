@@ -11,6 +11,7 @@ type DashboardIdentityPanelProps = {
   onOpenAuthorization: () => void;
   onRefresh: () => void;
   onRevoke: () => void;
+  authorizationDisabledReason?: string;
 };
 
 export function DashboardIdentityPanel({
@@ -22,6 +23,7 @@ export function DashboardIdentityPanel({
   onOpenAuthorization,
   onRefresh,
   onRevoke,
+  authorizationDisabledReason,
 }: DashboardIdentityPanelProps) {
   const flowActive = authorization?.state === 'starting' || authorization?.state === 'pending';
   const [label, kind] = identityLabel(identity);
@@ -42,7 +44,7 @@ export function DashboardIdentityPanel({
         </div>
         <div className="identity-actions">
           <button className="btn btn-icon" title="刷新账号状态" aria-label="刷新账号状态" disabled={busy} onClick={onRefresh}><RefreshCw size={15} /></button>
-          {identity?.authorized ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />取消账号授权</button> : <button className="btn btn-primary" disabled={busy || flowActive || identity?.state === 'not_enrolled'} onClick={onStartAuthorization}><LogIn size={15} />登录并授权</button>}
+          {identity?.authorized ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />退出登录</button> : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || identity?.state === 'not_enrolled' || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />登录 HiMind</button>}
         </div>
       </div>
       {flowActive ? (
@@ -53,13 +55,13 @@ export function DashboardIdentityPanel({
           </div>
           <div className="actions-row">
             {authorization?.verification_uri_complete ? <button className="btn" onClick={onOpenAuthorization}><ArrowUpRight size={15} />打开确认页面</button> : null}
-            <button className="btn btn-icon" title="取消" aria-label="取消登录授权" onClick={onCancelAuthorization}><X size={15} /></button>
+            <button className="btn btn-icon" title="取消" aria-label="取消登录" onClick={onCancelAuthorization}><X size={15} /></button>
           </div>
         </div>
       ) : null}
       {identity ? (
         <details className="identity-technical">
-          <summary>高级信息</summary>
+          <summary>账号详情</summary>
           <div className="identity-technical-grid">
             <div><span>工作台地址</span><code>{identity.dashboard_base || '--'}</code></div>
             <div><span>Agent ID</span><code>{identity.agent_id || '--'}</code></div>
@@ -75,9 +77,9 @@ export function DashboardIdentityPanel({
 
 function identityLabel(identity: DashboardIdentityStatus | null): [string, 'success' | 'warn' | 'danger' | 'neutral'] {
   if (!identity) return ['读取中', 'neutral'];
-  if (identity.state === 'authorized') return ['已授权', 'success'];
+  if (identity.state === 'authorized') return ['已登录', 'success'];
   if (identity.state === 'dashboard_unavailable') return ['暂时离线', 'warn'];
-  if (identity.state === 'not_authorized') return ['未授权', 'warn'];
+  if (identity.state === 'not_authorized') return ['未登录', 'warn'];
   if (identity.state === 'not_enrolled') return ['设备未绑定', 'danger'];
   if (identity.state === 'insufficient_scope') return ['权限不足', 'danger'];
   return ['需要处理', 'danger'];
@@ -85,10 +87,10 @@ function identityLabel(identity: DashboardIdentityStatus | null): [string, 'succ
 
 function identityDescription(identity: DashboardIdentityStatus | null) {
   if (!identity) return '正在确认工作台账号';
-  if (identity.state === 'authorized') return identity.online_verified ? '账号状态正常' : '账号已在这台电脑上授权';
+  if (identity.state === 'authorized') return identity.online_verified ? '账号状态正常' : '账号已在这台电脑上登录';
   if (identity.state === 'dashboard_unavailable') return '授权仍然有效，但暂时无法连接工作台';
   if (identity.state === 'not_enrolled') return '请先从工作台安装或重新连接 HiMind Agent';
-  if (identity.state === 'expired') return '授权已过期，需要重新授权';
-  if (identity.state === 'requires_login') return '授权已撤销或失效，需要重新授权';
+  if (identity.state === 'expired') return '登录已过期，需要重新登录';
+  if (identity.state === 'requires_login') return '登录已失效，需要重新登录';
   return '当前无法使用工作台功能';
 }

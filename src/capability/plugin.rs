@@ -48,6 +48,8 @@ pub(crate) struct PluginManifest {
     pub author: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub release_notes: String,
     pub version: String,
     #[serde(default)]
     pub entry: String,
@@ -105,6 +107,7 @@ pub(crate) struct PluginRegistryItem {
     pub name: String,
     pub author_name: String,
     pub description: String,
+    pub release_notes: String,
     pub version: String,
     pub runtime: String,
     pub min_agent_version: String,
@@ -246,7 +249,11 @@ fn is_plugin_install_directory(path: &std::path::Path) -> bool {
 pub(crate) fn is_builtin_plugin(plugin_id: &str) -> bool {
     matches!(
         plugin_id,
-        "com.himind.builtin.svn" | "com.himind.builtin.smb" | "com.himind.builtin.inner-admin"
+        "com.himind.builtin.svn"
+            | "com.himind.builtin.smb"
+            | "com.himind.builtin.inner-admin"
+            | "com.himind.dashboard-business"
+            | "com.himind.knowledge"
     )
 }
 
@@ -261,6 +268,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
                 "svn.connection.test",
                 "exhibit.workspace.checkout",
                 "exhibit.workspace.status",
+                "exhibit.migration_source.scan",
                 "exhibit.workspace.update",
                 "exhibit.workspace.open",
                 "exhibit.repository_path.create",
@@ -288,6 +296,25 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
                 "artifact.read",
             ],
         ),
+        builtin_plugin(
+            "com.himind.dashboard-business",
+            "项目业务助手",
+            "以当前用户身份读取 Dashboard 项目、展项、需求、IP 和我的工作聚合事实。",
+            &[
+                "context.resolve",
+                "project.context.get",
+                "exhibit.context.get",
+                "work.my_summary",
+            ],
+            &["dashboard.business.read", "oauth.delegated_user"],
+        ),
+        builtin_plugin(
+            "com.himind.knowledge",
+            "知识检索",
+            "以当前用户身份检索获准向外部 AI 工具开放的 Dashboard 知识空间。",
+            &["knowledge.search.v1"],
+            &["dashboard.knowledge.search", "oauth.delegated_user"],
+        ),
     ]
 }
 
@@ -303,6 +330,7 @@ fn builtin_plugin(
         name: name.to_string(),
         author_name: "马宝全".to_string(),
         description: description.to_string(),
+        release_notes: description.to_string(),
         version: crate::VERSION.to_string(),
         runtime: "builtin".to_string(),
         min_agent_version: crate::VERSION.to_string(),
@@ -457,6 +485,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 name: manifest.name,
                 author_name: manifest.author,
                 description: manifest.description,
+                release_notes: manifest.release_notes,
                 version: manifest.version,
                 runtime: manifest.runtime,
                 min_agent_version: manifest.min_agent_version,
@@ -498,6 +527,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             name: default_id,
             author_name: "未知作者".to_string(),
             description: String::new(),
+            release_notes: String::new(),
             version: String::new(),
             runtime: String::new(),
             min_agent_version: String::new(),
@@ -1034,6 +1064,23 @@ mod tests {
     }
 
     #[test]
+    fn installed_plugin_item_includes_release_notes() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-release-notes-{}", next_request_id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            r#"{"id":"com.himind.release-notes-test","name":"更新说明测试","version":"1.2.3","release_notes":"新增本机详情更新说明。"}"#,
+        )
+        .unwrap();
+
+        let item = read_plugin_item(root.clone(), false);
+        assert_eq!(item.version, "1.2.3");
+        assert_eq!(item.release_notes, "新增本机详情更新说明。");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn plugin_health_opens_at_threshold_and_clears_on_success() {
         let root = std::env::temp_dir().join(format!("agent-plugin-health-{}", next_request_id()));
         fs::create_dir_all(&root).unwrap();
@@ -1063,6 +1110,7 @@ mod tests {
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
             description: String::new(),
+            release_notes: "测试插件视图。".to_string(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
@@ -1097,6 +1145,7 @@ mod tests {
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
             description: String::new(),
+            release_notes: "测试插件视图。".to_string(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
@@ -1135,6 +1184,7 @@ mod tests {
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
             description: String::new(),
+            release_notes: "测试插件视图。".to_string(),
             version: "1.0.0".to_string(),
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),

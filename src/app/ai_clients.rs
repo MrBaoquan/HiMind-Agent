@@ -239,7 +239,7 @@ fn client_definitions() -> Vec<ClientDefinition> {
         .unwrap_or_else(|| home.join(".copilot").join("mcp-config.json"));
     let workbuddy_path = env::var_os("HIMIND_WORKBUDDY_MCP_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".workbuddy").join(".mcp.json"));
+        .unwrap_or_else(|| default_workbuddy_mcp_config_path(&home));
     let codex_detected = executable_on_path("codex");
     let copilot_detected = executable_responds("copilot", &["--version"]);
     let workbuddy_detected = executable_on_path("workbuddy") || workbuddy_executable_exists();
@@ -269,6 +269,10 @@ fn client_definitions() -> Vec<ClientDefinition> {
             kind: ConfigKind::WorkBuddyJson,
         },
     ]
+}
+
+fn default_workbuddy_mcp_config_path(home: &Path) -> PathBuf {
+    home.join(".workbuddy").join("mcp.json")
 }
 
 fn find_client_definition(client_id: &str) -> Result<ClientDefinition, Box<dyn Error>> {
@@ -523,7 +527,10 @@ fn mcp_arguments(options: &Options) -> Vec<String> {
     ]
 }
 
-fn backup_and_write(path: &Path, content: &[u8]) -> Result<Option<PathBuf>, Box<dyn Error>> {
+pub(crate) fn backup_and_write(
+    path: &Path,
+    content: &[u8],
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -676,25 +683,78 @@ fn command_output_indicates_client(message: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
-fn workbuddy_executable_exists() -> bool {
-    let Some(root) = env::var_os("LOCALAPPDATA")
+pub(crate) fn workbuddy_executable_exists() -> bool {
+    let local_install = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .map(|path| path.join("WorkBuddy"))
         .filter(|path| path.is_dir())
-    else {
-        return false;
-    };
-    walkdir::WalkDir::new(root)
-        .max_depth(3)
-        .into_iter()
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry.file_type().is_file()
-                && entry.file_name().to_str().is_some_and(|name| {
-                    name.to_ascii_lowercase().contains("workbuddy")
-                        && name.to_ascii_lowercase().ends_with(".exe")
+        .is_some_and(|root| {
+            walkdir::WalkDir::new(root)
+                .max_depth(3)
+                .into_iter()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_type().is_file()
+                        && entry.file_name().to_str().is_some_and(|name| {
+                            name.to_ascii_lowercase().contains("workbuddy")
+                                && name.to_ascii_lowercase().ends_with(".exe")
+                        })
                 })
-        })
+        });
+    local_install || workbuddy_start_menu_link_exists() || workbuddy_registry_entry_exists()
+}
+
+fn workbuddy_start_menu_link_exists() -> bool {
+    [
+        env::var_os("APPDATA").map(PathBuf::from),
+        env::var_os("ProgramData").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|root| {
+        root.join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+    })
+    .filter(|root| root.is_dir())
+    .any(|root| {
+        walkdir::WalkDir::new(root)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name().to_str().is_some_and(|name| {
+                        name.to_ascii_lowercase().contains("workbuddy")
+                            && name.to_ascii_lowercase().ends_with(".lnk")
+                    })
+            })
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn workbuddy_registry_entry_exists() -> bool {
+    [
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ]
+    .iter()
+    .any(|path| {
+        Command::new("reg.exe")
+            .args(["query", path, "/s", "/f", "WorkBuddy"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn workbuddy_registry_entry_exists() -> bool {
+    false
 }
 
 fn detection_message(detected: bool) -> String {
@@ -729,14 +789,24 @@ fn unix_now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_output_indicates_client, merge_client_config, merge_codex_config,
-        merge_json_config, remove_codex_config, remove_json_config, ConfigKind, SERVER_ID,
+        command_output_indicates_client, default_workbuddy_mcp_config_path, merge_client_config,
+        merge_codex_config, merge_json_config, remove_codex_config, remove_json_config, ConfigKind,
+        SERVER_ID,
     };
     use serde_json::Value;
     use std::env;
     use std::fs;
     use std::path::Path;
     use toml_edit::DocumentMut;
+
+    #[test]
+    fn workbuddy_uses_mcp_json_as_its_default_config_file() {
+        let home = Path::new("test-home");
+        assert_eq!(
+            default_workbuddy_mcp_config_path(home),
+            home.join(".workbuddy").join("mcp.json")
+        );
+    }
 
     #[test]
     fn merges_codex_server_without_removing_existing_configuration() {

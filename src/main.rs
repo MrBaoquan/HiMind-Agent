@@ -17,9 +17,11 @@ mod api;
 mod app;
 mod approval;
 mod capability;
+mod extension_projects;
 mod mcp;
 mod plugin_authoring;
 mod remote;
+mod runtime;
 mod scan;
 mod skill;
 mod store;
@@ -33,19 +35,23 @@ use approval::manager::ApprovalManager;
 use approval::types::RequestType;
 use remote::sync::execute_sync_exhibits;
 use scan::service::execute_scan;
-use store::outbox::{list_reports, remove_report, store_report, TaskReportRecord};
+use store::outbox::{
+    list_reports, remove_report, remove_reports_for_execution, store_report, TaskReportRecord,
+};
 use svn::service::{
-    apply_project_acl, create_exhibit_repository_path, create_repository,
+    apply_project_acl, clone_exhibit_repository, create_exhibit_repository_path, create_repository,
+    ensure_project_exhibits_access, import_local_exhibit,
     initialize_exhibit_repository_with_cancel, preview_project_acl,
 };
 use svn::types::{
-    ApplyProjectAclRequest, CreateExhibitRepositoryPathRequest, CreateRepositoryRequest,
+    ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
+    CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
     InitializeExhibitRepositoryRequest, PreviewProjectAclRequest,
 };
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
 
-pub(crate) const VERSION: &str = "0.3.1";
+pub(crate) const VERSION: &str = "0.3.2";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginViewLaunch {
@@ -53,7 +59,33 @@ pub(crate) struct PluginViewLaunch {
     pub view_id: String,
 }
 
+const AGENT_PROTOCOL_SCHEME: &str = "himind-agent";
+
+fn protocol_open_requested(args: &[String]) -> bool {
+    let Some(index) = args.iter().position(|value| value == "--protocol-url") else {
+        return false;
+    };
+    let Some(value) = args.get(index + 1) else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == AGENT_PROTOCOL_SCHEME
+        && url.host_str() == Some("open")
+        && (url.path().is_empty() || url.path() == "/")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 fn main() {
+    if let Err(error) = svn::service::bootstrap_svn_credentials() {
+        eprintln!("SVN credential initialization failed: {error}");
+        std::process::exit(1);
+    }
     if let Err(error) = svn::service::bootstrap_svn_admin_credentials() {
         eprintln!("SVN administrator credential initialization failed: {error}");
         std::process::exit(1);
@@ -177,7 +209,7 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
     match arguments.first().map(String::as_str) {
         Some("list") => println!("{}", capability::plugin::registry_json()?),
         Some("install") if arguments.len() == 2 => {
-            app::plugin_manager::install(options, &state.agent_id, &arguments[1])?
+            app::plugin_manager::install(options, &state.agent_id, &arguments[1], None)?
         }
         Some("uninstall") if arguments.len() == 2 => {
             app::plugin_manager::uninstall(&arguments[1])?
@@ -240,6 +272,7 @@ pub(crate) struct Options {
     interval_seconds: u64,
     local_app: bool,
     local_port: u16,
+    reenroll: bool,
     enrollment_token: String,
     agent_credential: Arc<RwLock<String>>,
     platform_access: Arc<RwLock<Option<api::oauth::AgentAccessToken>>>,
@@ -251,6 +284,10 @@ impl Options {
         parse_plugin_view_launch(&env::args().collect::<Vec<_>>())
     }
 
+    pub(crate) fn protocol_open_requested(&self) -> bool {
+        protocol_open_requested(&env::args().collect::<Vec<_>>())
+    }
+
     fn from_env() -> Self {
         let mut api_base =
             env::var("DASHBOARD_API_BASE").unwrap_or_else(|_| "http://localhost:8080".to_string());
@@ -259,6 +296,7 @@ impl Options {
         let mut interval_seconds = 10;
         let mut local_app = false;
         let mut local_port = 18181;
+        let mut reenroll = false;
         let enrollment_token = env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
 
         let args: Vec<String> = env::args().collect();
@@ -275,6 +313,7 @@ impl Options {
                 }
                 "--once" => once = true,
                 "--local-app" => local_app = true,
+                "--reenroll" => reenroll = true,
                 "--interval" if i + 1 < args.len() => {
                     interval_seconds = args[i + 1].parse().unwrap_or(10);
                     i += 1;
@@ -298,6 +337,7 @@ impl Options {
             interval_seconds,
             local_app,
             local_port,
+            reenroll,
             enrollment_token,
             agent_credential: Arc::new(RwLock::new(String::new())),
             platform_access: Arc::new(RwLock::new(None)),
@@ -385,7 +425,7 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_plugin_view_launch, PluginViewLaunch};
+    use super::{parse_plugin_view_launch, protocol_open_requested, PluginViewLaunch};
 
     #[test]
     fn parses_plugin_view_shortcut_arguments() {
@@ -414,6 +454,32 @@ mod tests {
             "demo.multi-cap".to_string(),
         ];
         assert_eq!(parse_plugin_view_launch(&args), None);
+    }
+
+    #[test]
+    fn accepts_only_the_safe_agent_open_protocol_url() {
+        let accepted = vec![
+            "agent.exe".to_string(),
+            "--protocol-url".to_string(),
+            "himind-agent://open".to_string(),
+        ];
+        assert!(protocol_open_requested(&accepted));
+
+        for value in [
+            "himind-agent://open?command=exec",
+            "himind-agent://open/project",
+            "himind-agent://user@open",
+            "himind-agent://plugin/open",
+            "https://open",
+            "not-a-url",
+        ] {
+            let rejected = vec![
+                "agent.exe".to_string(),
+                "--protocol-url".to_string(),
+                value.to_string(),
+            ];
+            assert!(!protocol_open_requested(&rejected), "accepted {value}");
+        }
     }
 }
 
@@ -589,7 +655,28 @@ fn execute_task(
             let request = serde_json::from_value::<CreateRepositoryRequest>(
                 task.payload.clone().unwrap_or_else(|| json!({})),
             )?;
-            create_repository(request)
+            let project_id = request.project_id.clone();
+            let repository = create_repository(request)?;
+            let access =
+                ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest { project_id })?;
+            Ok(json!({ "repository": repository, "exhibits_access": access }))
+        }
+        "project_repository_exhibits_access_ensure" => {
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                40,
+                "Agent 正在确保项目展项目录读写权限",
+                None,
+                None,
+            )?;
+            let request = serde_json::from_value::<EnsureProjectExhibitsAccessRequest>(
+                task.payload.clone().unwrap_or_else(|| json!({})),
+            )?;
+            ensure_project_exhibits_access(request)
         }
         "exhibit_repository_path_create" => {
             report_task(
@@ -648,6 +735,41 @@ fn execute_task(
             let mut check_cancel = || cancel_guard.check(client, options, agent_id, &task.id);
             initialize_exhibit_repository_with_cancel(request, &mut check_cancel)
         }
+        "exhibit_repository_clone" => {
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                45,
+                "Agent 正在从源展项复制 SVN 仓库",
+                None,
+                None,
+            )?;
+            let request = serde_json::from_value::<CloneExhibitRepositoryRequest>(
+                task.payload.clone().unwrap_or_else(|| json!({})),
+            )?;
+            clone_exhibit_repository(request)
+        }
+        "exhibit_repository_import_local" => {
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                35,
+                "Agent 正在导入本地展项工程并建立工作副本",
+                None,
+                None,
+            )?;
+            let request = serde_json::from_value::<ImportLocalExhibitRequest>(
+                task.payload.clone().unwrap_or_else(|| json!({})),
+            )?;
+            import_local_exhibit(request)
+        }
+        "agent_run" => runtime::execute(client, options, agent_id, &task),
         "project_acl_preview" => {
             report_task(
                 client,
@@ -790,10 +912,29 @@ pub(crate) fn report_task(
         &options.agent_credential(),
     );
     if let Err(report_error) = response {
-        if let Err(outbox_error) = store_report(&options.state_path, &report) {
-            eprintln!("task report failed and outbox write failed: {outbox_error}");
+        match store_report(&options.state_path, &report) {
+            Ok(path) => {
+                if let Err(error) = remove_reports_for_execution(
+                    &options.state_path,
+                    task_id,
+                    &execution_id,
+                    Some(&path),
+                ) {
+                    eprintln!("task report outbox prune failed: {error}");
+                }
+                eprintln!("task report deferred to outbox: {report_error}");
+                return Ok(());
+            }
+            Err(outbox_error) => {
+                eprintln!("task report failed and outbox write failed: {outbox_error}");
+                return Err(report_error);
+            }
         }
-        return Err(report_error);
+    }
+    if let Err(error) =
+        remove_reports_for_execution(&options.state_path, task_id, &execution_id, None)
+    {
+        eprintln!("task report outbox cleanup failed: {error}");
     }
     Ok(())
 }
@@ -834,6 +975,12 @@ fn flush_report_outbox(client: &Client, options: &Options, agent_id: &str) {
                 }
             }
             Err(error) => {
+                if error.to_string().contains("409 Conflict") {
+                    if let Err(remove_error) = remove_report(&path) {
+                        eprintln!("stale task report outbox cleanup failed: {remove_error}");
+                    }
+                    continue;
+                }
                 eprintln!("task report outbox replay failed: {error}");
                 break;
             }

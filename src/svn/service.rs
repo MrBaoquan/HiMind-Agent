@@ -9,16 +9,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
+use walkdir::{DirEntry, WalkDir};
 
 use crate::store::credentials::{
     list_local_svn_connections, load_local_svn_connection_secret, remove_local_svn_connection,
     save_local_svn_connection, update_local_svn_connection_status,
 };
 use crate::svn::types::{
-    ApplyProjectAclRequest, CreateExhibitRepositoryPathRequest, CreateRepositoryRequest,
-    EnsureProjectExhibitsAccessRequest, InitializeExhibitRepositoryRequest,
-    PreviewProjectAclRequest, ProjectAclEntry, SaveSvnConnectionRequest, SvnCheckoutRequest,
-    SvnConnectionSummary, SvnWorkspaceRequest,
+    ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
+    CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
+    InitializeExhibitRepositoryRequest, MigrationSourceScanRequest, PreviewProjectAclRequest,
+    ProjectAclEntry, SaveSvnConnectionRequest, SvnCheckoutRequest, SvnConnectionSummary,
+    SvnWorkspaceRequest,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -27,8 +29,32 @@ const SVN_ADMIN_CONNECTION_ID: &str = "company-svn-admin";
 const SVN_ADMIN_URL: &str = "http://svn.andcrane.com";
 const SVN_SERVICE_URL: &str = "http://svn.andcrane.com/repo";
 const UNITY_TEMPLATE_URL: &str = "http://svn.andcrane.com/repo/UNIArtTemplate";
-const UNREAL_TEMPLATE_URL: &str = "http://svn.andcrane.com/repo/UETemplate";
+const UNREAL_TEMPLATE_ROOT_URL: &str = "http://svn.andcrane.com/repo/repo_UETemplates";
 const TEMPLATE_MARKER_FILE: &str = ".himind-template.json";
+
+pub(crate) fn bootstrap_svn_credentials() -> Result<bool, Box<dyn Error>> {
+    let username = std::env::var("SVN_USERNAME").unwrap_or_default();
+    let password = std::env::var("SVN_PASSWORD").unwrap_or_default();
+    if username.trim().is_empty() && password.is_empty() {
+        return Ok(false);
+    }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err("SVN_USERNAME and SVN_PASSWORD must be configured together".into());
+    }
+    save_local_svn_connection(
+        SVN_CONNECTION_ID,
+        "公司 SVN",
+        SVN_SERVICE_URL,
+        username.trim(),
+        &password,
+        "svn",
+    )?;
+    unsafe {
+        std::env::remove_var("SVN_USERNAME");
+        std::env::remove_var("SVN_PASSWORD");
+    }
+    Ok(true)
+}
 
 pub(crate) fn bootstrap_svn_admin_credentials() -> Result<bool, Box<dyn Error>> {
     let username = std::env::var("SVN_ADMIN_USERNAME").unwrap_or_default();
@@ -270,6 +296,134 @@ pub(crate) fn initialize_exhibit_repository(
     initialize_exhibit_repository_with_cancel(request, &mut || Ok(()))
 }
 
+pub(crate) fn clone_exhibit_repository(
+    request: CloneExhibitRepositoryRequest,
+) -> Result<Value, Box<dyn Error>> {
+    let project_id = normalize_repository_name(&request.project_id)?;
+    let exhibit_id = normalize_repository_name(&request.exhibit_id)?;
+    let source_url = request.source_repository_url.trim().trim_end_matches('/');
+    let expected_prefix = format!("{SVN_SERVICE_URL}/");
+    if !source_url.starts_with(&expected_prefix) || !source_url.contains("/trunk/exhibits/") {
+        return Err("source_repository_url must be a HiMind exhibit SVN URL".into());
+    }
+    let target_url = exhibit_repository_url(&project_id, &exhibit_id)?;
+    if source_url.eq_ignore_ascii_case(target_url.trim_end_matches('/')) {
+        return Err("source and target exhibit repositories must be different".into());
+    }
+    let (connection, password) = load_company_svn_secret()?;
+    let output = run_svn_authenticated(
+        [
+            "copy".to_string(),
+            source_url.to_string(),
+            target_url.clone(),
+            "-m".to_string(),
+            format!("Clone exhibit {exhibit_id} from {source_url}"),
+        ],
+        &connection.username,
+        &password,
+    )?;
+    let revision = run_svn_authenticated(
+        [
+            "info".to_string(),
+            "--show-item".to_string(),
+            "revision".to_string(),
+            target_url.clone(),
+        ],
+        &connection.username,
+        &password,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "cloned": true,
+        "project_id": project_id,
+        "exhibit_id": exhibit_id,
+        "source_repository_url": source_url,
+        "repository_url": target_url,
+        "revision": revision.trim().parse::<u64>().unwrap_or_default(),
+        "output": output
+    }))
+}
+
+pub(crate) fn import_local_exhibit(
+    request: ImportLocalExhibitRequest,
+) -> Result<Value, Box<dyn Error>> {
+    let project_id = normalize_repository_name(&request.project_id)?;
+    let exhibit_id = normalize_repository_name(&request.exhibit_id)?;
+    let source = absolute_path(&request.source_path)?;
+    reject_sensitive_path(&source)?;
+    if !source.is_dir() {
+        return Err("source_path must be an existing directory".into());
+    }
+    if source.join(".svn").is_dir() {
+        return Err("existing SVN working copies must use repository clone mode".into());
+    }
+
+    create_exhibit_repository_path(CreateExhibitRepositoryPathRequest {
+        project_id: project_id.clone(),
+        exhibit_id: exhibit_id.clone(),
+    })?;
+    let repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
+    let (connection, password) = load_company_svn_secret()?;
+    let temp_root = std::env::temp_dir().join(format!(
+        "himind-local-import-{}-{}-{}",
+        std::process::id(),
+        exhibit_id,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+    ));
+    let working_copy = temp_root.join("target");
+    std::fs::create_dir_all(&temp_root)?;
+    let result = (|| -> Result<Value, Box<dyn Error>> {
+        run_svn_authenticated(
+            [
+                "checkout".to_string(),
+                repository_url.clone(),
+                working_copy.to_string_lossy().to_string(),
+            ],
+            &connection.username,
+            &password,
+        )?;
+        copy_migration_tree(&source, &working_copy)?;
+        run_svn_in_directory(
+            &working_copy,
+            ["add", "--force", "--parents", "--depth", "infinity", "."],
+        )?;
+        run_svn_authenticated(
+            [
+                "commit".to_string(),
+                working_copy.to_string_lossy().to_string(),
+                "-m".to_string(),
+                format!("Import local exhibit {exhibit_id}"),
+            ],
+            &connection.username,
+            &password,
+        )?;
+        run_svn_authenticated(
+            [
+                "checkout".to_string(),
+                "--force".to_string(),
+                repository_url.clone(),
+                source.to_string_lossy().to_string(),
+            ],
+            &connection.username,
+            &password,
+        )?;
+        let revision = svn_item(&source, "revision")?;
+        Ok(json!({
+            "ok": true,
+            "imported": true,
+            "project_id": project_id,
+            "exhibit_id": exhibit_id,
+            "repository_url": repository_url,
+            "workspace_path": source,
+            "revision": revision.trim().parse::<u64>().unwrap_or_default()
+        }))
+    })();
+    let _ = std::fs::remove_dir_all(&temp_root);
+    result
+}
+
 pub(crate) fn initialize_exhibit_repository_with_cancel<F>(
     request: InitializeExhibitRepositoryRequest,
     cancel: &mut F,
@@ -422,13 +576,42 @@ where
 fn resolve_template<'a>(
     engine_type: &str,
     template_id: &'a str,
-) -> Result<(&'static str, &'a str, &'static str), Box<dyn Error>> {
+) -> Result<(&'static str, &'a str, String), Box<dyn Error>> {
     match (engine_type.trim(), template_id.trim()) {
-        ("Unity3D", "unity-default") => Ok(("Unity3D", "unity-default", UNITY_TEMPLATE_URL)),
-        ("Unreal Engine", "unreal-default") => {
-            Ok(("Unreal Engine", "unreal-default", UNREAL_TEMPLATE_URL))
+        ("Unity3D", "unity-uniart") => {
+            Ok(("Unity3D", "unity-uniart", UNITY_TEMPLATE_URL.to_string()))
         }
-        _ => Err("template_id does not match the project repository engine_type".into()),
+        ("Unreal Engine", "unreal-blank-4.27") => Ok((
+            "Unreal Engine",
+            template_id,
+            format!("{UNREAL_TEMPLATE_ROOT_URL}/UE_Blank (4.27)"),
+        )),
+        ("Unreal Engine", "unreal-blank-5.3") => Ok((
+            "Unreal Engine",
+            template_id,
+            format!("{UNREAL_TEMPLATE_ROOT_URL}/UE_Blank (5.3)"),
+        )),
+        ("Unreal Engine", "unreal-blank-5.4") => Ok((
+            "Unreal Engine",
+            template_id,
+            format!("{UNREAL_TEMPLATE_ROOT_URL}/UE_Blank (5.4)"),
+        )),
+        ("Unreal Engine", "unreal-blank-5.5") => Ok((
+            "Unreal Engine",
+            template_id,
+            format!("{UNREAL_TEMPLATE_ROOT_URL}/UE_Blank (5.5)"),
+        )),
+        ("Unreal Engine", "unreal-picoxr-5.3") => Ok((
+            "Unreal Engine",
+            template_id,
+            format!("{UNREAL_TEMPLATE_ROOT_URL}/PicoXR_Template (UE5.3)"),
+        )),
+        ("Unreal Engine", "unreal-picoxr-5.5") => Ok((
+            "Unreal Engine",
+            template_id,
+            format!("{UNREAL_TEMPLATE_ROOT_URL}/PicoXR_Template (UE5.5)"),
+        )),
+        _ => Err("template_id does not match the exhibit engine_type".into()),
     }
 }
 
@@ -448,6 +631,30 @@ fn copy_template_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>
         if relative.as_os_str().is_empty()
             || relative.components().any(|part| part.as_os_str() == ".svn")
         {
+            continue;
+        }
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&destination)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_migration_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    for item in WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_migration_excluded(entry))
+    {
+        let entry = item?;
+        let relative = entry.path().strip_prefix(source)?;
+        if relative.as_os_str().is_empty() || entry.file_type().is_symlink() {
             continue;
         }
         let destination = target.join(relative);
@@ -1055,6 +1262,120 @@ pub(crate) fn workspace_status(request: SvnWorkspaceRequest) -> Result<Value, Bo
     workspace_status_path(&target)
 }
 
+pub(crate) fn scan_migration_source(
+    request: MigrationSourceScanRequest,
+) -> Result<Value, Box<dyn Error>> {
+    let target = absolute_path(&request.target_path)?;
+    reject_sensitive_path(&target)?;
+    if !target.is_dir() {
+        return Err("target_path must be an existing directory".into());
+    }
+
+    let mut fingerprint = Sha256::new();
+    let mut file_count = 0_u64;
+    let mut total_bytes = 0_u64;
+    let mut excluded_count = 0_u64;
+    let mut unity = target.join("ProjectSettings").is_dir();
+    let mut unreal = false;
+    let walker = WalkDir::new(&target)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter();
+    for item in walker.filter_entry(|entry| !is_migration_excluded(entry)) {
+        let entry = item?;
+        if entry.path() == target || entry.file_type().is_dir() {
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            excluded_count += 1;
+            continue;
+        }
+        let relative = entry.path().strip_prefix(&target)?;
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        unity |= extension == "unity";
+        unreal |= extension == "uproject";
+        let metadata = entry.metadata()?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or_default();
+        fingerprint.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        fingerprint.update([0]);
+        fingerprint.update(metadata.len().to_le_bytes());
+        fingerprint.update(modified.to_le_bytes());
+        file_count += 1;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+    }
+
+    for entry in WalkDir::new(&target)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if is_migration_excluded(&entry) {
+            excluded_count += 1;
+        }
+    }
+
+    let is_svn = target.join(".svn").is_dir();
+    let mut repository_url = String::new();
+    let mut revision = String::new();
+    let mut change_count = 0_u64;
+    let mut blocking_reasons: Vec<String> = Vec::new();
+    if is_svn {
+        let status = workspace_status_path(&target)?;
+        repository_url = status["repository_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        revision = status["revision"].as_str().unwrap_or_default().to_string();
+        change_count = status["change_count"].as_u64().unwrap_or_default();
+        if change_count > 0 {
+            blocking_reasons.push("SVN 工作副本存在未提交变更，请先提交或清理后再迁移".to_string());
+        }
+    }
+
+    Ok(json!({
+        "source_kind": if is_svn { "svn_working_copy" } else { "local_directory" },
+        "source_display_name": target.file_name().and_then(|value| value.to_str()).unwrap_or("历史工程"),
+        "source_repository_url": repository_url,
+        "source_revision": revision,
+        "source_fingerprint": format!("sha256:{:x}", fingerprint.finalize()),
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "excluded_count": excluded_count,
+        "change_count": change_count,
+        "engine_type": if unity { "Unity3D" } else if unreal { "Unreal Engine" } else { "unknown" },
+        "blocking_reasons": blocking_reasons,
+    }))
+}
+
+fn is_migration_excluded(entry: &DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        ".svn"
+            | "library"
+            | "temp"
+            | "obj"
+            | "logs"
+            | "userSettings"
+            | "binaries"
+            | "deriveddatacache"
+            | "intermediate"
+            | "saved"
+            | "usersettings"
+            | ".vs"
+    )
+}
+
 pub(crate) fn update_workspace(request: SvnWorkspaceRequest) -> Result<Value, Box<dyn Error>> {
     let target = validate_working_copy(&request.target_path)?;
     let (connection, password) = load_company_svn_secret()?;
@@ -1476,6 +1797,30 @@ mod tests {
         assert!(absolute_path("relative/path").is_err());
         assert!(reject_sensitive_path(Path::new(r"C:\Windows\Temp\repo")).is_err());
         assert!(reject_sensitive_path(Path::new(r"D:\Projects\repo")).is_ok());
+    }
+
+    #[test]
+    fn migration_scan_is_read_only_and_does_not_expose_source_path() {
+        let target =
+            std::env::temp_dir().join(format!("himind-migration-scan-{}", std::process::id()));
+        let assets = target.join("Assets");
+        let library = target.join("Library");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(assets.join("Main.unity"), "scene").unwrap();
+        std::fs::write(library.join("cache.bin"), "cache").unwrap();
+
+        let result = scan_migration_source(MigrationSourceScanRequest {
+            target_path: target.to_string_lossy().to_string(),
+        })
+        .unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert_eq!(result["source_kind"], "local_directory");
+        assert_eq!(result["engine_type"], "Unity3D");
+        assert_eq!(result["file_count"], 1);
+        assert!(!serialized.contains(&target.to_string_lossy().to_string()));
+
+        std::fs::remove_dir_all(target).unwrap();
     }
 
     #[test]

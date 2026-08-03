@@ -1,6 +1,6 @@
 [package]
 name = "himind-agent"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 default-run = "himind-agent"
 
@@ -44,3 +44,6 @@ url = "2"
 quick-xml = { version = "0.39", features = ["serialize"] }
 fs4 = "0.13"
 toml_edit = "0.22"
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+rand = "0.8"
+semver = "1"

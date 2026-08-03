@@ -11,6 +11,9 @@ impl LocalRequestSecurity {
     pub(crate) fn new(dashboard_base: &str, local_port: u16) -> Self {
         let mut allowed_origins = HashSet::new();
         if let Some(origin) = normalized_origin(dashboard_base) {
+            if let Some(peer_origin) = loopback_peer_origin(&origin) {
+                allowed_origins.insert(peer_origin);
+            }
             allowed_origins.insert(origin);
         }
         if let Ok(configured) = env::var("HIMIND_AGENT_ALLOWED_ORIGINS") {
@@ -65,6 +68,24 @@ fn normalized_origin(value: &str) -> Option<String> {
     Some(format!("{}://{}", scheme.to_ascii_lowercase(), authority))
 }
 
+fn loopback_peer_origin(origin: &str) -> Option<String> {
+    let (scheme, authority) = match origin.split_once("://") {
+        Some(value) => value,
+        None => return None,
+    };
+    let (host, port) = authority.rsplit_once(':').unwrap_or((authority, ""));
+    let peer = match host {
+        "localhost" => "127.0.0.1",
+        "127.0.0.1" => "localhost",
+        _ => return None,
+    };
+    Some(if port.is_empty() {
+        format!("{scheme}://{peer}")
+    } else {
+        format!("{scheme}://{peer}:{port}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +101,22 @@ mod tests {
             security().validate(request),
             Ok(Some("http://localhost:18081"))
         );
+    }
+
+    #[test]
+    fn accepts_equivalent_loopback_dashboard_origin() {
+        let request = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:18181\r\nOrigin: http://127.0.0.1:18081\r\n\r\n";
+        assert_eq!(
+            security().validate(request),
+            Ok(Some("http://127.0.0.1:18081"))
+        );
+    }
+
+    #[test]
+    fn does_not_enable_loopback_peer_for_remote_dashboard() {
+        let security = LocalRequestSecurity::new("https://dashboard.example.com", 18181);
+        let request = "GET /health HTTP/1.1\r\nHost: 127.0.0.1:18181\r\nOrigin: http://127.0.0.1:18081\r\n\r\n";
+        assert_eq!(security.validate(request), Err("untrusted Origin header"));
     }
 
     #[test]

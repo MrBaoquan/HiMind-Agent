@@ -1,6 +1,7 @@
 use reqwest::blocking::multipart::{Form, Part};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -11,7 +12,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionState {
     pub client_id: String,
+    #[serde(default, skip_serializing)]
     pub token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token_protected: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +59,14 @@ pub struct UpdateCheckResponse {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
+    pub release_id: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub package_type: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
     pub download_url: String,
     #[serde(default)]
     pub sha256: String,
@@ -64,6 +76,12 @@ pub struct UpdateCheckResponse {
     pub signature_key_id: String,
     #[serde(default)]
     pub signature_algorithm: String,
+    #[serde(default)]
+    pub mandatory: bool,
+    #[serde(default)]
+    pub min_supported_version: String,
+    #[serde(default)]
+    pub release_notes: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,6 +98,8 @@ pub struct PluginCatalogItem {
     pub governance: String,
     pub version: String,
     pub release_notes: String,
+    #[serde(default)]
+    pub published_at: String,
     pub min_agent_version: String,
     pub channel: String,
     pub artifact_id: String,
@@ -129,6 +149,8 @@ pub struct SkillCatalogItem {
     pub categories: Vec<String>,
     pub version: String,
     pub release_notes: String,
+    #[serde(default)]
+    pub published_at: String,
     pub min_agent_version: String,
     pub supported_clients: Vec<String>,
     pub capability_ids: Vec<String>,
@@ -273,14 +295,40 @@ struct SkillCatalogResponse {
 pub struct SkillSubmissionStatus {
     pub id: String,
     pub product_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub author_name: String,
     pub version: String,
     pub status: String,
     #[serde(default)]
     pub review_note: String,
     #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
     pub artifact_id: String,
     #[serde(default)]
     pub release_id: String,
+    #[serde(default)]
+    pub release_status: String,
+    #[serde(default)]
+    pub parent_release_id: String,
+    #[serde(default)]
+    pub revision_of_version: String,
+    #[serde(default)]
+    pub source_type: String,
+    #[serde(default)]
+    pub source_repository: String,
+    #[serde(default)]
+    pub source_branch: String,
+    #[serde(default)]
+    pub source_subdirectory: String,
+    #[serde(default)]
+    pub source_commit: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub role: String,
     pub updated_at: String,
 }
 
@@ -294,8 +342,28 @@ pub struct PluginSubmissionStatus {
     pub review_status: String,
     #[serde(default)]
     pub review_note: String,
+    #[serde(default)]
+    pub release_notes: String,
     pub artifact_id: String,
     pub release_id: String,
+    #[serde(default)]
+    pub release_status: String,
+    #[serde(default)]
+    pub parent_release_id: String,
+    #[serde(default)]
+    pub revision_of_version: String,
+    #[serde(default)]
+    pub source_type: String,
+    #[serde(default)]
+    pub source_repository: String,
+    #[serde(default)]
+    pub source_branch: String,
+    #[serde(default)]
+    pub source_subdirectory: String,
+    #[serde(default)]
+    pub source_commit: String,
+    #[serde(default)]
+    pub role: String,
     pub sha256: String,
     pub updated_at: String,
 }
@@ -308,6 +376,108 @@ struct SkillSubmissionResponse {
 #[derive(Debug, Deserialize)]
 struct PluginSubmissionResponse {
     items: Vec<PluginSubmissionStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionCollaborationMember {
+    pub id: String,
+    pub product_id: String,
+    pub product_key: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub role: String,
+    pub status: String,
+    #[serde(default)]
+    pub granted_by: String,
+    #[serde(default)]
+    pub responded_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionCollaboration {
+    pub registered: bool,
+    pub product_key: String,
+    #[serde(default)]
+    pub product_name: String,
+    #[serde(default)]
+    pub product_type: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub can_manage: bool,
+    #[serde(default)]
+    pub can_submit: bool,
+    #[serde(default)]
+    pub source_repository: String,
+    #[serde(default)]
+    pub source_default_branch: String,
+    #[serde(default)]
+    pub source_subdirectory: String,
+    #[serde(default)]
+    pub members: Vec<ExtensionCollaborationMember>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentExtensionProject {
+    pub product_key: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub product_type: String,
+    pub role: String,
+    #[serde(default)]
+    pub can_manage: bool,
+    #[serde(default)]
+    pub can_submit: bool,
+    #[serde(default)]
+    pub source_repository: String,
+    #[serde(default)]
+    pub source_default_branch: String,
+    #[serde(default)]
+    pub source_subdirectory: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionCollaboratorOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub department_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExtensionCollaborationInvitation {
+    pub id: String,
+    pub product_id: String,
+    pub product_key: String,
+    pub product_name: String,
+    pub product_type: String,
+    pub user_id: String,
+    pub role: String,
+    pub status: String,
+    pub invited_by: String,
+    #[serde(default)]
+    pub invited_by_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtensionCollaboratorOptionsResponse {
+    items: Vec<ExtensionCollaboratorOption>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtensionCollaborationInvitationsResponse {
+    items: Vec<ExtensionCollaborationInvitation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentExtensionProjectsResponse {
+    items: Vec<AgentExtensionProject>,
 }
 
 pub fn plugin_catalog(
@@ -325,6 +495,25 @@ pub fn plugin_catalog(
         .items)
 }
 
+pub fn plugin_versions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    plugin_id: &str,
+) -> Result<Vec<PluginCatalogItem>, Box<dyn Error>> {
+    let plugin_id = url::form_urlencoded::byte_serialize(plugin_id.as_bytes()).collect::<String>();
+    Ok(client
+        .get(format!(
+            "{api_base}/api/agent/plugins/catalog/{plugin_id}/versions"
+        ))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<PluginCatalogResponse>()?
+        .items)
+}
+
 pub fn skill_catalog(
     client: &Client,
     api_base: &str,
@@ -333,6 +522,25 @@ pub fn skill_catalog(
 ) -> Result<Vec<SkillCatalogItem>, Box<dyn Error>> {
     Ok(client
         .get(format!("{api_base}/api/agent/skills/catalog"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<SkillCatalogResponse>()?
+        .items)
+}
+
+pub fn skill_versions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    skill_id: &str,
+) -> Result<Vec<SkillCatalogItem>, Box<dyn Error>> {
+    let skill_id = url::form_urlencoded::byte_serialize(skill_id.as_bytes()).collect::<String>();
+    Ok(client
+        .get(format!(
+            "{api_base}/api/agent/skills/catalog/{skill_id}/versions"
+        ))
         .header("Authorization", format!("Agent {agent_id}:{credential}"))
         .send()?
         .error_for_status()?
@@ -377,6 +585,8 @@ pub fn submit_skill(
     access_token: &str,
     package_path: &Path,
     test_report: &serde_json::Value,
+    revision_of_version: Option<&str>,
+    source: &crate::extension_projects::ExtensionSubmissionSource,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let file_name = package_path
         .file_name()
@@ -386,16 +596,28 @@ pub fn submit_skill(
     let package = Part::bytes(fs::read(package_path)?)
         .file_name(file_name)
         .mime_str("application/vnd.himind.skill+zip")?;
+    let source_type = if source.source_repository.trim().is_empty() {
+        "local"
+    } else {
+        "repository"
+    };
+    let mut form = Form::new()
+        .part("file", package)
+        .text("test_report", serde_json::to_string(test_report)?)
+        .text("source_type", source_type)
+        .text("source_repository", source.source_repository.clone())
+        .text("source_branch", source.source_default_branch.clone())
+        .text("source_subdirectory", source.source_subdirectory.clone())
+        .text("source_commit", source.source_commit.clone());
+    if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
+        form = form.text("revision_of_version", version.to_string());
+    }
     Ok(client
         .post(format!("{api_base}/api/agent/skills/submissions"))
         .bearer_auth(access_token)
         .header("X-HiMind-Agent-ID", agent_id)
         .header("X-HiMind-AI-Client", ai_client_id())
-        .multipart(
-            Form::new()
-                .part("file", package)
-                .text("test_report", serde_json::to_string(test_report)?),
-        )
+        .multipart(form)
         .send()?
         .error_for_status()?
         .json::<serde_json::Value>()?)
@@ -425,6 +647,8 @@ pub fn submit_plugin(
     access_token: &str,
     package_path: &Path,
     test_report: &serde_json::Value,
+    revision_of_version: Option<&str>,
+    source: &crate::extension_projects::ExtensionSubmissionSource,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let file_name = package_path
         .file_name()
@@ -434,16 +658,28 @@ pub fn submit_plugin(
     let package = Part::bytes(fs::read(package_path)?)
         .file_name(file_name)
         .mime_str("application/vnd.himind.plugin+zip")?;
+    let source_type = if source.source_repository.trim().is_empty() {
+        "local"
+    } else {
+        "repository"
+    };
+    let mut form = Form::new()
+        .part("file", package)
+        .text("test_report", serde_json::to_string(test_report)?)
+        .text("source_type", source_type)
+        .text("source_repository", source.source_repository.clone())
+        .text("source_branch", source.source_default_branch.clone())
+        .text("source_subdirectory", source.source_subdirectory.clone())
+        .text("source_commit", source.source_commit.clone());
+    if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
+        form = form.text("revision_of_version", version.to_string());
+    }
     Ok(client
         .post(format!("{api_base}/api/agent/plugins/submissions"))
         .bearer_auth(access_token)
         .header("X-HiMind-Agent-ID", agent_id)
         .header("X-HiMind-AI-Client", ai_client_id())
-        .multipart(
-            Form::new()
-                .part("file", package)
-                .text("test_report", serde_json::to_string(test_report)?),
-        )
+        .multipart(form)
         .send()?
         .error_for_status()?
         .json::<serde_json::Value>()?)
@@ -464,6 +700,237 @@ pub fn plugin_submissions(
         .error_for_status()?
         .json::<PluginSubmissionResponse>()?
         .items)
+}
+
+pub fn extension_collaboration(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    product_key: &str,
+) -> Result<ExtensionCollaboration, Box<dyn Error>> {
+    let product_key = encode_path_segment(product_key);
+    collaboration_json(
+        client
+            .get(format!(
+                "{api_base}/api/agent/extensions/{product_key}/collaboration"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )
+}
+
+pub fn extension_projects(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+) -> Result<Vec<AgentExtensionProject>, Box<dyn Error>> {
+    Ok(collaboration_json::<AgentExtensionProjectsResponse>(
+        client
+            .get(format!("{api_base}/api/agent/extensions/projects"))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )?
+    .items)
+}
+
+pub fn upsert_extension_source(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    project: &crate::extension_projects::ExtensionProject,
+    source: &crate::extension_projects::ExtensionProjectSourceInput,
+) -> Result<AgentExtensionProject, Box<dyn Error>> {
+    let product_key = encode_path_segment(&project.extension_id);
+    collaboration_json(
+        client
+            .put(format!(
+                "{api_base}/api/agent/extensions/{product_key}/source"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .json(&json!({
+                "kind": project.kind,
+                "name": project.name,
+                "description": project.description,
+                "source_repository": source.source_repository,
+                "source_default_branch": source.source_default_branch,
+                "source_subdirectory": source.source_subdirectory,
+            }))
+            .send()?,
+    )
+}
+
+pub fn extension_collaborator_options(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    product_key: &str,
+    query: &str,
+) -> Result<Vec<ExtensionCollaboratorOption>, Box<dyn Error>> {
+    let product_key = encode_path_segment(product_key);
+    Ok(collaboration_json::<ExtensionCollaboratorOptionsResponse>(
+        client
+            .get(format!(
+                "{api_base}/api/agent/extensions/{product_key}/collaborator-options"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .query(&[("q", query)])
+            .send()?,
+    )?
+    .items)
+}
+
+pub fn invite_extension_collaborator(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    product_key: &str,
+    user_id: &str,
+    role: &str,
+) -> Result<ExtensionCollaborationMember, Box<dyn Error>> {
+    let product_key = encode_path_segment(product_key);
+    collaboration_json(
+        client
+            .post(format!(
+                "{api_base}/api/agent/extensions/{product_key}/invitations"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .json(&json!({"user_id": user_id, "role": role}))
+            .send()?,
+    )
+}
+
+pub fn update_extension_collaborator(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    product_key: &str,
+    user_id: &str,
+    role: &str,
+) -> Result<(), Box<dyn Error>> {
+    let product_key = encode_path_segment(product_key);
+    let user_id = encode_path_segment(user_id);
+    collaboration_json::<serde_json::Value>(
+        client
+            .put(format!(
+                "{api_base}/api/agent/extensions/{product_key}/members/{user_id}"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .json(&json!({"role": role}))
+            .send()?,
+    )?;
+    Ok(())
+}
+
+pub fn delete_extension_collaborator(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    product_key: &str,
+    user_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let product_key = encode_path_segment(product_key);
+    let user_id = encode_path_segment(user_id);
+    collaboration_empty(
+        client
+            .delete(format!(
+                "{api_base}/api/agent/extensions/{product_key}/members/{user_id}"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )
+}
+
+pub fn extension_collaboration_invitations(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+) -> Result<Vec<ExtensionCollaborationInvitation>, Box<dyn Error>> {
+    Ok(
+        collaboration_json::<ExtensionCollaborationInvitationsResponse>(
+            client
+                .get(format!("{api_base}/api/agent/extensions/invitations"))
+                .bearer_auth(access_token)
+                .header("X-HiMind-Agent-ID", agent_id)
+                .header("X-HiMind-AI-Client", ai_client_id())
+                .send()?,
+        )?
+        .items,
+    )
+}
+
+pub fn respond_extension_collaboration_invitation(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    invitation_id: &str,
+    action: &str,
+) -> Result<(), Box<dyn Error>> {
+    let invitation_id = encode_path_segment(invitation_id);
+    collaboration_json::<serde_json::Value>(
+        client
+            .post(format!(
+                "{api_base}/api/agent/extensions/invitations/{invitation_id}/respond"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .json(&json!({"action": action}))
+            .send()?,
+    )?;
+    Ok(())
+}
+
+fn encode_path_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.trim().as_bytes()).collect()
+}
+
+fn collaboration_json<T: DeserializeOwned>(response: Response) -> Result<T, Box<dyn Error>> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response.json()?);
+    }
+    let message = response
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|value| value["error"].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("Dashboard request failed: {status}"));
+    Err(message.into())
+}
+
+fn collaboration_empty(response: Response) -> Result<(), Box<dyn Error>> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let message = response
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|value| value["error"].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("Dashboard request failed: {status}"));
+    Err(message.into())
 }
 
 pub fn publish_software_release(
@@ -628,6 +1095,40 @@ pub fn distribution_state_path(agent_state_path: &Path) -> PathBuf {
     agent_state_path.with_file_name("agent-state.distribution.json")
 }
 
+pub fn load_state(state_path: &Path) -> Result<Option<DistributionState>, Box<dyn Error>> {
+    if !state_path.is_file() {
+        return Ok(None);
+    }
+    let mut state = serde_json::from_slice::<DistributionState>(&fs::read(state_path)?)?;
+    if state.token.trim().is_empty() && !state.token_protected.trim().is_empty() {
+        state.token =
+            crate::store::credentials::unprotect_secret_for_current_user(&state.token_protected)?;
+    }
+    if state.client_id.trim().is_empty() || state.token.trim().is_empty() {
+        return Err("stored Distribution client identity is incomplete".into());
+    }
+    if state.token_protected.trim().is_empty() {
+        save_state(state_path, &state)?;
+    }
+    Ok(Some(state))
+}
+
+fn save_state(state_path: &Path, state: &DistributionState) -> Result<(), Box<dyn Error>> {
+    let mut stored = state.clone();
+    stored.token_protected =
+        crate::store::credentials::protect_secret_for_current_user(&state.token)?;
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = state_path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(&stored)?)?;
+    if state_path.exists() {
+        fs::remove_file(state_path)?;
+    }
+    fs::rename(temporary, state_path)?;
+    Ok(())
+}
+
 pub fn load_or_register(
     client: &Client,
     api_base: &str,
@@ -636,10 +1137,11 @@ pub fn load_or_register(
     client_key: &str,
     version: &str,
     channel: &str,
+    host_agent_id: &str,
+    host_agent_credential: &str,
 ) -> Result<Option<DistributionState>, Box<dyn Error>> {
-    let enrollment_token = env::var("HIMIND_DISTRIBUTION_ENROLLMENT_TOKEN").unwrap_or_default();
-    if state_path.exists() {
-        let state = serde_json::from_str::<DistributionState>(&fs::read_to_string(state_path)?)?;
+    let mut enrollment_token = env::var("HIMIND_DISTRIBUTION_ENROLLMENT_TOKEN").unwrap_or_default();
+    if let Some(state) = load_state(state_path)? {
         if !state.client_id.trim().is_empty()
             && !state.token.trim().is_empty()
             && heartbeat(client, api_base, &state, version, channel).is_ok()
@@ -648,7 +1150,13 @@ pub fn load_or_register(
         }
     }
     if enrollment_token.trim().is_empty() {
-        return Ok(None);
+        enrollment_token = request_client_enrollment(
+            client,
+            api_base,
+            product_key,
+            host_agent_id,
+            host_agent_credential,
+        )?;
     }
     let state = register(
         client,
@@ -661,6 +1169,36 @@ pub fn load_or_register(
         &enrollment_token,
     )?;
     Ok(Some(state))
+}
+
+fn request_client_enrollment(
+    client: &Client,
+    api_base: &str,
+    product_key: &str,
+    host_agent_id: &str,
+    host_agent_credential: &str,
+) -> Result<String, Box<dyn Error>> {
+    if host_agent_id.trim().is_empty() || host_agent_credential.trim().is_empty() {
+        return Err("a trusted host identity is required for Distribution enrollment".into());
+    }
+    #[derive(Deserialize)]
+    struct EnrollmentResponse {
+        token: String,
+    }
+    let response = client
+        .post(format!("{api_base}/api/distribution/client/enrollment"))
+        .header(
+            "Authorization",
+            format!("Agent {host_agent_id}:{host_agent_credential}"),
+        )
+        .json(&json!({"product_key": product_key}))
+        .send()?
+        .error_for_status()?
+        .json::<EnrollmentResponse>()?;
+    if response.token.trim().is_empty() {
+        return Err("Distribution enrollment response did not include a token".into());
+    }
+    Ok(response.token)
 }
 
 fn register(
@@ -690,8 +1228,9 @@ fn register(
     let state = DistributionState {
         client_id: response.id,
         token: response.token,
+        token_protected: String::new(),
     };
-    fs::write(state_path, serde_json::to_string_pretty(&state)?)?;
+    save_state(state_path, &state)?;
     Ok(state)
 }
 
@@ -757,7 +1296,10 @@ pub fn report_update_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{distribution_state_path, publish_software_release, SoftwareReleasePublishRequest};
+    use super::{
+        distribution_state_path, publish_software_release, DistributionState,
+        SoftwareReleasePublishRequest,
+    };
     use reqwest::blocking::Client;
     use std::fs;
     use std::io::{Read, Write};
@@ -773,6 +1315,18 @@ mod tests {
             distribution_state_path(Path::new("agent-state.json")),
             Path::new("agent-state.distribution.json")
         );
+    }
+
+    #[test]
+    fn distribution_state_never_serializes_plaintext_token() {
+        let state = DistributionState {
+            client_id: "client-1".to_string(),
+            token: "plaintext-secret".to_string(),
+            token_protected: "protected-value".to_string(),
+        };
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert!(!serialized.contains("plaintext-secret"));
+        assert!(serialized.contains("protected-value"));
     }
 
     #[test]

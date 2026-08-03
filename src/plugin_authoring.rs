@@ -18,6 +18,10 @@ const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PluginDraftInput {
     pub package_path: PathBuf,
+    #[serde(default)]
+    pub revision_of_version: Option<String>,
+    #[serde(default)]
+    pub parent_submission_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,13 +83,6 @@ pub(crate) fn save(input: PluginDraftInput) -> Result<PluginDraft, Box<dyn Error
         .as_ref()
         .map(|draft| draft.candidate_sha256 == candidate_sha256)
         .unwrap_or(false);
-    if previous
-        .as_ref()
-        .is_some_and(|draft| draft.submitted_at.is_some())
-        && !unchanged
-    {
-        return Err("已提交的插件版本不可覆盖，请创建新版本".into());
-    }
     fs::create_dir_all(&root)?;
     let candidate_path = root.join(format!("{}-{}.hmpkg", manifest.id, manifest.version));
     fs::copy(&source, &candidate_path)?;
@@ -102,8 +99,14 @@ pub(crate) fn save(input: PluginDraftInput) -> Result<PluginDraft, Box<dyn Error
         development_path: Some(package_root),
         workspace_path: Some(source.parent().unwrap_or(source.as_path()).to_path_buf()),
         source: "local_package".to_string(),
-        revision_of: None,
-        parent_submission_id: None,
+        revision_of: input
+            .revision_of_version
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        parent_submission_id: input
+            .parent_submission_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         tested_at: previous
             .as_ref()
             .filter(|_| unchanged)
@@ -134,6 +137,17 @@ pub(crate) fn read(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dy
     )?)?)
 }
 
+pub(crate) fn associate_workspace(
+    mut draft: PluginDraft,
+    workspace: &Path,
+) -> Result<PluginDraft, Box<dyn Error>> {
+    draft.workspace_path = Some(workspace.canonicalize()?);
+    draft.source = "workspace".to_string();
+    draft.updated_at = now_stamp();
+    persist(&draft)?;
+    Ok(draft)
+}
+
 pub(crate) fn create_revision(
     plugin_id: &str,
     version: &str,
@@ -152,6 +166,7 @@ pub(crate) fn create_revision(
     let manifest_path = package_root.join("plugin.json");
     let mut manifest = parse_plugin_manifest(&fs::read_to_string(&manifest_path)?)?;
     manifest.version = next_version.clone();
+    manifest.release_notes = format!("基于 v{version} 的功能改进与问题修复。");
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     write_checksums(&package_root)?;
     let candidate_path = root.join(format!("{plugin_id}-{next_version}.hmpkg"));
@@ -299,12 +314,15 @@ pub(crate) fn submit(
     let report = serde_json::json!({
         "candidate_sha256": draft.candidate_sha256,
         "agent_version": VERSION,
-        "tested_at": draft.tested_at,
-        "confirmed_at": draft.confirmed_at,
+        "built_at": draft.updated_at,
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
+    let source = crate::extension_projects::submission_source(
+        crate::extension_projects::ExtensionProjectKind::Plugin,
+        plugin_id,
+    )?;
     let submitted = crate::api::distribution::submit_plugin(
         &client,
         &options.api_base,
@@ -312,6 +330,8 @@ pub(crate) fn submit(
         &access.token,
         &draft.candidate_path,
         &report,
+        draft.revision_of.as_deref(),
+        &source,
     )?;
     draft.dashboard_submission_id = submitted
         .get("id")
@@ -324,11 +344,7 @@ pub(crate) fn submit(
 }
 
 fn ensure_ready_to_submit(draft: &PluginDraft) -> Result<(), Box<dyn Error>> {
-    ensure_candidate_unchanged(draft)?;
-    if draft.tested_at.is_none() || draft.confirmed_at.is_none() {
-        return Err("插件候选包尚未完成测试和用户确认".into());
-    }
-    Ok(())
+    ensure_candidate_unchanged(draft)
 }
 
 fn read_archive_manifest(path: &Path) -> Result<PluginManifest, Box<dyn Error>> {
@@ -377,6 +393,9 @@ fn validate_identity(manifest: &PluginManifest) -> Result<(), Box<dyn Error>> {
     validate_version(&manifest.version)?;
     if manifest.name.trim().is_empty() {
         return Err("插件中文名称不能为空".into());
+    }
+    if manifest.release_notes.trim().is_empty() {
+        return Err("请在 plugin.json 中填写本版本更新说明 release_notes".into());
     }
     Ok(())
 }
@@ -466,7 +485,7 @@ mod tests {
         env::set_var("HIMIND_PLUGIN_DRAFTS_DIR", &drafts);
         env::set_var("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY", &development_registry);
         let package = root.join("candidate.hmpkg");
-        let manifest = r#"{"id":"com.himind.authoring-test","name":"候选测试插件","version":"1.0.0","entry":"plugin.exe","runtime":"process-jsonrpc-stdio","min_agent_version":"0.3.0","governance":"optional","capabilities":[],"permissions":[],"contributes":{"commands":[],"views":[]}}"#
+        let manifest = r#"{"id":"com.himind.authoring-test","name":"候选测试插件","author":"测试用户","description":"测试插件候选链路","release_notes":"新增候选包保存、测试与修订验证。","version":"1.0.0","entry":"plugin.exe","runtime":"process-jsonrpc-stdio","min_agent_version":"0.3.0","governance":"optional","capabilities":[],"permissions":[],"contributes":{"commands":[],"views":[]}}"#
             .as_bytes();
         let entry = b"test-binary";
         let checksums = format!(
@@ -489,6 +508,8 @@ mod tests {
 
         let saved = save(PluginDraftInput {
             package_path: package,
+            revision_of_version: None,
+            parent_submission_id: None,
         })
         .unwrap();
         assert!(saved.candidate_path.exists());
@@ -499,6 +520,7 @@ mod tests {
         assert!(fs::read_to_string(&development_registry)
             .unwrap()
             .contains("com.himind.authoring-test"));
+        assert!(ensure_ready_to_submit(&saved).is_ok());
         let tested = test(&saved.manifest.id, &saved.manifest.version).unwrap();
         assert!(tested.tested_at.is_some());
         let confirmed = confirm(&saved.manifest.id, &saved.manifest.version).unwrap();

@@ -629,6 +629,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 scope: SkillScope::Organization,
                 description: String::new(),
+                release_notes: "测试 Copilot 渲染。".to_string(),
                 min_agent_version: String::new(),
                 supported_clients: vec![CLIENT_ID.to_string()],
                 capabilities: vec![],

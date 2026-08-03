@@ -639,6 +639,7 @@ mod tests {
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: String::new(),
+            release_notes: "测试 Codex 渲染。".to_string(),
             min_agent_version: "0.2.0".to_string(),
             supported_clients: vec!["codex".to_string()],
             capabilities: vec![SkillCapabilityDependency {

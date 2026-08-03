@@ -1,6 +1,33 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeInstallationReport {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    pub status: String,
+    #[serde(default)]
+    pub capabilities: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteExecutionReport {
+    pub enabled: bool,
+    pub access_mode: String,
+    pub default_provider: String,
+}
+
+impl From<crate::app::remote_execution::RemoteExecutionSettings> for RemoteExecutionReport {
+    fn from(value: crate::app::remote_execution::RemoteExecutionSettings) -> Self {
+        Self {
+            enabled: value.enabled,
+            access_mode: value.access_mode,
+            default_provider: value.default_provider,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
     pub agent_id: String,
@@ -67,4 +94,27 @@ pub struct Task {
 pub struct TaskCancelStatus {
     pub status: String,
     pub cancel_requested: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentRun {
+    pub id: String,
+    pub instruction: String,
+    pub status: String,
+    pub created_by_user_id: String,
+    pub runtime_provider: String,
+    #[serde(default)]
+    pub access_mode: String,
+    #[serde(default)]
+    pub input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentRunClaim {
+    pub run: AgentRun,
+    pub claim_token: String,
+    pub workspace_path: String,
+    pub ai_model: String,
+    #[serde(default)]
+    pub access_mode: String,
 }

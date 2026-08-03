@@ -152,8 +152,39 @@ fn write_message(writer: &mut impl Write, value: &Value) -> Result<(), Box<dyn E
 
 #[cfg(test)]
 mod tests {
-    use super::negotiate_protocol_version;
+    use super::{handle_request, negotiate_protocol_version};
+    use crate::capability::service::CapabilityGateway;
+    use crate::store::types::LocalWorkerStatus;
+    use crate::Options;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn test_gateway() -> CapabilityGateway {
+        let mut options = Options::from_env();
+        options.api_base = "http://127.0.0.1:9".to_string();
+        options.state_path = std::env::temp_dir().join(format!(
+            "himind-agent-mcp-test-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        CapabilityGateway::new(
+            options,
+            Arc::new(Mutex::new(LocalWorkerStatus {
+                dashboard_worker_online: false,
+                dashboard_agent_id: String::new(),
+                dashboard_worker_error: String::new(),
+                local_service_online: false,
+                local_service_error: String::new(),
+                distribution_update_available: false,
+                distribution_update_version: String::new(),
+                distribution_update_url: String::new(),
+                distribution_update_sha256: String::new(),
+                distribution_update_signature: String::new(),
+                distribution_update_signature_key_id: String::new(),
+                distribution_update_signature_algorithm: String::new(),
+            })),
+        )
+    }
 
     #[test]
     fn initialize_uses_a_supported_requested_protocol_version() {
@@ -169,5 +200,36 @@ mod tests {
             negotiate_protocol_version(&json!({ "protocolVersion": "future-version" })),
             "2025-11-25"
         );
+    }
+
+    #[test]
+    fn tools_list_exposes_the_builtin_knowledge_search_capability() {
+        let result = handle_request(&test_gateway(), "tools/list", json!({})).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        let knowledge = tools
+            .iter()
+            .find(|tool| tool["name"] == "knowledge.search.v1")
+            .expect("knowledge.search.v1 must be discoverable through MCP");
+        assert_eq!(knowledge["inputSchema"]["required"], json!(["query"]));
+        assert!(knowledge["description"]
+            .as_str()
+            .unwrap()
+            .contains("不调用 HiMind 模型"));
+    }
+
+    #[test]
+    fn tools_call_routes_knowledge_search_through_the_gateway() {
+        let result = handle_request(
+            &test_gateway(),
+            "tools/call",
+            json!({
+                "name": "knowledge.search.v1",
+                "arguments": { "query": "知识平台架构" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        let message = result["content"][0]["text"].as_str().unwrap();
+        assert!(!message.contains("capability not found"), "{message}");
     }
 }

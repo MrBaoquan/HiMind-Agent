@@ -10,7 +10,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::types::{AgentResponse, AgentState, Task, TaskCancelStatus};
+use super::types::{
+    AgentResponse, AgentRunClaim, AgentState, RemoteExecutionReport, RuntimeInstallationReport,
+    Task, TaskCancelStatus,
+};
 use crate::store::credentials::{
     protect_secret_for_current_user, unprotect_secret_for_current_user,
 };
@@ -188,6 +191,10 @@ pub fn register_agent(
 pub fn load_agent_state(state_path: &Path) -> Result<AgentState, Box<dyn Error>> {
     let content = fs::read_to_string(state_path)?;
     let mut state = serde_json::from_str::<AgentState>(&content)?;
+    let missing_device_id = state.device_id.trim().is_empty();
+    if missing_device_id {
+        state.device_id = load_or_create_device_id(state_path)?;
+    }
     if state.credential.trim().is_empty() && !state.credential_protected.trim().is_empty() {
         state.credential = unprotect_secret_for_current_user(&state.credential_protected)?;
     }
@@ -200,8 +207,9 @@ pub fn load_agent_state(state_path: &Path) -> Result<AgentState, Box<dyn Error>>
     if state.agent_id.trim().is_empty() || state.credential.trim().is_empty() {
         return Err("stored Agent identity is incomplete".into());
     }
-    let needs_migration =
-        state.credential_protected.trim().is_empty() || state.credential_updated_at == 0;
+    let needs_migration = missing_device_id
+        || state.credential_protected.trim().is_empty()
+        || state.credential_updated_at == 0;
     if state.credential_updated_at == 0 {
         state.credential_updated_at = unix_now();
     }
@@ -310,12 +318,30 @@ pub fn heartbeat(
     agent_id: &str,
     credential: &str,
 ) -> Result<bool, Box<dyn Error>> {
+    heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None)
+}
+
+pub fn heartbeat_with_runtime_installations(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    runtime_installations: Option<&[RuntimeInstallationReport]>,
+    remote_execution: Option<&RemoteExecutionReport>,
+) -> Result<bool, Box<dyn Error>> {
+    let mut payload = json!({
+        "agent_id": agent_id,
+        "status": "online",
+    });
+    if let Some(items) = runtime_installations {
+        payload["runtime_installations"] = serde_json::to_value(items)?;
+    }
+    if let Some(settings) = remote_execution {
+        payload["remote_execution"] = serde_json::to_value(settings)?;
+    }
     let response = client
         .post(format!("{}/api/agent/heartbeat", api_base))
-        .json(&json!({
-            "agent_id": agent_id,
-            "status": "online",
-        }))
+        .json(&payload)
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?;
     if matches!(
@@ -399,6 +425,104 @@ pub fn renew_task_lease(
         .send()?
         .error_for_status()?;
     Ok(())
+}
+
+pub fn claim_agent_run(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    task_id: &str,
+    run_id: &str,
+    credential: &str,
+) -> Result<AgentRunClaim, Box<dyn Error>> {
+    let response = client
+        .post(format!("{}/api/agent/runs/{}/claim", api_base, run_id))
+        .json(&json!({"agent_id": agent_id, "task_id": task_id}))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "Agent Run 领取失败（HTTP {}）：{}",
+            status.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(response.json::<AgentRunClaim>()?)
+}
+
+pub fn update_agent_run_status(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    status: &str,
+    result: Option<&Value>,
+    error: &str,
+    credential: &str,
+) -> Result<(), Box<dyn Error>> {
+    let response = client
+        .post(format!("{}/api/agent/runs/{}/status", api_base, run_id))
+        .json(&json!({
+            "agent_id": agent_id,
+            "claim_token": claim_token,
+            "status": status,
+            "result": result.cloned().unwrap_or(Value::Null),
+            "error": error,
+        }))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?;
+    if !response.status().is_success() {
+        let http_status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "Agent Run 状态回报失败（HTTP {}）：{}",
+            http_status.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub fn renew_agent_run_lease(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    credential: &str,
+) -> Result<(), Box<dyn Error>> {
+    let response = client
+        .post(format!(
+            "{}/api/agent/runs/{}/lease/renew",
+            api_base, run_id
+        ))
+        .json(&json!({"agent_id": agent_id, "claim_token": claim_token}))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "Agent Run 租约续期失败（HTTP {}）：{}",
+            status.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn bounded_response_detail(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "服务未返回错误详情".to_string();
+    }
+    value.chars().take(1000).collect()
 }
 
 pub fn verify_local_agent_ticket(

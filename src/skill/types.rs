@@ -45,6 +45,8 @@ pub(crate) struct SkillManifest {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
     pub min_agent_version: String,
     #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub supported_clients: Vec<String>,

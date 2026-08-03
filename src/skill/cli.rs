@@ -49,7 +49,7 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         Some("plan") if arguments.len() == 2 => {
             let state = paired_agent_state(options)?;
             print_json(serde_json::to_value(
-                crate::app::skill_manager::plan_install(options, &state.agent_id, &arguments[1])?,
+                crate::app::skill_manager::plan_install(options, &state.agent_id, &arguments[1], None)?,
             )?)?
         }
         Some("author")

@@ -10,8 +10,8 @@ type AiConnectionsPageProps = {
   busyAction: string | null;
   onOpenAccount: () => void;
   onRefresh: () => void;
-  onConfigure: (clientId: string, resetInvalid?: boolean) => void;
-  onRemove: (clientId: string) => void;
+  onRegister: (clientId: string, resetInvalid?: boolean) => void;
+  onUnregister: (clientId: string) => void;
   onOpenDirectory: (path: string) => void;
   onTest: () => void;
 };
@@ -23,14 +23,18 @@ export function AiConnectionsPage({
   busyAction,
   onOpenAccount,
   onRefresh,
-  onConfigure,
-  onRemove,
+  onRegister,
+  onUnregister,
   onOpenDirectory,
   onTest,
 }: AiConnectionsPageProps) {
   const [copied, setCopied] = useState<string | null>(null);
   const [removeCandidate, setRemoveCandidate] = useState<string | null>(null);
   const [repairCandidate, setRepairCandidate] = useState<string | null>(null);
+  const clients = integration?.clients || [];
+  const installedCount = clients.filter(client => client.detected).length;
+  const readyCount = clients.filter(client => client.detected && client.state === 'configured').length;
+  const attentionCount = clients.filter(client => client.detected && (client.state === 'needs_repair' || client.state === 'invalid_config')).length;
 
   async function copyConfiguration(client: AiClientIntegration) {
     await navigator.clipboard.writeText(client.config_preview);
@@ -41,90 +45,100 @@ export function AiConnectionsPage({
   return (
     <div className="ai-page">
       <PageHeader
-        title="连接 AI"
-        description="让常用 AI 工具使用 HiMind 提供的功能。"
-        actions={<button className="btn btn-icon" title="刷新连接状态" aria-label="刷新连接状态" disabled={Boolean(busyAction)} onClick={onRefresh}><RefreshCw size={16} /></button>}
+        title="AI 工具连接"
+        description="管理 HiMind MCP 服务在常用 AI 工具中的注册状态。"
+        actions={<button className="btn btn-icon" title="刷新注册状态" aria-label="刷新注册状态" disabled={Boolean(busyAction)} onClick={onRefresh}><RefreshCw size={16} /></button>}
       />
 
-      <div className="ai-runtime-strip">
-        <div><span className="status-dot success" /><span>本机服务</span><strong>已准备</strong></div>
-        <div><span>已写入配置</span><strong>{integration?.clients.filter(client => client.state === 'configured').length || 0}/{integration?.clients.length || 3}</strong></div>
-        <div className="ai-runtime-technical" title={`${integration?.protocol || 'MCP stdio'} · ${integration?.server_id || 'himind-agent'}`}><span>连接方式</span><strong>本机连接</strong></div>
-        <button className="btn" disabled={!integration || busyAction === 'test'} onClick={onTest}><PlugZap size={15} />{busyAction === 'test' ? '检查中' : '检查本机服务'}</button>
+      <div className="ai-connection-summary">
+        <div className="ai-summary-icon"><PlugZap size={19} /></div>
+        <div className="ai-summary-copy"><strong>MCP 服务注册状态</strong><span>注册后即可使用 HiMind 功能</span></div>
+        <div className="ai-summary-metrics">
+          <div><span>已注册</span><strong>{integration ? `${readyCount}/${installedCount}` : '—'}</strong></div>
+          <div><span>需要处理</span><strong className={attentionCount ? 'warning-text' : ''}>{attentionCount}</strong></div>
+        </div>
+        <button className="btn" disabled={!integration || busyAction === 'test'} onClick={onTest}><PlugZap size={15} />{busyAction === 'test' ? '检查中' : '检查 MCP 服务'}</button>
       </div>
 
       {testResult ? (
         <div className="mcp-test-result">
           <Check size={16} />
-          <span>本机服务正常</span>
-          <strong>{testResult.capability_count} 项功能可用</strong>
-          <code>{testResult.duration_ms} ms</code>
+          <span>MCP 服务正常</span>
+          <strong>可以供已注册的 AI 工具使用</strong>
         </div>
       ) : null}
 
-      {!identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>尚未登录 HiMind</strong><span>连接 AI 不受影响；使用工作台数据前需要登录。</span></div><button className="btn" onClick={onOpenAccount}>前往登录</button></div> : null}
+      {!identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>尚未登录 HiMind</strong><span>注册 MCP 服务不受影响；使用工作台数据前需要登录。</span></div><button className="btn" onClick={onOpenAccount}>登录 HiMind</button></div> : null}
 
       <section className="ai-client-section">
         <div className="ai-section-heading">
-          <div><h3>AI 工具连接</h3><span>选择要使用的客户端，连接信息会保存到本机</span></div>
-          <Pill kind="neutral">支持 {integration?.clients.length || 3} 个</Pill>
+          <div><h3>AI 工具</h3><span>注册或取消注册 HiMind MCP 服务</span></div>
+          <Pill kind="neutral">已安装 {installedCount}/{clients.length || 3}</Pill>
         </div>
-        <div className="ai-client-grid">
-          {(integration?.clients || []).map(client => {
+        <div className="ai-client-list">
+          {clients.map(client => {
             const state = clientState(client);
-            const pending = busyAction === `configure:${client.id}` || busyAction === `remove:${client.id}`;
+            const pending = busyAction === `register:${client.id}` || busyAction === `unregister:${client.id}`;
             return (
-              <article className="ai-client-card" key={client.id}>
-                <div className="ai-client-header">
-                  <div className={`ai-client-icon ${client.id}`}>{clientIcon(client.id)}</div>
-                  <div><strong>{client.name}</strong><span>{client.detection_message}</span></div>
-                  <div className="ai-client-state"><span className={`status-dot ${state.kind === 'success' ? 'success' : state.kind === 'danger' ? 'danger' : ''}`} /><Pill kind={state.kind}>{state.label}</Pill></div>
-                </div>
-                <div className="ai-client-config">
-                  <span>连接信息保存位置</span>
-                  <code title={client.config_path}>{client.config_path}</code>
-                  {client.state === 'invalid_config' ? <small>原配置文件格式有误，需要备份后重建</small> : null}
-                </div>
-                <details className="ai-config-preview">
-                  <summary>查看配置</summary>
-                  <div className="ai-code-wrap">
-                    <pre>{client.config_preview}</pre>
-                    <button className="btn btn-icon" title="复制配置" aria-label={`复制 ${client.name} 配置`} onClick={() => copyConfiguration(client)}>{copied === client.id ? <Check size={14} /> : <Copy size={14} />}</button>
-                  </div>
-                </details>
-                {client.state === 'configured' ? <div className="ai-client-next-step"><Check size={14} /><span>连接信息已准备好，重启 {client.name} 后即可使用</span></div> : null}
-                <div className="ai-client-actions">
-                  {client.state === 'invalid_config' && repairCandidate === client.id ? (
-                    <div className="ai-repair-confirm">
-                      <span>继续后会备份原文件，并只保留新的 HiMind 连接信息。</span>
-                      <button className="btn btn-primary" disabled={pending} onClick={() => { onConfigure(client.id, true); setRepairCandidate(null); }}>备份并重建</button>
-                      <button className="btn btn-icon" title="取消" aria-label="取消重建" onClick={() => setRepairCandidate(null)}><X size={14} /></button>
-                    </div>
-                  ) : (
-                    <button
-                      className="btn btn-primary"
-                      disabled={pending || (!client.detected && client.state === 'not_configured')}
-                      title={!client.detected && client.state === 'not_configured' ? `请先安装 ${client.name}` : undefined}
-                      onClick={() => client.state === 'invalid_config' ? setRepairCandidate(client.id) : onConfigure(client.id)}
-                    >
-                      {client.state === 'configured' ? <Settings2 size={15} /> : client.state === 'needs_repair' || client.state === 'invalid_config' ? <Wrench size={15} /> : <PlugZap size={15} />}
-                      {client.state === 'configured' ? '更新连接' : client.state === 'invalid_config' ? '重建连接' : client.state === 'needs_repair' ? '更新连接' : '连接'}
-                    </button>
-                  )}
-                  <button className="btn btn-icon" title="打开连接信息目录" aria-label={`打开 ${client.name} 连接信息目录`} onClick={() => onOpenDirectory(client.config_directory)}><FolderOpen size={15} /></button>
-                  {client.state === 'configured' || client.state === 'needs_repair' ? (
-                    removeCandidate === client.id ? (
-                      <div className="ai-remove-confirm"><button className="btn btn-danger-quiet" disabled={pending} onClick={() => { onRemove(client.id); setRemoveCandidate(null); }}>确认断开</button><button className="btn btn-icon" title="取消" aria-label="取消断开" onClick={() => setRemoveCandidate(null)}><X size={14} /></button></div>
-                    ) : <button className="btn btn-icon ai-remove" title="断开连接" aria-label={`断开 ${client.name}`} onClick={() => setRemoveCandidate(client.id)}><Trash2 size={15} /></button>
-                  ) : null}
+              <article className="ai-client-row" key={client.id}>
+                <div className={`ai-client-icon ${client.id}`}>{clientIcon(client.id)}</div>
+                <div className="ai-client-copy"><strong>{client.name}</strong><span>{clientDescription(client)}</span></div>
+                <Pill kind={state.kind}>{state.label}</Pill>
+                <div className="ai-client-registration-actions">
+                  {removeCandidate === client.id ? <div className="ai-remove-confirm"><button className="btn btn-danger-quiet" disabled={pending} onClick={() => { onUnregister(client.id); setRemoveCandidate(null); }}>确认取消注册</button><button className="btn btn-icon" title="保留注册" aria-label="保留 MCP 注册" onClick={() => setRemoveCandidate(null)}><X size={14} /></button></div> : client.state === 'invalid_config' && repairCandidate === client.id ? <div className="ai-repair-confirm"><small>将备份现有配置并重新注册 HiMind MCP 服务。</small><button className="btn btn-primary" disabled={pending} onClick={() => { onRegister(client.id, true); setRepairCandidate(null); }}>确认修复</button><button className="btn btn-icon" title="取消" aria-label="取消修复" onClick={() => setRepairCandidate(null)}><X size={14} /></button></div> : <>
+                    {client.detected && client.state !== 'configured' ? <button className="btn btn-primary" disabled={pending} onClick={() => client.state === 'invalid_config' ? setRepairCandidate(client.id) : onRegister(client.id)}>{clientActionIcon(client)}{clientActionLabel(client)}</button> : null}
+                    {client.state !== 'not_configured' ? <button className="btn btn-danger-quiet" disabled={pending} onClick={() => setRemoveCandidate(client.id)}><Trash2 size={14} />取消注册</button> : null}
+                    {!client.detected && client.state === 'not_configured' ? <span>安装客户端后可注册</span> : null}
+                  </>}
                 </div>
               </article>
             );
           })}
         </div>
       </section>
+
+      {clients.length ? <details className="ai-advanced">
+        <summary><Settings2 size={16} /><span><strong>高级诊断</strong><small>查看客户端配置路径和原始配置</small></span></summary>
+        <div className="ai-diagnostic-list">
+          {clients.map(client => {
+            const state = clientState(client);
+            return <div className="ai-diagnostic-item" key={client.id}>
+              <div className="ai-diagnostic-heading"><strong>{client.name}</strong><Pill kind={state.kind}>{state.label}</Pill></div>
+              <div className="ai-diagnostic-path"><span>配置文件</span><code title={client.config_path}>{client.config_path}</code></div>
+              {client.state === 'invalid_config' ? <div className="ai-diagnostic-error">原配置文件格式异常，需要备份后重建。</div> : null}
+              <details className="ai-config-preview">
+                <summary>查看原始配置</summary>
+                <div className="ai-code-wrap"><pre>{client.config_preview}</pre><button className="btn btn-icon" title="复制配置" aria-label={`复制 ${client.name} 配置`} onClick={() => copyConfiguration(client)}>{copied === client.id ? <Check size={14} /> : <Copy size={14} />}</button></div>
+              </details>
+              <div className="ai-diagnostic-actions">
+                <button className="btn btn-icon" title="打开配置目录" aria-label={`打开 ${client.name} 配置目录`} onClick={() => onOpenDirectory(client.config_directory)}><FolderOpen size={15} /></button>
+              </div>
+            </div>;
+          })}
+        </div>
+      </details> : null}
     </div>
   );
+}
+
+function clientDescription(client: AiClientIntegration) {
+  if (!client.detected && client.state !== 'not_configured') return '未检测到客户端，现有注册已保留';
+  if (!client.detected) return '未在这台电脑上检测到客户端';
+  if (client.state === 'configured') return `HiMind MCP 服务已注册，重启 ${client.name} 后生效`;
+  if (client.state === 'needs_repair') return '当前注册需要更新';
+  if (client.state === 'invalid_config') return '当前注册需要修复';
+  return '可以注册 HiMind MCP 服务';
+}
+
+function clientActionLabel(client: AiClientIntegration) {
+  if (client.state === 'needs_repair') return '更新注册';
+  if (client.state === 'invalid_config') return '修复注册';
+  return '注册 MCP 服务';
+}
+
+function clientActionIcon(client: AiClientIntegration) {
+  if (client.state === 'needs_repair' || client.state === 'invalid_config') return <Wrench size={15} />;
+  return <PlugZap size={15} />;
 }
 
 function clientIcon(clientId: string) {
@@ -134,8 +148,9 @@ function clientIcon(clientId: string) {
 }
 
 function clientState(client: AiClientIntegration): { label: string; kind: 'success' | 'warn' | 'danger' | 'neutral' } {
-  if (client.state === 'configured') return { label: '已连接', kind: 'success' };
-  if (client.state === 'needs_repair') return { label: '需要更新', kind: 'warn' };
-  if (client.state === 'invalid_config') return { label: '需要重建', kind: 'danger' };
-  return { label: client.detected ? '未连接' : '未安装', kind: client.detected ? 'warn' : 'neutral' };
+  if (!client.detected) return { label: '未安装', kind: 'neutral' };
+  if (client.state === 'configured') return { label: '已注册', kind: 'success' };
+  if (client.state === 'needs_repair') return { label: '注册需更新', kind: 'warn' };
+  if (client.state === 'invalid_config') return { label: '注册异常', kind: 'danger' };
+  return { label: '未注册', kind: 'neutral' };
 }

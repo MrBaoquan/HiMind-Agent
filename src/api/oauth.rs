@@ -16,8 +16,11 @@ use crate::store::credentials::{
 use crate::Options;
 
 pub(crate) const PROFILE_SCOPE: &str = "agent.profile";
+pub(crate) const BUSINESS_CONTEXT_READ_SCOPE: &str = "business.context.read";
+pub(crate) const KNOWLEDGE_SEARCH_SCOPE: &str = "knowledge.search";
 pub(crate) const CREATIVE_SUBMIT_SCOPE: &str = "distribution.creative.submit";
 pub(crate) const RELEASE_MANAGE_SCOPE: &str = "distribution.release.manage";
+pub(crate) const AI_CONVERSATION_SCOPE: &str = "ai.conversation.invoke";
 const CLIENT_ID: &str = "himind-agent";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -124,11 +127,12 @@ pub(crate) fn platform_access_token(
 
     let path = authorization_path(&options.state_path);
     let _refresh_lock = lock_authorization_file(&options.state_path)?;
-    let stored: StoredAgentAuthorization = serde_json::from_slice(&fs::read(&path).map_err(|_| {
-        "Agent has no delegated Dashboard authorization; pair it again or run `himind-agent auth login`"
-    })?)?;
+    let stored: StoredAgentAuthorization =
+        serde_json::from_slice(&fs::read(&path).map_err(|_| "请先登录 HiMind 账号")?)?;
     if stored.refresh_expires_at <= unix_now() {
-        return Err("Agent delegated Dashboard authorization has expired".into());
+        let _ = clear_authorization_unlocked(&options.state_path);
+        *cache = None;
+        return Err("HiMind 账号授权已过期，请重新登录".into());
     }
     if !required_scope.is_empty()
         && !stored
@@ -148,7 +152,18 @@ pub(crate) fn platform_access_token(
             ("refresh_token", refresh_token.as_str()),
         ])
         .send()?;
-    let token = parse_token_response(response)?;
+    let token = match parse_token_response(response) {
+        Ok(token) => token,
+        Err(error) => {
+            let message = error.to_string();
+            if authorization_requires_login(&message) {
+                let _ = clear_authorization_unlocked(&options.state_path);
+                *cache = None;
+                return Err("HiMind 账号授权已失效，请重新登录".into());
+            }
+            return Err(error);
+        }
+    };
     if token.agent_id != stored.agent_id {
         return Err("Dashboard returned an access token for a different Agent".into());
     }
@@ -282,7 +297,9 @@ pub(crate) fn begin_device_authorization(
             ("client_id", CLIENT_ID),
             (
                 "scope",
-                &format!("{PROFILE_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"),
+                &format!(
+                    "{PROFILE_SCOPE} {BUSINESS_CONTEXT_READ_SCOPE} {KNOWLEDGE_SEARCH_SCOPE} {AI_CONVERSATION_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"
+                ),
             ),
             ("agent_id", state.agent_id.as_str()),
             ("device_id", state.device_id.as_str()),
@@ -479,6 +496,13 @@ fn parse_oauth_error(response: Response) -> String {
     }
 }
 
+fn authorization_requires_login(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("invalid_grant")
+        || normalized.contains("invalid_token")
+        || normalized.contains("refresh token reuse")
+}
+
 fn access_from_response(response: &OAuthTokenResponse) -> AgentAccessToken {
     AgentAccessToken {
         token: response.access_token.clone(),
@@ -502,7 +526,10 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{save_authorization_response, unix_now, AgentAccessToken, OAuthTokenResponse};
+    use super::{
+        authorization_requires_login, save_authorization_response, unix_now, AgentAccessToken,
+        OAuthTokenResponse,
+    };
     use std::fs;
 
     fn access(expires_at: u64, scope: &str) -> AgentAccessToken {
@@ -533,6 +560,17 @@ mod tests {
             ..usable
         };
         assert!(!empty.valid_for("agent.profile"));
+    }
+
+    #[test]
+    fn terminal_oauth_errors_require_a_new_login() {
+        assert!(authorization_requires_login(
+            "invalid_grant: refresh token reuse detected"
+        ));
+        assert!(authorization_requires_login("invalid_token"));
+        assert!(!authorization_requires_login(
+            "Dashboard is temporarily unavailable"
+        ));
     }
 
     #[test]

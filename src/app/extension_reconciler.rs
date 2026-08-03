@@ -131,7 +131,7 @@ fn reconcile_plugin(
     let needs_install = before.current_version.is_empty()
         || (!item.desired_version.is_empty() && before.current_version != item.desired_version);
     if needs_install {
-        if let Err(error) = plugin_manager::install(options, agent_id, &item.asset_key) {
+        if let Err(error) = plugin_manager::install(options, agent_id, &item.asset_key, None) {
             let local = plugin_manager::local_status(&item.asset_key);
             return result(
                 item,
@@ -264,21 +264,25 @@ fn reconcile_skill(
         })
         .unwrap_or(true);
     if needs_install {
-        let record =
-            match skill_manager::install_with_dependencies(options, agent_id, &item.asset_key, &[])
-            {
-                Ok((_, record)) => record,
-                Err(error) => {
-                    return result(
-                        item,
-                        "failed",
-                        "installing_dependencies",
-                        "",
-                        json!({}),
-                        &error.to_string(),
-                    )
-                }
-            };
+        let record = match skill_manager::install_with_dependencies(
+            options,
+            agent_id,
+            &item.asset_key,
+            None,
+            &[],
+        ) {
+            Ok((_, record)) => record,
+            Err(error) => {
+                return result(
+                    item,
+                    "failed",
+                    "installing_dependencies",
+                    "",
+                    json!({}),
+                    &error.to_string(),
+                )
+            }
+        };
         if let Err(error) = store.apply_management_policy(&item.asset_key, &policy) {
             return result(
                 item,

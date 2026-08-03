@@ -1,6 +1,5 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use reqwest::blocking::Client;
 use reqwest::Url;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Pss, RsaPublicKey};
@@ -8,15 +7,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
-use std::fs::File;
-use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::app::types::{LocalAgentUpdateRequest, RemoteConnectRequest};
+use crate::app::types::RemoteConnectRequest;
 use crate::store::credentials::{configured_unity_editor_path, unity_editor_environment_path};
 use crate::Options;
 
@@ -28,178 +23,10 @@ const EMBEDDED_UPDATE_PUBLIC_KEY_PEM: &str =
 const EMBEDDED_UPDATE_KEY_ID: &str =
     include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt"));
 
-pub(crate) fn local_agent_update_supported() -> bool {
-    env::current_exe().is_ok()
-}
-
-pub(crate) fn trigger_local_agent_update(
-    options: &Options,
-    payload: &LocalAgentUpdateRequest,
-) -> Result<String, Box<dyn Error>> {
-    let exe = env::current_exe()?;
-    let download_url = payload
-        .download_url
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if download_url.is_empty() {
-        schedule_agent_restart(&exe, options)?;
-
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(500));
-            std::process::exit(0);
-        });
-        return Ok(
-            "已开始重新加载本机 Agent 可执行文件，托盘和 127.0.0.1:18181 服务会短暂重启。"
-                .to_string(),
-        );
-    }
-
-    validate_update_download_url(&options.api_base, &download_url)?;
-    let expected_sha256 = payload.sha256.as_deref().unwrap_or_default().trim();
-    validate_sha256(expected_sha256)?;
-    let target_version = payload.version.as_deref().unwrap_or_default().trim();
-    if target_version.is_empty()
-        || crate::skill::resolver::compare_versions(target_version, crate::VERSION)
-            != std::cmp::Ordering::Greater
-    {
-        return Err("Agent 更新目标版本必须高于当前版本".into());
-    }
-    let staged_file = download_agent_package(&download_url, expected_sha256, &options.state_path)?;
-    if let Err(error) = verify_agent_package_signature(&staged_file, payload) {
-        let _ = std::fs::remove_file(&staged_file);
-        return Err(error);
-    }
-    schedule_agent_replace_and_restart(&staged_file, &exe, options, target_version)?;
-
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500));
-        std::process::exit(0);
-    });
-    let version_label = payload.version.as_deref().unwrap_or_default().trim();
-    let checksum_label = payload.sha256.as_deref().unwrap_or_default().trim();
-    let mut message = if version_label.is_empty() {
-        "已开始下载并安装最新 Agent，可执行文件会在本机静默替换并自动重启。".to_string()
-    } else {
-        format!(
-            "已开始下载并安装 Agent {}，可执行文件会在本机静默替换并自动重启。",
-            version_label
-        )
-    };
-    if !checksum_label.is_empty() {
-        message.push_str(&format!(
-            " 校验摘要：{}...",
-            &checksum_label.chars().take(12).collect::<String>()
-        ));
-    }
-    Ok(message)
-}
-
-fn schedule_agent_restart(executable: &Path, options: &Options) -> Result<(), Box<dyn Error>> {
-    let working_dir = env::current_dir()?;
-    let mut arg_list = vec![
-        "'--api'".to_string(),
-        format!("'{}'", powershell_escape_single_quoted(&options.api_base)),
-        "'--local-app'".to_string(),
-        "'--local-port'".to_string(),
-        format!("'{}'", options.local_port),
-    ];
-    if !options.state_path.as_os_str().is_empty() {
-        arg_list.push("'--state'".to_string());
-        arg_list.push(format!(
-            "'{}'",
-            powershell_escape_single_quoted(&options.state_path.to_string_lossy())
-        ));
-    }
-    let script = format!(
-        "Start-Sleep -Milliseconds 900; Start-Process -FilePath '{}' -ArgumentList @({}) -WorkingDirectory '{}' -WindowStyle Hidden",
-        powershell_escape_single_quoted(&executable.to_string_lossy()),
-        arg_list.join(", "),
-        powershell_escape_single_quoted(&working_dir.to_string_lossy())
-    );
-    let mut started = false;
-    for shell in ["pwsh", "powershell"] {
-        if Command::new(shell)
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .is_ok()
-        {
-            started = true;
-            break;
-        }
-    }
-    if !started {
-        return Err("无法调度 Agent 可执行文件重载，请确认 pwsh 或 powershell 可用。".into());
-    }
-    Ok(())
-}
-
-fn download_agent_package(
+pub(crate) fn validate_update_download_url(
+    api_base: &str,
     download_url: &str,
-    expected_sha256: &str,
-    agent_state_path: &Path,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(180))
-        .build()?;
-    let mut request = client.get(download_url);
-    if download_url.contains("/api/distribution/artifacts/") {
-        let state_path = crate::api::distribution::distribution_state_path(agent_state_path);
-        if let Ok(content) = std::fs::read_to_string(state_path) {
-            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(token) = state
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                {
-                    request = request.bearer_auth(token);
-                }
-            }
-        }
-    } else if download_url.contains("/api/agent-package/latest/update") {
-        if let Ok(state) = crate::api::client::load_agent_state(agent_state_path) {
-            if !state.agent_id.trim().is_empty() && !state.credential.trim().is_empty() {
-                request = request.header(
-                    "Authorization",
-                    format!("Agent {}:{}", state.agent_id, state.credential),
-                );
-            }
-        }
-    }
-    let mut response = request.send()?;
-    response.error_for_status_ref()?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or_default();
-    let staged_path = env::temp_dir().join(format!("himind-agent-update-{timestamp}.exe"));
-    let mut file = File::create(&staged_path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = response.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
-    }
-    file.flush()?;
-    let actual_sha256 = format!("{:x}", hasher.finalize());
-    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-        let _ = std::fs::remove_file(&staged_path);
-        return Err(format!(
-            "Agent 更新包 SHA-256 校验失败，期望 {expected_sha256}，实际 {actual_sha256}"
-        )
-        .into());
-    }
-    Ok(staged_path)
-}
-
-fn validate_update_download_url(api_base: &str, download_url: &str) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let api = Url::parse(api_base).map_err(|_| "Dashboard API 地址无效")?;
     let download = Url::parse(download_url).map_err(|_| "Agent 更新包下载地址无效")?;
     if !matches!(download.scheme(), "http" | "https") {
@@ -214,35 +41,22 @@ fn validate_update_download_url(api_base: &str, download_url: &str) -> Result<()
     Ok(())
 }
 
-fn validate_sha256(value: &str) -> Result<(), Box<dyn Error>> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Agent 更新必须提供合法的 SHA-256 摘要".into());
-    }
-    Ok(())
-}
-
-fn verify_agent_package_signature(
-    staged_executable: &Path,
-    payload: &LocalAgentUpdateRequest,
+pub(crate) fn verify_agent_package_signature(
+    staged_package: &Path,
+    signature: &str,
+    key_id: &str,
+    algorithm: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let signature = payload.signature.as_deref().unwrap_or_default().trim();
-    let key_id = payload
-        .signature_key_id
-        .as_deref()
-        .unwrap_or_default()
-        .trim();
-    let algorithm = payload
-        .signature_algorithm
-        .as_deref()
-        .unwrap_or_default()
-        .trim();
+    let signature = signature.trim();
+    let key_id = key_id.trim();
+    let algorithm = algorithm.trim();
     let require_signed = signed_agent_updates_required();
     validate_signature_metadata(signature, key_id, algorithm, require_signed)?;
     if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
         return Ok(());
     }
     let public_key = trusted_agent_update_public_key(key_id)?;
-    verify_rsa_pss_sha256(staged_executable, &public_key, signature)
+    verify_rsa_pss_sha256(staged_package, &public_key, signature)
 }
 
 pub(crate) fn signed_agent_updates_required() -> bool {
@@ -313,8 +127,11 @@ pub(crate) fn validate_signature_metadata(
     Ok(())
 }
 
-fn schedule_agent_replace_and_restart(
+pub(crate) fn schedule_agent_replace_and_restart(
     staged_executable: &Path,
+    staged_package: &Path,
+    staged_updater: &Path,
+    staged_launcher: &Path,
     current_executable: &Path,
     options: &Options,
     target_version: &str,
@@ -325,11 +142,21 @@ fn schedule_agent_replace_and_restart(
         .and_then(|value| value.to_str())
         == Some("current");
     if !installed_layout {
-        return schedule_legacy_agent_replace_and_restart(
-            staged_executable,
-            current_executable,
-            options,
-        );
+        return Err("Agent updates require the installed current-directory layout".into());
+    }
+    for (path, name) in [
+        (staged_executable, "himind-agent.exe"),
+        (staged_updater, "himind-agent-updater.exe"),
+        (staged_launcher, "himind-agent-launcher.exe"),
+    ] {
+        if !path.is_file() || path.file_name().and_then(|value| value.to_str()) != Some(name) {
+            return Err(format!("Agent directory update is missing {name}").into());
+        }
+    }
+    if !staged_package.is_file()
+        || staged_package.extension().and_then(|value| value.to_str()) != Some("zip")
+    {
+        return Err("Agent directory update package is unavailable".into());
     }
     let updater = current_executable
         .parent()
@@ -341,6 +168,7 @@ fn schedule_agent_replace_and_restart(
                 .parent()
                 .map(|path| path.join("himind-agent-updater.exe"))
         })
+        .filter(|path| path.is_file())
         .ok_or("无法定位 Agent updater")?;
     let mut arguments = vec![
         "--api".to_string(),
@@ -356,7 +184,11 @@ fn schedule_agent_replace_and_restart(
     let payload = serde_json::json!({
         "current_executable": current_executable,
         "staged_executable": staged_executable,
+        "staged_package": staged_package,
+        "staged_updater": staged_updater,
+        "staged_launcher": staged_launcher,
         "api_base": options.api_base,
+        "from_version": crate::VERSION,
         "target_version": target_version,
         "local_port": options.local_port,
         "state_path": options.state_path,
@@ -368,44 +200,6 @@ fn schedule_agent_replace_and_restart(
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
-}
-
-fn schedule_legacy_agent_replace_and_restart(
-    staged_executable: &Path,
-    current_executable: &Path,
-    options: &Options,
-) -> Result<(), Box<dyn Error>> {
-    let working_dir = env::current_dir()?;
-    let args = format!(
-        "'--api','{}','--local-app','--local-port','{}','--state','{}'",
-        powershell_escape_single_quoted(&options.api_base),
-        options.local_port,
-        powershell_escape_single_quoted(&options.state_path.to_string_lossy())
-    );
-    let script = format!(
-        "Start-Sleep -Milliseconds 900; Copy-Item -Force '{}' '{}'; Start-Process -FilePath '{}' -ArgumentList @({}) -WorkingDirectory '{}' -WindowStyle Hidden; Remove-Item -Force '{}' -ErrorAction SilentlyContinue",
-        powershell_escape_single_quoted(&staged_executable.to_string_lossy()),
-        powershell_escape_single_quoted(&current_executable.to_string_lossy()),
-        powershell_escape_single_quoted(&current_executable.to_string_lossy()),
-        args,
-        powershell_escape_single_quoted(&working_dir.to_string_lossy()),
-        powershell_escape_single_quoted(&staged_executable.to_string_lossy()),
-    );
-    for shell in ["pwsh", "powershell"] {
-        if Command::new(shell)
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err("无法调度 Agent 更新，请确认 PowerShell 可用。".into())
-}
-
-fn powershell_escape_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 pub(crate) fn local_agent_executable_metadata() -> Value {
@@ -998,8 +792,7 @@ fn resolve_project_launcher(folder: &Path, engine: &str) -> (Option<String>, Opt
         let project_file = is_unity_project(folder).then(|| folder.to_string_lossy().to_string());
         let launcher = configured_unity_editor_path()
             .or_else(unity_editor_environment_path)
-            .filter(|value| Path::new(value).is_file())
-            .or_else(find_unity_editor);
+            .filter(|value| Path::new(value).is_file());
         return (project_file, launcher);
     }
     if engine == "unreal" {
@@ -1031,39 +824,6 @@ fn first_file_with_extension(folder: &Path, extension: &str) -> Option<PathBuf> 
                 .map(|value| value.eq_ignore_ascii_case(extension))
                 .unwrap_or(false)
         })
-}
-
-fn find_unity_editor() -> Option<String> {
-    let mut candidates = Vec::new();
-    collect_unity_editors(
-        Path::new(r"C:\Program Files\Unity\Hub\Editor"),
-        &mut candidates,
-    );
-    collect_unity_editors(Path::new(r"C:\Program Files\Unity"), &mut candidates);
-    if let Ok(entries) = std::fs::read_dir(r"C:\Program Files") {
-        candidates.extend(entries.filter_map(Result::ok).filter_map(|item| {
-            let name = item.file_name().to_string_lossy().to_string();
-            name.starts_with("Unity ")
-                .then(|| item.path().join(r"Editor\Unity.exe"))
-                .filter(|path| path.is_file())
-        }));
-    }
-    candidates.sort();
-    candidates
-        .pop()
-        .map(|path| path.to_string_lossy().to_string())
-}
-
-fn collect_unity_editors(root: &Path, candidates: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    candidates.extend(
-        entries
-            .filter_map(Result::ok)
-            .map(|item| item.path().join(r"Editor\Unity.exe"))
-            .filter(|path| path.is_file()),
-    );
 }
 
 fn find_unreal_editor() -> Option<String> {
@@ -1300,6 +1060,7 @@ mod tests {
     use rsa::pkcs8::{EncodePublicKey, LineEnding};
     use rsa::rand_core::OsRng;
     use rsa::RsaPrivateKey;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn detects_only_conventional_workspace_build_scripts() {
@@ -1347,7 +1108,7 @@ mod tests {
     fn accepts_same_origin_update_url() {
         assert!(validate_update_download_url(
             "http://localhost:18081",
-            "http://localhost:18081/api/agent-package/latest/download"
+            "http://localhost:18081/api/distribution/artifacts/artifact-1/download"
         )
         .is_ok());
     }
@@ -1356,7 +1117,7 @@ mod tests {
     fn rejects_cross_origin_update_url() {
         assert!(validate_update_download_url(
             "http://localhost:18081",
-            "https://downloads.example/agent.exe"
+            "https://downloads.example/himind-agent-update.zip"
         )
         .is_err());
     }
@@ -1368,14 +1129,6 @@ mod tests {
             "file:///C:/Temp/agent.exe"
         )
         .is_err());
-    }
-
-    #[test]
-    fn validates_sha256_format() {
-        assert!(validate_sha256(&"a".repeat(64)).is_ok());
-        assert!(validate_sha256("").is_err());
-        assert!(validate_sha256(&"z".repeat(64)).is_err());
-        assert!(validate_sha256(&"a".repeat(63)).is_err());
     }
 
     #[test]

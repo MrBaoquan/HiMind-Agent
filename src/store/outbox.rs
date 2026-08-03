@@ -85,6 +85,26 @@ pub(crate) fn remove_report(path: &Path) -> io::Result<()> {
     }
 }
 
+pub(crate) fn remove_reports_for_execution(
+    state_path: &Path,
+    task_id: &str,
+    execution_id: &str,
+    except: Option<&Path>,
+) -> io::Result<usize> {
+    let mut removed = 0;
+    for (path, report) in list_reports(state_path)? {
+        if report.task_id != task_id
+            || report.execution_id != execution_id
+            || except.is_some_and(|value| value == path)
+        {
+            continue;
+        }
+        remove_report(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn safe_name(value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -134,6 +154,34 @@ mod tests {
         assert_eq!(listed[0].1.task_id, "task/1");
         remove_report(&path).unwrap();
         assert!(list_reports(&state).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removes_superseded_reports_for_the_same_execution() {
+        let root = std::env::temp_dir().join(format!("himind-outbox-prune-{}", timestamp()));
+        let state = root.join("agent-state.json");
+        let mut report = TaskReportRecord {
+            task_id: "task-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            lease_id: "lease-1".to_string(),
+            status: "running".to_string(),
+            progress: 50,
+            detail: "copying".to_string(),
+            result: serde_json::json!({}),
+            error: String::new(),
+        };
+        store_report(&state, &report).unwrap();
+        report.status = "finished".to_string();
+        let finished = store_report(&state, &report).unwrap();
+        assert_eq!(
+            remove_reports_for_execution(&state, "task-1", "exec-1", Some(&finished)).unwrap(),
+            1
+        );
+        let listed = list_reports(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.status, "finished");
         let _ = fs::remove_dir_all(root);
     }
 }

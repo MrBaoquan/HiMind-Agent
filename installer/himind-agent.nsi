@@ -16,11 +16,15 @@ Unicode true
 !ifndef ASSET_DIR
   !define ASSET_DIR "generated"
 !endif
+!ifndef VSCODE_EXTENSION_VSIX
+  !error "VSCODE_EXTENSION_VSIX is required"
+!endif
 
 !define PRODUCT_NAME "HiMind Agent"
 !define PRODUCT_PUBLISHER "HiMind"
 !define PRODUCT_REGISTRY_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\HiMindAgent"
 !define PRODUCT_RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
+!define PRODUCT_PROTOCOL_KEY "Software\Classes\himind-agent"
 !define PRODUCT_LAUNCH_ARGS '--api ${API_BASE} --local-app --local-port 18181'
 
 Name "${PRODUCT_NAME}"
@@ -150,6 +154,9 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   SetOutPath "$INSTDIR\current"
   File "${RELEASE}\himind-agent.exe"
 
+  SetOutPath "$INSTDIR\resources\vscode"
+  File /oname=himind-ai.vsix "${VSCODE_EXTENSION_VSIX}"
+
   SetOutPath "$INSTDIR\data"
   SetOutPath "$INSTDIR\previous"
   SetOutPath "$INSTDIR\logs"
@@ -164,6 +171,11 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   WriteRegStr HKCU "${PRODUCT_REGISTRY_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegDWORD HKCU "${PRODUCT_REGISTRY_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${PRODUCT_REGISTRY_KEY}" "NoRepair" 1
+
+  WriteRegStr HKCU "${PRODUCT_PROTOCOL_KEY}" "" "URL:HiMind Agent Protocol"
+  WriteRegStr HKCU "${PRODUCT_PROTOCOL_KEY}" "URL Protocol" ""
+  WriteRegStr HKCU "${PRODUCT_PROTOCOL_KEY}\DefaultIcon" "" "$INSTDIR\himind-agent.ico"
+  WriteRegStr HKCU "${PRODUCT_PROTOCOL_KEY}\shell\open\command" "" '"$INSTDIR\himind-agent-launcher.exe" ${PRODUCT_LAUNCH_ARGS} --protocol-url "%1"'
 
   ${If} $StartWithWindowsState == ${BST_CHECKED}
     WriteRegStr HKCU "${PRODUCT_RUN_KEY}" "HiMindAgent" '"$INSTDIR\himind-agent-launcher.exe" ${PRODUCT_LAUNCH_ARGS}'
@@ -187,11 +199,13 @@ FunctionEnd
 Section "Uninstall"
   nsExec::Exec /TIMEOUT=10000 'taskkill /IM himind-agent.exe /T /F'
   DeleteRegValue HKCU "${PRODUCT_RUN_KEY}" "HiMindAgent"
+  DeleteRegKey HKCU "${PRODUCT_PROTOCOL_KEY}"
   DeleteRegKey HKCU "${PRODUCT_REGISTRY_KEY}"
   Delete "$DESKTOP\HiMind Agent.lnk"
   RMDir /r "$INSTDIR\current"
   RMDir /r "$INSTDIR\previous"
   RMDir /r "$INSTDIR\logs"
+  RMDir /r "$INSTDIR\resources"
   RMDir /r "$INSTDIR\trusted-keys"
   Delete "$INSTDIR\himind-agent-launcher.exe"
   Delete "$INSTDIR\himind-agent-updater.exe"

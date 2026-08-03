@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::write::FileOptions;
 
+const MAX_SKILL_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SkillDraftInput {
     pub id: String,
@@ -30,6 +32,8 @@ pub(crate) struct SkillDraftInput {
     pub version: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub release_notes: String,
     #[serde(default = "default_agent_version")]
     pub min_agent_version: String,
     #[serde(default = "default_clients")]
@@ -43,6 +47,15 @@ pub(crate) struct SkillDraftInput {
     pub readme: String,
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SkillPackageInput {
+    pub package_path: PathBuf,
+    #[serde(default)]
+    pub revision_of_version: Option<String>,
+    #[serde(default)]
+    pub parent_submission_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +118,9 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
     if input.readme.trim().is_empty() {
         return Err("SKILL.md 内容不能为空".into());
     }
+    if input.release_notes.trim().is_empty() {
+        return Err("请填写本版本更新说明".into());
+    }
     let supplemental_files = input.files.clone();
     let mut contents = vec!["skill.json".to_string(), "SKILL.md".to_string()];
     for path in supplemental_files.keys() {
@@ -130,6 +146,7 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
         version: input.version.trim().to_string(),
         scope: SkillScope::Organization,
         description: input.description.trim().to_string(),
+        release_notes: input.release_notes.trim().to_string(),
         min_agent_version: input.min_agent_version.trim().to_string(),
         supported_clients: input.supported_clients,
         capabilities: input.capabilities,
@@ -139,19 +156,6 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
     };
     validate_skill_manifest(&manifest)?;
     let previous = read(&manifest.id, &manifest.version).ok();
-    if let Some(submitted) = previous
-        .as_ref()
-        .filter(|draft| draft.submitted_at.is_some())
-    {
-        let same_manifest =
-            serde_json::to_vec(&submitted.manifest)? == serde_json::to_vec(&manifest)?;
-        if !same_manifest
-            || submitted.readme != input.readme
-            || submitted.files != supplemental_files
-        {
-            return Err("已提交的 Skill 版本不可覆盖，请创建新版本".into());
-        }
-    }
     let root = draft_version_root(&manifest.id, &manifest.version);
     let package_root = root.join("package");
     if package_root.exists() {
@@ -186,13 +190,6 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
         .as_ref()
         .map(|draft| draft.candidate_sha256 == candidate_sha256)
         .unwrap_or(false);
-    if previous
-        .as_ref()
-        .is_some_and(|draft| draft.submitted_at.is_some())
-        && !unchanged
-    {
-        return Err("已提交的 Skill 版本不可覆盖，请创建新版本".into());
-    }
     let draft = AuthoringDraft {
         manifest,
         readme: input.readme,
@@ -234,6 +231,114 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
     Ok(draft)
 }
 
+pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft, Box<dyn Error>> {
+    let source = input.package_path.canonicalize()?;
+    if source.extension().and_then(|value| value.to_str()) != Some("hmskill") {
+        return Err("Skill 候选包必须使用 .hmskill 扩展名".into());
+    }
+    if fs::metadata(&source)?.len() > MAX_SKILL_ARCHIVE_BYTES {
+        return Err("Skill 候选包超过 16 MiB".into());
+    }
+
+    let staging = drafts_root().join(format!(".import-{}", now_stamp()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    let import_result = (|| -> Result<AuthoringDraft, Box<dyn Error>> {
+        crate::app::skill_manager::extract_archive(&source, &staging)?;
+        crate::app::skill_manager::verify_checksums(&staging)?;
+        crate::app::skill_manager::verify_declared_contents(&staging)?;
+        let manifest = crate::skill::manifest::validate_skill_package_root(&staging)?;
+        if manifest.release_notes.trim().is_empty() {
+            return Err("请在 skill.json 中填写本版本更新说明 release_notes".into());
+        }
+        if manifest.author.trim().is_empty() {
+            return Err("请在 skill.json 中填写作者 author".into());
+        }
+
+        let candidate_sha256 = sha256_file(&source)?;
+        let previous = read(&manifest.id, &manifest.version).ok();
+        let unchanged = previous
+            .as_ref()
+            .is_some_and(|draft| draft.candidate_sha256 == candidate_sha256);
+        let root = draft_version_root(&manifest.id, &manifest.version);
+        fs::create_dir_all(&root)?;
+        let candidate_path = root.join(format!("{}-{}.hmskill", manifest.id, manifest.version));
+        let same_candidate = candidate_path
+            .canonicalize()
+            .is_ok_and(|path| path == source);
+        if !same_candidate {
+            fs::copy(&source, &candidate_path)?;
+        }
+        let package_root = root.join("package");
+        if package_root.exists() {
+            fs::remove_dir_all(&package_root)?;
+        }
+        fs::rename(&staging, &package_root)?;
+
+        let readme = fs::read_to_string(package_root.join("SKILL.md"))?;
+        let mut files = BTreeMap::new();
+        for relative in &manifest.contents {
+            if matches!(relative.as_str(), "skill.json" | "SKILL.md") {
+                continue;
+            }
+            files.insert(
+                relative.clone(),
+                fs::read_to_string(package_root.join(relative))?,
+            );
+        }
+        let draft = AuthoringDraft {
+            manifest,
+            readme,
+            files,
+            candidate_path,
+            candidate_sha256,
+            workspace_path: source.parent().map(Path::to_path_buf),
+            source: "local_package".to_string(),
+            revision_of: normalize_optional(input.revision_of_version),
+            parent_submission_id: normalize_optional(input.parent_submission_id),
+            tested_at: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .and_then(|value| value.tested_at.clone()),
+            confirmed_at: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .and_then(|value| value.confirmed_at.clone()),
+            submitted_at: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .and_then(|value| value.submitted_at.clone()),
+            dashboard_draft_id: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .and_then(|value| value.dashboard_draft_id.clone()),
+            codex_target: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .and_then(|value| value.codex_target.clone()),
+            client_targets: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .map(|value| value.client_targets.clone())
+                .unwrap_or_default(),
+            updated_at: now_stamp(),
+        };
+        persist(&draft)?;
+        Ok(draft)
+    })();
+    if staging.exists() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    import_result
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+}
+
 pub(crate) fn create_revision(
     skill_id: &str,
     version: &str,
@@ -250,6 +355,7 @@ pub(crate) fn create_revision(
         categories: previous.manifest.categories.clone(),
         version: next_version,
         description: previous.manifest.description.clone(),
+        release_notes: format!("基于 v{version} 的功能改进与问题修复。"),
         min_agent_version: previous.manifest.min_agent_version.clone(),
         supported_clients: previous.manifest.supported_clients.clone(),
         capabilities: previous.manifest.capabilities.clone(),
@@ -281,7 +387,7 @@ fn bump_patch(version: &str) -> String {
 }
 
 fn default_author() -> String {
-    "马宝全".to_string()
+    "未授权用户".to_string()
 }
 
 pub(crate) fn read(skill_id: &str, version: &str) -> Result<AuthoringDraft, Box<dyn Error>> {
@@ -295,6 +401,17 @@ pub(crate) fn read(skill_id: &str, version: &str) -> Result<AuthoringDraft, Box<
     }
     let path = draft_version_root(skill_id, version).join("draft.json");
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+pub(crate) fn associate_workspace(
+    mut draft: AuthoringDraft,
+    workspace: &Path,
+) -> Result<AuthoringDraft, Box<dyn Error>> {
+    draft.workspace_path = Some(workspace.canonicalize()?);
+    draft.source = "workspace".to_string();
+    draft.updated_at = now_stamp();
+    persist(&draft)?;
+    Ok(draft)
 }
 
 pub(crate) fn test(
@@ -425,14 +542,17 @@ pub(crate) fn submit(
     let report = serde_json::json!({
         "candidate_sha256": draft.candidate_sha256,
         "agent_version": VERSION,
-        "tested_at": draft.tested_at,
-        "confirmed_at": draft.confirmed_at,
+        "built_at": draft.updated_at,
         "codex_target": draft.codex_target,
         "client_targets": draft.client_targets,
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
+    let source = crate::extension_projects::submission_source(
+        crate::extension_projects::ExtensionProjectKind::Skill,
+        skill_id,
+    )?;
     let submitted = crate::api::distribution::submit_skill(
         &client,
         &options.api_base,
@@ -440,6 +560,8 @@ pub(crate) fn submit(
         &access.token,
         &draft.candidate_path,
         &report,
+        draft.revision_of.as_deref(),
+        &source,
     )?;
     let dashboard_draft_id = submitted
         .get("id")
@@ -449,11 +571,7 @@ pub(crate) fn submit(
 }
 
 pub(crate) fn ensure_ready_to_submit(draft: &AuthoringDraft) -> Result<(), Box<dyn Error>> {
-    ensure_candidate_unchanged(draft)?;
-    if draft.tested_at.is_none() || draft.confirmed_at.is_none() {
-        return Err("Skill 尚未完成本地测试确认".into());
-    }
-    Ok(())
+    ensure_candidate_unchanged(draft)
 }
 
 fn plugin_dependency_issues(dependencies: &[SkillPluginDependency]) -> Vec<String> {
@@ -580,6 +698,7 @@ mod tests {
             categories: vec!["开发工具".to_string()],
             version: "1.0.0".to_string(),
             description: "Local authoring test".to_string(),
+            release_notes: "新增本地 Skill 候选测试。".to_string(),
             min_agent_version: VERSION.to_string(),
             supported_clients: vec!["codex".to_string()],
             capabilities: vec![],
@@ -621,6 +740,19 @@ mod tests {
                 .join("package/agents/openai.yaml")
                 .exists()
         );
+        let imported = import_package(SkillPackageInput {
+            package_path: metadata.candidate_path.clone(),
+            revision_of_version: Some("0.9.0".to_string()),
+            parent_submission_id: Some("submission-parent".to_string()),
+        })
+        .unwrap();
+        assert_eq!(imported.candidate_sha256, metadata.candidate_sha256);
+        assert_eq!(imported.revision_of.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            imported.parent_submission_id.as_deref(),
+            Some("submission-parent")
+        );
+        assert_eq!(imported.manifest.author, "马宝全");
         let revision = create_revision(&metadata.manifest.id, &metadata.manifest.version).unwrap();
         assert_eq!(revision.manifest.version, "1.0.1");
         assert_eq!(revision.revision_of.as_deref(), Some("1.0.0"));
@@ -628,11 +760,12 @@ mod tests {
         let mut locked = metadata.clone();
         locked.submitted_at = Some("submitted".to_string());
         persist(&locked).unwrap();
-        let candidate_before = fs::read(&locked.candidate_path).unwrap();
         let mut overwrite = input("# changed after submission");
         overwrite.files = locked.files.clone();
-        assert!(save(overwrite).is_err());
-        assert_eq!(fs::read(&locked.candidate_path).unwrap(), candidate_before);
+        let rebuilt = save(overwrite).unwrap();
+        assert_ne!(rebuilt.candidate_sha256, locked.candidate_sha256);
+        assert!(rebuilt.submitted_at.is_none());
+        assert!(rebuilt.dashboard_draft_id.is_none());
         env::remove_var("HIMIND_SKILL_DRAFTS_DIR");
         let _ = fs::remove_dir_all(root);
     }

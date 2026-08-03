@@ -41,7 +41,26 @@ pub(crate) struct InitializeExhibitRepositoryRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct CloneExhibitRepositoryRequest {
+    pub project_id: String,
+    pub exhibit_id: String,
+    pub source_repository_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ImportLocalExhibitRequest {
+    pub project_id: String,
+    pub exhibit_id: String,
+    pub source_path: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct SvnWorkspaceRequest {
+    pub target_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MigrationSourceScanRequest {
     pub target_path: String,
 }
 

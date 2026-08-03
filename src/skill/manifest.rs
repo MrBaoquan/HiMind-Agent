@@ -198,6 +198,7 @@ mod tests {
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: "read only".to_string(),
+            release_notes: "测试 Skill Manifest。".to_string(),
             min_agent_version: "0.2.0".to_string(),
             supported_clients: vec!["codex".to_string()],
             capabilities: vec![SkillCapabilityDependency {
@@ -235,6 +236,7 @@ mod tests {
             version: "1.0.0".to_string(),
             scope: SkillScope::Builtin,
             description: "read only".to_string(),
+            release_notes: "测试脚本拒绝规则。".to_string(),
             min_agent_version: "0.2.0".to_string(),
             supported_clients: vec!["codex".to_string()],
             capabilities: vec![],

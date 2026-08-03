@@ -1,4 +1,4 @@
-use crate::api::distribution::{skill_catalog, SkillCatalogItem};
+use crate::api::distribution::{skill_catalog, skill_versions, SkillCatalogItem};
 use crate::app::plugin_manager;
 use crate::app::system::{validate_signature_metadata, verify_rsa_pss_sha256};
 use crate::skill::manifest::{validate_relative_package_path, validate_skill_package_root};
@@ -49,13 +49,14 @@ pub(crate) fn install(
     agent_id: &str,
     skill_id: &str,
 ) -> Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> {
-    install_with_dependencies(options, agent_id, skill_id, &[])
+    install_with_dependencies(options, agent_id, skill_id, None, &[])
 }
 
 pub(crate) fn plan_install(
     options: &Options,
     agent_id: &str,
     skill_id: &str,
+    version: Option<&str>,
 ) -> Result<SkillInstallPlan, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
@@ -64,7 +65,7 @@ pub(crate) fn plan_install(
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let item = catalog_item(&client, options, agent_id, skill_id)?;
+    let item = catalog_item(&client, options, agent_id, skill_id, version)?;
     ensure_supported(&item)?;
     let (plugin_actions, blocked_reasons) = plugin_manager::plan_dependency_set(
         options,
@@ -84,9 +85,10 @@ pub(crate) fn install_with_dependencies(
     options: &Options,
     agent_id: &str,
     skill_id: &str,
+    version: Option<&str>,
     selected_optional_plugins: &[String],
 ) -> Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> {
-    let plan = plan_install(options, agent_id, skill_id)?;
+    let plan = plan_install(options, agent_id, skill_id, version)?;
     if !plan.ready {
         return Err(format!("Skill 安装计划被阻止: {}", plan.blocked_reasons.join(", ")).into());
     }
@@ -105,7 +107,7 @@ pub(crate) fn install_with_dependencies(
         }
         selected_plugin_ids.push(action.plugin_id.clone());
         let before = plugin_manager::local_status(&action.plugin_id);
-        if let Err(error) = plugin_manager::install(options, agent_id, &action.plugin_id) {
+        if let Err(error) = plugin_manager::install(options, agent_id, &action.plugin_id, None) {
             compensate_plugin_changes(&plugin_changes);
             return Err(error);
         }
@@ -171,18 +173,35 @@ fn catalog_item(
     options: &Options,
     agent_id: &str,
     skill_id: &str,
+    version: Option<&str>,
 ) -> Result<SkillCatalogItem, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
         return Err("Agent 尚未完成 Dashboard 配对".into());
     }
-    skill_catalog(client, &options.api_base, agent_id, &credential)?
+    let latest = skill_catalog(client, &options.api_base, agent_id, &credential)?
         .into_iter()
         .find(|item| item.skill_id == skill_id)
-        .ok_or_else(|| "Skill 未上架或当前不可用".into())
+        .ok_or_else(|| "Skill 未上架或当前不可用".to_string())?;
+    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(latest);
+    };
+    if latest.version == version {
+        return Ok(latest);
+    }
+    if latest.management != "user_managed" || latest.managed {
+        return Err("该 Skill 由组织管理，不能切换版本".into());
+    }
+    skill_versions(client, &options.api_base, agent_id, &credential, skill_id)?
+        .into_iter()
+        .find(|item| item.version == version)
+        .ok_or_else(|| format!("Skill 版本 v{version} 不可用").into())
 }
 
 fn ensure_supported(item: &SkillCatalogItem) -> Result<(), Box<dyn Error>> {
+    if item.assignment == "blocked" {
+        return Err("该 Skill 已被组织禁止安装".into());
+    }
     if !item.supported_clients.iter().any(|client| {
         client.eq_ignore_ascii_case("codex")
             || client.eq_ignore_ascii_case("github-copilot")
@@ -274,7 +293,7 @@ fn verify_signature(path: &Path, item: &SkillCatalogItem) -> Result<(), Box<dyn 
     verify_rsa_pss_sha256(path, &pem, &item.signature)
 }
 
-fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+pub(crate) fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(target)?;
     let mut archive = ZipArchive::new(File::open(archive_path)?)?;
     for index in 0..archive.len() {
@@ -297,7 +316,7 @@ fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn verify_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
+pub(crate) fn verify_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     let checksum_path = root.join("checksums.sha256");
     let content =
         fs::read_to_string(&checksum_path).map_err(|_| "Skill 包缺少 checksums.sha256")?;
@@ -349,7 +368,7 @@ fn verify_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn verify_declared_contents(root: &Path) -> Result<(), Box<dyn Error>> {
+pub(crate) fn verify_declared_contents(root: &Path) -> Result<(), Box<dyn Error>> {
     let manifest = validate_skill_package_root(root)?;
     let declared = manifest
         .contents

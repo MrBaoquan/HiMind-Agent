@@ -1,9 +1,11 @@
 pub(crate) mod ai_clients;
+pub(crate) mod ai_provider_import;
 pub(crate) mod commands;
 pub(crate) mod extension_reconciler;
 pub mod http;
 pub(crate) mod identity;
 pub(crate) mod plugin_manager;
+pub(crate) mod remote_execution;
 pub(crate) mod security;
 pub mod service;
 pub(crate) mod skill_manager;
@@ -12,3 +14,4 @@ pub mod system;
 pub mod tray;
 pub mod types;
 pub(crate) mod ui;
+pub(crate) mod update_manager;

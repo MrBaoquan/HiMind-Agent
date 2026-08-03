@@ -18,6 +18,7 @@ use crate::Options;
 pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let port = options.local_port;
     let initial_plugin_view = options.plugin_view_launch();
+    let initial_protocol_open = options.protocol_open_requested();
 
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
@@ -51,8 +52,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     };
     let popup_approval_manager = Arc::clone(&state.approval_manager);
 
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+    let builder = tauri::Builder::default();
+    let builder = if std::env::var("HIMIND_AGENT_ALLOW_PARALLEL_INSTANCE").as_deref() == Ok("1") {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(launch) = crate::parse_plugin_view_launch(&args) {
                 let result = open_plugin_view(app, &launch.plugin_id, &launch.view_id);
                 if let Some(state) = app.try_state::<AgentState>() {
@@ -70,10 +74,14 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                         ),
                     }
                 }
-            } else {
+            } else if crate::protocol_open_requested(&args)
+                || !args.iter().any(|argument| argument == "--protocol-url")
+            {
                 show_main_window(app);
             }
         }))
+    };
+    let builder = builder
         .register_uri_scheme_protocol("plugin-ui", |_ctx, request| plugin_ui_response(request))
         .manage(state)
         .on_window_event(|window, event| match (window.label(), event) {
@@ -99,6 +107,12 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         })
         .invoke_handler(tauri::generate_handler![
             super::commands::get_agent_status,
+            super::commands::get_agent_update_status,
+            super::commands::check_agent_update,
+            super::commands::download_agent_update,
+            super::commands::cancel_agent_update_download,
+            super::commands::set_agent_update_preferences,
+            super::commands::install_agent_update,
             super::commands::get_dashboard_identity_status,
             super::commands::start_dashboard_authorization,
             super::commands::get_dashboard_authorization_progress,
@@ -106,12 +120,14 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_dashboard_authorization_page,
             super::commands::revoke_dashboard_authorization,
             super::commands::get_ai_integration_overview,
-            super::commands::configure_ai_client,
-            super::commands::remove_ai_client_configuration,
+            super::commands::register_ai_client_mcp_server,
+            super::commands::unregister_ai_client_mcp_server,
             super::commands::test_mcp_connection,
             super::commands::get_pending_approvals,
             super::commands::respond_approval,
             super::commands::get_approval_settings,
+            super::commands::get_remote_execution_settings,
+            super::commands::save_remote_execution_settings,
             super::commands::set_approval_rule,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
@@ -121,10 +137,18 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_inner_admin_page,
             super::commands::open_agent_directory,
             super::commands::show_main_window,
+            super::commands::quit_agent,
             super::commands::set_auto_start,
+            super::commands::pick_unity_editor,
+            super::commands::save_unity_editor,
             super::commands::get_agent_logs,
+            super::commands::get_svn_connections,
+            super::commands::save_svn_connection,
+            super::commands::remove_svn_connection,
+            super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
             super::commands::get_plugin_catalog,
+            super::commands::get_plugin_versions,
             super::commands::plan_plugin_install,
             super::commands::install_plugin,
             super::commands::uninstall_plugin,
@@ -133,9 +157,26 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_agent_capabilities,
             super::commands::get_skill_catalog,
             super::commands::get_organization_skill_catalog,
+            super::commands::get_skill_versions,
             super::commands::install_organization_skill,
             super::commands::plan_organization_skill_install,
+            super::commands::list_extension_projects,
+            super::commands::open_extension_project,
+            super::commands::associate_extension_project,
+            super::commands::create_extension_project,
+            super::commands::build_extension_project,
+            super::commands::remove_extension_project,
+            super::commands::list_extension_collaboration_projects,
+            super::commands::update_extension_project_source,
+            super::commands::get_extension_collaboration,
+            super::commands::list_extension_collaborator_options,
+            super::commands::invite_extension_collaborator,
+            super::commands::update_extension_collaborator,
+            super::commands::delete_extension_collaborator,
+            super::commands::list_extension_collaboration_invitations,
+            super::commands::respond_extension_collaboration_invitation,
             super::commands::list_skill_drafts,
+            super::commands::import_skill_candidate,
             super::commands::list_plugin_drafts,
             super::commands::import_plugin_candidate,
             super::commands::create_plugin_revision,
@@ -181,6 +222,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             start_approval_popup_watcher(app.handle().clone(), Arc::clone(&popup_approval_manager));
             if let Some(launch) = initial_plugin_view.as_ref() {
                 open_plugin_view(app.handle(), &launch.plugin_id, &launch.view_id)?;
+            } else if initial_protocol_open {
+                show_main_window(app.handle());
             }
             Ok(())
         });
@@ -201,22 +244,80 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
         false,
         None::<&str>,
     )?;
+    let check_update_item =
+        MenuItem::with_id(handle, "check-update", "检查更新", true, None::<&str>)?;
+    let update_status = handle
+        .try_state::<AgentState>()
+        .and_then(|state| crate::app::update_manager::load(&state.state_path).ok());
+    let install_update_item = MenuItem::with_id(
+        handle,
+        "install-update",
+        update_status
+            .as_ref()
+            .filter(|status| status.status == "ready")
+            .map(|status| format!("重启并更新到 v{}", status.available_version))
+            .unwrap_or_else(|| "重启并更新".to_string()),
+        update_status
+            .as_ref()
+            .map(|status| status.status == "ready")
+            .unwrap_or(false),
+        None::<&str>,
+    )?;
     let quit_item = MenuItem::with_id(handle, "quit", "退出 Agent", true, None::<&str>)?;
 
-    let menu = Menu::with_items(handle, &[&open_item, &status_item, &quit_item])?;
+    let menu = Menu::with_items(
+        handle,
+        &[
+            &open_item,
+            &status_item,
+            &check_update_item,
+            &install_update_item,
+            &quit_item,
+        ],
+    )?;
 
     let icon = make_tray_icon()?;
+    start_update_tray_watcher(handle.clone(), install_update_item.clone());
 
     let _tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
         .tooltip("HiMind Agent")
-        .on_menu_event(|app, event| match event.id().as_ref() {
+        .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => {
                 show_main_window(app);
             }
             "quit" => {
                 app.exit(0);
+            }
+            "check-update" => {
+                let app = app.clone();
+                let check_item = check_update_item.clone();
+                let install_item = install_update_item.clone();
+                let _ = check_item.set_enabled(false);
+                let _ = check_item.set_text("正在检查更新...");
+                thread::spawn(move || {
+                    let result = app
+                        .try_state::<AgentState>()
+                        .map(|state| crate::app::update_manager::check_now(&state.options));
+                    let _ = check_item.set_text("检查更新");
+                    let _ = check_item.set_enabled(true);
+                    if let Some(Ok(status)) = result {
+                        let ready = status.status == "ready";
+                        let _ = install_item.set_enabled(ready);
+                        let _ = install_item.set_text(if ready {
+                            format!("重启并更新到 v{}", status.available_version)
+                        } else {
+                            "重启并更新".to_string()
+                        });
+                        show_main_window(&app);
+                    }
+                });
+            }
+            "install-update" => {
+                if let Some(state) = app.try_state::<AgentState>() {
+                    let _ = crate::app::update_manager::install(&state.options);
+                }
             }
             _ => {}
         })
@@ -233,6 +334,33 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
         .build(handle)?;
 
     Ok(())
+}
+
+fn start_update_tray_watcher(app: tauri::AppHandle, install_item: MenuItem<tauri::Wry>) {
+    thread::spawn(move || {
+        let mut previous = String::new();
+        loop {
+            let Some(state) = app.try_state::<AgentState>() else {
+                return;
+            };
+            let Ok(status) = crate::app::update_manager::load(&state.state_path) else {
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            };
+            let signature = format!("{}:{}", status.status, status.available_version);
+            if signature != previous {
+                let ready = status.status == "ready";
+                let _ = install_item.set_enabled(ready);
+                let _ = install_item.set_text(if ready {
+                    format!("重启并更新到 v{}", status.available_version)
+                } else {
+                    "重启并更新".to_string()
+                });
+                previous = signature;
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
 }
 
 fn setup_approval_popup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
