@@ -47,3 +47,6 @@ toml_edit = "0.22"
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 rand = "0.8"
 semver = "1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
