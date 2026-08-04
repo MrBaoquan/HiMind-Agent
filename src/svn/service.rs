@@ -1480,32 +1480,43 @@ where
     S: Into<String>,
 {
     const MAX_ARGUMENT_CHARS: usize = 20_000;
-    let prefix_length = prefix.iter().map(|value| value.len() + 3).sum::<usize>();
-    let mut arguments = prefix
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>();
+    let batch_prefix = || {
+        let mut arguments = prefix
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        arguments.push("--".to_string());
+        arguments
+    };
+    let mut arguments = batch_prefix();
+    let target_start = arguments.len();
+    let prefix_length = arguments.iter().map(|value| value.len() + 3).sum::<usize>();
     let mut argument_length = prefix_length;
     for target in targets {
-        let target = target.into();
+        let target = svn_local_target_argument(target.into());
         let next_length = target.len() + 3;
-        if arguments.len() > prefix.len() && argument_length + next_length > MAX_ARGUMENT_CHARS {
+        if arguments.len() > target_start && argument_length + next_length > MAX_ARGUMENT_CHARS {
             run_svn_in_directory_owned(
                 working_copy,
-                std::mem::replace(
-                    &mut arguments,
-                    prefix.iter().map(|value| value.to_string()).collect(),
-                ),
+                std::mem::replace(&mut arguments, batch_prefix()),
             )?;
             argument_length = prefix_length;
         }
         argument_length += next_length;
         arguments.push(target);
     }
-    if arguments.len() > prefix.len() {
+    if arguments.len() > target_start {
         run_svn_in_directory_owned(working_copy, arguments)?;
     }
     Ok(())
+}
+
+fn svn_local_target_argument(mut target: String) -> String {
+    // An empty peg revision makes a literal '@' unambiguous to the SVN CLI.
+    if target.contains('@') {
+        target.push('@');
+    }
+    target
 }
 
 fn migrate_template_ignore_properties(
@@ -1693,12 +1704,12 @@ fn run_svn_in_directory<const N: usize>(
         .creation_flags(CREATE_NO_WINDOW)
         .output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr)
+        return Err(decode_svn_cli_output(&output.stderr)
             .trim()
             .to_string()
             .into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(decode_svn_cli_output(&output.stdout).trim().to_string())
 }
 
 fn run_svn_in_directory_owned(
@@ -1712,12 +1723,24 @@ fn run_svn_in_directory_owned(
         .creation_flags(CREATE_NO_WINDOW)
         .output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr)
+        return Err(decode_svn_cli_output(&output.stderr)
             .trim()
             .to_string()
             .into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(decode_svn_cli_output(&output.stdout).trim().to_string())
+}
+
+fn decode_svn_cli_output(bytes: &[u8]) -> String {
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return value.to_string();
+    }
+    let (value, had_errors) = encoding_rs::GBK.decode_without_bom_handling(bytes);
+    if had_errors {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        value.into_owned()
+    }
 }
 
 fn svn_status_change_count(working_copy: &Path) -> Result<usize, Box<dyn Error>> {
@@ -1749,7 +1772,7 @@ fn probe_svn_remote(url: &str, timeout: Duration) -> String {
                 if output.status.success() {
                     return "reachable".to_string();
                 }
-                return classify_svn_remote_error(&String::from_utf8_lossy(&output.stderr));
+                return classify_svn_remote_error(&decode_svn_cli_output(&output.stderr));
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
             Ok(None) => {
@@ -2469,7 +2492,7 @@ fn workspace_status_path(target: &Path) -> Result<Value, Box<dyn Error>> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()?;
     if !info.status.success() {
-        return Err(String::from_utf8_lossy(&info.stderr)
+        return Err(decode_svn_cli_output(&info.stderr)
             .trim()
             .to_string()
             .into());
@@ -2487,12 +2510,12 @@ fn workspace_status_path(target: &Path) -> Result<Value, Box<dyn Error>> {
     if !revision.status.success() || !changes.status.success() {
         return Err("failed to read SVN working copy status".into());
     }
-    let status_xml = String::from_utf8_lossy(&changes.stdout);
+    let status_xml = decode_svn_cli_output(&changes.stdout);
     let change_count = status_xml.matches("<entry").count();
     Ok(json!({
         "target_path": target,
-        "repository_url": String::from_utf8_lossy(&info.stdout).trim(),
-        "revision": String::from_utf8_lossy(&revision.stdout).trim(),
+        "repository_url": decode_svn_cli_output(&info.stdout).trim(),
+        "revision": decode_svn_cli_output(&revision.stdout).trim(),
         "change_count": change_count,
         "clean": change_count == 0
     }))
@@ -2569,9 +2592,9 @@ where
         .join()
         .map_err(|_| "failed to join SVN stderr reader")??;
     if !status.success() {
-        return Err(String::from_utf8_lossy(&stderr).trim().to_string().into());
+        return Err(decode_svn_cli_output(&stderr).trim().to_string().into());
     }
-    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    Ok(decode_svn_cli_output(&stdout).trim().to_string())
 }
 
 fn load_company_svn_secret(
@@ -2884,6 +2907,30 @@ mod tests {
             Some("123")
         );
         assert_eq!(external_peg_revision("http://user@example/repo/lib"), None);
+    }
+
+    #[test]
+    fn escapes_literal_at_signs_in_local_svn_targets() {
+        assert_eq!(
+            svn_local_target_argument(
+                "Assets/ArtAssets/Textures/二级-切图/下一关@点击_二级-切图_063.png".to_string()
+            ),
+            "Assets/ArtAssets/Textures/二级-切图/下一关@点击_二级-切图_063.png@"
+        );
+        assert_eq!(
+            svn_local_target_argument("Assets/icon@".to_string()),
+            "Assets/icon@@"
+        );
+        assert_eq!(
+            svn_local_target_argument("Assets/icon.png".to_string()),
+            "Assets/icon.png"
+        );
+    }
+
+    #[test]
+    fn decodes_svn_cli_output_as_utf8_or_gbk() {
+        assert_eq!(decode_svn_cli_output("路径正常".as_bytes()), "路径正常");
+        assert_eq!(decode_svn_cli_output(&[0xD6, 0xD0, 0xCE, 0xC4]), "中文");
     }
 
     #[test]
