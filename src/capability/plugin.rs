@@ -132,11 +132,7 @@ pub(crate) struct PluginRegistryItem {
 }
 
 pub(crate) fn plugin_registry_dir() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join("HiMindAgent")
-        .join("plugins")
+    crate::store::paths::agent_home().join("plugins")
 }
 
 fn development_registry_path() -> PathBuf {

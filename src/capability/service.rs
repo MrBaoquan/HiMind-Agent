@@ -295,7 +295,7 @@ impl CapabilityGateway {
             registration(
                 "project.repository.exhibits_access.ensure",
                 "配置项目展项目录访问权限",
-                "使用隐藏 SvnAdmin 凭据确保项目 trunk/exhibits 对所有已认证 SVN 用户开放读写。",
+                "使用隐藏 SvnAdmin 凭据开放仓库祖先节点只读遍历、默认隔离展项目录，并保留具体展项用户 ACL。",
                 "admin_action",
                 json!({
                     "type": "object",
@@ -669,11 +669,14 @@ impl CapabilityGateway {
             "dashboard_worker_online": worker["dashboard_worker_online"],
             "dashboard_agent_id": worker["dashboard_agent_id"],
             "dashboard_worker_error": worker["dashboard_worker_error"],
+            "svn_admin_ready": crate::svn::service::svn_admin_ready(),
+            "svn_admin_status": crate::svn::service::svn_admin_status(),
             "local_service_online": worker["local_service_online"],
             "local_service_error": worker["local_service_error"],
             "capability_gateway": true,
             "capabilities": self.list_capabilities(context).map(|items| items.len()).unwrap_or_default(),
             "local_port": self.options.local_port,
+            "profile": crate::store::paths::profile_name(),
         })
     }
 

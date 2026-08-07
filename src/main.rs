@@ -82,15 +82,29 @@ fn protocol_open_requested(args: &[String]) -> bool {
 }
 
 fn main() {
-    if let Err(error) = svn::service::bootstrap_svn_credentials() {
-        eprintln!("SVN credential initialization failed: {error}");
-        std::process::exit(1);
-    }
+    let svn_credentials_from_environment = match svn::service::bootstrap_svn_credentials() {
+        Ok(configured) => configured,
+        Err(error) => {
+            eprintln!("SVN credential initialization failed: {error}");
+            std::process::exit(1);
+        }
+    };
     if let Err(error) = svn::service::bootstrap_svn_admin_credentials() {
         eprintln!("SVN administrator credential initialization failed: {error}");
         std::process::exit(1);
     }
     let options = Options::from_env();
+    if !svn_credentials_from_environment {
+        if let Ok(Some(snapshot)) = api::oauth::authorization_snapshot(&options.state_path) {
+            if !snapshot.display_name.trim().is_empty() {
+                if let Err(error) =
+                    svn::service::ensure_default_svn_credentials(&snapshot.display_name)
+                {
+                    eprintln!("SVN user credential initialization failed: {error}");
+                }
+            }
+        }
+    }
     if let Some(arguments) = auth_cli_arguments() {
         if let Err(error) = run_auth_cli(&options, &arguments) {
             eprintln!("auth command failed: {error}");
@@ -137,6 +151,16 @@ fn run_auth_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn E
             println!("Authorization code: {}", authorization.user_code);
             let _ = app::system::open_url(&authorization.verification_uri_complete);
             let access = api::oauth::wait_for_device_authorization(options, &authorization)?;
+            if let Ok(info) = api::oauth::fetch_user_info(options) {
+                let svn_username = if info.svn_username.trim().is_empty() {
+                    svn::service::default_svn_username(&info.name)?
+                } else {
+                    info.svn_username
+                };
+                if info.svn_provisioning_status == "ready" {
+                    svn::service::ensure_default_svn_credentials(&svn_username)?;
+                }
+            }
             println!(
                 "Agent {} is authorized as Dashboard user {} with scopes: {}",
                 access.agent_id, access.user_id, access.scope
@@ -347,10 +371,7 @@ impl Options {
 }
 
 fn default_state_path() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("HiMindAgent")
+    store::paths::agent_home()
         .join("data")
         .join("agent-state.json")
 }
@@ -605,6 +626,31 @@ fn execute_task(
         }
     }
     let result = match task.task_type.as_str() {
+        "svn_user_provision" => {
+            #[derive(serde::Deserialize)]
+            struct SvnUserProvisionRequest {
+                user_id: String,
+                svn_username: String,
+            }
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                40,
+                "正在创建并验证 SVN 用户账号",
+                None,
+                None,
+            )?;
+            let request = serde_json::from_value::<SvnUserProvisionRequest>(
+                task.payload.clone().unwrap_or_else(|| json!({})),
+            )?;
+            let mut result =
+                svn::service::provision_default_svn_user_account(&request.svn_username)?;
+            result["user_id"] = json!(request.user_id);
+            Ok(result)
+        }
         "sync_exhibits" => {
             report_task(
                 client,
@@ -669,7 +715,7 @@ fn execute_task(
                 &task.id,
                 "running",
                 40,
-                "Agent 正在确保项目展项目录读写权限",
+                "Agent 正在配置 TortoiseSVN 兼容且按展项隔离的访问权限",
                 None,
                 None,
             )?;

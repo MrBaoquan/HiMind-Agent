@@ -71,10 +71,7 @@ Page custom OptionsPage OptionsPageLeave
 !insertmacro MUI_PAGE_INSTFILES
 
 !define MUI_FINISHPAGE_TITLE "HiMind Agent 已准备就绪"
-!define MUI_FINISHPAGE_TEXT "安装已完成。启动后，HiMind Agent 会在系统托盘中保持运行，并自动连接工作台。"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\himind-agent-launcher.exe"
-!define MUI_FINISHPAGE_RUN_PARAMETERS "${PRODUCT_LAUNCH_ARGS}"
-!define MUI_FINISHPAGE_RUN_TEXT "立即启动 HiMind Agent"
+!define MUI_FINISHPAGE_TEXT "安装已完成。HiMind Agent 已在后台启动，并会自动连接工作台完成当前账号绑定。"
 !define MUI_FINISHPAGE_NOAUTOCLOSE
 !insertmacro MUI_PAGE_FINISH
 
@@ -191,9 +188,7 @@ Section "HiMind Agent 核心组件" SEC_AGENT
 SectionEnd
 
 Function .onInstSuccess
-  IfSilent 0 done
   Exec '"$INSTDIR\himind-agent-launcher.exe" ${PRODUCT_LAUNCH_ARGS}'
-done:
 FunctionEnd
 
 Section "Uninstall"

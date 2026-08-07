@@ -177,6 +177,11 @@ pub(crate) fn run_loop(
             ) {
                 Ok(true) => {
                     set_status(&heartbeat_status, true, &heartbeat_agent_id, "");
+                    if let Err(error) =
+                        crate::app::identity::sync_svn_credentials(&heartbeat_options)
+                    {
+                        eprintln!("SVN identity synchronization deferred: {error}");
+                    }
                     crate::app::plugin_manager::flush_status_outbox(
                         &heartbeat_options,
                         &heartbeat_agent_id,

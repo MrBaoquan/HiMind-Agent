@@ -67,12 +67,18 @@ export function DashboardIdentityPanel({
             <div><span>Agent ID</span><code>{identity.agent_id || '--'}</code></div>
             <div><span>用户 ID</span><code>{identity.user_id || '--'}</code></div>
             <div><span>授权范围</span><code>{identity.scopes.length ? identity.scopes.join(' · ') : '--'}</code></div>
+            <div><span>SVN 账号</span><code>{identity.svn_username ? `${identity.svn_username} · ${svnProvisioningLabel(identity.svn_provisioning_status)}` : '--'}</code></div>
+            {identity.svn_provisioning_error ? <div><span>SVN 开通状态</span><code>{identity.svn_provisioning_error}</code></div> : null}
             {identity.error ? <div><span>故障详情</span><code>{identity.error}</code></div> : null}
           </div>
         </details>
       ) : null}
     </section>
   );
+}
+
+function svnProvisioningLabel(status: string) {
+  return ({ ready: '已就绪', provisioning: '正在开通', waiting_admin_agent: '等待控制 Agent', failed: '等待重试', unmanaged: '未托管' } as Record<string, string>)[status] || status || '等待同步';
 }
 
 function identityLabel(identity: DashboardIdentityStatus | null): [string, 'success' | 'warn' | 'danger' | 'neutral'] {
@@ -87,7 +93,10 @@ function identityLabel(identity: DashboardIdentityStatus | null): [string, 'succ
 
 function identityDescription(identity: DashboardIdentityStatus | null) {
   if (!identity) return '正在确认工作台账号';
-  if (identity.state === 'authorized') return identity.online_verified ? '账号状态正常' : '账号已在这台电脑上登录';
+  if (identity.state === 'authorized') {
+    if (identity.svn_provisioning_status && identity.svn_provisioning_status !== 'ready') return `账号已登录，SVN 账号${svnProvisioningLabel(identity.svn_provisioning_status)}`;
+    return identity.online_verified ? '账号状态正常' : '账号已在这台电脑上登录';
+  }
   if (identity.state === 'dashboard_unavailable') return '授权仍然有效，但暂时无法连接工作台';
   if (identity.state === 'not_enrolled') return '请先从工作台安装或重新连接 HiMind Agent';
   if (identity.state === 'expired') return '登录已过期，需要重新登录';

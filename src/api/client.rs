@@ -332,6 +332,7 @@ pub fn heartbeat_with_runtime_installations(
     let mut payload = json!({
         "agent_id": agent_id,
         "status": "online",
+        "svn_admin_ready": crate::svn::service::svn_admin_ready(),
     });
     if let Some(items) = runtime_installations {
         payload["runtime_installations"] = serde_json::to_value(items)?;

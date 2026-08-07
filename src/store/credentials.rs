@@ -230,22 +230,19 @@ fn inner_admin_base() -> String {
 }
 
 fn inner_admin_credentials_path() -> Result<PathBuf, Box<dyn Error>> {
-    let local_app_data = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(local_app_data).join("HiMindAgent");
+    let dir = crate::store::paths::agent_home();
     fs::create_dir_all(&dir)?;
     Ok(dir.join("inner-admin-credentials.json"))
 }
 
 fn svn_connections_path() -> Result<PathBuf, Box<dyn Error>> {
-    let local_app_data = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(local_app_data).join("HiMindAgent");
+    let dir = crate::store::paths::agent_home();
     fs::create_dir_all(&dir)?;
     Ok(dir.join("svn-connections.json"))
 }
 
 fn editor_settings_path() -> Result<PathBuf, Box<dyn Error>> {
-    let local_app_data = env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let dir = PathBuf::from(local_app_data).join("HiMindAgent");
+    let dir = crate::store::paths::agent_home();
     fs::create_dir_all(&dir)?;
     Ok(dir.join("editor-settings.json"))
 }

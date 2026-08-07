@@ -10,6 +10,7 @@ export type AgentStatus = {
     mode?: string;
     login_account?: string;
     login_label?: string;
+    profile?: string;
 };
 
 export type AgentUpdateStatus = {
@@ -198,6 +199,9 @@ export type DashboardIdentityStatus = {
     scopes: string[];
     refresh_expires_at: number;
     last_verified_at: number;
+    svn_username: string;
+    svn_provisioning_status: string;
+    svn_provisioning_error: string;
     error: string;
 };
 

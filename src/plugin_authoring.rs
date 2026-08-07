@@ -444,11 +444,7 @@ fn drafts_root() -> PathBuf {
     if let Some(root) = env::var_os("HIMIND_PLUGIN_DRAFTS_DIR") {
         return PathBuf::from(root);
     }
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join("HiMindAgent")
-        .join("plugin-drafts")
+    crate::store::paths::agent_home().join("plugin-drafts")
 }
 
 fn draft_version_root(plugin_id: &str, version: &str) -> PathBuf {

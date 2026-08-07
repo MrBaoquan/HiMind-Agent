@@ -569,11 +569,7 @@ fn registry_path() -> PathBuf {
     if let Some(path) = env::var_os("HIMIND_EXTENSION_PROJECTS_FILE") {
         return PathBuf::from(path);
     }
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join("HiMindAgent")
-        .join("extension-projects.json")
+    crate::store::paths::agent_home().join("extension-projects.json")
 }
 
 fn now_stamp() -> String {

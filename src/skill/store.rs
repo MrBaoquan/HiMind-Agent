@@ -4,7 +4,6 @@ use crate::skill::manifest::{
 use crate::skill::resolver::compare_versions;
 use crate::skill::types::{SkillManifest, SkillPointer, SkillRecord, SkillScope};
 use std::collections::HashSet;
-use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -397,11 +396,7 @@ fn copy_package_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>>
 }
 
 fn skill_store_root() -> PathBuf {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
-        .join("HiMindAgent")
-        .join("skills")
+    crate::store::paths::agent_home().join("skills")
 }
 
 fn read_pointer(path: &Path) -> Result<Option<SkillPointer>, Box<dyn Error>> {

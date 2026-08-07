@@ -21,6 +21,9 @@ pub(crate) struct DashboardIdentityStatus {
     pub scopes: Vec<String>,
     pub refresh_expires_at: u64,
     pub last_verified_at: u64,
+    pub svn_username: String,
+    pub svn_provisioning_status: String,
+    pub svn_provisioning_error: String,
     pub error: String,
 }
 
@@ -75,6 +78,9 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
                 scopes: Vec::new(),
                 refresh_expires_at: 0,
                 last_verified_at: 0,
+                svn_username: String::new(),
+                svn_provisioning_status: String::new(),
+                svn_provisioning_error: String::new(),
                 error: error.to_string(),
             }
         }
@@ -96,6 +102,9 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
             scopes: Vec::new(),
             refresh_expires_at: 0,
             last_verified_at: 0,
+            svn_username: String::new(),
+            svn_provisioning_status: String::new(),
+            svn_provisioning_error: String::new(),
             error: String::new(),
         };
     };
@@ -112,28 +121,34 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
     }
 
     match oauth::fetch_user_info(options) {
-        Ok(info) => DashboardIdentityStatus {
-            state: if info.active {
-                "authorized"
-            } else {
-                "disabled"
+        Ok(info) => {
+            let _ = ensure_svn_credentials_for_identity(&info);
+            DashboardIdentityStatus {
+                state: if info.active {
+                    "authorized"
+                } else {
+                    "disabled"
+                }
+                .to_string(),
+                authorized: info.active,
+                online_verified: true,
+                dashboard_base: options.api_base.clone(),
+                user_name: info.name,
+                user_id: info.sub,
+                agent_id: info.agent_id,
+                scopes: split_scopes(&info.scope),
+                refresh_expires_at: snapshot.refresh_expires_at,
+                last_verified_at: unix_now(),
+                svn_username: info.svn_username,
+                svn_provisioning_status: info.svn_provisioning_status,
+                svn_provisioning_error: info.svn_provisioning_error,
+                error: if info.active {
+                    String::new()
+                } else {
+                    "Dashboard 用户已停用".to_string()
+                },
             }
-            .to_string(),
-            authorized: info.active,
-            online_verified: true,
-            dashboard_base: options.api_base.clone(),
-            user_name: info.name,
-            user_id: info.sub,
-            agent_id: info.agent_id,
-            scopes: split_scopes(&info.scope),
-            refresh_expires_at: snapshot.refresh_expires_at,
-            last_verified_at: unix_now(),
-            error: if info.active {
-                String::new()
-            } else {
-                "Dashboard 用户已停用".to_string()
-            },
-        },
+        }
         Err(error) => {
             let message = error.to_string();
             let normalized = message.to_ascii_lowercase();
@@ -231,6 +246,7 @@ pub(crate) fn start_authorization(
         match result {
             Ok(access) => {
                 let info = oauth::fetch_user_info(&options).ok();
+                let svn_result = info.as_ref().map(ensure_svn_credentials_for_identity);
                 let Ok(mut state) = flow_for_thread.lock() else {
                     return;
                 };
@@ -246,7 +262,16 @@ pub(crate) fn start_authorization(
                     user_id: access.user_id,
                     ..state.progress.clone()
                 };
+                drop(state);
                 logs.add_log("info", "Dashboard 账号授权成功");
+                match svn_result {
+                    Some(Ok(true)) => logs.add_log("info", "已按 HiMind 姓名配置 SVN 账号"),
+                    Some(Err(error)) => logs.add_log(
+                        "error",
+                        &format!("自动配置 SVN 账号失败，可在设置中重试: {error}"),
+                    ),
+                    _ => {}
+                }
             }
             Err(error) => {
                 let message = error.to_string();
@@ -267,6 +292,32 @@ pub(crate) fn start_authorization(
     });
 
     Ok(authorization_progress(&flow))
+}
+
+fn ensure_svn_credentials_for_identity(
+    info: &oauth::AgentUserInfo,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !info.active
+        || info.svn_identity_status == "disabled"
+        || info.svn_identity_status == "ambiguous"
+        || info.svn_provisioning_status != "ready"
+    {
+        return Ok(false);
+    }
+    let username = if info.svn_username.trim().is_empty() {
+        crate::svn::service::default_svn_username(&info.name)?
+    } else {
+        info.svn_username.trim().to_string()
+    };
+    crate::svn::service::ensure_default_svn_credentials(&username)
+}
+
+pub(crate) fn sync_svn_credentials(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
+    if oauth::authorization_snapshot(&options.state_path)?.is_none() {
+        return Ok(false);
+    }
+    let info = oauth::fetch_user_info(options)?;
+    ensure_svn_credentials_for_identity(&info)
 }
 
 pub(crate) fn cancel_authorization(
@@ -313,6 +364,9 @@ fn status_from_snapshot(
         scopes: split_scopes(&snapshot.scope),
         refresh_expires_at: snapshot.refresh_expires_at,
         last_verified_at: snapshot.last_verified_at,
+        svn_username: String::new(),
+        svn_provisioning_status: String::new(),
+        svn_provisioning_error: String::new(),
         error,
     }
 }

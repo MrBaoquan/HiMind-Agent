@@ -287,7 +287,7 @@ function App() {
         if (progress.state === 'authorized') {
           stopped = true;
           window.clearInterval(timer);
-          await Promise.all([refreshDashboardIdentity(), refreshAiIntegration()]);
+          await Promise.all([refreshDashboardIdentity(), refreshAiIntegration(), refreshSvnConnections()]);
           notify('success', progress.user_name ? `已登录工作台账号：${progress.user_name}` : '工作台账号授权成功');
         } else if (['denied', 'expired', 'failed', 'canceled'].includes(progress.state)) {
           stopped = true;

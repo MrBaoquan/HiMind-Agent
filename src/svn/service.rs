@@ -31,9 +31,12 @@ const SVN_CONNECTION_ID: &str = "company-svn";
 const SVN_ADMIN_CONNECTION_ID: &str = "company-svn-admin";
 const SVN_ADMIN_URL: &str = "http://svn.andcrane.com";
 const SVN_SERVICE_URL: &str = "http://svn.andcrane.com/repo";
+const DEFAULT_SVN_USER_PASSWORD: &str = "123456";
 const UNITY_TEMPLATE_URL: &str = "http://svn.andcrane.com/repo/UNIArtTemplate";
 const UNREAL_TEMPLATE_ROOT_URL: &str = "http://svn.andcrane.com/repo/repo_UETemplates";
 const TEMPLATE_MARKER_FILE: &str = ".himind-template.json";
+const PROJECT_REPOSITORY_BROAD_ACL: [(&str, &str); 3] =
+    [("/", "r"), ("/trunk", "r"), ("/trunk/exhibits", "no")];
 const MIGRATION_PROPERTY_NAMES: [&str; 7] = [
     "svn:ignore",
     "svn:externals",
@@ -90,6 +93,76 @@ pub(crate) fn bootstrap_svn_admin_credentials() -> Result<bool, Box<dyn Error>> 
         std::env::remove_var("SVN_ADMIN_PASSWORD");
     }
     Ok(true)
+}
+
+pub(crate) fn default_svn_username(display_name: &str) -> Result<String, Box<dyn Error>> {
+    let mut username = display_name.trim();
+    for suffix in ["（软件）", "(软件)"] {
+        if let Some(value) = username.strip_suffix(suffix) {
+            username = value.trim();
+            break;
+        }
+    }
+    if username.is_empty() || username.len() > 200 || username.contains(['\r', '\n']) {
+        return Err("HiMind user name cannot be used as an SVN username".into());
+    }
+    Ok(username.to_string())
+}
+
+pub(crate) fn ensure_default_svn_credentials(username: &str) -> Result<bool, Box<dyn Error>> {
+    let username = default_svn_username(username)?;
+    if list_local_svn_connections()?
+        .into_iter()
+        .any(|item| item.id == SVN_CONNECTION_ID && !item.encrypted_password.is_empty())
+    {
+        return Ok(false);
+    }
+    let password = DEFAULT_SVN_USER_PASSWORD.to_string();
+    login_svn_user(&username, &password)?;
+    save_local_svn_connection(
+        SVN_CONNECTION_ID,
+        "公司 SVN",
+        SVN_SERVICE_URL,
+        &username,
+        &password,
+        "svn",
+    )?;
+    update_local_svn_connection_status(SVN_CONNECTION_ID, "ready", "")?;
+    Ok(true)
+}
+
+pub(crate) fn svn_admin_ready() -> bool {
+    load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID).is_ok()
+}
+
+pub(crate) fn svn_admin_status() -> &'static str {
+    let connections = match list_local_svn_connections() {
+        Ok(connections) => connections,
+        Err(_) => return "unreadable",
+    };
+    if !connections.iter().any(|item| {
+        item.id == SVN_ADMIN_CONNECTION_ID && !item.encrypted_password.trim().is_empty()
+    }) {
+        return "missing";
+    }
+    if svn_admin_ready() {
+        "ready"
+    } else {
+        "unreadable"
+    }
+}
+
+pub(crate) fn provision_default_svn_user_account(username: &str) -> Result<Value, Box<dyn Error>> {
+    let username = default_svn_username(username)?;
+    if !ensure_svn_user_account(&username, DEFAULT_SVN_USER_PASSWORD)? {
+        return Err("SvnAdmin credentials are not configured on this Agent".into());
+    }
+    Ok(json!({
+        "ok": true,
+        "svn_username": username,
+        "verified": true,
+        "password_policy": "default-v1"
+    }))
 }
 
 pub(crate) fn list_connections() -> Result<Vec<SvnConnectionSummary>, Box<dyn Error>> {
@@ -165,33 +238,25 @@ pub(crate) fn test_connection() -> Result<Value, Box<dyn Error>> {
             return Err(error);
         }
     };
-    let response = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?
-        .post(format!("{SVN_ADMIN_URL}/api.php?c=Common&a=Login&t=web"))
-        .json(&json!({
-            "user_name": connection.username,
-            "user_pass": password,
-            "user_role": "2",
-            "uuid": "",
-            "code": ""
-        }))
-        .send()?;
-    if !response.status().is_success() {
-        let _ =
-            update_local_svn_connection_status(SVN_CONNECTION_ID, "unreachable", "SVN 服务不可用");
-        return Err(format!("SVN service returned HTTP {}", response.status()).into());
-    }
-    let payload: Value = response.json()?;
-    if payload.get("status").and_then(Value::as_i64) != Some(1) {
-        let _ =
-            update_local_svn_connection_status(SVN_CONNECTION_ID, "invalid", "SVN 账号或密码无效");
-        return Err(payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("SVN account or password is invalid")
-            .to_string()
-            .into());
+    if let Err(error) = login_svn_user(&connection.username, &password) {
+        let message = error.to_string();
+        let unreachable = message.starts_with("SVN service returned HTTP")
+            || message.contains("timed out")
+            || message.contains("connect");
+        let _ = update_local_svn_connection_status(
+            SVN_CONNECTION_ID,
+            if unreachable {
+                "unreachable"
+            } else {
+                "invalid"
+            },
+            if unreachable {
+                "SVN 服务不可用"
+            } else {
+                "SVN 账号或密码无效"
+            },
+        );
+        return Err(error);
     }
     update_local_svn_connection_status(SVN_CONNECTION_ID, "ready", "")?;
     Ok(json!({
@@ -203,6 +268,97 @@ pub(crate) fn test_connection() -> Result<Value, Box<dyn Error>> {
     }))
 }
 
+fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error>> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?
+        .post(format!("{SVN_ADMIN_URL}/api.php?c=Common&a=Login&t=web"))
+        .json(&json!({
+            "user_name": username,
+            "user_pass": password,
+            "user_role": "2",
+            "uuid": "",
+            "code": ""
+        }))
+        .send()?;
+    if !response.status().is_success() {
+        return Err(format!("SVN service returned HTTP {}", response.status()).into());
+    }
+    let payload: Value = response.json()?;
+    if payload.get("status").and_then(Value::as_i64) != Some(1) {
+        return Err(payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("SVN account or password is invalid")
+            .to_string()
+            .into());
+    }
+    Ok(payload)
+}
+
+fn ensure_svn_user_account(username: &str, password: &str) -> Result<bool, Box<dyn Error>> {
+    let Ok((admin, admin_password)) = load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)
+    else {
+        return Ok(false);
+    };
+    let token = login_svnadmin(&admin.username, &admin_password)?;
+    let list = svnadmin_post(
+        "Svnuser",
+        "GetUserList",
+        Some(&token),
+        json!({
+            "pageSize": 10000,
+            "currentPage": 1,
+            "searchKeyword": "",
+            "sortName": "svn_user_name",
+            "sortType": "asc",
+            "sync": false,
+            "page": true
+        }),
+    )?;
+    ensure_svnadmin_success(&list)?;
+    let existing = list
+        .pointer("/data/data")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("svn_user_name").and_then(Value::as_str) == Some(username))
+        });
+    if login_svn_user(username, password).is_ok() {
+        return Ok(true);
+    }
+    let response = if let Some(existing) = existing {
+        svnadmin_post(
+            "Svnuser",
+            "UpdUserPass",
+            Some(&token),
+            json!({
+                "svn_user_name": username,
+                "svn_user_pass": password,
+                "svn_user_status": existing
+                    .get("svn_user_status")
+                    .cloned()
+                    .unwrap_or(Value::Bool(true))
+            }),
+        )?
+    } else {
+        svnadmin_post(
+            "Svnuser",
+            "CreateUser",
+            Some(&token),
+            json!({
+                "svn_user_name": username,
+                "svn_user_pass": password,
+                "svn_user_note": "HiMind 用户"
+            }),
+        )?
+    };
+    ensure_svnadmin_success(&response)?;
+    login_svn_user(username, password)?;
+    Ok(true)
+}
+
 pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, Box<dyn Error>> {
     let project_id = normalize_repository_name(&request.project_id)?;
     let exhibit_id = normalize_repository_name(&request.exhibit_id)?;
@@ -210,47 +366,357 @@ pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, B
     let repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
     let candidate = absolute_path(&request.target_path)?;
     reject_sensitive_path(&candidate)?;
-    let (target, output) = if candidate.join(".svn").is_dir() {
+    let target_uuid = svn_remote_item(
+        &repository_url,
+        "repos-uuid",
+        &connection.username,
+        &password,
+    )?;
+    if target_uuid.trim().is_empty() {
+        return Err("SVN target repository did not return a repository UUID".into());
+    }
+    let (target, output, checkout_mode, backup_retained, preserved_property_count) = if candidate
+        .join(".svn")
+        .is_dir()
+    {
         let status = workspace_status_path(&candidate)?;
         let current_url = status
             .get("repository_url")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if current_url.trim_end_matches('/') != repository_url.trim_end_matches('/') {
-            return Err("checkout target is an SVN working copy for a different repository".into());
+        let current_uuid = status
+            .get("repository_uuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if current_uuid == target_uuid {
+            if same_svn_url(current_url, &repository_url) {
+                let output = run_svn_authenticated(
+                    [
+                        "update".to_string(),
+                        "--ignore-externals".to_string(),
+                        candidate.to_string_lossy().to_string(),
+                    ],
+                    &connection.username,
+                    &password,
+                )?;
+                (candidate, output, "update", false, 0)
+            } else {
+                if status
+                    .get("change_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    > 0
+                {
+                    return Err(
+                            "same SVN repository but different path; commit or back up local changes before switching"
+                                .into(),
+                        );
+                }
+                let output = switch_same_repository_workspace(
+                    &candidate,
+                    current_url,
+                    &repository_url,
+                    &connection.username,
+                    &password,
+                )?;
+                (candidate, output, "switch", false, 0)
+            }
+        } else {
+            takeover_non_empty_workspace(
+                &candidate,
+                &repository_url,
+                &target_uuid,
+                &connection.username,
+                &password,
+            )?
         }
-        let output = run_svn_authenticated(
-            [
-                "update".to_string(),
-                candidate.to_string_lossy().to_string(),
-            ],
-            &connection.username,
-            &password,
-        )?;
-        (candidate, output)
     } else {
         let target = validate_checkout_target(&request.target_path)?;
-        let output = run_svn_authenticated(
-            [
-                "checkout".to_string(),
-                repository_url.clone(),
-                target.to_string_lossy().to_string(),
-            ],
-            &connection.username,
-            &password,
-        )?;
-        (target, output)
+        let non_empty = target.is_dir() && working_copy_contains_content(&target)?;
+        if non_empty {
+            takeover_non_empty_workspace(
+                &target,
+                &repository_url,
+                &target_uuid,
+                &connection.username,
+                &password,
+            )?
+        } else {
+            let output = run_svn_authenticated(
+                [
+                    "checkout".to_string(),
+                    "--ignore-externals".to_string(),
+                    repository_url.clone(),
+                    target.to_string_lossy().to_string(),
+                ],
+                &connection.username,
+                &password,
+            )?;
+            (target, output, "checkout", false, 0)
+        }
     };
+    let external_sync = sync_workspace_externals(&target, &connection.username, &password);
     let status = workspace_status_path(&target)?;
     Ok(json!({
         "ok": true,
         "project_id": project_id,
         "exhibit_id": exhibit_id,
         "repository_url": repository_url,
+        "repository_uuid": target_uuid,
+        "checkout_mode": checkout_mode,
+        "backup_retained": backup_retained,
+        "preserved_property_count": preserved_property_count,
+        "external_sync": external_sync,
         "target_path": target,
         "output": output,
         "workspace": status
     }))
+}
+
+fn sync_workspace_externals(target: &Path, username: &str, password: &str) -> Value {
+    match run_svn_authenticated(
+        [
+            "update".to_string(),
+            "--include-externals".to_string(),
+            target.to_string_lossy().to_string(),
+        ],
+        username,
+        password,
+    ) {
+        Ok(output) => json!({ "status": "ready", "output": output }),
+        Err(error) => json!({
+            "status": "warning",
+            "error": error.to_string(),
+            "message": "主工程已检出，但部分外部依赖未能更新；本地已有 external 目录保持不变"
+        }),
+    }
+}
+
+fn svn_remote_item(
+    repository_url: &str,
+    item: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, Box<dyn Error>> {
+    run_svn_authenticated(
+        [
+            "info".to_string(),
+            "--show-item".to_string(),
+            item.to_string(),
+            repository_url.to_string(),
+        ],
+        username,
+        password,
+    )
+    .map(|value| value.trim().to_string())
+}
+
+fn same_svn_url(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/')
+        .eq_ignore_ascii_case(right.trim_end_matches('/'))
+}
+
+fn switch_same_repository_workspace(
+    target: &Path,
+    current_url: &str,
+    target_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, Box<dyn Error>> {
+    let current_root = svn_item(target, "repos-root-url")?;
+    let target_root =
+        svn_remote_item(target_url, "repos-root-url", username, password).unwrap_or_default();
+    let current_suffix = svn_repository_relative_url(current_url, &current_root);
+    let target_suffix = svn_repository_relative_url(target_url, &target_root);
+    let arguments = if !current_root.trim().is_empty()
+        && !target_root.trim().is_empty()
+        && current_suffix.is_some()
+        && current_suffix == target_suffix
+        && !same_svn_url(&current_root, &target_root)
+    {
+        vec![
+            "switch".to_string(),
+            "--ignore-externals".to_string(),
+            "--relocate".to_string(),
+            current_root,
+            target_root,
+            target.to_string_lossy().to_string(),
+        ]
+    } else {
+        vec![
+            "switch".to_string(),
+            "--ignore-externals".to_string(),
+            target_url.to_string(),
+            target.to_string_lossy().to_string(),
+        ]
+    };
+    run_svn_authenticated(arguments, username, password)
+}
+
+fn svn_repository_relative_url(url: &str, root: &str) -> Option<String> {
+    let url = Url::parse(url.trim_end_matches('/')).ok()?;
+    let root = Url::parse(root.trim_end_matches('/')).ok()?;
+    if url.scheme() != root.scheme()
+        || url.host_str() != root.host_str()
+        || url.port_or_known_default() != root.port_or_known_default()
+    {
+        return None;
+    }
+    let root_path = root.path().trim_end_matches('/');
+    let url_path = url.path().trim_end_matches('/');
+    let suffix = url_path.strip_prefix(root_path)?;
+    Some(suffix.trim_matches('/').to_string())
+}
+
+fn takeover_non_empty_workspace(
+    target: &Path,
+    repository_url: &str,
+    target_uuid: &str,
+    username: &str,
+    password: &str,
+) -> Result<(PathBuf, String, &'static str, bool, usize), Box<dyn Error>> {
+    let had_working_copy = target.join(".svn").is_dir();
+    let old_paths = workspace_path_manifest(target)?;
+    let snapshot = if had_working_copy {
+        snapshot_migration_metadata(target, false)?
+    } else {
+        MigrationMetadataSnapshot::default()
+    };
+    let mut backup = if had_working_copy {
+        Some(WorkingCopyAdminBackup::create(target)?)
+    } else {
+        None
+    };
+    let result = (|| -> Result<(String, usize), Box<dyn Error>> {
+        let output = run_svn_authenticated(
+            [
+                "checkout".to_string(),
+                "--force".to_string(),
+                "--ignore-externals".to_string(),
+                repository_url.to_string(),
+                target.to_string_lossy().to_string(),
+            ],
+            username,
+            password,
+        )?;
+        let switched_url = svn_item(target, "url")?;
+        let switched_uuid = svn_item(target, "repos-uuid")?;
+        if !same_svn_url(&switched_url, repository_url) || switched_uuid.trim() != target_uuid {
+            return Err("local workspace switched to an unexpected SVN repository".into());
+        }
+        let preserved_property_count =
+            preserve_missing_migration_properties(target, &snapshot.properties)?;
+        Ok((output, preserved_property_count))
+    })();
+    match result {
+        Ok((output, preserved_property_count)) => {
+            if let Some(backup) = backup.as_mut() {
+                backup.retain();
+            }
+            Ok((
+                target.to_path_buf(),
+                output,
+                if had_working_copy {
+                    "takeover-old-svn"
+                } else {
+                    "takeover-existing"
+                },
+                had_working_copy,
+                preserved_property_count,
+            ))
+        }
+        Err(error) => {
+            cleanup_partial_checkout(target, &old_paths)?;
+            if let Some(backup) = backup.as_mut() {
+                backup.rollback()?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn preserve_missing_migration_properties(
+    working_copy: &Path,
+    properties: &[MigrationProperty],
+) -> Result<usize, Box<dyn Error>> {
+    let mut pending = Vec::new();
+    for property in properties {
+        if property.value.is_empty() {
+            continue;
+        }
+        let target = working_copy.join(&property.relative_path);
+        if !target.exists() {
+            continue;
+        }
+        let current = run_svn_in_directory_owned(
+            &target,
+            vec![
+                "propget".to_string(),
+                "--strict".to_string(),
+                property.name.clone(),
+                ".".to_string(),
+            ],
+        )
+        .unwrap_or_default();
+        if current.trim().is_empty() {
+            pending.push(property.clone());
+        }
+    }
+    let count = pending.len();
+    run_migration_propset_batches(working_copy, pending.iter())?;
+    Ok(count)
+}
+
+fn workspace_path_manifest(root: &Path) -> Result<BTreeSet<PathBuf>, Box<dyn Error>> {
+    if !root.is_dir() {
+        return Ok(BTreeSet::new());
+    }
+    let mut paths = BTreeSet::new();
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(root)?;
+        if relative.as_os_str().is_empty() || relative == Path::new(".svn") {
+            continue;
+        }
+        if relative.starts_with(".svn") {
+            continue;
+        }
+        paths.insert(relative.to_path_buf());
+    }
+    Ok(paths)
+}
+
+fn cleanup_partial_checkout(
+    root: &Path,
+    original_paths: &BTreeSet<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let admin = root.join(".svn");
+    if admin.exists() {
+        std::fs::remove_dir_all(admin)?;
+    }
+    for entry in WalkDir::new(root)
+        .contents_first(true)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(root)?;
+        if relative.as_os_str().is_empty()
+            || relative.starts_with(".svn")
+            || original_paths.contains(relative)
+        {
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            let _ = std::fs::remove_dir(entry.path());
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn create_exhibit_repository_path(
@@ -1899,14 +2365,38 @@ pub(crate) fn ensure_project_exhibits_access(
     request: EnsureProjectExhibitsAccessRequest,
 ) -> Result<Value, Box<dyn Error>> {
     let project_id = normalize_repository_name(&request.project_id)?;
-    let path = "/trunk/exhibits";
     let (connection, password) = load_svn_admin_secret()?;
     let token = login_svnadmin(&connection.username, &password)?;
+    let mut paths = Vec::new();
+    for (path, access) in PROJECT_REPOSITORY_BROAD_ACL {
+        let action = ensure_authenticated_path_access(&project_id, path, access, &token)?;
+        paths.push(json!({ "path": path, "access": access, "action": action }));
+    }
+    Ok(json!({
+        "ok": true,
+        "project_id": project_id,
+        "principal": "$authenticated",
+        "paths": paths,
+        "tortoise_log_compatible": true,
+        "exhibit_default_access": "no",
+        "verified": true
+    }))
+}
+
+fn ensure_authenticated_path_access(
+    project_id: &str,
+    path: &str,
+    access: &str,
+    token: &str,
+) -> Result<&'static str, Box<dyn Error>> {
+    if !matches!(access, "r" | "rw" | "no") {
+        return Err("unsupported SVN access value".into());
+    }
     let query_body = json!({ "rep_name": project_id, "path": path, "svnn_user_pri_path_id": -1 });
     let before = svnadmin_post(
         "Svnrep",
         "GetRepPathAllPri",
-        Some(&token),
+        Some(token),
         query_body.clone(),
     )?;
     ensure_svnadmin_success(&before)?;
@@ -1919,11 +2409,13 @@ pub(crate) fn ensure_project_exhibits_access(
                     && item.get("objectName").and_then(Value::as_str) == Some("$authenticated")
             })
         });
-    let action = if existing
-        .and_then(|item| item.get("objectPri"))
-        .and_then(Value::as_str)
-        == Some("rw")
-    {
+    let existing_matches = existing.is_some_and(|item| {
+        item.get("objectPri").and_then(Value::as_str) == Some(access)
+            && !item
+                .get("invert")
+                .is_some_and(|value| value == true || value == 1)
+    });
+    let action = if existing_matches {
         "unchanged"
     } else {
         let endpoint_action = if existing.is_some() {
@@ -1936,13 +2428,13 @@ pub(crate) fn ensure_project_exhibits_access(
             "path": path,
             "objectType": "$authenticated",
             "objectName": "$authenticated",
-            "objectPri": "rw",
+            "objectPri": access,
             "svnn_user_pri_path_id": -1
         });
         if endpoint_action == "UpdRepPathPri" {
             body["invert"] = Value::Bool(false);
         }
-        let response = svnadmin_post("Svnrep", endpoint_action, Some(&token), body)?;
+        let response = svnadmin_post("Svnrep", endpoint_action, Some(token), body)?;
         ensure_svnadmin_success(&response)?;
         if endpoint_action == "UpdRepPathPri" {
             "updated"
@@ -1950,7 +2442,7 @@ pub(crate) fn ensure_project_exhibits_access(
             "created"
         }
     };
-    let after = svnadmin_post("Svnrep", "GetRepPathAllPri", Some(&token), query_body)?;
+    let after = svnadmin_post("Svnrep", "GetRepPathAllPri", Some(token), query_body)?;
     ensure_svnadmin_success(&after)?;
     let verified = after
         .get("data")
@@ -1959,24 +2451,18 @@ pub(crate) fn ensure_project_exhibits_access(
             items.iter().any(|item| {
                 item.get("objectType").and_then(Value::as_str) == Some("$authenticated")
                     && item.get("objectName").and_then(Value::as_str) == Some("$authenticated")
-                    && item.get("objectPri").and_then(Value::as_str) == Some("rw")
+                    && item.get("objectPri").and_then(Value::as_str) == Some(access)
                     && !item
                         .get("invert")
                         .is_some_and(|value| value == true || value == 1)
             })
         });
     if !verified {
-        return Err("SvnAdmin did not persist authenticated read-write access".into());
+        return Err(
+            format!("SvnAdmin did not persist authenticated {access} access for {path}").into(),
+        );
     }
-    Ok(json!({
-        "ok": true,
-        "project_id": project_id,
-        "path": path,
-        "principal": "$authenticated",
-        "access": "rw",
-        "action": action,
-        "verified": true
-    }))
+    Ok(action)
 }
 
 pub(crate) fn preview_project_acl(
@@ -2006,6 +2492,9 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
     if before_digest != request.expected_current_digest {
         return Err("SVN ACL changed after preview; generate a new plan".into());
     }
+    let repository_policy = ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest {
+        project_id: project_id.clone(),
+    })?;
     let (connection, password) = load_svn_admin_secret()?;
     let token = login_svnadmin(&connection.username, &password)?;
     let current_users = user_acl_map(&before);
@@ -2064,6 +2553,7 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
         "before_digest": before_digest,
         "after_digest": acl_digest(&after)?,
         "applied": applied,
+        "repository_policy": repository_policy,
         "verified": true,
         "broad_access": broad_acl_entries(&after)
     }))
@@ -2515,6 +3005,8 @@ fn workspace_status_path(target: &Path) -> Result<Value, Box<dyn Error>> {
     Ok(json!({
         "target_path": target,
         "repository_url": decode_svn_cli_output(&info.stdout).trim(),
+        "repository_uuid": svn_item(target, "repos-uuid").unwrap_or_default(),
+        "repository_root_url": svn_item(target, "repos-root-url").unwrap_or_default(),
         "revision": decode_svn_cli_output(&revision.stdout).trim(),
         "change_count": change_count,
         "clean": change_count == 0
@@ -2699,9 +3191,6 @@ fn validate_checkout_target(value: &str) -> Result<PathBuf, Box<dyn Error>> {
         if target.join(".svn").exists() {
             return Err("checkout target is already an SVN working copy".into());
         }
-        if fs_directory_not_empty(&target)? {
-            return Err("checkout target directory must be empty".into());
-        }
     } else if let Some(parent) = target.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -2749,10 +3238,6 @@ fn reject_sensitive_path(target: &Path) -> Result<(), Box<dyn Error>> {
         return Err("target_path points to a protected system directory".into());
     }
     Ok(())
-}
-
-fn fs_directory_not_empty(path: &Path) -> Result<bool, Box<dyn Error>> {
-    Ok(std::fs::read_dir(path)?.next().is_some())
 }
 
 fn normalize_repository_name(value: &str) -> Result<String, Box<dyn Error>> {
@@ -2817,6 +3302,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn derives_svn_username_from_himind_name() {
+        assert_eq!(default_svn_username("马宝全").unwrap(), "马宝全");
+        assert_eq!(default_svn_username(" 李鹏（软件） ").unwrap(), "李鹏");
+        assert_eq!(default_svn_username("陈晨(软件)").unwrap(), "陈晨");
+        assert!(default_svn_username("\n").is_err());
+    }
+
+    #[test]
     fn validates_repository_paths_and_names() {
         assert_eq!(normalize_repository_name("Project_1").unwrap(), "Project_1");
         assert!(normalize_repository_name("bad/name").is_err());
@@ -2838,6 +3331,75 @@ mod tests {
         assert!(absolute_path("relative/path").is_err());
         assert!(reject_sensitive_path(Path::new(r"C:\Windows\Temp\repo")).is_err());
         assert!(reject_sensitive_path(Path::new(r"D:\Projects\repo")).is_ok());
+    }
+
+    #[test]
+    fn accepts_non_empty_checkout_targets_for_controlled_takeover() {
+        let target = std::env::temp_dir().join(format!(
+            "himind-non-empty-checkout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("local.txt"), "keep").unwrap();
+
+        assert_eq!(
+            validate_checkout_target(target.to_string_lossy().as_ref()).unwrap(),
+            target
+        );
+
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn cleanup_partial_checkout_only_removes_new_paths_and_svn_metadata() {
+        let target = std::env::temp_dir().join(format!(
+            "himind-checkout-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(target.join("existing")).unwrap();
+        std::fs::write(target.join("existing/local.txt"), "keep").unwrap();
+        let manifest = workspace_path_manifest(&target).unwrap();
+        std::fs::create_dir_all(target.join(".svn")).unwrap();
+        std::fs::write(target.join(".svn/wc.db"), "new metadata").unwrap();
+        std::fs::create_dir_all(target.join("downloaded")).unwrap();
+        std::fs::write(target.join("downloaded/remote.txt"), "remove").unwrap();
+
+        cleanup_partial_checkout(&target, &manifest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("existing/local.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!target.join("downloaded").exists());
+        assert!(!target.join(".svn").exists());
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn compares_repository_locations_without_confusing_uuid_and_url() {
+        assert!(same_svn_url(
+            "http://svn.example/repo/project/",
+            "HTTP://SVN.EXAMPLE/repo/project"
+        ));
+        assert_eq!(
+            svn_repository_relative_url(
+                "http://svn.example/repo/project/trunk/exhibits/EX-1",
+                "http://svn.example/repo/project"
+            ),
+            Some("trunk/exhibits/EX-1".to_string())
+        );
+        assert_eq!(
+            PROJECT_REPOSITORY_BROAD_ACL,
+            [("/", "r"), ("/trunk", "r"), ("/trunk/exhibits", "no")]
+        );
     }
 
     #[test]

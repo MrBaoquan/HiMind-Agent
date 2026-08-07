@@ -101,6 +101,14 @@ pub(crate) struct AgentUserInfo {
     pub scope: String,
     pub name: String,
     pub active: bool,
+    #[serde(default)]
+    pub svn_username: String,
+    #[serde(default)]
+    pub svn_identity_status: String,
+    #[serde(default)]
+    pub svn_provisioning_status: String,
+    #[serde(default)]
+    pub svn_provisioning_error: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -99,6 +99,7 @@ export function DashboardPage({
         <div className="overview-technical-grid">
           <div><span>内网账号</span><strong>{status.login_account || status.login_label || '未配置'}</strong></div>
           <div><span>审批超时</span><strong>{settings?.timeout_seconds || 30} 秒</strong></div>
+          <div><span>运行档</span><strong>{status.profile || 'production'}</strong></div>
           <div><span>本地端口</span><strong>{status.local_port || 18181}</strong></div>
           <div><span>Agent 版本</span><strong>v{status.version}</strong></div>
         </div>
