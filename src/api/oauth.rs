@@ -286,6 +286,7 @@ pub(crate) fn revoke_authorization(options: &Options) -> Result<(), Box<dyn Erro
         .send()?
         .error_for_status()?;
     clear_authorization_unlocked(&options.state_path)?;
+    crate::svn::service::remove_connection()?;
     *cache = None;
     Ok(())
 }

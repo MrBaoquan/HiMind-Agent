@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::{
-    AgentResponse, AgentRunClaim, AgentState, RemoteExecutionReport, RuntimeInstallationReport,
-    Task, TaskCancelStatus,
+    AgentResponse, AgentRunClaim, AgentState, AgentTaskHistoryItem, RemoteExecutionReport,
+    RuntimeInstallationReport, Task, TaskCancelStatus,
 };
 use crate::store::credentials::{
     protect_secret_for_current_user, unprotect_secret_for_current_user,
@@ -368,6 +368,23 @@ pub fn poll_tasks(
         .send()?
         .error_for_status()?
         .json::<Vec<Task>>()?;
+    Ok(tasks)
+}
+
+pub fn list_task_history(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    limit: usize,
+) -> Result<Vec<AgentTaskHistoryItem>, Box<dyn Error>> {
+    let tasks = client
+        .get(format!("{}/api/agent/tasks/history", api_base))
+        .query(&[("limit", limit.to_string())])
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?
+        .error_for_status()?
+        .json::<Vec<AgentTaskHistoryItem>>()?;
     Ok(tasks)
 }
 

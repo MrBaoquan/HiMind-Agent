@@ -11,6 +11,34 @@ export type AgentStatus = {
     login_account?: string;
     login_label?: string;
     profile?: string;
+    current_task?: CurrentTaskStatus | null;
+};
+
+export type CurrentTaskStatus = {
+    task_id: string;
+    task_type: string;
+    execution_id: string;
+    status: 'running' | string;
+};
+
+export type AgentTaskHistoryItem = {
+    id: string;
+    task_type: string;
+    status: string;
+    progress: number;
+    detail?: string | null;
+    error?: string | null;
+    created_at: string;
+    started_at?: string | null;
+    finished_at?: string | null;
+    updated_at: string;
+};
+
+export type CatalogPage<T> = {
+    items: T[];
+    total: number;
+    page: number;
+    page_size: number;
 };
 
 export type AgentUpdateStatus = {
@@ -63,6 +91,20 @@ export type RemoteExecutionSettings = {
     default_provider: 'auto' | 'personal.codex' | 'personal.github-copilot' | 'himind.openhands';
 };
 
+export type OpenHandsRuntimeStatus = {
+    provider: 'himind.openhands' | string;
+    status: 'ready' | 'unavailable' | string;
+    version: string;
+    cli_compatible: boolean;
+    executable_path: string;
+    uv_available: boolean;
+    uv_version: string;
+    python_available: boolean;
+    python_version: string;
+    install_command: string;
+    message: string;
+};
+
 export type LoginState = {
     status: string;
     account?: string;
@@ -105,6 +147,31 @@ export type PluginRegistry = {
     external_runtime?: string;
     total?: number;
     items?: PluginItem[];
+};
+
+export type ExtensionDesiredItem = {
+    product_id: string;
+    asset_key: string;
+    asset_kind: 'plugin' | 'skill' | string;
+    name: string;
+    desired_state: 'absent' | 'present' | 'optional' | string;
+    desired_version?: string;
+    desired_enabled?: boolean;
+    intent: 'required' | 'recommended' | 'optional' | string;
+    management: 'user_managed' | 'organization_managed' | 'builtin' | string;
+    install_mode?: 'prompt' | 'silent' | string;
+    assignment_id?: string;
+    source?: 'marketplace' | 'organization' | 'system' | string;
+    reason?: string;
+    allow_disable?: boolean;
+    allow_uninstall?: boolean;
+    on_scope_exit?: string;
+};
+
+export type ExtensionDesiredState = {
+    generation: string;
+    reconcile_interval_seconds: number;
+    items: ExtensionDesiredItem[];
 };
 
 export type PluginItem = {
@@ -719,6 +786,7 @@ export function invoke<T>(command: string, args?: Record<string, unknown>): Prom
 
 export const agentApi = {
     status: () => invoke<AgentStatus>('get_agent_status'),
+    taskHistory: (limit = 50) => invoke<AgentTaskHistoryItem[]>('get_agent_task_history', { limit }),
     updateStatus: () => invoke<AgentUpdateStatus>('get_agent_update_status'),
     checkUpdate: () => invoke<AgentUpdateStatus>('check_agent_update'),
     downloadUpdate: () => invoke<AgentUpdateStatus>('download_agent_update'),
@@ -739,10 +807,14 @@ export const agentApi = {
     settings: () => invoke<ApprovalSettings>('get_approval_settings'),
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
     saveRemoteExecutionSettings: (settings: RemoteExecutionSettings, fullAccessConfirmed = false) => invoke<RemoteExecutionSettings>('save_remote_execution_settings', { settings, fullAccessConfirmed }),
+    openHandsRuntimeStatus: () => invoke<OpenHandsRuntimeStatus>('get_openhands_runtime_status'),
+    installOpenHandsRuntime: () => invoke<OpenHandsRuntimeStatus>('install_openhands_runtime'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     plugins: () => invoke<PluginRegistry>('get_plugin_registry'),
+    extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
+    queryPluginCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<PluginCatalogItem>>('query_plugin_catalog', { q, category, page, pageSize }),
     pluginDrafts: () => invoke<AuthoringPluginDraft[]>('list_plugin_drafts'),
     pluginSubmissions: () => invoke<PluginSubmissionStatus[]>('list_plugin_submissions'),
     extensionProjects: () => invoke<ExtensionProject[]>('list_extension_projects'),
@@ -768,6 +840,7 @@ export const agentApi = {
     planPluginInstall: (pluginId: string, version?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version }),
     skillCatalog: () => invoke<SkillCatalogResponse>('get_skill_catalog'),
     organizationSkillCatalog: () => invoke<OrganizationSkillCatalogItem[]>('get_organization_skill_catalog'),
+    queryOrganizationSkillCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<OrganizationSkillCatalogItem>>('query_organization_skill_catalog', { q, category, page, pageSize }),
     skillVersions: (skillId: string) => invoke<OrganizationSkillCatalogItem[]>('get_skill_versions', { skillId }),
     planOrganizationSkillInstall: (skillId: string, version?: string) => invoke<SkillInstallPlan>('plan_organization_skill_install', { skillId, version }),
     installOrganizationSkill: (skillId: string, version?: string, optionalPluginIds: string[] = []) => invoke<OrganizationSkillInstallResponse>('install_organization_skill', { skillId, version, optionalPluginIds }),

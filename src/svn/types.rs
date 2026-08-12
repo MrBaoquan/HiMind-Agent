@@ -23,6 +23,8 @@ pub(crate) struct SaveSvnConnectionRequest {
 pub(crate) struct SvnCheckoutRequest {
     pub project_id: String,
     pub exhibit_id: String,
+    #[serde(default)]
+    pub repository_url: Option<String>,
     pub target_path: String,
 }
 
@@ -52,6 +54,8 @@ pub(crate) struct ImportLocalExhibitRequest {
     pub project_id: String,
     pub exhibit_id: String,
     pub source_path: String,
+    #[serde(default)]
+    pub force_migration: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +73,7 @@ pub(crate) struct CreateRepositoryRequest {
     pub project_id: String,
     #[serde(default)]
     pub project_name: String,
+    pub hook_endpoint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,4 +103,11 @@ pub(crate) struct ApplyProjectAclRequest {
     pub managed_paths: Vec<String>,
     pub desired_entries: Vec<ProjectAclEntry>,
     pub expected_current_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReconcileProjectAclRequest {
+    pub project_id: String,
+    pub managed_paths: Vec<String>,
+    pub desired_entries: Vec<ProjectAclEntry>,
 }

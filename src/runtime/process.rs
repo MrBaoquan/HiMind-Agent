@@ -62,6 +62,7 @@ pub(crate) fn verify_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    remove_himind_secret_environment(&mut command);
     configure_hidden_process(&mut command);
     let output = command.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);

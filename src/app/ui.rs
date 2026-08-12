@@ -128,6 +128,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_approval_settings,
             super::commands::get_remote_execution_settings,
             super::commands::save_remote_execution_settings,
+            super::commands::get_openhands_runtime_status,
+            super::commands::install_openhands_runtime,
             super::commands::set_approval_rule,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
@@ -147,7 +149,10 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_svn_connection,
             super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
+            super::commands::get_extension_desired_state,
+            super::commands::get_agent_task_history,
             super::commands::get_plugin_catalog,
+            super::commands::query_plugin_catalog,
             super::commands::get_plugin_versions,
             super::commands::plan_plugin_install,
             super::commands::install_plugin,
@@ -157,6 +162,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_agent_capabilities,
             super::commands::get_skill_catalog,
             super::commands::get_organization_skill_catalog,
+            super::commands::query_organization_skill_catalog,
             super::commands::get_skill_versions,
             super::commands::install_organization_skill,
             super::commands::plan_organization_skill_install,
@@ -448,6 +454,12 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn should_hide_internal_window(class_name: &str) -> bool {
+    // Tauri delivers AppHandle::exit through the Tao event target window.
+    class_name.ends_with("-sic")
+}
+
 #[cfg(target_os = "windows")]
 fn start_internal_window_filter() {
     use std::ffi::c_void;
@@ -476,7 +488,7 @@ fn start_internal_window_filter() {
         let length =
             unsafe { GetClassNameW(window, class_name.as_mut_ptr(), class_name.len() as i32) };
         let class_name = String::from_utf16_lossy(&class_name[..length.max(0) as usize]);
-        if class_name == "Tao Thread Event Target" || class_name.ends_with("-sic") {
+        if should_hide_internal_window(&class_name) {
             unsafe { ShowWindow(window, 0) };
         }
         1
@@ -611,5 +623,16 @@ mod tray_icon_tests {
         let icon = make_tray_icon().expect("embedded tray icon should decode");
         assert_eq!((icon.width(), icon.height()), (64, 64));
         assert_eq!(icon.rgba().len(), 64 * 64 * 4);
+    }
+}
+
+#[cfg(test)]
+mod internal_window_filter_tests {
+    use super::should_hide_internal_window;
+
+    #[test]
+    fn preserves_tao_event_target_used_by_app_exit() {
+        assert!(!should_hide_internal_window("Tao Thread Event Target"));
+        assert!(should_hide_internal_window("internal-sic"));
     }
 }

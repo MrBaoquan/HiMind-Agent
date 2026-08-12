@@ -18,7 +18,8 @@ use std::num::NonZeroIsize;
 
 use crate::api::client::verify_local_agent_ticket;
 use crate::app::ai_provider_import::{
-    consume_vscode_enrollment, import as import_ai_provider, AIProviderImportRequest,
+    cancel as cancel_ai_provider_import, consume_vscode_enrollment, import as import_ai_provider,
+    status as ai_provider_import_status, AIProviderImportRequest,
 };
 use crate::app::http::{
     local_tree_json, query_param, set_response_origin, split_target, write_local_response,
@@ -754,6 +755,39 @@ fn handle_local_http(
                 ),
             }
         }
+        ("GET", "/ai-provider-import/status") => write_local_response(
+            &mut stream,
+            200,
+            &serde_json::to_string(&ai_provider_import_status(&options))?,
+            "application/json",
+        ),
+        ("POST", "/ai-provider-import/cancel") => {
+            let payload: AIProviderImportRequest = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "error": format!("invalid AI provider cancellation payload: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            match cancel_ai_provider_import(&options, &payload.target) {
+                Ok(value) => write_local_response(
+                    &mut stream,
+                    200,
+                    &serde_json::to_string(&value)?,
+                    "application/json",
+                ),
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "target": payload.target, "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
         ("GET", "/login-status") => write_local_response(
             &mut stream,
             200,
@@ -1392,6 +1426,8 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
         ("POST", "/open-project") => Some("local.workspace.open"),
         ("POST", "/remote-connect") => Some("local.remote.connect"),
         ("POST", "/ai-provider-import") => Some("local.ai.provider_import"),
+        ("GET", "/ai-provider-import/status") => Some("local.ai.provider_import_status"),
+        ("POST", "/ai-provider-import/cancel") => Some("local.ai.provider_import_cancel"),
         ("GET", "/login-status") => Some("local.inner_admin.login_status"),
         ("GET", "/engineering-projects") => Some("local.inner_admin.projects"),
         ("POST", "/engineering-exhibits") => Some("local.inner_admin.exhibits"),
@@ -1447,6 +1483,14 @@ mod local_operation_tests {
         assert_eq!(
             local_operation("POST", "/ai-provider-import"),
             Some("local.ai.provider_import")
+        );
+        assert_eq!(
+            local_operation("GET", "/ai-provider-import/status"),
+            Some("local.ai.provider_import_status")
+        );
+        assert_eq!(
+            local_operation("POST", "/ai-provider-import/cancel"),
+            Some("local.ai.provider_import_cancel")
         );
     }
 

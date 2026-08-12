@@ -90,6 +90,25 @@ pub struct Task {
     pub lease_expires_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentTaskHistoryItem {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub task_type: String,
+    pub status: String,
+    pub progress: i32,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TaskCancelStatus {
     pub status: String,

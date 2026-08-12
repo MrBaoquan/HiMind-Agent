@@ -39,14 +39,15 @@ use store::outbox::{
     list_reports, remove_report, remove_reports_for_execution, store_report, TaskReportRecord,
 };
 use svn::service::{
-    apply_project_acl, clone_exhibit_repository, create_exhibit_repository_path, create_repository,
-    ensure_project_exhibits_access, import_local_exhibit_with_cancel_and_progress,
-    initialize_exhibit_repository_with_cancel, preview_project_acl,
+    apply_project_acl, clone_exhibit_repository, create_exhibit_repository_path,
+    create_repository_with_post_commit_hook, ensure_project_exhibits_access,
+    import_local_exhibit_with_cancel_and_progress, initialize_exhibit_repository_with_cancel,
+    preview_project_acl, reconcile_project_acl,
 };
 use svn::types::{
     ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
     CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
-    InitializeExhibitRepositoryRequest, PreviewProjectAclRequest,
+    InitializeExhibitRepositoryRequest, PreviewProjectAclRequest, ReconcileProjectAclRequest,
 };
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
@@ -300,7 +301,7 @@ pub(crate) struct Options {
     enrollment_token: String,
     agent_credential: Arc<RwLock<String>>,
     platform_access: Arc<RwLock<Option<api::oauth::AgentAccessToken>>>,
-    task_execution: Arc<RwLock<Option<(String, String)>>>,
+    task_execution: Arc<RwLock<Option<(String, String, String, String)>>>,
 }
 
 impl Options {
@@ -404,8 +405,14 @@ struct TaskExecutionGuard {
 }
 
 impl TaskExecutionGuard {
-    fn start(options: &Options, execution_id: &str, lease_id: &str) -> Self {
-        options.set_task_execution(execution_id, lease_id);
+    fn start(
+        options: &Options,
+        task_id: &str,
+        task_type: &str,
+        execution_id: &str,
+        lease_id: &str,
+    ) -> Self {
+        options.set_task_execution(task_id, task_type, execution_id, lease_id);
         Self {
             options: options.clone(),
         }
@@ -518,9 +525,20 @@ impl Options {
             .unwrap_or_default()
     }
 
-    pub(crate) fn set_task_execution(&self, execution_id: &str, lease_id: &str) {
+    pub(crate) fn set_task_execution(
+        &self,
+        task_id: &str,
+        task_type: &str,
+        execution_id: &str,
+        lease_id: &str,
+    ) {
         if let Ok(mut current) = self.task_execution.write() {
-            *current = Some((execution_id.to_string(), lease_id.to_string()));
+            *current = Some((
+                task_id.to_string(),
+                task_type.to_string(),
+                execution_id.to_string(),
+                lease_id.to_string(),
+            ));
         }
     }
 
@@ -530,7 +548,7 @@ impl Options {
         }
     }
 
-    pub(crate) fn task_execution(&self) -> Option<(String, String)> {
+    pub(crate) fn task_execution(&self) -> Option<(String, String, String, String)> {
         self.task_execution
             .read()
             .ok()
@@ -546,7 +564,13 @@ fn execute_task(
     approval_mgr: Option<&ApprovalManager>,
 ) -> Result<(), Box<dyn Error>> {
     println!("executing task {} ({})", task.id, task.task_type);
-    let _execution = TaskExecutionGuard::start(options, &task.execution_id, &task.lease_id);
+    let _execution = TaskExecutionGuard::start(
+        options,
+        &task.id,
+        &task.task_type,
+        &task.execution_id,
+        &task.lease_id,
+    );
     let _lease_renewal = if !task.execution_id.is_empty() && !task.lease_id.is_empty() {
         let lease_stop = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&lease_stop);
@@ -702,7 +726,7 @@ fn execute_task(
                 task.payload.clone().unwrap_or_else(|| json!({})),
             )?;
             let project_id = request.project_id.clone();
-            let repository = create_repository(request)?;
+            let repository = create_repository_with_post_commit_hook(request)?;
             let access =
                 ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest { project_id })?;
             Ok(json!({ "repository": repository, "exhibits_access": access }))
@@ -861,6 +885,23 @@ fn execute_task(
             )?;
             apply_project_acl(request)
         }
+        "project_acl_reconcile" => {
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                40,
+                "Agent 正在自动收敛项目 SVN 权限",
+                None,
+                None,
+            )?;
+            let request = serde_json::from_value::<ReconcileProjectAclRequest>(
+                task.payload.clone().unwrap_or_else(|| json!({})),
+            )?;
+            reconcile_project_acl(request)
+        }
         _ => Ok(json!({ "message": "unsupported task type", "task_type": task.task_type })),
     };
 
@@ -940,9 +981,9 @@ pub(crate) fn report_task(
     result: Option<Value>,
     error: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    let (execution_id, lease_id) = options
+    let (_, _, execution_id, lease_id) = options
         .task_execution()
-        .unwrap_or_else(|| (String::new(), String::new()));
+        .unwrap_or_else(|| (String::new(), String::new(), String::new(), String::new()));
     let report = TaskReportRecord {
         task_id: task_id.to_string(),
         agent_id: agent_id.to_string(),

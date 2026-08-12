@@ -16,7 +16,7 @@ use crate::capability::types::{CapabilityDescriptor, InvocationContext};
 use crate::store::credentials::{local_login_status_json, local_login_status_value};
 use crate::store::types::LocalWorkerStatus;
 use crate::svn::service::{
-    checkout_workspace, create_exhibit_repository_path, create_repository,
+    checkout_workspace, create_exhibit_repository_path, create_repository_with_post_commit_hook,
     ensure_project_exhibits_access, initialize_exhibit_repository, list_connections,
     open_workspace, scan_migration_source, test_connection, update_workspace, workspace_status,
 };
@@ -182,6 +182,7 @@ impl CapabilityGateway {
                     "properties": {
                         "project_id": { "type": "string" },
                         "exhibit_id": { "type": "string" },
+                        "repository_url": { "type": "string" },
                         "target_path": { "type": "string" }
                     },
                     "required": ["project_id", "exhibit_id", "target_path"],
@@ -598,7 +599,9 @@ impl CapabilityGateway {
                 open_workspace(serde_json::from_value::<SvnWorkspaceRequest>(input)?)
             }
             CapabilityHandler::SvnRepositoryCreate => {
-                create_repository(serde_json::from_value::<CreateRepositoryRequest>(input)?)
+                create_repository_with_post_commit_hook(serde_json::from_value::<
+                    CreateRepositoryRequest,
+                >(input)?)
             }
             CapabilityHandler::SvnExhibitRepositoryPathCreate => {
                 create_exhibit_repository_path(serde_json::from_value::<

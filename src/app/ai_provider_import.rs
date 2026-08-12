@@ -28,6 +28,7 @@ const MANAGED_VENDOR: &str = "HiMind";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
 const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 60;
 const VSCODE_ENROLLMENT_HANDOFF_FILE: &str = "vscode-enrollment-v2.json";
+const VSCODE_IMPORT_STATUS_FILE: &str = "vscode-import-status.json";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct VSCodeEnrollmentCredential {
@@ -36,6 +37,7 @@ pub(crate) struct VSCodeEnrollmentCredential {
     pub model: String,
     pub models: Vec<String>,
     pub expires_at: u64,
+    pub import_status_path: String,
 }
 
 struct PendingVSCodeEnrollment {
@@ -72,6 +74,33 @@ pub(crate) struct AIProviderImportResult {
     pub client_detected: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct AIProviderImportStatus {
+    pub target: String,
+    pub state: String,
+    pub client_detected: bool,
+    pub detail: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub config_path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AIProviderImportStatusOverview {
+    pub targets: Vec<AIProviderImportStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AIProviderImportCancelResult {
+    pub ok: bool,
+    pub target: String,
+    pub status: String,
+    pub changed: bool,
+    pub client_detected: bool,
+    pub detail: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub backup_path: String,
+}
+
 pub(crate) fn import(
     options: &Options,
     expected_user_id: &str,
@@ -85,6 +114,28 @@ pub(crate) fn import(
     }
 }
 
+pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
+    AIProviderImportStatusOverview {
+        targets: vec![
+            vscode_import_status(options),
+            cc_switch_import_status(),
+            workbuddy_import_status(),
+        ],
+    }
+}
+
+pub(crate) fn cancel(
+    options: &Options,
+    target: &str,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    match target.trim() {
+        "vscode" => cancel_vscode(options),
+        "cc-switch" => cancel_cc_switch(),
+        "workbuddy" => cancel_workbuddy(),
+        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch 或 WorkBuddy".into()),
+    }
+}
+
 fn import_vscode(
     options: &Options,
     expected_user_id: &str,
@@ -93,7 +144,14 @@ fn import_vscode(
     let credential = fetch_client_credential(options, expected_user_id, "vscode-import")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
-    let code = create_vscode_enrollment(credential, preferred.clone(), models.clone())?;
+    let code = create_vscode_enrollment(
+        credential,
+        preferred.clone(),
+        models.clone(),
+        vscode_import_status_path(options)
+            .to_string_lossy()
+            .to_string(),
+    )?;
     let enrollment_url = build_vscode_enrollment_url(options.local_port, &code)?;
     write_vscode_enrollment_handoff(options, &code)?;
     launch_vscode(&vscode_cli, &enrollment_url)?;
@@ -134,6 +192,7 @@ fn create_vscode_enrollment(
     credential: AIClientCredential,
     preferred: String,
     models: Vec<String>,
+    import_status_path: String,
 ) -> Result<String, Box<dyn Error>> {
     let code: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -148,6 +207,7 @@ fn create_vscode_enrollment(
             model: preferred,
             models,
             expires_at: now.saturating_add(VSCODE_ENROLLMENT_TTL_SECONDS),
+            import_status_path,
         },
     };
     let enrollments = VSCODE_ENROLLMENTS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -248,6 +308,181 @@ fn import_workbuddy(
             .unwrap_or_default(),
         client_detected: workbuddy_executable_exists(),
     })
+}
+
+fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
+    let path = vscode_import_status_path(options);
+    let client_detected = locate_vscode_cli()
+        .and_then(|cli| installed_vscode_extension_version(&cli).ok().flatten())
+        .is_some();
+    let imported = path.is_file();
+    AIProviderImportStatus {
+        target: "vscode".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported {
+            "VS Code 已保存 HiMind AI 凭据".to_string()
+        } else if client_detected {
+            "已安装 HiMind AI 扩展，尚未检测到导入记录".to_string()
+        } else {
+            "未检测到 VS Code HiMind AI 扩展".to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn cc_switch_import_status() -> AIProviderImportStatus {
+    let path = cc_switch_database_path();
+    let client_detected =
+        cc_switch_protocol_registered() || running_cc_switch_executable().is_some();
+    let imported = path.is_file() && cc_switch_managed_provider_count(&path).unwrap_or(0) > 0;
+    AIProviderImportStatus {
+        target: "cc-switch".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported {
+            "检测到 CC Switch 中的 HiMind 供应商".to_string()
+        } else if client_detected {
+            "已检测到 CC Switch，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 CC Switch".to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn workbuddy_import_status() -> AIProviderImportStatus {
+    let path = workbuddy_models_path();
+    let imported = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .and_then(|root| root.get("models").and_then(Value::as_array).cloned())
+        .map(|models| models.iter().any(is_managed_workbuddy_model))
+        .unwrap_or(false);
+    let client_detected = workbuddy_executable_exists();
+    AIProviderImportStatus {
+        target: "workbuddy".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported {
+            "检测到 WorkBuddy 中的 HiMind 模型".to_string()
+        } else if client_detected {
+            "已检测到 WorkBuddy，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 WorkBuddy".to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn cancel_vscode(options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let path = vscode_import_status_path(options);
+    let client_detected = locate_vscode_cli().is_some();
+    if !path.is_file() {
+        return Ok(AIProviderImportCancelResult {
+            ok: true,
+            target: "vscode".to_string(),
+            status: "not_imported".to_string(),
+            changed: false,
+            client_detected,
+            detail: "VS Code 当前没有 HiMind 导入记录".to_string(),
+            backup_path: String::new(),
+        });
+    }
+    let cli = locate_vscode_cli().ok_or("未检测到 VS Code，无法取消导入")?;
+    launch_vscode(&cli, "vscode://himind.himind-ai/disconnect")?;
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "vscode".to_string(),
+        status: "cancellation_opened".to_string(),
+        changed: true,
+        client_detected: true,
+        detail: "已通知 VS Code 扩展清除 HiMind 凭据".to_string(),
+        backup_path: String::new(),
+    })
+}
+
+fn cancel_workbuddy() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let path = workbuddy_models_path();
+    let original = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let (updated, removed) = remove_workbuddy_models(&original)?;
+    let backup = if removed > 0 {
+        backup_and_write(&path, updated.as_bytes())?
+    } else {
+        None
+    };
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "workbuddy".to_string(),
+        status: if removed > 0 {
+            "cancelled"
+        } else {
+            "not_imported"
+        }
+        .to_string(),
+        changed: removed > 0,
+        client_detected: workbuddy_executable_exists(),
+        detail: if removed > 0 {
+            format!("已移除 {removed} 个 HiMind 模型")
+        } else {
+            "WorkBuddy 当前没有 HiMind 模型".to_string()
+        },
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+fn remove_workbuddy_models(content: &str) -> Result<(String, usize), Box<dyn Error>> {
+    if content.trim().is_empty() {
+        return Ok((String::new(), 0));
+    }
+    let mut root = serde_json::from_str::<Value>(content)
+        .map_err(|_| "WorkBuddy models.json 格式无效，已停止取消导入且未覆盖原文件")?;
+    let object = root
+        .as_object_mut()
+        .ok_or("WorkBuddy models.json 根节点必须是 JSON 对象")?;
+    let Some(models_value) = object.get_mut("models") else {
+        return Ok((content.to_string(), 0));
+    };
+    let models = models_value
+        .as_array_mut()
+        .ok_or_else(|| "WorkBuddy models.json 的 models 必须是数组".to_string())?;
+    let mut removed_ids = HashSet::new();
+    let mut removed_count = 0usize;
+    models.retain(|item| {
+        if is_managed_workbuddy_model(item) {
+            removed_count += 1;
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                removed_ids.insert(id.to_string());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(available) = object
+        .get_mut("availableModels")
+        .and_then(Value::as_array_mut)
+    {
+        available.retain(|item| {
+            item.as_str()
+                .map(|id| !removed_ids.contains(id))
+                .unwrap_or(true)
+        });
+    }
+    let removed = removed_count;
+    if removed == 0 {
+        return Ok((content.to_string(), 0));
+    }
+    Ok((
+        format!("{}\n", serde_json::to_string_pretty(&root)?),
+        removed,
+    ))
 }
 
 fn preferred_model(credential: &AIClientCredential) -> Result<String, Box<dyn Error>> {
@@ -540,6 +775,109 @@ fn workbuddy_models_path_in(home: &Path) -> PathBuf {
     // WorkBuddy Desktop uses its own runtime directory. `.codebuddy` belongs to
     // the standalone CodeBuddy CLI and is not observed by the desktop client.
     home.join(".workbuddy").join("models.json")
+}
+
+fn vscode_import_status_path(options: &Options) -> PathBuf {
+    options
+        .state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(VSCODE_IMPORT_STATUS_FILE)
+}
+
+fn cc_switch_database_path() -> PathBuf {
+    if let Some(path) = env::var_os("HIMIND_CC_SWITCH_DATABASE") {
+        return PathBuf::from(path);
+    }
+    user_home().join(".cc-switch").join("cc-switch.db")
+}
+
+fn cc_switch_managed_provider_count(path: &Path) -> Result<usize, Box<dyn Error>> {
+    let connection = Connection::open(path)?;
+    let has_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_table {
+        return Ok(0);
+    }
+    let count: usize = connection.query_row(
+        "SELECT COUNT(*) FROM providers WHERE app_type = 'codex' AND name = 'HiMind' AND id LIKE 'himind-%'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+fn cancel_cc_switch() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let path = cc_switch_database_path();
+    let client_detected =
+        cc_switch_protocol_registered() || running_cc_switch_executable().is_some();
+    if !path.is_file() {
+        return Ok(AIProviderImportCancelResult {
+            ok: true,
+            target: "cc-switch".to_string(),
+            status: "not_imported".to_string(),
+            changed: false,
+            client_detected,
+            detail: "CC Switch 当前没有 HiMind 导入记录".to_string(),
+            backup_path: String::new(),
+        });
+    }
+    let count = cc_switch_managed_provider_count(&path)?;
+    if count == 0 {
+        return Ok(AIProviderImportCancelResult {
+            ok: true,
+            target: "cc-switch".to_string(),
+            status: "not_imported".to_string(),
+            changed: false,
+            client_detected,
+            detail: "CC Switch 当前没有 HiMind 导入记录".to_string(),
+            backup_path: String::new(),
+        });
+    }
+    let connection = Connection::open(&path)?;
+    let backup = backup_sqlite_database(&connection, &path)?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "DELETE FROM provider_endpoints WHERE app_type = 'codex' AND provider_id IN (SELECT id FROM providers WHERE app_type = 'codex' AND name = 'HiMind' AND id LIKE 'himind-%')",
+        [],
+    )?;
+    let removed = transaction.execute(
+        "DELETE FROM providers WHERE app_type = 'codex' AND name = 'HiMind' AND id LIKE 'himind-%'",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "cc-switch".to_string(),
+        status: "cancelled".to_string(),
+        changed: removed > 0,
+        client_detected,
+        detail: format!("已从 CC Switch 移除 {removed} 个 HiMind 供应商"),
+        backup_path: backup.to_string_lossy().to_string(),
+    })
+}
+
+fn backup_sqlite_database(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let file_name = database_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cc-switch.db");
+    let backup_path = database_path.with_file_name(format!(
+        "{file_name}.himind-backup-{}.bak",
+        unix_now_millis()
+    ));
+    let mut destination = Connection::open(&backup_path)?;
+    let backup = Backup::new(connection, &mut destination)?;
+    backup.run_to_completion(8, Duration::from_millis(25), None)?;
+    drop(backup);
+    destination.close().map_err(|(_, error)| error)?;
+    Ok(backup_path)
 }
 
 fn user_home() -> PathBuf {
@@ -878,7 +1216,7 @@ mod tests {
         build_cc_switch_deep_link, build_vscode_enrollment_url, bundled_vscode_vsix_candidates,
         chat_completions_url, compare_extension_versions, consume_vscode_enrollment,
         create_vscode_enrollment, legacy_workbuddy_model_id, merge_workbuddy_models,
-        migrate_workbuddy_sessions, parse_vscode_extension_version,
+        migrate_workbuddy_sessions, parse_vscode_extension_version, remove_workbuddy_models,
         vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
         AIClientCredential,
     };
@@ -943,6 +1281,7 @@ mod tests {
             credential(&["glm-5.1", "deepseek-v4-flash"]),
             "glm-5.1".to_string(),
             vec!["glm-5.1".to_string(), "deepseek-v4-flash".to_string()],
+            r"C:\HiMindAgent\profiles\development\data\vscode-import-status.json".to_string(),
         )
         .unwrap();
         let enrollment_url = build_vscode_enrollment_url(18181, &code).unwrap();
@@ -956,6 +1295,10 @@ mod tests {
         assert_eq!(exchanged.api_key, "test-secret-key");
         assert_eq!(exchanged.model, "glm-5.1");
         assert_eq!(exchanged.models.len(), 2);
+        assert_eq!(
+            exchanged.import_status_path,
+            r"C:\HiMindAgent\profiles\development\data\vscode-import-status.json"
+        );
         assert!(consume_vscode_enrollment(&code).is_err());
     }
 
@@ -1108,6 +1451,25 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["id"] == "gpt-4.1" && item["name"] == "HiMind"));
+    }
+
+    #[test]
+    fn removes_only_himind_workbuddy_models_and_available_ids() {
+        let source = r#"{
+          "models": [
+            {"id":"personal","vendor":"Other","apiKey":"keep"},
+            {"id":"gpt-4.1","vendor":"HiMind","apiKey":"remove"}
+          ],
+          "availableModels": ["personal", "gpt-4.1"],
+          "theme": "dark"
+        }"#;
+        let (updated, removed) = remove_workbuddy_models(source).unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(root["theme"], "dark");
+        assert_eq!(root["models"].as_array().unwrap().len(), 1);
+        assert_eq!(root["models"][0]["vendor"], "Other");
+        assert_eq!(root["availableModels"], serde_json::json!(["personal"]));
     }
 
     #[test]

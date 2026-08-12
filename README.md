@@ -30,6 +30,8 @@ cargo build --release
 11. `GET /plugins`：扫描 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/` 并返回本机插件 Registry 状态。
 12. `GET /plugins/manifest?plugin_id=`：返回指定插件的 Manifest、能力和权限摘要。
 13. `POST /plugins/install|update|uninstall|enable|disable`：已预留本地接口，当前在 Distribution 策略与制品校验接入前返回 `not_implemented`。
+14. `GET /ai-provider-import/status`：读取 VS Code、CC Switch 和 WorkBuddy 的 HiMind AI 导入状态。
+15. `POST /ai-provider-import/cancel`：取消指定客户端的 HiMind AI 导入；WorkBuddy 和 CC Switch 会在变更前创建备份，VS Code 由官方扩展清除 SecretStorage 凭据。
 
 Agent 主窗口已提供“本机插件”页：左侧选择当前设备已安装插件，右侧查看该插件的本机状态、错误、功能页面、权限和已注册能力，并可打开独立插件窗口、创建桌面快捷方式或打开插件目录；页面通过 Tauri 命令直接读取本机注册表和 Gateway，避免主窗口 WebView 再 fetch 自身 `127.0.0.1` 服务。安装、升级、启停、卸载、回滚和版本策略统一由 Dashboard 组织控制面负责，不在 Agent 主窗口重复提供占位入口。
 

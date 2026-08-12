@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type LoginState, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
+import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type LoginState, type OpenHandsRuntimeStatus, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
 import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
@@ -15,6 +15,10 @@ const SETTINGS_SECTIONS = [
 export function SettingsPage({
   settings,
   remoteExecutionSettings,
+  openHandsRuntimeStatus,
+  openHandsRuntimeBusy,
+  onRefreshOpenHandsRuntime,
+  onInstallOpenHandsRuntime,
   loginState,
   loginModalOpen,
   loginUsername,
@@ -51,6 +55,10 @@ export function SettingsPage({
 }: {
   settings: ApprovalSettings | null;
   remoteExecutionSettings: RemoteExecutionSettings | null;
+  openHandsRuntimeStatus: OpenHandsRuntimeStatus | null;
+  openHandsRuntimeBusy: boolean;
+  onRefreshOpenHandsRuntime: () => void;
+  onInstallOpenHandsRuntime: () => void;
   loginState: LoginState | null;
   loginModalOpen: boolean;
   loginUsername: string;
@@ -159,9 +167,41 @@ export function SettingsPage({
                 </SettingRow>
                 <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '自动模式会选择本机可用的 AI 工具' : '启用远程任务后生效'}>
                   <select aria-label="远程任务执行工具" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.default_provider} onChange={event => updateRemoteExecution({ default_provider: event.target.value as RemoteExecutionSettings['default_provider'] })}>
-                    <option value="auto">自动选择（推荐）</option><option value="personal.codex">Codex</option><option value="personal.github-copilot">GitHub Copilot</option><option value="himind.openhands">OpenHands</option>
+                    <option value="auto">自动选择（推荐）</option><option value="personal.codex">Codex</option><option value="personal.github-copilot">GitHub Copilot</option><option value="himind.openhands" disabled={openHandsRuntimeStatus?.status !== 'ready'}>OpenHands{openHandsRuntimeStatus?.status === 'ready' ? '' : '（未安装）'}</option>
                   </select>
                 </SettingRow>
+              </div>
+            </section>
+            <section className="card settings-section openhands-runtime-card">
+              <div className="card-header">
+                <span>OpenHands Runtime</span>
+                <Pill kind={openHandsRuntimeStatus?.status === 'ready' ? 'success' : openHandsRuntimeStatus ? 'warn' : 'neutral'}>
+                  {openHandsRuntimeStatus?.status === 'ready' ? '已安装' : openHandsRuntimeStatus ? '未安装' : '检测中'}
+                </Pill>
+              </div>
+              <div className="runtime-summary">
+                <div className="runtime-summary-main">
+                  <div>
+                    <strong>{openHandsRuntimeStatus?.version || 'OpenHands 可选运行时'}</strong>
+                    <span>{openHandsRuntimeStatus?.message || '正在检查本机 OpenHands、uv 与 Python 3.12。'}</span>
+                  </div>
+                  <div className="actions-row runtime-actions">
+                    <button className="btn" disabled={openHandsRuntimeBusy} onClick={onRefreshOpenHandsRuntime}>
+                      {openHandsRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重新检测
+                    </button>
+                    <button className="btn btn-primary" disabled={openHandsRuntimeBusy} onClick={onInstallOpenHandsRuntime}>
+                      {openHandsRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
+                      {openHandsRuntimeStatus?.status === 'ready' ? '修复安装' : '安装 OpenHands'}
+                    </button>
+                  </div>
+                </div>
+                <div className="runtime-facts">
+                  <div><span>uv</span><strong>{openHandsRuntimeStatus?.uv_available ? openHandsRuntimeStatus.uv_version : '未检测到'}</strong></div>
+                  <div><span>CLI 参数预检</span><strong>{openHandsRuntimeStatus?.cli_compatible ? '通过' : '未通过'}</strong></div>
+                  <div><span>Python 3.12</span><strong>{openHandsRuntimeStatus?.python_available ? openHandsRuntimeStatus.python_version : '未检测到（uv 会按需安装）'}</strong></div>
+                  <div><span>命令</span><code>{openHandsRuntimeStatus?.executable_path || 'openhands'}</code></div>
+                </div>
+                {openHandsRuntimeStatus && openHandsRuntimeStatus.status === 'error' ? <div className="runtime-prerequisite"><ShieldAlert size={16} /><span>{openHandsRuntimeStatus.message}</span></div> : null}
               </div>
             </section>
             <section className="card settings-section">

@@ -5,6 +5,8 @@ use std::thread;
 use std::time::Instant;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
+use crate::api::distribution::ExtensionDesiredState;
+use crate::api::types::AgentTaskHistoryItem;
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
     is_agent_auto_start_enabled, local_agent_executable_metadata, open_agent_install_directory,
@@ -176,6 +178,18 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
     let executable = local_agent_executable_metadata();
     let pending = state.approval_manager.list_pending();
     let login = local_login_status_json();
+    let current_task =
+        state
+            .options
+            .task_execution()
+            .map(|(task_id, task_type, execution_id, _)| {
+                json!({
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "execution_id": execution_id,
+                    "status": "running",
+                })
+            });
 
     Ok(json!({
         "status": "online",
@@ -194,6 +208,7 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
         "local_service_online": worker["local_service_online"],
         "local_service_error": worker["local_service_error"],
         "pending_approvals": pending.len(),
+        "current_task": current_task,
     }))
 }
 
@@ -332,6 +347,38 @@ pub(crate) fn save_remote_execution_settings(
         },
     );
     Ok(settings)
+}
+
+#[tauri::command]
+pub(crate) async fn get_openhands_runtime_status(
+    _state: State<'_, AgentState>,
+) -> Result<crate::runtime::openhands::OpenHandsRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(crate::runtime::openhands::status)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn install_openhands_runtime(
+    state: State<'_, AgentState>,
+) -> Result<crate::runtime::openhands::OpenHandsRuntimeStatus, String> {
+    let options = state.options.clone();
+    let client_instance_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("himind-agent-{}", crate::store::paths::profile_name()));
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::runtime::openhands::install(&options, &client_instance_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", "OpenHands Runtime 已完成安装或修复");
+    Ok(result)
 }
 
 #[tauri::command]
@@ -532,6 +579,62 @@ pub(crate) fn get_plugin_registry() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+pub(crate) fn get_extension_desired_state(
+    state: State<'_, AgentState>,
+) -> Result<ExtensionDesiredState, String> {
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let credential = state.options.agent_credential();
+    if agent_id.is_empty() || credential.trim().is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::distribution::extension_desired_state(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &credential,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_agent_task_history(
+    state: State<'_, AgentState>,
+    limit: Option<usize>,
+) -> Result<Vec<AgentTaskHistoryItem>, String> {
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let credential = state.options.agent_credential();
+    if agent_id.is_empty() || credential.trim().is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::client::list_task_history(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &credential,
+        limit.unwrap_or(50).clamp(1, 100),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn get_agent_capabilities(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::capability::types::CapabilityDescriptor>, String> {
@@ -568,6 +671,40 @@ pub(crate) fn get_organization_skill_catalog(
         .unwrap_or_default()
         .to_string();
     crate::app::skill_manager::catalog(&state.options, &agent_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn query_organization_skill_catalog(
+    q: String,
+    category: String,
+    page: usize,
+    page_size: usize,
+    state: State<'_, AgentState>,
+) -> Result<crate::api::distribution::SkillCatalogPage, String> {
+    let snapshot = local_worker_snapshot(&state.worker_status);
+    let agent_id = snapshot
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let credential = state.options.agent_credential();
+    if agent_id.is_empty() || credential.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::distribution::skill_catalog_page(
+        &client,
+        &state.dashboard_base,
+        agent_id,
+        &credential,
+        &q,
+        &category,
+        page.clamp(1, 10_000),
+        page_size.clamp(1, 100),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1255,6 +1392,40 @@ pub(crate) fn get_plugin_catalog(
         .map_err(|error| error.to_string())?;
     crate::api::distribution::plugin_catalog(&client, &state.dashboard_base, agent_id, &credential)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn query_plugin_catalog(
+    q: String,
+    category: String,
+    page: usize,
+    page_size: usize,
+    state: State<'_, AgentState>,
+) -> Result<crate::api::distribution::PluginCatalogPage, String> {
+    let snapshot = local_worker_snapshot(&state.worker_status);
+    let agent_id = snapshot
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let credential = state.options.agent_credential();
+    if agent_id.is_empty() || credential.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::distribution::plugin_catalog_page(
+        &client,
+        &state.dashboard_base,
+        agent_id,
+        &credential,
+        &q,
+        &category,
+        page.clamp(1, 10_000),
+        page_size.clamp(1, 100),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

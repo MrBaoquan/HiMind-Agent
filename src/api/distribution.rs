@@ -84,6 +84,70 @@ pub struct UpdateCheckResponse {
     pub release_notes: String,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeComponentUpdate {
+    #[serde(rename = "productId")]
+    pub product_id: String,
+    pub version: String,
+    #[serde(rename = "releaseName", default)]
+    pub release_name: String,
+    #[serde(rename = "releaseNotes", default)]
+    pub release_notes: String,
+    pub channel: String,
+    #[serde(rename = "artifactUrl")]
+    pub artifact_url: String,
+    #[serde(rename = "fileName")]
+    pub file_name: String,
+    #[serde(rename = "packageType")]
+    pub package_type: String,
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default)]
+    pub mandatory: bool,
+    #[serde(rename = "publishedAt", default)]
+    pub published_at: String,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(rename = "signatureKeyId", default)]
+    pub signature_key_id: String,
+    #[serde(rename = "signatureAlgorithm", default)]
+    pub signature_algorithm: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeComponentResolveResponse {
+    pub update: Option<RuntimeComponentUpdate>,
+}
+
+pub fn resolve_runtime_component(
+    client: &Client,
+    api_base: &str,
+    product_id: &str,
+    current_version: &str,
+    channel: &str,
+    platform: &str,
+    architecture: &str,
+    client_instance_id: &str,
+) -> Result<Option<RuntimeComponentUpdate>, Box<dyn Error>> {
+    let response = client
+        .post(format!(
+            "{api_base}/api/software-distribution/v1/runtime/resolve"
+        ))
+        .json(&json!({
+            "productId": product_id,
+            "currentVersion": current_version,
+            "channel": channel,
+            "platform": platform,
+            "architecture": architecture,
+            "clientInstanceId": client_instance_id,
+        }))
+        .send()?
+        .error_for_status()?
+        .json::<RuntimeComponentResolveResponse>()?;
+    Ok(response.update)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginCatalogItem {
     pub plugin_id: String,
@@ -285,6 +349,17 @@ pub struct PluginStatusReport<'a> {
 struct PluginCatalogResponse {
     items: Vec<PluginCatalogItem>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CatalogPage<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
+pub type PluginCatalogPage = CatalogPage<PluginCatalogItem>;
+pub type SkillCatalogPage = CatalogPage<SkillCatalogItem>;
 
 #[derive(Debug, Deserialize)]
 struct SkillCatalogResponse {
@@ -495,6 +570,30 @@ pub fn plugin_catalog(
         .items)
 }
 
+pub fn plugin_catalog_page(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    q: &str,
+    category: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<PluginCatalogPage, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/plugins/catalog"))
+        .query(&[
+            ("q", q.to_string()),
+            ("category", category.to_string()),
+            ("page", page.to_string()),
+            ("page_size", page_size.to_string()),
+        ])
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<PluginCatalogPage>()?)
+}
+
 pub fn plugin_versions(
     client: &Client,
     api_base: &str,
@@ -527,6 +626,30 @@ pub fn skill_catalog(
         .error_for_status()?
         .json::<SkillCatalogResponse>()?
         .items)
+}
+
+pub fn skill_catalog_page(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    q: &str,
+    category: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<SkillCatalogPage, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/skills/catalog"))
+        .query(&[
+            ("q", q.to_string()),
+            ("category", category.to_string()),
+            ("page", page.to_string()),
+            ("page_size", page_size.to_string()),
+        ])
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<SkillCatalogPage>()?)
 }
 
 pub fn skill_versions(

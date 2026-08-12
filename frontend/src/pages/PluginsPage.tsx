@@ -1,24 +1,27 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AppWindow, Blocks, Bot, CheckCircle2, Download, ExternalLink, FolderOpen, FlaskConical, LockKeyhole, MonitorUp, MoreHorizontal, PackagePlus, Play, RefreshCw, Search, Send, ShieldCheck, Unplug, X } from 'lucide-react';
-import type { AuthoringPluginDraft, CapabilityItem, DevelopmentInvocationResult, PluginCapability, PluginCatalogItem, PluginInstallPlan, PluginItem, PluginJsonSchema, PluginRegistry, PluginSubmissionStatus } from '../services/agentApi';
+import { AppWindow, Blocks, Bot, Download, ExternalLink, LockKeyhole, MonitorUp, MoreHorizontal, RefreshCw, Search, ShieldCheck, X } from 'lucide-react';
+import type { CapabilityItem, CatalogPage, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, PluginCatalogItem, PluginInstallPlan, PluginItem, PluginRegistry } from '../services/agentApi';
 import { EmptyState, PageHeader, Pill, Tags } from '../components/Common';
 import { FUNCTIONAL_CATEGORIES, categorySearchText, functionalCategoryLabels, functionalCategoryMatches } from '../data/categoryCatalog';
+import { ManagedCapabilitiesPanel } from './ManagedCapabilitiesPage';
 
 const governanceLabels: Record<string, string> = {
   required: '系统内置',
-  managed: '组织提供',
-  optional: '自行安装',
-  blocked: '组织已禁止',
+  managed: '组织管理',
+  optional: '可选插件',
+  blocked: '不可安装',
 };
 
-export function PluginsPage({ loading, registry, catalog, capabilities, drafts, submissions, busyAction, onRefresh, onLoadVersions, onPlanInstall, onInstall, onUninstall, onRollback, onSetEnabled, onOpenDirectory, onRegisterDevelopment, onImportCandidate, onCreateRevision, onTestDraft, onConfirmDraft, onSubmitDraft, onUnregisterDevelopment, onInvokeDevelopment, onOpenView, onCreateShortcut }: {
+export function PluginsPage({ loading, registry, catalog, desired, desiredLoading, desiredError, skillStatus, capabilities, onQueryCatalog, onRefresh, onLoadVersions, onPlanInstall, onInstall, onUninstall, onRollback, onSetEnabled, onOpenView, onCreateShortcut }: {
   loading: boolean;
   registry: PluginRegistry | null;
   catalog: PluginCatalogItem[];
+  desired: ExtensionDesiredState | null;
+  desiredLoading: boolean;
+  desiredError: string | null;
+  skillStatus: CodexSkillStatusResponse | null;
   capabilities: CapabilityItem[];
-  drafts: AuthoringPluginDraft[];
-  submissions: PluginSubmissionStatus[];
-  busyAction: string | null;
+  onQueryCatalog: (q: string, category: string, page?: number, pageSize?: number) => Promise<CatalogPage<PluginCatalogItem>>;
   onLoadVersions: (pluginId: string) => Promise<PluginCatalogItem[]>;
   onPlanInstall: (pluginId: string, version?: string) => Promise<PluginInstallPlan>;
   onRefresh: () => void;
@@ -26,32 +29,36 @@ export function PluginsPage({ loading, registry, catalog, capabilities, drafts, 
   onUninstall: (pluginId: string) => void;
   onRollback: (pluginId: string) => void;
   onSetEnabled: (pluginId: string, enabled: boolean) => void;
-  onOpenDirectory: () => void;
-  onRegisterDevelopment: () => void;
-  onImportCandidate: (revisionOfVersion?: string, parentSubmissionId?: string) => void;
-  onCreateRevision: (pluginId: string, version: string) => void;
-  onTestDraft: (pluginId: string, version: string) => void;
-  onConfirmDraft: (pluginId: string, version: string) => void;
-  onSubmitDraft: (pluginId: string, version: string) => void;
-  onUnregisterDevelopment: (pluginId: string) => void;
-  onInvokeDevelopment: (pluginId: string, capabilityId: string, input: unknown) => Promise<DevelopmentInvocationResult>;
   onOpenView: (pluginId: string, viewId: string) => void;
   onCreateShortcut: (pluginId: string, viewId: string, title: string) => void;
 }) {
   const pluginItems = registry?.items || [];
+  const userPluginItems = useMemo(() => pluginItems.filter(item => !isManagedPlugin(item, desired)), [desired, pluginItems]);
+  const systemPluginCount = useMemo(() => {
+    const ids = new Set((desired?.items || []).filter(item => item.asset_kind === 'plugin' && isManagedPolicy(item)).map(item => item.asset_key));
+    pluginItems.filter(item => ['required', 'managed', 'blocked'].includes(item.governance || '')).forEach(item => ids.add(item.id));
+    return ids.size;
+  }, [desired, pluginItems]);
   const [selectedId, setSelectedId] = useState('');
   const [selectedMarketId, setSelectedMarketId] = useState('');
-  const [view, setView] = useState<'market' | 'installed' | 'mine'>('market');
-  const [selectedDraftId, setSelectedDraftId] = useState('');
+  const [view, setView] = useState<'market' | 'installed' | 'system'>(() => {
+    try {
+      const stored = window.localStorage.getItem('himind-agent.plugins-view');
+      return stored === 'market' || stored === 'system' ? stored : 'installed';
+    } catch { return 'installed'; }
+  });
   const [query, setQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
-  const [visibleLimit, setVisibleLimit] = useState(50);
+  const [marketCatalog, setMarketCatalog] = useState<PluginCatalogItem[]>(catalog);
+  const [marketTotal, setMarketTotal] = useState(catalog.length);
+  const [marketPage, setMarketPage] = useState(1);
+  const [marketLoading, setMarketLoading] = useState(false);
   const [installPlan, setInstallPlan] = useState<PluginInstallPlan | null>(null);
   const [planError, setPlanError] = useState('');
   const [planningId, setPlanningId] = useState('');
   const selectedPlugin = useMemo(
-    () => pluginItems.find(item => item.id === selectedId) || pluginItems[0] || null,
-    [pluginItems, selectedId],
+    () => userPluginItems.find(item => item.id === selectedId) || userPluginItems[0] || null,
+    [selectedId, userPluginItems],
   );
   const selectedCapabilities = useMemo(
     () => selectedPlugin ? capabilities.filter(item => item.source === `plugin:${selectedPlugin.id}` || selectedPlugin.capabilities?.some(capability => capability.id === item.id)) : [],
@@ -59,22 +66,54 @@ export function PluginsPage({ loading, registry, catalog, capabilities, drafts, 
   );
   const installedById = new Map(pluginItems.map(item => [item.id, item]));
   const categoryCounts = useMemo(() => new Map(FUNCTIONAL_CATEGORIES.map(category => [category.id, catalog.filter(item => functionalCategoryMatches(item.categories, category.id)).length])), [catalog]);
-  const filteredCatalog = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
-    return catalog.filter(item => {
-      if (normalized && !`${item.name} ${item.plugin_id} ${item.description} ${item.author_name || ''} ${categorySearchText(item.categories)} ${(item.capability_ids || []).join(' ')}`.toLowerCase().includes(normalized)) return false;
-      if (categoryFilter !== 'all' && !functionalCategoryMatches(item.categories, categoryFilter)) return false;
-      return true;
-    });
-  }, [catalog, categoryFilter, query]);
-  const visibleCatalog = filteredCatalog.slice(0, visibleLimit);
+  const filteredCatalog = marketCatalog;
+  const visibleCatalog = filteredCatalog;
   const selectedMarket = filteredCatalog.find(item => item.plugin_id === selectedMarketId) || filteredCatalog[0] || null;
-  const remoteOnlySubmissions = useMemo(() => submissions.filter(submission => !drafts.some(draft => draft.dashboard_submission_id === submission.id || (draft.manifest.id === submission.product_key && draft.manifest.version === submission.version))), [drafts, submissions]);
-  const selectedDraft = drafts.find(item => `${item.manifest.id}@${item.manifest.version}` === selectedDraftId) || (!selectedDraftId.startsWith('remote:') ? drafts[0] : null) || null;
-  const selectedRemoteSubmission = remoteOnlySubmissions.find(item => `remote:${item.id}` === selectedDraftId) || (!selectedDraft ? remoteOnlySubmissions[0] : null) || null;
-  const creationCount = drafts.length + remoteOnlySubmissions.length;
 
-  useEffect(() => { setVisibleLimit(50); }, [query, categoryFilter]);
+  useEffect(() => {
+    if (view !== 'market') return;
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      setMarketLoading(true);
+      try {
+        const result = await onQueryCatalog(query.trim(), categoryFilter === 'all' ? '' : categoryFilter, 1, 50);
+        if (!active) return;
+        setMarketCatalog(result.items || []);
+        setMarketTotal(result.total ?? result.items.length);
+        setMarketPage(result.page || 1);
+      } catch {
+        if (!active) return;
+        const normalized = query.trim().toLowerCase();
+        const fallback = catalog.filter(item => {
+          if (normalized && !`${item.name} ${item.plugin_id} ${item.description} ${item.author_name || ''} ${categorySearchText(item.categories)} ${(item.capability_ids || []).join(' ')}`.toLowerCase().includes(normalized)) return false;
+          if (categoryFilter !== 'all' && !functionalCategoryMatches(item.categories, categoryFilter)) return false;
+          return true;
+        });
+        setMarketCatalog(fallback);
+        setMarketTotal(fallback.length);
+        setMarketPage(1);
+      } finally {
+        if (active) setMarketLoading(false);
+      }
+    }, 180);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [catalog, categoryFilter, onQueryCatalog, query, view]);
+
+  async function loadMoreMarket() {
+    if (marketLoading || marketCatalog.length >= marketTotal) return;
+    setMarketLoading(true);
+    try {
+      const result = await onQueryCatalog(query.trim(), categoryFilter === 'all' ? '' : categoryFilter, marketPage + 1, 50);
+      setMarketCatalog(current => [...current, ...(result.items || [])]);
+      setMarketTotal(result.total ?? marketTotal);
+      setMarketPage(result.page || marketPage + 1);
+    } catch {
+      // Keep the already loaded page visible when the next page is unavailable.
+    } finally {
+      setMarketLoading(false);
+    }
+  }
+  useEffect(() => { try { window.localStorage.setItem('himind-agent.plugins-view', view); } catch { /* storage is optional */ } }, [view]);
 
   async function openInstallPlan(pluginId: string, version?: string) {
     setPlanningId(pluginId);
@@ -89,32 +128,32 @@ export function PluginsPage({ loading, registry, catalog, capabilities, drafts, 
   return (
     <div className="plugin-page">
       <PageHeader title="插件" description="安装和管理本机功能" actions={<button className="btn btn-icon" title="刷新插件状态" aria-label="刷新插件状态" onClick={onRefresh}><RefreshCw size={16} /></button>} />
-      <div className="plugin-toolbar"><div className="plugin-tabs" role="tablist" aria-label="插件视图"><button role="tab" aria-selected={view === 'market'} className={view === 'market' ? 'active' : ''} onClick={() => setView('market')}>市场 <span>{catalog.length}</span></button><button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{pluginItems.length}</span></button></div><div className="plugin-toolbar-meta"><span className={`status-dot ${registry?.registry_ready ? 'success' : 'danger'}`} /><span>{registry?.registry_ready ? '插件可用' : '插件需要处理'}</span></div></div>
+      <div className="plugin-toolbar"><div className="plugin-tabs" role="tablist" aria-label="插件视图"><button role="tab" aria-selected={view === 'market'} className={view === 'market' ? 'active' : ''} onClick={() => setView('market')}>市场 <span>{catalog.length}</span></button><button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{userPluginItems.length}</span></button><button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>系统内置 <span>{systemPluginCount}</span></button></div><div className="plugin-toolbar-meta"><span className={`status-dot ${registry?.registry_ready ? 'success' : 'danger'}`} /><span>{registry?.registry_ready ? '插件可用' : '插件需要处理'}</span></div></div>
       {view === 'market' ? <section className="plugin-catalog-workspace">
         <aside className="plugin-catalog-browser">
           <div className="plugin-catalog-tools"><label className="plugin-search"><Search size={15} /><span className="sr-only">搜索插件</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索名称或用途" /></label></div>
           <div className="market-category-block"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">插件功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部插件（{catalog.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="插件功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部插件<span>{catalog.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div>
-          <div className="plugin-catalog-result"><span>{filteredCatalog.length} 个结果</span></div>
-          <div className="plugin-catalog-list">{visibleCatalog.map(item => { const installed = installedById.get(item.plugin_id); const upgrade = installed?.version ? compareSemanticVersions(item.version, installed.version) > 0 : false; return <button key={item.plugin_id} className={`plugin-catalog-item ${selectedMarket?.plugin_id === item.plugin_id ? 'selected' : ''}`} onClick={() => setSelectedMarketId(item.plugin_id)}><span className="plugin-card-mark">{item.name.slice(0, 1)}</span><span><strong>{item.name}</strong><small>{item.description || catalogSourceLabel(item.source)}</small><small className="catalog-item-author">作者：{item.author_name || '未知作者'}</small></span><span className={`skill-state-label ${upgrade ? 'warn' : installed ? 'success' : 'neutral'}`}>{upgrade ? '可更新' : installed ? '已安装' : catalogAssignmentLabel(item)}</span></button>; })}{visibleCatalog.length < filteredCatalog.length ? <button className="plugin-load-more" onClick={() => setVisibleLimit(current => current + 50)}>加载更多</button> : null}{!visibleCatalog.length ? <EmptyState icon={Search} title="没有匹配的插件" text={catalog.length ? '调整关键词或筛选条件。' : '插件库暂无内容。'} /> : null}</div>
+          <div className="plugin-catalog-result"><span>{marketTotal} 个结果</span>{marketLoading ? <span className="spinner" /> : null}</div>
+          <div className="plugin-catalog-list">{visibleCatalog.map(item => { const installed = installedById.get(item.plugin_id); const upgrade = installed?.version ? compareSemanticVersions(item.version, installed.version) > 0 : false; return <button key={item.plugin_id} className={`plugin-catalog-item ${selectedMarket?.plugin_id === item.plugin_id ? 'selected' : ''}`} onClick={() => setSelectedMarketId(item.plugin_id)}><span className="plugin-card-mark">{item.name.slice(0, 1)}</span><span><strong>{item.name}</strong><small>{item.description || catalogSourceLabel(item.source)}</small><small className="catalog-item-author">作者：{item.author_name || '未知作者'}</small></span><span className={`skill-state-label ${upgrade ? 'warn' : installed ? 'success' : 'neutral'}`}>{upgrade ? '可更新' : installed ? '已安装' : catalogAssignmentLabel(item)}</span></button>; })}{visibleCatalog.length < marketTotal ? <button className="plugin-load-more" disabled={marketLoading} onClick={() => void loadMoreMarket()}>{marketLoading ? '正在加载' : '加载更多'}</button> : null}{!visibleCatalog.length && !marketLoading ? <EmptyState icon={Search} title="没有匹配的插件" text={catalog.length ? '调整关键词或筛选条件。' : '插件库暂无内容。'} /> : null}</div>
         </aside>
         <main className="plugin-catalog-detail">{selectedMarket ? <MarketPluginDetail item={selectedMarket} installed={installedById.get(selectedMarket.plugin_id)} catalog={catalog} planning={planningId === selectedMarket.plugin_id} onLoadVersions={onLoadVersions} onPlan={(version) => void openInstallPlan(selectedMarket.plugin_id, version)} /> : <EmptyState icon={Blocks} title="选择一个插件" text="查看功能、依赖和版本。" />}</main>
-      </section> : view === 'mine' ? <PluginDraftWorkspace drafts={drafts} selected={selectedDraft} remoteSubmissions={remoteOnlySubmissions} selectedRemote={selectedRemoteSubmission} submissions={submissions} busyAction={busyAction} onSelect={setSelectedDraftId} onImportCandidate={onImportCandidate} onCreateRevision={onCreateRevision} onTest={onTestDraft} onConfirm={onConfirmDraft} onSubmit={onSubmitDraft} /> : <>
+      </section> : view === 'system' ? <ManagedCapabilitiesPanel assetKind="plugin" desired={desired} loading={desiredLoading} error={desiredError} registry={registry} skillStatus={skillStatus} /> : <>
       <div className="plugin-workspace">
         <aside className="plugin-list" aria-label="本机插件列表">
-          <div className="plugin-list-header"><strong>已安装</strong><span className="section-count">{pluginItems.length}</span></div>
+          <div className="plugin-list-header"><strong>已安装</strong><span className="section-count">{userPluginItems.length}</span></div>
           <div className="plugin-list-body">
-            {pluginItems.map(item => (
+            {userPluginItems.map(item => (
               <button key={item.id} type="button" className={`plugin-list-item ${selectedPlugin?.id === item.id ? 'selected' : ''}`} onClick={() => setSelectedId(item.id)}>
                 <span className={`status-dot ${item.status === 'failed' ? 'danger' : item.enabled ? 'success' : ''}`} />
                 <span><strong>{item.name || item.id}</strong><small>作者：{item.author_name || catalog.find(candidate => candidate.plugin_id === item.id)?.author_name || '未知作者'}</small><small>{item.circuit_open || item.status === 'failed' ? '需要处理' : item.enabled ? '已启用' : '已停用'}</small></span>
                 <small>v{item.version || '--'}</small>
               </button>
             ))}
-            {pluginItems.length === 0 ? <EmptyState icon={Blocks} title="暂无本机插件" text="插件可从 HiMind 工作台下发，也可以安装到这台电脑。" /> : null}
+            {userPluginItems.length === 0 ? <EmptyState icon={Blocks} title="暂无本机插件" text="系统内置和组织管理插件已移到“系统内置”分类。" /> : null}
           </div>
         </aside>
       <main className="plugin-detail">
-          {selectedPlugin ? <PluginDetail key={selectedPlugin.id} item={selectedPlugin} capabilities={selectedCapabilities} catalog={catalog} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selectedPlugin.id, version)} onUninstall={onUninstall} onRollback={onRollback} onSetEnabled={onSetEnabled} onUnregisterDevelopment={onUnregisterDevelopment} onInvokeDevelopment={onInvokeDevelopment} onOpenView={onOpenView} onCreateShortcut={onCreateShortcut} /> : <EmptyState icon={Blocks} title="选择插件" text="查看功能、依赖和版本。" />}
+          {selectedPlugin ? <PluginDetail key={selectedPlugin.id} item={selectedPlugin} capabilities={selectedCapabilities} catalog={catalog} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selectedPlugin.id, version)} onUninstall={onUninstall} onRollback={onRollback} onSetEnabled={onSetEnabled} onOpenView={onOpenView} onCreateShortcut={onCreateShortcut} /> : <EmptyState icon={Blocks} title="选择插件" text="查看功能、依赖和版本。" />}
         </main>
       </div></>}
       {installPlan || planError ? <PluginInstallPlanDialog plan={installPlan} error={planError} currentVersion={installPlan ? installedById.get(installPlan.plugin.plugin_id)?.version : undefined} onClose={() => { setInstallPlan(null); setPlanError(''); }} onInstall={() => { if (installPlan) onInstall(installPlan.plugin.plugin_id, installPlan.plugin.version); setInstallPlan(null); }} /> : null}
@@ -122,82 +161,11 @@ export function PluginsPage({ loading, registry, catalog, capabilities, drafts, 
   );
 }
 
-function PluginDraftWorkspace({ drafts, selected, remoteSubmissions, selectedRemote, submissions, busyAction, onSelect, onImportCandidate, onCreateRevision, onTest, onConfirm, onSubmit }: {
-  drafts: AuthoringPluginDraft[];
-  selected: AuthoringPluginDraft | null;
-  remoteSubmissions: PluginSubmissionStatus[];
-  selectedRemote: PluginSubmissionStatus | null;
-  submissions: PluginSubmissionStatus[];
-  busyAction: string | null;
-  onSelect: (id: string) => void;
-  onImportCandidate: (revisionOfVersion?: string, parentSubmissionId?: string) => void;
-  onCreateRevision: (pluginId: string, version: string) => void;
-  onTest: (pluginId: string, version: string) => void;
-  onConfirm: (pluginId: string, version: string) => void;
-  onSubmit: (pluginId: string, version: string) => void;
-}) {
-  if (!drafts.length && !remoteSubmissions.length) return <div className="plugin-workspace"><EmptyState icon={PackagePlus} title="还没有插件候选" text="AI 完成打包后候选会自动出现在这里，也可以导入本机 .hmpkg。" /></div>;
-  if (!selected && selectedRemote) return <div className="plugin-workspace"><PluginCreationList drafts={drafts} remoteSubmissions={remoteSubmissions} selectedKey={`remote:${selectedRemote.id}`} submissions={submissions} onSelect={onSelect} /><PluginRemoteSubmissionDetail item={selectedRemote} onImportCandidate={onImportCandidate} /></div>;
-  if (!selected) return null;
-  const submission = submissions.find(item => item.id === selected.dashboard_submission_id || (item.product_key === selected.manifest.id && item.version === selected.manifest.version));
-  const state = pluginDraftState(selected, submission);
-  const canRevise = !selected.submitted_at;
-  const busy = Boolean(busyAction?.endsWith(selected.manifest.id));
-  return <div className="plugin-workspace">
-    <PluginCreationList drafts={drafts} remoteSubmissions={remoteSubmissions} selectedKey={`${selected.manifest.id}@${selected.manifest.version}`} submissions={submissions} onSelect={onSelect} />
-    <main className="plugin-detail">
-      <header className="plugin-detail-header"><div><div className="plugin-title-line"><h3>{selected.manifest.name}</h3><Pill kind={state.tone}>{state.label}</Pill><Pill kind="warn">开发候选</Pill></div><small>作者：{selected.manifest.author || '马宝全'}</small></div><div className="plugin-installed-actions">
-        {canRevise ? <button className="btn btn-primary" disabled={busy} onClick={() => onTest(selected.manifest.id, selected.manifest.version)}><Play className={busyAction === `test:${selected.manifest.id}` ? 'spin' : ''} size={15} />部署测试</button> : null}
-        {!canRevise ? <button className="btn btn-primary" disabled={busy} onClick={() => onCreateRevision(selected.manifest.id, selected.manifest.version)}><PackagePlus size={15} />创建新版本</button> : null}
-        {selected.tested_at && !selected.confirmed_at && canRevise ? <button className="btn" disabled={busy} onClick={() => onConfirm(selected.manifest.id, selected.manifest.version)}><CheckCircle2 size={15} />确认通过</button> : null}
-        {selected.confirmed_at && canRevise ? <button className="btn btn-primary" disabled={busy} onClick={() => onSubmit(selected.manifest.id, selected.manifest.version)}><Send size={15} />提交审核</button> : null}
-      </div></header>
-      <p className="plugin-product-description">{selected.manifest.description || '暂无用途说明。'}</p>
-      {submission?.review_note ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>审核意见</strong><span>{submission.review_note}</span></div></div> : null}
-      <div className="skill-authoring-pipeline"><DraftStage complete label="候选已保存" /><DraftStage complete={Boolean(selected.development_path)} label="运行时已加载" /><DraftStage complete={Boolean(selected.tested_at)} label="部署测试完成" /><DraftStage complete={Boolean(selected.confirmed_at)} label="测试已确认" /><DraftStage complete={Boolean(selected.submitted_at)} label="已提交审核" /></div>
-      <div className="plugin-meta-grid"><div><span>版本</span><strong>v{selected.manifest.version}</strong></div><div><span>Capability</span><strong>{selected.manifest.capabilities?.length || 0}</strong></div><div><span>测试时间</span><strong>{formatDraftTime(selected.tested_at)}</strong></div><div><span>权限</span><strong>{selected.manifest.permissions?.length || 0}</strong></div></div>
-      <section className="plugin-detail-section"><div className="plugin-section-heading"><div><h4>版本更新说明</h4></div><span className="section-count">v{selected.manifest.version}</span></div><p>{selected.manifest.release_notes || '导入候选前需要在 plugin.json 中补充本版本更新说明。'}</p></section>
-      <section className="plugin-detail-section"><div className="plugin-section-heading"><div><h4>AI 能力</h4></div><span className="section-count">{selected.manifest.capabilities?.length || 0}</span></div><div className="plugin-capability-list">{(selected.manifest.capabilities || []).map(capability => <div key={capability.id}><Bot size={16} /><span><strong>{capability.id}</strong><small>{capability.description || '未提供说明'}</small></span><Pill kind={capability.risk_level === 'read_only' ? 'success' : 'warn'}>{capability.risk_level || '未声明'}</Pill></div>)}</div></section>
-      <details className="plugin-technical-panel"><summary>工作区与版本候选</summary><div className="plugin-technical-grid"><div><span>来源</span><strong>{selected.revision_of ? `基于 v${selected.revision_of}` : '本地候选'}</strong></div><div><span>状态</span><strong>{selected.submitted_at ? '版本已冻结' : '工作区可编辑'}</strong></div><div className="wide"><span>工作区</span><code>{selected.workspace_path || selected.development_path || '未关联'}</code></div><div className="wide"><span>SHA-256</span><code>{selected.candidate_sha256}</code></div><div className="wide"><span>候选包</span><code>{selected.candidate_path}</code></div><div className="wide"><span>开发运行目录</span><code>{selected.development_path || '尚未部署测试'}</code></div></div></details>
-    </main>
-  </div>;
-}
-
-function PluginCreationList({ drafts, remoteSubmissions, selectedKey, submissions, onSelect }: { drafts: AuthoringPluginDraft[]; remoteSubmissions: PluginSubmissionStatus[]; selectedKey: string; submissions: PluginSubmissionStatus[]; onSelect: (id: string) => void }) {
-  return <aside className="plugin-list" aria-label="插件创作候选">
-    <div className="plugin-list-header"><strong>我的创作</strong><span className="section-count">{drafts.length + remoteSubmissions.length}</span></div>
-    <div className="plugin-list-body">
-      {drafts.map(item => { const key = `${item.manifest.id}@${item.manifest.version}`; const itemSubmission = submissions.find(candidate => candidate.id === item.dashboard_submission_id || (candidate.product_key === item.manifest.id && candidate.version === item.manifest.version)); const itemState = pluginDraftState(item, itemSubmission); return <button key={key} type="button" className={`plugin-list-item ${key === selectedKey ? 'selected' : ''}`} onClick={() => onSelect(key)}><span className={`status-dot ${itemState.tone === 'success' ? 'success' : itemState.tone === 'danger' ? 'danger' : ''}`} /><span><strong>{item.manifest.name}</strong><small>{item.manifest.id}</small><small>{itemState.label}</small></span><small>v{item.manifest.version}</small></button>; })}
-      {remoteSubmissions.map(item => { const key = `remote:${item.id}`; const state = pluginSubmissionState(item); return <button key={key} type="button" className={`plugin-list-item ${key === selectedKey ? 'selected' : ''}`} onClick={() => onSelect(key)}><span className={`status-dot ${state.tone === 'success' ? 'success' : state.tone === 'danger' ? 'danger' : ''}`} /><span><strong>{item.name}</strong><small>{item.product_key}</small><small>{state.label} · 未关联本地源码</small></span><small>v{item.version}</small></button>; })}
-    </div>
-  </aside>;
-}
-
-function PluginRemoteSubmissionDetail({ item, onImportCandidate }: { item: PluginSubmissionStatus; onImportCandidate: (revisionOfVersion?: string, parentSubmissionId?: string) => void }) {
-  const state = pluginSubmissionState(item);
-  const canMaintain = item.role === 'owner' || item.role === 'contributor';
-  return <main className="plugin-detail">
-    <header className="plugin-detail-header"><div><div className="plugin-title-line"><h3>{item.name}</h3><Pill kind={state.tone}>{state.label}</Pill><Pill kind="warn">未关联本地源码</Pill></div><small>{creationRoleLabel(item.role)}</small></div><div className="plugin-installed-actions">{canMaintain ? <button className="btn btn-primary" onClick={() => onImportCandidate(item.version, item.id)}><PackagePlus size={15} />关联新版本候选</button> : null}</div></header>
-    {item.review_note ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>审核意见</strong><span>{item.review_note}</span></div></div> : null}
-    <div className="plugin-meta-grid"><div><span>版本</span><strong>v{item.version}</strong></div><div><span>版本来源</span><strong>{item.revision_of_version ? `基于 v${item.revision_of_version}` : '首个版本'}</strong></div><div><span>审核状态</span><strong>{state.label}</strong></div><div><span>发布状态</span><strong>{releaseStatusLabel(item.release_status)}</strong></div></div>
-    <section className="plugin-detail-section"><div className="plugin-section-heading"><div><h4>版本更新说明</h4></div><span className="section-count">v{item.version}</span></div><p>{item.release_notes || '该提交未提供更新说明。'}</p></section>
-    <details className="plugin-technical-panel"><summary>提交记录</summary><div className="plugin-technical-grid"><div><span>协作角色</span><strong>{creationRoleLabel(item.role)}</strong></div><div><span>来源</span><strong>{sourceTypeLabel(item.source_type)}</strong></div><div className="wide"><span>提交记录</span><code>{item.id}</code></div><div className="wide"><span>SHA-256</span><code>{item.sha256}</code></div></div></details>
-  </main>;
-}
-
-function DraftStage({ complete, label }: { complete: boolean; label: string }) { return <div className={complete ? 'complete' : ''}><span>{complete ? <CheckCircle2 size={13} /> : null}</span><strong>{label}</strong></div>; }
-function formatDraftTime(value?: string | null) { if (!value) return '--'; const time = Number.parseInt(value, 10); return Number.isFinite(time) ? new Date(time).toLocaleString('zh-CN', { hour12: false }) : value; }
-function pluginDraftState(draft: AuthoringPluginDraft, submission?: PluginSubmissionStatus): { label: string; tone: 'success' | 'warn' | 'danger' } { if (submission?.release_status === 'revoked') return { label: '已撤回', tone: 'danger' }; if (submission?.status === 'approved' && submission.release_status === 'published') return { label: '已上架', tone: 'success' }; if (submission?.status === 'approved') return { label: '审核通过，待发布', tone: 'warn' }; if (submission?.status === 'changes_requested') return { label: '需修改', tone: 'warn' }; if (submission?.status === 'rejected') return { label: '已拒绝', tone: 'danger' }; if (draft.submitted_at) return { label: '审核中', tone: 'success' }; if (draft.confirmed_at) return { label: '可提交', tone: 'success' }; if (draft.tested_at) return { label: '待确认', tone: 'warn' }; if (draft.development_path) return { label: '开发中', tone: 'warn' }; return { label: '候选', tone: 'warn' }; }
-function pluginSubmissionState(submission: PluginSubmissionStatus): { label: string; tone: 'success' | 'warn' | 'danger' } { if (submission.release_status === 'revoked') return { label: '已撤回', tone: 'danger' }; if (submission.status === 'approved' && submission.release_status === 'published') return { label: '已上架', tone: 'success' }; if (submission.status === 'approved') return { label: '审核通过，待发布', tone: 'warn' }; if (submission.status === 'changes_requested') return { label: '需修改', tone: 'warn' }; if (submission.status === 'rejected') return { label: '已拒绝', tone: 'danger' }; return { label: '审核中', tone: 'warn' }; }
-function creationRoleLabel(role?: PluginSubmissionStatus['role']) { if (role === 'owner') return '我是作者'; if (role === 'contributor') return '我是贡献者'; return '我的提交'; }
-function releaseStatusLabel(status?: string) { if (status === 'published') return '已上架'; if (status === 'draft') return '待发布'; if (status === 'revoked') return '已撤回'; return '未发布'; }
-function sourceTypeLabel(source?: string) { if (source === 'repository_snapshot') return '源码快照'; if (source === 'archive') return '归档包'; return '本地源码'; }
-
 function MarketPluginDetail({ item, installed, catalog, planning, onLoadVersions, onPlan }: { item: PluginCatalogItem; installed?: PluginItem; catalog: PluginCatalogItem[]; planning: boolean; onLoadVersions: (pluginId: string) => Promise<PluginCatalogItem[]>; onPlan: (version?: string) => void }) {
   const upgrade = installed?.version ? compareSemanticVersions(item.version, installed.version) > 0 : false;
   const current = Boolean(installed) && !upgrade;
   const managed = item.assignment === 'required' && item.management !== 'user_managed';
-  const lockedLabel = item.governance === 'blocked' ? '不可安装' : managed ? '由组织管理' : undefined;
+  const lockedLabel = item.governance === 'blocked' ? '不可安装' : managed ? '组织管理' : undefined;
   const permissions = friendlyPermissions(item.permissions || []);
   const [tab, setTab] = useState<'details' | 'versions'>('details');
   const [versions, setVersions] = useState<PluginCatalogItem[]>([item]);
@@ -214,7 +182,7 @@ function MarketPluginDetail({ item, installed, catalog, planning, onLoadVersions
   }, [item, onLoadVersions, tab]);
 
   return <>
-    <header className="plugin-product-header"><div className="plugin-product-title"><span className="plugin-product-mark">{item.name.slice(0, 1)}</span><div><div><h3>{item.name}</h3><Pill kind={item.governance === 'blocked' ? 'danger' : managed ? 'warn' : 'success'}>{catalogAssignmentLabel(item)}</Pill></div><span>{catalogSourceLabel(item.source)} · {item.author_name || '未知作者'}</span></div></div><button className="btn btn-primary" disabled={current || managed || item.governance === 'blocked' || planning} onClick={() => onPlan(item.version)}><Download size={15} />{planning ? '正在检查' : item.governance === 'blocked' ? '不可安装' : managed ? '由组织管理' : upgrade ? '更新' : current ? '已安装' : '安装'}</button></header>
+      <header className="plugin-product-header"><div className="plugin-product-title"><span className="plugin-product-mark">{item.name.slice(0, 1)}</span><div><div><h3>{item.name}</h3><Pill kind={item.governance === 'blocked' ? 'danger' : managed ? 'warn' : 'success'}>{catalogAssignmentLabel(item)}</Pill></div><span>{catalogSourceLabel(item.source)} · {item.author_name || '未知作者'}</span></div></div><button className="btn btn-primary" disabled={current || managed || item.governance === 'blocked' || planning} onClick={() => onPlan(item.version)}><Download size={15} />{planning ? '正在检查' : item.governance === 'blocked' ? '不可安装' : managed ? '组织管理' : upgrade ? '更新' : current ? '已安装' : '安装'}</button></header>
     <p className="plugin-product-description">{item.description || '暂无用途说明。'}</p>
     {item.organization_reason ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>组织说明</strong><span>{item.organization_reason}</span></div></div> : null}
     <DetailTabs value={tab} onChange={setTab} />
@@ -247,7 +215,7 @@ function PluginInstallPlanDialog({ plan, error, currentVersion, onClose, onInsta
   return <div className="skill-dialog-backdrop"><div className="skill-dialog skill-plan-dialog" role="dialog" aria-modal="true"><div className="skill-dialog-head"><strong>{title}</strong><button className="btn btn-icon" onClick={onClose} aria-label="关闭"><X size={16} /></button></div>{error ? <div className="skill-dialog-warning">{error}</div> : null}{plan ? <><div className="skill-plan-summary"><strong>{plan.plugin.name} v{plan.plugin.version}</strong><span>{plan.ready ? '可以安装' : '当前无法安装'}</span></div><div className="skill-plan-actions">{plan.dependency_actions.map(action => <div className={`plugin-plan-row ${['blocked', 'unavailable'].includes(action.action) ? 'blocked' : ''}`} key={action.plugin_id}><span className={`status-dot ${action.action === 'satisfied' ? 'success' : ['blocked', 'unavailable'].includes(action.action) ? 'danger' : ''}`} /><span><strong>{action.plugin_name || readablePluginID(action.plugin_id)}</strong><small>{pluginInstallActionDescription(action.action)}</small></span><strong>{action.target_version ? `v${action.target_version}` : '—'}</strong></div>)}{!plan.dependency_actions.length ? <span className="skill-section-empty">无依赖</span> : null}</div></> : null}<div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" disabled={!plan?.ready} onClick={onInstall}><Download size={15} />确认{action}</button></div></div></div>;
 }
 
-function PluginDetail({ item, capabilities, catalog, onLoadVersions, onPlanVersion, onUninstall, onRollback, onSetEnabled, onUnregisterDevelopment, onInvokeDevelopment, onOpenView, onCreateShortcut }: {
+function PluginDetail({ item, capabilities, catalog, onLoadVersions, onPlanVersion, onUninstall, onRollback, onSetEnabled, onOpenView, onCreateShortcut }: {
   item: PluginItem;
   capabilities: CapabilityItem[];
   catalog: PluginCatalogItem[];
@@ -256,49 +224,15 @@ function PluginDetail({ item, capabilities, catalog, onLoadVersions, onPlanVersi
   onUninstall: (pluginId: string) => void;
   onRollback: (pluginId: string) => void;
   onSetEnabled: (pluginId: string, enabled: boolean) => void;
-  onUnregisterDevelopment: (pluginId: string) => void;
-  onInvokeDevelopment: (pluginId: string, capabilityId: string, input: unknown) => Promise<DevelopmentInvocationResult>;
   onOpenView: (pluginId: string, viewId: string) => void;
   onCreateShortcut: (pluginId: string, viewId: string, title: string) => void;
 }) {
-  const [debugCapability, setDebugCapability] = useState(item.capabilities?.[0]?.id || '');
-  const initialCapability = item.capabilities?.[0];
-  const [debugMode, setDebugMode] = useState<'form' | 'json'>(supportsSchemaForm(initialCapability) ? 'form' : 'json');
-  const [formInput, setFormInput] = useState<Record<string, unknown>>(() => schemaDefaults(initialCapability?.input_schema));
-  const [debugInput, setDebugInput] = useState(() => JSON.stringify(schemaDefaults(initialCapability?.input_schema), null, 2));
-  const [debugResult, setDebugResult] = useState<DevelopmentInvocationResult | null>(null);
-  const [debugging, setDebugging] = useState(false);
   const [pendingAction, setPendingAction] = useState<{ title: string; description: string; confirmText: string; run: () => void } | null>(null);
   const [tab, setTab] = useState<'details' | 'versions'>('details');
   const [versions, setVersions] = useState<PluginCatalogItem[]>(() => catalog.filter(candidate => candidate.plugin_id === item.id));
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsError, setVersionsError] = useState('');
 
-  async function runDebug() {
-    setDebugging(true);
-    try {
-      const input = debugMode === 'form' ? formInput : JSON.parse(debugInput || '{}');
-      const result = await onInvokeDevelopment(item.id, debugCapability, input);
-      setDebugResult(result);
-    } catch (error) {
-      setDebugResult({ ok: false, duration_ms: 0, error: String(error) });
-    } finally {
-      setDebugging(false);
-    }
-  }
-
-  function selectCapability(capabilityId: string) {
-    const capability = item.capabilities?.find(candidate => candidate.id === capabilityId);
-    const defaults = schemaDefaults(capability?.input_schema);
-    setDebugCapability(capabilityId);
-    setFormInput(defaults);
-    setDebugInput(JSON.stringify(defaults, null, 2));
-    setDebugMode(supportsSchemaForm(capability) ? 'form' : 'json');
-    setDebugResult(null);
-  }
-
-  const selectedCapability = item.capabilities?.find(capability => capability.id === debugCapability);
-  const supportsForm = supportsSchemaForm(selectedCapability);
   const friendlyPermissionItems = friendlyPermissions(item.permissions || []);
   const catalogItem = catalog.find(candidate => candidate.plugin_id === item.id);
   const managed = item.governance === 'required' || item.governance === 'managed' || catalogItem?.management !== 'user_managed' && Boolean(catalogItem?.managed);
@@ -316,12 +250,13 @@ function PluginDetail({ item, capabilities, catalog, onLoadVersions, onPlanVersi
     <>
       <div className="plugin-detail-header">
         <div><div className="plugin-title-line"><h3>{item.name || item.id}</h3><Pill kind={item.circuit_open ? 'danger' : item.status === 'installed' && item.enabled ? 'success' : item.status === 'failed' ? 'danger' : 'warn'}>{item.circuit_open || item.status === 'failed' ? '运行异常' : item.enabled ? '已安装' : '已停用'}</Pill>{item.development ? <Pill kind="warn">开发中</Pill> : null}{item.governance ? <Pill kind={item.governance === 'required' || item.governance === 'managed' ? 'warn' : 'success'}>{governanceLabels[item.governance] || item.governance}</Pill> : null}</div></div>
-        <div className="plugin-installed-actions">{item.development ? <button className="btn btn-danger-quiet" onClick={() => setPendingAction({ title: '移除开发插件注册？', description: `移除后将停止加载“${item.name || item.id}”的本地工程，但不会删除工程文件。`, confirmText: '确认移除', run: () => onUnregisterDevelopment(item.id) })}><Unplug size={15} />移除开发注册</button> : <><label className="plugin-enable-control"><span>启用</span><span className="toggle"><input type="checkbox" checked={Boolean(item.enabled)} disabled={item.governance === 'required' || item.governance === 'managed'} onChange={event => event.target.checked ? onSetEnabled(item.id, true) : setPendingAction({ title: '确认停用插件？', description: `停用后，Agent 将不再调用“${item.name || item.id}”提供的能力。`, confirmText: '确认停用', run: () => onSetEnabled(item.id, false) })} /><span className="slider" /></span></label><details className="plugin-more-actions"><summary title="更多操作" aria-label="更多操作"><MoreHorizontal size={17} /></summary><div>{item.governance !== 'required' && item.governance !== 'managed' && item.governance !== 'blocked' ? <button disabled={!item.rollback_available} onClick={() => setPendingAction({ title: '确认回滚插件？', description: `将“${item.name || item.id}”切换到 v${item.previous_version || '--'}，当前版本会停止运行。`, confirmText: '确认回滚', run: () => onRollback(item.id) })}>回滚{item.previous_version ? `到 v${item.previous_version}` : ''}</button> : null}<button className="danger-text" disabled={item.governance === 'required' || item.governance === 'managed'} onClick={() => setPendingAction({ title: '确认卸载插件？', description: `卸载后将移除“${item.name || item.id}”，其能力和功能页面会立即不可用。`, confirmText: '确认卸载', run: () => onUninstall(item.id) })}>卸载</button></div></details></>}</div>
+        <div className="plugin-installed-actions">{!item.development ? <><label className="plugin-enable-control"><span>启用</span><span className="toggle"><input type="checkbox" checked={Boolean(item.enabled)} disabled={item.governance === 'required' || item.governance === 'managed'} onChange={event => event.target.checked ? onSetEnabled(item.id, true) : setPendingAction({ title: '确认停用插件？', description: `停用后，Agent 将不再调用“${item.name || item.id}”提供的能力。`, confirmText: '确认停用', run: () => onSetEnabled(item.id, false) })} /><span className="slider" /></span></label><details className="plugin-more-actions"><summary title="更多操作" aria-label="更多操作"><MoreHorizontal size={17} /></summary><div>{item.governance !== 'required' && item.governance !== 'managed' && item.governance !== 'blocked' ? <button disabled={!item.rollback_available} onClick={() => setPendingAction({ title: '确认回滚插件？', description: `将“${item.name || item.id}”切换到 v${item.previous_version || '--'}，当前版本会停止运行。`, confirmText: '确认回滚', run: () => onRollback(item.id) })}>回滚{item.previous_version ? `到 v${item.previous_version}` : ''}</button> : null}<button className="danger-text" disabled={item.governance === 'required' || item.governance === 'managed'} onClick={() => setPendingAction({ title: '确认卸载插件？', description: `卸载后将移除“${item.name || item.id}”，其能力和功能页面会立即不可用。`, confirmText: '确认卸载', run: () => onUninstall(item.id) })}>卸载</button></div></details></> : null}</div>
       </div>
       {item.error ? <div className="plugin-local-error">插件暂时无法运行，请刷新状态或重新安装。</div> : null}
+      {item.development ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>本机开发版本</strong><span>项目构建、测试和移除统一在“扩展开发”中管理。</span></div></div> : null}
       <p className="plugin-product-description">{item.description || '暂无用途说明。'}</p>
       {!item.development ? <DetailTabs value={tab} onChange={setTab} /> : null}
-      {!item.development && tab === 'versions' ? <PluginVersionList versions={versions.length ? versions : catalogItem ? [catalogItem] : []} currentVersion={item.version} lockedLabel={item.governance === 'blocked' ? '不可安装' : managed ? '由组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={onPlanVersion} /> : <>
+      {!item.development && tab === 'versions' ? <PluginVersionList versions={versions.length ? versions : catalogItem ? [catalogItem] : []} currentVersion={item.version} lockedLabel={item.governance === 'blocked' ? '不可安装' : managed ? '组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={onPlanVersion} /> : <>
         {item.development ? <div className="plugin-meta-grid"><div><span>版本</span><strong>v{item.version || '--'}</strong></div><div><span>构建时间</span><strong>{formatBuildTime(item.entry_modified_at)}</strong></div><div><span>入口大小</span><strong>{formatFileSize(item.entry_size)}</strong></div></div> : null}
         <section className="plugin-detail-section">
           <div className="plugin-section-heading"><div><h4>功能</h4></div></div>
@@ -335,16 +270,6 @@ function PluginDetail({ item, capabilities, catalog, onLoadVersions, onPlanVersi
         {friendlyPermissionItems.length ? <section className="plugin-detail-section"><div className="plugin-section-heading"><div><h4>权限</h4></div></div><div className="plugin-permission-list"><Tags items={friendlyPermissionItems} /></div></section> : null}
         {!item.development ? <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>插件 ID</span><code>{item.id}</code></div><div><span>作者</span><strong>{item.author_name || catalogItem?.author_name || '未知作者'}</strong></div><div><span>运行时</span><strong>{item.runtime || '--'}</strong></div><div><span>最低 Agent 版本</span><strong>{item.min_agent_version ? `v${item.min_agent_version}` : '--'}</strong></div></div></details> : null}
       </>}
-      {item.development ? <section className="plugin-detail-section plugin-capability-section">
-        <div className="plugin-section-heading"><div><h4>Capability 调试</h4><p>修改 JSON 参数后直接调用当前本地工程的编译入口。</p></div><FlaskConical size={17} /></div>
-        <div className="plugin-debug-grid">
-          <label><span>Capability</span><select value={debugCapability} onChange={event => selectCapability(event.target.value)}>{item.capabilities?.map(capability => <option key={capability.id} value={capability.id}>{capability.id}</option>)}</select></label>
-          <div className="plugin-debug-modes"><button className={debugMode === 'form' ? 'active' : ''} disabled={!supportsForm} onClick={() => setDebugMode('form')}>表单</button><button className={debugMode === 'json' ? 'active' : ''} onClick={() => { setDebugInput(JSON.stringify(formInput, null, 2)); setDebugMode('json'); }}>JSON</button></div>
-          {debugMode === 'form' && selectedCapability ? <SchemaForm schema={selectedCapability.input_schema} value={formInput} onChange={setFormInput} /> : <label className="plugin-debug-json"><span>JSON 参数</span><textarea value={debugInput} onChange={event => setDebugInput(event.target.value)} rows={7} spellCheck={false} /></label>}
-          <button className="btn btn-primary" disabled={!debugCapability || debugging} onClick={runDebug}><Play size={15} />{debugging ? '运行中...' : '运行调试'}</button>
-          <div className={`plugin-debug-result ${debugResult ? debugResult.ok ? 'success' : 'danger' : ''}`}><div><span>运行结果</span>{debugResult ? <strong>{debugResult.ok ? '成功' : '失败'} · {debugResult.duration_ms} ms</strong> : null}</div><pre>{debugResult ? debugResult.ok ? JSON.stringify(debugResult.result, null, 2) : debugResult.error : '尚未运行'}</pre></div>
-        </div>
-      </section> : null}
       {pendingAction ? <ConfirmPluginAction action={pendingAction} onClose={() => setPendingAction(null)} /> : null}
     </>
   );
@@ -352,28 +277,6 @@ function PluginDetail({ item, capabilities, catalog, onLoadVersions, onPlanVersi
 
 function ConfirmPluginAction({ action, onClose }: { action: { title: string; description: string; confirmText: string; run: () => void }; onClose: () => void }) {
   return <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="plugin-action-title"><div className="modal-header"><div><h3 id="plugin-action-title">{action.title}</h3><p>{action.description}</p></div><button className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div><div className="modal-body"><div className="modal-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={() => { action.run(); onClose(); }}>{action.confirmText}</button></div></div></div></div>;
-}
-
-function supportsSchemaForm(capability?: PluginCapability) {
-  const schema = capability?.input_schema;
-  if (!schema || schema.type !== 'object' || !schema.properties) return false;
-  return Object.values(schema.properties).every(property => ['string', 'number', 'integer', 'boolean'].includes(property.type || ''));
-}
-
-function schemaDefaults(schema?: PluginJsonSchema) {
-  const result: Record<string, unknown> = {};
-  for (const [name, property] of Object.entries(schema?.properties || {})) {
-    if (property.default !== undefined) result[name] = property.default;
-    else if (property.type === 'boolean') result[name] = false;
-    else if (property.type === 'number' || property.type === 'integer') result[name] = property.minimum ?? 0;
-    else result[name] = '';
-  }
-  return result;
-}
-
-function SchemaForm({ schema, value, onChange }: { schema?: PluginJsonSchema; value: Record<string, unknown>; onChange: (value: Record<string, unknown>) => void }) {
-  const required = new Set(schema?.required || []);
-  return <div className="plugin-schema-form">{Object.entries(schema?.properties || {}).map(([name, property]) => <label key={name}><span>{name}{required.has(name) ? ' *' : ''}</span>{property.type === 'boolean' ? <input type="checkbox" checked={Boolean(value[name])} onChange={event => onChange({ ...value, [name]: event.target.checked })} /> : <input type={property.type === 'number' || property.type === 'integer' ? 'number' : 'text'} min={property.minimum} step={property.type === 'integer' ? 1 : 'any'} value={String(value[name] ?? '')} onChange={event => onChange({ ...value, [name]: property.type === 'number' || property.type === 'integer' ? event.target.value === '' ? '' : Number(event.target.value) : event.target.value })} />}{property.description ? <small>{property.description}</small> : null}</label>)}</div>;
 }
 
 function formatBuildTime(value?: number) {
@@ -395,16 +298,25 @@ function formatPublishedAt(value?: string) {
 
 function catalogSourceLabel(source?: string) {
   if (source === 'system') return '系统内置';
-  if (source === 'organization') return '组织提供';
+  if (source === 'organization') return '组织';
   return '公共插件库';
 }
 
 function catalogAssignmentLabel(item: PluginCatalogItem) {
-  if (item.assignment === 'blocked' || item.governance === 'blocked') return '组织已禁止';
+  if (item.assignment === 'blocked' || item.governance === 'blocked') return '不可安装';
   if (item.source === 'system') return '系统内置';
-  if (item.assignment === 'required') return '由组织管理';
+  if (item.assignment === 'required') return item.management === 'builtin' ? '系统内置' : '组织必装';
   if (item.assignment === 'recommended') return '组织推荐';
-  return '可安装';
+  return '可选插件';
+}
+
+function isManagedPolicy(item: ExtensionDesiredItem) {
+  return item.management !== 'user_managed' || item.intent === 'required' || item.desired_state === 'absent';
+}
+
+function isManagedPlugin(item: PluginItem, desired: ExtensionDesiredState | null) {
+  if (['required', 'managed', 'blocked'].includes(item.governance || '')) return true;
+  return Boolean(desired?.items.some(policy => policy.asset_kind === 'plugin' && policy.asset_key === item.id && isManagedPolicy(policy)));
 }
 
 function readablePluginID(value: string) { const tail = value.split('.').filter(Boolean).pop() || value; return tail.split(/[-_]/).filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' '); }

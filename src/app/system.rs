@@ -59,6 +59,17 @@ pub(crate) fn verify_agent_package_signature(
     verify_rsa_pss_sha256(staged_package, &public_key, signature)
 }
 
+pub(crate) fn verify_runtime_component_signature(
+    staged_package: &Path,
+    signature: &str,
+    key_id: &str,
+    algorithm: &str,
+) -> Result<(), Box<dyn Error>> {
+    validate_signature_metadata(signature.trim(), key_id.trim(), algorithm.trim(), true)?;
+    let public_key = trusted_agent_update_public_key(key_id.trim())?;
+    verify_rsa_pss_sha256(staged_package, &public_key, signature.trim())
+}
+
 pub(crate) fn signed_agent_updates_required() -> bool {
     env::var("HIMIND_REQUIRE_SIGNED_UPDATES")
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")

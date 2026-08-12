@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Blocks, BookOpen, Cable, ChevronDown, CircleUserRound, ClipboardCheck, ExternalLink, FileText, FolderOpen, Hammer, Info, LayoutDashboard, LogOut, RefreshCw, Settings, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Blocks, BookOpen, Cable, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, ClipboardCheck, Clock3, ExternalLink, FileText, FolderOpen, Hammer, Info, LayoutDashboard, ListChecks, LoaderCircle, LogOut, RefreshCw, Settings, X } from 'lucide-react';
 import type { PageKey } from '../types';
-import type { DashboardIdentityStatus } from '../services/agentApi';
+import type { AgentTaskHistoryItem, CurrentTaskStatus, DashboardIdentityStatus } from '../services/agentApi';
 
 type ShellProps = {
   currentPage: PageKey;
@@ -9,6 +9,8 @@ type ShellProps = {
   identity: DashboardIdentityStatus | null;
   agentVersion: string;
   updateBusy: boolean;
+  currentTask: CurrentTaskStatus | null;
+  onLoadTaskHistory: () => Promise<AgentTaskHistoryItem[]>;
   onNavigate: (page: PageKey) => void;
   onOpenDashboard: () => void;
   onCheckUpdate: () => void;
@@ -33,7 +35,7 @@ const developerNavItems = [
 
 type MenuKey = 'application' | 'diagnostics' | 'help';
 
-function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onCheckUpdate, onOpenAgentDirectory, onQuit }: Pick<ShellProps, 'agentVersion' | 'updateBusy' | 'onNavigate' | 'onOpenDashboard' | 'onCheckUpdate' | 'onOpenAgentDirectory' | 'onQuit'>) {
+function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onCheckUpdate, onOpenAgentDirectory, onOpenTasks, onQuit }: Pick<ShellProps, 'agentVersion' | 'updateBusy' | 'onNavigate' | 'onOpenDashboard' | 'onCheckUpdate' | 'onOpenAgentDirectory' | 'onQuit'> & { onOpenTasks: () => void }) {
   const [openMenu, setOpenMenu] = useState<MenuKey | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const menuBarRef = useRef<HTMLDivElement>(null);
@@ -85,6 +87,7 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
           </button>
           {openMenu === 'diagnostics' ? (
             <div className="app-menu-dropdown" role="menu">
+              <button type="button" role="menuitem" onClick={() => runAction(onOpenTasks)}><ListChecks size={16} /><span>任务记录</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('logs'))}><FileText size={16} /><span>诊断日志</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(onOpenAgentDirectory)}><FolderOpen size={16} /><span>打开 Agent 文件夹</span></button>
             </div>
@@ -119,10 +122,33 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
   );
 }
 
-export function Shell({ currentPage, approvalCount, identity, agentVersion, updateBusy, onNavigate, onOpenDashboard, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
+export function Shell({ currentPage, approvalCount, identity, agentVersion, updateBusy, currentTask, onLoadTaskHistory, onNavigate, onOpenDashboard, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
+  const [taskDrawerOpen, setTaskDrawerOpen] = useState(false);
+  const [taskHistory, setTaskHistory] = useState<AgentTaskHistoryItem[]>([]);
+  const [taskHistoryLoading, setTaskHistoryLoading] = useState(false);
+  const [taskHistoryError, setTaskHistoryError] = useState('');
+  const loadTaskHistory = useCallback(async (silent = false) => {
+    if (!silent) setTaskHistoryLoading(true);
+    try {
+      setTaskHistory(await onLoadTaskHistory());
+      setTaskHistoryError('');
+    } catch (error) {
+      setTaskHistoryError(typeof error === 'string' ? error : '暂时无法读取任务记录。');
+    } finally {
+      if (!silent) setTaskHistoryLoading(false);
+    }
+  }, [onLoadTaskHistory]);
+
+  useEffect(() => {
+    if (!taskDrawerOpen) return;
+    void loadTaskHistory();
+    const timer = window.setInterval(() => void loadTaskHistory(true), 5000);
+    return () => window.clearInterval(timer);
+  }, [loadTaskHistory, taskDrawerOpen]);
+
   return (
     <div className="shell">
-      <AppMenuBar agentVersion={agentVersion} updateBusy={updateBusy} onNavigate={onNavigate} onOpenDashboard={onOpenDashboard} onCheckUpdate={onCheckUpdate} onOpenAgentDirectory={onOpenAgentDirectory} onQuit={onQuit} />
+      <AppMenuBar agentVersion={agentVersion} updateBusy={updateBusy} onNavigate={onNavigate} onOpenDashboard={onOpenDashboard} onCheckUpdate={onCheckUpdate} onOpenAgentDirectory={onOpenAgentDirectory} onOpenTasks={() => setTaskDrawerOpen(true)} onQuit={onQuit} />
       <div className="shell-body">
         <aside className="sidebar">
         <div className="sidebar-header">
@@ -172,8 +198,54 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
           <span className={`status-dot ${identity?.authorized ? 'success' : ''}`} />
         </button>
         </aside>
-        <main className="main">{children}</main>
+        <main className="main">
+          {currentTask ? <button type="button" className="current-task-strip" onClick={() => setTaskDrawerOpen(true)} title="查看当前任务"><LoaderCircle size={15} className="spin" /><span><strong>正在执行 {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></span><code>{currentTask.execution_id || '本机执行'}</code><span className="current-task-open-label">任务记录</span></button> : null}
+          {children}
+        </main>
       </div>
+      {taskDrawerOpen ? <TaskHistoryDrawer currentTask={currentTask} items={taskHistory} loading={taskHistoryLoading} error={taskHistoryError} onRefresh={() => void loadTaskHistory()} onClose={() => setTaskDrawerOpen(false)} /> : null}
     </div>
   );
+}
+
+function TaskHistoryDrawer({ currentTask, items, loading, error, onRefresh, onClose }: { currentTask: CurrentTaskStatus | null; items: AgentTaskHistoryItem[]; loading: boolean; error: string; onRefresh: () => void; onClose: () => void }) {
+  const active = items.filter(item => ['pending', 'running', 'canceling'].includes(item.status));
+  const completed = items.filter(item => !['pending', 'running', 'canceling'].includes(item.status));
+  return <>
+    <button type="button" className="task-drawer-backdrop" aria-label="关闭任务记录" onClick={onClose} />
+    <aside className="task-drawer" role="dialog" aria-modal="true" aria-labelledby="task-drawer-title">
+      <header className="task-drawer-header"><div><span className="task-drawer-kicker">Agent 工作记录</span><h2 id="task-drawer-title">任务记录</h2></div><div className="task-drawer-actions"><button type="button" className="btn btn-icon" title="刷新任务记录" aria-label="刷新任务记录" onClick={onRefresh} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''} /></button><button type="button" className="btn btn-icon" title="关闭任务记录" aria-label="关闭任务记录" onClick={onClose}><X size={17} /></button></div></header>
+      {currentTask ? <section className="task-current-summary"><div className="task-summary-icon"><LoaderCircle size={17} className="spin" /></div><div><strong>正在执行 · {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></div><span className="task-status-pill running">运行中</span></section> : null}
+      {error ? <div className="task-drawer-notice"><CircleAlert size={16} /><span>{error}</span></div> : null}
+      <div className="task-drawer-body">
+        <TaskHistorySection title="进行中" icon={<Clock3 size={15} />} items={active} empty="当前没有进行中的任务。" />
+        <TaskHistorySection title="已完成" icon={<CheckCircle2 size={15} />} items={completed} empty="还没有已完成的任务。" />
+      </div>
+    </aside>
+  </>;
+}
+
+function TaskHistorySection({ title, icon, items, empty }: { title: string; icon: ReactNode; items: AgentTaskHistoryItem[]; empty: string }) {
+  return <section className="task-history-section"><div className="task-history-heading"><span>{icon}</span><strong>{title}</strong><small>{items.length}</small></div>{items.length ? <div className="task-history-list">{items.map(item => <TaskHistoryRow key={item.id} item={item} />)}</div> : <p className="task-history-empty">{empty}</p>}</section>;
+}
+
+function TaskHistoryRow({ item }: { item: AgentTaskHistoryItem }) {
+  const tone = taskStatusTone(item.status);
+  return <article className="task-history-row"><div className="task-history-row-head"><span className={`task-status-dot ${tone}`} /><strong>{taskTypeLabel(item.task_type)}</strong><span className={`task-status-pill ${tone}`}>{taskStatusLabel(item.status)}</span></div><div className="task-history-row-meta"><code>{item.id}</code><time>{formatTaskTime(item.finished_at || item.updated_at || item.created_at)}</time></div>{item.detail || item.error ? <p className={item.error ? 'error' : ''}>{item.error || item.detail}</p> : null}{['pending', 'running', 'canceling'].includes(item.status) ? <div className="task-progress"><span style={{ width: `${Math.max(0, Math.min(100, item.progress || 0))}%` }} /></div> : null}</article>;
+}
+
+function taskStatusLabel(status: string) { return ({ pending: '等待中', running: '运行中', canceling: '取消中', completed: '已完成', failed: '失败', canceled: '已取消' } as Record<string, string>)[status] || status || '未知'; }
+function taskStatusTone(status: string) { if (status === 'completed') return 'success'; if (status === 'failed') return 'danger'; if (status === 'canceled') return 'neutral'; if (status === 'pending') return 'pending'; return 'running'; }
+function formatTaskTime(value?: string | null) { if (!value) return '--'; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false }); }
+
+function taskTypeLabel(taskType: string) {
+  const labels: Record<string, string> = {
+    upload_code: '代码上传',
+    upload_placeholder: '占位上传',
+    smb_upload: '共享目录上传',
+    sync_exhibits: '展项同步',
+    initialize_exhibit_repository: '展项初始化',
+    agent_run: 'AI 执行',
+  };
+  return labels[taskType] || taskType || '远程任务';
 }
