@@ -1645,6 +1645,12 @@ fn snapshot_migration_metadata(
         }) {
             continue;
         }
+        // A working copy may still carry svn:* metadata for paths that were
+        // deleted locally (svn status "!"). Such targets cannot be copied, so
+        // skip them instead of failing the whole migration later.
+        if !relative_path.as_os_str().is_empty() && !source.join(&relative_path).exists() {
+            continue;
+        }
         for property in target.properties {
             if !MIGRATION_PROPERTY_NAMES.contains(&property.name.as_str()) {
                 continue;
