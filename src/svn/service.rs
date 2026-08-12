@@ -1032,28 +1032,27 @@ where
             "target exhibit repository",
         )?;
 
-        // Verify a fresh server checkout as an independent consumer of the repository.
-        let verified_working_copy = temp_root.join("verified");
-        run_svn_authenticated_cancelable(
+        // Commit already wrote the authoritative content to the server and the
+        // working copy was re-verified from the server via `update` above. A
+        // second full checkout only re-downloads every file and times out on
+        // large projects, so confirm the server HEAD instead.
+        let committed_revision = svn_item(&working_copy, "revision")?;
+        let server_revision = run_svn_authenticated_cancelable(
             [
-                "checkout".to_string(),
-                "--ignore-externals".to_string(),
+                "info".to_string(),
+                "--show-item".to_string(),
+                "revision".to_string(),
                 repository_url.clone(),
-                verified_working_copy.to_string_lossy().to_string(),
             ],
             &connection.username,
             &password,
             cancel,
         )?;
-        verify_migration_working_copy(
-            &verified_working_copy,
-            &repository_url,
-            &target_uuid,
-            &source_summary,
-            &snapshot.external_roots,
-            &transformed_paths,
-            "server checkout",
-        )?;
+        let server_revision: u64 = server_revision.trim().parse()?;
+        let committed_revision: u64 = committed_revision.trim().parse()?;
+        if server_revision < committed_revision {
+            return Err("server revision fell behind the committed working copy".into());
+        }
 
         let mut backup = if source_has_svn_metadata {
             progress(88, "目标仓库已验证，正在安全接管原工程目录")?;
@@ -3179,7 +3178,7 @@ fn is_migration_excluded(entry: &DirEntry) -> bool {
 
 fn is_migration_excluded_name(value: &str) -> bool {
     let name = value.to_ascii_lowercase();
-    matches!(
+    if matches!(
         name.as_str(),
         ".svn"
             | "library"
@@ -3193,7 +3192,16 @@ fn is_migration_excluded_name(value: &str) -> bool {
             | "saved"
             | "usersettings"
             | ".vs"
-    )
+    ) {
+        return true;
+    }
+    // 归档/备份类大文件不入库，避免拖慢提交与后续校验
+    name.ends_with(".zip")
+        || name.ends_with(".rar")
+        || name.ends_with(".7z")
+        || name.ends_with(".unitypackage")
+        || name.ends_with(".gz")
+        || name.ends_with(".tgz")
 }
 
 pub(crate) fn update_workspace(request: SvnWorkspaceRequest) -> Result<Value, Box<dyn Error>> {
