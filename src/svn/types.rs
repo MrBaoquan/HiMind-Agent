@@ -56,6 +56,10 @@ pub(crate) struct ImportLocalExhibitRequest {
     pub source_path: String,
     #[serde(default)]
     pub force_migration: bool,
+    #[serde(default)]
+    pub ignore_policy: MigrationIgnorePolicy,
+    #[serde(default)]
+    pub expected_source_fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +70,22 @@ pub(crate) struct SvnWorkspaceRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct MigrationSourceScanRequest {
     pub target_path: String,
+    #[serde(default)]
+    pub ignore_policy: MigrationIgnorePolicy,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct MigrationIgnorePolicy {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub root_large_file_threshold_bytes: u64,
+    #[serde(default)]
+    pub root_archive_patterns: Vec<String>,
+    #[serde(default)]
+    pub excluded_relative_paths: Vec<String>,
+    #[serde(default)]
+    pub included_relative_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

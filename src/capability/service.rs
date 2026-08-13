@@ -197,7 +197,20 @@ impl CapabilityGateway {
                 "read_only",
                 json!({
                     "type": "object",
-                    "properties": { "target_path": { "type": "string" } },
+                    "properties": {
+                        "target_path": { "type": "string" },
+                        "ignore_policy": {
+                            "type": "object",
+                            "properties": {
+                                "version": { "type": "integer", "minimum": 1 },
+                                "root_large_file_threshold_bytes": { "type": "integer", "minimum": 1 },
+                                "root_archive_patterns": { "type": "array", "items": { "type": "string" } },
+                                "excluded_relative_paths": { "type": "array", "items": { "type": "string" } },
+                                "included_relative_paths": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
                     "required": ["target_path"],
                     "additionalProperties": false
                 }),

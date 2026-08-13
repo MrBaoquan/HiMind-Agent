@@ -23,9 +23,9 @@ use crate::store::credentials::{
 use crate::svn::types::{
     ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
     CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
-    InitializeExhibitRepositoryRequest, MigrationSourceScanRequest, PreviewProjectAclRequest,
-    ProjectAclEntry, ReconcileProjectAclRequest, SaveSvnConnectionRequest, SvnCheckoutRequest,
-    SvnConnectionSummary, SvnWorkspaceRequest,
+    InitializeExhibitRepositoryRequest, MigrationIgnorePolicy, MigrationSourceScanRequest,
+    PreviewProjectAclRequest, ProjectAclEntry, ReconcileProjectAclRequest,
+    SaveSvnConnectionRequest, SvnCheckoutRequest, SvnConnectionSummary, SvnWorkspaceRequest,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -272,31 +272,37 @@ pub(crate) fn test_connection() -> Result<Value, Box<dyn Error>> {
 }
 
 fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error>> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?
-        .post(format!("{SVN_ADMIN_URL}/api.php?c=Common&a=Login&t=web"))
-        .json(&json!({
-            "user_name": username,
-            "user_pass": password,
-            "user_role": "2",
-            "uuid": "",
-            "code": ""
-        }))
-        .send()?;
-    if !response.status().is_success() {
-        return Err(format!("SVN service returned HTTP {}", response.status()).into());
+    let executable = find_svn_executable().ok_or("SVN CLI was not found")?;
+    let mut child = Command::new(&executable)
+        .args([
+            "info".to_string(),
+            SVN_SERVICE_URL.to_string(),
+            "--non-interactive".to_string(),
+            "--no-auth-cache".to_string(),
+            "--username".to_string(),
+            username.to_string(),
+            "--password-from-stdin".to_string(),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(password.as_bytes())?;
+        stdin.write_all(b"\r\n")?;
     }
-    let payload: Value = response.json()?;
-    if payload.get("status").and_then(Value::as_i64) != Some(1) {
-        return Err(payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("SVN account or password is invalid")
-            .to_string()
-            .into());
+    let output = child.wait_with_output()?;
+    let stderr = decode_svn_cli_output(&output.stderr);
+    if output.status.success() {
+        return Ok(json!({ "authenticated": true, "username": username }));
     }
-    Ok(payload)
+    if stderr.contains("E215004") || stderr.contains("E170001") || stderr.contains("Authentication failed") {
+        return Err("SVN account or password is invalid".into());
+    }
+    // The repository root URL is not itself a repository, so an info probe
+    // legitimately fails after authentication succeeded (E190001/E170013).
+    Ok(json!({ "authenticated": true, "username": username }))
 }
 
 fn ensure_svn_user_account(username: &str, password: &str) -> Result<bool, Box<dyn Error>> {
@@ -574,7 +580,7 @@ fn takeover_non_empty_workspace(
     let had_working_copy = is_valid_svn_working_copy(target);
     let old_paths = workspace_path_manifest(target)?;
     let snapshot = if had_working_copy {
-        snapshot_migration_metadata(target, false)?
+        snapshot_migration_metadata(target, false, None)?
     } else {
         MigrationMetadataSnapshot::default()
     };
@@ -827,6 +833,7 @@ where
     F: FnMut() -> Result<(), Box<dyn Error>>,
     P: FnMut(i32, &str) -> Result<(), Box<dyn Error>>,
 {
+    let ignore_policy = normalized_ignore_policy(&request.ignore_policy);
     let project_id = normalize_repository_name(&request.project_id)?;
     let exhibit_id = normalize_repository_name(&request.exhibit_id)?;
     let source = absolute_path(&request.source_path)?;
@@ -891,14 +898,27 @@ where
 		}
     }
     let snapshot = if source_is_working_copy {
-        snapshot_migration_metadata(&source, false)?
+        snapshot_migration_metadata(&source, false, Some(&ignore_policy))?
     } else {
         MigrationMetadataSnapshot::default()
     };
     let transformed_paths = migration_transform_paths(&snapshot.properties);
-    // Capture a raw source fingerprint before remote work and compare it again after copying.
+    // Include locally retained files in the source fingerprint so an ignored
+    // archive cannot change unnoticed while the repository is being prepared.
     let source_stability_before =
-        migration_tree_summary(&source, &snapshot.external_roots, &BTreeSet::new())?;
+        migration_source_stability_summary(&source, &snapshot.external_roots, &transformed_paths)?;
+    if !request.expected_source_fingerprint.trim().is_empty()
+        && request
+            .expected_source_fingerprint
+            .trim()
+            .trim_start_matches("sha256:")
+            != source_stability_before.digest
+    {
+        return Err(
+            "source project changed after scanning; scan the directory again before migration"
+                .into(),
+        );
+    }
 
     progress(22, "本地工程预检完成，正在创建目标展项仓库")?;
     create_exhibit_repository_path(CreateExhibitRepositoryPathRequest {
@@ -959,9 +979,13 @@ where
             &working_copy,
             &snapshot.external_roots,
             &transformed_paths,
+            &ignore_policy,
         )?;
-        let source_stability_after =
-            migration_tree_summary(&source, &snapshot.external_roots, &BTreeSet::new())?;
+        let source_stability_after = migration_source_stability_summary(
+            &source,
+            &snapshot.external_roots,
+            &transformed_paths,
+        )?;
         if source_stability_before != source_stability_after {
             return Err(
                 "source project changed while preparing migration; refusing to continue".into(),
@@ -981,11 +1005,16 @@ where
                 ".",
             ],
         )?;
-        add_previously_versioned_paths(&working_copy, &snapshot.versioned_paths)?;
+        add_previously_versioned_paths(&working_copy, &snapshot.versioned_paths, &ignore_policy)?;
         progress(58, "正在恢复 SVN 忽略规则、文件属性和外部依赖")?;
         apply_migration_properties(&working_copy, &snapshot.properties)?;
-        let staged_summary =
-            migration_tree_summary(&working_copy, &snapshot.external_roots, &transformed_paths)?;
+        apply_migration_ignore_policy(&source, &working_copy, &ignore_policy)?;
+        let staged_summary = migration_tree_summary(
+            &working_copy,
+            &snapshot.external_roots,
+            &transformed_paths,
+            &ignore_policy,
+        )?;
         if staged_summary != source_summary {
             return Err(
                 "staged target exhibit repository does not match the source project; refusing to commit"
@@ -1029,6 +1058,7 @@ where
             &source_summary,
             &snapshot.external_roots,
             &transformed_paths,
+            &ignore_policy,
             "target exhibit repository",
         )?;
 
@@ -1080,13 +1110,36 @@ where
             {
                 return Err("local workspace switched to an unexpected SVN repository".into());
             }
-            let switched_summary =
-                migration_tree_summary(&source, &snapshot.external_roots, &transformed_paths)?;
+            let switched_summary = migration_tree_summary(
+                &source,
+                &snapshot.external_roots,
+                &transformed_paths,
+                &ignore_policy,
+            )?;
             if source_summary != switched_summary {
                 return Err(
                     "local workspace verification failed after switching SVN metadata".into(),
                 );
             }
+            let switched_source_stability = migration_source_stability_summary(
+                &source,
+                &snapshot.external_roots,
+                &transformed_paths,
+            )?;
+            if source_stability_before != switched_source_stability {
+                return Err(
+                    "local files changed while switching SVN metadata; restoring the previous association"
+                        .into(),
+                );
+            }
+            let switched_change_count = svn_status_change_count(&source)?;
+            if switched_change_count != 0 {
+                return Err(format!(
+                    "local workspace is not clean after switching SVN metadata ({switched_change_count} pending SVN changes)"
+                )
+                .into());
+            }
+            verify_migration_ignored_paths_unversioned(&source, &ignore_policy)?;
             svn_item(&source, "revision")
         })();
         let revision = match switch_result {
@@ -1099,6 +1152,7 @@ where
                         &source,
                         &snapshot.external_roots,
                         &transformed_paths,
+                        &ignore_policy,
                     )?;
                 } else {
                     let partial_admin = source.join(".svn");
@@ -1383,6 +1437,178 @@ struct MigrationTreeSummary {
     digest: String,
 }
 
+const DEFAULT_ROOT_LARGE_FILE_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_ROOT_ARCHIVE_PATTERNS: [&str; 10] = [
+    "*.zip", "*.rar", "*.7z", "*.tar", "*.tar.gz", "*.tgz", "*.gz", "*.bz2", "*.xz", "*.iso",
+];
+
+fn normalized_ignore_policy(policy: &MigrationIgnorePolicy) -> MigrationIgnorePolicy {
+    let mut result = policy.clone();
+    if result.version == 0 {
+        result.version = 1;
+    }
+    if result.root_large_file_threshold_bytes == 0 {
+        result.root_large_file_threshold_bytes = DEFAULT_ROOT_LARGE_FILE_THRESHOLD_BYTES;
+    }
+    if result.root_archive_patterns.is_empty() {
+        result.root_archive_patterns = DEFAULT_ROOT_ARCHIVE_PATTERNS
+            .iter()
+            .map(|v| (*v).to_string())
+            .collect();
+    }
+    result.root_archive_patterns = result
+        .root_archive_patterns
+        .iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    result.excluded_relative_paths = result
+        .excluded_relative_paths
+        .iter()
+        .map(|v| v.replace('\\', "/").trim_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    result.included_relative_paths = result
+        .included_relative_paths
+        .iter()
+        .map(|v| v.replace('\\', "/").trim_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    result
+}
+
+fn migration_policy_excludes(
+    relative: &Path,
+    file_size: Option<u64>,
+    policy: &MigrationIgnorePolicy,
+) -> bool {
+    let normalized = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if policy.included_relative_paths.iter().any(|value| {
+        value
+            .replace('\\', "/")
+            .trim_matches('/')
+            .eq_ignore_ascii_case(&normalized)
+    }) {
+        return false;
+    }
+    migration_policy_candidate(relative, file_size, policy)
+}
+
+fn migration_policy_candidate(
+    relative: &Path,
+    file_size: Option<u64>,
+    policy: &MigrationIgnorePolicy,
+) -> bool {
+    let normalized = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if policy.excluded_relative_paths.iter().any(|value| {
+        value
+            .replace('\\', "/")
+            .trim_matches('/')
+            .eq_ignore_ascii_case(&normalized)
+    }) {
+        return true;
+    }
+    if relative.components().count() != 1 {
+        return false;
+    }
+    let name = relative
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let archive = policy
+        .root_archive_patterns
+        .iter()
+        .any(|pattern| wildcard_match(pattern, &name));
+    archive || file_size.is_some_and(|size| size >= policy.root_large_file_threshold_bytes)
+}
+
+fn migration_entry_excluded(
+    entry: &DirEntry,
+    source: &Path,
+    policy: &MigrationIgnorePolicy,
+) -> bool {
+    let Ok(relative) = entry.path().strip_prefix(source) else {
+        return false;
+    };
+    migration_relative_path_excluded(source, relative, policy)
+}
+
+fn migration_relative_path_excluded(
+    source: &Path,
+    relative: &Path,
+    policy: &MigrationIgnorePolicy,
+) -> bool {
+    if relative.components().any(|component| {
+        is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+    }) {
+        return true;
+    }
+    migration_policy_excludes(
+        relative,
+        source
+            .join(relative)
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len()),
+        policy,
+    )
+}
+
+fn apply_migration_ignore_policy(
+    source: &Path,
+    working_copy: &Path,
+    policy: &MigrationIgnorePolicy,
+) -> Result<(), Box<dyn Error>> {
+    let mut rules = policy.root_archive_patterns.clone();
+    for entry in WalkDir::new(source)
+        .min_depth(1)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let relative = entry.path().strip_prefix(source)?;
+        if migration_policy_excludes(
+            relative,
+            entry
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len()),
+            policy,
+        ) {
+            if let Some(name) = relative.file_name().and_then(|v| v.to_str()) {
+                rules.push(name.to_string());
+            }
+        }
+    }
+    rules.sort();
+    rules.dedup();
+    let existing =
+        run_svn_in_directory(working_copy, ["propget", "svn:ignore", "."]).unwrap_or_default();
+    let mut lines = existing
+        .lines()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    lines.extend(rules);
+    lines.sort();
+    lines.dedup();
+    run_svn_in_directory(
+        working_copy,
+        ["propset", "svn:ignore", &lines.join("\n"), "."],
+    )?;
+    Ok(())
+}
+
 impl PartialEq for MigrationTreeSummary {
     fn eq(&self, other: &Self) -> bool {
         // Keyword and EOL properties legitimately rewrite bytes on checkout; the digest
@@ -1416,6 +1642,7 @@ fn copy_migration_tree(
     target: &Path,
     external_roots: &[PathBuf],
     transformed_paths: &BTreeSet<PathBuf>,
+    ignore_policy: &MigrationIgnorePolicy,
 ) -> Result<MigrationTreeSummary, Box<dyn Error>> {
     let mut fingerprint = Sha256::new();
     let mut file_count = 0_u64;
@@ -1424,7 +1651,7 @@ fn copy_migration_tree(
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
-            !is_migration_excluded(entry)
+            !migration_entry_excluded(entry, source, ignore_policy)
                 && entry
                     .path()
                     .strip_prefix(source)
@@ -1464,6 +1691,7 @@ fn migration_tree_summary(
     source: &Path,
     external_roots: &[PathBuf],
     transformed_paths: &BTreeSet<PathBuf>,
+    ignore_policy: &MigrationIgnorePolicy,
 ) -> Result<MigrationTreeSummary, Box<dyn Error>> {
     let mut fingerprint = Sha256::new();
     let mut file_count = 0_u64;
@@ -1472,12 +1700,57 @@ fn migration_tree_summary(
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
-            !is_migration_excluded(entry)
+            !migration_entry_excluded(entry, source, ignore_policy)
                 && entry
                     .path()
                     .strip_prefix(source)
                     .ok()
                     .is_none_or(|relative| !path_is_within_roots(relative, external_roots))
+        })
+    {
+        let entry = item?;
+        let relative = entry.path().strip_prefix(source)?;
+        if relative.as_os_str().is_empty()
+            || !entry.file_type().is_file()
+            || entry.file_type().is_symlink()
+        {
+            continue;
+        }
+        update_migration_digest(
+            &mut fingerprint,
+            relative,
+            entry.path(),
+            transformed_paths.contains(relative),
+        )?;
+        file_count += 1;
+    }
+    Ok(MigrationTreeSummary {
+        file_count,
+        digest: format!("{:x}", fingerprint.finalize()),
+    })
+}
+
+fn migration_source_stability_summary(
+    source: &Path,
+    external_roots: &[PathBuf],
+    transformed_paths: &BTreeSet<PathBuf>,
+) -> Result<MigrationTreeSummary, Box<dyn Error>> {
+    let mut fingerprint = Sha256::new();
+    let mut file_count = 0_u64;
+    for item in WalkDir::new(source)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry
+                .path()
+                .strip_prefix(source)
+                .ok()
+                .is_none_or(|relative| {
+                    !relative.components().any(|component| {
+                        is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+                    }) && !path_is_within_roots(relative, external_roots)
+                })
         })
     {
         let entry = item?;
@@ -1509,6 +1782,7 @@ fn verify_migration_working_copy(
     expected_summary: &MigrationTreeSummary,
     external_roots: &[PathBuf],
     transformed_paths: &BTreeSet<PathBuf>,
+    ignore_policy: &MigrationIgnorePolicy,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     let actual_url = svn_item(working_copy, "url")?;
@@ -1523,13 +1797,59 @@ fn verify_migration_working_copy(
         )
         .into());
     }
-    let actual_summary = migration_tree_summary(working_copy, external_roots, transformed_paths)?;
+    verify_migration_ignored_paths_unversioned(working_copy, ignore_policy)?;
+    let actual_summary = migration_tree_summary(
+        working_copy,
+        external_roots,
+        transformed_paths,
+        ignore_policy,
+    )?;
     if actual_summary != *expected_summary {
         return Err(format!(
             "{label} file verification failed (expected {} files, received {} files)",
             expected_summary.file_count, actual_summary.file_count
         )
         .into());
+    }
+    Ok(())
+}
+
+fn verify_migration_ignored_paths_unversioned(
+    working_copy: &Path,
+    ignore_policy: &MigrationIgnorePolicy,
+) -> Result<(), Box<dyn Error>> {
+    let output = run_svn_in_directory(
+        working_copy,
+        ["status", "--xml", "--verbose", "--ignore-externals", "."],
+    )?;
+    let status: SvnStatusDocument = quick_xml::de::from_str(&output)?;
+    for entry in status.targets.into_iter().flat_map(|target| target.entries) {
+        if matches!(
+            entry.status.item.as_str(),
+            "unversioned" | "ignored" | "external" | "none"
+        ) {
+            continue;
+        }
+        let relative = migration_property_relative_path(working_copy, &entry.path)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if migration_policy_excludes(
+            &relative,
+            working_copy
+                .join(&relative)
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len()),
+            ignore_policy,
+        ) {
+            return Err(format!(
+                "target repository contains a file that must remain local: {}",
+                relative.display()
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1627,6 +1947,7 @@ struct SvnWorkingCopyStatus {
 fn snapshot_migration_metadata(
     source: &Path,
     probe_externals: bool,
+    ignore_policy: Option<&MigrationIgnorePolicy>,
 ) -> Result<MigrationMetadataSnapshot, Box<dyn Error>> {
     let output = run_svn_in_directory(
         source,
@@ -1641,7 +1962,9 @@ fn snapshot_migration_metadata(
         let relative_path = migration_property_relative_path(source, &target.path)?;
         if relative_path.components().any(|component| {
             is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
-        }) {
+        }) || ignore_policy
+            .is_some_and(|policy| migration_relative_path_excluded(source, &relative_path, policy))
+        {
             continue;
         }
         // A working copy may still carry svn:* metadata for paths that were
@@ -1688,7 +2011,7 @@ fn snapshot_migration_metadata(
     snapshot.external_roots.sort();
     snapshot.external_roots.dedup();
     snapshot.versioned_paths =
-        snapshot_migration_versioned_paths(source, &snapshot.external_roots)?;
+        snapshot_migration_versioned_paths(source, &snapshot.external_roots, ignore_policy)?;
     Ok(snapshot)
 }
 
@@ -1721,6 +2044,7 @@ fn decode_svn_property_value(property: &SvnProperty) -> Result<String, Box<dyn E
 fn snapshot_migration_versioned_paths(
     source: &Path,
     external_roots: &[PathBuf],
+    ignore_policy: Option<&MigrationIgnorePolicy>,
 ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let output = run_svn_in_directory(
         source,
@@ -1741,6 +2065,8 @@ fn snapshot_migration_versioned_paths(
             || relative.components().any(|component| {
                 is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
             })
+            || ignore_policy
+                .is_some_and(|policy| migration_relative_path_excluded(source, &relative, policy))
         {
             continue;
         }
@@ -2079,10 +2405,12 @@ fn apply_migration_directory_properties(
 fn add_previously_versioned_paths(
     working_copy: &Path,
     versioned_paths: &[PathBuf],
+    ignore_policy: &MigrationIgnorePolicy,
 ) -> Result<(), Box<dyn Error>> {
     let targets = versioned_paths
         .iter()
         .filter(|relative| working_copy.join(relative).exists())
+        .filter(|relative| !migration_relative_path_excluded(working_copy, relative, ignore_policy))
         .map(|relative| relative.to_string_lossy().to_string());
     run_svn_target_batches(
         working_copy,
@@ -2512,7 +2840,7 @@ impl WorkingCopyAdminBackup {
             return Err("source is not an SVN working copy".into());
         }
         let parent = source.parent().ok_or("source directory has no parent")?;
-        let backup_root = parent.join(".himind-svn-backups");
+        let backup_root = parent.join(". himind-svn-backups");
         std::fs::create_dir_all(&backup_root)?;
         let _ = Command::new("attrib.exe")
             .args(["+H", backup_root.to_string_lossy().as_ref()])
@@ -2571,6 +2899,7 @@ fn restore_adopted_workspace(
     source: &Path,
     external_roots: &[PathBuf],
     transformed_paths: &BTreeSet<PathBuf>,
+    ignore_policy: &MigrationIgnorePolicy,
 ) -> Result<(), Box<dyn Error>> {
     backup.rollback()?;
     copy_migration_tree(
@@ -2578,6 +2907,7 @@ fn restore_adopted_workspace(
         source,
         external_roots,
         transformed_paths,
+        ignore_policy,
     )?;
     Ok(())
 }
@@ -3017,6 +3347,7 @@ pub(crate) fn workspace_status(request: SvnWorkspaceRequest) -> Result<Value, Bo
 pub(crate) fn scan_migration_source(
     request: MigrationSourceScanRequest,
 ) -> Result<Value, Box<dyn Error>> {
+    let ignore_policy = normalized_ignore_policy(&request.ignore_policy);
     let target = absolute_path(&request.target_path)?;
     reject_sensitive_path(&target)?;
     if !target.is_dir() {
@@ -3026,11 +3357,10 @@ pub(crate) fn scan_migration_source(
     let has_svn_metadata = target.join(".svn").is_dir();
     let is_svn = is_valid_svn_working_copy(&target);
     let snapshot = if is_svn {
-        snapshot_migration_metadata(&target, true)?
+        snapshot_migration_metadata(&target, true, Some(&ignore_policy))?
     } else {
         MigrationMetadataSnapshot::default()
     };
-    let mut fingerprint = Sha256::new();
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
     let mut excluded_count = 0_u64;
@@ -3041,7 +3371,7 @@ pub(crate) fn scan_migration_source(
         .sort_by_file_name()
         .into_iter();
     for item in walker.filter_entry(|entry| {
-        !is_migration_excluded(entry)
+        !migration_entry_excluded(entry, &target, &ignore_policy)
             && entry
                 .path()
                 .strip_prefix(&target)
@@ -3056,7 +3386,6 @@ pub(crate) fn scan_migration_source(
             excluded_count += 1;
             continue;
         }
-        let relative = entry.path().strip_prefix(&target)?;
         let extension = entry
             .path()
             .extension()
@@ -3066,29 +3395,64 @@ pub(crate) fn scan_migration_source(
         unity |= extension == "unity";
         unreal |= extension == "uproject";
         let metadata = entry.metadata()?;
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|value| value.as_secs())
-            .unwrap_or_default();
-        fingerprint.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
-        fingerprint.update([0]);
-        fingerprint.update(metadata.len().to_le_bytes());
-        fingerprint.update(modified.to_le_bytes());
         file_count += 1;
         total_bytes = total_bytes.saturating_add(metadata.len());
     }
 
+    let mut ignored_files = Vec::new();
+    let mut ignore_candidates = Vec::new();
+    let mut ignored_bytes = 0_u64;
     for entry in WalkDir::new(&target)
         .min_depth(1)
         .into_iter()
+        .filter_entry(|entry| {
+            entry
+                .path()
+                .strip_prefix(&target)
+                .ok()
+                .is_none_or(|relative| {
+                    !relative.components().any(|component| {
+                        is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+                    })
+                })
+        })
         .filter_map(Result::ok)
     {
-        if is_migration_excluded(&entry) {
+        let Ok(relative) = entry.path().strip_prefix(&target) else {
+            continue;
+        };
+        if relative.components().any(|component| {
+            is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+        }) {
             excluded_count += 1;
+            continue;
+        }
+        if entry.file_type().is_file() {
+            let size = entry
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            if migration_policy_candidate(relative, Some(size), &ignore_policy) {
+                let ignored = migration_policy_excludes(relative, Some(size), &ignore_policy);
+                ignore_candidates.push(json!({
+                    "path": relative.to_string_lossy().replace('\\', "/"),
+                    "size_bytes": size,
+                    "ignored": ignored,
+                }));
+                if ignored {
+                    excluded_count += 1;
+                    ignored_bytes = ignored_bytes.saturating_add(size);
+                    ignored_files.push(json!({ "path": relative.to_string_lossy().replace('\\', "/"), "size_bytes": size }));
+                }
+            }
         }
     }
+
+    let source_fingerprint = migration_source_stability_summary(
+        &target,
+        &snapshot.external_roots,
+        &migration_transform_paths(&snapshot.properties),
+    )?;
 
     let mut repository_url = String::new();
     let mut revision = String::new();
@@ -3154,10 +3518,14 @@ pub(crate) fn scan_migration_source(
         "source_display_name": target.file_name().and_then(|value| value.to_str()).unwrap_or("历史工程"),
         "source_repository_url": repository_url,
         "source_revision": revision,
-        "source_fingerprint": format!("sha256:{:x}", fingerprint.finalize()),
+        "source_fingerprint": format!("sha256:{}", source_fingerprint.digest),
         "file_count": file_count,
         "total_bytes": total_bytes,
         "excluded_count": excluded_count,
+        "ignored_files": ignored_files,
+        "ignore_candidates": ignore_candidates,
+        "ignored_bytes": ignored_bytes,
+        "ignore_policy": ignore_policy,
         "change_count": change_count,
         "old_remote_status": old_remote_status,
         "external_count": snapshot.external_count,
@@ -3172,10 +3540,6 @@ pub(crate) fn scan_migration_source(
     }))
 }
 
-fn is_migration_excluded(entry: &DirEntry) -> bool {
-    is_migration_excluded_name(entry.file_name().to_string_lossy().as_ref())
-}
-
 fn is_migration_excluded_name(value: &str) -> bool {
     let name = value.to_ascii_lowercase();
     if matches!(
@@ -3185,7 +3549,6 @@ fn is_migration_excluded_name(value: &str) -> bool {
             | "temp"
             | "obj"
             | "logs"
-            | "userSettings"
             | "binaries"
             | "deriveddatacache"
             | "intermediate"
@@ -3195,13 +3558,7 @@ fn is_migration_excluded_name(value: &str) -> bool {
     ) {
         return true;
     }
-    // 归档/备份类大文件不入库，避免拖慢提交与后续校验
-    name.ends_with(".zip")
-        || name.ends_with(".rar")
-        || name.ends_with(".7z")
-        || name.ends_with(".unitypackage")
-        || name.ends_with(".gz")
-        || name.ends_with(".tgz")
+    false
 }
 
 pub(crate) fn update_workspace(request: SvnWorkspaceRequest) -> Result<Value, Box<dyn Error>> {
@@ -4019,7 +4376,7 @@ mod tests {
     #[test]
     fn accepts_non_empty_checkout_targets_for_controlled_takeover() {
         let target = std::env::temp_dir().join(format!(
-            "himind-non-empty-checkout-{}-{}",
+            " himind-non-empty-checkout-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4040,7 +4397,7 @@ mod tests {
     #[test]
     fn cleanup_partial_checkout_only_removes_new_paths_and_svn_metadata() {
         let target = std::env::temp_dir().join(format!(
-            "himind-checkout-rollback-{}-{}",
+            " himind-checkout-rollback-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4096,7 +4453,7 @@ mod tests {
     #[test]
     fn migration_scan_is_read_only_and_does_not_expose_source_path() {
         let target =
-            std::env::temp_dir().join(format!("himind-migration-scan-{}", std::process::id()));
+            std::env::temp_dir().join(format!(" himind-migration-scan-{}", std::process::id()));
         let assets = target.join("Assets");
         let library = target.join("Library");
         std::fs::create_dir_all(&assets).unwrap();
@@ -4106,6 +4463,7 @@ mod tests {
 
         let result = scan_migration_source(MigrationSourceScanRequest {
             target_path: target.to_string_lossy().to_string(),
+            ignore_policy: MigrationIgnorePolicy::default(),
         })
         .unwrap();
         let serialized = serde_json::to_string(&result).unwrap();
@@ -4120,7 +4478,7 @@ mod tests {
     #[test]
     fn migration_scan_treats_stale_svn_metadata_as_a_local_directory() {
         let target = std::env::temp_dir().join(format!(
-            "himind-stale-svn-scan-{}-{}",
+            " himind-stale-svn-scan-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4134,6 +4492,7 @@ mod tests {
 
         let result = scan_migration_source(MigrationSourceScanRequest {
             target_path: target.to_string_lossy().to_string(),
+            ignore_policy: MigrationIgnorePolicy::default(),
         })
         .unwrap();
 
@@ -4148,9 +4507,197 @@ mod tests {
     }
 
     #[test]
+    fn migration_scan_ignores_only_root_archives_and_large_files() {
+        let target = std::env::temp_dir().join(format!(
+            " himind-ignore-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(target.join("Assets")).unwrap();
+        std::fs::write(target.join("Assets/Main.unity"), "scene").unwrap();
+        std::fs::write(target.join("backup.zip"), "archive").unwrap();
+        std::fs::write(target.join("Assets/required.zip"), "asset").unwrap();
+        std::fs::write(target.join("large.bin"), vec![0_u8; 16]).unwrap();
+
+        let result = scan_migration_source(MigrationSourceScanRequest {
+            target_path: target.to_string_lossy().to_string(),
+            ignore_policy: MigrationIgnorePolicy {
+                root_large_file_threshold_bytes: 8,
+                ..MigrationIgnorePolicy::default()
+            },
+        })
+        .unwrap();
+        let ignored = result["ignored_files"].as_array().unwrap();
+        assert!(ignored.iter().any(|item| item["path"] == "backup.zip"));
+        assert!(ignored.iter().any(|item| item["path"] == "large.bin"));
+        assert!(!ignored
+            .iter()
+            .any(|item| item["path"] == "Assets/required.zip"));
+        assert_eq!(result["file_count"], 2);
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn explicit_include_overrides_root_ignore_policy() {
+        let policy = normalized_ignore_policy(&MigrationIgnorePolicy {
+            included_relative_paths: vec!["backup.zip".to_string()],
+            ..MigrationIgnorePolicy::default()
+        });
+        assert!(!migration_policy_excludes(
+            Path::new("backup.zip"),
+            Some(200 * 1024 * 1024),
+            &policy
+        ));
+        assert!(migration_policy_excludes(
+            Path::new("other.zip"),
+            Some(1),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn migration_fingerprint_detects_changes_to_locally_retained_files() {
+        let target = std::env::temp_dir().join(format!(
+            " himind-retained-fingerprint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(target.join("Assets")).unwrap();
+        std::fs::write(target.join("Assets/Main.unity"), "scene").unwrap();
+        std::fs::write(target.join("backup.zip"), "archive-v1").unwrap();
+
+        let first = scan_migration_source(MigrationSourceScanRequest {
+            target_path: target.to_string_lossy().to_string(),
+            ignore_policy: MigrationIgnorePolicy::default(),
+        })
+        .unwrap();
+        std::fs::write(target.join("backup.zip"), "archive-v2").unwrap();
+        let second = scan_migration_source(MigrationSourceScanRequest {
+            target_path: target.to_string_lossy().to_string(),
+            ignore_policy: MigrationIgnorePolicy::default(),
+        })
+        .unwrap();
+
+        assert_ne!(first["source_fingerprint"], second["source_fingerprint"]);
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn migration_ignore_policy_keeps_local_files_out_of_a_real_svn_repository() {
+        let svn = find_svn_executable().unwrap();
+        let svnadmin = svn.with_file_name("svnadmin.exe");
+        if !svnadmin.is_file() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            " himind-ignore-svn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let source = root.join("source");
+        let repository = root.join("repository");
+        let working_copy = root.join("working-copy");
+        std::fs::create_dir_all(source.join("Assets")).unwrap();
+        std::fs::write(source.join("Assets/Main.unity"), "scene").unwrap();
+        std::fs::write(source.join("Assets/required.zip"), "required asset").unwrap();
+        std::fs::write(source.join("backup.zip"), "local archive").unwrap();
+        std::fs::write(source.join("large.bin"), vec![7_u8; 16]).unwrap();
+        let retained_before =
+            migration_source_stability_summary(&source, &[], &BTreeSet::new()).unwrap();
+
+        let created = Command::new(&svnadmin)
+            .args(["create", repository.to_string_lossy().as_ref()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap();
+        assert!(created.success());
+        let repository_url = Url::from_file_path(&repository).unwrap().to_string();
+        let checked_out = Command::new(&svn)
+            .args([
+                "checkout",
+                &repository_url,
+                working_copy.to_string_lossy().as_ref(),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap();
+        assert!(checked_out.success());
+
+        let policy = normalized_ignore_policy(&MigrationIgnorePolicy {
+            root_large_file_threshold_bytes: 8,
+            ..MigrationIgnorePolicy::default()
+        });
+        let source_summary =
+            copy_migration_tree(&source, &working_copy, &[], &BTreeSet::new(), &policy).unwrap();
+        run_svn_in_directory(
+            &working_copy,
+            [
+                "add",
+                "--force",
+                "--no-ignore",
+                "--parents",
+                "--depth",
+                "infinity",
+                ".",
+            ],
+        )
+        .unwrap();
+        apply_migration_ignore_policy(&source, &working_copy, &policy).unwrap();
+        run_svn_in_directory(&working_copy, ["commit", "-m", "migration ignore test"]).unwrap();
+
+        std::fs::copy(source.join("backup.zip"), working_copy.join("backup.zip")).unwrap();
+        std::fs::copy(source.join("large.bin"), working_copy.join("large.bin")).unwrap();
+        let ignore = run_svn_in_directory(&working_copy, ["propget", "svn:ignore", "."]).unwrap();
+        assert!(ignore.lines().any(|line| line == "*.zip"));
+        assert!(ignore.lines().any(|line| line == "large.bin"));
+        assert!(run_svn_in_directory(&working_copy, ["status"])
+            .unwrap()
+            .is_empty());
+
+        let listing = Command::new(&svn)
+            .args(["list", "--recursive", &repository_url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        let listing = decode_svn_cli_output(&listing.stdout);
+        assert!(listing.contains("Assets/Main.unity"));
+        assert!(listing.contains("Assets/required.zip"));
+        assert!(!listing.contains("backup.zip"));
+        assert!(!listing.contains("large.bin"));
+
+        let uuid = svn_item(&working_copy, "repos-uuid").unwrap();
+        verify_migration_working_copy(
+            &working_copy,
+            &repository_url,
+            &uuid,
+            &source_summary,
+            &[],
+            &BTreeSet::new(),
+            &policy,
+            "test repository",
+        )
+        .unwrap();
+        let retained_after =
+            migration_source_stability_summary(&source, &[], &BTreeSet::new()).unwrap();
+        assert_eq!(retained_before, retained_after);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn normalizes_external_urls_and_preserves_revision_options() {
         let source =
-            std::env::temp_dir().join(format!("himind-external-normalize-{}", std::process::id()));
+            std::env::temp_dir().join(format!(" himind-external-normalize-{}", std::process::id()));
         std::fs::create_dir_all(source.join("Packages")).unwrap();
         let result = normalize_external_property(
             &source,
@@ -4219,7 +4766,7 @@ mod tests {
     #[test]
     fn migration_tree_skips_generated_and_external_directories() {
         let root =
-            std::env::temp_dir().join(format!("himind-migration-tree-{}", std::process::id()));
+            std::env::temp_dir().join(format!(" himind-migration-tree-{}", std::process::id()));
         let source = root.join("source");
         let target = root.join("target");
         std::fs::create_dir_all(source.join("Assets")).unwrap();
@@ -4239,6 +4786,7 @@ mod tests {
             &target,
             &[PathBuf::from("Packages/External")],
             &BTreeSet::new(),
+            &normalized_ignore_policy(&MigrationIgnorePolicy::default()),
         )
         .unwrap();
         assert_eq!(summary.file_count, 1);
@@ -4252,7 +4800,7 @@ mod tests {
     #[test]
     fn migration_tree_summary_detects_template_residue_and_missing_source_files() {
         let root = std::env::temp_dir().join(format!(
-            "himind-migration-compare-{}-{}",
+            " himind-migration-compare-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4268,8 +4816,11 @@ mod tests {
         std::fs::write(target.join("Assets/Main.unity"), "scene").unwrap();
         std::fs::write(target.join("Assets/TemplateOnly.asset"), "template").unwrap();
 
-        let source_summary = migration_tree_summary(&source, &[], &BTreeSet::new()).unwrap();
-        let target_summary = migration_tree_summary(&target, &[], &BTreeSet::new()).unwrap();
+        let policy = normalized_ignore_policy(&MigrationIgnorePolicy::default());
+        let source_summary =
+            migration_tree_summary(&source, &[], &BTreeSet::new(), &policy).unwrap();
+        let target_summary =
+            migration_tree_summary(&target, &[], &BTreeSet::new(), &policy).unwrap();
         assert_eq!(source_summary.file_count, 2);
         assert_eq!(target_summary.file_count, 2);
         assert_ne!(source_summary, target_summary);
@@ -4280,7 +4831,7 @@ mod tests {
     #[test]
     fn working_copy_admin_backup_restores_on_drop() {
         let root = std::env::temp_dir().join(format!(
-            "himind-svn-backup-{}-{}",
+            " himind-svn-backup-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
