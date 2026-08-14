@@ -144,6 +144,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::pick_unity_editor,
             super::commands::save_unity_editor,
             super::commands::get_agent_logs,
+            super::commands::export_agent_diagnostics,
             super::commands::get_svn_connections,
             super::commands::save_svn_connection,
             super::commands::remove_svn_connection,

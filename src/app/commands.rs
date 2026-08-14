@@ -530,6 +530,39 @@ pub(crate) fn get_agent_logs(
 }
 
 #[tauri::command]
+pub(crate) fn export_agent_diagnostics(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let file_name = format!("himind-agent-diagnostics-{}.zip", diagnostics_unix_now());
+    let Some(destination) = rfd::FileDialog::new()
+        .set_title("导出 HiMind Agent 诊断包")
+        .set_file_name(&file_name)
+        .add_filter("ZIP 诊断包", &["zip"])
+        .save_file()
+    else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let worker = state
+        .worker_status
+        .lock()
+        .map_err(|_| "Agent Worker 状态不可用".to_string())?;
+    let path = crate::app::diagnostics::export_bundle(&destination, &state.options, &worker)
+        .map_err(|error| error.to_string())?;
+    drop(worker);
+    state
+        .approval_manager
+        .add_log("info", "已导出脱敏 Agent 诊断包");
+    Ok(json!({ "canceled": false, "path": path.to_string_lossy() }))
+}
+
+fn diagnostics_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[tauri::command]
 pub(crate) fn get_svn_connections() -> Result<serde_json::Value, String> {
     let items = crate::svn::service::list_connections().map_err(|error| error.to_string())?;
     Ok(json!({ "items": items }))
@@ -1747,6 +1780,7 @@ pub(crate) fn invoke_plugin_view_capability(
         reenroll: false,
         enrollment_token: std::env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default(),
         agent_credential: Arc::new(std::sync::RwLock::new(String::new())),
+        identity_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         platform_access: Arc::new(std::sync::RwLock::new(None)),
         task_execution: Arc::new(std::sync::RwLock::new(None)),
     };

@@ -1,16 +1,19 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{json, Value};
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::Write;
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use super::types::{StoredInnerAdminCredentials, StoredSvnConnection};
 
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 const UNITY_EDITOR_WORKFLOW_ENV: &str = "unity_art_editor";
+const DPAPI_PREFIX: &str = "dpapi:v1:";
+
+pub(crate) fn protected_secret_is_current(value: &str) -> bool {
+    value.starts_with(DPAPI_PREFIX)
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct LocalEditorSettings {
@@ -288,47 +291,163 @@ fn stored_inner_admin_account() -> Option<String> {
 }
 
 pub(crate) fn protect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
-    run_powershell_script(
-        r#"$plain = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $plain -AsPlainText -Force; ConvertFrom-SecureString $secure"#,
-        secret,
-    )
+    let protected = crypt_protect(secret)?;
+    Ok(format!("{DPAPI_PREFIX}{}", STANDARD.encode(protected)))
 }
 
 pub(crate) fn unprotect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
-    run_powershell_script(
-        r#"$encrypted = [Console]::In.ReadToEnd(); $secure = ConvertTo-SecureString $encrypted; $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }"#,
-        secret,
-    )
+    let blob = if let Some(encoded) = secret.strip_prefix(DPAPI_PREFIX) {
+        STANDARD.decode(encoded.trim())?
+    } else {
+        decode_legacy_dpapi_hex(secret)?
+    };
+    crypt_unprotect(&blob)
 }
 
-fn run_powershell_script(script: &str, stdin_payload: &str) -> Result<String, Box<dyn Error>> {
-    let mut last_error = String::new();
-    for shell in ["pwsh", "powershell"] {
-        let mut child = match Command::new(shell)
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                last_error = error.to_string();
-                continue;
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(stdin_payload.as_bytes())?;
-        }
-        let output = child.wait_with_output()?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
-        }
-        last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+fn decode_legacy_dpapi_hex(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() % 2 != 0
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("unsupported protected credential format".into());
     }
-    if last_error.is_empty() {
-        last_error = "PowerShell unavailable".to_string();
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair)?;
+        bytes.push(u8::from_str_radix(pair, 16)?);
     }
-    Err(format!("failed to access local credential store: {last_error}").into())
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn crypt_protect(secret: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let mut plaintext = secret
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: plaintext.len().try_into()?,
+        pbData: plaintext.as_mut_ptr(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let succeeded = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    plaintext.fill(0);
+    if succeeded == 0 {
+        return Err(format!(
+            "failed to protect local credential: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    let protected = unsafe {
+        let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        LocalFree(output.pbData.cast());
+        bytes
+    };
+    Ok(protected)
+}
+
+#[cfg(windows)]
+fn crypt_unprotect(protected: &[u8]) -> Result<String, Box<dyn Error>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: protected.len().try_into()?,
+        pbData: protected.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let succeeded = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if succeeded == 0 {
+        return Err(format!(
+            "failed to unprotect local credential: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    let result = unsafe {
+        let bytes = std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize);
+        let words = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let decoded = String::from_utf16(&words);
+        bytes.fill(0);
+        LocalFree(output.pbData.cast());
+        decoded?
+    };
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn crypt_protect(_secret: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    Err("Windows DPAPI is unavailable on this platform".into())
+}
+
+#[cfg(not(windows))]
+fn crypt_unprotect(_protected: &[u8]) -> Result<String, Box<dyn Error>> {
+    Err("Windows DPAPI is unavailable on this platform".into())
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::{
+        decode_legacy_dpapi_hex, protect_secret_for_current_user,
+        unprotect_secret_for_current_user, DPAPI_PREFIX,
+    };
+
+    #[test]
+    fn legacy_dpapi_hex_decoder_is_strict() {
+        assert_eq!(
+            decode_legacy_dpapi_hex("00a1FF").unwrap(),
+            vec![0, 0xa1, 0xff]
+        );
+        assert!(decode_legacy_dpapi_hex("not-hex").is_err());
+        assert!(decode_legacy_dpapi_hex("abc").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_dpapi_round_trip_uses_versioned_format() {
+        let protected = protect_secret_for_current_user("HiMind-test-凭据").unwrap();
+        assert!(protected.starts_with(DPAPI_PREFIX));
+        assert_eq!(
+            unprotect_secret_for_current_user(&protected).unwrap(),
+            "HiMind-test-凭据"
+        );
+    }
 }

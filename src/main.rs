@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -52,7 +52,7 @@ use svn::types::{
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
 
-pub(crate) const VERSION: &str = "0.3.8";
+pub(crate) const VERSION: &str = "0.3.9";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginViewLaunch {
@@ -300,6 +300,7 @@ pub(crate) struct Options {
     reenroll: bool,
     enrollment_token: String,
     agent_credential: Arc<RwLock<String>>,
+    identity_generation: Arc<AtomicU64>,
     platform_access: Arc<RwLock<Option<api::oauth::AgentAccessToken>>>,
     task_execution: Arc<RwLock<Option<(String, String, String, String)>>>,
 }
@@ -365,6 +366,7 @@ impl Options {
             reenroll,
             enrollment_token,
             agent_credential: Arc::new(RwLock::new(String::new())),
+            identity_generation: Arc::new(AtomicU64::new(0)),
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
         }
@@ -514,8 +516,15 @@ mod tests {
 impl Options {
     pub(crate) fn set_agent_credential(&self, credential: &str) {
         if let Ok(mut current) = self.agent_credential.write() {
-            *current = credential.to_string();
+            if current.as_str() != credential {
+                *current = credential.to_string();
+                self.identity_generation.fetch_add(1, Ordering::SeqCst);
+            }
         }
+    }
+
+    pub(crate) fn identity_generation(&self) -> u64 {
+        self.identity_generation.load(Ordering::SeqCst)
     }
 
     pub(crate) fn agent_credential(&self) -> String {

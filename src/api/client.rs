@@ -14,8 +14,9 @@ use super::types::{
     AgentResponse, AgentRunClaim, AgentState, AgentTaskHistoryItem, RemoteExecutionReport,
     RuntimeInstallationReport, Task, TaskCancelStatus,
 };
+use crate::store::atomic_file;
 use crate::store::credentials::{
-    protect_secret_for_current_user, unprotect_secret_for_current_user,
+    protect_secret_for_current_user, protected_secret_is_current, unprotect_secret_for_current_user,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -89,19 +90,7 @@ pub fn load_or_register(
 ) -> Result<AgentState, Box<dyn Error>> {
     if state_path.exists() {
         let mut state = load_agent_state(state_path)?;
-        let current_valid = !state.agent_id.trim().is_empty()
-            && !state.credential.trim().is_empty()
-            && matches!(
-                heartbeat(client, api_base, &state.agent_id, &state.credential),
-                Ok(true)
-            );
         if !state.credential_pending.trim().is_empty() {
-            if current_valid {
-                state.credential_pending.clear();
-                state.credential_pending_protected.clear();
-                save_agent_state(state_path, &state)?;
-                return Ok(state);
-            }
             if matches!(
                 heartbeat(client, api_base, &state.agent_id, &state.credential_pending),
                 Ok(true)
@@ -113,7 +102,19 @@ pub fn load_or_register(
                 save_agent_state(state_path, &state)?;
                 return Ok(state);
             }
-        } else if current_valid {
+        }
+        let current_valid = !state.agent_id.trim().is_empty()
+            && !state.credential.trim().is_empty()
+            && matches!(
+                heartbeat(client, api_base, &state.agent_id, &state.credential),
+                Ok(true)
+            );
+        if current_valid {
+            if !state.credential_pending.trim().is_empty() {
+                state.credential_pending.clear();
+                state.credential_pending_protected.clear();
+                save_agent_state(state_path, &state)?;
+            }
             return Ok(state);
         }
         if !enrollment_token.trim().is_empty() {
@@ -137,6 +138,7 @@ pub fn register_agent(
     }
     let name = env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-agent".to_string());
     let device_id = load_or_create_device_id(state_path)?;
+    let previous_state = load_agent_state(state_path).ok();
     let response = client
         .post(format!("{}/api/agent/register", api_base))
         .json(&json!({
@@ -181,14 +183,49 @@ pub fn register_agent(
         access_scope: response.scope,
         user_id: response.user_id,
     };
-    save_agent_state(state_path, &state)?;
+    let staged = previous_state.as_ref().filter(|previous| {
+        previous.agent_id == state.agent_id
+            && !previous.credential.trim().is_empty()
+            && previous.credential != state.credential
+    });
+    if let Some(previous) = staged {
+        let mut pending = state.clone();
+        pending.credential = previous.credential.clone();
+        pending.credential_protected = previous.credential_protected.clone();
+        pending.credential_pending = state.credential.clone();
+        pending.credential_pending_protected.clear();
+        pending.credential_updated_at = previous.credential_updated_at;
+        save_agent_state(state_path, &pending)?;
+    } else {
+        save_agent_state(state_path, &state)?;
+    }
     if let Some(token) = token_response.as_ref() {
         super::oauth::save_authorization_response(state_path, token)?;
+    }
+    if staged.is_some() {
+        save_agent_state(state_path, &state)?;
     }
     Ok(state)
 }
 
 pub fn load_agent_state(state_path: &Path) -> Result<AgentState, Box<dyn Error>> {
+    match load_agent_state_file(state_path) {
+        Ok(state) => Ok(state),
+        Err(primary_error) => {
+            let backup = atomic_file::backup_path(state_path);
+            let recovered = load_agent_state_file(&backup).map_err(|backup_error| {
+                format!(
+                    "Agent state is unreadable (primary: {primary_error}; backup: {backup_error})"
+                )
+            })?;
+            atomic_file::restore_backup(state_path)?;
+            eprintln!("Agent state recovered from the last known good backup");
+            Ok(recovered)
+        }
+    }
+}
+
+fn load_agent_state_file(state_path: &Path) -> Result<AgentState, Box<dyn Error>> {
     let content = fs::read_to_string(state_path)?;
     let mut state = serde_json::from_str::<AgentState>(&content)?;
     let missing_device_id = state.device_id.trim().is_empty();
@@ -209,6 +246,9 @@ pub fn load_agent_state(state_path: &Path) -> Result<AgentState, Box<dyn Error>>
     }
     let needs_migration = missing_device_id
         || state.credential_protected.trim().is_empty()
+        || !protected_secret_is_current(&state.credential_protected)
+        || (!state.credential_pending_protected.trim().is_empty()
+            && !protected_secret_is_current(&state.credential_pending_protected))
         || state.credential_updated_at == 0;
     if state.credential_updated_at == 0 {
         state.credential_updated_at = unix_now();
@@ -220,6 +260,7 @@ pub fn load_agent_state(state_path: &Path) -> Result<AgentState, Box<dyn Error>>
 }
 
 pub fn save_agent_state(state_path: &Path, state: &AgentState) -> Result<(), Box<dyn Error>> {
+    let _lock = atomic_file::lock(state_path)?;
     let mut stored = state.clone();
     stored.credential_protected = protect_secret_for_current_user(&state.credential)?;
     stored.credential_pending_protected = if state.credential_pending.trim().is_empty() {
@@ -230,15 +271,7 @@ pub fn save_agent_state(state_path: &Path, state: &AgentState) -> Result<(), Box
     if stored.credential_updated_at == 0 {
         stored.credential_updated_at = unix_now();
     }
-    if let Some(parent) = state_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = state_path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(&stored)?)?;
-    if state_path.exists() {
-        fs::remove_file(state_path)?;
-    }
-    fs::rename(temporary, state_path)?;
+    atomic_file::atomic_write(state_path, &serde_json::to_vec_pretty(&stored)?)?;
     Ok(())
 }
 
@@ -392,7 +425,7 @@ pub fn poll_tasks(
 ) -> Result<Vec<Task>, Box<dyn Error>> {
     let tasks = client
         .get(format!("{}/api/agent/tasks/poll", api_base))
-        .query(&[("agent_id", agent_id), ("wait", "25")])
+        .query(&[("agent_id", agent_id), ("wait", "10")])
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
         .error_for_status()?

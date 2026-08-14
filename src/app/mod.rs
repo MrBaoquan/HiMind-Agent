@@ -1,6 +1,7 @@
 pub(crate) mod ai_clients;
 pub(crate) mod ai_provider_import;
 pub(crate) mod commands;
+pub(crate) mod diagnostics;
 pub(crate) mod extension_reconciler;
 pub mod http;
 pub(crate) mod identity;

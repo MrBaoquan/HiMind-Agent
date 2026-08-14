@@ -1,15 +1,16 @@
+use base64::Engine;
+use rand::RngCore;
 use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fs4::fs_std::FileExt;
-
 use crate::api::client::load_agent_state;
 use crate::api::types::AgentState;
+use crate::store::atomic_file::{self, AtomicFileLock};
 use crate::store::credentials::{
     protect_secret_for_current_user, unprotect_secret_for_current_user,
 };
@@ -75,6 +76,8 @@ struct StoredAgentAuthorization {
     user_id: String,
     scope: String,
     refresh_token_protected: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pending_refresh_token_protected: String,
     refresh_expires_at: u64,
     updated_at: u64,
     #[serde(default)]
@@ -133,10 +136,9 @@ pub(crate) fn platform_access_token(
         return Ok(token.clone());
     }
 
-    let path = authorization_path(&options.state_path);
     let _refresh_lock = lock_authorization_file(&options.state_path)?;
-    let stored: StoredAgentAuthorization =
-        serde_json::from_slice(&fs::read(&path).map_err(|_| "请先登录 HiMind 账号")?)?;
+    let stored =
+        read_stored_authorization(&options.state_path).map_err(|_| "请先登录 HiMind 账号")?;
     if stored.refresh_expires_at <= unix_now() {
         let _ = clear_authorization_unlocked(&options.state_path);
         *cache = None;
@@ -151,6 +153,7 @@ pub(crate) fn platform_access_token(
         return Err(format!("Dashboard authorization is missing scope: {required_scope}").into());
     }
     let refresh_token = unprotect_secret_for_current_user(&stored.refresh_token_protected)?;
+    let next_refresh_token = prepare_refresh_attempt(&options.state_path, &stored)?;
     let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
     let response = client
         .post(format!("{}/oauth/token", options.api_base))
@@ -158,6 +161,7 @@ pub(crate) fn platform_access_token(
             ("grant_type", "refresh_token"),
             ("client_id", CLIENT_ID),
             ("refresh_token", refresh_token.as_str()),
+            ("next_refresh_token", next_refresh_token.as_str()),
         ])
         .send()?;
     let token = match parse_token_response(response) {
@@ -174,6 +178,9 @@ pub(crate) fn platform_access_token(
     };
     if token.agent_id != stored.agent_id {
         return Err("Dashboard returned an access token for a different Agent".into());
+    }
+    if token.refresh_token != next_refresh_token {
+        return Err("Dashboard returned an unexpected refresh token".into());
     }
     save_authorization_response_unlocked(&options.state_path, &token, Some(&stored))?;
     let access = access_from_response(&token);
@@ -226,6 +233,7 @@ fn save_authorization_response_unlocked(
         user_id: response.user_id.trim().to_string(),
         scope: response.scope.trim().to_string(),
         refresh_token_protected: protect_secret_for_current_user(&response.refresh_token)?,
+        pending_refresh_token_protected: String::new(),
         refresh_expires_at: unix_now()
             .saturating_add(response.refresh_token_expires_in.max(1) as u64),
         updated_at: unix_now(),
@@ -240,13 +248,35 @@ fn save_authorization_response_unlocked(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(&stored)?)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(temporary, path)?;
+    atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&stored)?)?;
     Ok(())
+}
+
+fn prepare_refresh_attempt(
+    state_path: &Path,
+    stored: &StoredAgentAuthorization,
+) -> Result<String, Box<dyn Error>> {
+    if !stored.pending_refresh_token_protected.trim().is_empty() {
+        return unprotect_secret_for_current_user(&stored.pending_refresh_token_protected);
+    }
+    let mut bytes = [0_u8; 48];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let next_refresh_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let mut pending = StoredAgentAuthorization {
+        version: stored.version,
+        agent_id: stored.agent_id.clone(),
+        user_id: stored.user_id.clone(),
+        scope: stored.scope.clone(),
+        refresh_token_protected: stored.refresh_token_protected.clone(),
+        pending_refresh_token_protected: protect_secret_for_current_user(&next_refresh_token)?,
+        refresh_expires_at: stored.refresh_expires_at,
+        updated_at: stored.updated_at,
+        display_name: stored.display_name.clone(),
+        last_verified_at: stored.last_verified_at,
+    };
+    pending.updated_at = unix_now();
+    write_stored_authorization(state_path, &pending)?;
+    Ok(next_refresh_token)
 }
 
 pub(crate) fn clear_authorization(state_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -428,9 +458,25 @@ fn save_user_info_snapshot(state_path: &Path, info: &AgentUserInfo) -> Result<()
 fn read_stored_authorization(
     state_path: &Path,
 ) -> Result<StoredAgentAuthorization, Box<dyn Error>> {
-    Ok(serde_json::from_slice(&fs::read(authorization_path(
-        state_path,
-    ))?)?)
+    let path = authorization_path(state_path);
+    match read_stored_authorization_file(&path) {
+        Ok(value) => Ok(value),
+        Err(primary_error) => {
+            let backup = atomic_file::backup_path(&path);
+            let recovered = read_stored_authorization_file(&backup).map_err(|backup_error| {
+                format!(
+                    "Agent user authorization is unreadable (primary: {primary_error}; backup: {backup_error})"
+                )
+            })?;
+            atomic_file::restore_backup(&path)?;
+            eprintln!("Agent user authorization recovered from the last known good backup");
+            Ok(recovered)
+        }
+    }
+}
+
+fn read_stored_authorization_file(path: &Path) -> Result<StoredAgentAuthorization, Box<dyn Error>> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 fn write_stored_authorization(
@@ -441,35 +487,12 @@ fn write_stored_authorization(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(stored)?)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(temporary, path)?;
+    atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(stored)?)?;
     Ok(())
 }
 
-fn lock_authorization_file(state_path: &Path) -> Result<AuthorizationFileLock, Box<dyn Error>> {
-    let path = authorization_path(state_path).with_extension("lock");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(path)?;
-    file.lock_exclusive()?;
-    Ok(AuthorizationFileLock(file))
-}
-
-struct AuthorizationFileLock(File);
-
-impl Drop for AuthorizationFileLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
+fn lock_authorization_file(state_path: &Path) -> Result<AtomicFileLock, Box<dyn Error>> {
+    Ok(atomic_file::lock(&authorization_path(state_path))?)
 }
 
 fn parse_token_response(response: Response) -> Result<OAuthTokenResponse, Box<dyn Error>> {
@@ -536,8 +559,8 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        authorization_requires_login, save_authorization_response, unix_now, AgentAccessToken,
-        OAuthTokenResponse,
+        authorization_requires_login, prepare_refresh_attempt, read_stored_authorization,
+        save_authorization_response, unix_now, AgentAccessToken, OAuthTokenResponse,
     };
     use std::fs;
 
@@ -610,6 +633,41 @@ mod tests {
         assert!(!raw.contains(refresh_token));
         assert!(!raw.contains("memory-only-access-token"));
         assert!(raw.contains("refresh_token_protected"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_attempt_reuses_persisted_pending_token() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-agent-oauth-pending-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create OAuth pending test directory");
+        let state_path = root.join("agent-state.json");
+        let response = OAuthTokenResponse {
+            access_token: "memory-only-access-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 600,
+            refresh_token: "current-refresh-token".to_string(),
+            refresh_token_expires_in: 3600,
+            scope: "agent.profile".to_string(),
+            user_id: "usr-test".to_string(),
+            agent_id: "agt-test".to_string(),
+        };
+        save_authorization_response(&state_path, &response).expect("save authorization");
+        let stored = read_stored_authorization(&state_path).expect("read authorization");
+        let first = prepare_refresh_attempt(&state_path, &stored).expect("prepare refresh");
+        let pending = read_stored_authorization(&state_path).expect("read pending authorization");
+        let retry = prepare_refresh_attempt(&state_path, &pending).expect("resume refresh");
+        assert_eq!(first, retry);
+        let raw = fs::read_to_string(root.join("agent-user-authorization.json"))
+            .expect("read raw authorization");
+        assert!(!raw.contains(&first));
+        assert!(!pending.pending_refresh_token_protected.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }

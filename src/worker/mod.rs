@@ -60,6 +60,10 @@ pub(crate) fn run_loop(
     worker_status: Option<Arc<Mutex<LocalWorkerStatus>>>,
     approval_mgr: Option<Arc<ApprovalManager>>,
 ) -> Result<(), Box<dyn Error>> {
+    let connect_started = Instant::now();
+    if let Some(logs) = approval_mgr.as_ref() {
+        logs.add_log("info", "Dashboard Worker 开始连接");
+    }
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     set_status(&worker_status, false, "", "正在连接 Dashboard 任务 Worker");
     let mut state = if options.reenroll {
@@ -100,6 +104,7 @@ pub(crate) fn run_loop(
         };
     }
     options.set_agent_credential(&state.credential);
+    let identity_generation = options.identity_generation();
     if let Err(error) = crate::api::client::sync_svn_management_credentials(
         &client,
         &options.api_base,
@@ -118,22 +123,41 @@ pub(crate) fn run_loop(
         };
     crate::api::oauth::cache_registration_access(&options, &state);
     set_status(&worker_status, true, &state.agent_id, "");
+    if let Some(logs) = approval_mgr.as_ref() {
+        logs.add_log(
+            "info",
+            &format!(
+                "Dashboard Worker 已连接，耗时 {} ms，Agent {}",
+                connect_started.elapsed().as_millis(),
+                state.agent_id
+            ),
+        );
+    }
     flush_report_outbox(&client, &options, &state.agent_id);
     crate::app::plugin_manager::flush_status_outbox(&options, &state.agent_id);
 
     println!("agent {} connected to {}", state.agent_id, options.api_base);
+    let restart_requested = Arc::new(AtomicBool::new(false));
     let heartbeat_stop = Arc::new(AtomicBool::new(false));
     let heartbeat_stop_for_thread = Arc::clone(&heartbeat_stop);
     let heartbeat_status = worker_status.clone();
     let heartbeat_client = client.clone();
     let heartbeat_options = options.clone();
+    let heartbeat_logs = approval_mgr.clone();
     let heartbeat_agent_id = state.agent_id.clone();
     let mut heartbeat_agent_state = state.clone();
     let heartbeat_interval = options.interval_seconds.max(1);
+    let heartbeat_restart_requested = Arc::clone(&restart_requested);
     let heartbeat_thread = thread::spawn(move || {
         let mut runtime_installations = crate::runtime::probe_installations();
         let mut last_runtime_probe = Instant::now();
+        let mut last_identity_error = String::new();
+        let mut last_heartbeat_error = String::new();
         while !heartbeat_stop_for_thread.load(Ordering::Relaxed) {
+            if heartbeat_options.identity_generation() != identity_generation {
+                heartbeat_restart_requested.store(true, Ordering::SeqCst);
+                break;
+            }
             if crate::api::client::agent_credential_rotation_due(&heartbeat_agent_state) {
                 heartbeat_agent_state = match crate::api::client::rotate_agent_credential(
                     &heartbeat_client,
@@ -153,6 +177,12 @@ pub(crate) fn run_loop(
                         ) {
                             Ok(recovered) => recovered,
                             Err(recovery_error) => {
+                                if let Some(logs) = heartbeat_logs.as_ref() {
+                                    logs.add_log(
+                                        "error",
+                                        &format!("Agent 凭据轮换恢复失败: {recovery_error}"),
+                                    );
+                                }
                                 set_status(
                                     &heartbeat_status,
                                     false,
@@ -165,6 +195,8 @@ pub(crate) fn run_loop(
                     }
                 };
                 heartbeat_options.set_agent_credential(&heartbeat_agent_state.credential);
+                heartbeat_restart_requested.store(true, Ordering::SeqCst);
+                break;
             }
             let heartbeat_credential = heartbeat_options.agent_credential();
             if let Err(error) = crate::api::client::sync_svn_management_credentials(
@@ -192,11 +224,35 @@ pub(crate) fn run_loop(
                 Some(&remote_execution),
             ) {
                 Ok(true) => {
+                    if !last_heartbeat_error.is_empty() {
+                        if let Some(logs) = heartbeat_logs.as_ref() {
+                            logs.add_log("info", "Dashboard 心跳已恢复");
+                        }
+                        last_heartbeat_error.clear();
+                    }
                     set_status(&heartbeat_status, true, &heartbeat_agent_id, "");
-                    if let Err(error) =
-                        crate::app::identity::sync_svn_credentials(&heartbeat_options)
-                    {
-                        eprintln!("SVN identity synchronization deferred: {error}");
+                    match crate::app::identity::sync_svn_credentials(&heartbeat_options) {
+                        Ok(_) => {
+                            if !last_identity_error.is_empty() {
+                                if let Some(logs) = heartbeat_logs.as_ref() {
+                                    logs.add_log("info", "Dashboard 用户授权连接已恢复");
+                                }
+                                last_identity_error.clear();
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            if message != last_identity_error {
+                                if let Some(logs) = heartbeat_logs.as_ref() {
+                                    logs.add_log(
+                                        "warn",
+                                        &format!("Dashboard 用户授权同步暂缓: {message}"),
+                                    );
+                                }
+                                last_identity_error = message.clone();
+                            }
+                            eprintln!("SVN identity synchronization deferred: {message}");
+                        }
                     }
                     crate::app::plugin_manager::flush_status_outbox(
                         &heartbeat_options,
@@ -204,20 +260,33 @@ pub(crate) fn run_loop(
                     );
                 }
                 Ok(false) => {
+                    if let Some(logs) = heartbeat_logs.as_ref() {
+                        logs.add_log("error", "Dashboard Agent 凭据已失效，Worker 将自动重连");
+                    }
                     set_status(
                         &heartbeat_status,
                         false,
                         "",
                         "Dashboard Agent 凭据已失效，需要管理员重新授权配对",
                     );
+                    heartbeat_restart_requested.store(true, Ordering::SeqCst);
                     break;
                 }
-                Err(error) => set_status(
-                    &heartbeat_status,
-                    false,
-                    &heartbeat_agent_id,
-                    &format!("Dashboard Agent 心跳失败：{error}"),
-                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    if message != last_heartbeat_error {
+                        if let Some(logs) = heartbeat_logs.as_ref() {
+                            logs.add_log("warn", &format!("Dashboard Agent 心跳失败: {message}"));
+                        }
+                        last_heartbeat_error = message.clone();
+                    }
+                    set_status(
+                        &heartbeat_status,
+                        false,
+                        &heartbeat_agent_id,
+                        &format!("Dashboard Agent 心跳失败：{message}"),
+                    )
+                }
             }
             for _ in 0..heartbeat_interval {
                 if heartbeat_stop_for_thread.load(Ordering::Relaxed) {
@@ -305,8 +374,17 @@ pub(crate) fn run_loop(
     };
 
     loop {
-        let credential = options.agent_credential();
-        let tasks = poll_tasks(&client, &options.api_base, &state.agent_id, &credential)?;
+        if restart_requested.load(Ordering::SeqCst)
+            || options.identity_generation() != identity_generation
+        {
+            return Err("Dashboard Agent 身份已更新，正在重新连接任务 Worker".into());
+        }
+        let tasks = poll_tasks(
+            &client,
+            &options.api_base,
+            &state.agent_id,
+            &state.credential,
+        )?;
         for task in tasks {
             execute_task(
                 &client,
@@ -369,6 +447,12 @@ pub(crate) fn run_supervisor(
             }
             Err(error) => {
                 let message = error.to_string();
+                if let Some(logs) = approval_mgr.as_ref() {
+                    logs.add_log(
+                        "error",
+                        &format!("Dashboard Worker 已停止并准备重连: {message}"),
+                    );
+                }
                 set_status(&Some(Arc::clone(&worker_status)), false, "", &message);
                 eprintln!("agent worker stopped: {}", message);
                 thread::sleep(Duration::from_secs(2));

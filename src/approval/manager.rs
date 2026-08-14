@@ -1,12 +1,15 @@
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Instant;
+use std::{fs, io::Write, path::PathBuf};
 
 use super::types::*;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub time: String,
+    #[serde(default)]
+    pub timestamp: u64,
     pub level: String,
     pub message: String,
 }
@@ -15,14 +18,20 @@ pub struct ApprovalManager {
     pending: Mutex<Vec<PendingApproval>>,
     settings: Mutex<ApprovalSettings>,
     log_entries: Mutex<Vec<LogEntry>>,
+    log_path: PathBuf,
 }
 
 impl ApprovalManager {
     pub fn new() -> Self {
+        let log_path = crate::store::paths::agent_home()
+            .join("logs")
+            .join("agent-events.jsonl");
+        let log_entries = load_persisted_logs(&log_path);
         Self {
             pending: Mutex::new(Vec::new()),
             settings: Mutex::new(ApprovalSettings::default()),
-            log_entries: Mutex::new(Vec::new()),
+            log_entries: Mutex::new(log_entries),
+            log_path,
         }
     }
 
@@ -163,12 +172,15 @@ impl ApprovalManager {
     }
 
     pub fn add_log(&self, level: &str, message: &str) {
+        let entry = LogEntry {
+            time: now_string(),
+            timestamp: unix_now(),
+            level: level.to_string(),
+            message: redact_message(message),
+        };
         if let Ok(mut logs) = self.log_entries.lock() {
-            logs.push(LogEntry {
-                time: now_string(),
-                level: level.to_string(),
-                message: message.to_string(),
-            });
+            persist_log_entry(&self.log_path, &entry);
+            logs.push(entry);
             if logs.len() > 500 {
                 logs.drain(0..200);
             }
@@ -200,6 +212,76 @@ impl ApprovalManager {
     }
 }
 
+fn load_persisted_logs(path: &std::path::Path) -> Vec<LogEntry> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut entries = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<LogEntry>(line).ok())
+        .collect::<Vec<_>>();
+    if entries.len() > 500 {
+        entries.drain(0..entries.len() - 500);
+    }
+    entries
+}
+
+fn persist_log_entry(path: &std::path::Path, entry: &LogEntry) {
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    rotate_logs(path);
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(entry) {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
+fn rotate_logs(path: &std::path::Path) {
+    const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+    if path.metadata().map(|value| value.len()).unwrap_or_default() < MAX_LOG_BYTES {
+        return;
+    }
+    let second = path.with_extension("jsonl.2");
+    let first = path.with_extension("jsonl.1");
+    let _ = fs::remove_file(&second);
+    let _ = fs::rename(&first, &second);
+    let _ = fs::rename(path, &first);
+}
+
+pub(crate) fn redact_message(message: &str) -> String {
+    const MARKERS: [&str; 6] = [
+        "Bearer ",
+        "credential=",
+        "access_token=",
+        "refresh_token=",
+        "password=",
+        "token=",
+    ];
+    let mut result = message.to_string();
+    for marker in MARKERS {
+        let mut offset = 0;
+        while let Some(relative) = result[offset..].find(marker) {
+            let start = offset + relative + marker.len();
+            let end = result[start..]
+                .find(|value: char| value.is_whitespace() || matches!(value, '&' | ',' | ';' | '"'))
+                .map(|value| start + value)
+                .unwrap_or(result.len());
+            if end <= start {
+                break;
+            }
+            result.replace_range(start..end, "[REDACTED]");
+            offset = start + "[REDACTED]".len();
+        }
+    }
+    result
+}
+
 fn generate_id() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
@@ -217,4 +299,27 @@ fn now_string() -> String {
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::redact_message;
+
+    #[test]
+    fn diagnostic_logs_redact_common_secret_fields() {
+        let message =
+            "request token=secret123&scope=a Bearer access-secret credential=device-secret";
+        let redacted = redact_message(message);
+        assert!(!redacted.contains("secret123"));
+        assert!(!redacted.contains("access-secret"));
+        assert!(!redacted.contains("device-secret"));
+        assert!(redacted.matches("[REDACTED]").count() >= 3);
+    }
 }

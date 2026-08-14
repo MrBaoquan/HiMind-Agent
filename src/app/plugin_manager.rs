@@ -1465,6 +1465,7 @@ mod tests {
             reenroll: false,
             enrollment_token: String::new(),
             agent_credential: Arc::new(RwLock::new("credential".to_string())),
+            identity_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
         };

@@ -141,6 +141,11 @@ export type LogItem = {
     message?: string;
 };
 
+export type DiagnosticsExportResult = {
+    canceled: boolean;
+    path?: string;
+};
+
 export type PluginRegistry = {
     registry_ready: boolean;
     registry_dir?: string;
@@ -811,6 +816,7 @@ export const agentApi = {
     installOpenHandsRuntime: () => invoke<OpenHandsRuntimeStatus>('install_openhands_runtime'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
+    exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),
     plugins: () => invoke<PluginRegistry>('get_plugin_registry'),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
