@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CircleAlert, CircleCheck, ShieldCheck, Unplug } from 'lucide-react';
+import { ArrowLeft, CircleAlert, CircleCheck, ShieldCheck, Unplug } from 'lucide-react';
 import { EmptyState, Pill } from '../components/Common';
 import type { CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, PluginRegistry } from '../services/agentApi';
 
@@ -24,6 +24,7 @@ type LocalInfo = {
 export function ManagedCapabilitiesPanel({ assetKind, desired, loading, error, registry, skillStatus }: ManagedCapabilitiesPageProps) {
   const items = useMemo(() => managedItems(desired, registry, skillStatus).filter(item => item.asset_kind === assetKind), [assetKind, desired, registry, skillStatus]);
   const [selectedKey, setSelectedKey] = useState('');
+  const [detailOpen, setDetailOpen] = useState(false);
   useEffect(() => {
     if (!items.some(item => `${item.asset_kind}:${item.asset_key}` === selectedKey)) {
       setSelectedKey(items[0] ? `${items[0].asset_kind}:${items[0].asset_key}` : '');
@@ -36,30 +37,31 @@ export function ManagedCapabilitiesPanel({ assetKind, desired, loading, error, r
   const requiredCount = items.filter(item => policyLabel(item) === '组织必装').length;
   const managedCount = items.filter(item => policyLabel(item) === '组织管理').length;
 
-  if (loading && !desired) return <div className="page-loading"><span className="spinner" />正在读取系统内置{assetKind === 'plugin' ? '插件' : '技能'}</div>;
+  if (loading && !desired) return <div className="page-loading"><span className="spinner" />正在读取受管理{assetKind === 'plugin' ? '插件' : '技能'}</div>;
 
   return (
     <div className="managed-page managed-panel">
-      {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>系统内置数据暂时不可用</strong><span>{error}</span></div></div> : null}
-      <section className="managed-summary" aria-label="系统内置摘要">
+      {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>受管理数据暂时不可用</strong><span>{error}</span></div></div> : null}
+      {items.length ? <section className="managed-summary" aria-label="受管理能力摘要">
         <div><span>系统内置</span><strong>{builtinCount}</strong></div>
         <div><span>组织必装</span><strong>{requiredCount}</strong></div>
         <div><span>组织管理</span><strong>{managedCount}</strong></div>
         <div><span>需处理</span><strong className={attentionCount ? 'warning-text' : ''}>{attentionCount}</strong></div>
-        <div className="managed-summary-note"><ShieldCheck size={16} /><span>{desired?.generation ? `策略版本 ${desired.generation}` : '尚未获取策略版本'}</span></div>
-      </section>
+        <details className="managed-summary-note"><summary><ShieldCheck size={16} /><span>策略信息</span></summary><code>{desired?.generation || '尚未获取策略版本'}</code></details>
+      </section> : null}
 
       {!items.length ? (
-        <div className="managed-empty"><EmptyState icon={Unplug} title={`当前没有系统内置${assetKind === 'plugin' ? '插件' : '技能'}`} text={error ? '请完成 Agent 配对后重新刷新。' : '系统内置和组织策略条目会显示在这里。'} /></div>
+        <div className="managed-empty"><EmptyState icon={Unplug} title={`当前没有受管理${assetKind === 'plugin' ? '插件' : '技能'}`} text={error ? '请完成 Agent 配对后重新刷新。' : '系统内置和组织管理的条目会显示在这里。'} /></div>
       ) : (
-        <section className="managed-workspace">
-          <aside className="managed-list" aria-label="系统内置条目列表">
+        <section className={`managed-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
+          <aside className="managed-list" aria-label="受管理条目列表">
             <div className="managed-list-header"><strong>全部条目</strong><span className="section-count">{items.length}</span></div>
             <div className="managed-list-body">
-              {items.map(item => <ManagedListItem key={`${item.asset_kind}:${item.asset_key}`} item={item} local={localFor(item)} selected={`${item.asset_kind}:${item.asset_key}` === selectedKey} onSelect={() => setSelectedKey(`${item.asset_kind}:${item.asset_key}`)} />)}
+              {items.map(item => <ManagedListItem key={`${item.asset_kind}:${item.asset_key}`} item={item} local={localFor(item)} selected={`${item.asset_kind}:${item.asset_key}` === selectedKey} onSelect={() => { setSelectedKey(`${item.asset_kind}:${item.asset_key}`); setDetailOpen(true); }} />)}
             </div>
           </aside>
           <main className="managed-detail">
+            <button className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回全部条目</button>
             {selected ? <ManagedDetail item={selected} local={localFor(selected)} /> : null}
           </main>
         </section>

@@ -31,7 +31,7 @@ export function NotificationCenter({ messages, onClose }: { messages: UiMessage[
 
 export function PageHeader({ title, description, actions }: { title: string; description: string; actions?: ReactNode }) {
   return (
-    <header className="page-header">
+    <header className={`page-header${actions ? ' has-actions' : ''}`}>
       <div>
         <h2>{title}</h2>
         <p>{description}</p>

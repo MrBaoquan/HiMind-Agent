@@ -82,19 +82,30 @@ pub(crate) fn bootstrap_svn_admin_credentials() -> Result<bool, Box<dyn Error>> 
     if username.trim().is_empty() || password.is_empty() {
         return Err("SVN_ADMIN_USERNAME and SVN_ADMIN_PASSWORD must be configured together".into());
     }
-    save_local_svn_connection(
-        SVN_ADMIN_CONNECTION_ID,
-        "公司 SVN 管理",
-        SVN_ADMIN_URL,
-        username.trim(),
-        &password,
-        "svnadmin_v2",
-    )?;
+    install_svn_admin_credentials(username.trim(), &password)?;
     unsafe {
         std::env::remove_var("SVN_ADMIN_USERNAME");
         std::env::remove_var("SVN_ADMIN_PASSWORD");
     }
     Ok(true)
+}
+
+pub(crate) fn install_svn_admin_credentials(
+    username: &str,
+    password: &str,
+) -> Result<(), Box<dyn Error>> {
+    if username.trim().is_empty() || password.is_empty() {
+        return Err("SVN management credentials are incomplete".into());
+    }
+    save_local_svn_connection(
+        SVN_ADMIN_CONNECTION_ID,
+        "公司 SVN 管理",
+        SVN_ADMIN_URL,
+        username.trim(),
+        password,
+        "svnadmin_v2",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn default_svn_username(display_name: &str) -> Result<String, Box<dyn Error>> {
@@ -297,7 +308,10 @@ fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error
     if output.status.success() {
         return Ok(json!({ "authenticated": true, "username": username }));
     }
-    if stderr.contains("E215004") || stderr.contains("E170001") || stderr.contains("Authentication failed") {
+    if stderr.contains("E215004")
+        || stderr.contains("E170001")
+        || stderr.contains("Authentication failed")
+    {
         return Err("SVN account or password is invalid".into());
     }
     // The repository root URL is not itself a repository, so an info probe

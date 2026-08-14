@@ -582,8 +582,8 @@ function App() {
         await agentApi.setSkillSyncMode(mode);
         await agentApi.syncCodexSkills();
         await refreshSkills();
-        return '高级文件设置已更新';
-      }, '更新文件设置失败')}
+        return '安装方式已更新';
+      }, '更新安装方式失败')}
       onPlanMarketplace={agentApi.planOrganizationSkillInstall}
       onLoadVersions={agentApi.skillVersions}
       onInstallMarketplace={(skillId, version, optionalPluginIds) => runSkillOperation(`market:${skillId}`, async () => {

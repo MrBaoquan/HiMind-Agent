@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Blocks, BookOpen, CheckCircle2, CircleAlert, Clock3, FolderOpen, GitBranch, Hammer, Inbox, Plus, RefreshCw, Save, Search, Send, Trash2, UserPlus, Users, X } from 'lucide-react';
+import { ArrowLeft, Blocks, BookOpen, CheckCircle2, CircleAlert, Clock3, FolderOpen, GitBranch, Hammer, Inbox, Plus, RefreshCw, Save, Search, Send, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
 import { FUNCTIONAL_CATEGORIES } from '../data/categoryCatalog';
 import type { AuthoringPluginDraft, AuthoringSkillDraft, CreateExtensionProjectInput, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
@@ -55,6 +55,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   const [query, setQuery] = useState('');
   const [kindFilter, setKindFilter] = useState<'all' | ExtensionProjectKind>('all');
   const [selectedKey, setSelectedKey] = useState('');
+  const [detailOpen, setDetailOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [removeProject, setRemoveProject] = useState<ExtensionProject | null>(null);
   const models = useMemo(() => buildProjectModels(props), [props.projects, props.remoteProjects, props.pluginDrafts, props.skillDrafts, props.pluginSubmissions, props.skillSubmissions]);
@@ -86,15 +87,16 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
       </div>
       <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索项目" /></label>
     </div>
-    <section className="development-workspace">
+    <section className={`development-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
       <aside className="development-project-list">
         <div className="development-list-heading"><strong>项目</strong><span>{visible.length}</span></div>
         <div className="development-list-body">
-          {visible.map(project => <ProjectListItem key={project.key} project={project} selected={project.key === selected?.key} onSelect={setSelectedKey} />)}
+          {visible.map(project => <ProjectListItem key={project.key} project={project} selected={project.key === selected?.key} onSelect={key => { setSelectedKey(key); setDetailOpen(true); }} />)}
           {!visible.length ? <EmptyState icon={Blocks} title="没有项目" text="新建项目或打开已有项目。" /> : null}
         </div>
       </aside>
       <main className="development-project-detail">
+        <button className="workspace-back development-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回项目列表</button>
         {selected ? <ProjectDetail key={selected.key} project={selected} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onSubmit={props.onSubmit} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个项目" text="查看本地工程、构建和发布进度。" />}
       </main>
     </section>

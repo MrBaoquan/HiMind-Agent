@@ -62,7 +62,7 @@ export function DashboardPage({
   const aiReadyCount = aiIntegration?.clients.filter(client => client.detected && client.state === 'configured').length || 0;
   const aiInstalledCount = aiIntegration?.clients.filter(client => client.detected).length || 0;
   return (
-    <>
+    <div className="dashboard-page">
       <PageHeader
         title="HiMind Agent"
         description="查看这台电脑与 HiMind 工作台的连接状态。"
@@ -105,7 +105,7 @@ export function DashboardPage({
         </div>
         <div className="overview-technical-actions"><button className="btn" onClick={onOpenAgentDirectory}><FolderOpen size={16} />程序目录</button><button className="btn" onClick={onOpenSettings}><Settings2 size={16} />打开设置</button></div>
       </details>
-    </>
+    </div>
   );
 }
 

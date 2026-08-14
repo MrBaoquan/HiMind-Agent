@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   BookOpen,
+  ArrowLeft,
   BadgeCheck,
   Building2,
   CircleAlert,
@@ -62,6 +63,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
     } catch { return 'installed'; }
   });
   const [selectedId, setSelectedId] = useState('');
+  const [detailOpen, setDetailOpen] = useState(false);
   const [pendingUninstall, setPendingUninstall] = useState<CodexSkillStatusItem | null>(null);
   const [installPlan, setInstallPlan] = useState<SkillInstallPlan | null>(null);
   const [planError, setPlanError] = useState('');
@@ -130,6 +132,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
     }
   }, [view, marketplaceItems, localItems, selectedId]);
 
+  useEffect(() => { setDetailOpen(false); }, [view]);
   useEffect(() => { try { window.localStorage.setItem('himind-agent.skills-view', view); } catch { /* storage is optional */ } }, [view]);
 
   const filteredItems = useMemo(() => {
@@ -177,25 +180,25 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
 	  <div className="plugin-toolbar skill-view-toolbar"><div className="plugin-tabs" role="tablist" aria-label="技能视图">
 	    <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button>
 	    <button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{installedCount}</span></button>
-	    <button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>系统内置 <span>{systemSkillCount}</span></button>
-	  </div></div>
-	  {view === 'installed' ? <details className="skill-sync-settings"><summary><span><strong>高级文件设置</strong><small>当前使用{syncMode === 'symlink' ? '软链接' : '复制文件'}</small></span></summary><div className="segmented-control" role="group" aria-label="技能文件管理方式"><button type="button" className={syncMode === 'copy' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('copy')}><Files size={14} />复制文件</button><button type="button" className={syncMode === 'symlink' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('symlink')}><Link2 size={14} />软链接</button></div></details> : null}
+	    <button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>受管理 <span>{systemSkillCount}</span></button>
+	  </div><div className="skill-sync-compact"><span>安装方式</span><div className="segmented-control" role="group" aria-label="技能安装方式"><button type="button" title="复制文件" aria-label="复制文件" aria-pressed={syncMode === 'copy'} className={syncMode === 'copy' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('copy')}><Files size={13} />复制</button><button type="button" title="软链接" aria-label="软链接" aria-pressed={syncMode === 'symlink'} className={syncMode === 'symlink' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('symlink')}><Link2 size={13} />链接</button></div></div></div>
 
-      {view === 'system' ? <ManagedCapabilitiesPanel assetKind="skill" desired={desired} loading={desiredLoading} error={desiredError} registry={pluginRegistry} skillStatus={status} /> : <section className="skill-workspace">
+      {view === 'system' ? <ManagedCapabilitiesPanel assetKind="skill" desired={desired} loading={desiredLoading} error={desiredError} registry={pluginRegistry} skillStatus={status} /> : <section className={`skill-workspace ${view === 'marketplace' ? 'skill-marketplace-workspace' : ''} ${view === 'marketplace' && !visibleMarket.length ? 'catalog-empty-workspace' : ''} compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
         <aside className="skill-browser">
           <div className="skill-browser-tools">
             <label className="skill-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索技能" /></label>
-            {view === 'marketplace' ? <div className="market-category-block"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">技能功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部技能（{marketplace.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="技能功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部技能<span>{marketplace.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div> : null}
           </div>
+          {view === 'marketplace' ? <div className="market-category-block skill-marketplace-category"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">技能功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部技能（{marketplace.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="技能功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部技能<span>{marketplace.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div> : null}
           {view === 'marketplace' ? <div className="plugin-catalog-result"><span>{marketplaceTotal} 个结果</span>{marketplaceLoading ? <span className="spinner" /> : null}</div> : null}
           <div className="skill-browser-list">
-			{view === 'marketplace' ? visibleMarket.map(item => <MarketSkillListItem key={item.skill_id} item={item} installed={installedById.get(item.skill_id)} selected={item.skill_id === selectedMarket?.skill_id} onSelect={setSelectedId} />) : filteredItems.map(item => <SkillListItem key={item.record.manifest.id} item={item} selected={item.record.manifest.id === selected?.record.manifest.id} onSelect={setSelectedId} />)}
+			{view === 'marketplace' ? visibleMarket.map(item => <MarketSkillListItem key={item.skill_id} item={item} installed={installedById.get(item.skill_id)} selected={item.skill_id === selectedMarket?.skill_id} onSelect={id => { setSelectedId(id); setDetailOpen(true); }} />) : filteredItems.map(item => <SkillListItem key={item.record.manifest.id} item={item} selected={item.record.manifest.id === selected?.record.manifest.id} onSelect={id => { setSelectedId(id); setDetailOpen(true); }} />)}
 			{view === 'marketplace' && visibleMarket.length < marketplaceTotal ? <button className="plugin-load-more" disabled={marketplaceLoading} onClick={() => void loadMoreMarketplace()}>{marketplaceLoading ? '正在加载' : '加载更多'}</button> : null}
-			{(view === 'marketplace' ? !visibleMarket.length && !marketplaceLoading : !filteredItems.length) ? <EmptyState icon={view === 'marketplace' ? Building2 : BookOpen} title={view === 'marketplace' ? '技能库暂无内容' : '没有匹配的技能'} text={view === 'marketplace' ? '审核通过并正式发布的 AI 技能会出现在这里。' : '调整搜索内容或筛选条件。'} /> : null}
+			{(view === 'marketplace' ? !visibleMarket.length && !marketplaceLoading : !filteredItems.length) ? <EmptyState icon={view === 'marketplace' ? Building2 : BookOpen} title={view === 'marketplace' ? (marketplace.length ? '没有匹配的技能' : '技能市场暂无内容') : '没有匹配的技能'} text={view === 'marketplace' ? (marketplace.length ? '调整搜索关键词或分类后重试。' : '审核通过并正式发布的 AI 技能会出现在这里。') : '调整搜索内容或筛选条件。'} /> : null}
           </div>
         </aside>
 
         <main className="skill-detail">
+		  <button className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回技能列表</button>
 		  {view === 'marketplace' ? (selectedMarket ? <MarketSkillDetail item={selectedMarket} installed={installedById.get(selectedMarket.skill_id)} availablePlugins={availablePlugins} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlan={(version) => void openInstallPlan(selectedMarket.skill_id, version)} planLoading={planLoading} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />) : (selected ? <SkillDetail item={selected} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />)}
         </main>
       </section>}
@@ -216,7 +219,7 @@ function MarketSkillListItem({ item, installed, selected, onSelect }: { item: Or
   const managed = item.assignment === 'required' && item.management !== 'user_managed';
   const label = item.assignment === 'blocked' ? '不可安装' : update ? '可更新' : installed ? '已安装' : managed ? '由组织管理' : item.assignment === 'recommended' ? '组织推荐' : '可安装';
   const tone = item.assignment === 'blocked' ? 'danger' : update ? 'warn' : installed ? 'success' : managed ? 'warn' : 'neutral';
-  return <button className={`skill-browser-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(item.skill_id)}><span className={`skill-state-rail ${tone}`} /><span className="skill-browser-item-copy"><strong>{item.name}</strong><small>{item.source === 'organization' ? '组织提供' : '公共技能库'} · {item.description || '暂无用途说明'}</small><small className="catalog-item-author">作者：{item.author_name || '马宝全'}</small></span><span className={`skill-state-label ${tone}`}>{label}</span></button>;
+  return <button className={`skill-browser-item skill-marketplace-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(item.skill_id)}><span className={`skill-card-mark ${tone}`}>{item.name.slice(0, 1).toUpperCase()}</span><span className="skill-browser-item-copy"><strong>{item.name}</strong><small>{item.source === 'organization' ? '组织提供' : '公共技能库'} · {item.description || '暂无用途说明'}</small><small className="catalog-item-author">作者：{item.author_name || '马宝全'}</small></span><span className={`skill-state-label ${tone}`}>{label}</span></button>;
 }
 
 const SKILL_CLIENTS = [

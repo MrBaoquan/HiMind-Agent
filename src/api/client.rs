@@ -321,6 +321,35 @@ pub fn heartbeat(
     heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None)
 }
 
+#[derive(serde::Deserialize)]
+struct SvnManagementBootstrapResponse {
+    username: String,
+    password: String,
+}
+
+pub fn sync_svn_management_credentials(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<bool, Box<dyn Error>> {
+    if crate::svn::service::svn_admin_ready() {
+        return Ok(false);
+    }
+    let response = client
+        .get(format!("{}/api/agent/svn-management/bootstrap", api_base))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .send()?;
+    if response.status() == StatusCode::NO_CONTENT {
+        return Ok(false);
+    }
+    let bootstrap = response
+        .error_for_status()?
+        .json::<SvnManagementBootstrapResponse>()?;
+    crate::svn::service::install_svn_admin_credentials(&bootstrap.username, &bootstrap.password)?;
+    Ok(true)
+}
+
 pub fn heartbeat_with_runtime_installations(
     client: &Client,
     api_base: &str,

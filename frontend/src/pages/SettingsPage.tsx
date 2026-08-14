@@ -145,6 +145,12 @@ export function SettingsPage({
     <>
       <PageHeader title="设置" description="管理远程任务、账号、开发工具和启动设置。" />
       <div className="settings-workspace">
+        <label className="settings-section-select">
+          <span>设置分类</span>
+          <select value={section} onChange={event => setSection(event.target.value as SettingsSection)}>
+            {SETTINGS_SECTIONS.map(item => <option key={item.key} value={item.key}>{item.label} · {item.description}</option>)}
+          </select>
+        </label>
         <nav className="settings-nav" aria-label="设置分类">
           {SETTINGS_SECTIONS.map(item => (
             <button key={item.key} className={section === item.key ? 'active' : ''} onClick={() => setSection(item.key)} aria-current={section === item.key ? 'page' : undefined}>
@@ -195,12 +201,15 @@ export function SettingsPage({
                     </button>
                   </div>
                 </div>
-                <div className="runtime-facts">
-                  <div><span>uv</span><strong>{openHandsRuntimeStatus?.uv_available ? openHandsRuntimeStatus.uv_version : '未检测到'}</strong></div>
-                  <div><span>CLI 参数预检</span><strong>{openHandsRuntimeStatus?.cli_compatible ? '通过' : '未通过'}</strong></div>
-                  <div><span>Python 3.12</span><strong>{openHandsRuntimeStatus?.python_available ? openHandsRuntimeStatus.python_version : '未检测到（uv 会按需安装）'}</strong></div>
-                  <div><span>命令</span><code>{openHandsRuntimeStatus?.executable_path || 'openhands'}</code></div>
-                </div>
+                <details className="runtime-details">
+                  <summary>安装详情</summary>
+                  <div className="runtime-facts">
+                    <div><span>uv</span><strong>{openHandsRuntimeStatus?.uv_available ? openHandsRuntimeStatus.uv_version : '未检测到'}</strong></div>
+                    <div><span>CLI 参数预检</span><strong>{openHandsRuntimeStatus?.cli_compatible ? '通过' : '未通过'}</strong></div>
+                    <div><span>Python 3.12</span><strong>{openHandsRuntimeStatus?.python_available ? openHandsRuntimeStatus.python_version : '未检测到（uv 会按需安装）'}</strong></div>
+                    <div><span>命令</span><code>{openHandsRuntimeStatus?.executable_path || 'openhands'}</code></div>
+                  </div>
+                </details>
                 {openHandsRuntimeStatus && openHandsRuntimeStatus.status === 'error' ? <div className="runtime-prerequisite"><ShieldAlert size={16} /><span>{openHandsRuntimeStatus.message}</span></div> : null}
               </div>
             </section>
