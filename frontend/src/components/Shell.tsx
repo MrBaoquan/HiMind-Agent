@@ -21,16 +21,16 @@ type ShellProps = {
 
 const navSections = [
   {
-    label: '我的 Agent',
+    label: 'Agent',
     items: [
-      { key: 'dashboard', icon: LayoutDashboard, label: '执行端概览' },
-      { key: 'approvals', icon: ClipboardCheck, label: '授权中心' },
+      { key: 'dashboard', icon: LayoutDashboard, label: '概览' },
+      { key: 'approvals', icon: ClipboardCheck, label: '审批' },
     ],
   },
   {
     label: '能力',
     items: [
-      { key: 'ai', icon: Cable, label: 'AI 工具连接' },
+      { key: 'ai', icon: Cable, label: 'AI 连接' },
       { key: 'skills', icon: BookOpen, label: '技能' },
       { key: 'plugins', icon: Blocks, label: '插件' },
     ],
@@ -38,14 +38,14 @@ const navSections = [
   {
     label: '设备',
     items: [
-      { key: 'settings', icon: Settings, label: '设备设置' },
+      { key: 'settings', icon: Settings, label: '设置' },
     ],
   },
 ] satisfies { label: string; items: { key: PageKey; icon: typeof LayoutDashboard; label: string }[] }[];
 
 const developerNavItems = [
-  { key: 'development', icon: Hammer, label: '扩展开发' },
-  { key: 'logs', icon: FileText, label: '诊断日志' },
+  { key: 'development', icon: Hammer, label: '扩展' },
+  { key: 'logs', icon: FileText, label: '日志' },
 ] satisfies { key: PageKey; icon: typeof LayoutDashboard; label: string }[];
 
 type MenuKey = 'application' | 'diagnostics' | 'help';
@@ -91,7 +91,7 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
               <button type="button" role="menuitem" onClick={() => runAction(onOpenDashboard)}><ExternalLink size={16} /><span>打开工作台</span></button>
               <button type="button" role="menuitem" disabled={updateBusy} onClick={() => runAction(onCheckUpdate)}><RefreshCw className={updateBusy ? 'spin' : ''} size={16} /><span>{updateBusy ? '正在检查更新' : '检查更新'}</span></button>
               <div className="app-menu-separator" role="separator" />
-              <button type="button" role="menuitem" className="danger" onClick={() => runAction(onQuit)}><LogOut size={16} /><span>退出 HiMind Agent</span></button>
+              <button type="button" role="menuitem" className="danger" onClick={() => runAction(onQuit)}><LogOut size={16} /><span>退出 Agent</span></button>
             </div>
           ) : null}
         </div>
@@ -103,8 +103,8 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
           {openMenu === 'diagnostics' ? (
             <div className="app-menu-dropdown" role="menu">
               <button type="button" role="menuitem" onClick={() => runAction(onOpenTasks)}><ListChecks size={16} /><span>任务记录</span></button>
-              <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('logs'))}><FileText size={16} /><span>诊断日志</span></button>
-              <button type="button" role="menuitem" onClick={() => runAction(onOpenAgentDirectory)}><FolderOpen size={16} /><span>打开 Agent 文件夹</span></button>
+              <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('logs'))}><FileText size={16} /><span>运行日志</span></button>
+              <button type="button" role="menuitem" onClick={() => runAction(onOpenAgentDirectory)}><FolderOpen size={16} /><span>打开目录</span></button>
             </div>
           ) : null}
         </div>
@@ -115,7 +115,7 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
           </button>
           {openMenu === 'help' ? (
             <div className="app-menu-dropdown" role="menu">
-              <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); setAboutOpen(true); }}><Info size={16} /><span>关于 HiMind Agent</span></button>
+              <button type="button" role="menuitem" onClick={() => { setOpenMenu(null); setAboutOpen(true); }}><Info size={16} /><span>关于 HiMind</span></button>
             </div>
           ) : null}
         </div>
@@ -170,7 +170,7 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
           <img className="product-mark" src="/brand/himind-app.png" alt="" aria-hidden="true" />
           <div>
             <h1>HiMind</h1>
-            <div className="product-type">数字分身执行端</div>
+            <div className="product-type">数字分身</div>
           </div>
         </div>
         <nav aria-label="主导航">
@@ -195,7 +195,7 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
             </div>
           ))}
           <div className="sidebar-developer">
-            <span className="sidebar-section-label">开发者</span>
+            <span className="sidebar-section-label">开发</span>
             {developerNavItems.map(item => (
               <button
                 type="button"

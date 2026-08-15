@@ -45,7 +45,7 @@ export function AiConnectionsPage({
   return (
     <div className="ai-page">
       <PageHeader
-        title="AI 工具连接"
+        title="AI 连接"
         description="管理 HiMind MCP 服务在常用 AI 工具中的注册状态。"
         actions={<button className="btn btn-icon" title="刷新注册状态" aria-label="刷新注册状态" disabled={Boolean(busyAction)} onClick={onRefresh}><RefreshCw size={16} /></button>}
       />

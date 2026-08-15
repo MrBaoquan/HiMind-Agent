@@ -224,8 +224,24 @@ pub(crate) async fn check_agent_update(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
     let options = state.options.clone();
+    let logs = Arc::clone(&state.approval_manager);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::app::update_manager::check_now(&options).map_err(|error| error.to_string())
+        crate::app::update_manager::check_now(&options)
+            .inspect(|status| {
+                logs.add_log(
+                    "info",
+                    if status.available_version.is_empty() {
+                        "软件更新检查完成，当前已是最新版本".to_string()
+                    } else {
+                        format!("软件更新检查完成，发现 v{}", status.available_version)
+                    }
+                    .as_str(),
+                )
+            })
+            .map_err(|error| {
+                logs.add_log("error", &format!("软件更新检查失败: {error}"));
+                error.to_string()
+            })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -236,8 +252,19 @@ pub(crate) async fn download_agent_update(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
     let options = state.options.clone();
+    let logs = Arc::clone(&state.approval_manager);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::app::update_manager::download(&options).map_err(|error| error.to_string())
+        crate::app::update_manager::download(&options)
+            .inspect(|status| {
+                logs.add_log(
+                    "info",
+                    &format!("软件更新下载完成: v{}", status.available_version),
+                )
+            })
+            .map_err(|error| {
+                logs.add_log("error", &format!("软件更新下载失败: {error}"));
+                error.to_string()
+            })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -247,8 +274,12 @@ pub(crate) async fn download_agent_update(
 pub(crate) fn cancel_agent_update_download(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
-    crate::app::update_manager::cancel_download(&state.state_path)
-        .map_err(|error| error.to_string())
+    let status = crate::app::update_manager::cancel_download(&state.state_path)
+        .map_err(|error| error.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", "已请求取消软件更新下载");
+    Ok(status)
 }
 
 #[tauri::command]
@@ -257,8 +288,26 @@ pub(crate) fn set_agent_update_preferences(
     auto_download: bool,
     state: State<'_, AgentState>,
 ) -> Result<crate::app::update_manager::AgentUpdateStatus, String> {
-    crate::app::update_manager::set_preferences(&state.state_path, auto_check, auto_download)
-        .map_err(|error| error.to_string())
+    let status =
+        crate::app::update_manager::set_preferences(&state.state_path, auto_check, auto_download)
+            .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "软件更新策略已调整: 自动检查={}，自动下载={}",
+            if status.auto_check {
+                "开启"
+            } else {
+                "关闭"
+            },
+            if status.auto_download {
+                "开启"
+            } else {
+                "关闭"
+            },
+        ),
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -387,7 +436,12 @@ pub(crate) fn set_approval_rule(
     request_type: String,
     mode: String,
 ) -> Result<(), String> {
-    state.approval_manager.update_rule(&request_type, &mode)
+    state.approval_manager.update_rule(&request_type, &mode)?;
+    state.approval_manager.add_log(
+        "info",
+        &format!("审批策略已调整: {} -> {}", request_type, mode),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -395,7 +449,11 @@ pub(crate) fn set_approval_timeout(
     state: State<'_, AgentState>,
     seconds: u64,
 ) -> Result<(), String> {
-    state.approval_manager.update_timeout(seconds)
+    state.approval_manager.update_timeout(seconds)?;
+    state
+        .approval_manager
+        .add_log("info", &format!("审批超时已调整为 {seconds} 秒"));
+    Ok(())
 }
 
 #[tauri::command]

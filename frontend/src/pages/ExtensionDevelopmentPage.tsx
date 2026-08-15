@@ -73,7 +73,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   }, [selected, selectedKey]);
 
   return <div className="development-page">
-    <PageHeader title="扩展开发" description="本地项目与发布" actions={<>
+    <PageHeader title="扩展" description="本地项目与发布" actions={<>
       <button className="btn" disabled={Boolean(props.busyAction)} onClick={() => void props.onOpenProject()}><FolderOpen size={16} />打开项目</button>
       <button className="btn btn-primary" disabled={Boolean(props.busyAction)} onClick={() => setCreateOpen(true)}><Plus size={16} />新建项目</button>
       <button className="btn btn-icon" title="刷新项目" aria-label="刷新项目" disabled={Boolean(props.busyAction)} onClick={props.onRefresh}><RefreshCw size={16} /></button>
@@ -321,7 +321,7 @@ function CreateProjectDialog({ busy, onClose, onCreate }: { busy: boolean; onClo
 }
 
 function ConfirmRemoveDialog({ project, busy, onClose, onConfirm }: { project: ExtensionProject; busy: boolean; onClose: () => void; onConfirm: () => Promise<void> }) {
-  return <div className="skill-dialog-backdrop"><div className="skill-dialog" role="dialog" aria-modal="true"><div className="skill-dialog-head"><strong>移出工作台</strong><button className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div><div className="development-remove-copy"><p>“{project.name}”将不再显示在扩展开发中。</p><span>本地源码、构建和已提交审核不会被删除。</span></div><div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" disabled={busy} onClick={() => void onConfirm()}><Trash2 size={15} />移出</button></div></div></div>;
+  return <div className="skill-dialog-backdrop"><div className="skill-dialog" role="dialog" aria-modal="true"><div className="skill-dialog-head"><strong>移出工作台</strong><button className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div><div className="development-remove-copy"><p>“{project.name}”将不再显示在扩展中。</p><span>本地源码、构建和已提交审核不会被删除。</span></div><div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" disabled={busy} onClick={() => void onConfirm()}><Trash2 size={15} />移出</button></div></div></div>;
 }
 
 function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remoteProjects' | 'pluginDrafts' | 'skillDrafts' | 'pluginSubmissions' | 'skillSubmissions'>): ProjectModel[] {

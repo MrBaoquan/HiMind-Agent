@@ -162,7 +162,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   return (
     <div className="skill-page skill-product-page">
       <PageHeader
-        title="AI 技能"
+        title="技能"
         description="安装和管理 AI 技能"
         actions={<>
           {view === 'installed' ? <button className="btn btn-primary" onClick={onSyncAll} disabled={isBusy || !items.length}><RefreshCw className={busyAction === 'sync-all' ? 'spin' : ''} size={16} />{busyAction === 'sync-all' ? '正在更新' : '更新全部'}</button> : null}

@@ -137,6 +137,7 @@ export type SvnConnectionTest = {
 
 export type LogItem = {
     time?: string;
+    timestamp?: number;
     level?: string;
     message?: string;
 };

@@ -6,9 +6,9 @@ import { IconButton, PageHeader, Pill } from '../components/Common';
 type SettingsSection = 'remote' | 'accounts' | 'tools' | 'general';
 
 const SETTINGS_SECTIONS = [
-  { key: 'remote', label: '远程任务与安全', description: '访问范围与审批', icon: ShieldCheck },
+  { key: 'remote', label: '远程任务', description: '权限与审批', icon: ShieldCheck },
   { key: 'accounts', label: '账号', description: '内网和 SVN', icon: KeyRound },
-  { key: 'tools', label: '开发工具', description: '本机编辑器', icon: Wrench },
+  { key: 'tools', label: '工具', description: '本机编辑器', icon: Wrench },
   { key: 'general', label: '通用', description: '启动与更新', icon: Power },
 ] satisfies { key: SettingsSection; label: string; description: string; icon: typeof ShieldCheck }[];
 
@@ -143,7 +143,7 @@ export function SettingsPage({
   };
   return (
     <>
-      <PageHeader title="设置" description="管理远程任务、账号、开发工具和启动设置。" />
+      <PageHeader title="设置" description="管理任务权限、账号、工具与启动设置。" />
       <div className="settings-workspace">
         <label className="settings-section-select">
           <span>设置分类</span>

@@ -287,6 +287,23 @@ function App() {
   }, [page]);
 
   useEffect(() => {
+    if (page !== 'logs') return;
+    const refreshVisibleLogs = () => {
+      if (document.visibilityState === 'hidden') return;
+      refreshLogs().catch(console.error);
+    };
+    refreshVisibleLogs();
+    const timer = window.setInterval(refreshVisibleLogs, 5000);
+    window.addEventListener('focus', refreshVisibleLogs);
+    document.addEventListener('visibilitychange', refreshVisibleLogs);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshVisibleLogs);
+      document.removeEventListener('visibilitychange', refreshVisibleLogs);
+    };
+  }, [page]);
+
+  useEffect(() => {
     const snapshot = new Map<string, string>();
     const items = [
       ...pluginSubmissions.map(item => ({ id: `plugin:${item.id}`, name: item.name, state: `${item.status}:${item.release_status || ''}:${item.review_note || ''}` })),

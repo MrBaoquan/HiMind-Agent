@@ -947,6 +947,11 @@ tr:last-child td { border-bottom: 0; }
 }
 .field-hint { margin-top: 4px; color: var(--text-muted); font-size: 11px; }
 
+.logs-page { height: 100%; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.logs-page .page-header { flex: 0 0 auto; }
+.logs-card { min-height: 0; flex: 1; display: flex; flex-direction: column; margin-bottom: 0; }
+.logs-card .card-header { flex: 0 0 auto; }
+.logs-card .log-list { min-height: 0; max-height: none; flex: 1; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .log-list { max-height: calc(100vh - 185px); overflow: auto; padding: 6px 14px; font-family: Consolas, "SFMono-Regular", monospace; font-size: 11px; }
 .log-entry { min-height: 30px; display: grid; grid-template-columns: 142px 48px minmax(0, 1fr); align-items: start; gap: 10px; padding: 7px 0; border-bottom: 1px solid #f0f1f3; }
 .log-entry:last-child { border-bottom: 0; }
