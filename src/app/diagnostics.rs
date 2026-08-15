@@ -29,6 +29,9 @@ pub(crate) fn export_bundle(
         "agent-events.jsonl",
         "agent-events.jsonl.1",
         "agent-events.jsonl.2",
+        "svn-events.jsonl",
+        "svn-events.jsonl.1",
+        "svn-events.jsonl.2",
     ] {
         let path = log_dir.join(name);
         if !path.is_file() {
@@ -45,7 +48,7 @@ pub(crate) fn export_bundle(
     archive.write_all(
         "请补充以下信息后提交诊断包：\r\n\
          1. 问题发生的大致时间\r\n\
-         2. 当时执行的操作\r\n\
+         2. 当时执行的操作和展项名称\r\n\
          3. 是否安装加密或终端安全软件，以及产品名称\r\n\
          4. 问题是否可稳定复现\r\n\
          诊断包不会收集密码、Agent credential 或 OAuth token。\r\n"

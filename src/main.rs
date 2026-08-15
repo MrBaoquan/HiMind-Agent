@@ -42,7 +42,7 @@ use svn::service::{
     apply_project_acl, clone_exhibit_repository, create_exhibit_repository_path,
     create_repository_with_post_commit_hook, ensure_project_exhibits_access,
     import_local_exhibit_with_cancel_and_progress, initialize_exhibit_repository_with_cancel,
-    preview_project_acl, reconcile_project_acl,
+    preview_project_acl, reconcile_project_acl, task_failure_result, SvnDiagnosticContextGuard,
 };
 use svn::types::{
     ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
@@ -580,6 +580,7 @@ fn execute_task(
         &task.execution_id,
         &task.lease_id,
     );
+    let _svn_diagnostic_context = SvnDiagnosticContextGuard::enter(&task.id, &task.execution_id);
     let _lease_renewal = if !task.execution_id.is_empty() && !task.lease_id.is_empty() {
         let lease_stop = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&lease_stop);
@@ -642,6 +643,7 @@ fn execute_task(
         None,
         None,
     )?;
+    let mut last_task_detail = initial_detail;
 
     if task.task_type == "upload_code"
         || task.task_type == "upload_placeholder"
@@ -849,9 +851,24 @@ fn execute_task(
             let mut cancel_guard = TaskCancelGuard::new();
             let mut check_cancel = || cancel_guard.check(client, options, agent_id, &task.id);
             let mut report_progress = |progress: i32, detail: &str| {
-                report_task(
+                last_task_detail = detail.to_string();
+                if let Some(manager) = approval_mgr {
+                    manager.add_log("info", &format!("{}: {}", task.id, detail));
+                }
+                if let Err(error) = report_task(
                     client, options, agent_id, &task.id, "running", progress, detail, None, None,
-                )
+                ) {
+                    if let Some(manager) = approval_mgr {
+                        manager.add_log(
+                            "warn",
+                            &format!(
+                                "{}: 进度上报暂时失败，SVN 操作继续执行 - {}",
+                                task.id, error
+                            ),
+                        );
+                    }
+                }
+                Ok(())
             };
             import_local_exhibit_with_cancel_and_progress(
                 request,
@@ -935,6 +952,7 @@ fn execute_task(
             )?
         }
         Err(error) => {
+            let failure_result = task_failure_result(error.as_ref());
             let error_text = error.to_string();
             if let Some(manager) = approval_mgr {
                 manager.add_log(
@@ -962,6 +980,13 @@ fn execute_task(
                     Some(error_text),
                 )?
             } else {
+                let failure_detail = if task.task_type == "exhibit_repository_import_local"
+                    && !last_task_detail.trim().is_empty()
+                {
+                    format!("失败于：{}", last_task_detail)
+                } else {
+                    "任务失败".to_string()
+                };
                 report_task(
                     client,
                     options,
@@ -969,8 +994,8 @@ fn execute_task(
                     &task.id,
                     "failed",
                     100,
-                    "任务失败",
-                    None,
+                    &failure_detail,
+                    failure_result,
                     Some(error_text),
                 )?
             }

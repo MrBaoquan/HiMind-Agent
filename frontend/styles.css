@@ -316,11 +316,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .product-mark { width: 40px; height: 40px; display: block; flex: 0 0 auto; object-fit: contain; }
 .sidebar-header h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0; }
 .product-type { margin-top: 2px; color: var(--sidebar-muted); font-size: 11px; font-weight: 500; }
-.sidebar nav { display: flex; flex: 1; flex-direction: column; gap: 3px; padding: 10px 8px; }
+.sidebar nav { min-height: 0; display: flex; flex: 1; flex-direction: column; gap: 3px; padding: 10px 8px; overflow-y: auto; }
 .sidebar nav button { width: 100%; min-height: 36px; display: flex; align-items: center; gap: 10px; padding: 7px 10px; border: 0; border-radius: 6px; color: #cbd5e1; background: transparent; cursor: pointer; text-align: left; }
 .sidebar nav button:hover { color: #fff; background: var(--sidebar-hover); }
 .sidebar nav button.active { color: #fff; background: #263244; font-weight: 500; }
 .sidebar nav .badge { min-width: 19px; height: 18px; margin-left: auto; padding: 0 5px; border-radius: 9px; background: #ef4444; color: #fff; font-size: 10px; font-weight: 600; line-height: 18px; text-align: center; }
+.sidebar-nav-group { display: grid; gap: 3px; }
+.sidebar-nav-group + .sidebar-nav-group { margin-top: 7px; }
 .sidebar-developer { margin-top: auto; padding-top: 7px; border-top: 1px solid #273244; }
 .sidebar-section-label { display: block; padding: 0 10px 5px; color: #64748b; font-size: 9px; font-weight: 600; }
 .sidebar-developer button + button { margin-top: 3px; }

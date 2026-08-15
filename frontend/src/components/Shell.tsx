@@ -19,14 +19,29 @@ type ShellProps = {
   children: ReactNode;
 };
 
-const navItems = [
-  { key: 'dashboard', icon: LayoutDashboard, label: '总览' },
-  { key: 'ai', icon: Cable, label: 'AI 工具连接' },
-  { key: 'approvals', icon: ClipboardCheck, label: '审批' },
-  { key: 'plugins', icon: Blocks, label: '插件' },
-  { key: 'skills', icon: BookOpen, label: '技能' },
-  { key: 'settings', icon: Settings, label: '设置' },
-] satisfies { key: PageKey; icon: typeof LayoutDashboard; label: string }[];
+const navSections = [
+  {
+    label: '我的 Agent',
+    items: [
+      { key: 'dashboard', icon: LayoutDashboard, label: '执行端概览' },
+      { key: 'approvals', icon: ClipboardCheck, label: '授权中心' },
+    ],
+  },
+  {
+    label: '能力',
+    items: [
+      { key: 'ai', icon: Cable, label: 'AI 工具连接' },
+      { key: 'skills', icon: BookOpen, label: '技能' },
+      { key: 'plugins', icon: Blocks, label: '插件' },
+    ],
+  },
+  {
+    label: '设备',
+    items: [
+      { key: 'settings', icon: Settings, label: '设备设置' },
+    ],
+  },
+] satisfies { label: string; items: { key: PageKey; icon: typeof LayoutDashboard; label: string }[] }[];
 
 const developerNavItems = [
   { key: 'development', icon: Hammer, label: '扩展开发' },
@@ -113,7 +128,7 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
             <img src="/brand/himind-app.png" alt="" aria-hidden="true" />
             <h2 id="app-about-title">HiMind Agent</h2>
             <span className="app-about-version">版本 {agentVersion}</span>
-            <p>连接 HiMind 工作台与本机 AI 工具。</p>
+            <p>为员工数字分身提供本机执行能力。</p>
             <button type="button" className="btn btn-primary" onClick={() => setAboutOpen(false)}>确定</button>
           </section>
         </div>
@@ -155,24 +170,29 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
           <img className="product-mark" src="/brand/himind-app.png" alt="" aria-hidden="true" />
           <div>
             <h1>HiMind</h1>
-            <div className="product-type">本机 Agent</div>
+            <div className="product-type">数字分身执行端</div>
           </div>
         </div>
         <nav aria-label="主导航">
-          {navItems.map(item => (
-            <button
-              type="button"
-              key={item.key}
-              className={currentPage === item.key ? 'active' : ''}
-              onClick={() => onNavigate(item.key)}
-              aria-current={currentPage === item.key ? 'page' : undefined}
-              aria-label={item.label}
-              title={item.label}
-            >
-              <item.icon size={17} strokeWidth={1.8} aria-hidden="true" />
-              <span>{item.label}</span>
-              {item.key === 'approvals' && approvalCount > 0 ? <span className="badge">{approvalCount}</span> : null}
-            </button>
+          {navSections.map(section => (
+            <div className="sidebar-nav-group" key={section.label}>
+              <span className="sidebar-section-label">{section.label}</span>
+              {section.items.map(item => (
+                <button
+                  type="button"
+                  key={item.key}
+                  className={currentPage === item.key ? 'active' : ''}
+                  onClick={() => onNavigate(item.key)}
+                  aria-current={currentPage === item.key ? 'page' : undefined}
+                  aria-label={item.label}
+                  title={item.label}
+                >
+                  <item.icon size={17} strokeWidth={1.8} aria-hidden="true" />
+                  <span>{item.label}</span>
+                  {item.key === 'approvals' && approvalCount > 0 ? <span className="badge">{approvalCount}</span> : null}
+                </button>
+              ))}
+            </div>
           ))}
           <div className="sidebar-developer">
             <span className="sidebar-section-label">开发者</span>
@@ -194,7 +214,7 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
         </nav>
         <button className={`sidebar-account ${identity?.authorized ? 'authorized' : ''}`} type="button" onClick={() => { onNavigate('dashboard'); window.setTimeout(() => document.getElementById('account-authorization')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0); }} title="HiMind 账号">
           <CircleUserRound size={18} />
-          <span><strong>{identity?.authorized ? identity.user_name || '已登录 HiMind' : '登录 HiMind'}</strong><small>{identity?.authorized ? '账号正常' : '使用工作台功能'}</small></span>
+          <span><strong>{identity?.authorized ? identity.user_name || '已连接 HiMind' : '连接 HiMind'}</strong><small>{identity?.authorized ? '数字分身已连接' : '连接你的数字分身'}</small></span>
           <span className={`status-dot ${identity?.authorized ? 'success' : ''}`} />
         </button>
         </aside>

@@ -5,12 +5,15 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::fmt;
 use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -37,6 +40,8 @@ const DEFAULT_SVN_USER_PASSWORD: &str = "123456";
 const UNITY_TEMPLATE_URL: &str = "http://svn.andcrane.com/repo/UNIArtTemplate";
 const UNREAL_TEMPLATE_ROOT_URL: &str = "http://svn.andcrane.com/repo/repo_UETemplates";
 const TEMPLATE_MARKER_FILE: &str = ".himind-template.json";
+const SVN_ADMIN_READ_ATTEMPTS: usize = 3;
+const SVN_ADMIN_CREATE_PATH_ATTEMPTS: usize = 2;
 const PROJECT_REPOSITORY_BROAD_ACL: [(&str, &str); 3] =
     [("/", "r"), ("/trunk", "r"), ("/trunk/exhibits", "no")];
 const MIGRATION_PROPERTY_NAMES: [&str; 7] = [
@@ -48,6 +53,94 @@ const MIGRATION_PROPERTY_NAMES: [&str; 7] = [
     "svn:executable",
     "svn:needs-lock",
 ];
+
+#[derive(Clone, Default)]
+struct SvnDiagnosticContext {
+    task_id: String,
+    execution_id: String,
+}
+
+thread_local! {
+    static SVN_DIAGNOSTIC_CONTEXT: RefCell<SvnDiagnosticContext> = RefCell::new(SvnDiagnosticContext::default());
+}
+
+static SVN_DIAGNOSTIC_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static SVN_ADMIN_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+pub(crate) struct SvnDiagnosticContextGuard {
+    previous: SvnDiagnosticContext,
+}
+
+impl SvnDiagnosticContextGuard {
+    pub(crate) fn enter(task_id: &str, execution_id: &str) -> Self {
+        let next = SvnDiagnosticContext {
+            task_id: task_id.to_string(),
+            execution_id: execution_id.to_string(),
+        };
+        let previous = SVN_DIAGNOSTIC_CONTEXT.with(|context| context.replace(next));
+        Self { previous }
+    }
+}
+
+impl Drop for SvnDiagnosticContextGuard {
+    fn drop(&mut self) {
+        SVN_DIAGNOSTIC_CONTEXT.with(|context| {
+            context.replace(self.previous.clone());
+        });
+    }
+}
+
+#[derive(Debug)]
+struct SvnAdminRequestError {
+    action: String,
+    category: &'static str,
+    attempt: usize,
+    max_attempts: usize,
+    http_status: Option<u16>,
+    elapsed_ms: u128,
+    retryable: bool,
+    message: String,
+}
+
+impl fmt::Display for SvnAdminRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "SvnAdmin request failed (action={}, category={}, attempt={}/{}, http_status={}, elapsed_ms={}): {}",
+            self.action,
+            self.category,
+            self.attempt,
+            self.max_attempts,
+            self.http_status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.elapsed_ms,
+            self.message
+        )
+    }
+}
+
+impl Error for SvnAdminRequestError {}
+
+#[derive(Debug)]
+struct ExhibitImportPartialFailure {
+    message: String,
+    result: Value,
+}
+
+impl fmt::Display for ExhibitImportPartialFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ExhibitImportPartialFailure {}
+
+pub(crate) fn task_failure_result(error: &(dyn Error + 'static)) -> Option<Value> {
+    error
+        .downcast_ref::<ExhibitImportPartialFailure>()
+        .map(|failure| failure.result.clone())
+}
 
 pub(crate) fn bootstrap_svn_credentials() -> Result<bool, Box<dyn Error>> {
     let username = std::env::var("SVN_USERNAME").unwrap_or_default();
@@ -325,7 +418,7 @@ fn ensure_svn_user_account(username: &str, password: &str) -> Result<bool, Box<d
         return Ok(false);
     };
     let token = login_svnadmin(&admin.username, &admin_password)?;
-    let list = svnadmin_post(
+    let list = svnadmin_post_read(
         "Svnuser",
         "GetUserList",
         Some(&token),
@@ -357,19 +450,34 @@ fn ensure_svn_user_account(username: &str, password: &str) -> Result<bool, Box<d
                 .into(),
         );
     }
-    let response = {
-        svnadmin_post(
-            "Svnuser",
-            "CreateUser",
-            Some(&token),
-            json!({
-                "svn_user_name": username,
-                "svn_user_pass": password,
-                "svn_user_note": "HiMind 用户"
-            }),
-        )?
-    };
-    ensure_svnadmin_success(&response)?;
+    let mutation_error = svnadmin_post(
+        "Svnuser",
+        "CreateUser",
+        Some(&token),
+        json!({
+            "svn_user_name": username,
+            "svn_user_pass": password,
+            "svn_user_note": "HiMind 用户"
+        }),
+    )
+    .and_then(|response| ensure_svnadmin_success(&response))
+    .err();
+    if let Some(error) = mutation_error {
+        if login_svn_user(username, password).is_ok() {
+            record_svn_diagnostic_event(
+                "svnadmin",
+                "CreateUser",
+                "recovered_by_login",
+                "write_response_uncertain",
+                1,
+                1,
+                None,
+                0,
+            );
+            return Ok(true);
+        }
+        return Err(error);
+    }
     login_svn_user(username, password)?;
     Ok(true)
 }
@@ -743,7 +851,7 @@ pub(crate) fn create_exhibit_repository_path(
     let repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
     let (connection, password) = load_svn_admin_secret()?;
     let token = login_svnadmin(&connection.username, &password)?;
-    let response = svnadmin_post(
+    let response = svnadmin_post_with_attempts(
         "Svnrep",
         "CreateRepFolder",
         Some(&token),
@@ -752,6 +860,7 @@ pub(crate) fn create_exhibit_repository_path(
             "path": "/trunk/exhibits/",
             "folder_name": exhibit_id
         }),
+        SVN_ADMIN_CREATE_PATH_ATTEMPTS,
     )?;
     if let Err(error) = ensure_svnadmin_success(&response) {
         let message = error.to_string();
@@ -805,27 +914,80 @@ pub(crate) fn clone_exhibit_repository(
         return Err("source and target exhibit repositories must be different".into());
     }
     let (connection, password) = load_company_svn_secret()?;
-    let output = run_svn_authenticated(
+    let commit_message = format!("Clone exhibit {exhibit_id} from {source_url}");
+    let copy_result = run_svn_authenticated(
         [
             "copy".to_string(),
             source_url.to_string(),
             target_url.clone(),
             "-m".to_string(),
-            format!("Clone exhibit {exhibit_id} from {source_url}"),
+            commit_message.clone(),
         ],
         &connection.username,
         &password,
-    )?;
-    let revision = run_svn_authenticated(
-        [
-            "info".to_string(),
-            "--show-item".to_string(),
-            "revision".to_string(),
-            target_url.clone(),
-        ],
-        &connection.username,
-        &password,
-    )?;
+    );
+    let (revision, output, recovered_after_error) = match copy_result {
+        Ok(output) => {
+            let revision = run_svn_authenticated(
+                [
+                    "info".to_string(),
+                    "--show-item".to_string(),
+                    "revision".to_string(),
+                    target_url.clone(),
+                ],
+                &connection.username,
+                &password,
+            )?;
+            (
+                revision.trim().parse::<u64>().unwrap_or_default(),
+                output,
+                false,
+            )
+        }
+        Err(copy_error) => {
+            record_svn_diagnostic_event(
+                "svn_cli",
+                "clone_exhibit",
+                "verifying_uncertain_result",
+                "copy_response_error",
+                1,
+                1,
+                None,
+                0,
+            );
+            let (revision, remote_message) = svn_remote_latest_log(
+                &target_url,
+                &connection.username,
+                &password,
+            )
+            .map_err(|verification_error| {
+                format!(
+                    "SVN copy result is uncertain: {copy_error}; target verification failed: {verification_error}"
+                )
+            })?;
+            if remote_message != commit_message {
+                return Err(format!(
+                    "SVN copy result is uncertain: {copy_error}; target commit message did not match this clone request"
+                )
+                .into());
+            }
+            record_svn_diagnostic_event(
+                "svn_cli",
+                "clone_exhibit",
+                "recovered_by_server_verification",
+                "copy_response_error",
+                1,
+                1,
+                None,
+                0,
+            );
+            (
+                revision,
+                "SVN copy response was interrupted; target commit verified".to_string(),
+                true,
+            )
+        }
+    };
     Ok(json!({
         "ok": true,
         "cloned": true,
@@ -833,9 +995,49 @@ pub(crate) fn clone_exhibit_repository(
         "exhibit_id": exhibit_id,
         "source_repository_url": source_url,
         "repository_url": target_url,
-        "revision": revision.trim().parse::<u64>().unwrap_or_default(),
+        "revision": revision,
+        "recovered_after_error": recovered_after_error,
         "output": output
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SvnLogDocument {
+    #[serde(rename = "logentry", default)]
+    entries: Vec<SvnLogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SvnLogEntry {
+    #[serde(rename = "@revision")]
+    revision: u64,
+    #[serde(default)]
+    msg: String,
+}
+
+fn svn_remote_latest_log(
+    repository_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<(u64, String), Box<dyn Error>> {
+    let output = run_svn_authenticated(
+        [
+            "log".to_string(),
+            "--xml".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+            repository_url.to_string(),
+        ],
+        username,
+        password,
+    )?;
+    let document: SvnLogDocument = quick_xml::de::from_str(&output)?;
+    let entry = document
+        .entries
+        .into_iter()
+        .next()
+        .ok_or("target SVN path has no commit history")?;
+    Ok((entry.revision, entry.msg))
 }
 
 pub(crate) fn import_local_exhibit_with_cancel_and_progress<F, P>(
@@ -911,6 +1113,7 @@ where
 			_ => return Err("unexpected existing SVN repository status".into()),
 		}
     }
+    progress(19, "正在读取旧 SVN 忽略规则、文件属性和外部依赖")?;
     let snapshot = if source_is_working_copy {
         snapshot_migration_metadata(&source, false, Some(&ignore_policy))?
     } else {
@@ -921,6 +1124,13 @@ where
     // archive cannot change unnoticed while the repository is being prepared.
     let source_stability_before =
         migration_source_stability_summary(&source, &snapshot.external_roots, &transformed_paths)?;
+    progress(
+        20,
+        &format!(
+            "已核对 {} 个工程文件，正在确认工程未发生变化",
+            source_stability_before.file_count
+        ),
+    )?;
     if !request.expected_source_fingerprint.trim().is_empty()
         && request
             .expected_source_fingerprint
@@ -987,7 +1197,13 @@ where
             target_was_empty = true;
         }
 
-        progress(45, "正在复制当前工程文件并保留本地修改")?;
+        progress(
+            45,
+            &format!(
+                "正在复制 {} 个工程文件并保留本地修改",
+                source_stability_before.file_count
+            ),
+        )?;
         let source_summary = copy_migration_tree(
             &source,
             &working_copy,
@@ -1006,6 +1222,7 @@ where
             );
         }
         cancel()?;
+        progress(54, "工程文件复制完成，正在登记需要提交的文件")?;
         apply_migration_directory_properties(&working_copy, &snapshot.properties)?;
         run_svn_in_directory(
             &working_copy,
@@ -1023,6 +1240,7 @@ where
         progress(58, "正在恢复 SVN 忽略规则、文件属性和外部依赖")?;
         apply_migration_properties(&working_copy, &snapshot.properties)?;
         apply_migration_ignore_policy(&source, &working_copy, &ignore_policy)?;
+        progress(64, "正在校验待提交文件与原工程是否一致")?;
         let staged_summary = migration_tree_summary(
             &working_copy,
             &snapshot.external_roots,
@@ -1039,9 +1257,10 @@ where
         if !target_was_empty && pending_change_count > 0 {
             return Err("target exhibit repository already contains different content; refusing to overwrite it".into());
         }
+        let mut commit_response_error = None;
         if pending_change_count > 0 {
             progress(70, "正在提交工程到目标展项仓库")?;
-            run_svn_authenticated_cancelable(
+            if let Err(error) = run_svn_authenticated_cancelable(
                 [
                     "commit".to_string(),
                     working_copy.to_string_lossy().to_string(),
@@ -1051,11 +1270,26 @@ where
                 &connection.username,
                 &password,
                 cancel,
-            )?;
+            ) {
+                commit_response_error = Some(error.to_string());
+                record_svn_diagnostic_event(
+                    "svn_cli",
+                    "commit",
+                    "verifying_uncertain_result",
+                    "commit_response_error",
+                    1,
+                    1,
+                    None,
+                    0,
+                );
+                progress(74, "SVN 提交响应异常，正在核验服务端是否已经提交")?;
+            } else {
+                progress(76, "SVN 提交完成，正在读取服务端版本")?;
+            }
         }
 
         progress(80, "目标仓库提交完成，正在校验文件和版本")?;
-        run_svn_authenticated_cancelable(
+        if let Err(error) = run_svn_authenticated_cancelable(
             [
                 "update".to_string(),
                 "--ignore-externals".to_string(),
@@ -1064,8 +1298,16 @@ where
             &connection.username,
             &password,
             cancel,
-        )?;
-        verify_migration_working_copy(
+        ) {
+            if let Some(commit_error) = commit_response_error.as_ref() {
+                return Err(format!(
+                    "SVN commit result is uncertain: {commit_error}; server verification update failed: {error}"
+                )
+                .into());
+            }
+            return Err(error);
+        }
+        if let Err(error) = verify_migration_working_copy(
             &working_copy,
             &repository_url,
             &target_uuid,
@@ -1074,14 +1316,36 @@ where
             &transformed_paths,
             &ignore_policy,
             "target exhibit repository",
-        )?;
+        ) {
+            if let Some(commit_error) = commit_response_error.as_ref() {
+                return Err(format!(
+                    "SVN commit result is uncertain: {commit_error}; server content verification failed: {error}"
+                )
+                .into());
+            }
+            return Err(error);
+        }
+        if commit_response_error.is_some() {
+            record_svn_diagnostic_event(
+                "svn_cli",
+                "commit",
+                "recovered_by_server_verification",
+                "commit_response_error",
+                1,
+                1,
+                None,
+                0,
+            );
+            progress(84, "已确认服务端提交成功，正在继续接管本地工程")?;
+        }
 
         // Commit already wrote the authoritative content to the server and the
         // working copy was re-verified from the server via `update` above. A
         // second full checkout only re-downloads every file and times out on
         // large projects, so confirm the server HEAD instead.
         let committed_revision = svn_item(&working_copy, "revision")?;
-        let server_revision = run_svn_authenticated_cancelable(
+        let committed_revision: u64 = committed_revision.trim().parse()?;
+        let server_revision_result = run_svn_authenticated_cancelable(
             [
                 "info".to_string(),
                 "--show-item".to_string(),
@@ -1091,9 +1355,38 @@ where
             &connection.username,
             &password,
             cancel,
-        )?;
-        let server_revision: u64 = server_revision.trim().parse()?;
-        let committed_revision: u64 = committed_revision.trim().parse()?;
+        );
+        let server_revision = match server_revision_result {
+            Ok(value) => match value.trim().parse::<u64>() {
+                Ok(revision) => revision,
+                Err(_) => {
+                    record_svn_diagnostic_event(
+                        "svn_cli",
+                        "read_server_revision",
+                        "recovered_from_working_copy",
+                        "invalid_server_revision",
+                        1,
+                        1,
+                        None,
+                        0,
+                    );
+                    committed_revision
+                }
+            },
+            Err(_) => {
+                record_svn_diagnostic_event(
+                    "svn_cli",
+                    "read_server_revision",
+                    "recovered_from_working_copy",
+                    "server_revision_unavailable",
+                    1,
+                    1,
+                    None,
+                    0,
+                );
+                committed_revision
+            }
+        };
         if server_revision < committed_revision {
             return Err("server revision fell behind the committed working copy".into());
         }
@@ -1105,18 +1398,13 @@ where
             None
         };
         let switch_result = (|| -> Result<String, Box<dyn Error>> {
-            run_svn_authenticated_cancelable(
-                [
-                    "checkout".to_string(),
-                    "--force".to_string(),
-                    "--ignore-externals".to_string(),
-                    repository_url.clone(),
-                    source.to_string_lossy().to_string(),
-                ],
-                &connection.username,
-                &password,
-                cancel,
-            )?;
+            // The temporary working copy already contains the exact source
+            // tree and has been verified against the server. Replacing only
+            // the SVN admin metadata avoids downloading the whole project a
+            // second time during local workspace adoption.
+            cancel()?;
+            progress(92, "正在写入新的 SVN 工作副本信息")?;
+            copy_working_copy_admin(&working_copy, &source)?;
             progress(96, "正在验证原目录的新 SVN 关联")?;
             let switched_url = svn_item(&source, "url")?;
             let switched_uuid = svn_item(&source, "repos-uuid")?;
@@ -1153,13 +1441,14 @@ where
                 )
                 .into());
             }
+            progress(98, "正在确认忽略文件和外部依赖保持不变")?;
             verify_migration_ignored_paths_unversioned(&source, &ignore_policy)?;
             svn_item(&source, "revision")
         })();
         let revision = match switch_result {
             Ok(revision) => revision,
             Err(error) => {
-                if let Some(backup) = backup.as_mut() {
+                let recovery_error = if let Some(backup) = backup.as_mut() {
                     restore_adopted_workspace(
                         backup,
                         &working_copy,
@@ -1167,14 +1456,61 @@ where
                         &snapshot.external_roots,
                         &transformed_paths,
                         &ignore_policy,
-                    )?;
+                    )
+                    .err()
                 } else {
                     let partial_admin = source.join(".svn");
                     if partial_admin.exists() {
-                        std::fs::remove_dir_all(partial_admin)?;
+                        std::fs::remove_dir_all(partial_admin)
+                            .err()
+                            .map(|error| -> Box<dyn Error> { Box::new(error) })
+                    } else {
+                        None
                     }
-                }
-                return Err(error);
+                };
+                let local_recovery_succeeded = recovery_error.is_none();
+                let message = if let Some(recovery_error) = recovery_error {
+                    format!(
+                        "目标展项仓库已成功导入到 r{server_revision}，但原目录接管失败且本地恢复未完成：{error}；恢复错误：{recovery_error}"
+                    )
+                } else {
+                    format!(
+                        "目标展项仓库已成功导入到 r{server_revision}，但原目录接管失败，已恢复原 SVN 关联：{error}"
+                    )
+                };
+                record_svn_diagnostic_event(
+                    "svn_workspace",
+                    "adopt_local_workspace",
+                    "partial_failure",
+                    if local_recovery_succeeded {
+                        "remote_imported_local_restored"
+                    } else {
+                        "remote_imported_local_recovery_failed"
+                    },
+                    1,
+                    1,
+                    None,
+                    0,
+                );
+                return Err(Box::new(ExhibitImportPartialFailure {
+                    message,
+                    result: json!({
+                        "ok": false,
+                        "imported": true,
+                        "remote_imported": true,
+                        "repository_revision": server_revision,
+                        "revision": server_revision,
+                        "local_adoption_pending": true,
+                        "local_recovery_succeeded": local_recovery_succeeded,
+                        "failure_code": "local_adoption_failed",
+                        "project_id": project_id,
+                        "exhibit_id": exhibit_id,
+                        "repository_url": repository_url,
+                        "workspace_path": source,
+                        "backup_retained": false,
+                        "force_migration": request.force_migration
+                    }),
+                }));
             }
         };
         if let Some(backup) = backup.as_mut() {
@@ -1196,7 +1532,18 @@ where
             "force_migration": request.force_migration
         }))
     })();
-    let _ = std::fs::remove_dir_all(&temp_root);
+    if std::fs::remove_dir_all(&temp_root).is_err() {
+        record_svn_diagnostic_event(
+            "svn_workspace",
+            "cleanup_import_staging",
+            "warning",
+            "temporary_directory_cleanup_failed",
+            1,
+            1,
+            None,
+            0,
+        );
+    }
     result
 }
 
@@ -1311,7 +1658,7 @@ where
                 ".",
             ],
         )?;
-        run_svn_authenticated_cancelable(
+        let commit_error = run_svn_authenticated_cancelable(
             [
                 "commit".to_string(),
                 working_copy.to_string_lossy().to_string(),
@@ -1321,18 +1668,66 @@ where
             &connection.username,
             &password,
             cancel,
-        )?;
-        let revision = run_svn_authenticated_cancelable(
-            [
-                "info".to_string(),
-                "--show-item".to_string(),
-                "revision".to_string(),
-                repository_url.clone(),
-            ],
-            &connection.username,
-            &password,
-            cancel,
-        )?;
+        )
+        .err();
+        if let Some(commit_error) = commit_error.as_ref() {
+            record_svn_diagnostic_event(
+                "svn_cli",
+                "initialize_template_commit",
+                "verifying_uncertain_result",
+                "commit_response_error",
+                1,
+                1,
+                None,
+                0,
+            );
+            run_svn_authenticated_cancelable(
+                [
+                    "update".to_string(),
+                    "--ignore-externals".to_string(),
+                    working_copy.to_string_lossy().to_string(),
+                ],
+                &connection.username,
+                &password,
+                cancel,
+            )
+            .map_err(|verification_error| {
+                format!(
+                    "SVN template commit result is uncertain: {commit_error}; verification update failed: {verification_error}"
+                )
+            })?;
+            let pending_changes = svn_status_change_count(&working_copy)?;
+            if pending_changes != 0 {
+                return Err(format!(
+                    "SVN template commit result is uncertain: {commit_error}; server readback left {pending_changes} pending working-copy changes"
+                )
+                .into());
+            }
+            let verified_marker: Value = serde_json::from_slice(&std::fs::read(&marker_path)?)?;
+            if verified_marker.get("template_id").and_then(Value::as_str) != Some(template_id)
+                || verified_marker.get("engine_type").and_then(Value::as_str) != Some(engine_type)
+                || verified_marker
+                    .get("template_version")
+                    .and_then(Value::as_str)
+                    != Some(template_version.trim())
+            {
+                return Err(format!(
+                    "SVN template commit result is uncertain: {commit_error}; marker readback did not match the requested template"
+                )
+                .into());
+            }
+            record_svn_diagnostic_event(
+                "svn_cli",
+                "initialize_template_commit",
+                "recovered_by_server_verification",
+                "commit_response_error",
+                1,
+                1,
+                None,
+                0,
+            );
+        }
+        let revision = svn_item(&working_copy, "revision")?;
         Ok(json!({
             "ok": true,
             "initialized": true,
@@ -1346,7 +1741,18 @@ where
             "revision": revision.parse::<u64>().unwrap_or_default()
         }))
     })();
-    let _ = std::fs::remove_dir_all(&temp_root);
+    if std::fs::remove_dir_all(&temp_root).is_err() {
+        record_svn_diagnostic_event(
+            "svn_workspace",
+            "cleanup_template_staging",
+            "warning",
+            "temporary_directory_cleanup_failed",
+            1,
+            1,
+            None,
+            0,
+        );
+    }
     result
 }
 
@@ -1956,6 +2362,8 @@ struct SvnStatusEntry {
 struct SvnWorkingCopyStatus {
     #[serde(rename = "@item")]
     item: String,
+    #[serde(rename = "@props", default)]
+    props: String,
 }
 
 fn snapshot_migration_metadata(
@@ -2736,8 +3144,27 @@ fn decode_svn_cli_output(bytes: &[u8]) -> String {
 }
 
 fn svn_status_change_count(working_copy: &Path) -> Result<usize, Box<dyn Error>> {
-    let output = run_svn_in_directory(working_copy, ["status", "--xml"])?;
-    Ok(output.matches("<entry").count())
+    let output =
+        run_svn_in_directory(working_copy, ["status", "--xml", "--ignore-externals", "."])?;
+    svn_status_change_count_from_xml(&output)
+}
+
+fn svn_status_change_count_from_xml(output: &str) -> Result<usize, Box<dyn Error>> {
+    let status: SvnStatusDocument = quick_xml::de::from_str(&output)?;
+    Ok(status
+        .targets
+        .into_iter()
+        .flat_map(|target| target.entries)
+        .filter(|entry| {
+            // SVN externals and explicitly ignored files are not pending
+            // repository changes. Ordinary unversioned files still count so
+            // an incomplete adoption cannot be reported as clean.
+            let item = entry.status.item.as_str();
+            let props = entry.status.props.as_str();
+            !matches!(item, "normal" | "ignored" | "external" | "none")
+                || (item == "normal" && !matches!(props, "" | "normal" | "none"))
+        })
+        .count())
 }
 
 fn probe_svn_remote(url: &str, timeout: Duration) -> String {
@@ -2926,6 +3353,38 @@ fn restore_adopted_workspace(
     Ok(())
 }
 
+fn copy_working_copy_admin(
+    verified_working_copy: &Path,
+    source: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let source_admin = source.join(".svn");
+    if source_admin.exists() {
+        std::fs::remove_dir_all(&source_admin)?;
+    }
+    copy_directory_tree(&verified_working_copy.join(".svn"), &source_admin)
+}
+
+fn copy_directory_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    if !source.is_dir() {
+        return Err(format!("SVN working copy metadata is missing: {}", source.display()).into());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in WalkDir::new(source).min_depth(1) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(source)?;
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), &destination)?;
+        }
+    }
+    Ok(())
+}
+
 fn svn_item(working_copy: &Path, item: &str) -> Result<String, Box<dyn Error>> {
     run_svn_in_directory(working_copy, ["info", "--show-item", item])
 }
@@ -2984,7 +3443,7 @@ fn ensure_principal_path_access(
         return Err("unsupported SVN access value".into());
     }
     let query_body = json!({ "rep_name": project_id, "path": path, "svnn_user_pri_path_id": -1 });
-    let before = svnadmin_post(
+    let before = svnadmin_post_read(
         "Svnrep",
         "GetRepPathAllPri",
         Some(token),
@@ -3006,6 +3465,7 @@ fn ensure_principal_path_access(
                 .get("invert")
                 .is_some_and(|value| value == true || value == 1)
     });
+    let mut mutation_error: Option<Box<dyn Error>> = None;
     let action = if existing_matches {
         "unchanged"
     } else {
@@ -3025,15 +3485,24 @@ fn ensure_principal_path_access(
         if endpoint_action == "UpdRepPathPri" {
             body["invert"] = Value::Bool(false);
         }
-        let response = svnadmin_post("Svnrep", endpoint_action, Some(token), body)?;
-        ensure_svnadmin_success(&response)?;
+        mutation_error = svnadmin_post("Svnrep", endpoint_action, Some(token), body)
+            .and_then(|response| ensure_svnadmin_success(&response))
+            .err();
         if endpoint_action == "UpdRepPathPri" {
-            "updated"
+            if mutation_error.is_some() {
+                "updated_after_readback"
+            } else {
+                "updated"
+            }
         } else {
-            "created"
+            if mutation_error.is_some() {
+                "created_after_readback"
+            } else {
+                "created"
+            }
         }
     };
-    let after = svnadmin_post("Svnrep", "GetRepPathAllPri", Some(token), query_body)?;
+    let after = svnadmin_post_read("Svnrep", "GetRepPathAllPri", Some(token), query_body)?;
     ensure_svnadmin_success(&after)?;
     let verified = after
         .get("data")
@@ -3049,8 +3518,26 @@ fn ensure_principal_path_access(
             })
         });
     if !verified {
+        if let Some(error) = mutation_error.as_ref() {
+            return Err(format!(
+                "{error}; SvnAdmin ACL readback did not confirm the requested change"
+            )
+            .into());
+        }
         return Err(
             format!("SvnAdmin did not persist {object_name} {access} access for {path}").into(),
+        );
+    }
+    if mutation_error.is_some() {
+        record_svn_diagnostic_event(
+            "svnadmin",
+            "AclMutation",
+            "recovered_by_readback",
+            "write_response_uncertain",
+            1,
+            1,
+            None,
+            0,
         );
     }
     Ok(action)
@@ -3103,6 +3590,8 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
     let current_users = user_acl_map(&before);
     let desired_users = desired_acl_map(&desired);
     let mut applied = Vec::new();
+    let mut uncertain_write_count = 0usize;
+    let mut first_write_error = None;
     for (key, access) in &desired_users {
         let action = match current_users.get(key) {
             None => "CreateRepPathPri",
@@ -3120,15 +3609,22 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
         if action == "UpdRepPathPri" {
             body["invert"] = Value::Bool(false);
         }
-        let response = svnadmin_post("Svnrep", action, Some(&token), body)?;
-        ensure_svnadmin_success(&response)?;
-        applied.push(json!({ "action": if action == "CreateRepPathPri" { "create" } else { "update" }, "path": key.0, "username": key.1, "access": access }));
+        let mutation = svnadmin_post("Svnrep", action, Some(&token), body)
+            .and_then(|response| ensure_svnadmin_success(&response));
+        let response_confirmed = mutation.is_ok();
+        if !response_confirmed {
+            uncertain_write_count += 1;
+            if first_write_error.is_none() {
+                first_write_error = mutation.err().map(|error| error.to_string());
+            }
+        }
+        applied.push(json!({ "action": if action == "CreateRepPathPri" { "create" } else { "update" }, "path": key.0, "username": key.1, "access": access, "response_confirmed": response_confirmed }));
     }
     for (key, access) in &current_users {
         if desired_users.contains_key(key) {
             continue;
         }
-        let response = svnadmin_post(
+        let mutation = svnadmin_post(
             "Svnrep",
             "DelRepPathPri",
             Some(&token),
@@ -3139,15 +3635,38 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
                 "objectName": key.1,
                 "svnn_user_pri_path_id": -1
             }),
-        )?;
-        ensure_svnadmin_success(&response)?;
+        )
+        .and_then(|response| ensure_svnadmin_success(&response));
+        let response_confirmed = mutation.is_ok();
+        if !response_confirmed {
+            uncertain_write_count += 1;
+            if first_write_error.is_none() {
+                first_write_error = mutation.err().map(|error| error.to_string());
+            }
+        }
         applied.push(
-            json!({ "action": "delete", "path": key.0, "username": key.1, "access": access }),
+            json!({ "action": "delete", "path": key.0, "username": key.1, "access": access, "response_confirmed": response_confirmed }),
         );
     }
     let after = read_project_acl(&project_id, &managed_paths)?;
     if user_acl_map(&after) != desired_users {
-        return Err("SvnAdmin ACL readback did not match the approved plan".into());
+        return Err(format!(
+            "SvnAdmin ACL readback did not match the approved plan ({uncertain_write_count} write responses were uncertain; first_error={})",
+            first_write_error.as_deref().unwrap_or("none")
+        )
+        .into());
+    }
+    if uncertain_write_count > 0 {
+        record_svn_diagnostic_event(
+            "svnadmin",
+            "ApplyAclPlan",
+            "recovered_by_readback",
+            "write_response_uncertain",
+            uncertain_write_count,
+            uncertain_write_count,
+            None,
+            0,
+        );
     }
     Ok(json!({
         "ok": true,
@@ -3249,7 +3768,7 @@ fn read_project_acl(project_id: &str, paths: &[String]) -> Result<Vec<Value>, Bo
     let token = login_svnadmin(&connection.username, &password)?;
     let mut entries = Vec::new();
     for path in paths {
-        let response = svnadmin_post(
+        let response = svnadmin_post_read(
             "Svnrep",
             "GetRepPathAllPri",
             Some(&token),
@@ -3641,26 +4160,38 @@ pub(crate) fn create_repository(request: CreateRepositoryRequest) -> Result<Valu
             "rep_note": request.project_name.trim(),
             "rep_type": "2"
         }),
-    )?;
-    if let Err(error) = ensure_svnadmin_success(&response) {
-        if svnadmin_repository_exists(&token, &project_id)? {
-            return Ok(json!({
-                "ok": true,
-                "created": false,
-                "already_exists": true,
-                "project_id": project_id,
-                "repository_url": project_repository_url(&project_id)?,
-                "result": response.get("data").cloned().unwrap_or(Value::Null)
-            }));
+    );
+    let (result_data, mutation_error) = match response {
+        Ok(response) => (
+            response.get("data").cloned().unwrap_or(Value::Null),
+            ensure_svnadmin_success(&response).err(),
+        ),
+        Err(error) => (Value::Null, Some(error)),
+    };
+    let recovered_after_error = mutation_error.is_some();
+    if recovered_after_error {
+        if !svnadmin_repository_exists(&token, &project_id)? {
+            return Err(mutation_error
+                .unwrap_or_else(|| "SvnAdmin did not persist the new repository".into()));
         }
-        return Err(error);
+        record_svn_diagnostic_event(
+            "svnadmin",
+            "CreateRep",
+            "recovered_by_readback",
+            "write_response_uncertain",
+            1,
+            1,
+            None,
+            0,
+        );
     }
     Ok(json!({
         "ok": true,
         "created": true,
+        "recovered_after_error": recovered_after_error,
         "project_id": project_id,
         "repository_url": project_repository_url(&project_id)?,
-        "result": response.get("data").cloned().unwrap_or(Value::Null)
+        "result": result_data
     }))
 }
 
@@ -3697,7 +4228,7 @@ pub(crate) fn install_repository_post_commit_hook(
     let content_sha256 = repository_post_commit_hook_sha256(&content);
     let credential_sha256 = repository_post_commit_hook_sha256(hook_credential);
 
-    let response = svnadmin_post(
+    let mutation_error = svnadmin_post(
         "Svnrep",
         "UpdRepHook",
         Some(&token),
@@ -3706,10 +4237,11 @@ pub(crate) fn install_repository_post_commit_hook(
             "fileName": "post-commit",
             "content": content,
         }),
-    )?;
-    ensure_svnadmin_success(&response)?;
+    )
+    .and_then(|response| ensure_svnadmin_success(&response))
+    .err();
 
-    let verify = svnadmin_post(
+    let verify = svnadmin_post_read(
         "Svnrep",
         "GetRepHooks",
         Some(&token),
@@ -3729,11 +4261,31 @@ pub(crate) fn install_repository_post_commit_hook(
         .unwrap_or_default();
     let installed_content = hook.get("con").and_then(Value::as_str).unwrap_or_default();
     if !has_file || file_name != "post-commit" || installed_content != content {
+        if let Some(error) = mutation_error.as_ref() {
+            return Err(format!(
+                "{error}; SvnAdmin Hook readback did not confirm the requested content"
+            )
+            .into());
+        }
         return Err("SvnAdmin post-commit Hook readback verification failed".into());
+    }
+    let recovered_after_error = mutation_error.is_some();
+    if recovered_after_error {
+        record_svn_diagnostic_event(
+            "svnadmin",
+            "UpdRepHook",
+            "recovered_by_readback",
+            "write_response_uncertain",
+            1,
+            1,
+            None,
+            0,
+        );
     }
 
     Ok(json!({
         "installed": true,
+        "recovered_after_error": recovered_after_error,
         "repository": project_id,
         "hook_version": HIMIND_SVN_POST_COMMIT_HOOK_VERSION,
         "content_sha256": content_sha256,
@@ -3857,7 +4409,7 @@ fn php_single_quoted_literal(value: &str) -> String {
 }
 
 fn svnadmin_repository_exists(token: &str, project_id: &str) -> Result<bool, Box<dyn Error>> {
-    let response = svnadmin_post(
+    let response = svnadmin_post_read(
         "Svnrep",
         "GetRepCon",
         Some(token),
@@ -4030,7 +4582,7 @@ fn load_svn_admin_secret(
 }
 
 fn login_svnadmin(username: &str, password: &str) -> Result<String, Box<dyn Error>> {
-    let verify_option = svnadmin_post("Setting", "GetVerifyOption", None, json!({}))?;
+    let verify_option = svnadmin_post_read("Setting", "GetVerifyOption", None, json!({}))?;
     ensure_svnadmin_success(&verify_option)?;
     if verify_option
         .pointer("/data/enable")
@@ -4041,7 +4593,7 @@ fn login_svnadmin(username: &str, password: &str) -> Result<String, Box<dyn Erro
             "SvnAdmin verification code is enabled; disable it for Agent automation".into(),
         );
     }
-    let response = svnadmin_post(
+    let response = svnadmin_post_read(
         "Common",
         "Login",
         None,
@@ -4062,19 +4614,210 @@ fn svnadmin_post(
     token: Option<&str>,
     body: Value,
 ) -> Result<Value, Box<dyn Error>> {
+    svnadmin_post_with_attempts(controller, action, token, body, 1)
+}
+
+fn svnadmin_post_read(
+    controller: &str,
+    action: &str,
+    token: Option<&str>,
+    body: Value,
+) -> Result<Value, Box<dyn Error>> {
+    svnadmin_post_with_attempts(controller, action, token, body, SVN_ADMIN_READ_ATTEMPTS)
+}
+
+fn svnadmin_post_with_attempts(
+    controller: &str,
+    action: &str,
+    token: Option<&str>,
+    body: Value,
+    max_attempts: usize,
+) -> Result<Value, Box<dyn Error>> {
+    let max_attempts = max_attempts.max(1);
+    for attempt in 1..=max_attempts {
+        match svnadmin_post_once(controller, action, token, &body, attempt, max_attempts) {
+            Ok(response) => {
+                if attempt > 1 {
+                    record_svn_diagnostic_event(
+                        "svnadmin",
+                        action,
+                        "recovered",
+                        "",
+                        attempt,
+                        max_attempts,
+                        None,
+                        0,
+                    );
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                let should_retry = error.retryable && attempt < max_attempts;
+                record_svn_diagnostic_event(
+                    "svnadmin",
+                    action,
+                    if should_retry { "retrying" } else { "failed" },
+                    error.category,
+                    attempt,
+                    max_attempts,
+                    error.http_status,
+                    error.elapsed_ms,
+                );
+                if !should_retry {
+                    return Err(Box::new(error));
+                }
+                thread::sleep(svnadmin_retry_delay(attempt));
+            }
+        }
+    }
+    Err("SvnAdmin request exhausted all attempts".into())
+}
+
+fn svnadmin_post_once(
+    controller: &str,
+    action: &str,
+    token: Option<&str>,
+    body: &Value,
+    attempt: usize,
+    max_attempts: usize,
+) -> Result<Value, SvnAdminRequestError> {
     let endpoint = format!("{SVN_ADMIN_URL}/api.php?c={controller}&a={action}&t=web");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?;
-    let mut request = client.post(endpoint).json(&body);
+    let started = Instant::now();
+    let client = SVN_ADMIN_CLIENT.get_or_init(reqwest::blocking::Client::new);
+    let mut request = client
+        .post(endpoint)
+        .timeout(Duration::from_secs(20))
+        .json(body);
     if let Some(token) = token {
         request = request.header("Token", token);
     }
-    let response = request.send()?;
+    let response = request.send().map_err(|error| {
+        let category = if error.is_timeout() {
+            "timeout"
+        } else if error.is_connect() {
+            "connect"
+        } else {
+            "transport"
+        };
+        SvnAdminRequestError {
+            action: action.to_string(),
+            category,
+            attempt,
+            max_attempts,
+            http_status: error.status().map(|status| status.as_u16()),
+            elapsed_ms: started.elapsed().as_millis(),
+            retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+            message: error.to_string(),
+        }
+    })?;
     if !response.status().is_success() {
-        return Err(format!("SvnAdmin returned HTTP {}", response.status()).into());
+        let status = response.status();
+        return Err(SvnAdminRequestError {
+            action: action.to_string(),
+            category: "http",
+            attempt,
+            max_attempts,
+            http_status: Some(status.as_u16()),
+            elapsed_ms: started.elapsed().as_millis(),
+            retryable: is_retryable_svnadmin_status(status.as_u16()),
+            message: format!("SvnAdmin returned HTTP {status}"),
+        });
     }
-    Ok(response.json()?)
+    response.json().map_err(|error| SvnAdminRequestError {
+        action: action.to_string(),
+        category: "invalid_response",
+        attempt,
+        max_attempts,
+        http_status: error.status().map(|status| status.as_u16()),
+        elapsed_ms: started.elapsed().as_millis(),
+        retryable: true,
+        message: "SvnAdmin returned an invalid JSON response".to_string(),
+    })
+}
+
+fn is_retryable_svnadmin_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn svnadmin_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(match attempt {
+        1 => 250,
+        _ => 750,
+    })
+}
+
+fn record_svn_diagnostic_event(
+    component: &str,
+    action: &str,
+    outcome: &str,
+    category: &str,
+    attempt: usize,
+    max_attempts: usize,
+    http_status: Option<u16>,
+    elapsed_ms: u128,
+) {
+    let context = SVN_DIAGNOSTIC_CONTEXT.with(|value| value.borrow().clone());
+    let event = json!({
+        "timestamp": svn_diagnostic_unix_now(),
+        "component": component,
+        "action": action,
+        "outcome": outcome,
+        "category": category,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "http_status": http_status,
+        "elapsed_ms": elapsed_ms,
+        "task_id": context.task_id,
+        "execution_id": context.execution_id,
+    });
+    let lock = SVN_DIAGNOSTIC_LOG_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+    let path = crate::store::paths::agent_home()
+        .join("logs")
+        .join("svn-events.jsonl");
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    rotate_svn_diagnostic_logs(&path);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    if let Ok(line) = serde_json::to_string(&event) {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
+fn rotate_svn_diagnostic_logs(path: &Path) {
+    const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+    if path
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or_default()
+        < MAX_LOG_BYTES
+    {
+        return;
+    }
+    let second = path.with_extension("jsonl.2");
+    let first = path.with_extension("jsonl.1");
+    let _ = std::fs::remove_file(&second);
+    let _ = std::fs::rename(&first, &second);
+    let _ = std::fs::rename(path, &first);
+}
+
+fn svn_diagnostic_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn ensure_svnadmin_success(response: &Value) -> Result<(), Box<dyn Error>> {
@@ -4709,6 +5452,61 @@ mod tests {
     }
 
     #[test]
+    fn adopts_verified_working_copy_metadata_without_a_second_checkout() {
+        let svn = find_svn_executable().unwrap();
+        let svnadmin = svn.with_file_name("svnadmin.exe");
+        if !svnadmin.is_file() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "himind-adopt-svn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let repository = root.join("repository");
+        let verified = root.join("verified");
+        let source = root.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new(&svnadmin)
+            .args(["create", repository.to_string_lossy().as_ref()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap()
+            .success());
+        let repository_url = Url::from_file_path(&repository).unwrap().to_string();
+        assert!(Command::new(&svn)
+            .args([
+                "checkout",
+                &repository_url,
+                verified.to_string_lossy().as_ref()
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(verified.join("project.txt"), "verified content").unwrap();
+        run_svn_in_directory(&verified, ["add", "project.txt"]).unwrap();
+        run_svn_in_directory(&verified, ["commit", "-m", "initial"]).unwrap();
+
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::copy(verified.join("project.txt"), source.join("project.txt")).unwrap();
+        copy_working_copy_admin(&verified, &source).unwrap();
+
+        assert!(same_svn_url(
+            &svn_item(&source, "url").unwrap(),
+            &repository_url
+        ));
+        assert_eq!(svn_status_change_count(&source).unwrap(), 0);
+        std::fs::write(source.join("project.txt"), "changed").unwrap();
+        assert_eq!(svn_status_change_count(&source).unwrap(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn normalizes_external_urls_and_preserves_revision_options() {
         let source =
             std::env::temp_dir().join(format!(" himind-external-normalize-{}", std::process::id()));
@@ -4775,6 +5573,20 @@ mod tests {
     fn decodes_svn_cli_output_as_utf8_or_gbk() {
         assert_eq!(decode_svn_cli_output("路径正常".as_bytes()), "路径正常");
         assert_eq!(decode_svn_cli_output(&[0xD6, 0xD0, 0xCE, 0xC4]), "中文");
+    }
+
+    #[test]
+    fn svn_status_count_ignores_externals_but_keeps_real_changes() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status><target path=".">
+<entry path="Assets/Main.unity"><wc-status item="normal" props="none" revision="12" /></entry>
+<entry path="Packages/External"><wc-status item="external" props="none" /></entry>
+<entry path="backup.zip"><wc-status item="unversioned" props="none" /></entry>
+<entry path="Assets/Changed.asset"><wc-status item="modified" props="none" revision="12" /></entry>
+<entry path="ProjectSettings"><wc-status item="normal" props="modified" revision="12" /></entry>
+</target></status>"#;
+
+        assert_eq!(svn_status_change_count_from_xml(xml).unwrap(), 3);
     }
 
     #[test]
@@ -4994,5 +5806,45 @@ Develop.meta
         assert_eq!(parsed.targets[0].entries.len(), 4);
         assert_eq!(parsed.targets[0].entries[1].status.item, "modified");
         assert_eq!(parsed.targets[0].entries[2].status.item, "external");
+    }
+
+    #[test]
+    fn retries_only_transient_svnadmin_http_statuses() {
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_svnadmin_status(status), "status={status}");
+        }
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(!is_retryable_svnadmin_status(status), "status={status}");
+        }
+        assert_eq!(svnadmin_retry_delay(1), Duration::from_millis(250));
+        assert_eq!(svnadmin_retry_delay(2), Duration::from_millis(750));
+    }
+
+    #[test]
+    fn exposes_remote_import_state_from_partial_failure() {
+        let error: Box<dyn Error> = Box::new(ExhibitImportPartialFailure {
+            message: "local adoption failed".to_string(),
+            result: json!({
+                "remote_imported": true,
+                "repository_revision": 12,
+                "local_adoption_pending": true,
+            }),
+        });
+        let result = task_failure_result(error.as_ref()).unwrap();
+        assert_eq!(result["repository_revision"], 12);
+        assert_eq!(result["local_adoption_pending"], true);
+    }
+
+    #[test]
+    fn parses_clone_verification_log_entry() {
+        let document: SvnLogDocument = quick_xml::de::from_str(
+            r#"<?xml version="1.0"?><log><logentry revision="42"><author>tester</author><msg>Clone exhibit EX-1 from http://svn.example/source</msg></logentry></log>"#,
+        )
+        .unwrap();
+        assert_eq!(document.entries[0].revision, 42);
+        assert_eq!(
+            document.entries[0].msg,
+            "Clone exhibit EX-1 from http://svn.example/source"
+        );
     }
 }

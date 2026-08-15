@@ -64,25 +64,12 @@ export function DashboardPage({
   return (
     <div className="dashboard-page">
       <PageHeader
-        title="HiMind Agent"
-        description="查看这台电脑与 HiMind 工作台的连接状态。"
+        title={identity?.authorized && identity.user_name ? `${identity.user_name}的执行端` : 'HiMind Agent'}
+        description="数字分身通过这台电脑调用已授权的 AI 工具与业务能力，并把执行结果回写到 HiMind 工作台。"
         actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
       {!workerOnline ? <div className="blocker"><CircleAlert size={18} /><div><strong>{workerIssue.title}</strong><span>{workerIssue.description}</span></div></div> : null}
-      <section className="health-panel">
-        <div className={`health-icon ${workerOnline ? 'success' : 'danger'}`}>{workerOnline ? <CheckCircle2 size={25} /> : <CircleAlert size={25} />}</div>
-        <div className="health-copy">
-          <span className="eyebrow">运行状态</span>
-          <h3>{workerOnline ? 'HiMind Agent 运行正常' : '连接需要处理'}</h3>
-          <p>{workerOnline ? '这台电脑已连接 HiMind 工作台。' : workerIssue.healthDescription}</p>
-        </div>
-        <div className="health-metrics">
-          <div><span>待审批</span><strong className={approvals.length ? 'warning-text' : ''}>{approvals.length}</strong></div>
-          <div><span>远程任务</span><strong>{remoteExecutionSettings?.enabled ? '已开启' : '已关闭'}</strong></div>
-          <div><span>AI 工具</span><strong>{aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已注册` : '未安装'}</strong></div>
-        </div>
-      </section>
       <DashboardIdentityPanel
         identity={identity}
         authorization={authorization}
@@ -94,6 +81,19 @@ export function DashboardPage({
         onRevoke={onRevokeAuthorization}
         authorizationDisabledReason={workerIssue.requiresEnrollment ? workerIssue.description : undefined}
       />
+      <section className="health-panel">
+        <div className={`health-icon ${workerOnline ? 'success' : 'danger'}`}>{workerOnline ? <CheckCircle2 size={25} /> : <CircleAlert size={25} />}</div>
+        <div className="health-copy">
+          <span className="eyebrow">运行状态</span>
+          <h3>{workerOnline ? '数字分身执行端运行正常' : '连接需要处理'}</h3>
+          <p>{workerOnline ? '已连接工作台，等待数字分身下发任务。' : workerIssue.healthDescription}</p>
+        </div>
+        <div className="health-metrics">
+          <div><span>待审批</span><strong className={approvals.length ? 'warning-text' : ''}>{approvals.length}</strong></div>
+          <div><span>远程任务</span><strong>{remoteExecutionSettings?.enabled ? '已开启' : '已关闭'}</strong></div>
+          <div><span>AI 工具</span><strong>{aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已注册` : '未安装'}</strong></div>
+        </div>
+      </section>
       <details className="overview-technical">
         <summary><ShieldCheck size={16} /><span><strong>设备信息</strong><small>版本与本机连接</small></span><Pill kind={loginConfigured ? 'success' : 'warn'}>{loginConfigured ? '账号已配置' : '账号待配置'}</Pill></summary>
         <div className="overview-technical-grid">

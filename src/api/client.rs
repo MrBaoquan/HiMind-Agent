@@ -60,15 +60,36 @@ impl TaskCancelGuard {
             }
         }
         self.last_checked = Some(Instant::now());
-        let state = client
+        let response = match client
             .get(format!("{}/api/tasks/{}/cancel", options.api_base, task_id))
             .header(
                 "Authorization",
                 agent_authorization(agent_id, &options.agent_credential()),
             )
-            .send()?
-            .error_for_status()?
-            .json::<TaskCancelStatus>()?;
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
+                eprintln!(
+                    "task {task_id} cancel status temporarily unavailable; operation will continue: {error}"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if response.status().is_server_error()
+            || matches!(
+                response.status(),
+                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+            )
+        {
+            eprintln!(
+                "task {task_id} cancel status returned transient HTTP {}; operation will continue",
+                response.status()
+            );
+            return Ok(());
+        }
+        let state = response.error_for_status()?.json::<TaskCancelStatus>()?;
         if state.cancel_requested || state.status == "canceled" || state.status == "canceling" {
             self.canceled = true;
             return Err(TASK_CANCELED_ERROR.into());
