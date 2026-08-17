@@ -7,12 +7,16 @@ use crate::api::client::{claim_agent_run, is_task_canceled_error, update_agent_r
 use crate::api::types::{AgentRunClaim, RuntimeInstallationReport, Task};
 use crate::Options;
 
+pub(crate) mod artifacts;
+pub(crate) mod builtin;
 pub(crate) mod codex;
 pub(crate) mod copilot;
-pub(crate) mod openhands;
+mod deepseek_harness;
+pub(crate) mod native;
 pub(crate) mod process;
 
-pub(crate) const PROVIDER_OPENHANDS: &str = "himind.openhands";
+pub(crate) const PROVIDER_NATIVE: &str = "himind.native";
+pub(crate) const PROVIDER_BUILTIN: &str = "himind.builtin";
 pub(crate) const PROVIDER_CODEX: &str = "personal.codex";
 pub(crate) const PROVIDER_GITHUB_COPILOT: &str = "personal.github-copilot";
 
@@ -30,6 +34,8 @@ struct ProviderExecutionReport {
     verification: Vec<ProviderVerification>,
     #[serde(default)]
     remaining_risks: Vec<String>,
+    #[serde(default)]
+    output_artifacts: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -43,7 +49,7 @@ struct ProviderVerification {
 }
 
 pub(crate) fn probe_installations() -> Vec<RuntimeInstallationReport> {
-    vec![codex::probe(), copilot::probe(), openhands::probe()]
+    vec![builtin::probe(), codex::probe(), copilot::probe()]
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -60,7 +66,8 @@ pub(crate) fn execute(
 ) -> Result<Value, Box<dyn Error>> {
     let envelope = parse_envelope(task)?;
     match envelope.runtime_provider.as_str() {
-        PROVIDER_OPENHANDS => openhands::execute(client, options, agent_id, task),
+        PROVIDER_NATIVE => native::execute(client, options, agent_id, task, &envelope),
+        PROVIDER_BUILTIN => builtin::execute(client, options, agent_id, task, &envelope),
         PROVIDER_CODEX => codex::execute(client, options, agent_id, task, &envelope),
         PROVIDER_GITHUB_COPILOT => copilot::execute(client, options, agent_id, task, &envelope),
         provider => Err(format!("unsupported Agent Run provider: {provider}").into()),
@@ -137,22 +144,25 @@ where
         _ => return Err("Dashboard returned an unsupported Agent Run access mode".into()),
     }
 
-    match executor(&claim) {
-        Ok(value) => {
-            let value = normalize_execution_result(value, expected_provider);
-            update_agent_run_status(
-                client,
-                &options.api_base,
-                agent_id,
-                &claim.run.id,
-                &claim.claim_token,
-                "succeeded",
-                Some(&value),
-                "",
-                &credential,
-            )?;
-            Ok(value)
-        }
+    let execution = executor(&claim).and_then(|value| {
+        let _artifact_lease = process::start_run_lease_renewal(client, options, agent_id, &claim);
+        let value = artifacts::prepare_execution_result(client, options, agent_id, &claim, value)?;
+        let value = normalize_execution_result(value, expected_provider);
+        update_agent_run_status(
+            client,
+            &options.api_base,
+            agent_id,
+            &claim.run.id,
+            &claim.claim_token,
+            "succeeded",
+            Some(&value),
+            "",
+            &credential,
+        )?;
+        Ok(value)
+    });
+    match execution {
+        Ok(value) => Ok(value),
         Err(error) => {
             let message = process::redact_error(&error.to_string(), &claim, &credential);
             let status = if is_task_canceled_error(&message) {
@@ -221,6 +231,31 @@ pub(super) fn normalize_execution_result(value: Value, runtime_provider: &str) -
             }))
         })
         .collect::<Vec<_>>();
+    let output_artifacts = report
+        .output_artifacts
+        .into_iter()
+        .take(10)
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let file_object_id = object.get("file_object_id").and_then(Value::as_str)?.trim();
+            let title = object.get("title").and_then(Value::as_str)?.trim();
+            let name = object.get("name").and_then(Value::as_str)?.trim();
+            let content_type = object.get("content_type").and_then(Value::as_str)?.trim();
+            let artifact_type = object.get("artifact_type").and_then(Value::as_str)?.trim();
+            if file_object_id.is_empty() || title.is_empty() || name.is_empty() || content_type.is_empty() || artifact_type.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "file_object_id": process::summarize_output(file_object_id, 300),
+                "artifact_type": process::summarize_output(artifact_type, 80),
+                "title": process::summarize_output(title, 240),
+                "content_type": process::summarize_output(content_type, 160),
+                "name": process::summarize_output(name, 500),
+                "size_bytes": object.get("size_bytes").and_then(Value::as_i64).unwrap_or(0).max(0),
+                "sha256": process::summarize_output(object.get("sha256").and_then(Value::as_str).unwrap_or_default(), 128),
+            }))
+        })
+        .collect::<Vec<_>>();
     json!({
         "schema_version": "agent_execution_result.v1",
         "run_id": value.get("run_id").and_then(Value::as_str).unwrap_or_default(),
@@ -233,6 +268,7 @@ pub(super) fn normalize_execution_result(value: Value, runtime_provider: &str) -
         "remaining_risks": remaining_risks,
         "provider_session_id": value.get("session_id").and_then(Value::as_str).unwrap_or_default(),
         "provider_version": value.get("version").and_then(Value::as_str).unwrap_or_default(),
+        "output_artifacts": output_artifacts,
     })
 }
 
@@ -314,7 +350,7 @@ fn find_provider_execution_report(value: &Value, depth: usize) -> Option<Provide
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_execution_result, parse_envelope, PROVIDER_CODEX, PROVIDER_OPENHANDS};
+    use super::{normalize_execution_result, parse_envelope, PROVIDER_BUILTIN, PROVIDER_CODEX};
     use crate::api::types::Task;
     use serde_json::json;
 
@@ -361,7 +397,7 @@ mod tests {
                 "billing_owner":"himind",
                 "final_message":"{\"type\":\"message\",\"payload\":{\"content\":\"{\\\"summary\\\":\\\"Implemented\\\",\\\"changes\\\":[],\\\"verification\\\":[{\\\"name\\\":\\\"tests\\\",\\\"status\\\":\\\"passed\\\",\\\"detail\\\":\\\"ok\\\"}],\\\"remaining_risks\\\":[]}\"}}"
             }),
-            PROVIDER_OPENHANDS,
+            PROVIDER_BUILTIN,
         );
         assert_eq!(value["summary"], "Implemented");
         assert_eq!(value["verification"][0]["status"], "passed");

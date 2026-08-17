@@ -1,7 +1,9 @@
 use std::{
+    io::{BufRead, BufReader},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::http::{Request, Response, StatusCode};
 use tauri::{
@@ -10,10 +12,25 @@ use tauri::{
     Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
+use crate::app::builtin_ai_proxy::BuiltinAiProxy;
+use crate::app::builtin_ai_sync::BuiltinAiEventSync;
 use crate::app::commands::AgentState;
 use crate::approval::manager::ApprovalManager;
 use crate::store::types::LocalWorkerStatus;
 use crate::Options;
+
+struct BuiltinAiSession {
+    child: Child,
+    proxy: BuiltinAiProxy,
+    event_sync: BuiltinAiEventSync,
+}
+
+static BUILTIN_AI_SESSION: std::sync::OnceLock<Mutex<Option<BuiltinAiSession>>> =
+    std::sync::OnceLock::new();
+
+fn builtin_ai_session() -> &'static Mutex<Option<BuiltinAiSession>> {
+    BUILTIN_AI_SESSION.get_or_init(|| Mutex::new(None))
+}
 
 pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let port = options.local_port;
@@ -93,6 +110,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                 api.prevent_close();
                 let _ = window.hide();
             }
+            ("builtin-ai", WindowEvent::CloseRequested { .. }) => {
+                stop_builtin_ai_process();
+            }
             (label, WindowEvent::CloseRequested { api, .. })
                 if label.starts_with("plugin-view-") =>
             {
@@ -128,8 +148,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_approval_settings,
             super::commands::get_remote_execution_settings,
             super::commands::save_remote_execution_settings,
-            super::commands::get_openhands_runtime_status,
-            super::commands::install_openhands_runtime,
+            super::commands::get_builtin_ai_runtime_status,
+            super::commands::install_builtin_ai_runtime,
+            super::commands::open_builtin_ai,
             super::commands::set_approval_rule,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
@@ -295,6 +316,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
                 show_main_window(app);
             }
             "quit" => {
+                stop_builtin_ai_process();
                 app.exit(0);
             }
             "check-update" => {
@@ -554,6 +576,123 @@ pub(crate) fn open_plugin_view(
     .build()
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("builtin-ai") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    stop_builtin_ai_process();
+    let launch = crate::runtime::builtin::prepare_interactive_launch(options)?;
+    let mut command = if launch
+        .executable
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/D").arg("/C").arg(&launch.executable);
+        command
+    } else {
+        Command::new(&launch.executable)
+    };
+    command
+        .args(["--profile", "web", "--host", "127.0.0.1", "--port", "0"])
+        .env("DSH_HOME", &launch.home)
+        .env("DEEPSEEK_API_KEY", &launch.api_key)
+        .env("DEEPSEEK_BASE_URL", &launch.base_url)
+        .env("DSH_TELEMETRY_MODE", "DISABLED")
+        .env("DSH_PERMISSION_MODE", "ask")
+        .env("HIMIND_BUILTIN_AI_MODEL", &launch.model)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::runtime::process::remove_himind_secret_environment(&mut command);
+    command
+        .env("DEEPSEEK_API_KEY", &launch.api_key)
+        .env("DEEPSEEK_BASE_URL", &launch.base_url);
+    crate::runtime::process::configure_hidden_process(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动 HiMind AI：{error}"))?;
+    let stdout = child.stdout.take().ok_or("HiMind AI 没有返回启动输出")?;
+    let stderr = child.stderr.take();
+    let (url_sender, url_receiver) = std::sync::mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().flatten() {
+            if let Some(url) = line
+                .split_whitespace()
+                .find(|value| value.starts_with("http://127.0.0.1:"))
+            {
+                let _ = url_sender.send(url.trim_end_matches(')').to_string());
+            }
+        }
+    });
+    if let Some(stderr) = stderr {
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().flatten() {
+                eprintln!("HiMind AI: {line}");
+            }
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let url = loop {
+        if let Ok(url) = url_receiver.recv_timeout(Duration::from_millis(200)) {
+            break url;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("HiMind AI 启动超时，请检查内置组件状态".to_string());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("HiMind AI 启动失败（退出码 {:?}）", status.code()));
+        }
+    };
+    let (event_sync, observer) = BuiltinAiEventSync::start(options.clone());
+    let proxy = BuiltinAiProxy::start(&url, Some(observer)).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        error
+    })?;
+    let window_url = proxy.url().to_string();
+    *builtin_ai_session()
+        .lock()
+        .map_err(|_| "HiMind AI 会话状态不可用")? = Some(BuiltinAiSession {
+        child,
+        proxy,
+        event_sync,
+    });
+    WebviewWindowBuilder::new(
+        app,
+        "builtin-ai",
+        WebviewUrl::External(window_url.parse().map_err(|_| "HiMind AI 地址无效")?),
+    )
+    .title("HiMind AI")
+    .inner_size(1220.0, 820.0)
+    .min_inner_size(860.0, 620.0)
+    .resizable(true)
+    .build()
+    .map(|_| ())
+    .map_err(|error| {
+        stop_builtin_ai_process();
+        format!("打开 HiMind AI 失败：{error}")
+    })
+}
+
+pub(crate) fn stop_builtin_ai_process() {
+    if let Ok(mut active) = builtin_ai_session().lock() {
+        if let Some(mut session) = active.take() {
+            session.proxy.stop();
+            session.event_sync.stop();
+            let _ = session.child.kill();
+            let _ = session.child.wait();
+        }
+    }
 }
 
 pub(crate) fn plugin_view_window_label(plugin_id: &str, view_id: &str) -> String {

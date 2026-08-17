@@ -67,6 +67,9 @@ enum CapabilityHandler {
     DashboardExhibitContext,
     DashboardMyWorkSummary,
     DashboardKnowledgeSearch,
+    MediaSubmit(String, String),
+    MediaJobGet,
+    MediaJobCancel,
     PluginCapability(String),
 }
 
@@ -447,7 +450,9 @@ impl CapabilityGateway {
                     "type": "object",
                     "properties": {
                         "workspace_root": {"type":"string"}, "artifact_path": {"type":"string"},
-                        "product_id": {"type":"string"}, "product_name": {"type":"string"}, "version": {"type":"string"},
+                        "product_id": {"type":"string"}, "product_name": {"type":"string"},
+                        "product_type": {"type":"string", "enum":["desktop_agent","agent_plugin","organization_skill","desktop_app","runtime_component","knowledge_edge_node"]},
+                        "version": {"type":"string"},
                         "channel": {"type":"string"}, "platform": {"type":"string"}, "architecture": {"type":"string"},
                         "package_type": {"type":"string", "enum":["directory-zip","apk","unity-addressables","content"]},
                         "release_notes": {"type":"string"}, "mandatory": {"type":"boolean"},
@@ -528,6 +533,13 @@ impl CapabilityGateway {
                 }),
                 CapabilityHandler::DashboardKnowledgeSearch,
             ),
+            media_registration("media.image.generate", "生成图片", "根据提示词生成图片，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("image".into(), "generate".into())),
+            media_registration("media.image.edit", "编辑图片", "根据提示词和参考图片编辑图像，返回可查询的媒体任务。", "network_write", media_generate_schema(true), CapabilityHandler::MediaSubmit("image".into(), "edit".into())),
+            media_registration("media.video.generate", "生成视频", "根据提示词和可选参考素材生成视频，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("video".into(), "generate".into())),
+            media_registration("media.audio.speech", "生成语音", "将文案合成为语音，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("speech".into(), "generate".into())),
+            media_registration("media.audio.transcribe", "语音转写", "转写已上传的音频文件，返回可查询的媒体任务。", "network_write", media_transcribe_schema(), CapabilityHandler::MediaSubmit("transcription".into(), "transcribe".into())),
+            media_registration("media.job.get", "查看媒体任务", "查看图片、视频或语音任务的状态和输出文件。", "read_only", media_job_schema(), CapabilityHandler::MediaJobGet),
+            media_registration("media.job.cancel", "取消媒体任务", "取消仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
         ];
 
         for item in builtins {
@@ -660,6 +672,11 @@ impl CapabilityGateway {
             CapabilityHandler::DashboardKnowledgeSearch => {
                 crate::api::dashboard_business::search_knowledge(&self.options, input)
             }
+            CapabilityHandler::MediaSubmit(kind, operation) => {
+                crate::api::media::submit(&self.options, &kind, &operation, input)
+            }
+            CapabilityHandler::MediaJobGet => crate::api::media::get(&self.options, input),
+            CapabilityHandler::MediaJobCancel => crate::api::media::cancel(&self.options, input),
             CapabilityHandler::PluginCapability(id) => invoke_plugin_capability(&id, input),
         }
     }
@@ -993,6 +1010,13 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
             Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
         }
         "knowledge.search.v1" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
+        "media.image.generate"
+        | "media.image.edit"
+        | "media.video.generate"
+        | "media.audio.speech"
+        | "media.audio.transcribe" => Some(crate::api::oauth::MEDIA_SUBMIT_SCOPE),
+        "media.job.get" => Some(crate::api::oauth::MEDIA_READ_SCOPE),
+        "media.job.cancel" => Some(crate::api::oauth::MEDIA_CANCEL_SCOPE),
         _ => None,
     }
 }
@@ -1018,6 +1042,17 @@ fn validate_distribution_publish_request(
     }
     if request.product_name.trim().is_empty() || request.version.trim().is_empty() {
         return Err("product_name 和 version 不能为空".into());
+    }
+    if !matches!(
+        request.product_type.as_str(),
+        "desktop_agent"
+            | "agent_plugin"
+            | "organization_skill"
+            | "desktop_app"
+            | "runtime_component"
+            | "knowledge_edge_node"
+    ) {
+        return Err("不支持的 product_type".into());
     }
     if !(1..=100).contains(&request.rollout_percent) {
         return Err("rollout_percent 必须在 1 到 100 之间".into());
@@ -1092,6 +1127,76 @@ fn dashboard_knowledge_registration(
     let mut item = registration(id, name, description, risk_level, input_schema, handler);
     item.descriptor.source = "plugin:com.himind.knowledge".to_string();
     item
+}
+
+fn media_registration(
+    id: &str,
+    name: &str,
+    description: &str,
+    risk_level: &str,
+    input_schema: Value,
+    handler: CapabilityHandler,
+) -> CapabilityRegistration {
+    let mut item = registration(id, name, description, risk_level, input_schema, handler);
+    item.descriptor.source = "builtin:himind-media".to_string();
+    item
+}
+
+fn media_generate_schema(reference_required: bool) -> Value {
+    let mut required = vec!["prompt"];
+    if reference_required {
+        required.push("reference_file_ids");
+    }
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {"type":"string", "maxLength":12000},
+            "model": {"type":"string"},
+            "reference_file_ids": {"type":"array", "maxItems":16, "items":{"type":"string"}},
+            "parameters": {
+                "type":"object",
+                "properties": {
+                    "aspect_ratio":{"type":"string"},
+                    "resolution":{"type":"string"},
+                    "duration_seconds":{"type":"number", "minimum":1},
+                    "voice":{"type":"string"},
+                    "format":{"type":"string"},
+                    "output_count":{"type":"integer", "minimum":1, "maximum":8}
+                },
+                "additionalProperties":true
+            },
+            "project_id":{"type":"string"},
+            "work_item_id":{"type":"string"},
+            "agent_run_id":{"type":"string"}
+        },
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn media_transcribe_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "reference_file_ids":{"type":"array", "minItems":1, "maxItems":16, "items":{"type":"string"}},
+            "model":{"type":"string"},
+            "parameters":{"type":"object", "additionalProperties":true},
+            "project_id":{"type":"string"},
+            "work_item_id":{"type":"string"},
+            "agent_run_id":{"type":"string"}
+        },
+        "required":["reference_file_ids"],
+        "additionalProperties":false
+    })
+}
+
+fn media_job_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"job_id":{"type":"string"}},
+        "required":["job_id"],
+        "additionalProperties":false
+    })
 }
 
 fn insert_registration(

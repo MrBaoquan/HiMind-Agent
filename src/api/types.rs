@@ -137,3 +137,16 @@ pub struct AgentRunClaim {
     #[serde(default)]
     pub access_mode: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentRunArtifactResponse {
+    pub run_id: String,
+    pub file_object_id: String,
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    pub name: String,
+    pub content_type: String,
+    pub file_size: i64,
+    pub sha256: String,
+    pub scan_status: String,
+}

@@ -725,10 +725,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .setting-control { width: 190px; flex: 0 0 190px; }
 .setting-control select { width: 100%; }
 .runtime-summary { padding: 14px; }
-.runtime-summary-main { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.runtime-summary-main { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; }
 .runtime-summary-main > div:first-child { min-width: 0; display: grid; gap: 3px; }
 .runtime-summary-main strong { font-size: 12px; font-weight: 600; }
-.runtime-summary-main span { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.runtime-summary-main span { color: var(--text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .runtime-actions { flex: 0 0 auto; justify-content: flex-end; }
 .runtime-actions .btn { white-space: nowrap; }
 .runtime-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -933,8 +933,6 @@ tr:last-child td { border-bottom: 0; }
   .settings-workspace { grid-template-columns: minmax(0, 1fr); }
   .settings-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-nav button { min-height: 46px; }
-  .runtime-summary-main { align-items: stretch; flex-direction: column; }
-  .runtime-actions { justify-content: flex-start; }
   .unity-editor-source { align-items: flex-start; flex-direction: column; gap: 6px; }
   .unity-editor-source small { text-align: left; }
   .unity-editor-footer { align-items: stretch; flex-direction: column; }
@@ -1518,8 +1516,8 @@ tr:last-child td { border-bottom: 0; }
   .log-entry { grid-template-columns: 116px 42px minmax(0, 1fr); gap: 7px; }
 
   .setting-row { min-height: 0; }
-  .runtime-summary-main { gap: 12px; }
-  .runtime-actions { width: 100%; flex-wrap: wrap; }
+  .runtime-summary-main { grid-template-columns: minmax(0, 1fr); align-items: stretch; gap: 12px; }
+  .runtime-actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
   .runtime-actions .btn { flex: 1 1 140px; }
   .unity-editor-actions { width: 100%; flex-wrap: wrap; }
   .unity-editor-actions .btn { flex: 1 1 140px; }

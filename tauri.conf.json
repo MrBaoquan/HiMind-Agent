@@ -1,6 +1,6 @@
 {
   "productName": "HiMind Agent",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "identifier": "com.himind.agent",
   "build": {
     "frontendDist": "frontend/dist"
@@ -10,8 +10,9 @@
       {
         "label": "main",
         "title": "HiMind Agent",
-        "width": 900,
-        "height": 640,
+        "width": 1100,
+        "height": 680,
+        "minWidth": 1000,
         "visible": false,
         "resizable": true,
         "center": true

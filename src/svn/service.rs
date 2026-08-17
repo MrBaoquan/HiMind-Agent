@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Write};
+use std::net::ToSocketAddrs;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -65,7 +66,10 @@ thread_local! {
 }
 
 static SVN_DIAGNOSTIC_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static SVN_ADMIN_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+// SvnAdmin is intentionally an intranet-only service. Do not inherit the
+// desktop's HTTP proxy settings for this client: a proxy can route the
+// request outside the LAN and turn a healthy service into a connect timeout.
+static SVN_ADMIN_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
 
 pub(crate) struct SvnDiagnosticContextGuard {
     previous: SvnDiagnosticContext,
@@ -4737,7 +4741,7 @@ fn svnadmin_post_with_attempts(
             }
             Err(error) => {
                 let should_retry = error.retryable && attempt < max_attempts;
-                record_svn_diagnostic_event(
+                record_svn_diagnostic_event_with_detail(
                     "svnadmin",
                     action,
                     if should_retry { "retrying" } else { "failed" },
@@ -4746,6 +4750,7 @@ fn svnadmin_post_with_attempts(
                     max_attempts,
                     error.http_status,
                     error.elapsed_ms,
+                    Some(&error.message),
                 );
                 if !should_retry {
                     return Err(Box::new(error));
@@ -4767,22 +4772,45 @@ fn svnadmin_post_once(
 ) -> Result<Value, SvnAdminRequestError> {
     let endpoint = format!("{SVN_ADMIN_URL}/api.php?c={controller}&a={action}&t=web");
     let started = Instant::now();
-    let client = SVN_ADMIN_CLIENT.get_or_init(reqwest::blocking::Client::new);
+    let client = match SVN_ADMIN_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|error| format!("failed to build direct LAN HTTP client: {error}"))
+    }) {
+        Ok(client) => client,
+        Err(message) => {
+            return Err(SvnAdminRequestError {
+                action: action.to_string(),
+                category: "client",
+                attempt,
+                max_attempts,
+                http_status: None,
+                elapsed_ms: started.elapsed().as_millis(),
+                retryable: false,
+                message: message.clone(),
+            });
+        }
+    };
     let mut request = client
-        .post(endpoint)
+        .post(&endpoint)
         .timeout(Duration::from_secs(20))
         .json(body);
     if let Some(token) = token {
         request = request.header("Token", token);
     }
     let response = request.send().map_err(|error| {
-        let category = if error.is_timeout() {
-            "timeout"
+        let category = if error.is_connect() && error.is_timeout() {
+            "connect_timeout"
         } else if error.is_connect() {
             "connect"
+        } else if error.is_timeout() {
+            "timeout"
         } else {
             "transport"
         };
+        let network_diagnostic = svnadmin_network_diagnostic(&endpoint);
         SvnAdminRequestError {
             action: action.to_string(),
             category,
@@ -4791,7 +4819,7 @@ fn svnadmin_post_once(
             http_status: error.status().map(|status| status.as_u16()),
             elapsed_ms: started.elapsed().as_millis(),
             retryable: error.is_timeout() || error.is_connect() || error.is_request(),
-            message: error.to_string(),
+            message: format!("{}; {}", error, network_diagnostic),
         }
     })?;
     if !response.status().is_success() {
@@ -4823,6 +4851,31 @@ fn is_retryable_svnadmin_status(status: u16) -> bool {
     matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
+fn svnadmin_network_diagnostic(endpoint: &str) -> String {
+    let Ok(parsed) = Url::parse(endpoint) else {
+        return "direct_lan=true;proxy=disabled;dns=invalid_endpoint".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "direct_lan=true;proxy=disabled;dns=missing_host".to_string();
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let resolved = match (host, port).to_socket_addrs() {
+        Ok(addresses) => {
+            let mut ips = BTreeSet::new();
+            for address in addresses.take(8) {
+                ips.insert(address.ip().to_string());
+            }
+            if ips.is_empty() {
+                "empty".to_string()
+            } else {
+                ips.into_iter().collect::<Vec<_>>().join(",")
+            }
+        }
+        Err(_) => "failed".to_string(),
+    };
+    format!("direct_lan=true;proxy=disabled;dns_host={host};dns_port={port};resolved={resolved}")
+}
+
 fn svnadmin_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(match attempt {
         1 => 250,
@@ -4840,8 +4893,32 @@ fn record_svn_diagnostic_event(
     http_status: Option<u16>,
     elapsed_ms: u128,
 ) {
+    record_svn_diagnostic_event_with_detail(
+        component,
+        action,
+        outcome,
+        category,
+        attempt,
+        max_attempts,
+        http_status,
+        elapsed_ms,
+        None,
+    );
+}
+
+fn record_svn_diagnostic_event_with_detail(
+    component: &str,
+    action: &str,
+    outcome: &str,
+    category: &str,
+    attempt: usize,
+    max_attempts: usize,
+    http_status: Option<u16>,
+    elapsed_ms: u128,
+    detail: Option<&str>,
+) {
     let context = SVN_DIAGNOSTIC_CONTEXT.with(|value| value.borrow().clone());
-    let event = json!({
+    let mut event = json!({
         "timestamp": svn_diagnostic_unix_now(),
         "component": component,
         "action": action,
@@ -4854,6 +4931,14 @@ fn record_svn_diagnostic_event(
         "task_id": context.task_id,
         "execution_id": context.execution_id,
     });
+    if let Some(detail) = detail {
+        if let Some(object) = event.as_object_mut() {
+            object.insert(
+                "detail".to_string(),
+                json!(crate::approval::manager::redact_message(detail)),
+            );
+        }
+    }
     let lock = SVN_DIAGNOSTIC_LOG_LOCK.get_or_init(|| Mutex::new(()));
     let Ok(_guard) = lock.lock() else {
         return;
@@ -5112,6 +5197,17 @@ mod tests {
             "http://svn.andcrane.com/repo/prj_123/trunk/exhibits/EXH-000001"
         );
         assert!(exhibit_repository_url("prj_123", "bad/name").is_err());
+    }
+
+    #[test]
+    fn svnadmin_network_diagnostic_marks_lan_requests_as_direct() {
+        let diagnostic = svnadmin_network_diagnostic(
+            "http://127.0.0.1/api.php?c=Setting&a=GetVerifyOption&t=web",
+        );
+        assert!(diagnostic.contains("direct_lan=true"));
+        assert!(diagnostic.contains("proxy=disabled"));
+        assert!(diagnostic.contains("dns_host=127.0.0.1"));
+        assert!(diagnostic.contains("resolved=127.0.0.1"));
     }
 
     #[test]
@@ -5584,6 +5680,7 @@ mod tests {
             &repository_url
         ));
         assert_eq!(svn_status_change_count(&source).unwrap(), 0);
+
         std::fs::create_dir_all(source.join("Library")).unwrap();
         std::fs::write(source.join("Library/cache.bin"), "local cache").unwrap();
         std::fs::write(source.join("backup.zip"), "local archive").unwrap();
@@ -5593,6 +5690,7 @@ mod tests {
             svn_status_change_count_after_adoption(&source, &[], &policy).unwrap(),
             0
         );
+
         std::fs::write(source.join("project.txt"), "changed").unwrap();
         assert_eq!(
             svn_status_change_count_after_adoption(&source, &[], &policy).unwrap(),

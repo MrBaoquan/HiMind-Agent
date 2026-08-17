@@ -143,9 +143,11 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
     } else {
         AgentUpdateStatus::default()
     };
+    let mut changed = status.current_version != crate::VERSION;
     status.current_version = crate::VERSION.to_string();
     if status.channel.trim().is_empty() {
         status.channel = default_channel();
+        changed = true;
     }
     if status.status == "installing" && status.available_version == crate::VERSION {
         status.status = "idle".to_string();
@@ -153,7 +155,7 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
         clear_staged_paths(&mut status);
         status.downloaded_bytes = 0;
         status.progress_percent = 0;
-        save(agent_state_path, &status)?;
+        changed = true;
     }
     if status.status == "ready" && !staged_payload_available(&status) {
         status.status = "available".to_string();
@@ -161,6 +163,9 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
         status.progress_percent = 0;
         clear_staged_paths(&mut status);
         status.last_error = "已下载的更新包不再可用，请重新下载".to_string();
+        changed = true;
+    }
+    if changed {
         save(agent_state_path, &status)?;
     }
     Ok(status)
@@ -759,14 +764,34 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_update_check, extract_directory_package, safe_version_segment, AgentUpdateStatus,
-        DIRECTORY_PACKAGE_FILES,
+        apply_update_check, extract_directory_package, load, safe_version_segment, save,
+        status_path, AgentUpdateStatus, DIRECTORY_PACKAGE_FILES,
     };
     use crate::api::distribution::UpdateCheckResponse;
     use std::fs::{self, File};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::FileOptions;
+
+    #[test]
+    fn load_persists_the_running_agent_version() {
+        let root = temporary_test_root("persist-version");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let mut status = AgentUpdateStatus::default();
+        status.current_version = "0.0.0".to_string();
+        save(&state_path, &status).unwrap();
+
+        let loaded = load(&state_path).unwrap();
+        let persisted = serde_json::from_slice::<AgentUpdateStatus>(
+            &fs::read(status_path(&state_path)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.current_version, crate::VERSION);
+        assert_eq!(persisted.current_version, crate::VERSION);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn applies_directory_distribution_manifest() {

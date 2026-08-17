@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::{
-    AgentResponse, AgentRunClaim, AgentState, AgentTaskHistoryItem, RemoteExecutionReport,
-    RuntimeInstallationReport, Task, TaskCancelStatus,
+    AgentResponse, AgentRunArtifactResponse, AgentRunClaim, AgentState, AgentTaskHistoryItem,
+    RemoteExecutionReport, RuntimeInstallationReport, Task, TaskCancelStatus,
 };
 use crate::store::atomic_file;
 use crate::store::credentials::{
@@ -588,6 +588,78 @@ pub fn update_agent_run_status(
         .into());
     }
     Ok(())
+}
+
+pub fn upload_agent_run_artifact(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    request_key: &str,
+    artifact_type: &str,
+    path: &Path,
+    credential: &str,
+) -> Result<AgentRunArtifactResponse, Box<dyn Error>> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("Agent artifact file name is invalid")?;
+    let part = reqwest::blocking::multipart::Part::file(path)
+        .map_err(|_| "Agent artifact could not be opened")?
+        .file_name(file_name.to_string());
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("claim_token", claim_token.to_string())
+        .text("request_key", request_key.to_string())
+        .text("artifact_type", artifact_type.to_string())
+        .part("file", part);
+    let response = client
+        .post(format!("{}/api/agent/runs/{}/artifacts", api_base, run_id))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .multipart(form)
+        .send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "Agent artifact upload failed (HTTP {}): {}",
+            status.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(response.json::<AgentRunArtifactResponse>()?)
+}
+
+pub fn get_agent_run_artifact(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    file_object_id: &str,
+    credential: &str,
+) -> Result<AgentRunArtifactResponse, Box<dyn Error>> {
+    let response = client
+        .get(format!(
+            "{}/api/agent/runs/{}/artifacts/{}",
+            api_base, run_id, file_object_id
+        ))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .header("X-HiMind-Claim-Token", claim_token)
+        .send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "Agent artifact status failed (HTTP {}): {}",
+            status.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(response.json::<AgentRunArtifactResponse>()?)
 }
 
 pub fn renew_agent_run_lease(

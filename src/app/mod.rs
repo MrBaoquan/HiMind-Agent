@@ -1,5 +1,7 @@
 pub(crate) mod ai_clients;
 pub(crate) mod ai_provider_import;
+pub(crate) mod builtin_ai_proxy;
+pub(crate) mod builtin_ai_sync;
 pub(crate) mod commands;
 pub(crate) mod diagnostics;
 pub(crate) mod extension_reconciler;

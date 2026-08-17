@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type LoginState, type OpenHandsRuntimeStatus, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
+import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeStatus, type LoginState, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
 import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
@@ -15,10 +15,6 @@ const SETTINGS_SECTIONS = [
 export function SettingsPage({
   settings,
   remoteExecutionSettings,
-  openHandsRuntimeStatus,
-  openHandsRuntimeBusy,
-  onRefreshOpenHandsRuntime,
-  onInstallOpenHandsRuntime,
   loginState,
   loginModalOpen,
   loginUsername,
@@ -55,10 +51,6 @@ export function SettingsPage({
 }: {
   settings: ApprovalSettings | null;
   remoteExecutionSettings: RemoteExecutionSettings | null;
-  openHandsRuntimeStatus: OpenHandsRuntimeStatus | null;
-  openHandsRuntimeBusy: boolean;
-  onRefreshOpenHandsRuntime: () => void;
-  onInstallOpenHandsRuntime: () => void;
   loginState: LoginState | null;
   loginModalOpen: boolean;
   loginUsername: string;
@@ -93,6 +85,35 @@ export function SettingsPage({
   onInstallUpdate: () => void;
   onUpdatePreferences: (autoCheck: boolean, autoDownload: boolean) => void;
 }) {
+  const [builtinAIRuntimeStatus, setBuiltinAIRuntimeStatus] = useState<BuiltinAIRuntimeStatus | null>(null);
+  const [builtinAIRuntimeBusy, setBuiltinAIRuntimeBusy] = useState(false);
+  const [builtinAIRuntimeFeedback, setBuiltinAIRuntimeFeedback] = useState('');
+  useEffect(() => {
+    agentApi.builtinAiRuntimeStatus().then(setBuiltinAIRuntimeStatus).catch(() => setBuiltinAIRuntimeStatus(null));
+  }, []);
+  const refreshBuiltinAIRuntime = async () => {
+    setBuiltinAIRuntimeFeedback('');
+    try {
+      setBuiltinAIRuntimeStatus(await agentApi.builtinAiRuntimeStatus());
+    } catch {
+      setBuiltinAIRuntimeFeedback('暂时无法检查内置 AI 组件，请稍后重试');
+    }
+  };
+  const installBuiltinAIRuntime = async () => {
+    if (builtinAIRuntimeBusy) return;
+    setBuiltinAIRuntimeBusy(true);
+    setBuiltinAIRuntimeFeedback('');
+    try {
+      setBuiltinAIRuntimeStatus(await agentApi.installBuiltinAiRuntime());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      setBuiltinAIRuntimeFeedback(message.includes('没有可用') || message.includes('Release')
+        ? '当前没有可用的内置 AI 组件安装包'
+        : '安装内置 AI 组件失败，请稍后重试');
+    } finally {
+      setBuiltinAIRuntimeBusy(false);
+    }
+  };
   const [unityEditorPath, setUnityEditorPath] = useState('');
   const [unityEditorSettings, setUnityEditorSettings] = useState<UnityEditorSettings | null>(null);
   const [editorFeedback, setEditorFeedback] = useState('');
@@ -173,44 +194,44 @@ export function SettingsPage({
                 </SettingRow>
                 <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '自动模式会选择本机可用的 AI 工具' : '启用远程任务后生效'}>
                   <select aria-label="远程任务执行工具" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.default_provider} onChange={event => updateRemoteExecution({ default_provider: event.target.value as RemoteExecutionSettings['default_provider'] })}>
-                    <option value="auto">自动选择（推荐）</option><option value="personal.codex">Codex</option><option value="personal.github-copilot">GitHub Copilot</option><option value="himind.openhands" disabled={openHandsRuntimeStatus?.status !== 'ready'}>OpenHands{openHandsRuntimeStatus?.status === 'ready' ? '' : '（未安装）'}</option>
+                    <option value="himind.builtin">HiMind AI（推荐）</option><option value="auto">自动选择可用工具</option><option value="personal.codex">Codex</option><option value="personal.github-copilot">GitHub Copilot</option>
                   </select>
                 </SettingRow>
               </div>
             </section>
-            <section className="card settings-section openhands-runtime-card">
+            <section className="card settings-section builtin-ai-runtime-card">
               <div className="card-header">
-                <span>OpenHands Runtime</span>
-                <Pill kind={openHandsRuntimeStatus?.status === 'ready' ? 'success' : openHandsRuntimeStatus ? 'warn' : 'neutral'}>
-                  {openHandsRuntimeStatus?.status === 'ready' ? '已安装' : openHandsRuntimeStatus ? '未安装' : '检测中'}
+                <span>HiMind AI</span>
+                <Pill kind={builtinAIRuntimeStatus?.status === 'ready' ? 'success' : builtinAIRuntimeStatus ? 'warn' : 'neutral'}>
+                  {builtinAIRuntimeStatus?.status === 'ready' ? '已就绪' : builtinAIRuntimeStatus ? '需要安装' : '检测中'}
                 </Pill>
               </div>
               <div className="runtime-summary">
                 <div className="runtime-summary-main">
                   <div>
-                    <strong>{openHandsRuntimeStatus?.version || 'OpenHands 可选运行时'}</strong>
-                    <span>{openHandsRuntimeStatus?.message || '正在检查本机 OpenHands、uv 与 Python 3.12。'}</span>
+                    <strong>内置 AI 组件</strong>
+                    <span>{builtinAIRuntimeStatus?.message || '正在检查组件状态。'}</span>
                   </div>
                   <div className="actions-row runtime-actions">
-                    <button className="btn" disabled={openHandsRuntimeBusy} onClick={onRefreshOpenHandsRuntime}>
-                      {openHandsRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重新检测
+                    <button className="btn" disabled={builtinAIRuntimeBusy} onClick={() => refreshBuiltinAIRuntime()}>
+                      {builtinAIRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重新检测
                     </button>
-                    <button className="btn btn-primary" disabled={openHandsRuntimeBusy} onClick={onInstallOpenHandsRuntime}>
-                      {openHandsRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
-                      {openHandsRuntimeStatus?.status === 'ready' ? '修复安装' : '安装 OpenHands'}
+                    <button className="btn btn-primary" disabled={builtinAIRuntimeBusy} onClick={() => installBuiltinAIRuntime()}>
+                      {builtinAIRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
+                      {builtinAIRuntimeStatus?.status === 'ready' ? '修复组件' : '安装组件'}
                     </button>
                   </div>
                 </div>
+                {builtinAIRuntimeFeedback ? <div className="inline-feedback visible runtime-feedback" role="status">{builtinAIRuntimeFeedback}</div> : null}
                 <details className="runtime-details">
-                  <summary>安装详情</summary>
+                  <summary>开发者诊断</summary>
                   <div className="runtime-facts">
-                    <div><span>uv</span><strong>{openHandsRuntimeStatus?.uv_available ? openHandsRuntimeStatus.uv_version : '未检测到'}</strong></div>
-                    <div><span>CLI 参数预检</span><strong>{openHandsRuntimeStatus?.cli_compatible ? '通过' : '未通过'}</strong></div>
-                    <div><span>Python 3.12</span><strong>{openHandsRuntimeStatus?.python_available ? openHandsRuntimeStatus.python_version : '未检测到（uv 会按需安装）'}</strong></div>
-                    <div><span>命令</span><code>{openHandsRuntimeStatus?.executable_path || 'openhands'}</code></div>
+                    <div><span>契约版本</span><strong>v{builtinAIRuntimeStatus?.diagnostics.contract_version || 1}</strong></div>
+                    <div><span>引擎</span><code>{builtinAIRuntimeStatus?.diagnostics.engine_id || '等待安装'}</code></div>
+                    <div><span>引擎版本</span><strong>{builtinAIRuntimeStatus?.version || '未安装'}</strong></div>
+                    <div><span>执行入口</span><code>{builtinAIRuntimeStatus?.diagnostics.executable_path || '等待安装'}</code></div>
                   </div>
                 </details>
-                {openHandsRuntimeStatus && openHandsRuntimeStatus.status === 'error' ? <div className="runtime-prerequisite"><ShieldAlert size={16} /><span>{openHandsRuntimeStatus.message}</span></div> : null}
               </div>
             </section>
             <section className="card settings-section">

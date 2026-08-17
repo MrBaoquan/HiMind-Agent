@@ -399,18 +399,18 @@ pub(crate) fn save_remote_execution_settings(
 }
 
 #[tauri::command]
-pub(crate) async fn get_openhands_runtime_status(
+pub(crate) async fn get_builtin_ai_runtime_status(
     _state: State<'_, AgentState>,
-) -> Result<crate::runtime::openhands::OpenHandsRuntimeStatus, String> {
-    tauri::async_runtime::spawn_blocking(crate::runtime::openhands::status)
+) -> Result<crate::runtime::builtin::BuiltinAIRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(crate::runtime::builtin::status)
         .await
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub(crate) async fn install_openhands_runtime(
+pub(crate) async fn install_builtin_ai_runtime(
     state: State<'_, AgentState>,
-) -> Result<crate::runtime::openhands::OpenHandsRuntimeStatus, String> {
+) -> Result<crate::runtime::builtin::BuiltinAIRuntimeStatus, String> {
     let options = state.options.clone();
     let client_instance_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
@@ -419,14 +419,14 @@ pub(crate) async fn install_openhands_runtime(
         .map(str::to_string)
         .unwrap_or_else(|| format!("himind-agent-{}", crate::store::paths::profile_name()));
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::runtime::openhands::install(&options, &client_instance_id)
+        crate::runtime::builtin::install(&options, &client_instance_id)
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
     state
         .approval_manager
-        .add_log("info", "OpenHands Runtime 已完成安装或修复");
+        .add_log("info", "HiMind 内置 AI 组件已完成安装或修复");
     Ok(result)
 }
 
@@ -492,6 +492,11 @@ pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), St
 }
 
 #[tauri::command]
+pub(crate) fn open_builtin_ai(app: AppHandle, state: State<'_, AgentState>) -> Result<(), String> {
+    crate::app::ui::open_builtin_ai(&app, &state.options)
+}
+
+#[tauri::command]
 pub(crate) fn open_inner_admin_page() -> Result<(), String> {
     open_url(&format!(
         "{}/admin/personal/software_code",
@@ -516,6 +521,7 @@ pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub(crate) fn quit_agent(app: AppHandle) -> Result<(), String> {
+    crate::app::ui::stop_builtin_ai_process();
     app.exit(0);
     Ok(())
 }

@@ -52,7 +52,7 @@ use svn::types::{
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
 
-pub(crate) const VERSION: &str = "0.3.11";
+pub(crate) const VERSION: &str = "0.3.12";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginViewLaunch {
@@ -83,25 +83,28 @@ fn protocol_open_requested(args: &[String]) -> bool {
 }
 
 fn main() {
-    let svn_credentials_from_environment = match svn::service::bootstrap_svn_credentials() {
-        Ok(configured) => configured,
-        Err(error) => {
-            eprintln!("SVN credential initialization failed: {error}");
+    let options = Options::from_env();
+    let mcp_mode = cfg!(feature = "mcp-console") || env::args().any(|argument| argument == "--mcp");
+    if !mcp_mode {
+        let svn_credentials_from_environment = match svn::service::bootstrap_svn_credentials() {
+            Ok(configured) => configured,
+            Err(error) => {
+                eprintln!("SVN credential initialization failed: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = svn::service::bootstrap_svn_admin_credentials() {
+            eprintln!("SVN administrator credential initialization failed: {error}");
             std::process::exit(1);
         }
-    };
-    if let Err(error) = svn::service::bootstrap_svn_admin_credentials() {
-        eprintln!("SVN administrator credential initialization failed: {error}");
-        std::process::exit(1);
-    }
-    let options = Options::from_env();
-    if !svn_credentials_from_environment {
-        if let Ok(Some(snapshot)) = api::oauth::authorization_snapshot(&options.state_path) {
-            if !snapshot.display_name.trim().is_empty() {
-                if let Err(error) =
-                    svn::service::ensure_default_svn_credentials(&snapshot.display_name)
-                {
-                    eprintln!("SVN user credential initialization failed: {error}");
+        if !svn_credentials_from_environment {
+            if let Ok(Some(snapshot)) = api::oauth::authorization_snapshot(&options.state_path) {
+                if !snapshot.display_name.trim().is_empty() {
+                    if let Err(error) =
+                        svn::service::ensure_default_svn_credentials(&snapshot.display_name)
+                    {
+                        eprintln!("SVN user credential initialization failed: {error}");
+                    }
                 }
             }
         }
@@ -121,7 +124,12 @@ fn main() {
             eprintln!("plugin command failed: {error}");
             std::process::exit(1);
         }
-    } else if cfg!(feature = "mcp-console") || env::args().any(|argument| argument == "--mcp") {
+    } else if let Some(arguments) = runtime_cli_arguments() {
+        if let Err(error) = run_runtime_cli(&options, &arguments) {
+            eprintln!("runtime command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if mcp_mode {
         if let Err(error) = mcp::run(options) {
             eprintln!("agent mcp failed: {error}");
             std::process::exit(1);
@@ -222,6 +230,32 @@ fn skill_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "skill")?;
     Some(arguments[index + 1..].to_vec())
+}
+
+fn runtime_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "runtime")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments.first().map(String::as_str) {
+        Some("status") => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&runtime::builtin::status())?
+            );
+        }
+        Some("install") => {
+            let client_instance_id =
+                format!("himind-agent-runtime-{}", store::paths::profile_name());
+            let status = runtime::builtin::install(options, &client_instance_id)
+                .map_err(std::io::Error::other)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        _ => return Err("usage: himind-agent runtime <status|install>".into()),
+    }
+    Ok(())
 }
 
 fn run_skill_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {

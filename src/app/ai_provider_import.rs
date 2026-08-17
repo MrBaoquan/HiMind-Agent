@@ -82,6 +82,18 @@ pub(crate) struct AIProviderImportStatus {
     pub detail: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub config_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub synced_at: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VSCodeImportStatusFile {
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    synced_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -316,18 +328,26 @@ fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
         .and_then(|cli| installed_vscode_extension_version(&cli).ok().flatten())
         .is_some();
     let imported = path.is_file();
+    let status = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| parse_vscode_import_status(&content).ok())
+        .unwrap_or_default();
     AIProviderImportStatus {
         target: "vscode".to_string(),
         state: if imported { "imported" } else { "not_imported" }.to_string(),
         client_detected,
-        detail: if imported {
-            "VS Code 已保存 HiMind AI 凭据".to_string()
+        detail: if imported && !status.models.is_empty() {
+            format!("VS Code 已同步 {} 个 HiMind 模型", status.models.len())
+        } else if imported {
+            "VS Code 已保存 HiMind AI 凭据，等待扩展同步模型状态".to_string()
         } else if client_detected {
             "已安装 HiMind AI 扩展，尚未检测到导入记录".to_string()
         } else {
             "未检测到 VS Code HiMind AI 扩展".to_string()
         },
         config_path: path.to_string_lossy().to_string(),
+        models: status.models,
+        synced_at: status.synced_at,
     }
 }
 
@@ -348,31 +368,54 @@ fn cc_switch_import_status() -> AIProviderImportStatus {
             "未检测到 CC Switch".to_string()
         },
         config_path: path.to_string_lossy().to_string(),
+        models: Vec::new(),
+        synced_at: String::new(),
     }
 }
 
 fn workbuddy_import_status() -> AIProviderImportStatus {
     let path = workbuddy_models_path();
-    let imported = fs::read_to_string(&path)
+    let models = fs::read_to_string(&path)
         .ok()
         .and_then(|content| serde_json::from_str::<Value>(&content).ok())
-        .and_then(|root| root.get("models").and_then(Value::as_array).cloned())
-        .map(|models| models.iter().any(is_managed_workbuddy_model))
-        .unwrap_or(false);
+        .map(|root| managed_workbuddy_model_ids(&root))
+        .unwrap_or_default();
+    let imported = !models.is_empty();
     let client_detected = workbuddy_executable_exists();
     AIProviderImportStatus {
         target: "workbuddy".to_string(),
         state: if imported { "imported" } else { "not_imported" }.to_string(),
         client_detected,
         detail: if imported {
-            "检测到 WorkBuddy 中的 HiMind 模型".to_string()
+            format!("检测到 WorkBuddy 中的 {} 个 HiMind 模型", models.len())
         } else if client_detected {
             "已检测到 WorkBuddy，尚未导入 HiMind AI".to_string()
         } else {
             "未检测到 WorkBuddy".to_string()
         },
         config_path: path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
     }
+}
+
+fn parse_vscode_import_status(content: &str) -> Result<VSCodeImportStatusFile, serde_json::Error> {
+    serde_json::from_str(content)
+}
+
+fn managed_workbuddy_model_ids(root: &Value) -> Vec<String> {
+    let mut seen = HashSet::new();
+    root.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| is_managed_workbuddy_model(item))
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| seen.insert((*id).to_string()))
+        .map(str::to_string)
+        .collect()
 }
 
 fn cancel_vscode(options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
@@ -1215,10 +1258,10 @@ mod tests {
     use super::{
         build_cc_switch_deep_link, build_vscode_enrollment_url, bundled_vscode_vsix_candidates,
         chat_completions_url, compare_extension_versions, consume_vscode_enrollment,
-        create_vscode_enrollment, legacy_workbuddy_model_id, merge_workbuddy_models,
-        migrate_workbuddy_sessions, parse_vscode_extension_version, remove_workbuddy_models,
-        vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
-        AIClientCredential,
+        create_vscode_enrollment, legacy_workbuddy_model_id, managed_workbuddy_model_ids,
+        merge_workbuddy_models, migrate_workbuddy_sessions, parse_vscode_extension_version,
+        parse_vscode_import_status, remove_workbuddy_models, vscode_extension_install_required,
+        workbuddy_model_id, workbuddy_models_path_in, AIClientCredential,
     };
     use crate::api::ai::AIUserCredential;
     use serde_json::Value;
@@ -1353,6 +1396,37 @@ mod tests {
         assert_eq!(workbuddy_model_id(" glm-5.2 "), "glm-5.2");
         assert_eq!(workbuddy_model_id("qwen-3.5-35b-a3b"), "qwen-3.5-35b-a3b");
         assert_eq!(legacy_workbuddy_model_id(" glm-5.2 "), "himind-glm-5-2");
+    }
+
+    #[test]
+    fn reads_vscode_synced_model_status() {
+        let status = parse_vscode_import_status(
+            r#"{"imported_at":"2026-08-17T01:00:00Z","synced_at":"2026-08-17T02:00:00Z","models":["glm-5.2","deepseek-v4"]}"#,
+        )
+        .unwrap();
+        assert_eq!(status.models, vec!["glm-5.2", "deepseek-v4"]);
+        assert_eq!(status.synced_at, "2026-08-17T02:00:00Z");
+
+        let legacy =
+            parse_vscode_import_status(r#"{"imported_at":"2026-08-16T01:00:00Z"}"#).unwrap();
+        assert!(legacy.models.is_empty());
+        assert!(legacy.synced_at.is_empty());
+    }
+
+    #[test]
+    fn extracts_only_himind_workbuddy_models() {
+        let root = serde_json::json!({
+            "models": [
+                {"id": "personal", "vendor": "Other"},
+                {"id": "glm-5.2", "vendor": "HiMind"},
+                {"id": " deepseek-v4 ", "vendor": "HiMind"},
+                {"id": "glm-5.2", "vendor": "HiMind"}
+            ]
+        });
+        assert_eq!(
+            managed_workbuddy_model_ids(&root),
+            vec!["glm-5.2", "deepseek-v4"]
+        );
     }
 
     #[test]

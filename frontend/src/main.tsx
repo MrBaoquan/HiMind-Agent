@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { RefreshCw, ShieldAlert } from 'lucide-react';
 import '../styles.css';
-import { NotificationCenter } from './components/Common';
+import { NotificationCenter, PageHeader } from './components/Common';
 import { Shell } from './components/Shell';
 import { ApprovalsPage } from './pages/ApprovalsPage';
 import { AiConnectionsPage } from './pages/AiConnectionsPage';
@@ -11,7 +12,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type OpenHandsRuntimeStatus, type PluginRegistry, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -43,8 +44,8 @@ function App() {
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [settings, setSettings] = useState<ApprovalSettings | null>(null);
   const [remoteExecutionSettings, setRemoteExecutionSettings] = useState<RemoteExecutionSettings | null>(null);
-  const [openHandsRuntimeStatus, setOpenHandsRuntimeStatus] = useState<OpenHandsRuntimeStatus | null>(null);
-  const [openHandsRuntimeBusy, setOpenHandsRuntimeBusy] = useState(false);
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [settingsLoadError, setSettingsLoadError] = useState('');
   const [loginState, setLoginState] = useState<LoginState | null>(null);
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [pluginRegistry, setPluginRegistry] = useState<PluginRegistry | null>(null);
@@ -85,22 +86,42 @@ function App() {
   async function refreshApprovals() { setApprovals(await agentApi.approvals()); }
   async function refreshSettings() { setSettings(await agentApi.settings()); }
   async function refreshRemoteExecutionSettings() { setRemoteExecutionSettings(await agentApi.remoteExecutionSettings()); }
-  async function refreshOpenHandsRuntimeStatus() { setOpenHandsRuntimeStatus(await agentApi.openHandsRuntimeStatus()); }
-  async function installOpenHandsRuntime() {
-    if (openHandsRuntimeBusy) return;
-    setOpenHandsRuntimeBusy(true);
+  async function refreshLogin() { setLoginState(await agentApi.login()); }
+  async function refreshSettingsPageData() {
+    setSettingsLoading(true);
+    setSettingsLoadError('');
     try {
-      const result = await agentApi.installOpenHandsRuntime();
-      setOpenHandsRuntimeStatus(result);
-      notify('success', 'OpenHands Runtime 已安装并通过预检');
+      const [settingsResult, remoteExecutionResult, loginResult] = await Promise.allSettled([
+        withTimeout(agentApi.settings(), '审批设置'),
+        withTimeout(agentApi.remoteExecutionSettings(), '远程任务设置'),
+        withTimeout(agentApi.login(), '本地登录状态'),
+      ] as const);
+      const errors: string[] = [];
+      if (settingsResult.status === 'fulfilled') setSettings(settingsResult.value);
+      else {
+        setSettings(null);
+        errors.push(formatError(settingsResult.reason, '审批设置读取失败'));
+      }
+      if (remoteExecutionResult.status === 'fulfilled') setRemoteExecutionSettings(remoteExecutionResult.value);
+      else {
+        setRemoteExecutionSettings(null);
+        errors.push(formatError(remoteExecutionResult.reason, '远程任务设置读取失败'));
+      }
+      if (loginResult.status === 'fulfilled') setLoginState(loginResult.value);
+      else {
+        setLoginState(null);
+        errors.push(formatError(loginResult.reason, '本地登录状态读取失败'));
+      }
+      setSettingsLoadError(errors.join('；'));
     } catch (error) {
-      notify('error', formatError(error, 'OpenHands Runtime 安装失败'));
-      await refreshOpenHandsRuntimeStatus().catch(console.error);
+      setSettings(null);
+      setRemoteExecutionSettings(null);
+      setLoginState(null);
+      setSettingsLoadError(formatError(error, 'Agent 配置读取失败'));
     } finally {
-      setOpenHandsRuntimeBusy(false);
+      setSettingsLoading(false);
     }
   }
-  async function refreshLogin() { setLoginState(await agentApi.login()); }
   async function refreshLogs() { setLogs(await agentApi.logs()); }
   async function refreshExtensionProjects() {
     setExtensionProjects(await agentApi.extensionProjects());
@@ -233,10 +254,7 @@ function App() {
       refreshDashboardIdentity(),
       refreshAiIntegration(),
       refreshApprovals(),
-      refreshSettings(),
-      refreshRemoteExecutionSettings(),
-      refreshOpenHandsRuntimeStatus(),
-      refreshLogin(),
+      refreshSettingsPageData(),
       refreshSvnConnections(),
       refreshPlugins(),
       refreshExtensionDesiredState(),
@@ -672,7 +690,10 @@ function App() {
         }
       }}
     />;
-     if (page === 'settings') return <SettingsPage settings={settings} remoteExecutionSettings={remoteExecutionSettings} openHandsRuntimeStatus={openHandsRuntimeStatus} openHandsRuntimeBusy={openHandsRuntimeBusy} onRefreshOpenHandsRuntime={refreshOpenHandsRuntimeStatus} onInstallOpenHandsRuntime={installOpenHandsRuntime} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除内网账号', '清除内网账号失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRemoteExecutionChange={(next, confirmed) => run(async () => { await agentApi.saveRemoteExecutionSettings(next, confirmed); await refreshRemoteExecutionSettings(); await refreshLogs(); }, next.enabled ? '远程任务设置已更新' : '已关闭远程任务', '远程任务设置更新失败')} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} onUnityEditorSettingsChange={editors => setSettings(current => current ? { ...current, editors } : current)} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={testSvnConnection} svnTesting={svnTesting} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} updateStatus={updateStatus} updateBusy={updateBusy} onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')} onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)} onCancelUpdateDownload={cancelUpdateDownload} onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)} onUpdatePreferences={(autoCheck, autoDownload) => runUpdateOperation(() => agentApi.setUpdatePreferences(autoCheck, autoDownload))} />;
+    if (page === 'settings' && (!settings || !remoteExecutionSettings || !loginState)) {
+      return <SettingsLoadState loading={settingsLoading} error={settingsLoadError} onRetry={refreshSettingsPageData} />;
+    }
+     if (page === 'settings') return <SettingsPage settings={settings} remoteExecutionSettings={remoteExecutionSettings} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除内网账号', '清除内网账号失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRemoteExecutionChange={(next, confirmed) => run(async () => { await agentApi.saveRemoteExecutionSettings(next, confirmed); await refreshRemoteExecutionSettings(); await refreshLogs(); }, next.enabled ? '远程任务设置已更新' : '已关闭远程任务', '远程任务设置更新失败')} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} onUnityEditorSettingsChange={editors => setSettings(current => current ? { ...current, editors } : current)} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={testSvnConnection} svnTesting={svnTesting} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} updateStatus={updateStatus} updateBusy={updateBusy} onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')} onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)} onCancelUpdateDownload={cancelUpdateDownload} onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)} onUpdatePreferences={(autoCheck, autoDownload) => runUpdateOperation(() => agentApi.setUpdatePreferences(autoCheck, autoDownload))} />;
     return <LogsPage logs={logs} onRefresh={() => run(refreshLogs)} onExport={() => run(async () => {
       const result = await agentApi.exportDiagnostics();
       if (!result.canceled) notify('success', `诊断包已导出：${result.path || ''}`);
@@ -690,6 +711,7 @@ function App() {
       onLoadTaskHistory={agentApi.taskHistory}
       onNavigate={setPage}
       onOpenDashboard={() => run(agentApi.openDashboard)}
+      onOpenBuiltinAi={() => run(agentApi.openBuiltinAi, undefined, '无法打开 HiMind AI')}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}
       onOpenAgentDirectory={() => run(agentApi.openAgentDirectory, 'Agent 文件夹已打开', '打开 Agent 文件夹失败')}
       onQuit={() => { void agentApi.quitAgent(); }}
@@ -697,6 +719,21 @@ function App() {
       <NotificationCenter messages={messages} onClose={dismissNotification} />
       {content}
     </Shell>
+  );
+}
+
+function SettingsLoadState({ loading, error, onRetry }: { loading: boolean; error: string; onRetry: () => void }) {
+  return (
+    <>
+      <PageHeader title="设置" description="管理任务权限、账号、工具与启动设置。" />
+      {loading
+        ? <div className="page-loading"><span className="spinner" />正在读取 Agent 配置</div>
+        : <div className="blocker account-blocker" role="alert">
+            <ShieldAlert size={18} />
+            <div><strong>Agent 配置读取失败</strong><span>{error || '部分配置暂时不可用，请重新读取。'}</span></div>
+            <button type="button" className="btn" onClick={onRetry}><RefreshCw size={15} />重新读取</button>
+          </div>}
+    </>
   );
 }
 

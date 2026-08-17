@@ -88,21 +88,21 @@ export type ApprovalSettings = {
 export type RemoteExecutionSettings = {
     enabled: boolean;
     access_mode: 'exhibit_linked' | 'full_access';
-    default_provider: 'auto' | 'personal.codex' | 'personal.github-copilot' | 'himind.openhands';
+    default_provider: 'himind.builtin' | 'auto' | 'personal.codex' | 'personal.github-copilot';
 };
 
-export type OpenHandsRuntimeStatus = {
-    provider: 'himind.openhands' | string;
+export type BuiltinAIRuntimeStatus = {
+    provider: 'himind.builtin' | string;
     status: 'ready' | 'unavailable' | string;
     version: string;
-    cli_compatible: boolean;
-    executable_path: string;
-    uv_available: boolean;
-    uv_version: string;
-    python_available: boolean;
-    python_version: string;
-    install_command: string;
+    compatible: boolean;
     message: string;
+    diagnostics: {
+        engine_id: string;
+        executable_path: string;
+        contract_version: number;
+        update_mode: string;
+    };
 };
 
 export type LoginState = {
@@ -813,8 +813,9 @@ export const agentApi = {
     settings: () => invoke<ApprovalSettings>('get_approval_settings'),
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
     saveRemoteExecutionSettings: (settings: RemoteExecutionSettings, fullAccessConfirmed = false) => invoke<RemoteExecutionSettings>('save_remote_execution_settings', { settings, fullAccessConfirmed }),
-    openHandsRuntimeStatus: () => invoke<OpenHandsRuntimeStatus>('get_openhands_runtime_status'),
-    installOpenHandsRuntime: () => invoke<OpenHandsRuntimeStatus>('install_openhands_runtime'),
+    builtinAiRuntimeStatus: () => invoke<BuiltinAIRuntimeStatus>('get_builtin_ai_runtime_status'),
+    installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
+    openBuiltinAi: () => invoke<void>('open_builtin_ai'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),

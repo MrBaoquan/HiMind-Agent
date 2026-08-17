@@ -22,6 +22,9 @@ pub(crate) const KNOWLEDGE_SEARCH_SCOPE: &str = "knowledge.search";
 pub(crate) const CREATIVE_SUBMIT_SCOPE: &str = "distribution.creative.submit";
 pub(crate) const RELEASE_MANAGE_SCOPE: &str = "distribution.release.manage";
 pub(crate) const AI_CONVERSATION_SCOPE: &str = "ai.conversation.invoke";
+pub(crate) const MEDIA_SUBMIT_SCOPE: &str = "ai.media.submit";
+pub(crate) const MEDIA_READ_SCOPE: &str = "ai.media.read";
+pub(crate) const MEDIA_CANCEL_SCOPE: &str = "ai.media.cancel";
 const CLIENT_ID: &str = "himind-agent";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -337,7 +340,7 @@ pub(crate) fn begin_device_authorization(
             (
                 "scope",
                 &format!(
-                    "{PROFILE_SCOPE} {BUSINESS_CONTEXT_READ_SCOPE} {KNOWLEDGE_SEARCH_SCOPE} {AI_CONVERSATION_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"
+                    "{PROFILE_SCOPE} {BUSINESS_CONTEXT_READ_SCOPE} {KNOWLEDGE_SEARCH_SCOPE} {AI_CONVERSATION_SCOPE} {MEDIA_SUBMIT_SCOPE} {MEDIA_READ_SCOPE} {MEDIA_CANCEL_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"
                 ),
             ),
             ("agent_id", state.agent_id.as_str()),

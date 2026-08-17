@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const ACCESS_MODE_EXHIBIT_LINKED: &str = "exhibit_linked";
 pub(crate) const ACCESS_MODE_FULL_ACCESS: &str = "full_access";
 pub(crate) const PROVIDER_AUTO: &str = "auto";
+const LEGACY_PROVIDER_OPENHANDS: &str = "himind.openhands";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RemoteExecutionSettings {
@@ -19,7 +20,7 @@ impl Default for RemoteExecutionSettings {
         Self {
             enabled: false,
             access_mode: ACCESS_MODE_EXHIBIT_LINKED.to_string(),
-            default_provider: PROVIDER_AUTO.to_string(),
+            default_provider: crate::runtime::PROVIDER_BUILTIN.to_string(),
         }
     }
 }
@@ -35,11 +36,11 @@ impl RemoteExecutionSettings {
         if !matches!(
             self.default_provider.as_str(),
             PROVIDER_AUTO
+                | crate::runtime::PROVIDER_BUILTIN
                 | crate::runtime::PROVIDER_CODEX
                 | crate::runtime::PROVIDER_GITHUB_COPILOT
-                | crate::runtime::PROVIDER_OPENHANDS
         ) {
-            return Err("默认执行器必须是自动、Codex、GitHub Copilot 或 OpenHands".into());
+            return Err("默认执行器必须是 HiMind AI、自动、Codex 或 GitHub Copilot".into());
         }
         Ok(())
     }
@@ -54,9 +55,22 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<RemoteExecutionSettings, B
     if !path.exists() {
         return Ok(RemoteExecutionSettings::default());
     }
-    let settings = serde_json::from_str::<RemoteExecutionSettings>(&fs::read_to_string(path)?)?;
+    let mut settings = serde_json::from_str::<RemoteExecutionSettings>(&fs::read_to_string(path)?)?;
+    let migrated = migrate_legacy_provider(&mut settings);
     settings.validate()?;
+    if migrated {
+        // A read-only legacy profile must remain usable even if normalization cannot be persisted.
+        let _ = save(agent_state_path, &settings);
+    }
     Ok(settings)
+}
+
+fn migrate_legacy_provider(settings: &mut RemoteExecutionSettings) -> bool {
+    if settings.default_provider != LEGACY_PROVIDER_OPENHANDS {
+        return false;
+    }
+    settings.default_provider = crate::runtime::PROVIDER_BUILTIN.to_string();
+    true
 }
 
 pub(crate) fn save(
@@ -92,7 +106,7 @@ mod tests {
         let settings = load(&state_path).unwrap();
         assert!(!settings.enabled);
         assert_eq!(settings.access_mode, "exhibit_linked");
-        assert_eq!(settings.default_provider, "auto");
+        assert_eq!(settings.default_provider, crate::runtime::PROVIDER_BUILTIN);
     }
 
     #[test]
@@ -110,6 +124,33 @@ mod tests {
         save(&state_path, &settings).unwrap();
         assert_eq!(load(&state_path).unwrap(), settings);
         assert!(settings_path(&state_path).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_openhands_provider_migrates_to_builtin() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-remote-execution-legacy-{}",
+            std::process::id()
+        ));
+        let state_path = root.join("agent-state.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            settings_path(&state_path),
+            r#"{
+                "enabled": true,
+                "access_mode": "exhibit_linked",
+                "default_provider": "himind.openhands"
+            }"#,
+        )
+        .unwrap();
+
+        let settings = load(&state_path).unwrap();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.default_provider, crate::runtime::PROVIDER_BUILTIN);
+        let persisted = load(&state_path).unwrap();
+        assert_eq!(persisted.default_provider, crate::runtime::PROVIDER_BUILTIN);
         fs::remove_dir_all(root).unwrap();
     }
 }

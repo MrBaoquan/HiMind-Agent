@@ -24,6 +24,8 @@ pub struct SoftwareReleasePublishRequest {
     pub artifact_path: String,
     pub product_id: String,
     pub product_name: String,
+    #[serde(default = "default_desktop_product_type")]
+    pub product_type: String,
     pub version: String,
     #[serde(default = "default_stable_channel")]
     pub channel: String,
@@ -41,6 +43,10 @@ pub struct SoftwareReleasePublishRequest {
 
 fn default_stable_channel() -> String {
     "stable".to_string()
+}
+
+fn default_desktop_product_type() -> String {
+    "desktop_app".to_string()
 }
 
 fn default_full_rollout() -> i64 {
@@ -1063,18 +1069,18 @@ pub fn publish_software_release(
     access_token: &str,
     request: &SoftwareReleasePublishRequest,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let products = client
-        .get(format!("{api_base}/api/distribution/products"))
-        .bearer_auth(access_token)
-        .header("X-HiMind-Agent-ID", agent_id)
-        .header("X-HiMind-AI-Client", ai_client_id())
-        .query(&[
-            ("product_key", request.product_id.as_str()),
-            ("page_size", "200"),
-        ])
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?;
+    let products = collaboration_json::<serde_json::Value>(
+        client
+            .get(format!("{api_base}/api/distribution/products"))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .query(&[
+                ("product_key", request.product_id.as_str()),
+                ("page_size", "200"),
+            ])
+            .send()?,
+    )?;
     let product_exists = products["items"]
         .as_array()
         .map(|items| {
@@ -1084,36 +1090,37 @@ pub fn publish_software_release(
         })
         .unwrap_or(false);
     if !product_exists {
+        collaboration_json::<serde_json::Value>(
+            client
+                .post(format!("{api_base}/api/distribution/products"))
+                .bearer_auth(access_token)
+                .header("X-HiMind-Agent-ID", agent_id)
+                .header("X-HiMind-AI-Client", ai_client_id())
+                .json(&json!({
+                    "product_key": request.product_id,
+                    "name": request.product_name,
+                    "description": "由 HiMind 软件分发能力创建",
+                    "default_channel": request.channel,
+                    "update_mode": "self_update",
+                    "product_type": request.product_type,
+                    "active": true
+                }))
+                .send()?,
+        )?;
+    }
+
+    let release_workspace = collaboration_json::<serde_json::Value>(
         client
-            .post(format!("{api_base}/api/distribution/products"))
+            .get(format!("{api_base}/api/distribution/releases"))
             .bearer_auth(access_token)
             .header("X-HiMind-Agent-ID", agent_id)
             .header("X-HiMind-AI-Client", ai_client_id())
-            .json(&json!({
-                "product_key": request.product_id,
-                "name": request.product_name,
-                "description": "由 HiMind 软件分发能力创建",
-                "default_channel": request.channel,
-                "update_mode": "self_update",
-                "product_type": "desktop_app",
-                "active": true
-            }))
-            .send()?
-            .error_for_status()?;
-    }
-
-    let release_workspace = client
-        .get(format!("{api_base}/api/distribution/releases"))
-        .bearer_auth(access_token)
-        .header("X-HiMind-Agent-ID", agent_id)
-        .header("X-HiMind-AI-Client", ai_client_id())
-        .query(&[
-            ("product_key", request.product_id.as_str()),
-            ("page_size", "200"),
-        ])
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?;
+            .query(&[
+                ("product_key", request.product_id.as_str()),
+                ("page_size", "200"),
+            ])
+            .send()?,
+    )?;
     let channel_id = release_workspace["channels"]
         .as_array()
         .and_then(|items| {
@@ -1131,58 +1138,58 @@ pub fn publish_software_release(
         .ok_or("artifact file name is invalid")?
         .to_string();
     let artifact_part = Part::file(&request.artifact_path)?.file_name(file_name);
-    let artifact = client
-        .post(format!("{api_base}/api/distribution/artifacts"))
-        .bearer_auth(access_token)
-        .header("X-HiMind-Agent-ID", agent_id)
-        .header("X-HiMind-AI-Client", ai_client_id())
-        .query(&[("product_key", request.product_id.as_str())])
-        .multipart(
-            Form::new()
-                .text("version", request.version.clone())
-                .text("platform", request.platform.clone())
-                .text("architecture", request.architecture.clone())
-                .text("package_type", request.package_type.clone())
-                .part("file", artifact_part),
-        )
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?;
+    let artifact = collaboration_json::<serde_json::Value>(
+        client
+            .post(format!("{api_base}/api/distribution/artifacts"))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .query(&[("product_key", request.product_id.as_str())])
+            .multipart(
+                Form::new()
+                    .text("version", request.version.clone())
+                    .text("platform", request.platform.clone())
+                    .text("architecture", request.architecture.clone())
+                    .text("package_type", request.package_type.clone())
+                    .part("file", artifact_part),
+            )
+            .send()?,
+    )?;
     let artifact_id = artifact["id"]
         .as_str()
         .ok_or("Dashboard artifact response is missing id")?;
 
-    let release = client
-        .post(format!("{api_base}/api/distribution/releases"))
-        .bearer_auth(access_token)
-        .header("X-HiMind-Agent-ID", agent_id)
-        .header("X-HiMind-AI-Client", ai_client_id())
-        .query(&[("product_key", request.product_id.as_str())])
-        .json(&json!({
-            "channel_id": channel_id,
-            "artifact_id": artifact_id,
-            "version": request.version,
-            "release_notes": request.release_notes,
-            "mandatory": request.mandatory,
-            "rollout_percent": request.rollout_percent
-        }))
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?;
+    let release = collaboration_json::<serde_json::Value>(
+        client
+            .post(format!("{api_base}/api/distribution/releases"))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .query(&[("product_key", request.product_id.as_str())])
+            .json(&json!({
+                "channel_id": channel_id,
+                "artifact_id": artifact_id,
+                "version": request.version,
+                "release_notes": request.release_notes,
+                "mandatory": request.mandatory,
+                "rollout_percent": request.rollout_percent
+            }))
+            .send()?,
+    )?;
     let release_id = release["id"]
         .as_str()
         .ok_or("Dashboard release response is missing id")?;
 
-    let published = client
-        .post(format!(
-            "{api_base}/api/distribution/releases/{release_id}/publish"
-        ))
-        .bearer_auth(access_token)
-        .header("X-HiMind-Agent-ID", agent_id)
-        .header("X-HiMind-AI-Client", ai_client_id())
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?;
+    let published = collaboration_json::<serde_json::Value>(
+        client
+            .post(format!(
+                "{api_base}/api/distribution/releases/{release_id}/publish"
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )?;
     Ok(json!({
         "product_id": request.product_id,
         "artifact": artifact,
@@ -1520,6 +1527,7 @@ mod tests {
             artifact_path: artifact.to_string_lossy().to_string(),
             product_id: "com.himind.media-resolver".to_string(),
             product_name: "MediaResolver".to_string(),
+            product_type: "runtime_component".to_string(),
             version: "1.0.0".to_string(),
             channel: "stable".to_string(),
             platform: "windows".to_string(),
@@ -1554,6 +1562,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(request_lines[0].starts_with("GET /api/distribution/products"));
         assert!(request_lines[1].starts_with("POST /api/distribution/products"));
+        assert!(captured[1].contains("\"product_type\":\"runtime_component\""));
         assert!(request_lines[2].starts_with("GET /api/distribution/releases"));
         assert!(request_lines[3].starts_with("POST /api/distribution/artifacts"));
         assert!(request_lines[4].starts_with("POST /api/distribution/releases"));

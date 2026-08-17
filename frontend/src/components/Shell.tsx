@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Blocks, BookOpen, Cable, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, ClipboardCheck, Clock3, ExternalLink, FileText, FolderOpen, Hammer, Info, LayoutDashboard, ListChecks, LoaderCircle, LogOut, RefreshCw, Settings, X } from 'lucide-react';
+import { Blocks, BookOpen, Cable, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, ClipboardCheck, Clock3, ExternalLink, FileText, FolderOpen, Hammer, Info, LayoutDashboard, ListChecks, LoaderCircle, LogOut, MessageCircle, RefreshCw, Settings, X } from 'lucide-react';
 import type { PageKey } from '../types';
 import type { AgentTaskHistoryItem, CurrentTaskStatus, DashboardIdentityStatus } from '../services/agentApi';
 
@@ -13,6 +13,7 @@ type ShellProps = {
   onLoadTaskHistory: () => Promise<AgentTaskHistoryItem[]>;
   onNavigate: (page: PageKey) => void;
   onOpenDashboard: () => void;
+  onOpenBuiltinAi: () => void;
   onCheckUpdate: () => void;
   onOpenAgentDirectory: () => void;
   onQuit: () => void;
@@ -50,7 +51,7 @@ const developerNavItems = [
 
 type MenuKey = 'application' | 'diagnostics' | 'help';
 
-function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onCheckUpdate, onOpenAgentDirectory, onOpenTasks, onQuit }: Pick<ShellProps, 'agentVersion' | 'updateBusy' | 'onNavigate' | 'onOpenDashboard' | 'onCheckUpdate' | 'onOpenAgentDirectory' | 'onQuit'> & { onOpenTasks: () => void }) {
+function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onOpenTasks, onQuit }: Pick<ShellProps, 'agentVersion' | 'updateBusy' | 'onNavigate' | 'onOpenDashboard' | 'onOpenBuiltinAi' | 'onCheckUpdate' | 'onOpenAgentDirectory' | 'onQuit'> & { onOpenTasks: () => void }) {
   const [openMenu, setOpenMenu] = useState<MenuKey | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const menuBarRef = useRef<HTMLDivElement>(null);
@@ -88,6 +89,7 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
           </button>
           {openMenu === 'application' ? (
             <div className="app-menu-dropdown" role="menu">
+              <button type="button" role="menuitem" onClick={() => runAction(onOpenBuiltinAi)}><MessageCircle size={16} /><span>打开 AI 对话</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(onOpenDashboard)}><ExternalLink size={16} /><span>打开工作台</span></button>
               <button type="button" role="menuitem" disabled={updateBusy} onClick={() => runAction(onCheckUpdate)}><RefreshCw className={updateBusy ? 'spin' : ''} size={16} /><span>{updateBusy ? '正在检查更新' : '检查更新'}</span></button>
               <div className="app-menu-separator" role="separator" />
@@ -137,7 +139,7 @@ function AppMenuBar({ agentVersion, updateBusy, onNavigate, onOpenDashboard, onC
   );
 }
 
-export function Shell({ currentPage, approvalCount, identity, agentVersion, updateBusy, currentTask, onLoadTaskHistory, onNavigate, onOpenDashboard, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
+export function Shell({ currentPage, approvalCount, identity, agentVersion, updateBusy, currentTask, onLoadTaskHistory, onNavigate, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
   const [taskDrawerOpen, setTaskDrawerOpen] = useState(false);
   const [taskHistory, setTaskHistory] = useState<AgentTaskHistoryItem[]>([]);
   const [taskHistoryLoading, setTaskHistoryLoading] = useState(false);
@@ -163,7 +165,7 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
 
   return (
     <div className="shell">
-      <AppMenuBar agentVersion={agentVersion} updateBusy={updateBusy} onNavigate={onNavigate} onOpenDashboard={onOpenDashboard} onCheckUpdate={onCheckUpdate} onOpenAgentDirectory={onOpenAgentDirectory} onOpenTasks={() => setTaskDrawerOpen(true)} onQuit={onQuit} />
+      <AppMenuBar agentVersion={agentVersion} updateBusy={updateBusy} onNavigate={onNavigate} onOpenDashboard={onOpenDashboard} onOpenBuiltinAi={onOpenBuiltinAi} onCheckUpdate={onCheckUpdate} onOpenAgentDirectory={onOpenAgentDirectory} onOpenTasks={() => setTaskDrawerOpen(true)} onQuit={onQuit} />
       <div className="shell-body">
         <aside className="sidebar">
         <div className="sidebar-header">
