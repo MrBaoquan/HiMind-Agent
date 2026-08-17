@@ -1434,7 +1434,11 @@ where
                         .into(),
                 );
             }
-            let switched_change_count = svn_status_change_count(&source)?;
+            let switched_change_count = svn_status_change_count_after_adoption(
+                &source,
+                &snapshot.external_roots,
+                &ignore_policy,
+            )?;
             if switched_change_count != 0 {
                 return Err(format!(
                     "local workspace is not clean after switching SVN metadata ({switched_change_count} pending SVN changes)"
@@ -3149,6 +3153,21 @@ fn svn_status_change_count(working_copy: &Path) -> Result<usize, Box<dyn Error>>
     svn_status_change_count_from_xml(&output)
 }
 
+fn svn_status_change_count_after_adoption(
+    working_copy: &Path,
+    external_roots: &[PathBuf],
+    ignore_policy: &MigrationIgnorePolicy,
+) -> Result<usize, Box<dyn Error>> {
+    let output =
+        run_svn_in_directory(working_copy, ["status", "--xml", "--ignore-externals", "."])?;
+    svn_status_change_count_from_xml_after_adoption(
+        &output,
+        working_copy,
+        external_roots,
+        ignore_policy,
+    )
+}
+
 fn svn_status_change_count_from_xml(output: &str) -> Result<usize, Box<dyn Error>> {
     let status: SvnStatusDocument = quick_xml::de::from_str(&output)?;
     Ok(status
@@ -3165,6 +3184,71 @@ fn svn_status_change_count_from_xml(output: &str) -> Result<usize, Box<dyn Error
                 || (item == "normal" && !matches!(props, "" | "normal" | "none"))
         })
         .count())
+}
+
+fn svn_status_change_count_from_xml_after_adoption(
+    output: &str,
+    working_copy: &Path,
+    external_roots: &[PathBuf],
+    ignore_policy: &MigrationIgnorePolicy,
+) -> Result<usize, Box<dyn Error>> {
+    let status: SvnStatusDocument = quick_xml::de::from_str(output)?;
+    let mut count = 0;
+    for entry in status.targets.into_iter().flat_map(|target| target.entries) {
+        let item = entry.status.item.as_str();
+        let props = entry.status.props.as_str();
+        if matches!(item, "normal" | "ignored" | "external" | "none")
+            && !(item == "normal" && !matches!(props, "" | "normal" | "none"))
+        {
+            continue;
+        }
+        if item == "unversioned" {
+            let relative = migration_property_relative_path(working_copy, &entry.path)?;
+            if migration_path_is_locally_retained(
+                working_copy,
+                &relative,
+                external_roots,
+                ignore_policy,
+            ) {
+                continue;
+            }
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn migration_path_is_locally_retained(
+    source: &Path,
+    relative: &Path,
+    external_roots: &[PathBuf],
+    ignore_policy: &MigrationIgnorePolicy,
+) -> bool {
+    if relative.as_os_str().is_empty()
+        || path_is_within_roots(relative, external_roots)
+        || relative.components().any(|component| {
+            is_migration_excluded_name(component.as_os_str().to_string_lossy().as_ref())
+        })
+    {
+        return true;
+    }
+
+    let mut candidate = relative.to_path_buf();
+    loop {
+        let size = source
+            .join(&candidate)
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len());
+        if migration_policy_excludes(&candidate, size, ignore_policy) {
+            return true;
+        }
+        if !candidate.pop() {
+            break;
+        }
+    }
+    false
 }
 
 fn probe_svn_remote(url: &str, timeout: Duration) -> String {
@@ -5500,8 +5584,20 @@ mod tests {
             &repository_url
         ));
         assert_eq!(svn_status_change_count(&source).unwrap(), 0);
+        std::fs::create_dir_all(source.join("Library")).unwrap();
+        std::fs::write(source.join("Library/cache.bin"), "local cache").unwrap();
+        std::fs::write(source.join("backup.zip"), "local archive").unwrap();
+        let policy = normalized_ignore_policy(&MigrationIgnorePolicy::default());
+        assert!(svn_status_change_count(&source).unwrap() > 0);
+        assert_eq!(
+            svn_status_change_count_after_adoption(&source, &[], &policy).unwrap(),
+            0
+        );
         std::fs::write(source.join("project.txt"), "changed").unwrap();
-        assert_eq!(svn_status_change_count(&source).unwrap(), 1);
+        assert_eq!(
+            svn_status_change_count_after_adoption(&source, &[], &policy).unwrap(),
+            1
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5587,6 +5683,51 @@ mod tests {
 </target></status>"#;
 
         assert_eq!(svn_status_change_count_from_xml(xml).unwrap(), 3);
+    }
+
+    #[test]
+    fn adoption_status_allows_only_locally_retained_unversioned_paths() {
+        let source = std::env::temp_dir().join(format!(
+            "himind-adoption-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(source.join("Library")).unwrap();
+        std::fs::create_dir_all(source.join("LocalCache")).unwrap();
+        std::fs::write(source.join("backup.zip"), "archive").unwrap();
+        std::fs::write(source.join("Library/cache.bin"), "cache").unwrap();
+        std::fs::write(source.join("LocalCache/cache.bin"), "cache").unwrap();
+        std::fs::write(source.join("notes.txt"), "review me").unwrap();
+
+        let policy = normalized_ignore_policy(&MigrationIgnorePolicy {
+            excluded_relative_paths: vec!["LocalCache".to_string()],
+            ..MigrationIgnorePolicy::default()
+        });
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status><target path=".">
+<entry path="backup.zip"><wc-status item="unversioned" props="none" /></entry>
+<entry path="Library/cache.bin"><wc-status item="unversioned" props="none" /></entry>
+<entry path="LocalCache/cache.bin"><wc-status item="unversioned" props="none" /></entry>
+<entry path="notes.txt"><wc-status item="unversioned" props="none" /></entry>
+<entry path="Assets/Changed.asset"><wc-status item="modified" props="none" /></entry>
+<entry path="ProjectSettings"><wc-status item="normal" props="modified" /></entry>
+<entry path="Packages/External"><wc-status item="external" props="none" /></entry>
+</target></status>"#;
+
+        assert_eq!(
+            svn_status_change_count_from_xml_after_adoption(
+                xml,
+                &source,
+                &[PathBuf::from("Packages/External")],
+                &policy,
+            )
+            .unwrap(),
+            3
+        );
+        std::fs::remove_dir_all(source).unwrap();
     }
 
     #[test]
