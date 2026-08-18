@@ -71,6 +71,7 @@ static SVN_DIAGNOSTIC_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 // desktop's HTTP proxy settings for this client: a proxy can route the
 // request outside the LAN and turn a healthy service into a connect timeout.
 static SVN_ADMIN_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+static SVN_DEFAULT_CREDENTIALS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) struct SvnDiagnosticContextGuard {
     previous: SvnDiagnosticContext,
@@ -221,9 +222,14 @@ pub(crate) fn default_svn_username(display_name: &str) -> Result<String, Box<dyn
 }
 
 pub(crate) fn ensure_default_svn_credentials(username: &str) -> Result<bool, Box<dyn Error>> {
+    let _guard = SVN_DEFAULT_CREDENTIALS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "SVN credential synchronization lock is poisoned")?;
     let username = default_svn_username(username)?;
     if list_local_svn_connections()?.into_iter().any(|item| {
         item.id == SVN_CONNECTION_ID
+            && item.status == "ready"
             && item.username == username
             && !item.encrypted_password.is_empty()
     }) {

@@ -1,5 +1,6 @@
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
+use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -42,6 +43,7 @@ const HIMIND_PROFILE: &str = "himind";
 const HIMIND_MCP_SERVER_NAME: &str = "himind";
 const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
+const DSH_SETTINGS_MIGRATION_MARKER: &str = ".himind-dsh-settings-v2";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct InstalledRuntimeState {
@@ -79,7 +81,6 @@ pub(crate) struct InteractiveLaunch {
     pub home: PathBuf,
     pub api_key: String,
     pub base_url: String,
-    pub model: String,
     pub permission_mode: &'static str,
 }
 
@@ -355,6 +356,7 @@ struct Invocation {
     api_key: String,
     base_url: String,
     model: String,
+    models: Vec<String>,
     permission_mode: &'static str,
     run_id: String,
 }
@@ -574,10 +576,7 @@ pub(crate) fn uninstall_with_progress(
     Ok(status())
 }
 
-pub(crate) fn prepare_interactive_launch(
-    options: &Options,
-    requested_model: Option<&str>,
-) -> Result<InteractiveLaunch, String> {
+pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     let delegated =
@@ -587,7 +586,8 @@ pub(crate) fn prepare_interactive_launch(
         crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
             .map_err(|error| error.to_string())?;
     let home = dsh_home(&version)?;
-    let model = select_interactive_model(&credential.access, requested_model)?;
+    let models = managed_model_catalog(&credential.access)?;
+    let model = credential.access.model.trim().to_string();
     let invocation = Invocation {
         executable: executable.clone(),
         args: Vec::new(),
@@ -595,7 +595,8 @@ pub(crate) fn prepare_interactive_launch(
         home: home.clone(),
         api_key: credential.api_key.clone(),
         base_url: credential.access.base_url.clone(),
-        model: model.clone(),
+        model,
+        models,
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         run_id: "interactive".to_string(),
     };
@@ -605,7 +606,6 @@ pub(crate) fn prepare_interactive_launch(
         home,
         api_key: credential.api_key,
         base_url: credential.access.base_url,
-        model,
         permission_mode: INTERACTIVE_PERMISSION_MODE,
     })
 }
@@ -628,33 +628,28 @@ pub(crate) fn interactive_tool_context_summary(
     })
 }
 
-fn select_interactive_model(
+fn managed_model_catalog(
     credential: &crate::api::ai::AIUserCredential,
-    requested_model: Option<&str>,
-) -> Result<String, String> {
-    let fallback = credential.model.trim();
-    let requested = requested_model.unwrap_or_default().trim();
-    let selected = if requested.is_empty() {
-        fallback
-    } else {
-        requested
-    };
-    if selected.is_empty() {
+) -> Result<Vec<String>, String> {
+    let default_model = credential.model.trim();
+    if default_model.is_empty() {
         return Err("当前账号没有可用模型".to_string());
     }
-    let mut allowed = credential
-        .models
-        .iter()
-        .map(|model| model.trim())
-        .filter(|model| !model.is_empty())
-        .collect::<Vec<_>>();
-    if !fallback.is_empty() && !allowed.iter().any(|model| *model == fallback) {
-        allowed.push(fallback);
+    let mut models = vec![default_model.to_string()];
+    models.extend(
+        credential
+            .models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+    );
+    let mut seen = HashSet::new();
+    models.retain(|model| seen.insert(model.clone()));
+    if models.is_empty() {
+        return Err("当前账号没有可用模型".to_string());
     }
-    if !allowed.is_empty() && !allowed.iter().any(|model| *model == selected) {
-        return Err("所选模型不在当前 AI 服务的可用范围内".to_string());
-    }
-    Ok(selected.to_string())
+    Ok(models)
 }
 
 fn validate_update(api_base: &str, update: &RuntimeComponentUpdate) -> Result<(), String> {
@@ -1118,7 +1113,7 @@ fn build_invocation(
     prompt.push_str("\n\nReturn only a JSON object with keys summary, changes, verification, and remaining_risks.");
     let executable = resolve_executable()?;
     let runtime_version = resolve_runtime_version(&executable)?;
-    let home = dsh_home(&runtime_version)?;
+    let home = dsh_run_home(&runtime_version, &claim.run.id)?;
     let permission_mode = match effective_access_mode(claim)? {
         crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED => "workspace-write",
         crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS => "danger-full-access",
@@ -1140,6 +1135,7 @@ fn build_invocation(
             claim.run.id
         ),
         model: claim.ai_model.trim().to_string(),
+        models: vec![claim.ai_model.trim().to_string()],
         permission_mode,
         run_id: claim.run.id.clone(),
     })
@@ -1185,14 +1181,16 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
 fn ensure_home_config(invocation: &Invocation, options: &Options) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&invocation.home)?;
     ensure_himind_skill_adapter(&invocation.home)?;
-    ensure_himind_profile(&invocation.home, options)?;
-    let settings = render_settings(&invocation.model, &invocation.base_url);
-    let path = invocation.home.join("settings.yaml");
-    fs::write(path, settings)?;
+    migrate_legacy_managed_settings(&invocation.home)?;
+    ensure_himind_profile(&invocation.home, options, invocation)?;
     Ok(())
 }
 
-fn ensure_himind_profile(home: &Path, options: &Options) -> Result<(), Box<dyn Error>> {
+fn ensure_himind_profile(
+    home: &Path,
+    options: &Options,
+    invocation: &Invocation,
+) -> Result<(), Box<dyn Error>> {
     let profile = home.join("profiles").join(HIMIND_PROFILE);
     fs::create_dir_all(&profile)?;
     let files = [
@@ -1214,17 +1212,30 @@ fn ensure_himind_profile(home: &Path, options: &Options) -> Result<(), Box<dyn E
     }
     fs::write(
         profile.join("cordis.patch.yml"),
-        render_himind_profile_patch(home, options)?,
+        render_himind_profile_patch(
+            home,
+            options,
+            &invocation.model,
+            &invocation.base_url,
+            &invocation.models,
+        )?,
     )?;
     Ok(())
 }
 
-fn render_himind_profile_patch(home: &Path, options: &Options) -> Result<String, Box<dyn Error>> {
+fn render_himind_profile_patch(
+    home: &Path,
+    options: &Options,
+    default_model: &str,
+    base_url: &str,
+    models: &[String],
+) -> Result<String, Box<dyn Error>> {
     let executable = env::current_exe()?;
     let args = himind_mcp_arguments(options);
     let mut patch = include_str!("../../runtime-profiles/himind/cordis.patch.yml")
         .trim_end()
         .to_string();
+    append_managed_model_profile(&mut patch, default_model, base_url, models)?;
     patch.push_str("\n\n# Agent-owned context. This layer is regenerated for each new HiMind AI session.\n- insert:\n");
     patch.push_str("    - id: himind-mcp\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        transport: stdio\n");
     patch.push_str(&format!(
@@ -1247,6 +1258,139 @@ fn render_himind_profile_patch(home: &Path, options: &Options) -> Result<String,
         yaml_scalar(&home.join(HIMIND_SKILL_ADAPTER_DIR).to_string_lossy()),
     ));
     Ok(patch)
+}
+
+fn append_managed_model_profile(
+    patch: &mut String,
+    default_model: &str,
+    base_url: &str,
+    models: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let default_model = default_model.trim();
+    let base_url = base_url.trim();
+    if default_model.is_empty() || base_url.is_empty() {
+        return Err("HiMind AI 模型配置不完整".into());
+    }
+    let mut catalog = vec![default_model.to_string()];
+    catalog.extend(
+        models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+    );
+    let mut seen = HashSet::new();
+    catalog.retain(|model| seen.insert(model.clone()));
+
+    patch.push_str(
+        "\n\n# HiMind provides the initial route. DSH settings remain the user-owned override.\n",
+    );
+    patch.push_str(&format!(
+        "- id: agent-default-model\n  config:\n    provider: himind-proxy\n    model: {}\n",
+        yaml_scalar(default_model),
+    ));
+    patch.push_str(
+        "- id: llm-pi-ai\n  config:\n    providers:\n      himind-proxy:\n        displayName: HiMind AI\n        apiKeyEnv: DEEPSEEK_API_KEY\n        api: openai-completions\n",
+    );
+    patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(base_url)));
+    patch.push_str("        models:\n");
+    for model in catalog {
+        patch.push_str(&format!("          - id: {}\n", yaml_scalar(&model)));
+    }
+    Ok(())
+}
+
+fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
+    let marker = home.join(DSH_SETTINGS_MIGRATION_MARKER);
+    if marker.is_file() {
+        return Ok(());
+    }
+    let path = home.join("settings.yaml");
+    if path.is_file() {
+        let source = fs::read_to_string(&path)?;
+        if let Ok(mut document) = serde_yaml::from_str::<YamlValue>(&source) {
+            if remove_legacy_managed_sections(&mut document) {
+                let empty = document
+                    .as_mapping()
+                    .is_some_and(|mapping| mapping.is_empty());
+                if empty {
+                    fs::remove_file(&path)?;
+                } else {
+                    fs::write(&path, serde_yaml::to_string(&document)?)?;
+                }
+            }
+        }
+    }
+    fs::write(marker, b"2\n")?;
+    Ok(())
+}
+
+fn remove_legacy_managed_sections(document: &mut YamlValue) -> bool {
+    let Some(root) = document.as_mapping_mut() else {
+        return false;
+    };
+    let default_key = YamlValue::String("agent-default-model".to_string());
+    let llm_key = YamlValue::String("llm-pi-ai".to_string());
+    let Some(default_model) = root
+        .get(&default_key)
+        .and_then(YamlValue::as_mapping)
+        .filter(|mapping| mapping.len() == 2)
+        .and_then(|mapping| {
+            let provider = mapping
+                .get(YamlValue::String("provider".to_string()))?
+                .as_str()?;
+            let model = mapping
+                .get(YamlValue::String("model".to_string()))?
+                .as_str()?;
+            (provider == "himind-proxy" && !model.trim().is_empty()).then_some(model.to_string())
+        })
+    else {
+        return false;
+    };
+    let legacy_provider = root
+        .get(&llm_key)
+        .and_then(YamlValue::as_mapping)
+        .filter(|mapping| mapping.len() == 1)
+        .and_then(|mapping| mapping.get(YamlValue::String("providers".to_string())))
+        .and_then(YamlValue::as_mapping)
+        .filter(|mapping| mapping.len() == 1)
+        .and_then(|mapping| mapping.get(YamlValue::String("himind-proxy".to_string())))
+        .and_then(YamlValue::as_mapping)
+        .is_some_and(|provider| legacy_provider_matches(provider, &default_model));
+    if !legacy_provider {
+        return false;
+    }
+    root.remove(&default_key);
+    root.remove(&llm_key);
+    true
+}
+
+fn legacy_provider_matches(provider: &serde_yaml::Mapping, default_model: &str) -> bool {
+    if provider.len() != 5 {
+        return false;
+    }
+    let string_field = |key: &str| {
+        provider
+            .get(YamlValue::String(key.to_string()))
+            .and_then(YamlValue::as_str)
+    };
+    if string_field("displayName") != Some("HiMind AI")
+        || string_field("apiKeyEnv") != Some("DEEPSEEK_API_KEY")
+        || string_field("api") != Some("openai-completions")
+        || string_field("baseURL").is_none_or(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    provider
+        .get(YamlValue::String("models".to_string()))
+        .and_then(YamlValue::as_sequence)
+        .filter(|models| models.len() == 1)
+        .and_then(|models| models.first())
+        .and_then(YamlValue::as_mapping)
+        .filter(|model| model.len() == 1)
+        .and_then(|model| model.get(YamlValue::String("id".to_string())))
+        .and_then(YamlValue::as_str)
+        == Some(default_model)
 }
 
 fn append_personal_mcp_row(patch: &mut String, server: &crate::app::mcp_settings::McpServerConfig) {
@@ -1438,15 +1582,6 @@ fn dsh_skill_name(skill_id: &str) -> String {
     )
 }
 
-fn render_settings(model: &str, base_url: &str) -> String {
-    format!(
-        "agent-default-model:\n  provider: himind-proxy\n  model: {}\nllm-pi-ai:\n  providers:\n    himind-proxy:\n      displayName: HiMind AI\n      apiKeyEnv: DEEPSEEK_API_KEY\n      api: openai-completions\n      baseURL: {}\n      models:\n        - id: {}\n",
-        yaml_scalar(model),
-        yaml_scalar(base_url),
-        yaml_scalar(model)
-    )
-}
-
 fn yaml_scalar(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "".to_string())
 }
@@ -1532,6 +1667,17 @@ fn dsh_home(version: &str) -> Result<PathBuf, String> {
     versioned_home(&root, version)
 }
 
+fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
+    let root = env::var_os(DSH_HOME_ROOT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_root().join("homes"));
+    Ok(root
+        .join("runs")
+        .join(safe_segment(version)?)
+        .join(safe_segment(run_id)?))
+}
+
 fn versioned_home(root: &Path, version: &str) -> Result<PathBuf, String> {
     Ok(root.join(safe_segment(version)?))
 }
@@ -1548,9 +1694,10 @@ fn first_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_skill_name, first_line, parse_runtime_version, remove_managed_runtime,
-        render_himind_profile_patch, safe_relative_path, safe_segment, select_interactive_model,
-        strip_yaml_frontmatter, versioned_home, InteractiveEventProjector,
+        dsh_run_home, dsh_skill_name, first_line, managed_model_catalog,
+        migrate_legacy_managed_settings, parse_runtime_version, remove_managed_runtime,
+        render_himind_profile_patch, safe_relative_path, safe_segment, strip_yaml_frontmatter,
+        versioned_home, InteractiveEventProjector,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
@@ -1573,6 +1720,13 @@ mod tests {
             std::path::PathBuf::from("runtime-homes").join("0.1.0-rc.6")
         );
         assert!(versioned_home(std::path::Path::new("runtime-homes"), "../shared").is_err());
+    }
+
+    #[test]
+    fn managed_run_home_is_isolated_from_interactive_settings() {
+        let home = dsh_run_home("0.1.0-rc.6", "run-123").unwrap();
+        assert!(home.ends_with("runs/0.1.0-rc.6/run-123"));
+        assert!(dsh_run_home("0.1.0-rc.6", "../interactive").is_err());
     }
 
     #[test]
@@ -1612,10 +1766,19 @@ mod tests {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
-        let patch =
-            render_himind_profile_patch(std::path::Path::new("C:/HiMind/runtime-home"), &options)
-                .unwrap();
+        let patch = render_himind_profile_patch(
+            std::path::Path::new("C:/HiMind/runtime-home"),
+            &options,
+            "model-default",
+            "https://gateway.example/v1",
+            &["model-default".to_string(), "model-fast".to_string()],
+        )
+        .unwrap();
 
+        assert!(patch.contains("id: agent-default-model"));
+        assert!(patch.contains("id: llm-pi-ai"));
+        assert!(patch.contains("id: \"model-default\""));
+        assert!(patch.contains("id: \"model-fast\""));
         assert!(patch.contains("id: himind-mcp"));
         assert!(patch.contains("name: '@deepseek-ai/dsh-mcp-client'"));
         assert!(patch.contains("HIMIND_AI_CLIENT_ID: \"himind-ai\""));
@@ -1659,7 +1822,14 @@ mod tests {
         };
         crate::app::mcp_settings::upsert(&options.state_path, server).unwrap();
 
-        let patch = render_himind_profile_patch(&root.join("runtime-home"), &options).unwrap();
+        let patch = render_himind_profile_patch(
+            &root.join("runtime-home"),
+            &options,
+            "model-default",
+            "https://gateway.example/v1",
+            &["model-default".to_string()],
+        )
+        .unwrap();
         assert!(patch.contains("id: himind-mcp"));
         assert!(patch.contains("id: personal-mcp-project-tools"));
         assert!(patch.contains("serverName: \"project-tools\""));
@@ -1688,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_model_must_be_in_the_assigned_catalog() {
+    fn interactive_catalog_starts_with_the_default_and_removes_duplicates() {
         let credential = AIUserCredential {
             active_entitlement_id: "entitlement".to_string(),
             active_personal_connection_id: String::new(),
@@ -1698,26 +1868,83 @@ mod tests {
             models: vec!["fast".to_string(), "deep".to_string()],
         };
         assert_eq!(
-            select_interactive_model(&credential, Some("deep")).unwrap(),
-            "deep"
+            managed_model_catalog(&credential).unwrap(),
+            vec!["fast", "deep"]
         );
-        assert!(select_interactive_model(&credential, Some("unknown")).is_err());
     }
 
     #[test]
-    fn settings_route_uses_only_the_claim_scoped_himind_proxy() {
-        let settings = super::render_settings(
+    fn profile_route_uses_only_the_claim_scoped_himind_proxy() {
+        let mut options = crate::Options::from_env();
+        options.api_base = "https://dashboard.example".to_string();
+        options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        let profile = render_himind_profile_patch(
+            std::path::Path::new("C:/HiMind/runtime-home"),
+            &options,
             "deepseek-model",
             "https://dashboard.example/api/agent/runs/run-1/ai/v1",
-        );
-        assert!(settings.contains("provider: himind-proxy"));
-        assert!(settings.contains("apiKeyEnv: DEEPSEEK_API_KEY"));
-        assert!(settings.contains("api: openai-completions"));
-        assert!(settings.contains("model: \"deepseek-model\""));
+            &["deepseek-model".to_string(), "fast-model".to_string()],
+        )
+        .unwrap();
+        assert!(profile.contains("provider: himind-proxy"));
+        assert!(profile.contains("apiKeyEnv: DEEPSEEK_API_KEY"));
+        assert!(profile.contains("api: openai-completions"));
+        assert!(profile.contains("model: \"deepseek-model\""));
         assert!(
-            settings.contains("baseURL: \"https://dashboard.example/api/agent/runs/run-1/ai/v1\"")
+            profile.contains("baseURL: \"https://dashboard.example/api/agent/runs/run-1/ai/v1\"")
         );
-        assert!(!settings.contains("apiKey:"));
+        assert!(profile.contains("id: \"fast-model\""));
+        assert!(!profile.contains("apiKey:"));
+    }
+
+    #[test]
+    fn legacy_generated_settings_are_removed_without_touching_other_preferences() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-settings-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.yaml"),
+            "theme:\n  mode: dark\nagent-default-model:\n  provider: himind-proxy\n  model: glm-5.2\nllm-pi-ai:\n  providers:\n    himind-proxy:\n      displayName: HiMind AI\n      apiKeyEnv: DEEPSEEK_API_KEY\n      api: openai-completions\n      baseURL: https://gateway.example/v1\n      models:\n        - id: glm-5.2\n",
+        )
+        .unwrap();
+
+        migrate_legacy_managed_settings(&root).unwrap();
+
+        let migrated = std::fs::read_to_string(root.join("settings.yaml")).unwrap();
+        assert!(migrated.contains("theme:"));
+        assert!(!migrated.contains("agent-default-model"));
+        assert!(!migrated.contains("llm-pi-ai"));
+        assert!(root.join(super::DSH_SETTINGS_MIGRATION_MARKER).is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn customized_dsh_model_settings_are_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-settings-custom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = "agent-default-model:\n  provider: custom\n  model: my-model\nllm-pi-ai:\n  providers:\n    custom:\n      displayName: My Provider\n      apiKeyEnv: CUSTOM_API_KEY\n      api: openai-completions\n      baseURL: https://example.test/v1\n      models:\n        - id: my-model\n";
+        std::fs::write(root.join("settings.yaml"), settings).unwrap();
+
+        migrate_legacy_managed_settings(&root).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("settings.yaml")).unwrap(),
+            settings
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1739,18 +1966,14 @@ mod tests {
     #[test]
     fn himind_profile_keeps_personal_plugin_settings_open() {
         let profile = include_str!("../../runtime-profiles/himind/cordis.patch.yml");
-        for id in [
-            "ui-settings-models",
-            "ui-agent-preset",
-            "ui-model-selection",
-        ] {
-            assert!(profile.contains(&format!("- id: {id}\n  disabled: true")));
-        }
+        assert!(profile.contains("- id: ui-agent-preset\n  disabled: true"));
         for id in [
             "ui-settings",
             "ui-settings-general",
+            "ui-settings-models",
             "ui-settings-plugin-inventory",
             "ui-settings-plugins",
+            "ui-model-selection",
         ] {
             assert!(!profile.contains(&format!("- id: {id}\n  disabled: true")));
         }

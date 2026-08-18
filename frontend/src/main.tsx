@@ -13,7 +13,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type BuiltinAIModelOptions, type BuiltinAIToolContextSummary, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -40,8 +40,6 @@ function App() {
   const [dashboardIdentity, setDashboardIdentity] = useState<DashboardIdentityStatus | null>(null);
   const [dashboardAuthorization, setDashboardAuthorization] = useState<DashboardAuthorizationProgress | null>(null);
   const [aiIntegration, setAiIntegration] = useState<AiIntegrationOverview | null>(null);
-  const [builtinAiModelOptions, setBuiltinAiModelOptions] = useState<BuiltinAIModelOptions | null>(null);
-  const [builtinAiModelOptionsLoading, setBuiltinAiModelOptionsLoading] = useState(true);
   const [builtinAiToolContext, setBuiltinAiToolContext] = useState<BuiltinAIToolContextSummary | null>(null);
   const [mcpTestResult, setMcpTestResult] = useState<McpConnectionTestResult | null>(null);
   const [aiOperation, setAiOperation] = useState<string | null>(null);
@@ -79,24 +77,23 @@ function App() {
   const [loginUsername, setLoginUsername] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [svnConnections, setSvnConnections] = useState<SvnConnection[]>([]);
+  const svnRefreshInFlight = useRef<Promise<void> | null>(null);
   const [svnModalOpen, setSvnModalOpen] = useState(false);
   const [svnDraft, setSvnDraft] = useState<SvnConnectionInput>({ username: '', password: '' });
   const [svnTesting, setSvnTesting] = useState(false);
 
   async function refreshStatus() { setStatus(await agentApi.status()); }
   async function refreshUpdateStatus() { setUpdateStatus(await agentApi.updateStatus()); }
-  async function refreshDashboardIdentity() { setDashboardIdentity(await agentApi.dashboardIdentity()); }
-  async function refreshAiIntegration() { setAiIntegration(await agentApi.aiIntegration()); }
-  async function refreshBuiltinAiModelOptions() {
-    setBuiltinAiModelOptionsLoading(true);
+  async function refreshDashboardIdentity() {
     try {
-      setBuiltinAiModelOptions(await agentApi.builtinAiModelOptions());
-    } catch {
-      setBuiltinAiModelOptions(null);
+      const identity = await agentApi.dashboardIdentity();
+      setDashboardIdentity(identity);
     } finally {
-      setBuiltinAiModelOptionsLoading(false);
+      // identity_status may finish the delayed local SVN bootstrap. Read the file only after it returns.
+      try { await refreshSvnConnections(); } catch (error) { console.error(error); }
     }
   }
+  async function refreshAiIntegration() { setAiIntegration(await agentApi.aiIntegration()); }
   async function refreshBuiltinAiToolContext() {
     try {
       setBuiltinAiToolContext(await agentApi.builtinAiToolContextSummary());
@@ -153,7 +150,18 @@ function App() {
     try { setExtensionInvitations(await agentApi.extensionCollaborationInvitations()); }
     catch { setExtensionInvitations([]); }
   }
-  async function refreshSvnConnections() { setSvnConnections((await agentApi.svnConnections()).items || []); }
+  async function refreshSvnConnections() {
+    if (svnRefreshInFlight.current) return svnRefreshInFlight.current;
+    const operation = (async () => {
+      setSvnConnections((await agentApi.svnConnections()).items || []);
+    })();
+    svnRefreshInFlight.current = operation;
+    try {
+      await operation;
+    } finally {
+      if (svnRefreshInFlight.current === operation) svnRefreshInFlight.current = null;
+    }
+  }
   async function testSvnConnection() {
     if (svnTesting) return;
     setSvnTesting(true);
@@ -274,11 +282,9 @@ function App() {
       refreshUpdateStatus(),
       refreshDashboardIdentity(),
       refreshAiIntegration(),
-      refreshBuiltinAiModelOptions(),
       refreshBuiltinAiToolContext(),
       refreshApprovals(),
       refreshSettingsPageData(),
-      refreshSvnConnections(),
       refreshPlugins(),
       refreshExtensionDesiredState(),
       refreshSkills(),
@@ -298,17 +304,32 @@ function App() {
       Promise.all([refreshStatus(), refreshUpdateStatus(), refreshApprovals(), refreshLogin()]).catch(console.error);
     }, 5000);
     const identityTimer = window.setInterval(() => refreshDashboardIdentity().catch(console.error), 30000);
-    const modelTimer = window.setInterval(() => refreshBuiltinAiModelOptions().catch(console.error), 30000);
     const toolContextTimer = window.setInterval(() => refreshBuiltinAiToolContext().catch(console.error), 30000);
     const reviewTimer = window.setInterval(() => refreshReviewProgress().catch(console.error), 30000);
     return () => {
       window.clearInterval(timer);
       window.clearInterval(identityTimer);
-      window.clearInterval(modelTimer);
       window.clearInterval(toolContextTimer);
       window.clearInterval(reviewTimer);
     };
   }, []);
+
+  useEffect(() => {
+    if (page !== 'settings') return;
+    const refreshSettingsOnVisibility = () => {
+      if (document.visibilityState === 'hidden') return;
+      Promise.all([refreshSettingsPageData(), refreshDashboardIdentity()]).catch(console.error);
+    };
+    refreshSettingsOnVisibility();
+    const timer = window.setInterval(refreshSettingsOnVisibility, 15000);
+    window.addEventListener('focus', refreshSettingsOnVisibility);
+    document.addEventListener('visibilitychange', refreshSettingsOnVisibility);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshSettingsOnVisibility);
+      document.removeEventListener('visibilitychange', refreshSettingsOnVisibility);
+    };
+  }, [page]);
 
   useEffect(() => {
     if (page !== 'plugins' && page !== 'skills' && page !== 'development') return;
@@ -376,7 +397,7 @@ function App() {
         if (progress.state === 'authorized') {
           stopped = true;
           window.clearInterval(timer);
-          await Promise.all([refreshDashboardIdentity(), refreshAiIntegration(), refreshSvnConnections()]);
+          await Promise.all([refreshDashboardIdentity(), refreshAiIntegration()]);
           notify('success', progress.user_name ? `已登录工作台账号：${progress.user_name}` : '工作台账号授权成功');
         } else if (['denied', 'expired', 'failed', 'canceled'].includes(progress.state)) {
           stopped = true;
@@ -588,8 +609,6 @@ function App() {
       onOpenPlugins={() => setPage('plugins')}
       onOpenSkills={() => setPage('skills')}
       onToolContextChanged={() => { void refreshBuiltinAiToolContext(); }}
-      modelOptions={builtinAiModelOptions}
-      modelOptionsLoading={builtinAiModelOptionsLoading}
       toolSummary={builtinAiToolContext || {
         skills: skillCatalog?.items?.length || 0,
         mcp_services: 1,

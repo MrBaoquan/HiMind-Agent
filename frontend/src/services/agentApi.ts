@@ -120,14 +120,6 @@ export type BuiltinAIRuntimeInstallationStatus = {
     mandatory_update: boolean;
 };
 
-export type BuiltinAIModelOptions = {
-    selected_model: string;
-    models: string[];
-    source_type: 'personal' | 'organization' | string;
-    source_name: string;
-    source_provider: string;
-};
-
 export type BuiltinAIToolContextSummary = {
     skills: number;
     mcp_services: number;
@@ -860,7 +852,6 @@ export const agentApi = {
     builtinAiRuntimeStatus: () => invoke<BuiltinAIRuntimeStatus>('get_builtin_ai_runtime_status'),
     builtinAiRuntimeInstallationStatus: () => invoke<BuiltinAIRuntimeInstallationStatus>('get_builtin_ai_runtime_installation_status'),
     checkBuiltinAiRuntimeUpdate: () => invoke<BuiltinAIRuntimeInstallationStatus>('check_builtin_ai_runtime_update'),
-    builtinAiModelOptions: () => invoke<BuiltinAIModelOptions>('get_builtin_ai_model_options'),
     builtinAiToolContextSummary: () => invoke<BuiltinAIToolContextSummary>('get_builtin_ai_tool_context_summary'),
     builtinAiMcpServers: () => invoke<BuiltinAIMcpServer[]>('get_builtin_ai_mcp_servers'),
     saveBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<BuiltinAIMcpServer>('save_builtin_ai_mcp_server', { server }),
@@ -868,8 +859,7 @@ export const agentApi = {
     validateBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<void>('validate_builtin_ai_mcp_server', { server }),
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
     startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install') => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation }),
-    startBuiltinAiSession: (model?: string) => invoke<string>('start_builtin_ai_session', { model: model || null }),
-    restartBuiltinAiSession: (model?: string) => invoke<string>('restart_builtin_ai_session', { model: model || null }),
+    startBuiltinAiSession: () => invoke<string>('start_builtin_ai_session'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),

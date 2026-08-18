@@ -792,7 +792,6 @@ pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), St
 #[tauri::command]
 pub(crate) async fn start_builtin_ai_session(
     state: State<'_, AgentState>,
-    model: Option<String>,
 ) -> Result<String, String> {
     if !crate::runtime::builtin::status().compatible {
         return Err("HiMind AI 运行时尚未安装，请先安装 HiMind AI 运行时".to_string());
@@ -800,7 +799,7 @@ pub(crate) async fn start_builtin_ai_session(
     let options = state.options.clone();
     let logs = Arc::clone(&state.approval_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::app::ui::start_builtin_ai_session(&options, model.as_deref())
+        crate::app::ui::start_builtin_ai_session(&options)
     })
     .await
     .map_err(|error| error.to_string())?;
@@ -814,43 +813,6 @@ pub(crate) async fn start_builtin_ai_session(
             Err(present_builtin_ai_start_error(&error))
         }
     }
-}
-
-#[tauri::command]
-pub(crate) async fn restart_builtin_ai_session(
-    state: State<'_, AgentState>,
-    model: Option<String>,
-) -> Result<String, String> {
-    if !crate::runtime::builtin::status().compatible {
-        return Err("HiMind AI 运行时尚未安装，请先安装 HiMind AI 运行时".to_string());
-    }
-    let options = state.options.clone();
-    let logs = Arc::clone(&state.approval_manager);
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::app::ui::restart_builtin_ai_session(&options, model.as_deref())
-    })
-    .await
-    .map_err(|error| error.to_string())?;
-    match result {
-        Ok(session_url) => {
-            logs.add_log("info", "HiMind AI 已切换模型并启动新会话");
-            Ok(session_url)
-        }
-        Err(error) => {
-            logs.add_log("error", &format!("HiMind AI 模型切换失败: {error}"));
-            Err(present_builtin_ai_start_error(&error))
-        }
-    }
-}
-
-#[tauri::command]
-pub(crate) async fn get_builtin_ai_model_options(
-    state: State<'_, AgentState>,
-) -> Result<crate::runtime::builtin::BuiltinAIModelOptions, String> {
-    let options = state.options.clone();
-    tauri::async_runtime::spawn_blocking(move || crate::runtime::builtin::model_options(&options))
-        .await
-        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

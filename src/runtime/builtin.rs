@@ -40,7 +40,6 @@ trait AIRuntimeAdapter: Sync {
     fn prepare_interactive_launch(
         &self,
         options: &Options,
-        requested_model: Option<&str>,
     ) -> Result<BuiltinAIInteractiveLaunch, String>;
     fn interactive_tool_context_summary(
         &self,
@@ -103,15 +102,6 @@ pub(crate) struct BuiltinAIRuntimeUpdateStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct BuiltinAIModelOptions {
-    pub selected_model: String,
-    pub models: Vec<String>,
-    pub source_type: String,
-    pub source_name: String,
-    pub source_provider: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub(crate) struct BuiltinAIToolContextSummary {
     pub skills: usize,
     pub mcp_services: usize,
@@ -123,7 +113,6 @@ pub(crate) struct BuiltinAIInteractiveLaunch {
     pub home: PathBuf,
     pub api_key: String,
     pub base_url: String,
-    pub model: String,
     pub permission_mode: &'static str,
 }
 
@@ -190,23 +179,10 @@ pub(crate) fn uninstall_with_progress(
     active_adapter().uninstall(report_progress)
 }
 
-pub(crate) fn model_options(options: &Options) -> Result<BuiltinAIModelOptions, String> {
-    crate::api::ai::fetch_client_model_options(options, "himind-agent")
-        .map(|options| BuiltinAIModelOptions {
-            selected_model: options.selected_model,
-            models: options.models,
-            source_type: options.source_type,
-            source_name: options.source_name,
-            source_provider: options.source_provider,
-        })
-        .map_err(|error| error.to_string())
-}
-
 pub(crate) fn prepare_interactive_launch(
     options: &Options,
-    requested_model: Option<&str>,
 ) -> Result<BuiltinAIInteractiveLaunch, String> {
-    active_adapter().prepare_interactive_launch(options, requested_model)
+    active_adapter().prepare_interactive_launch(options)
 }
 
 pub(crate) fn interactive_tool_context_summary(
@@ -288,15 +264,13 @@ impl AIRuntimeAdapter for DeepSeekHarnessAdapter {
     fn prepare_interactive_launch(
         &self,
         options: &Options,
-        requested_model: Option<&str>,
     ) -> Result<BuiltinAIInteractiveLaunch, String> {
-        deepseek_harness::prepare_interactive_launch(options, requested_model).map(|launch| {
+        deepseek_harness::prepare_interactive_launch(options).map(|launch| {
             BuiltinAIInteractiveLaunch {
                 executable: launch.executable,
                 home: launch.home,
                 api_key: launch.api_key,
                 base_url: launch.base_url,
-                model: launch.model,
                 permission_mode: launch.permission_mode,
             }
         })

@@ -156,7 +156,6 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_builtin_ai_runtime_status,
             super::commands::get_builtin_ai_runtime_installation_status,
             super::commands::check_builtin_ai_runtime_update,
-            super::commands::get_builtin_ai_model_options,
             super::commands::get_builtin_ai_tool_context_summary,
             super::commands::get_builtin_ai_mcp_servers,
             super::commands::save_builtin_ai_mcp_server,
@@ -165,7 +164,6 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::install_builtin_ai_runtime,
             super::commands::start_builtin_ai_runtime_install,
             super::commands::start_builtin_ai_session,
-            super::commands::restart_builtin_ai_session,
             super::commands::set_approval_rule,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
@@ -593,10 +591,7 @@ pub(crate) fn open_plugin_view(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn start_builtin_ai_session(
-    options: &Options,
-    requested_model: Option<&str>,
-) -> Result<String, String> {
+pub(crate) fn start_builtin_ai_session(options: &Options) -> Result<String, String> {
     if let Some(session) = builtin_ai_session()
         .lock()
         .map_err(|_| "HiMind AI 会话状态不可用")?
@@ -608,29 +603,13 @@ pub(crate) fn start_builtin_ai_session(
         return Err("HiMind AI 正在启动，请稍后重试".to_string());
     }
 
-    let result = start_builtin_ai_session_inner(options, requested_model);
+    let result = start_builtin_ai_session_inner(options);
     builtin_ai_starting().store(false, Ordering::Release);
     result
 }
 
-pub(crate) fn restart_builtin_ai_session(
-    options: &Options,
-    requested_model: Option<&str>,
-) -> Result<String, String> {
-    if builtin_ai_starting().swap(true, Ordering::AcqRel) {
-        return Err("HiMind AI 正在启动，请稍后重试".to_string());
-    }
-    stop_builtin_ai_process();
-    let result = start_builtin_ai_session_inner(options, requested_model);
-    builtin_ai_starting().store(false, Ordering::Release);
-    result
-}
-
-fn start_builtin_ai_session_inner(
-    options: &Options,
-    requested_model: Option<&str>,
-) -> Result<String, String> {
-    let launch = crate::runtime::builtin::prepare_interactive_launch(options, requested_model)?;
+fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
+    let launch = crate::runtime::builtin::prepare_interactive_launch(options)?;
     let mut command = if launch
         .executable
         .extension()
@@ -649,7 +628,6 @@ fn start_builtin_ai_session_inner(
         .env("DEEPSEEK_BASE_URL", &launch.base_url)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
         .env("DSH_PERMISSION_MODE", launch.permission_mode)
-        .env("HIMIND_BUILTIN_AI_MODEL", &launch.model)
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -122,7 +122,20 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
 
     match oauth::fetch_user_info(options) {
         Ok(info) => {
-            let _ = ensure_svn_credentials_for_identity(&info);
+            let local_svn_error = ensure_svn_credentials_for_identity(&info)
+                .err()
+                .map(|error| error.to_string());
+            let svn_provisioning_status =
+                if local_svn_error.is_some() && info.svn_provisioning_status == "ready" {
+                    "local_error".to_string()
+                } else {
+                    info.svn_provisioning_status.clone()
+                };
+            let svn_provisioning_error = match local_svn_error {
+                Some(error) if info.svn_provisioning_error.trim().is_empty() => error,
+                Some(error) => format!("{}；本机配置失败：{}", info.svn_provisioning_error, error),
+                None => info.svn_provisioning_error.clone(),
+            };
             DashboardIdentityStatus {
                 state: if info.active {
                     "authorized"
@@ -140,8 +153,8 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
                 refresh_expires_at: snapshot.refresh_expires_at,
                 last_verified_at: unix_now(),
                 svn_username: info.svn_username,
-                svn_provisioning_status: info.svn_provisioning_status,
-                svn_provisioning_error: info.svn_provisioning_error,
+                svn_provisioning_status,
+                svn_provisioning_error,
                 error: if info.active {
                     String::new()
                 } else {

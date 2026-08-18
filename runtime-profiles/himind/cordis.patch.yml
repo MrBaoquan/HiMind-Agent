@@ -12,12 +12,8 @@
     surfaceContext: false
     trustedHosts: []
 
-# HiMind owns organization models and connections. Keep the Runtime's general
-# and extension settings available so personal and workspace extensions stay open.
-# ui-settings also provides settingsScope to locale, theme, and conversation.
-- id: ui-settings-models
-  disabled: true
+# HiMind supplies a ready-to-use provider, while DSH remains the owner of model
+# selection and provider settings. ui-settings also provides settingsScope to
+# locale, theme, and conversation.
 - id: ui-agent-preset
-  disabled: true
-- id: ui-model-selection
   disabled: true

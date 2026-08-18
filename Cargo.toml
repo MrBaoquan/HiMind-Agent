@@ -1,6 +1,6 @@
 [package]
 name = "himind-agent"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2021"
 default-run = "himind-agent"
 
@@ -33,6 +33,7 @@ tauri-plugin-single-instance = "2"
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "cookies"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 walkdir = "2.5"
 zip = "0.6"
 rfd = "0.15"

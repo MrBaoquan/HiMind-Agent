@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowUpRight, Blocks, Bot, Check, CircleAlert, ChevronDown, Download, LoaderCircle, LogIn, MessageCircle, RefreshCw, Settings } from 'lucide-react';
-import { agentApi, type BuiltinAIModelOptions, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIToolContextSummary, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { ArrowUpRight, Blocks, CircleAlert, Download, LoaderCircle, LogIn, MessageCircle, RefreshCw, Settings } from 'lucide-react';
+import { agentApi, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIToolContextSummary, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
 import { errorDetail } from '../types';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 
@@ -16,8 +16,6 @@ type BuiltinAiPageProps = {
   onOpenPlugins: () => void;
   onOpenSkills: () => void;
   onToolContextChanged: () => void;
-  modelOptions: BuiltinAIModelOptions | null;
-  modelOptionsLoading: boolean;
   toolSummary: BuiltinAIToolContextSummary;
 };
 
@@ -33,19 +31,15 @@ export function BuiltinAiPage({
   onOpenPlugins,
   onOpenSkills,
   onToolContextChanged,
-  modelOptions,
-  modelOptionsLoading,
   toolSummary,
 }: BuiltinAiPageProps) {
   const [sessionUrl, setSessionUrl] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [connectionError, setConnectionError] = useState('');
-  const [selectedModel, setSelectedModel] = useState('');
   const [extensionsOpen, setExtensionsOpen] = useState(false);
   const [runtimeInstallation, setRuntimeInstallation] = useState<BuiltinAIRuntimeInstallationStatus | null>(null);
   const authorizationActive = authorization?.state === 'starting' || authorization?.state === 'pending';
-  const activeModel = selectedModel || modelOptions?.selected_model || '';
   const runtimeReady = runtimeInstallation?.runtime.status === 'ready' && runtimeInstallation.runtime.compatible;
 
   const refreshRuntimeInstallation = useCallback(async () => {
@@ -86,51 +80,25 @@ export function BuiltinAiPage({
     return () => window.clearInterval(timer);
   }, [refreshRuntimeInstallation, runtimeInstallation?.state]);
 
-  useEffect(() => {
-    if (!modelOptions) return;
-    setSelectedModel(current => {
-      if (current && modelOptions.models.includes(current)) return current;
-      return modelOptions.selected_model;
-    });
-  }, [modelOptions]);
-
   const connect = useCallback(async () => {
     if (connecting) return;
     setConnecting(true);
     setConnectionError('');
     setFrameLoaded(false);
     try {
-      setSessionUrl(await agentApi.startBuiltinAiSession(selectedModel || undefined));
+      setSessionUrl(await agentApi.startBuiltinAiSession());
     } catch (error) {
       setSessionUrl('');
       setConnectionError(presentConnectionError(error));
     } finally {
       setConnecting(false);
     }
-  }, [connecting, selectedModel]);
-
-  const selectModel = useCallback(async (model: string) => {
-    if (!model || model === activeModel) return;
-    setSelectedModel(model);
-    setConnectionError('');
-    if (!sessionUrl) return;
-    setSessionUrl('');
-    setConnecting(true);
-    setConnectionError('');
-    setFrameLoaded(false);
-    try {
-      setSessionUrl(await agentApi.restartBuiltinAiSession(model));
-    } catch (error) {
-      setConnectionError(presentConnectionError(error));
-    } finally {
-      setConnecting(false);
-    }
-  }, [activeModel, sessionUrl]);
+  }, [connecting]);
 
   useEffect(() => {
-    if (!identity?.authorized || !runtimeReady || modelOptionsLoading || sessionUrl || connecting || connectionError) return;
+    if (!identity?.authorized || !runtimeReady || sessionUrl || connecting || connectionError) return;
     void connect();
-  }, [connect, connecting, connectionError, identity?.authorized, modelOptionsLoading, runtimeReady, sessionUrl]);
+  }, [connect, connecting, connectionError, identity?.authorized, runtimeReady, sessionUrl]);
 
   return (
     <section className="builtin-ai-page" aria-label="HiMind AI">
@@ -140,10 +108,7 @@ export function BuiltinAiPage({
           <div><h2>HiMind AI</h2><span>{sessionUrl ? '已连接' : '智能工作助手'}</span></div>
         </div>
         <div className="builtin-ai-toolbar-actions">
-          {modelOptionsLoading ? <span className="builtin-ai-model-loading"><LoaderCircle className="spin" size={13} />正在读取模型</span> : null}
-          {!modelOptionsLoading && modelOptions?.models.length ? (
-            <ModelPicker options={modelOptions} selectedModel={activeModel} sessionActive={Boolean(sessionUrl)} disabled={connecting} onSelect={selectModel} onOpenAiConnections={onOpenAiConnections} />
-          ) : null}
+          <button type="button" className="builtin-ai-tools-button" onClick={onOpenAiConnections} title="管理 AI 服务"><Settings size={15} />AI 服务</button>
           <button type="button" className={`builtin-ai-tools-button ${extensionsOpen ? 'active' : ''}`} onClick={() => setExtensionsOpen(true)} title="管理扩展"><Blocks size={15} />扩展</button>
           {sessionUrl ? <span className="builtin-ai-online"><i />可用</span> : null}
         </div>
@@ -226,55 +191,6 @@ export function BuiltinAiPage({
         onOpenSkills={() => { setExtensionsOpen(false); onOpenSkills(); }}
       />
     </section>
-  );
-}
-
-function ModelPicker({ options, selectedModel, sessionActive, disabled, onSelect, onOpenAiConnections }: { options: BuiltinAIModelOptions; selectedModel: string; sessionActive: boolean; disabled: boolean; onSelect: (model: string) => void; onOpenAiConnections: () => void }) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-  const sourceTypeLabel = options.source_type === 'personal' ? '个人服务' : '组织服务';
-  const sourceName = options.source_name || sourceTypeLabel;
-  const sourceProvider = options.source_provider && options.source_provider !== sourceName ? options.source_provider : '';
-
-  useEffect(() => {
-    if (!open) return;
-    const closeOnPointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false);
-    };
-    document.addEventListener('pointerdown', closeOnPointerDown);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('pointerdown', closeOnPointerDown);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [open]);
-
-  return (
-    <div className="builtin-ai-model-picker" ref={rootRef}>
-      <button type="button" className={open ? 'builtin-ai-model-trigger active' : 'builtin-ai-model-trigger'} disabled={disabled} onClick={() => setOpen(current => !current)} aria-haspopup="listbox" aria-expanded={open} title="选择模型">
-        <span className="builtin-ai-model-icon"><Bot size={15} /></span>
-        <span className="builtin-ai-model-current"><small>{sourceTypeLabel} · {options.models.length} 个模型</small><strong>{selectedModel}</strong></span>
-        {disabled ? <LoaderCircle className="spin" size={14} /> : <ChevronDown size={14} aria-hidden="true" />}
-      </button>
-      {open ? (
-        <div className="builtin-ai-model-menu" role="listbox" aria-label="可用模型">
-          <header><div><strong>选择模型</strong><span>{options.models.length} 个可用</span></div><span className={options.source_type === 'personal' ? 'personal' : ''}>{sourceTypeLabel}</span></header>
-          <div className="builtin-ai-model-source"><span>来自</span><div><strong>{sourceName}</strong>{sourceProvider ? <small>{sourceProvider}</small> : null}</div></div>
-          <div className="builtin-ai-model-options">
-            {options.models.map(model => (
-              <button type="button" role="option" aria-selected={model === selectedModel} className={model === selectedModel ? 'selected' : ''} key={model} onClick={() => { setOpen(false); onSelect(model); }}>
-                <span><strong>{model}</strong>{model === options.selected_model ? <small>默认</small> : null}</span>
-                {model === selectedModel ? <Check size={16} /> : null}
-              </button>
-            ))}
-          </div>
-          <footer><span>{sessionActive && options.models.length > 1 ? '切换模型会开始新会话' : options.models.length === 1 ? '当前服务仅提供此模型' : '模型由当前服务提供'}</span><button type="button" onClick={() => { setOpen(false); onOpenAiConnections(); }}>管理 AI 连接</button></footer>
-        </div>
-      ) : null}
-    </div>
   );
 }
 

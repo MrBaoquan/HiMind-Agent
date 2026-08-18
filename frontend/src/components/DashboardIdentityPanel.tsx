@@ -78,7 +78,7 @@ export function DashboardIdentityPanel({
 }
 
 function svnProvisioningLabel(status: string) {
-  return ({ ready: '已就绪', provisioning: '正在开通', waiting_user_agent: '等待本机 Agent', waiting_admin_agent: '等待本机 Agent', failed: '等待重试', unmanaged: '未托管' } as Record<string, string>)[status] || status || '等待同步';
+  return ({ ready: '已就绪', local_error: '本机配置失败', provisioning: '正在开通', waiting_user_agent: '等待本机 Agent', waiting_admin_agent: '等待本机 Agent', failed: '等待重试', unmanaged: '未托管' } as Record<string, string>)[status] || status || '等待同步';
 }
 
 function identityLabel(identity: DashboardIdentityStatus | null): [string, 'success' | 'warn' | 'danger' | 'neutral'] {
