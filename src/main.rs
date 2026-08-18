@@ -52,7 +52,7 @@ use svn::types::{
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
 
-pub(crate) const VERSION: &str = "0.3.12";
+pub(crate) const VERSION: &str = "0.3.14";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginViewLaunch {

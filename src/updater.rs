@@ -38,6 +38,14 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let raw = env::args().nth(1).ok_or("update arguments are required")?;
     let args = serde_json::from_str::<UpdateArgs>(&raw)?;
+    let result = run_update(&args);
+    if let Err(error) = &result {
+        let _ = mark_install_failed_if_pending(&args, &error.to_string());
+    }
+    result
+}
+
+fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
     let current = fs::canonicalize(&args.current_executable)?;
     let staged = fs::canonicalize(&args.staged_executable)?;
     if !staged.is_file()
@@ -60,8 +68,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let staged_launcher =
         canonical_staged_helper(&args.staged_launcher, "himind-agent-launcher.exe", &root)?;
     let staged_package = canonical_staged_path(&args.staged_package, &root)?;
-    if !wait_for_exit(args.old_pid) {
-        return Err("running Agent did not exit before update timeout".into());
+    if !stop_running_agents(&current, args.old_pid) {
+        return Err("安装目录下仍有 Agent 进程运行，更新超时".into());
     }
     let current_dir = root.join("current");
     let previous_dir = root.join("previous");
@@ -76,13 +84,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         if let Err(error) =
             update_helpers_after_health(&root, &staged_updater, &staged_launcher, &staged_package)
         {
-            let detail = format!("Agent started successfully, but helper update failed: {error}");
-            let _ = update_local_status(&args, "failed", &detail);
-            let _ = report_update_result(&args, "update_failed", &detail);
-            return Err(detail.into());
+            let detail = format!("Agent 已更新，但辅助程序将在后续更新中重试：{error}");
+            let _ = update_local_status(args, "idle", "");
+            let _ = report_update_result(args, "update_success", &detail);
+            return Ok(());
         }
-        let _ = update_local_status(&args, "idle", "");
-        let _ = report_update_result(&args, "update_success", "");
+        let _ = update_local_status(args, "idle", "");
+        let _ = report_update_result(args, "update_success", "");
         return Ok(());
     }
     if previous_target.exists() {
@@ -106,6 +114,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     Err("Agent update failed and previous version could not be confirmed".into())
 }
 
+fn mark_install_failed_if_pending(args: &UpdateArgs, error: &str) -> Result<(), Box<dyn Error>> {
+    let path = args.state_path.with_file_name("agent-update-state.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path)?)?;
+    if value.get("status").and_then(|value| value.as_str()) != Some("installing") {
+        return Ok(());
+    }
+    update_local_status(args, "failed", error)
+}
+
 fn update_local_status(args: &UpdateArgs, status: &str, error: &str) -> Result<(), Box<dyn Error>> {
     let path = args.state_path.with_file_name("agent-update-state.json");
     if !path.is_file() {
@@ -114,10 +134,10 @@ fn update_local_status(args: &UpdateArgs, status: &str, error: &str) -> Result<(
     let mut value = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path)?)?;
     value["status"] = serde_json::Value::String(status.to_string());
     value["last_error"] = serde_json::Value::String(error.to_string());
-    value["current_version"] = serde_json::Value::String(if status == "rolled_back" {
-        args.from_version.clone()
-    } else {
+    value["current_version"] = serde_json::Value::String(if status == "idle" {
         args.target_version.clone()
+    } else {
+        args.from_version.clone()
     });
     if status == "idle" {
         for key in [
@@ -295,18 +315,31 @@ fn update_helpers_after_health(
     let launcher = root.join("himind-agent-launcher.exe");
     let launcher_backup = root.join("himind-agent-launcher.previous.exe");
     let launcher_existed = launcher.is_file();
-    replace_helper(&launcher, &launcher_backup, staged_launcher)?;
-    let _ = fs::remove_file(staged_launcher);
+    let mut errors = Vec::new();
+    match replace_helper(&launcher, &launcher_backup, staged_launcher) {
+        Ok(()) => {
+            let _ = fs::remove_file(staged_launcher);
+        }
+        Err(error) => errors.push(format!("launcher update failed: {error}")),
+    }
 
     if let Err(error) = schedule_updater_self_replace(root, staged_updater, staged_package) {
+        errors.push(format!("updater update failed: {error}"));
+    }
+    if errors.is_empty() {
+        return Ok(());
+    }
+    if errors
+        .iter()
+        .any(|error| error.contains("launcher update failed"))
+    {
         if launcher_existed && launcher_backup.is_file() {
             let _ = fs::copy(&launcher_backup, &launcher);
         } else {
             let _ = fs::remove_file(&launcher);
         }
-        return Err(error);
     }
-    Ok(())
+    Err(errors.join("; ").into())
 }
 
 fn replace_helper(target: &Path, backup: &Path, staged: &Path) -> Result<(), Box<dyn Error>> {
@@ -471,20 +504,56 @@ fn health_matches_update(
     }
 }
 
-fn wait_for_exit(pid: u32) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn stop_running_agents(current_executable: &Path, old_pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        let running = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
-            .unwrap_or(false);
-        if !running {
+        let mut pids = running_agent_pids(current_executable);
+        if old_pid != 0 && process_exists(old_pid) && !pids.contains(&old_pid) {
+            pids.push(old_pid);
+        }
+        if pids.is_empty() {
             return true;
+        }
+        for pid in pids {
+            let _ = terminate(pid);
         }
         thread::sleep(Duration::from_millis(200));
     }
     false
+}
+
+fn running_agent_pids(current_executable: &Path) -> Vec<u32> {
+    let target = powershell_escape_single_quoted(&current_executable.to_string_lossy());
+    let script = format!(
+        "$target='{}'; Get-CimInstance Win32_Process -Filter \"Name='himind-agent.exe'\" | Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath.Equals($target, [System.StringComparison]::OrdinalIgnoreCase) }} | ForEach-Object {{ $_.ProcessId }}",
+        target
+    );
+    for shell in ["pwsh", "powershell"] {
+        let Ok(output) = Command::new(shell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != std::process::id())
+            .collect();
+    }
+    Vec::new()
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
 }
 
 fn terminate(pid: u32) -> Result<(), Box<dyn Error>> {

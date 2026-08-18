@@ -157,6 +157,26 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
         status.progress_percent = 0;
         changed = true;
     }
+    if status.status == "installing" && status.available_version != crate::VERSION {
+        let target_is_newer =
+            crate::skill::resolver::compare_versions(&status.available_version, crate::VERSION)
+                == std::cmp::Ordering::Greater;
+        if target_is_newer && staged_payload_available(&status) {
+            status.status = "ready".to_string();
+            status.last_error = "上一次更新未完成，更新包仍可继续安装".to_string();
+        } else if target_is_newer {
+            status.status = "available".to_string();
+            status.downloaded_bytes = 0;
+            status.progress_percent = 0;
+            clear_staged_paths(&mut status);
+            status.last_error = "上一次更新未完成，请重新下载更新包".to_string();
+        } else {
+            clear_release(&mut status);
+            status.status = "idle".to_string();
+            status.last_error.clear();
+        }
+        changed = true;
+    }
     if status.status == "ready" && !staged_payload_available(&status) {
         status.status = "available".to_string();
         status.downloaded_bytes = 0;
@@ -635,7 +655,10 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
     let version = safe_version_segment(&status.available_version)?;
     prepare_staged_payload(&mut status, &staging, &version)?;
     let current_executable = std::env::current_exe()?;
-    crate::app::system::schedule_agent_replace_and_restart(
+    status.status = "installing".to_string();
+    status.last_error.clear();
+    save(&options.state_path, &status)?;
+    if let Err(error) = crate::app::system::schedule_agent_replace_and_restart(
         Path::new(&status.staged_agent_path),
         &staged_package,
         Path::new(&status.staged_updater_path),
@@ -643,10 +666,12 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
         &current_executable,
         options,
         &status.available_version,
-    )?;
-    status.status = "installing".to_string();
-    status.last_error.clear();
-    save(&options.state_path, &status)?;
+    ) {
+        status.status = "failed".to_string();
+        status.last_error = format!("启动更新程序失败：{error}");
+        save(&options.state_path, &status)?;
+        return Err(error);
+    }
     thread::spawn(|| {
         thread::sleep(Duration::from_millis(500));
         std::process::exit(0);
@@ -790,6 +815,43 @@ mod tests {
 
         assert_eq!(loaded.current_version, crate::VERSION);
         assert_eq!(persisted.current_version, crate::VERSION);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_recovers_a_stale_installing_state() {
+        let root = temporary_test_root("stale-install");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let mut status = AgentUpdateStatus::default();
+        status.status = "installing".to_string();
+        status.current_version = "0.3.12".to_string();
+        status.available_version = "9.8.7".to_string();
+        save(&state_path, &status).unwrap();
+
+        let loaded = load(&state_path).unwrap();
+
+        assert_eq!(loaded.status, "available");
+        assert_eq!(loaded.current_version, crate::VERSION);
+        assert!(loaded.last_error.contains("重新下载"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_clears_an_installing_state_for_an_older_version() {
+        let root = temporary_test_root("obsolete-install");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let mut status = AgentUpdateStatus::default();
+        status.status = "installing".to_string();
+        status.available_version = "0.0.1".to_string();
+        status.release_id = "old-release".to_string();
+        save(&state_path, &status).unwrap();
+
+        let loaded = load(&state_path).unwrap();
+
+        assert_eq!(loaded.status, "idle");
+        assert!(loaded.available_version.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
