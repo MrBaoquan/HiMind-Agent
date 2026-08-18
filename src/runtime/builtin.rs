@@ -16,10 +16,26 @@ pub(crate) const CONTRACT_VERSION: u32 = 1;
 trait AIRuntimeAdapter: Sync {
     fn probe(&self) -> RuntimeInstallationReport;
     fn status(&self) -> BuiltinAIRuntimeStatus;
+    fn check_update(
+        &self,
+        options: &Options,
+        client_instance_id: &str,
+    ) -> Result<BuiltinAIRuntimeUpdateStatus, String>;
     fn install(
         &self,
         options: &Options,
         client_instance_id: &str,
+        report_progress: &mut dyn FnMut(&str, u8, &str),
+    ) -> Result<BuiltinAIRuntimeStatus, String>;
+    fn update(
+        &self,
+        options: &Options,
+        client_instance_id: &str,
+        report_progress: &mut dyn FnMut(&str, u8, &str),
+    ) -> Result<BuiltinAIRuntimeStatus, String>;
+    fn uninstall(
+        &self,
+        report_progress: &mut dyn FnMut(&str, u8, &str),
     ) -> Result<BuiltinAIRuntimeStatus, String>;
     fn prepare_interactive_launch(
         &self,
@@ -78,6 +94,15 @@ pub(crate) struct BuiltinAIRuntimeStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuiltinAIRuntimeUpdateStatus {
+    pub update_available: bool,
+    pub current_version: String,
+    pub available_version: String,
+    pub release_notes: String,
+    pub mandatory: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct BuiltinAIModelOptions {
     pub selected_model: String,
     pub models: Vec<String>,
@@ -128,11 +153,41 @@ pub(crate) fn status() -> BuiltinAIRuntimeStatus {
     active_adapter().status()
 }
 
+pub(crate) fn check_update(
+    options: &Options,
+    client_instance_id: &str,
+) -> Result<BuiltinAIRuntimeUpdateStatus, String> {
+    active_adapter().check_update(options, client_instance_id)
+}
+
 pub(crate) fn install(
     options: &Options,
     client_instance_id: &str,
 ) -> Result<BuiltinAIRuntimeStatus, String> {
-    active_adapter().install(options, client_instance_id)
+    let mut ignore_progress = |_: &str, _: u8, _: &str| {};
+    install_with_progress(options, client_instance_id, &mut ignore_progress)
+}
+
+pub(crate) fn install_with_progress(
+    options: &Options,
+    client_instance_id: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<BuiltinAIRuntimeStatus, String> {
+    active_adapter().install(options, client_instance_id, report_progress)
+}
+
+pub(crate) fn update_with_progress(
+    options: &Options,
+    client_instance_id: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<BuiltinAIRuntimeStatus, String> {
+    active_adapter().update(options, client_instance_id, report_progress)
+}
+
+pub(crate) fn uninstall_with_progress(
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<BuiltinAIRuntimeStatus, String> {
+    active_adapter().uninstall(report_progress)
 }
 
 pub(crate) fn model_options(options: &Options) -> Result<BuiltinAIModelOptions, String> {
@@ -183,12 +238,51 @@ impl AIRuntimeAdapter for DeepSeekHarnessAdapter {
         from_engine_status(deepseek_harness::status())
     }
 
+    fn check_update(
+        &self,
+        options: &Options,
+        client_instance_id: &str,
+    ) -> Result<BuiltinAIRuntimeUpdateStatus, String> {
+        deepseek_harness::check_update(options, client_instance_id)
+            .map(|update| BuiltinAIRuntimeUpdateStatus {
+                update_available: update.update_available,
+                current_version: update.current_version,
+                available_version: update.available_version,
+                release_notes: update.release_notes,
+                mandatory: update.mandatory,
+            })
+            .map_err(productize_runtime_error)
+    }
+
     fn install(
         &self,
         options: &Options,
         client_instance_id: &str,
+        report_progress: &mut dyn FnMut(&str, u8, &str),
     ) -> Result<BuiltinAIRuntimeStatus, String> {
-        deepseek_harness::install(options, client_instance_id).map(from_engine_status)
+        deepseek_harness::install_with_progress(options, client_instance_id, report_progress)
+            .map(from_engine_status)
+            .map_err(productize_runtime_error)
+    }
+
+    fn update(
+        &self,
+        options: &Options,
+        client_instance_id: &str,
+        report_progress: &mut dyn FnMut(&str, u8, &str),
+    ) -> Result<BuiltinAIRuntimeStatus, String> {
+        deepseek_harness::update_with_progress(options, client_instance_id, report_progress)
+            .map(from_engine_status)
+            .map_err(productize_runtime_error)
+    }
+
+    fn uninstall(
+        &self,
+        report_progress: &mut dyn FnMut(&str, u8, &str),
+    ) -> Result<BuiltinAIRuntimeStatus, String> {
+        deepseek_harness::uninstall_with_progress(report_progress)
+            .map(from_engine_status)
+            .map_err(productize_runtime_error)
     }
 
     fn prepare_interactive_launch(
@@ -250,7 +344,7 @@ fn from_engine_status(
         message: if ready {
             "HiMind AI 已就绪。".to_string()
         } else {
-            "内置 AI 组件尚未安装或需要修复。".to_string()
+            "HiMind AI 运行时尚未安装或需要修复。".to_string()
         },
         diagnostics: BuiltinAIRuntimeDiagnostics {
             engine_id: ENGINE_ID.to_string(),
@@ -259,6 +353,14 @@ fn from_engine_status(
             update_mode: "managed-distribution".to_string(),
         },
     }
+}
+
+fn productize_runtime_error(error: String) -> String {
+    error
+        .replace("DeepSeek Harness Runtime", "HiMind AI 运行时")
+        .replace("Dashboard Runtime", "HiMind AI 运行时")
+        .replace("Runtime", "运行时")
+        .replace("manifest", "安装清单")
 }
 
 #[cfg(test)]
@@ -281,5 +383,16 @@ mod tests {
         assert_eq!(status.status, "ready");
         assert_eq!(status.diagnostics.engine_id, ENGINE_ID);
         assert!(!status.message.contains("DeepSeek"));
+    }
+
+    #[test]
+    fn runtime_errors_do_not_leak_internal_product_names() {
+        let error = productize_runtime_error(
+            "Dashboard Runtime manifest for DeepSeek Harness Runtime is invalid".to_string(),
+        );
+        assert!(!error.contains("DeepSeek"));
+        assert!(!error.contains("Dashboard Runtime"));
+        assert!(error.contains("HiMind AI 运行时"));
+        assert!(error.contains("安装清单"));
     }
 }

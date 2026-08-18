@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
@@ -33,6 +33,83 @@ pub(crate) struct AgentState {
     pub state_path: PathBuf,
     pub options: Options,
     pub dashboard_authorization: Arc<Mutex<crate::app::identity::DashboardAuthorizationFlow>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct BuiltinAIRuntimeInstallationStatus {
+    pub state: String,
+    pub operation: String,
+    pub stage: String,
+    pub progress_percent: u8,
+    pub message: String,
+    pub error: String,
+    pub runtime: crate::runtime::builtin::BuiltinAIRuntimeStatus,
+    pub update_available: bool,
+    pub available_version: String,
+    pub release_notes: String,
+    pub mandatory_update: bool,
+}
+
+static BUILTIN_AI_RUNTIME_INSTALLATION: OnceLock<Mutex<BuiltinAIRuntimeInstallationStatus>> =
+    OnceLock::new();
+
+fn builtin_ai_runtime_installation() -> &'static Mutex<BuiltinAIRuntimeInstallationStatus> {
+    BUILTIN_AI_RUNTIME_INSTALLATION.get_or_init(|| {
+        let runtime = crate::runtime::builtin::status();
+        let ready = runtime.compatible;
+        Mutex::new(BuiltinAIRuntimeInstallationStatus {
+            state: if ready { "ready" } else { "idle" }.to_string(),
+            operation: "none".to_string(),
+            stage: if ready { "ready" } else { "idle" }.to_string(),
+            progress_percent: if ready { 100 } else { 0 },
+            message: if ready {
+                "HiMind AI 运行时已就绪".to_string()
+            } else {
+                "尚未安装 HiMind AI 运行时".to_string()
+            },
+            error: String::new(),
+            runtime,
+            update_available: false,
+            available_version: String::new(),
+            release_notes: String::new(),
+            mandatory_update: false,
+        })
+    })
+}
+
+fn builtin_ai_runtime_installation_snapshot() -> BuiltinAIRuntimeInstallationStatus {
+    builtin_ai_runtime_installation()
+        .lock()
+        .map(|status| status.clone())
+        .unwrap_or_else(|_| BuiltinAIRuntimeInstallationStatus {
+            state: "failed".to_string(),
+            operation: "none".to_string(),
+            stage: "failed".to_string(),
+            progress_percent: 0,
+            message: "无法读取 HiMind AI 运行时安装状态".to_string(),
+            error: "运行时安装状态不可用".to_string(),
+            runtime: crate::runtime::builtin::status(),
+            update_available: false,
+            available_version: String::new(),
+            release_notes: String::new(),
+            mandatory_update: false,
+        })
+}
+
+fn update_builtin_ai_runtime_installation(
+    operation: &str,
+    stage: &str,
+    progress_percent: u8,
+    message: &str,
+) {
+    if let Ok(mut status) = builtin_ai_runtime_installation().lock() {
+        status.state = "working".to_string();
+        status.operation = operation.to_string();
+        status.stage = stage.to_string();
+        status.progress_percent = progress_percent.min(100);
+        status.message = message.to_string();
+        status.error.clear();
+    }
 }
 
 fn dashboard_agent_user_client(
@@ -408,6 +485,227 @@ pub(crate) async fn get_builtin_ai_runtime_status(
 }
 
 #[tauri::command]
+pub(crate) async fn get_builtin_ai_runtime_installation_status(
+    _state: State<'_, AgentState>,
+) -> Result<BuiltinAIRuntimeInstallationStatus, String> {
+    let installation = builtin_ai_runtime_installation();
+    let mut status = installation
+        .lock()
+        .map_err(|_| "HiMind AI 运行时安装状态不可用".to_string())?;
+    if status.state != "working" && status.state != "failed" {
+        status.runtime = crate::runtime::builtin::status();
+        if status.runtime.compatible {
+            status.state = "ready".to_string();
+            status.operation = "none".to_string();
+            status.stage = "ready".to_string();
+            status.progress_percent = 100;
+            status.message = "HiMind AI 运行时已就绪".to_string();
+            status.error.clear();
+        } else {
+            status.state = "idle".to_string();
+            status.operation = "none".to_string();
+            status.stage = "idle".to_string();
+            status.progress_percent = 0;
+            status.message = "尚未安装 HiMind AI 运行时".to_string();
+        }
+    }
+    Ok(status.clone())
+}
+
+#[tauri::command]
+pub(crate) async fn start_builtin_ai_runtime_install(
+    state: State<'_, AgentState>,
+    operation: Option<String>,
+) -> Result<BuiltinAIRuntimeInstallationStatus, String> {
+    let operation = operation
+        .unwrap_or_else(|| "install".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        operation.as_str(),
+        "install" | "update" | "repair" | "uninstall"
+    ) {
+        return Err("不支持的 HiMind AI 运行时操作".to_string());
+    }
+    let installation = builtin_ai_runtime_installation();
+    {
+        let mut current = installation
+            .lock()
+            .map_err(|_| "HiMind AI 运行时安装状态不可用".to_string())?;
+        if current.state == "working" {
+            return Ok(current.clone());
+        }
+        current.runtime = crate::runtime::builtin::status();
+        if operation == "install" && current.runtime.compatible {
+            current.state = "ready".to_string();
+            current.operation = "none".to_string();
+            current.stage = "ready".to_string();
+            current.progress_percent = 100;
+            current.message = "HiMind AI 运行时已就绪".to_string();
+            current.error.clear();
+            return Ok(current.clone());
+        }
+        if operation == "update" && !current.runtime.compatible {
+            return Err("HiMind AI 运行时尚未安装，请先安装运行时".to_string());
+        }
+        current.state = "working".to_string();
+        current.operation = operation.clone();
+        current.stage = if operation == "uninstall" {
+            "uninstalling".to_string()
+        } else {
+            "resolving".to_string()
+        };
+        current.progress_percent = if operation == "uninstall" { 10 } else { 5 };
+        current.message = match operation.as_str() {
+            "update" => "正在检查 HiMind AI 运行时更新".to_string(),
+            "repair" => "正在准备修复 HiMind AI 运行时".to_string(),
+            "uninstall" => "正在准备卸载 HiMind AI 运行时".to_string(),
+            _ => "正在检查可用的 HiMind AI 运行时".to_string(),
+        };
+        current.error.clear();
+        current.update_available = false;
+        current.available_version.clear();
+        current.release_notes.clear();
+        current.mandatory_update = false;
+    }
+
+    crate::app::ui::stop_builtin_ai_process();
+    let options = state.options.clone();
+    let client_instance_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("himind-agent-{}", crate::store::paths::profile_name()));
+    let logs = Arc::clone(&state.approval_manager);
+    let operation_for_thread = operation.clone();
+    thread::spawn(move || {
+        let mut report_progress = |stage: &str, progress_percent: u8, message: &str| {
+            update_builtin_ai_runtime_installation(
+                &operation_for_thread,
+                stage,
+                progress_percent,
+                message,
+            );
+        };
+        let result = match operation_for_thread.as_str() {
+            "update" => crate::runtime::builtin::update_with_progress(
+                &options,
+                &client_instance_id,
+                &mut report_progress,
+            ),
+            "uninstall" => crate::runtime::builtin::uninstall_with_progress(&mut report_progress),
+            _ => crate::runtime::builtin::install_with_progress(
+                &options,
+                &client_instance_id,
+                &mut report_progress,
+            ),
+        };
+        if let Ok(mut current) = builtin_ai_runtime_installation().lock() {
+            match result {
+                Ok(runtime) => {
+                    current.state = if operation_for_thread == "uninstall" {
+                        "idle".to_string()
+                    } else {
+                        "ready".to_string()
+                    };
+                    current.operation = operation_for_thread.clone();
+                    current.stage = if operation_for_thread == "uninstall" {
+                        "idle".to_string()
+                    } else {
+                        "ready".to_string()
+                    };
+                    current.progress_percent = if operation_for_thread == "uninstall" {
+                        0
+                    } else {
+                        100
+                    };
+                    current.message = match operation_for_thread.as_str() {
+                        "update" => "HiMind AI 运行时已更新".to_string(),
+                        "repair" => "HiMind AI 运行时已修复".to_string(),
+                        "uninstall" => "HiMind AI 运行时已卸载".to_string(),
+                        _ => "HiMind AI 运行时已就绪".to_string(),
+                    };
+                    current.error.clear();
+                    current.runtime = runtime;
+                    current.update_available = false;
+                    current.available_version.clear();
+                    current.release_notes.clear();
+                    current.mandatory_update = false;
+                    logs.add_log("info", &current.message);
+                }
+                Err(error) => {
+                    current.state = "failed".to_string();
+                    current.operation = operation_for_thread.clone();
+                    current.stage = "failed".to_string();
+                    current.message = format!(
+                        "HiMind AI 运行时{}失败",
+                        runtime_operation_label(&operation_for_thread)
+                    );
+                    current.error = error.clone();
+                    current.runtime = crate::runtime::builtin::status();
+                    logs.add_log("error", &format!("{}: {error}", current.message));
+                }
+            }
+        }
+    });
+    Ok(builtin_ai_runtime_installation_snapshot())
+}
+
+fn runtime_operation_label(operation: &str) -> &'static str {
+    match operation {
+        "update" => "更新",
+        "repair" => "修复",
+        "uninstall" => "卸载",
+        _ => "安装",
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn check_builtin_ai_runtime_update(
+    state: State<'_, AgentState>,
+) -> Result<BuiltinAIRuntimeInstallationStatus, String> {
+    let current = builtin_ai_runtime_installation_snapshot();
+    if current.state == "working" {
+        return Ok(current);
+    }
+    if !current.runtime.compatible {
+        return Err("HiMind AI 运行时尚未安装".to_string());
+    }
+    let options = state.options.clone();
+    let client_instance_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("himind-agent-{}", crate::store::paths::profile_name()));
+    let update = tauri::async_runtime::spawn_blocking(move || {
+        crate::runtime::builtin::check_update(&options, &client_instance_id)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let mut status = builtin_ai_runtime_installation()
+        .lock()
+        .map_err(|_| "HiMind AI 运行时安装状态不可用".to_string())?;
+    status.runtime = crate::runtime::builtin::status();
+    status.state = "ready".to_string();
+    status.operation = "none".to_string();
+    status.stage = "ready".to_string();
+    status.progress_percent = 100;
+    status.update_available = update.update_available;
+    status.available_version = update.available_version;
+    status.release_notes = update.release_notes;
+    status.mandatory_update = update.mandatory;
+    status.message = if status.update_available {
+        format!("有新的 HiMind AI 运行时版本 v{}", status.available_version)
+    } else {
+        "HiMind AI 运行时已是最新版本".to_string()
+    };
+    status.error.clear();
+    Ok(status.clone())
+}
+
+#[tauri::command]
 pub(crate) async fn install_builtin_ai_runtime(
     state: State<'_, AgentState>,
 ) -> Result<crate::runtime::builtin::BuiltinAIRuntimeStatus, String> {
@@ -426,7 +724,7 @@ pub(crate) async fn install_builtin_ai_runtime(
     .map_err(|error| error.to_string())?;
     state
         .approval_manager
-        .add_log("info", "HiMind 内置 AI 组件已完成安装或修复");
+        .add_log("info", "HiMind AI 运行时已完成安装或修复");
     Ok(result)
 }
 
@@ -496,6 +794,9 @@ pub(crate) async fn start_builtin_ai_session(
     state: State<'_, AgentState>,
     model: Option<String>,
 ) -> Result<String, String> {
+    if !crate::runtime::builtin::status().compatible {
+        return Err("HiMind AI 运行时尚未安装，请先安装 HiMind AI 运行时".to_string());
+    }
     let options = state.options.clone();
     let logs = Arc::clone(&state.approval_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -520,6 +821,9 @@ pub(crate) async fn restart_builtin_ai_session(
     state: State<'_, AgentState>,
     model: Option<String>,
 ) -> Result<String, String> {
+    if !crate::runtime::builtin::status().compatible {
+        return Err("HiMind AI 运行时尚未安装，请先安装 HiMind AI 运行时".to_string());
+    }
     let options = state.options.clone();
     let logs = Arc::clone(&state.approval_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -608,6 +912,12 @@ pub(crate) fn validate_builtin_ai_mcp_server(
 
 fn present_builtin_ai_start_error(error: &str) -> String {
     let normalized = error.to_lowercase();
+    if normalized.contains("运行时尚未安装")
+        || normalized.contains("runtime is not installed")
+        || normalized.contains("runtime is unavailable")
+    {
+        return "请先安装 HiMind AI 运行时，再开始对话。".to_string();
+    }
     if normalized.contains("请先登录")
         || normalized.contains("授权已失效")
         || normalized.contains("授权已过期")
@@ -622,7 +932,7 @@ fn present_builtin_ai_start_error(error: &str) -> String {
         return "当前账号暂未分配可用 AI 服务".to_string();
     }
     if normalized.contains("尚未安装") || normalized.contains("组件状态") {
-        return "内置 AI 组件需要修复".to_string();
+        return "HiMind AI 运行时需要修复，请在设置中处理".to_string();
     }
     "HiMind AI 暂时无法启动，请稍后重试".to_string()
 }

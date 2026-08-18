@@ -36,6 +36,7 @@ const RUNTIME_ARCHITECTURE: &str = "x64";
 const RUNTIME_MAX_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const INSTALL_TIMEOUT_SECONDS: u64 = 30 * 60;
+const UPDATE_CHECK_TIMEOUT_SECONDS: u64 = 30;
 const INTERACTIVE_PERMISSION_MODE: &str = "workspace-write";
 const HIMIND_PROFILE: &str = "himind";
 const HIMIND_MCP_SERVER_NAME: &str = "himind";
@@ -61,6 +62,15 @@ pub(crate) struct DeepSeekHarnessRuntimeStatus {
     pub install_command: String,
     pub message: String,
     pub candidate: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DeepSeekHarnessRuntimeUpdateStatus {
+    pub update_available: bool,
+    pub current_version: String,
+    pub available_version: String,
+    pub release_notes: String,
+    pub mandatory: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -395,7 +405,7 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
     let version = executable
         .as_ref()
         .and_then(|path| process::verify_command(path, &["--version"]).ok())
-        .map(|value| first_line(&value))
+        .and_then(|value| parse_runtime_version(&value))
         .unwrap_or_default();
     let cli_compatible = executable.as_ref().is_some_and(|path| {
         process::verify_command(path, &["--profile", "headless", "--help"]).is_ok()
@@ -432,10 +442,88 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
     }
 }
 
+pub(crate) fn check_update(
+    options: &Options,
+    client_instance_id: &str,
+) -> Result<DeepSeekHarnessRuntimeUpdateStatus, String> {
+    let runtime = status();
+    if !runtime.cli_compatible || runtime.version.trim().is_empty() {
+        return Err("HiMind AI 运行时尚未安装".to_string());
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| format!("创建 Dashboard 客户端失败: {error}"))?;
+    let update = resolve_runtime_component(
+        &client,
+        &options.api_base,
+        RUNTIME_PRODUCT_ID,
+        &runtime.version,
+        RUNTIME_CHANNEL,
+        RUNTIME_PLATFORM,
+        RUNTIME_ARCHITECTURE,
+        client_instance_id,
+    )
+    .map_err(|error| format!("检查 HiMind AI 运行时更新失败: {error}"))?;
+    if let Some(update) = update {
+        validate_update(&options.api_base, &update)?;
+        return Ok(DeepSeekHarnessRuntimeUpdateStatus {
+            update_available: true,
+            current_version: runtime.version,
+            available_version: update.version,
+            release_notes: update.release_notes,
+            mandatory: update.mandatory,
+        });
+    }
+    Ok(DeepSeekHarnessRuntimeUpdateStatus {
+        update_available: false,
+        current_version: runtime.version,
+        available_version: String::new(),
+        release_notes: String::new(),
+        mandatory: false,
+    })
+}
+
 pub(crate) fn install(
     options: &Options,
     client_instance_id: &str,
 ) -> Result<DeepSeekHarnessRuntimeStatus, String> {
+    let mut ignore_progress = |_: &str, _: u8, _: &str| {};
+    install_with_progress(options, client_instance_id, &mut ignore_progress)
+}
+
+pub(crate) fn install_with_progress(
+    options: &Options,
+    client_instance_id: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<DeepSeekHarnessRuntimeStatus, String> {
+    install_resolved_with_progress(options, client_instance_id, "0.0.0", report_progress)
+}
+
+pub(crate) fn update_with_progress(
+    options: &Options,
+    client_instance_id: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<DeepSeekHarnessRuntimeStatus, String> {
+    let runtime = status();
+    if !runtime.cli_compatible || runtime.version.trim().is_empty() {
+        return Err("HiMind AI 运行时尚未安装".to_string());
+    }
+    install_resolved_with_progress(
+        options,
+        client_instance_id,
+        &runtime.version,
+        report_progress,
+    )
+}
+
+fn install_resolved_with_progress(
+    options: &Options,
+    client_instance_id: &str,
+    current_version: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<DeepSeekHarnessRuntimeStatus, String> {
+    report_progress("resolving", 5, "正在检查可用的 HiMind AI 运行时");
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(INSTALL_TIMEOUT_SECONDS))
         .build()
@@ -444,21 +532,46 @@ pub(crate) fn install(
         &client,
         &options.api_base,
         RUNTIME_PRODUCT_ID,
-        "0.0.0",
+        current_version,
         RUNTIME_CHANNEL,
         RUNTIME_PLATFORM,
         RUNTIME_ARCHITECTURE,
         client_instance_id,
     )
-    .map_err(|error| format!("解析 DeepSeek Harness Runtime 发布失败: {error}"))?
-    .ok_or_else(|| "Dashboard 没有可用的 DeepSeek Harness Runtime Release。".to_string())?;
+    .map_err(|error| format!("解析 HiMind AI 运行时发布失败: {error}"))?;
+    let Some(update) = update else {
+        if current_version == "0.0.0" {
+            return Err("当前没有可用的 HiMind AI 运行时安装包".to_string());
+        }
+        report_progress("ready", 100, "HiMind AI 运行时已是最新版本");
+        return Ok(status());
+    };
     validate_update(&options.api_base, &update)?;
-    let archive = download_runtime_archive(&client, &update)?;
-    let result = install_runtime_archive(&archive, &update);
+    report_progress("downloading", 12, "正在下载 HiMind AI 运行时");
+    let archive = download_runtime_archive(&client, &update, report_progress)?;
+    report_progress("verifying", 78, "正在校验下载的运行时");
+    let result = install_runtime_archive(&archive, &update, report_progress);
     if result.is_ok() {
         let _ = fs::remove_file(&archive);
     }
-    result.map(|_| status())
+    result.map(|_| {
+        report_progress("ready", 100, "HiMind AI 运行时已准备就绪");
+        status()
+    })
+}
+
+pub(crate) fn uninstall_with_progress(
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<DeepSeekHarnessRuntimeStatus, String> {
+    if load_runtime_state().ok().flatten().is_none()
+        && env::var_os("HIMIND_DSH_EXECUTABLE").is_some_and(|value| !value.is_empty())
+    {
+        return Err("当前运行时由外部环境提供，不能由 Agent 卸载".to_string());
+    }
+    report_progress("uninstalling", 20, "正在停止并移除 HiMind AI 运行时");
+    remove_managed_runtime(&runtime_root())?;
+    report_progress("uninstalling", 100, "HiMind AI 运行时已卸载");
+    Ok(status())
 }
 
 pub(crate) fn prepare_interactive_launch(
@@ -565,6 +678,7 @@ fn validate_update(api_base: &str, update: &RuntimeComponentUpdate) -> Result<()
 fn download_runtime_archive(
     client: &Client,
     update: &RuntimeComponentUpdate,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
 ) -> Result<PathBuf, String> {
     let directory = runtime_root().join("downloads");
     fs::create_dir_all(&directory)
@@ -583,6 +697,7 @@ fn download_runtime_archive(
     let mut hasher = Sha256::new();
     let mut downloaded = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
+    let mut last_reported_percent = 12_u8;
     loop {
         let count = response
             .read(&mut buffer)
@@ -598,6 +713,12 @@ fn download_runtime_archive(
         file.write_all(&buffer[..count])
             .map_err(|error| format!("写入 Runtime 下载失败: {error}"))?;
         hasher.update(&buffer[..count]);
+        let percent = 12_u8
+            .saturating_add(((downloaded.saturating_mul(64) / update.size.max(1)).min(64)) as u8);
+        if percent >= last_reported_percent.saturating_add(2) {
+            report_progress("downloading", percent, "正在下载 HiMind AI 运行时");
+            last_reported_percent = percent;
+        }
     }
     file.flush()
         .map_err(|error| format!("刷新 Runtime 下载失败: {error}"))?;
@@ -624,7 +745,9 @@ fn download_runtime_archive(
 fn install_runtime_archive(
     archive_path: &Path,
     update: &RuntimeComponentUpdate,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
 ) -> Result<(), String> {
+    report_progress("installing", 84, "正在安装 HiMind AI 运行时");
     let versions = runtime_root().join("versions");
     fs::create_dir_all(&versions).map_err(|error| format!("创建 Runtime 安装目录失败: {error}"))?;
     let suffix = &update.sha256[..12.min(update.sha256.len())];
@@ -634,6 +757,7 @@ fn install_runtime_archive(
         let _ = fs::remove_dir_all(&temporary);
     }
     extract_runtime_archive(archive_path, &temporary)?;
+    report_progress("verifying", 92, "正在验证 HiMind AI 运行时");
     let manifest: RuntimePackageManifest = serde_json::from_slice(
         &fs::read(temporary.join("runtime.json"))
             .map_err(|error| format!("读取 runtime.json 失败: {error}"))?,
@@ -656,17 +780,38 @@ fn install_runtime_archive(
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
-    if target.exists() {
-        let _ = fs::remove_dir_all(&target);
+    let previous = target.with_extension("previous");
+    if previous.exists() {
+        let _ = fs::remove_dir_all(&previous);
     }
-    fs::rename(&temporary, &target).map_err(|error| format!("提交 Runtime 安装失败: {error}"))?;
-    write_runtime_state(&InstalledRuntimeState {
+    if target.exists() {
+        fs::rename(&target, &previous)
+            .map_err(|error| format!("备份当前 HiMind AI 运行时失败: {error}"))?;
+    }
+    report_progress("installing", 97, "正在完成 HiMind AI 运行时安装");
+    if let Err(error) = fs::rename(&temporary, &target) {
+        if previous.exists() {
+            let _ = fs::rename(&previous, &target);
+        }
+        return Err(format!("提交 HiMind AI 运行时安装失败: {error}"));
+    }
+    let state = InstalledRuntimeState {
         schema_version: 2,
         product_id: RUNTIME_PRODUCT_ID.to_string(),
         provider: RUNTIME_CONTRACT.to_string(),
         version: manifest.version,
         executable_path: target.join(executable).to_string_lossy().to_string(),
-    })?;
+    };
+    if let Err(error) = write_runtime_state(&state) {
+        let _ = fs::remove_dir_all(&target);
+        if previous.exists() {
+            let _ = fs::rename(&previous, &target);
+        }
+        return Err(error);
+    }
+    if previous.exists() {
+        let _ = fs::remove_dir_all(previous);
+    }
     Ok(())
 }
 
@@ -837,6 +982,30 @@ fn write_runtime_state(state: &InstalledRuntimeState) -> Result<(), String> {
         let _ = fs::remove_file(&path);
     }
     fs::rename(temporary, path).map_err(|error| format!("提交 Runtime 状态失败: {error}"))
+}
+
+fn remove_managed_runtime(root: &Path) -> Result<(), String> {
+    for directory in [root.join("versions"), root.join("downloads")] {
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .map_err(|error| format!("移除 HiMind AI 运行时文件失败: {error}"))?;
+        }
+    }
+    for file in [root.join("state.json"), root.join("state.json.tmp")] {
+        if file.exists() {
+            fs::remove_file(&file)
+                .map_err(|error| format!("移除 HiMind AI 运行时状态失败: {error}"))?;
+        }
+    }
+    if root.is_dir()
+        && fs::read_dir(root)
+            .map_err(|error| format!("检查 HiMind AI 运行时目录失败: {error}"))?
+            .next()
+            .is_none()
+    {
+        fs::remove_dir(root).map_err(|error| format!("移除 HiMind AI 运行时目录失败: {error}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn execute(
@@ -1379,9 +1548,9 @@ fn first_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_skill_name, first_line, parse_runtime_version, render_himind_profile_patch,
-        safe_relative_path, safe_segment, select_interactive_model, strip_yaml_frontmatter,
-        versioned_home, InteractiveEventProjector,
+        dsh_skill_name, first_line, parse_runtime_version, remove_managed_runtime,
+        render_himind_profile_patch, safe_relative_path, safe_segment, select_interactive_model,
+        strip_yaml_frontmatter, versioned_home, InteractiveEventProjector,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
@@ -1404,6 +1573,33 @@ mod tests {
             std::path::PathBuf::from("runtime-homes").join("0.1.0-rc.6")
         );
         assert!(versioned_home(std::path::Path::new("runtime-homes"), "../shared").is_err());
+    }
+
+    #[test]
+    fn uninstall_removes_managed_files_and_preserves_user_home() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-runtime-uninstall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("versions/1.0.0")).unwrap();
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        std::fs::create_dir_all(root.join("homes/1.0.0")).unwrap();
+        std::fs::write(root.join("versions/1.0.0/runtime.exe"), b"runtime").unwrap();
+        std::fs::write(root.join("downloads/runtime.zip"), b"archive").unwrap();
+        std::fs::write(root.join("state.json"), b"{}").unwrap();
+        std::fs::write(root.join("homes/1.0.0/preferences.json"), b"{}").unwrap();
+
+        remove_managed_runtime(&root).unwrap();
+
+        assert!(!root.join("versions").exists());
+        assert!(!root.join("downloads").exists());
+        assert!(!root.join("state.json").exists());
+        assert!(root.join("homes/1.0.0/preferences.json").is_file());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

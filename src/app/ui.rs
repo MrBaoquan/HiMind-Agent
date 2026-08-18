@@ -154,6 +154,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_remote_execution_settings,
             super::commands::save_remote_execution_settings,
             super::commands::get_builtin_ai_runtime_status,
+            super::commands::get_builtin_ai_runtime_installation_status,
+            super::commands::check_builtin_ai_runtime_update,
             super::commands::get_builtin_ai_model_options,
             super::commands::get_builtin_ai_tool_context_summary,
             super::commands::get_builtin_ai_mcp_servers,
@@ -161,6 +163,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::delete_builtin_ai_mcp_server,
             super::commands::validate_builtin_ai_mcp_server,
             super::commands::install_builtin_ai_runtime,
+            super::commands::start_builtin_ai_runtime_install,
             super::commands::start_builtin_ai_session,
             super::commands::restart_builtin_ai_session,
             super::commands::set_approval_rule,
@@ -692,7 +695,7 @@ fn start_builtin_ai_session_inner(
             crate::runtime::process::terminate_process_tree(&mut child);
             let _ = child.wait();
             return Err(builtin_ai_startup_error(
-                "HiMind AI 启动超时，请检查内置组件状态",
+                "HiMind AI 启动超时，请检查运行时状态",
                 &diagnostics,
                 &launch.api_key,
             ));

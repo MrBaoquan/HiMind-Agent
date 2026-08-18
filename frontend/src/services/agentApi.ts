@@ -106,6 +106,20 @@ export type BuiltinAIRuntimeStatus = {
     };
 };
 
+export type BuiltinAIRuntimeInstallationStatus = {
+    state: 'idle' | 'working' | 'ready' | 'failed' | string;
+    operation: 'none' | 'install' | 'update' | 'repair' | 'uninstall' | string;
+    stage: 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'uninstalling' | 'ready' | 'failed' | string;
+    progress_percent: number;
+    message: string;
+    error: string;
+    runtime: BuiltinAIRuntimeStatus;
+    update_available: boolean;
+    available_version: string;
+    release_notes: string;
+    mandatory_update: boolean;
+};
+
 export type BuiltinAIModelOptions = {
     selected_model: string;
     models: string[];
@@ -844,6 +858,8 @@ export const agentApi = {
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
     saveRemoteExecutionSettings: (settings: RemoteExecutionSettings, fullAccessConfirmed = false) => invoke<RemoteExecutionSettings>('save_remote_execution_settings', { settings, fullAccessConfirmed }),
     builtinAiRuntimeStatus: () => invoke<BuiltinAIRuntimeStatus>('get_builtin_ai_runtime_status'),
+    builtinAiRuntimeInstallationStatus: () => invoke<BuiltinAIRuntimeInstallationStatus>('get_builtin_ai_runtime_installation_status'),
+    checkBuiltinAiRuntimeUpdate: () => invoke<BuiltinAIRuntimeInstallationStatus>('check_builtin_ai_runtime_update'),
     builtinAiModelOptions: () => invoke<BuiltinAIModelOptions>('get_builtin_ai_model_options'),
     builtinAiToolContextSummary: () => invoke<BuiltinAIToolContextSummary>('get_builtin_ai_tool_context_summary'),
     builtinAiMcpServers: () => invoke<BuiltinAIMcpServer[]>('get_builtin_ai_mcp_servers'),
@@ -851,6 +867,7 @@ export const agentApi = {
     deleteBuiltinAiMcpServer: (serverName: string) => invoke<boolean>('delete_builtin_ai_mcp_server', { serverName }),
     validateBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<void>('validate_builtin_ai_mcp_server', { server }),
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
+    startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install') => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation }),
     startBuiltinAiSession: (model?: string) => invoke<string>('start_builtin_ai_session', { model: model || null }),
     restartBuiltinAiSession: (model?: string) => invoke<string>('restart_builtin_ai_session', { model: model || null }),
     login: () => invoke<LoginState>('get_local_login_status'),

@@ -401,6 +401,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .builtin-ai-state h3 { max-width: 440px; margin: 0; font-size: 15px; font-weight: 650; letter-spacing: 0; }
 .builtin-ai-state p { max-width: 460px; margin: 6px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.6; }
 .builtin-ai-state-actions { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.builtin-ai-runtime-progress { width: min(360px, 100%); display: grid; gap: 7px; margin-top: 18px; text-align: left; }
+.builtin-ai-runtime-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-muted); font-size: 10px; }
+.builtin-ai-runtime-progress-head strong { color: var(--text); font-size: 10px; font-weight: 600; }
+.builtin-ai-runtime-progress-track { height: 6px; overflow: hidden; border-radius: 3px; background: #dbe3ed; }
+.builtin-ai-runtime-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width .2s ease; }
 .sidebar nav .sidebar-ai-entry.active { border-color: #64748b; background: #35445a; }
 .builtin-ai-extension-backdrop { padding: 18px; }
 .builtin-ai-extension-dialog { width: min(880px, 100%); height: min(680px, calc(100dvh - 36px)); min-height: 440px; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: #fff; box-shadow: 0 22px 60px rgba(15, 23, 42, .24); }
@@ -885,6 +890,21 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .runtime-summary-main span { color: var(--text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .runtime-actions { flex: 0 0 auto; justify-content: flex-end; }
 .runtime-actions .btn { white-space: nowrap; }
+.runtime-more-actions { position: relative; }
+.runtime-more-actions > summary { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text-muted); background: #fff; cursor: pointer; list-style: none; }
+.runtime-more-actions > summary::-webkit-details-marker { display: none; }
+.runtime-more-actions > summary:hover { color: var(--text); background: #f8fafc; }
+.runtime-more-actions > div { position: absolute; z-index: 20; top: 37px; right: 0; width: 160px; display: grid; gap: 3px; padding: 6px; border: 1px solid var(--border); border-radius: 6px; background: #fff; box-shadow: 0 10px 24px rgba(17, 24, 39, .14); }
+.runtime-more-actions button { min-height: 30px; display: flex; align-items: center; gap: 7px; padding: 0 8px; border: 0; border-radius: 4px; color: var(--text-secondary); background: transparent; font-size: 10px; cursor: pointer; }
+.runtime-more-actions button:hover { color: var(--text); background: #f3f4f6; }
+.runtime-more-actions button.danger-text { color: #b91c1c; }
+.runtime-more-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.runtime-install-progress { width: 100%; height: 5px; margin-top: 12px; overflow: hidden; border-radius: 3px; background: #dbe3ed; }
+.runtime-install-progress span { display: block; height: 100%; border-radius: inherit; background: var(--primary); transition: width .2s ease; }
+.runtime-update-notice { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; margin-top: 12px; padding: 9px 10px; border-left: 3px solid #2563eb; color: var(--text-secondary); background: #eff6ff; font-size: 10px; line-height: 1.5; }
+.runtime-update-notice strong { color: #1d4ed8; font-size: 10px; }
+.runtime-update-notice span { min-width: 0; overflow-wrap: anywhere; }
+.runtime-feedback { margin-top: 9px; }
 .runtime-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
 .runtime-facts > div { min-width: 0; display: grid; gap: 2px; }
 .runtime-facts > div:last-child { grid-column: 1 / -1; }

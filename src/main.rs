@@ -253,7 +253,37 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
                 .map_err(std::io::Error::other)?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        _ => return Err("usage: himind-agent runtime <status|install>".into()),
+        Some("check-update") => {
+            let client_instance_id =
+                format!("himind-agent-runtime-{}", store::paths::profile_name());
+            let status = runtime::builtin::check_update(options, &client_instance_id)
+                .map_err(std::io::Error::other)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Some("update") => {
+            let client_instance_id =
+                format!("himind-agent-runtime-{}", store::paths::profile_name());
+            let mut progress = |stage: &str, percent: u8, message: &str| {
+                eprintln!("[{percent:>3}%] {stage}: {message}");
+            };
+            let status =
+                runtime::builtin::update_with_progress(options, &client_instance_id, &mut progress)
+                    .map_err(std::io::Error::other)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Some("uninstall") => {
+            let mut progress = |stage: &str, percent: u8, message: &str| {
+                eprintln!("[{percent:>3}%] {stage}: {message}");
+            };
+            let status = runtime::builtin::uninstall_with_progress(&mut progress)
+                .map_err(std::io::Error::other)?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        _ => {
+            return Err(
+                "usage: himind-agent runtime <status|install|check-update|update|uninstall>".into(),
+            )
+        }
     }
     Ok(())
 }

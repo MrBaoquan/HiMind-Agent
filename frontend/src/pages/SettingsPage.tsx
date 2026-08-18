@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeStatus, type LoginState, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
-import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Wrench, X } from 'lucide-react';
+import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
+import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, MoreHorizontal, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Trash2, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
 type SettingsSection = 'remote' | 'accounts' | 'tools' | 'general';
@@ -86,33 +86,103 @@ export function SettingsPage({
   onUpdatePreferences: (autoCheck: boolean, autoDownload: boolean) => void;
 }) {
   const [builtinAIRuntimeStatus, setBuiltinAIRuntimeStatus] = useState<BuiltinAIRuntimeStatus | null>(null);
+  const [builtinAIRuntimeInstallation, setBuiltinAIRuntimeInstallation] = useState<BuiltinAIRuntimeInstallationStatus | null>(null);
   const [builtinAIRuntimeBusy, setBuiltinAIRuntimeBusy] = useState(false);
+  const [builtinAIRuntimeCheckBusy, setBuiltinAIRuntimeCheckBusy] = useState(false);
   const [builtinAIRuntimeFeedback, setBuiltinAIRuntimeFeedback] = useState('');
+  const [pendingRuntimeUninstall, setPendingRuntimeUninstall] = useState(false);
+  const runtimeWorking = builtinAIRuntimeInstallation?.state === 'working';
+  const runtimeReady = builtinAIRuntimeStatus?.status === 'ready';
   useEffect(() => {
-    agentApi.builtinAiRuntimeStatus().then(setBuiltinAIRuntimeStatus).catch(() => setBuiltinAIRuntimeStatus(null));
+    let disposed = false;
+    const load = async () => {
+      try {
+        const installation = await agentApi.builtinAiRuntimeInstallationStatus();
+        if (disposed) return;
+        setBuiltinAIRuntimeInstallation(installation);
+        setBuiltinAIRuntimeStatus(installation.runtime);
+        if (installation.runtime.status === 'ready') {
+          try {
+            const checked = await agentApi.checkBuiltinAiRuntimeUpdate();
+            if (!disposed) {
+              setBuiltinAIRuntimeInstallation(checked);
+              setBuiltinAIRuntimeStatus(checked.runtime);
+            }
+          } catch {
+            // A status page should remain usable when Dashboard is offline.
+          }
+        }
+      } catch {
+        if (!disposed) setBuiltinAIRuntimeStatus(null);
+      }
+    };
+    void load();
+    return () => { disposed = true; };
   }, []);
+  useEffect(() => {
+    if (!runtimeWorking) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await agentApi.builtinAiRuntimeInstallationStatus();
+        setBuiltinAIRuntimeInstallation(next);
+        setBuiltinAIRuntimeStatus(next.runtime);
+        if (next.state === 'ready' || next.state === 'idle') setBuiltinAIRuntimeFeedback(next.message);
+        if (next.state === 'failed') setBuiltinAIRuntimeFeedback(next.error || 'HiMind AI 运行时安装失败，请重试');
+      } catch {
+        setBuiltinAIRuntimeFeedback('暂时无法读取安装进度，请稍后重试');
+      }
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [runtimeWorking]);
   const refreshBuiltinAIRuntime = async () => {
     setBuiltinAIRuntimeFeedback('');
     try {
-      setBuiltinAIRuntimeStatus(await agentApi.builtinAiRuntimeStatus());
+      const installation = await agentApi.builtinAiRuntimeInstallationStatus();
+      setBuiltinAIRuntimeInstallation(installation);
+      setBuiltinAIRuntimeStatus(installation.runtime);
+      if (installation.runtime.status === 'ready') await checkBuiltinAIRuntimeUpdate();
     } catch {
-      setBuiltinAIRuntimeFeedback('暂时无法检查内置 AI 组件，请稍后重试');
+      setBuiltinAIRuntimeFeedback('暂时无法检查 HiMind AI 运行时，请稍后重试');
     }
   };
-  const installBuiltinAIRuntime = async () => {
-    if (builtinAIRuntimeBusy) return;
+  const checkBuiltinAIRuntimeUpdate = async () => {
+    if (builtinAIRuntimeCheckBusy || runtimeWorking) return;
+    setBuiltinAIRuntimeCheckBusy(true);
+    setBuiltinAIRuntimeFeedback('正在检查 HiMind AI 运行时更新');
+    try {
+      const installation = await agentApi.checkBuiltinAiRuntimeUpdate();
+      setBuiltinAIRuntimeInstallation(installation);
+      setBuiltinAIRuntimeStatus(installation.runtime);
+      setBuiltinAIRuntimeFeedback(installation.message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || '');
+      setBuiltinAIRuntimeFeedback(message.includes('尚未安装') ? '请先安装 HiMind AI 运行时' : '暂时无法检查更新，请稍后重试');
+    } finally {
+      setBuiltinAIRuntimeCheckBusy(false);
+    }
+  };
+  const startBuiltinAIRuntimeOperation = async (operation: BuiltinAIRuntimeInstallationStatus['operation']) => {
+    if (builtinAIRuntimeBusy || runtimeWorking) return;
     setBuiltinAIRuntimeBusy(true);
     setBuiltinAIRuntimeFeedback('');
     try {
-      setBuiltinAIRuntimeStatus(await agentApi.installBuiltinAiRuntime());
+      const installation = await agentApi.startBuiltinAiRuntimeInstall(operation);
+      setBuiltinAIRuntimeInstallation(installation);
+      setBuiltinAIRuntimeStatus(installation.runtime);
+      setBuiltinAIRuntimeFeedback(installation.message);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error || '');
-      setBuiltinAIRuntimeFeedback(message.includes('没有可用') || message.includes('Release')
-        ? '当前没有可用的内置 AI 组件安装包'
-        : '安装内置 AI 组件失败，请稍后重试');
+      setBuiltinAIRuntimeFeedback(message.includes('没有可用') || message.includes('发布')
+        ? '当前没有可用的 HiMind AI 运行时安装包'
+        : `HiMind AI 运行时${runtimeActionLabel(operation)}失败，请稍后重试`);
     } finally {
       setBuiltinAIRuntimeBusy(false);
     }
+  };
+  const primaryRuntimeAction = async () => {
+    if (!runtimeReady) return startBuiltinAIRuntimeOperation('install');
+    if (builtinAIRuntimeInstallation?.update_available) return startBuiltinAIRuntimeOperation('update');
+    return checkBuiltinAIRuntimeUpdate();
   };
   const [unityEditorPath, setUnityEditorPath] = useState('');
   const [unityEditorSettings, setUnityEditorSettings] = useState<UnityEditorSettings | null>(null);
@@ -202,26 +272,32 @@ export function SettingsPage({
             <section className="card settings-section builtin-ai-runtime-card">
               <div className="card-header">
                 <span>HiMind AI</span>
-                <Pill kind={builtinAIRuntimeStatus?.status === 'ready' ? 'success' : builtinAIRuntimeStatus ? 'warn' : 'neutral'}>
-                  {builtinAIRuntimeStatus?.status === 'ready' ? '已就绪' : builtinAIRuntimeStatus ? '需要安装' : '检测中'}
+                <Pill kind={runtimeReady ? 'success' : builtinAIRuntimeStatus ? 'warn' : 'neutral'}>
+                  {runtimeWorking ? `${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}中` : builtinAIRuntimeInstallation?.update_available ? '有可用更新' : runtimeReady ? '已就绪' : builtinAIRuntimeStatus ? '需要安装' : '检测中'}
                 </Pill>
               </div>
               <div className="runtime-summary">
                 <div className="runtime-summary-main">
                   <div>
-                    <strong>内置 AI 组件</strong>
-                    <span>{builtinAIRuntimeStatus?.message || '正在检查组件状态。'}</span>
+                    <strong>HiMind AI 运行时</strong>
+                    <span>{builtinAIRuntimeInstallation?.message || builtinAIRuntimeStatus?.message || '正在检查运行时状态。'}</span>
                   </div>
                   <div className="actions-row runtime-actions">
-                    <button className="btn" disabled={builtinAIRuntimeBusy} onClick={() => refreshBuiltinAIRuntime()}>
-                      {builtinAIRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}重新检测
+                    <button className="btn btn-primary" disabled={builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking} onClick={() => void primaryRuntimeAction()}>
+                      {builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking ? <LoaderCircle className="spin" size={15} /> : runtimeReady && builtinAIRuntimeInstallation?.update_available ? <Download size={15} /> : runtimeReady ? <RefreshCw size={15} /> : <Download size={15} />}
+                      {runtimeWorking ? `${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}中 ${builtinAIRuntimeInstallation?.progress_percent || 0}%` : !runtimeReady ? '安装运行时' : builtinAIRuntimeInstallation?.update_available ? `更新到 v${builtinAIRuntimeInstallation.available_version}` : builtinAIRuntimeCheckBusy ? '检查中' : '检查更新'}
                     </button>
-                    <button className="btn btn-primary" disabled={builtinAIRuntimeBusy} onClick={() => installBuiltinAIRuntime()}>
-                      {builtinAIRuntimeBusy ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
-                      {builtinAIRuntimeStatus?.status === 'ready' ? '修复组件' : '安装组件'}
-                    </button>
+                    <details className="runtime-more-actions">
+                      <summary title="更多操作" aria-label="更多操作"><MoreHorizontal size={17} /></summary>
+                      <div>
+                        {runtimeReady ? <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void startBuiltinAIRuntimeOperation('repair')}><Wrench size={14} />修复运行时</button> : null}
+                        {runtimeReady ? <button type="button" className="danger-text" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => setPendingRuntimeUninstall(true)}><Trash2 size={14} />卸载运行时</button> : <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void refreshBuiltinAIRuntime()}><RefreshCw size={14} />重新检测</button>}
+                      </div>
+                    </details>
                   </div>
                 </div>
+                {runtimeWorking ? <div className="runtime-install-progress" role="status" aria-label={`${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}进度 ${builtinAIRuntimeInstallation?.progress_percent || 0}%`}><span style={{ width: `${builtinAIRuntimeInstallation?.progress_percent || 0}%` }} /></div> : null}
+                {builtinAIRuntimeInstallation?.update_available ? <div className="runtime-update-notice"><strong>v{builtinAIRuntimeInstallation.available_version}</strong><span>{runtimeReleaseSummary(builtinAIRuntimeInstallation.release_notes)}</span></div> : null}
                 {builtinAIRuntimeFeedback ? <div className="inline-feedback visible runtime-feedback" role="status">{builtinAIRuntimeFeedback}</div> : null}
                 <details className="runtime-details">
                   <summary>开发者诊断</summary>
@@ -327,8 +403,21 @@ export function SettingsPage({
       {loginModalOpen ? <LoginModal configured={configured} username={loginUsername} password={loginPassword} onClose={onCloseLoginModal} onUsernameChange={onUsernameChange} onPasswordChange={onPasswordChange} onSave={onSaveLogin} onLogout={onLogoutLogin} onOpenInnerAdmin={onOpenInnerAdmin} /> : null}
       {svnModalOpen ? <SvnConnectionModal draft={svnDraft} exists={svnConnections.length > 0} onClose={onCloseSvnModal} onChange={onSvnDraftChange} onSave={onSaveSvnConnection} /> : null}
       {pendingFullAccess ? <FullAccessConfirmation onClose={() => setPendingFullAccess(null)} onConfirm={() => { onRemoteExecutionChange(pendingFullAccess, true); setPendingFullAccess(null); }} /> : null}
+      {pendingRuntimeUninstall ? <RuntimeUninstallConfirmation onClose={() => setPendingRuntimeUninstall(false)} onConfirm={() => { setPendingRuntimeUninstall(false); void startBuiltinAIRuntimeOperation('uninstall'); }} /> : null}
     </>
   );
+}
+
+function runtimeActionLabel(operation: string) {
+  if (operation === 'update') return '更新';
+  if (operation === 'repair') return '修复';
+  if (operation === 'uninstall') return '卸载';
+  return '安装';
+}
+
+function runtimeReleaseSummary(releaseNotes: string) {
+  const summary = releaseNotes.replace(/\s+/g, ' ').trim() || '包含稳定性和兼容性改进。';
+  return summary.length > 180 ? `${summary.slice(0, 180)}...` : summary;
 }
 
 function formatUpdateTime(timestamp?: number) {
@@ -357,6 +446,17 @@ function describeUpdateMessage(status: AgentUpdateStatus | null) {
   if (status.status === 'failed') return '暂时无法完成更新，请稍后重试。';
   if (status.status === 'rolled_back') return '更新没有完成，仍在使用上一版本。';
   return status.release_notes || 'HiMind Agent 会定期检查更新。';
+}
+
+function RuntimeUninstallConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="runtime-uninstall-title">
+        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI 运行时？</h3><p>HiMind AI 将暂时不可用，个人 AI 服务、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-body"><div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Trash2 size={15} />确认卸载</button></div></div></div>
+      </div>
+    </div>
+  );
 }
 
 function FullAccessConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
