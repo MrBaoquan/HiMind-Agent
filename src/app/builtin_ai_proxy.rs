@@ -11,9 +11,71 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const HEADER_LIMIT: usize = 64 * 1024;
+const HTML_RESPONSE_LIMIT: usize = 1024 * 1024;
 const OBSERVED_FRAME_LIMIT: u64 = 4 * 1024 * 1024;
 const SESSION_QUERY: &str = "himind_session";
 const SESSION_COOKIE: &str = "himind_ai_session";
+const RUNTIME_BRAND_BRIDGE: &str = r#"<style data-himind-runtime-brand>
+button:has(> svg[viewBox="0 0 182 24"]) > svg {
+  display: none !important;
+}
+button:has(> svg[viewBox="0 0 182 24"])::before {
+  content: 'HiMind AI';
+  color: currentColor;
+  font: 600 18px/24px system-ui, sans-serif;
+  white-space: nowrap;
+}
+</style>
+<script>
+(() => {
+  const replacements = [
+    [/DeepSeek Harness/gi, 'HiMind AI'],
+    [/\bdeepseek\b/gi, 'HiMind'],
+    [/\bHARNESS\b/g, 'AI'],
+  ];
+  const replace = (value) => replacements.reduce(
+    (current, [pattern, replacement]) => current.replace(pattern, replacement),
+    value,
+  );
+  const apply = () => {
+    document.title = 'HiMind AI';
+    if (!document.body) return;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      const next = replace(node.nodeValue || '');
+      if (next !== node.nodeValue) node.nodeValue = next;
+    }
+    document.querySelectorAll('[aria-label], [title]').forEach((element) => {
+      for (const attribute of ['aria-label', 'title']) {
+        const value = element.getAttribute(attribute);
+        if (value) element.setAttribute(attribute, replace(value));
+      }
+    });
+  };
+  let scheduled = false;
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      apply();
+    });
+  };
+  new MutationObserver(schedule).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['aria-label', 'title'],
+  });
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', schedule, { once: true });
+  } else {
+    schedule();
+  }
+})();
+</script>"#;
 
 pub(crate) type EventObserver = Arc<dyn Fn(Value) + Send + Sync + 'static>;
 
@@ -151,6 +213,10 @@ fn handle_connection(
     server.write_all(rewritten.as_bytes())?;
     server.write_all(remainder)?;
 
+    if !websocket && is_runtime_entry_request(&request) {
+        return proxy_customized_runtime_entry(&mut server, &mut client);
+    }
+
     let mut client_reader = client.try_clone()?;
     let mut server_writer = server.try_clone()?;
     let upload_shutdown = Arc::clone(&shutdown);
@@ -267,6 +333,7 @@ fn rewrite_request_header(request: &str, websocket: bool) -> String {
             continue;
         };
         if name.eq_ignore_ascii_case("sec-websocket-extensions")
+            || (!websocket && name.eq_ignore_ascii_case("accept-encoding"))
             || (!websocket && name.eq_ignore_ascii_case("connection"))
         {
             continue;
@@ -294,17 +361,234 @@ fn rewrite_request_header(request: &str, websocket: bool) -> String {
         output.push_str("\r\n");
     }
     if !websocket {
+        output.push_str("Accept-Encoding: identity\r\n");
         output.push_str("Connection: close\r\n");
     }
     output.push_str("\r\n");
     output
 }
 
-fn establish_browser_session(stream: &mut TcpStream, token: &str) -> io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: {SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+fn is_runtime_entry_request(request: &str) -> bool {
+    request
+        .lines()
+        .next()
+        .and_then(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .is_some_and(|(method, target)| method == "GET" && target == "/")
+}
+
+fn proxy_customized_runtime_entry(
+    server: &mut TcpStream,
+    client: &mut TcpStream,
+) -> io::Result<()> {
+    server.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let response = read_complete_http_response(server)?;
+    let Some(customized) = customize_runtime_html_response(&response)? else {
+        return client.write_all(&response);
+    };
+    client.write_all(&customized)
+}
+
+fn read_complete_http_response(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut response = Vec::with_capacity(16 * 1024);
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(response),
+            Ok(count) => {
+                response.extend_from_slice(&chunk[..count]);
+                if response.len() > HTML_RESPONSE_LIMIT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "HiMind AI entry response is too large",
+                    ));
+                }
+                if http_response_complete(&response)? {
+                    return Ok(response);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HiMind AI entry response timed out",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn http_response_complete(response: &[u8]) -> io::Result<bool> {
+    let Some(header_end) = find_header_end(response) else {
+        return Ok(false);
+    };
+    let header = String::from_utf8_lossy(&response[..header_end]);
+    let body = &response[header_end..];
+    if header_has_token(&header, "transfer-encoding", "chunked") {
+        return decode_chunked_body(body).map(|body| body.is_some());
+    }
+    if let Some(length) = response_content_length(&header)? {
+        return Ok(body.len() >= length);
+    }
+    Ok(false)
+}
+
+fn customize_runtime_html_response(response: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let Some(header_end) = find_header_end(response) else {
+        return Ok(None);
+    };
+    let header = String::from_utf8_lossy(&response[..header_end]);
+    if !header_has_token(&header, "content-type", "text/html")
+        || header.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("content-encoding")
+                    && !value.trim().eq_ignore_ascii_case("identity")
+            })
+        })
+    {
+        return Ok(None);
+    }
+    let raw_body = &response[header_end..];
+    let body = if header_has_token(&header, "transfer-encoding", "chunked") {
+        decode_chunked_body(raw_body)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete chunked HTML response",
+            )
+        })?
+    } else if let Some(length) = response_content_length(&header)? {
+        raw_body
+            .get(..length)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete HTML response")
+            })?
+            .to_vec()
+    } else {
+        raw_body.to_vec()
+    };
+    let html = String::from_utf8(body)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTML response is not UTF-8"))?;
+    let customized = customize_runtime_html(&html);
+    let mut output = String::new();
+    for (index, line) in header.lines().enumerate() {
+        if index > 0
+            && line.split_once(':').is_some_and(|(name, _)| {
+                name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+                    || name.eq_ignore_ascii_case("connection")
+                    || name.eq_ignore_ascii_case("keep-alive")
+            })
+        {
+            continue;
+        }
+        if !line.is_empty() {
+            output.push_str(line);
+            output.push_str("\r\n");
+        }
+    }
+    output.push_str(&format!("Content-Length: {}\r\n", customized.len()));
+    output.push_str("Cache-Control: no-store\r\nConnection: close\r\n\r\n");
+    let mut bytes = output.into_bytes();
+    bytes.extend_from_slice(customized.as_bytes());
+    Ok(Some(bytes))
+}
+
+fn customize_runtime_html(html: &str) -> String {
+    let html = html.replace(
+        "<title>DeepSeek Harness</title>",
+        "<title>HiMind AI</title>",
     );
-    stream.write_all(response.as_bytes())
+    if html.contains("data-himind-runtime-brand") {
+        return html;
+    }
+    html.replacen("</head>", &format!("{RUNTIME_BRAND_BRIDGE}\n</head>"), 1)
+}
+
+fn response_content_length(header: &str) -> io::Result<Option<usize>> {
+    header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("content-length") {
+                return None;
+            }
+            Some(
+                value.trim().parse::<usize>().map(Some).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid content length")
+                }),
+            )
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn header_has_token(header: &str, expected_name: &str, expected_value: &str) -> bool {
+    header.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case(expected_name)
+                && value
+                    .split(';')
+                    .flat_map(|part| part.split(','))
+                    .any(|part| part.trim().eq_ignore_ascii_case(expected_value))
+        })
+    })
+}
+
+fn decode_chunked_body(body: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let mut cursor = 0_usize;
+    let mut decoded = Vec::new();
+    loop {
+        let Some(line_end) = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|index| cursor + index)
+        else {
+            return Ok(None);
+        };
+        let size_text = std::str::from_utf8(&body[cursor..line_end])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+        let size =
+            usize::from_str_radix(size_text.split(';').next().unwrap_or_default().trim(), 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
+        cursor = line_end + 2;
+        if size == 0 {
+            return Ok(Some(decoded));
+        }
+        let Some(chunk_end) = cursor.checked_add(size) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk is too large",
+            ));
+        };
+        if body.len() < chunk_end + 2 {
+            return Ok(None);
+        }
+        if &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk terminator is missing",
+            ));
+        }
+        decoded.extend_from_slice(&body[cursor..chunk_end]);
+        cursor = chunk_end + 2;
+    }
+}
+
+fn establish_browser_session(stream: &mut TcpStream, token: &str) -> io::Result<()> {
+    stream.write_all(browser_session_response(token).as_bytes())
+}
+
+fn browser_session_response(token: &str) -> String {
+    format!(
+        "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: {SESSION_COOKIE}={token}; HttpOnly; SameSite=None; Secure; Partitioned; Path=/\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
 }
 
 fn write_forbidden(stream: &mut TcpStream) -> io::Result<()> {
@@ -533,5 +817,41 @@ mod tests {
         assert!(!rewritten.contains("secret"));
         assert!(rewritten.contains("Cookie: theme=dark"));
         assert!(rewritten.contains("Connection: close"));
+    }
+
+    #[test]
+    fn iframe_session_cookie_is_secure_and_partitioned() {
+        let response = browser_session_response("test-token");
+
+        assert!(response.contains("HttpOnly; SameSite=None; Secure; Partitioned; Path=/"));
+        assert!(!response.contains("SameSite=Strict"));
+    }
+
+    #[test]
+    fn runtime_entry_html_is_rebranded_without_changing_runtime_assets() {
+        let html = "<html><head><title>DeepSeek Harness</title></head><body></body></html>";
+        let customized = customize_runtime_html(html);
+
+        assert!(customized.contains("<title>HiMind AI</title>"));
+        assert!(customized.contains("data-himind-runtime-brand"));
+        assert!(customized.contains("svg[viewBox=\"0 0 182 24\"]"));
+        assert!(customized.contains("MutationObserver"));
+    }
+
+    #[test]
+    fn chunked_html_response_is_decoded_and_rewritten_with_content_length() {
+        let body = "<html><head><title>DeepSeek Harness</title></head></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        let rewritten = customize_runtime_html_response(response.as_bytes())
+            .unwrap()
+            .expect("HTML response should be customized");
+        let rewritten = String::from_utf8(rewritten).unwrap();
+
+        assert!(rewritten.contains("Content-Length:"));
+        assert!(!rewritten.to_ascii_lowercase().contains("transfer-encoding"));
+        assert!(rewritten.contains("data-himind-runtime-brand"));
     }
 }

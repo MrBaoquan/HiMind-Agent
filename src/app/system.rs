@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::app::types::RemoteConnectRequest;
-use crate::store::credentials::{configured_unity_editor_path, unity_editor_environment_path};
+use crate::store::credentials::{
+    configured_unity_editor_path, discovered_unity_editor_path, unity_editor_environment_path,
+};
 use crate::Options;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -801,8 +803,10 @@ fn normalized_engine_type(configured: &str, folder: &Path) -> String {
 fn resolve_project_launcher(folder: &Path, engine: &str) -> (Option<String>, Option<String>) {
     if engine == "unity" {
         let project_file = is_unity_project(folder).then(|| folder.to_string_lossy().to_string());
-        let launcher = configured_unity_editor_path()
-            .or_else(unity_editor_environment_path)
+        let launcher = unity_editor_environment_path()
+            .filter(|value| Path::new(value).is_file())
+            .or_else(configured_unity_editor_path)
+            .or_else(discovered_unity_editor_path)
             .filter(|value| Path::new(value).is_file());
         return (project_file, launcher);
     }

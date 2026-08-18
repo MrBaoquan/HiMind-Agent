@@ -289,8 +289,10 @@ pub(crate) fn clear_authorization(state_path: &Path) -> Result<(), Box<dyn Error
 
 fn clear_authorization_unlocked(state_path: &Path) -> Result<(), Box<dyn Error>> {
     let path = authorization_path(state_path);
-    if path.exists() {
-        fs::remove_file(path)?;
+    for candidate in [&path, &atomic_file::backup_path(&path)] {
+        if candidate.exists() {
+            fs::remove_file(candidate)?;
+        }
     }
     Ok(())
 }
@@ -562,8 +564,9 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        authorization_requires_login, prepare_refresh_attempt, read_stored_authorization,
-        save_authorization_response, unix_now, AgentAccessToken, OAuthTokenResponse,
+        authorization_requires_login, clear_authorization, prepare_refresh_attempt,
+        read_stored_authorization, save_authorization_response, unix_now, AgentAccessToken,
+        OAuthTokenResponse,
     };
     use std::fs;
 
@@ -595,6 +598,30 @@ mod tests {
             ..usable
         };
         assert!(!empty.valid_for("agent.profile"));
+    }
+
+    #[test]
+    fn clearing_authorization_removes_primary_and_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-agent-oauth-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let authorization = state_path.with_file_name("agent-user-authorization.json");
+        let backup = crate::store::atomic_file::backup_path(&authorization);
+        fs::write(&authorization, b"primary").unwrap();
+        fs::write(&backup, b"backup").unwrap();
+
+        clear_authorization(&state_path).unwrap();
+
+        assert!(!authorization.exists());
+        assert!(!backup.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

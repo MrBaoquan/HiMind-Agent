@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::types::{StoredInnerAdminCredentials, StoredSvnConnection};
 
@@ -23,16 +23,27 @@ struct LocalEditorSettings {
 pub(crate) fn local_unity_editor_settings() -> Result<Value, Box<dyn Error>> {
     let saved = load_local_editor_settings()?.unity_editor_path;
     let workflow_default_path = unity_editor_environment_path().unwrap_or_default();
-    let (path, source) = if !saved.trim().is_empty() {
-        (saved, "agent")
-    } else if !workflow_default_path.is_empty() {
+    let workflow_default_valid =
+        !workflow_default_path.is_empty() && PathBuf::from(&workflow_default_path).is_file();
+    let saved_valid = !saved.trim().is_empty() && PathBuf::from(&saved).is_file();
+    let discovered_path = if !workflow_default_valid && !saved_valid {
+        discovered_unity_editor_path().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (path, source) = if workflow_default_valid {
         (workflow_default_path.clone(), "environment")
+    } else if saved_valid {
+        (saved, "agent")
+    } else if !discovered_path.is_empty() {
+        (discovered_path.clone(), "discovered")
     } else {
         (String::new(), "unset")
     };
     Ok(json!({
         "unity_editor_path": path,
         "workflow_default_path": workflow_default_path,
+        "discovered_path": discovered_path,
         "source": source,
         "valid": !path.is_empty() && PathBuf::from(&path).is_file()
     }))
@@ -72,6 +83,60 @@ pub(crate) fn unity_editor_environment_path() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn discovered_unity_editor_path() -> Option<String> {
+    find_unity_editor_in_roots(&unity_editor_install_roots())
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn find_unity_editor_in_roots(roots: &[PathBuf]) -> Option<PathBuf> {
+    roots
+        .iter()
+        .flat_map(|root| unity_editor_candidates(root))
+        .filter(|path| path.is_file())
+        .max_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()))
+}
+
+fn unity_editor_install_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for value in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(path) = env::var_os(value).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        roots.push(local_app_data);
+    }
+    roots.push(PathBuf::from(r"C:\Program Files"));
+    roots.push(PathBuf::from(r"C:\Program Files (x86)"));
+    roots
+}
+
+fn unity_editor_candidates(root: &Path) -> Vec<PathBuf> {
+    let unity_root = root.join("Unity");
+    let mut candidates = Vec::new();
+    candidates.push(unity_root.join("Editor").join("Unity.exe"));
+    for version_root in [unity_root.join("Hub").join("Editor"), unity_root.clone()] {
+        if let Ok(entries) = fs::read_dir(version_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    candidates.push(path.join("Editor").join("Unity.exe"));
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if path.is_dir() && name.starts_with("unity ") {
+                candidates.push(path.join("Editor").join("Unity.exe"));
+            }
+        }
+    }
+    candidates
 }
 
 pub(crate) fn local_login_status_value() -> &'static str {
@@ -426,9 +491,11 @@ fn crypt_unprotect(_protected: &[u8]) -> Result<String, Box<dyn Error>> {
 #[cfg(test)]
 mod credential_tests {
     use super::{
-        decode_legacy_dpapi_hex, protect_secret_for_current_user,
+        decode_legacy_dpapi_hex, find_unity_editor_in_roots, protect_secret_for_current_user,
         unprotect_secret_for_current_user, DPAPI_PREFIX,
     };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn legacy_dpapi_hex_decoder_is_strict() {
@@ -438,6 +505,38 @@ mod credential_tests {
         );
         assert!(decode_legacy_dpapi_hex("not-hex").is_err());
         assert!(decode_legacy_dpapi_hex("abc").is_err());
+    }
+
+    #[test]
+    fn discovers_unity_editor_from_conventional_windows_layouts() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-unity-discovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let older = root
+            .join("Unity")
+            .join("Hub")
+            .join("Editor")
+            .join("2022.3.15f1")
+            .join("Editor")
+            .join("Unity.exe");
+        let expected = root
+            .join("Unity")
+            .join("Hub")
+            .join("Editor")
+            .join("6000.0.1f1")
+            .join("Editor")
+            .join("Unity.exe");
+        fs::create_dir_all(older.parent().unwrap()).unwrap();
+        fs::write(&older, b"unity").unwrap();
+        fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        fs::write(&expected, b"unity").unwrap();
+        assert_eq!(find_unity_editor_in_roots(&[root.clone()]), Some(expected));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]

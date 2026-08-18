@@ -6,13 +6,14 @@ import { NotificationCenter, PageHeader } from './components/Common';
 import { Shell } from './components/Shell';
 import { ApprovalsPage } from './pages/ApprovalsPage';
 import { AiConnectionsPage } from './pages/AiConnectionsPage';
+import { BuiltinAiPage } from './pages/BuiltinAiPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { LogsPage } from './pages/LogsPage';
 import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type BuiltinAIModelOptions, type BuiltinAIToolContextSummary, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -39,6 +40,9 @@ function App() {
   const [dashboardIdentity, setDashboardIdentity] = useState<DashboardIdentityStatus | null>(null);
   const [dashboardAuthorization, setDashboardAuthorization] = useState<DashboardAuthorizationProgress | null>(null);
   const [aiIntegration, setAiIntegration] = useState<AiIntegrationOverview | null>(null);
+  const [builtinAiModelOptions, setBuiltinAiModelOptions] = useState<BuiltinAIModelOptions | null>(null);
+  const [builtinAiModelOptionsLoading, setBuiltinAiModelOptionsLoading] = useState(true);
+  const [builtinAiToolContext, setBuiltinAiToolContext] = useState<BuiltinAIToolContextSummary | null>(null);
   const [mcpTestResult, setMcpTestResult] = useState<McpConnectionTestResult | null>(null);
   const [aiOperation, setAiOperation] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
@@ -83,6 +87,23 @@ function App() {
   async function refreshUpdateStatus() { setUpdateStatus(await agentApi.updateStatus()); }
   async function refreshDashboardIdentity() { setDashboardIdentity(await agentApi.dashboardIdentity()); }
   async function refreshAiIntegration() { setAiIntegration(await agentApi.aiIntegration()); }
+  async function refreshBuiltinAiModelOptions() {
+    setBuiltinAiModelOptionsLoading(true);
+    try {
+      setBuiltinAiModelOptions(await agentApi.builtinAiModelOptions());
+    } catch {
+      setBuiltinAiModelOptions(null);
+    } finally {
+      setBuiltinAiModelOptionsLoading(false);
+    }
+  }
+  async function refreshBuiltinAiToolContext() {
+    try {
+      setBuiltinAiToolContext(await agentApi.builtinAiToolContextSummary());
+    } catch {
+      setBuiltinAiToolContext(null);
+    }
+  }
   async function refreshApprovals() { setApprovals(await agentApi.approvals()); }
   async function refreshSettings() { setSettings(await agentApi.settings()); }
   async function refreshRemoteExecutionSettings() { setRemoteExecutionSettings(await agentApi.remoteExecutionSettings()); }
@@ -253,6 +274,8 @@ function App() {
       refreshUpdateStatus(),
       refreshDashboardIdentity(),
       refreshAiIntegration(),
+      refreshBuiltinAiModelOptions(),
+      refreshBuiltinAiToolContext(),
       refreshApprovals(),
       refreshSettingsPageData(),
       refreshSvnConnections(),
@@ -275,10 +298,14 @@ function App() {
       Promise.all([refreshStatus(), refreshUpdateStatus(), refreshApprovals(), refreshLogin()]).catch(console.error);
     }, 5000);
     const identityTimer = window.setInterval(() => refreshDashboardIdentity().catch(console.error), 30000);
+    const modelTimer = window.setInterval(() => refreshBuiltinAiModelOptions().catch(console.error), 30000);
+    const toolContextTimer = window.setInterval(() => refreshBuiltinAiToolContext().catch(console.error), 30000);
     const reviewTimer = window.setInterval(() => refreshReviewProgress().catch(console.error), 30000);
     return () => {
       window.clearInterval(timer);
       window.clearInterval(identityTimer);
+      window.clearInterval(modelTimer);
+      window.clearInterval(toolContextTimer);
       window.clearInterval(reviewTimer);
     };
   }, []);
@@ -385,6 +412,8 @@ function App() {
       notify('error', formatError(error, fallback));
     }
   }
+
+  function openBuiltinAi() { setPage('builtin-ai'); }
 
   async function runSkillOperation(key: string, action: () => Promise<string>, fallback: string) {
     if (skillOperation) return;
@@ -547,6 +576,25 @@ function App() {
   }
 
   const content = (() => {
+    if (page === 'builtin-ai') return <BuiltinAiPage
+      identity={dashboardIdentity}
+      authorization={dashboardAuthorization}
+      authorizationBusy={aiOperation === 'identity'}
+      onStartAuthorization={startDashboardAuthorization}
+      onCancelAuthorization={cancelDashboardAuthorization}
+      onOpenAuthorization={() => run(agentApi.openDashboardAuthorizationPage)}
+      onOpenSettings={() => setPage('settings')}
+      onOpenAiConnections={() => setPage('ai')}
+      onOpenPlugins={() => setPage('plugins')}
+      onOpenSkills={() => setPage('skills')}
+      onToolContextChanged={() => { void refreshBuiltinAiToolContext(); }}
+      modelOptions={builtinAiModelOptions}
+      modelOptionsLoading={builtinAiModelOptionsLoading}
+      toolSummary={builtinAiToolContext || {
+        skills: skillCatalog?.items?.length || 0,
+        mcp_services: 1,
+      }}
+    />;
     if (page === 'dashboard') return <DashboardPage
       status={status}
       approvals={approvals}
@@ -711,7 +759,7 @@ function App() {
       onLoadTaskHistory={agentApi.taskHistory}
       onNavigate={setPage}
       onOpenDashboard={() => run(agentApi.openDashboard)}
-      onOpenBuiltinAi={() => run(agentApi.openBuiltinAi, undefined, '无法打开 HiMind AI')}
+      onOpenBuiltinAi={openBuiltinAi}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}
       onOpenAgentDirectory={() => run(agentApi.openAgentDirectory, 'Agent 文件夹已打开', '打开 Agent 文件夹失败')}
       onQuit={() => { void agentApi.quitAgent(); }}

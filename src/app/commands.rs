@@ -492,8 +492,139 @@ pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), St
 }
 
 #[tauri::command]
-pub(crate) fn open_builtin_ai(app: AppHandle, state: State<'_, AgentState>) -> Result<(), String> {
-    crate::app::ui::open_builtin_ai(&app, &state.options)
+pub(crate) async fn start_builtin_ai_session(
+    state: State<'_, AgentState>,
+    model: Option<String>,
+) -> Result<String, String> {
+    let options = state.options.clone();
+    let logs = Arc::clone(&state.approval_manager);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::app::ui::start_builtin_ai_session(&options, model.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    match result {
+        Ok(session_url) => {
+            logs.add_log("info", "HiMind AI 会话已启动");
+            Ok(session_url)
+        }
+        Err(error) => {
+            logs.add_log("error", &format!("HiMind AI 会话启动失败: {error}"));
+            Err(present_builtin_ai_start_error(&error))
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn restart_builtin_ai_session(
+    state: State<'_, AgentState>,
+    model: Option<String>,
+) -> Result<String, String> {
+    let options = state.options.clone();
+    let logs = Arc::clone(&state.approval_manager);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::app::ui::restart_builtin_ai_session(&options, model.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    match result {
+        Ok(session_url) => {
+            logs.add_log("info", "HiMind AI 已切换模型并启动新会话");
+            Ok(session_url)
+        }
+        Err(error) => {
+            logs.add_log("error", &format!("HiMind AI 模型切换失败: {error}"));
+            Err(present_builtin_ai_start_error(&error))
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn get_builtin_ai_model_options(
+    state: State<'_, AgentState>,
+) -> Result<crate::runtime::builtin::BuiltinAIModelOptions, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::runtime::builtin::model_options(&options))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_builtin_ai_tool_context_summary(
+    state: State<'_, AgentState>,
+) -> Result<crate::runtime::builtin::BuiltinAIToolContextSummary, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::runtime::builtin::interactive_tool_context_summary(&options)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn get_builtin_ai_mcp_servers(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::app::mcp_settings::McpServerConfig>, String> {
+    crate::app::mcp_settings::load(&state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn save_builtin_ai_mcp_server(
+    state: State<'_, AgentState>,
+    server: crate::app::mcp_settings::McpServerConfig,
+) -> Result<crate::app::mcp_settings::McpServerConfig, String> {
+    let server = crate::app::mcp_settings::upsert(&state.state_path, server)
+        .map_err(|error| error.to_string())?;
+    crate::app::ui::stop_builtin_ai_process();
+    state.approval_manager.add_log(
+        "info",
+        &format!("已保存 HiMind AI MCP 服务: {}", server.server_name),
+    );
+    Ok(server)
+}
+
+#[tauri::command]
+pub(crate) fn delete_builtin_ai_mcp_server(
+    state: State<'_, AgentState>,
+    server_name: String,
+) -> Result<bool, String> {
+    let removed = crate::app::mcp_settings::remove(&state.state_path, &server_name)
+        .map_err(|error| error.to_string())?;
+    if removed {
+        crate::app::ui::stop_builtin_ai_process();
+        state
+            .approval_manager
+            .add_log("info", &format!("已删除 HiMind AI MCP 服务: {server_name}"));
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub(crate) fn validate_builtin_ai_mcp_server(
+    server: crate::app::mcp_settings::McpServerConfig,
+) -> Result<(), String> {
+    crate::app::mcp_settings::validate_config(&server)
+}
+
+fn present_builtin_ai_start_error(error: &str) -> String {
+    let normalized = error.to_lowercase();
+    if normalized.contains("请先登录")
+        || normalized.contains("授权已失效")
+        || normalized.contains("授权已过期")
+        || normalized.contains("missing scope")
+    {
+        return "需要登录 HiMind 账号后才能开始对话".to_string();
+    }
+    if normalized.contains("尚未生成 ai 凭证")
+        || normalized.contains("没有可用的 ai 服务")
+        || normalized.contains("没有可用渠道")
+    {
+        return "当前账号暂未分配可用 AI 服务".to_string();
+    }
+    if normalized.contains("尚未安装") || normalized.contains("组件状态") {
+        return "内置 AI 组件需要修复".to_string();
+    }
+    "HiMind AI 暂时无法启动，请稍后重试".to_string()
 }
 
 #[tauri::command]

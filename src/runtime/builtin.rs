@@ -2,6 +2,7 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::Value;
 use std::error::Error;
+use std::path::PathBuf;
 
 use crate::api::types::{RuntimeInstallationReport, Task};
 use crate::runtime::{deepseek_harness, AgentRunEnvelope, PROVIDER_BUILTIN};
@@ -9,6 +10,44 @@ use crate::Options;
 
 pub(crate) const ENGINE_ID: &str = "deepseek-harness";
 pub(crate) const CONTRACT_VERSION: u32 = 1;
+
+/// Product-facing runtime boundary. The active implementation can change
+/// without leaking its process, profile, or event details into the app layer.
+trait AIRuntimeAdapter: Sync {
+    fn probe(&self) -> RuntimeInstallationReport;
+    fn status(&self) -> BuiltinAIRuntimeStatus;
+    fn install(
+        &self,
+        options: &Options,
+        client_instance_id: &str,
+    ) -> Result<BuiltinAIRuntimeStatus, String>;
+    fn prepare_interactive_launch(
+        &self,
+        options: &Options,
+        requested_model: Option<&str>,
+    ) -> Result<BuiltinAIInteractiveLaunch, String>;
+    fn interactive_tool_context_summary(
+        &self,
+        options: &Options,
+    ) -> Result<BuiltinAIToolContextSummary, String>;
+    fn interactive_event_projector(&self) -> BuiltinAIEventProjector;
+    fn execute(
+        &self,
+        client: &Client,
+        options: &Options,
+        agent_id: &str,
+        task: &Task,
+        envelope: &AgentRunEnvelope,
+    ) -> Result<Value, Box<dyn Error>>;
+}
+
+struct DeepSeekHarnessAdapter;
+
+static ACTIVE_RUNTIME_ADAPTER: DeepSeekHarnessAdapter = DeepSeekHarnessAdapter;
+
+fn active_adapter() -> &'static dyn AIRuntimeAdapter {
+    &ACTIVE_RUNTIME_ADAPTER
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct BuiltinAIRuntimeEvent {
@@ -39,6 +78,41 @@ pub(crate) struct BuiltinAIRuntimeStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuiltinAIModelOptions {
+    pub selected_model: String,
+    pub models: Vec<String>,
+    pub source_type: String,
+    pub source_name: String,
+    pub source_provider: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuiltinAIToolContextSummary {
+    pub skills: usize,
+    pub mcp_services: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BuiltinAIInteractiveLaunch {
+    pub executable: PathBuf,
+    pub home: PathBuf,
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    pub permission_mode: &'static str,
+}
+
+pub(crate) struct BuiltinAIEventProjector {
+    inner: deepseek_harness::InteractiveEventProjector,
+}
+
+impl BuiltinAIEventProjector {
+    pub(crate) fn project(&mut self, message: &Value) -> Option<BuiltinAIRuntimeEvent> {
+        self.inner.project(message)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct BuiltinAIRuntimeDiagnostics {
     pub engine_id: String,
     pub executable_path: String,
@@ -47,28 +121,47 @@ pub(crate) struct BuiltinAIRuntimeDiagnostics {
 }
 
 pub(crate) fn probe() -> RuntimeInstallationReport {
-    deepseek_harness::probe()
+    active_adapter().probe()
 }
 
 pub(crate) fn status() -> BuiltinAIRuntimeStatus {
-    from_engine_status(deepseek_harness::status())
+    active_adapter().status()
 }
 
 pub(crate) fn install(
     options: &Options,
     client_instance_id: &str,
 ) -> Result<BuiltinAIRuntimeStatus, String> {
-    deepseek_harness::install(options, client_instance_id).map(from_engine_status)
+    active_adapter().install(options, client_instance_id)
+}
+
+pub(crate) fn model_options(options: &Options) -> Result<BuiltinAIModelOptions, String> {
+    crate::api::ai::fetch_client_model_options(options, "himind-agent")
+        .map(|options| BuiltinAIModelOptions {
+            selected_model: options.selected_model,
+            models: options.models,
+            source_type: options.source_type,
+            source_name: options.source_name,
+            source_provider: options.source_provider,
+        })
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn prepare_interactive_launch(
     options: &Options,
-) -> Result<deepseek_harness::InteractiveLaunch, String> {
-    deepseek_harness::prepare_interactive_launch(options)
+    requested_model: Option<&str>,
+) -> Result<BuiltinAIInteractiveLaunch, String> {
+    active_adapter().prepare_interactive_launch(options, requested_model)
 }
 
-pub(crate) fn interactive_event_projector() -> deepseek_harness::InteractiveEventProjector {
-    deepseek_harness::InteractiveEventProjector::default()
+pub(crate) fn interactive_tool_context_summary(
+    options: &Options,
+) -> Result<BuiltinAIToolContextSummary, String> {
+    active_adapter().interactive_tool_context_summary(options)
+}
+
+pub(crate) fn interactive_event_projector() -> BuiltinAIEventProjector {
+    active_adapter().interactive_event_projector()
 }
 
 pub(crate) fn execute(
@@ -78,7 +171,71 @@ pub(crate) fn execute(
     task: &Task,
     envelope: &AgentRunEnvelope,
 ) -> Result<Value, Box<dyn Error>> {
-    deepseek_harness::execute(client, options, agent_id, task, envelope)
+    active_adapter().execute(client, options, agent_id, task, envelope)
+}
+
+impl AIRuntimeAdapter for DeepSeekHarnessAdapter {
+    fn probe(&self) -> RuntimeInstallationReport {
+        deepseek_harness::probe()
+    }
+
+    fn status(&self) -> BuiltinAIRuntimeStatus {
+        from_engine_status(deepseek_harness::status())
+    }
+
+    fn install(
+        &self,
+        options: &Options,
+        client_instance_id: &str,
+    ) -> Result<BuiltinAIRuntimeStatus, String> {
+        deepseek_harness::install(options, client_instance_id).map(from_engine_status)
+    }
+
+    fn prepare_interactive_launch(
+        &self,
+        options: &Options,
+        requested_model: Option<&str>,
+    ) -> Result<BuiltinAIInteractiveLaunch, String> {
+        deepseek_harness::prepare_interactive_launch(options, requested_model).map(|launch| {
+            BuiltinAIInteractiveLaunch {
+                executable: launch.executable,
+                home: launch.home,
+                api_key: launch.api_key,
+                base_url: launch.base_url,
+                model: launch.model,
+                permission_mode: launch.permission_mode,
+            }
+        })
+    }
+
+    fn interactive_tool_context_summary(
+        &self,
+        options: &Options,
+    ) -> Result<BuiltinAIToolContextSummary, String> {
+        deepseek_harness::interactive_tool_context_summary(options).map(|summary| {
+            BuiltinAIToolContextSummary {
+                skills: summary.skills,
+                mcp_services: summary.mcp_services,
+            }
+        })
+    }
+
+    fn interactive_event_projector(&self) -> BuiltinAIEventProjector {
+        BuiltinAIEventProjector {
+            inner: deepseek_harness::InteractiveEventProjector::default(),
+        }
+    }
+
+    fn execute(
+        &self,
+        client: &Client,
+        options: &Options,
+        agent_id: &str,
+        task: &Task,
+        envelope: &AgentRunEnvelope,
+    ) -> Result<Value, Box<dyn Error>> {
+        deepseek_harness::execute(client, options, agent_id, task, envelope)
+    }
 }
 
 fn from_engine_status(

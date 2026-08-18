@@ -1,0 +1,16 @@
+# Managed by HiMind Agent. Organization AI configuration is provided by the host.
+# Keep ui-settings enabled: it provides the settingsScope service used by locale,
+# theme, and conversation plugins. Only Runtime-owned presentation surfaces are
+# removed from the embedded product experience.
+- id: ui-settings-general
+  disabled: true
+- id: ui-settings-models
+  disabled: true
+- id: ui-settings-plugin-inventory
+  disabled: true
+- id: ui-settings-plugins
+  disabled: true
+- id: ui-agent-preset
+  disabled: true
+- id: ui-model-selection
+  disabled: true

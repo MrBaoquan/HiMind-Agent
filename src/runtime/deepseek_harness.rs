@@ -19,6 +19,8 @@ use crate::app::system::{validate_update_download_url, verify_runtime_component_
 use crate::runtime::builtin::BuiltinAIRuntimeEvent;
 use crate::runtime::process;
 use crate::runtime::{execute_managed, AgentRunEnvelope, PROVIDER_BUILTIN};
+use crate::skill::store::SkillStore;
+use crate::skill::types::SkillRecord;
 use crate::Options;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
@@ -34,6 +36,11 @@ const RUNTIME_ARCHITECTURE: &str = "x64";
 const RUNTIME_MAX_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const INSTALL_TIMEOUT_SECONDS: u64 = 30 * 60;
+const INTERACTIVE_PERMISSION_MODE: &str = "workspace-write";
+const HIMIND_PROFILE: &str = "himind";
+const HIMIND_MCP_SERVER_NAME: &str = "himind";
+const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
+const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct InstalledRuntimeState {
@@ -63,6 +70,13 @@ pub(crate) struct InteractiveLaunch {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    pub permission_mode: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct InteractiveToolContextSummary {
+    pub skills: usize,
+    pub mcp_services: usize,
 }
 
 #[derive(Debug, Default)]
@@ -447,7 +461,10 @@ pub(crate) fn install(
     result.map(|_| status())
 }
 
-pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<InteractiveLaunch, String> {
+pub(crate) fn prepare_interactive_launch(
+    options: &Options,
+    requested_model: Option<&str>,
+) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     let delegated =
@@ -457,6 +474,7 @@ pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<Interactiv
         crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
             .map_err(|error| error.to_string())?;
     let home = dsh_home(&version)?;
+    let model = select_interactive_model(&credential.access, requested_model)?;
     let invocation = Invocation {
         executable: executable.clone(),
         args: Vec::new(),
@@ -464,18 +482,66 @@ pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<Interactiv
         home: home.clone(),
         api_key: credential.api_key.clone(),
         base_url: credential.access.base_url.clone(),
-        model: credential.access.model.clone(),
-        permission_mode: "ask",
+        model: model.clone(),
+        permission_mode: INTERACTIVE_PERMISSION_MODE,
         run_id: "interactive".to_string(),
     };
-    ensure_home_config(&invocation).map_err(|error| error.to_string())?;
+    ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
         api_key: credential.api_key,
         base_url: credential.access.base_url,
-        model: credential.access.model,
+        model,
+        permission_mode: INTERACTIVE_PERMISSION_MODE,
     })
+}
+
+pub(crate) fn interactive_tool_context_summary(
+    options: &Options,
+) -> Result<InteractiveToolContextSummary, String> {
+    let personal_mcp = crate::app::mcp_settings::load(&options.state_path)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|server| server.enabled)
+        .count();
+    Ok(InteractiveToolContextSummary {
+        skills: himind_skill_records()
+            .map_err(|error| error.to_string())?
+            .len(),
+        // The managed profile injects the Agent's local MCP bridge for every
+        // interactive session. Individual capabilities remain governed by Agent.
+        mcp_services: 1 + personal_mcp,
+    })
+}
+
+fn select_interactive_model(
+    credential: &crate::api::ai::AIUserCredential,
+    requested_model: Option<&str>,
+) -> Result<String, String> {
+    let fallback = credential.model.trim();
+    let requested = requested_model.unwrap_or_default().trim();
+    let selected = if requested.is_empty() {
+        fallback
+    } else {
+        requested
+    };
+    if selected.is_empty() {
+        return Err("当前账号没有可用模型".to_string());
+    }
+    let mut allowed = credential
+        .models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .collect::<Vec<_>>();
+    if !fallback.is_empty() && !allowed.iter().any(|model| *model == fallback) {
+        allowed.push(fallback);
+    }
+    if !allowed.is_empty() && !allowed.iter().any(|model| *model == selected) {
+        return Err("所选模型不在当前 AI 服务的可用范围内".to_string());
+    }
+    Ok(selected.to_string())
 }
 
 fn validate_update(api_base: &str, update: &RuntimeComponentUpdate) -> Result<(), String> {
@@ -801,7 +867,7 @@ fn execute_claimed(
     let invocation = build_invocation(options, claim)?;
     process::verify_command(&invocation.executable, &["--version"])
         .map_err(|error| format!("DeepSeek Harness CLI is unavailable: {error}"))?;
-    ensure_home_config(&invocation)?;
+    ensure_home_config(&invocation, options)?;
     update_agent_run_status(
         client,
         &options.api_base,
@@ -947,17 +1013,18 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
     Ok(command.spawn()?)
 }
 
-fn ensure_home_config(invocation: &Invocation) -> Result<(), Box<dyn Error>> {
+fn ensure_home_config(invocation: &Invocation, options: &Options) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&invocation.home)?;
-    ensure_himind_profile(&invocation.home)?;
+    ensure_himind_skill_adapter(&invocation.home)?;
+    ensure_himind_profile(&invocation.home, options)?;
     let settings = render_settings(&invocation.model, &invocation.base_url);
     let path = invocation.home.join("settings.yaml");
     fs::write(path, settings)?;
     Ok(())
 }
 
-fn ensure_himind_profile(home: &Path) -> Result<(), Box<dyn Error>> {
-    let profile = home.join("profiles").join("himind");
+fn ensure_himind_profile(home: &Path, options: &Options) -> Result<(), Box<dyn Error>> {
+    let profile = home.join("profiles").join(HIMIND_PROFILE);
     fs::create_dir_all(&profile)?;
     let files = [
         (
@@ -972,15 +1039,234 @@ fn ensure_himind_profile(home: &Path) -> Result<(), Box<dyn Error>> {
             "cordis.yml",
             include_str!("../../runtime-profiles/himind/cordis.yml"),
         ),
-        (
-            "cordis.patch.yml",
-            include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
-        ),
     ];
     for (name, content) in files {
         fs::write(profile.join(name), content)?;
     }
+    fs::write(
+        profile.join("cordis.patch.yml"),
+        render_himind_profile_patch(home, options)?,
+    )?;
     Ok(())
+}
+
+fn render_himind_profile_patch(home: &Path, options: &Options) -> Result<String, Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let args = himind_mcp_arguments(options);
+    let mut patch = include_str!("../../runtime-profiles/himind/cordis.patch.yml")
+        .trim_end()
+        .to_string();
+    patch.push_str("\n\n# Agent-owned context. This layer is regenerated for each new HiMind AI session.\n- insert:\n");
+    patch.push_str("    - id: himind-mcp\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        transport: stdio\n");
+    patch.push_str(&format!(
+        "        serverName: {}\n        command: {}\n        args:\n",
+        yaml_scalar(HIMIND_MCP_SERVER_NAME),
+        yaml_scalar(&executable.to_string_lossy()),
+    ));
+    for argument in args {
+        patch.push_str(&format!("          - {}\n", yaml_scalar(&argument)));
+    }
+    patch.push_str(&format!(
+        "        env:\n          HIMIND_AI_CLIENT_ID: {}\n        failOnStartupError: false\n        reconnect:\n          enabled: true\n          initialDelayMs: 500\n          maxDelayMs: 30000\n          maxAttempts: 5\n",
+        yaml_scalar(HIMIND_MCP_CLIENT_ID),
+    ));
+    for server in crate::app::mcp_settings::load(&options.state_path)? {
+        append_personal_mcp_row(&mut patch, &server);
+    }
+    patch.push_str(&format!(
+        "\n    - id: himind-skill-filesystem\n      name: '@deepseek-ai/dsh-skill-filesystem'\n      config:\n        providerName: himind-managed\n        includeDefaultRoots: false\n        customSkillDirs:\n          - {}\n        watch: false\n",
+        yaml_scalar(&home.join(HIMIND_SKILL_ADAPTER_DIR).to_string_lossy()),
+    ));
+    Ok(patch)
+}
+
+fn append_personal_mcp_row(patch: &mut String, server: &crate::app::mcp_settings::McpServerConfig) {
+    patch.push_str(&format!(
+        "\n    - id: personal-mcp-{}\n      name: '@deepseek-ai/dsh-mcp-client'\n",
+        server.server_name
+    ));
+    if !server.enabled {
+        patch.push_str("      disabled: true\n");
+    }
+    patch.push_str(&format!(
+        "      config:\n        transport: {}\n        serverName: {}\n",
+        yaml_scalar(&server.transport),
+        yaml_scalar(&server.server_name),
+    ));
+    if server.transport == "stdio" {
+        patch.push_str(&format!(
+            "        command: {}\n",
+            yaml_scalar(&server.command)
+        ));
+        if !server.args.is_empty() {
+            patch.push_str("        args:\n");
+            for argument in &server.args {
+                patch.push_str(&format!("          - {}\n", yaml_scalar(argument)));
+            }
+        }
+        if !server.env.is_empty() {
+            patch.push_str("        env:\n");
+            for (key, value) in &server.env {
+                patch.push_str(&format!(
+                    "          {}: {}\n",
+                    yaml_scalar(key),
+                    yaml_scalar(value)
+                ));
+            }
+        }
+        if !server.cwd.is_empty() {
+            patch.push_str(&format!("        cwd: {}\n", yaml_scalar(&server.cwd)));
+        }
+    } else {
+        patch.push_str(&format!("        url: {}\n", yaml_scalar(&server.url)));
+        if !server.headers.is_empty() {
+            patch.push_str("        headers:\n");
+            for (key, value) in &server.headers {
+                patch.push_str(&format!(
+                    "          {}: {}\n",
+                    yaml_scalar(key),
+                    yaml_scalar(value)
+                ));
+            }
+        }
+    }
+    patch.push_str(&format!(
+        "        toolCallTimeoutMs: {}\n        failOnStartupError: {}\n        reconnect:\n          enabled: {}\n",
+        server.tool_call_timeout_ms,
+        server.fail_on_startup_error,
+        server.reconnect,
+    ));
+}
+
+fn himind_mcp_arguments(options: &Options) -> Vec<String> {
+    vec![
+        "--mcp".to_string(),
+        "--api".to_string(),
+        options.api_base.clone(),
+        "--state".to_string(),
+        options.state_path.to_string_lossy().to_string(),
+    ]
+}
+
+fn ensure_himind_skill_adapter(home: &Path) -> Result<(), Box<dyn Error>> {
+    let records = himind_skill_records()?;
+    let target = home.join(HIMIND_SKILL_ADAPTER_DIR);
+    let staging = home.join(format!(
+        ".{HIMIND_SKILL_ADAPTER_DIR}-staging-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    ));
+    fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        for record in &records {
+            let name = dsh_skill_name(&record.manifest.id);
+            let destination = staging.join(&name);
+            copy_skill_package(record, &destination)?;
+            let source = fs::read_to_string(record.version_root.join("SKILL.md"))?;
+            fs::write(
+                destination.join("SKILL.md"),
+                render_dsh_skill(record, &name, &source),
+            )?;
+        }
+        if target.exists() {
+            fs::remove_dir_all(&target)?;
+        }
+        fs::rename(&staging, &target)?;
+        Ok(())
+    })();
+    if result.is_err() && staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn himind_skill_records() -> Result<Vec<SkillRecord>, Box<dyn Error>> {
+    let store = SkillStore::new();
+    store.bootstrap_builtin_skills()?;
+    store.list_records()
+}
+
+fn copy_skill_package(record: &SkillRecord, destination: &Path) -> Result<(), Box<dyn Error>> {
+    for entry in walkdir::WalkDir::new(&record.version_root).follow_links(false) {
+        let entry = entry?;
+        if entry.path() == record.version_root {
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "HiMind Skill 包不能包含符号链接: {}",
+                entry.path().display()
+            )
+            .into());
+        }
+        let relative = entry.path().strip_prefix(&record.version_root)?;
+        let target = destination.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn render_dsh_skill(record: &SkillRecord, name: &str, source: &str) -> String {
+    let description = if record.manifest.description.trim().is_empty() {
+        record.manifest.name.trim()
+    } else {
+        record.manifest.description.trim()
+    };
+    format!(
+        "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+        yaml_scalar(name),
+        yaml_scalar(description),
+        strip_yaml_frontmatter(source).trim(),
+    )
+}
+
+fn strip_yaml_frontmatter(source: &str) -> &str {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let Some(first_line_end) = source.find('\n') else {
+        return source;
+    };
+    if source[..first_line_end].trim_end_matches('\r') != "---" {
+        return source;
+    }
+    let remainder = &source[first_line_end + 1..];
+    let mut offset = first_line_end + 1;
+    for line in remainder.split_inclusive('\n') {
+        if line.trim() == "---" {
+            return &source[offset + line.len()..];
+        }
+        offset += line.len();
+    }
+    source
+}
+
+fn dsh_skill_name(skill_id: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for byte in skill_id.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            slug.push((byte as char).to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let mut digest = Sha256::new();
+    digest.update(skill_id.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    format!(
+        "himind-{}-{}",
+        if slug.is_empty() { "skill" } else { slug },
+        &digest[..10]
+    )
 }
 
 fn render_settings(model: &str, base_url: &str) -> String {
@@ -1093,10 +1379,14 @@ fn first_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        first_line, parse_runtime_version, safe_relative_path, safe_segment, versioned_home,
-        InteractiveEventProjector,
+        dsh_skill_name, first_line, parse_runtime_version, render_himind_profile_patch,
+        safe_relative_path, safe_segment, select_interactive_model, strip_yaml_frontmatter,
+        versioned_home, InteractiveEventProjector,
     };
+    use crate::api::ai::AIUserCredential;
+    use crate::app::mcp_settings::McpServerConfig;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn extracts_first_non_empty_version_line() {
@@ -1122,6 +1412,103 @@ mod tests {
     }
 
     #[test]
+    fn managed_profile_adds_agent_mcp_and_himind_skills_without_default_roots() {
+        let mut options = crate::Options::from_env();
+        options.api_base = "https://dashboard.example".to_string();
+        options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        let patch =
+            render_himind_profile_patch(std::path::Path::new("C:/HiMind/runtime-home"), &options)
+                .unwrap();
+
+        assert!(patch.contains("id: himind-mcp"));
+        assert!(patch.contains("name: '@deepseek-ai/dsh-mcp-client'"));
+        assert!(patch.contains("HIMIND_AI_CLIENT_ID: \"himind-ai\""));
+        assert!(patch.contains("id: himind-skill-filesystem"));
+        assert!(patch.contains("providerName: himind-managed"));
+        assert!(patch.contains("includeDefaultRoots: false"));
+        assert!(
+            patch.contains("C:/HiMind/runtime-home\\\\himind-skills")
+                || patch.contains("C:/HiMind/runtime-home/himind-skills")
+        );
+    }
+
+    #[test]
+    fn managed_profile_adds_personal_mcp_connections() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-profile-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut options = crate::Options::from_env();
+        options.api_base = "https://dashboard.example".to_string();
+        options.state_path = root.join("agent-state.json");
+        let server = McpServerConfig {
+            server_name: "project-tools".to_string(),
+            display_name: "Project tools".to_string(),
+            transport: "stdio".to_string(),
+            command: "node".to_string(),
+            args: vec!["server.js".to_string()],
+            env: BTreeMap::from([("API_KEY".to_string(), "local-secret".to_string())]),
+            cwd: "C:/Projects/demo".to_string(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            tool_call_timeout_ms: 45_000,
+            fail_on_startup_error: false,
+            reconnect: true,
+            enabled: false,
+        };
+        crate::app::mcp_settings::upsert(&options.state_path, server).unwrap();
+
+        let patch = render_himind_profile_patch(&root.join("runtime-home"), &options).unwrap();
+        assert!(patch.contains("id: himind-mcp"));
+        assert!(patch.contains("id: personal-mcp-project-tools"));
+        assert!(patch.contains("serverName: \"project-tools\""));
+        assert!(patch.contains("command: \"node\""));
+        assert!(patch.contains("\"API_KEY\": \"local-secret\""));
+        assert!(patch.contains("toolCallTimeoutMs: 45000"));
+        assert!(patch.contains("disabled: true"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn himind_skill_adapter_uses_valid_stable_names_and_one_frontmatter_block() {
+        let name = dsh_skill_name("com.himind.skill.example_tool");
+        assert!(name.starts_with("himind-com-himind-skill-example-tool-"));
+        assert!(name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+        assert_eq!(
+            strip_yaml_frontmatter(
+                "---\r\nname: original\r\ndescription: old\r\n---\r\n\r\n# Body"
+            )
+            .trim(),
+            "# Body"
+        );
+        assert_eq!(name, dsh_skill_name("com.himind.skill.example_tool"));
+    }
+
+    #[test]
+    fn interactive_model_must_be_in_the_assigned_catalog() {
+        let credential = AIUserCredential {
+            active_entitlement_id: "entitlement".to_string(),
+            active_personal_connection_id: String::new(),
+            status: "active".to_string(),
+            base_url: "https://example.test".to_string(),
+            model: "fast".to_string(),
+            models: vec!["fast".to_string(), "deep".to_string()],
+        };
+        assert_eq!(
+            select_interactive_model(&credential, Some("deep")).unwrap(),
+            "deep"
+        );
+        assert!(select_interactive_model(&credential, Some("unknown")).is_err());
+    }
+
+    #[test]
     fn settings_route_uses_only_the_claim_scoped_himind_proxy() {
         let settings = super::render_settings(
             "deepseek-model",
@@ -1135,6 +1522,42 @@ mod tests {
             settings.contains("baseURL: \"https://dashboard.example/api/agent/runs/run-1/ai/v1\"")
         );
         assert!(!settings.contains("apiKey:"));
+    }
+
+    #[test]
+    fn managed_web_profile_hides_runtime_configuration_without_removing_settings_service() {
+        let profile = include_str!("../../runtime-profiles/web/cordis.patch.yml");
+        for id in [
+            "ui-settings-general",
+            "ui-settings-models",
+            "ui-settings-plugin-inventory",
+            "ui-settings-plugins",
+            "ui-agent-preset",
+            "ui-model-selection",
+        ] {
+            assert!(profile.contains(&format!("- id: {id}\n  disabled: true")));
+        }
+        assert!(!profile.contains("- id: ui-settings\n  disabled: true"));
+    }
+
+    #[test]
+    fn himind_profile_keeps_personal_plugin_settings_open() {
+        let profile = include_str!("../../runtime-profiles/himind/cordis.patch.yml");
+        for id in [
+            "ui-settings-models",
+            "ui-agent-preset",
+            "ui-model-selection",
+        ] {
+            assert!(profile.contains(&format!("- id: {id}\n  disabled: true")));
+        }
+        for id in [
+            "ui-settings",
+            "ui-settings-general",
+            "ui-settings-plugin-inventory",
+            "ui-settings-plugins",
+        ] {
+            assert!(!profile.contains(&format!("- id: {id}\n  disabled: true")));
+        }
     }
 
     #[test]

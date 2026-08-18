@@ -74,7 +74,8 @@ export type ApprovalItem = {
 export type UnityEditorSettings = {
     unity_editor_path: string;
     workflow_default_path: string;
-    source: 'agent' | 'environment' | 'unset';
+    discovered_path?: string;
+    source: 'agent' | 'environment' | 'discovered' | 'unset';
     valid: boolean;
 };
 
@@ -103,6 +104,35 @@ export type BuiltinAIRuntimeStatus = {
         contract_version: number;
         update_mode: string;
     };
+};
+
+export type BuiltinAIModelOptions = {
+    selected_model: string;
+    models: string[];
+    source_type: 'personal' | 'organization' | string;
+    source_name: string;
+    source_provider: string;
+};
+
+export type BuiltinAIToolContextSummary = {
+    skills: number;
+    mcp_services: number;
+};
+
+export type BuiltinAIMcpServer = {
+    server_name: string;
+    display_name: string;
+    transport: 'stdio' | 'streamable-http';
+    command: string;
+    args: string[];
+    env: Record<string, string>;
+    cwd: string;
+    url: string;
+    headers: Record<string, string>;
+    tool_call_timeout_ms: number;
+    fail_on_startup_error: boolean;
+    reconnect: boolean;
+    enabled: boolean;
 };
 
 export type LoginState = {
@@ -814,8 +844,15 @@ export const agentApi = {
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
     saveRemoteExecutionSettings: (settings: RemoteExecutionSettings, fullAccessConfirmed = false) => invoke<RemoteExecutionSettings>('save_remote_execution_settings', { settings, fullAccessConfirmed }),
     builtinAiRuntimeStatus: () => invoke<BuiltinAIRuntimeStatus>('get_builtin_ai_runtime_status'),
+    builtinAiModelOptions: () => invoke<BuiltinAIModelOptions>('get_builtin_ai_model_options'),
+    builtinAiToolContextSummary: () => invoke<BuiltinAIToolContextSummary>('get_builtin_ai_tool_context_summary'),
+    builtinAiMcpServers: () => invoke<BuiltinAIMcpServer[]>('get_builtin_ai_mcp_servers'),
+    saveBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<BuiltinAIMcpServer>('save_builtin_ai_mcp_server', { server }),
+    deleteBuiltinAiMcpServer: (serverName: string) => invoke<boolean>('delete_builtin_ai_mcp_server', { serverName }),
+    validateBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<void>('validate_builtin_ai_mcp_server', { server }),
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
-    openBuiltinAi: () => invoke<void>('open_builtin_ai'),
+    startBuiltinAiSession: (model?: string) => invoke<string>('start_builtin_ai_session', { model: model || null }),
+    restartBuiltinAiSession: (model?: string) => invoke<string>('restart_builtin_ai_session', { model: model || null }),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),

@@ -1272,6 +1272,7 @@ mod tests {
         AIClientCredential {
             access: AIUserCredential {
                 active_entitlement_id: "ent-1".to_string(),
+                active_personal_connection_id: String::new(),
                 status: "active".to_string(),
                 base_url: "https://ai.example.com/v1/".to_string(),
                 model: models.first().copied().unwrap_or("default").to_string(),

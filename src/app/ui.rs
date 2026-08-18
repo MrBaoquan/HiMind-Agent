@@ -1,7 +1,10 @@
 use std::{
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -27,9 +30,14 @@ struct BuiltinAiSession {
 
 static BUILTIN_AI_SESSION: std::sync::OnceLock<Mutex<Option<BuiltinAiSession>>> =
     std::sync::OnceLock::new();
+static BUILTIN_AI_STARTING: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
 
 fn builtin_ai_session() -> &'static Mutex<Option<BuiltinAiSession>> {
     BUILTIN_AI_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+fn builtin_ai_starting() -> &'static AtomicBool {
+    BUILTIN_AI_STARTING.get_or_init(|| AtomicBool::new(false))
 }
 
 pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::Error>> {
@@ -110,9 +118,6 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                 api.prevent_close();
                 let _ = window.hide();
             }
-            ("builtin-ai", WindowEvent::CloseRequested { .. }) => {
-                stop_builtin_ai_process();
-            }
             (label, WindowEvent::CloseRequested { api, .. })
                 if label.starts_with("plugin-view-") =>
             {
@@ -149,8 +154,15 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_remote_execution_settings,
             super::commands::save_remote_execution_settings,
             super::commands::get_builtin_ai_runtime_status,
+            super::commands::get_builtin_ai_model_options,
+            super::commands::get_builtin_ai_tool_context_summary,
+            super::commands::get_builtin_ai_mcp_servers,
+            super::commands::save_builtin_ai_mcp_server,
+            super::commands::delete_builtin_ai_mcp_server,
+            super::commands::validate_builtin_ai_mcp_server,
             super::commands::install_builtin_ai_runtime,
-            super::commands::open_builtin_ai,
+            super::commands::start_builtin_ai_session,
+            super::commands::restart_builtin_ai_session,
             super::commands::set_approval_rule,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
@@ -578,16 +590,44 @@ pub(crate) fn open_plugin_view(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("builtin-ai") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        return Ok(());
+pub(crate) fn start_builtin_ai_session(
+    options: &Options,
+    requested_model: Option<&str>,
+) -> Result<String, String> {
+    if let Some(session) = builtin_ai_session()
+        .lock()
+        .map_err(|_| "HiMind AI 会话状态不可用")?
+        .as_ref()
+    {
+        return Ok(session.proxy.url().to_string());
+    }
+    if builtin_ai_starting().swap(true, Ordering::AcqRel) {
+        return Err("HiMind AI 正在启动，请稍后重试".to_string());
     }
 
+    let result = start_builtin_ai_session_inner(options, requested_model);
+    builtin_ai_starting().store(false, Ordering::Release);
+    result
+}
+
+pub(crate) fn restart_builtin_ai_session(
+    options: &Options,
+    requested_model: Option<&str>,
+) -> Result<String, String> {
+    if builtin_ai_starting().swap(true, Ordering::AcqRel) {
+        return Err("HiMind AI 正在启动，请稍后重试".to_string());
+    }
     stop_builtin_ai_process();
-    let launch = crate::runtime::builtin::prepare_interactive_launch(options)?;
+    let result = start_builtin_ai_session_inner(options, requested_model);
+    builtin_ai_starting().store(false, Ordering::Release);
+    result
+}
+
+fn start_builtin_ai_session_inner(
+    options: &Options,
+    requested_model: Option<&str>,
+) -> Result<String, String> {
+    let launch = crate::runtime::builtin::prepare_interactive_launch(options, requested_model)?;
     let mut command = if launch
         .executable
         .extension()
@@ -600,12 +640,12 @@ pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Resu
         Command::new(&launch.executable)
     };
     command
-        .args(["--profile", "web", "--host", "127.0.0.1", "--port", "0"])
+        .args(["--profile", "himind", "--host", "127.0.0.1", "--port", "0"])
         .env("DSH_HOME", &launch.home)
         .env("DEEPSEEK_API_KEY", &launch.api_key)
         .env("DEEPSEEK_BASE_URL", &launch.base_url)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
-        .env("DSH_PERMISSION_MODE", "ask")
+        .env("DSH_PERMISSION_MODE", launch.permission_mode)
         .env("HIMIND_BUILTIN_AI_MODEL", &launch.model)
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
@@ -622,8 +662,11 @@ pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Resu
     let stdout = child.stdout.take().ok_or("HiMind AI 没有返回启动输出")?;
     let stderr = child.stderr.take();
     let (url_sender, url_receiver) = std::sync::mpsc::channel::<String>();
+    let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stdout_diagnostics = Arc::clone(&diagnostics);
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines().flatten() {
+            append_builtin_ai_diagnostic(&stdout_diagnostics, &line);
             if let Some(url) = line
                 .split_whitespace()
                 .find(|value| value.starts_with("http://127.0.0.1:"))
@@ -633,9 +676,10 @@ pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Resu
         }
     });
     if let Some(stderr) = stderr {
+        let stderr_diagnostics = Arc::clone(&diagnostics);
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().flatten() {
-                eprintln!("HiMind AI: {line}");
+                append_builtin_ai_diagnostic(&stderr_diagnostics, &line);
             }
         });
     }
@@ -645,21 +689,29 @@ pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Resu
             break url;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            crate::runtime::process::terminate_process_tree(&mut child);
             let _ = child.wait();
-            return Err("HiMind AI 启动超时，请检查内置组件状态".to_string());
+            return Err(builtin_ai_startup_error(
+                "HiMind AI 启动超时，请检查内置组件状态",
+                &diagnostics,
+                &launch.api_key,
+            ));
         }
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("HiMind AI 启动失败（退出码 {:?}）", status.code()));
+            return Err(builtin_ai_startup_error(
+                &format!("HiMind AI 启动失败（退出码 {:?}）", status.code()),
+                &diagnostics,
+                &launch.api_key,
+            ));
         }
     };
     let (event_sync, observer) = BuiltinAiEventSync::start(options.clone());
     let proxy = BuiltinAiProxy::start(&url, Some(observer)).map_err(|error| {
-        let _ = child.kill();
+        crate::runtime::process::terminate_process_tree(&mut child);
         let _ = child.wait();
         error
     })?;
-    let window_url = proxy.url().to_string();
+    let session_url = proxy.url().to_string();
     *builtin_ai_session()
         .lock()
         .map_err(|_| "HiMind AI 会话状态不可用")? = Some(BuiltinAiSession {
@@ -667,21 +719,43 @@ pub(crate) fn open_builtin_ai(app: &tauri::AppHandle, options: &Options) -> Resu
         proxy,
         event_sync,
     });
-    WebviewWindowBuilder::new(
-        app,
-        "builtin-ai",
-        WebviewUrl::External(window_url.parse().map_err(|_| "HiMind AI 地址无效")?),
+    Ok(session_url)
+}
+
+fn append_builtin_ai_diagnostic(diagnostics: &Arc<Mutex<Vec<String>>>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    if let Ok(mut lines) = diagnostics.lock() {
+        if lines.len() == 24 {
+            lines.remove(0);
+        }
+        lines.push(line.to_string());
+    }
+}
+
+fn builtin_ai_startup_error(
+    summary: &str,
+    diagnostics: &Arc<Mutex<Vec<String>>>,
+    api_key: &str,
+) -> String {
+    let detail = diagnostics
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default();
+    if detail.is_empty() {
+        return summary.to_string();
+    }
+    let detail = if api_key.is_empty() {
+        detail
+    } else {
+        detail.replace(api_key, "[redacted]")
+    };
+    format!(
+        "{summary}: {}",
+        crate::runtime::process::summarize_output(&detail, 1_200)
     )
-    .title("HiMind AI")
-    .inner_size(1220.0, 820.0)
-    .min_inner_size(860.0, 620.0)
-    .resizable(true)
-    .build()
-    .map(|_| ())
-    .map_err(|error| {
-        stop_builtin_ai_process();
-        format!("打开 HiMind AI 失败：{error}")
-    })
 }
 
 pub(crate) fn stop_builtin_ai_process() {
@@ -689,7 +763,7 @@ pub(crate) fn stop_builtin_ai_process() {
         if let Some(mut session) = active.take() {
             session.proxy.stop();
             session.event_sync.stop();
-            let _ = session.child.kill();
+            crate::runtime::process::terminate_process_tree(&mut session.child);
             let _ = session.child.wait();
         }
     }
@@ -774,5 +848,23 @@ mod internal_window_filter_tests {
     fn preserves_tao_event_target_used_by_app_exit() {
         assert!(!should_hide_internal_window("Tao Thread Event Target"));
         assert!(should_hide_internal_window("internal-sic"));
+    }
+}
+
+#[cfg(test)]
+mod builtin_ai_startup_tests {
+    use super::builtin_ai_startup_error;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn startup_diagnostics_redact_the_runtime_api_key() {
+        let diagnostics = Arc::new(Mutex::new(vec![
+            "runtime failed with api_key=secret-value".to_string()
+        ]));
+
+        let error = builtin_ai_startup_error("HiMind AI 启动失败", &diagnostics, "secret-value");
+
+        assert!(error.contains("[redacted]"));
+        assert!(!error.contains("secret-value"));
     }
 }

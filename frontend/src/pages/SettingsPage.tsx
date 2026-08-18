@@ -141,7 +141,7 @@ export function SettingsPage({
       onUnityEditorSettingsChange(result);
       setUnityEditorSettings(result);
       setUnityEditorPath(result.unity_editor_path);
-      setEditorFeedback(path ? '已保存' : result.source === 'environment' ? '已恢复团队默认设置' : '已清除设置，当前没有团队默认编辑器');
+      setEditorFeedback(path ? '已保存' : ['environment', 'discovered'].includes(result.source) ? '已恢复默认编辑器' : '已清除设置，当前没有可用编辑器');
     } catch {
       setEditorFeedback('无法保存，请确认 Unity.exe 路径后重试');
     } finally {
@@ -154,7 +154,7 @@ export function SettingsPage({
   const editorState = unityEditorSettings || settings.editors;
   const editorDirty = unityEditorPath.trim() !== (editorState?.unity_editor_path || '');
   const editorStatus = editorState?.valid ? '可用' : editorState?.source === 'unset' ? '未配置' : '路径不可用';
-  const editorSource = editorState?.source === 'agent' ? '自定义' : editorState?.source === 'environment' ? '团队默认' : '未设置';
+  const editorSource = editorState?.source === 'agent' ? '自定义' : editorState?.source === 'environment' ? '团队默认' : editorState?.source === 'discovered' ? '本机安装' : '未设置';
   const updateRemoteExecution = (patch: Partial<RemoteExecutionSettings>) => {
     const next = { ...remoteExecutionSettings, ...patch };
     const enteringFullAccess = next.access_mode === 'full_access'
@@ -271,7 +271,7 @@ export function SettingsPage({
             <div className="unity-editor-body">
               <div className="unity-editor-source">
                 <div><span>当前来源</span><strong>{editorSource}</strong></div>
-                <small>{editorState?.source === 'environment' ? '当前使用团队提供的默认编辑器。' : '没有团队默认编辑器时，可以在此选择 Unity.exe。'}</small>
+                <small>{editorState?.source === 'environment' ? '当前使用团队提供的默认编辑器。' : editorState?.source === 'discovered' ? '已从本机常规安装目录发现 Unity 编辑器。' : '没有团队默认编辑器时，可以在此选择 Unity.exe。'}</small>
               </div>
               <label className="unity-editor-field" htmlFor="unity-editor-path">
                 <span>Unity.exe 路径</span>

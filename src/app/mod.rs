@@ -7,6 +7,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod extension_reconciler;
 pub mod http;
 pub(crate) mod identity;
+pub(crate) mod mcp_settings;
 pub(crate) mod plugin_manager;
 pub(crate) mod remote_execution;
 pub(crate) mod security;

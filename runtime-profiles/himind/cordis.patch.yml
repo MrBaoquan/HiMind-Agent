@@ -12,20 +12,12 @@
     surfaceContext: false
     trustedHosts: []
 
-# HiMind owns these controls and injects their values through the host bridge.
-- id: ui-settings
-  disabled: true
-- id: ui-settings-general
-  disabled: true
+# HiMind owns organization models and connections. Keep the Runtime's general
+# and extension settings available so personal and workspace extensions stay open.
+# ui-settings also provides settingsScope to locale, theme, and conversation.
 - id: ui-settings-models
-  disabled: true
-- id: ui-settings-plugin-inventory
-  disabled: true
-- id: ui-settings-plugins
   disabled: true
 - id: ui-agent-preset
   disabled: true
 - id: ui-model-selection
-  disabled: true
-- id: ui-workspace
   disabled: true

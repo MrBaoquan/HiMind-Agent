@@ -2,6 +2,7 @@ use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_P
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -243,7 +244,24 @@ pub(crate) fn ensure_default_svn_credentials(username: &str) -> Result<bool, Box
 }
 
 pub(crate) fn svn_admin_ready() -> bool {
+    load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)
+        .map(|(connection, _)| connection.status == "ready")
+        .unwrap_or(false)
+}
+
+pub(crate) fn svn_admin_credentials_configured() -> bool {
     load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID).is_ok()
+}
+
+pub(crate) fn verify_svn_admin_credentials() -> Result<(), Box<dyn Error>> {
+    let (connection, password) = load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)?;
+    let _ = login_svnadmin(&connection.username, &password)?;
+    update_local_svn_connection_status(SVN_ADMIN_CONNECTION_ID, "ready", "")?;
+    Ok(())
+}
+
+pub(crate) fn remove_svn_admin_credentials() -> Result<bool, Box<dyn Error>> {
+    remove_local_svn_connection(SVN_ADMIN_CONNECTION_ID)
 }
 
 pub(crate) fn svn_admin_status() -> &'static str {
@@ -251,15 +269,18 @@ pub(crate) fn svn_admin_status() -> &'static str {
         Ok(connections) => connections,
         Err(_) => return "unreadable",
     };
-    if !connections.iter().any(|item| {
+    let Some(connection) = connections.iter().find(|item| {
         item.id == SVN_ADMIN_CONNECTION_ID && !item.encrypted_password.trim().is_empty()
-    }) {
+    }) else {
         return "missing";
+    };
+    if load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID).is_err() {
+        return "unreadable";
     }
-    if svn_admin_ready() {
+    if connection.status == "ready" {
         "ready"
     } else {
-        "unreadable"
+        "unknown"
     }
 }
 
@@ -381,7 +402,7 @@ pub(crate) fn test_connection() -> Result<Value, Box<dyn Error>> {
 
 fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error>> {
     let executable = find_svn_executable().ok_or("SVN CLI was not found")?;
-    let mut child = Command::new(&executable)
+    let mut child = match Command::new(&executable)
         .args([
             "info".to_string(),
             SVN_SERVICE_URL.to_string(),
@@ -395,7 +416,14 @@ fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return login_svn_user_over_http(username, password);
+        }
+        Err(error) => return Err(error.into()),
+    };
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(password.as_bytes())?;
         stdin.write_all(b"\r\n")?;
@@ -414,6 +442,39 @@ fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error
     // The repository root URL is not itself a repository, so an info probe
     // legitimately fails after authentication succeeded (E190001/E170013).
     Ok(json!({ "authenticated": true, "username": username }))
+}
+
+fn login_svn_user_over_http(username: &str, password: &str) -> Result<Value, Box<dyn Error>> {
+    login_svn_user_over_http_at(SVN_SERVICE_URL, username, password)
+}
+
+fn login_svn_user_over_http_at(
+    service_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let response = client
+        .get(service_url)
+        .basic_auth(username, Some(password))
+        .header("Depth", "0")
+        .send()?;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED {
+        return Err("SVN account or password is invalid".into());
+    }
+    if status.is_server_error() {
+        return Err(format!("SVN service returned HTTP {status}").into());
+    }
+    Ok(json!({
+        "authenticated": true,
+        "username": username,
+        "verification": "http"
+    }))
 }
 
 fn ensure_svn_user_account(username: &str, password: &str) -> Result<bool, Box<dyn Error>> {
@@ -5208,6 +5269,30 @@ mod tests {
         assert!(diagnostic.contains("proxy=disabled"));
         assert!(diagnostic.contains("dns_host=127.0.0.1"));
         assert!(diagnostic.contains("resolved=127.0.0.1"));
+    }
+
+    #[test]
+    fn http_svn_auth_fallback_accepts_authenticated_non_401_responses() {
+        fn probe(response: &'static str) -> Result<Value, Box<dyn Error>> {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result =
+                login_svn_user_over_http_at(&format!("http://{address}"), "user", "password");
+            server.join().unwrap();
+            result
+        }
+
+        assert!(probe("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").is_ok());
+        assert!(probe("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n").is_err());
     }
 
     #[test]

@@ -176,6 +176,17 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
           </div>
         </div>
         <nav aria-label="主导航">
+          <button
+            type="button"
+            className={`sidebar-ai-entry ${currentPage === 'builtin-ai' ? 'active' : ''}`}
+            onClick={onOpenBuiltinAi}
+            aria-current={currentPage === 'builtin-ai' ? 'page' : undefined}
+            aria-label="打开 HiMind AI"
+            title="打开 HiMind AI"
+          >
+            <MessageCircle size={17} strokeWidth={1.8} aria-hidden="true" />
+            <span>HiMind AI</span>
+          </button>
           {navSections.map(section => (
             <div className="sidebar-nav-group" key={section.label}>
               <span className="sidebar-section-label">{section.label}</span>
@@ -220,8 +231,8 @@ export function Shell({ currentPage, approvalCount, identity, agentVersion, upda
           <span className={`status-dot ${identity?.authorized ? 'success' : ''}`} />
         </button>
         </aside>
-        <main className="main">
-          {currentTask ? <button type="button" className="current-task-strip" onClick={() => setTaskDrawerOpen(true)} title="查看当前任务"><LoaderCircle size={15} className="spin" /><span><strong>正在执行 {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></span><code>{currentTask.execution_id || '本机执行'}</code><span className="current-task-open-label">任务记录</span></button> : null}
+        <main className={`main${currentPage === 'builtin-ai' ? ' builtin-ai-main' : ''}`}>
+          {currentTask && currentPage !== 'builtin-ai' ? <button type="button" className="current-task-strip" onClick={() => setTaskDrawerOpen(true)} title="查看当前任务"><LoaderCircle size={15} className="spin" /><span><strong>正在执行 {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></span><code>{currentTask.execution_id || '本机执行'}</code><span className="current-task-open-label">任务记录</span></button> : null}
           {children}
         </main>
       </div>

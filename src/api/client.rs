@@ -390,6 +390,12 @@ pub fn sync_svn_management_credentials(
     if crate::svn::service::svn_admin_ready() {
         return Ok(false);
     }
+    if crate::svn::service::svn_admin_credentials_configured() {
+        if crate::svn::service::verify_svn_admin_credentials().is_ok() {
+            return Ok(true);
+        }
+        let _ = crate::svn::service::remove_svn_admin_credentials();
+    }
     let response = client
         .get(format!("{}/api/agent/svn-management/bootstrap", api_base))
         .header("Authorization", agent_authorization(agent_id, credential))
@@ -401,6 +407,10 @@ pub fn sync_svn_management_credentials(
         .error_for_status()?
         .json::<SvnManagementBootstrapResponse>()?;
     crate::svn::service::install_svn_admin_credentials(&bootstrap.username, &bootstrap.password)?;
+    if let Err(error) = crate::svn::service::verify_svn_admin_credentials() {
+        let _ = crate::svn::service::remove_svn_admin_credentials();
+        return Err(format!("SvnAdmin credentials verification failed: {error}").into());
+    }
     Ok(true)
 }
 
