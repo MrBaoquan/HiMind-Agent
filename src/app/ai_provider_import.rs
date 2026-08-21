@@ -25,6 +25,7 @@ use crate::Options;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MANAGED_VENDOR: &str = "HiMind";
+const CC_SWITCH_PROVIDER_ID: &str = "himind-codex";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
 const VSCODE_CHAT_PROVIDER_PROPOSAL: &str = "chatProvider";
 const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 60;
@@ -271,28 +272,33 @@ fn import_cc_switch(
     options: &Options,
     expected_user_id: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
-    let protocol_registered = cc_switch_protocol_registered();
-    let portable_executable = if protocol_registered {
-        None
-    } else {
-        running_cc_switch_executable()
-    };
-    if !protocol_registered && portable_executable.is_none() {
-        return Err("未检测到 CC Switch；便携版需先启动，安装版需注册 ccswitch:// 协议".into());
+    let path = cc_switch_database_path();
+    let client_detected =
+        cc_switch_protocol_registered() || running_cc_switch_executable().is_some();
+    if !path.is_file() {
+        return Err(if client_detected {
+            "CC Switch 尚未初始化数据库，请先打开一次 CC Switch 再导入".into()
+        } else {
+            "未检测到 CC Switch，请先安装并启动一次 CC Switch".into()
+        });
     }
     let credential = fetch_client_credential(options, expected_user_id, "cc-switch-import")?;
-    let model = preferred_model(&credential)?;
-    let deep_link = build_cc_switch_deep_link(&credential, &model)?;
-    launch_sensitive_url(&deep_link, portable_executable.as_deref())?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let settings = build_cc_switch_provider_settings(&credential, &models, &preferred)?;
+    let website = Url::parse(&credential.access.base_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default();
+    let backup = write_cc_switch_provider(&path, &settings, &website)?;
     Ok(AIProviderImportResult {
         ok: true,
         target: "cc-switch".to_string(),
-        status: "confirmation_opened".to_string(),
-        model_count: 1,
-        model,
-        config_path: String::new(),
-        backup_path: String::new(),
-        client_detected: true,
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: path.to_string_lossy().to_string(),
+        backup_path: backup.to_string_lossy().to_string(),
+        client_detected,
     })
 }
 
@@ -362,20 +368,33 @@ fn cc_switch_import_status() -> AIProviderImportStatus {
     let path = cc_switch_database_path();
     let client_detected =
         cc_switch_protocol_registered() || running_cc_switch_executable().is_some();
+    let models = if path.is_file() {
+        read_cc_switch_managed_models(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let imported = path.is_file() && cc_switch_managed_provider_count(&path).unwrap_or(0) > 0;
     AIProviderImportStatus {
         target: "cc-switch".to_string(),
         state: if imported { "imported" } else { "not_imported" }.to_string(),
         client_detected,
-        detail: if imported {
-            "检测到 CC Switch 中的 HiMind 供应商".to_string()
-        } else if client_detected {
+        detail: if imported && models.is_empty() {
+            "检测到 CC Switch 中的 HiMind 供应商，但缺少模型映射，请重新导入".to_string()
+        } else if imported {
+            format!(
+                "已写入 {} 个 HiMind 模型；在 CC Switch 启用 HiMind 并重启 Codex 后可在 /model 选择",
+                models.len()
+            )
+        } else if client_detected || path.is_file() {
             "已检测到 CC Switch，尚未导入 HiMind AI".to_string()
         } else {
             "未检测到 CC Switch".to_string()
         },
         config_path: path.to_string_lossy().to_string(),
-        models: Vec::new(),
+        models,
         synced_at: String::new(),
     }
 }
@@ -549,21 +568,117 @@ fn preferred_model(credential: &AIClientCredential) -> Result<String, Box<dyn Er
         .ok_or_else(|| "当前 AI 接入没有可导入的模型".into())
 }
 
-fn build_cc_switch_deep_link(
+// cc-switch v3.16+ 以供应商 settings_config.modelCatalog 为模型列表唯一事实源：
+// 启用供应商时生成 ~/.codex/cc-switch-model-catalog.json 并注入 model_catalog_json，
+// Codex 重启后 /model 才能列出第三方模型；官方 deep link 协议无法携带该字段。
+fn build_cc_switch_provider_settings(
     credential: &AIClientCredential,
-    model: &str,
+    models: &[String],
+    preferred: &str,
 ) -> Result<String, Box<dyn Error>> {
     let endpoint = normalized_base_url(&credential.access.base_url)?;
-    let mut url = Url::parse("ccswitch://v1/import")?;
-    url.query_pairs_mut()
-        .append_pair("resource", "provider")
-        .append_pair("app", "codex")
-        .append_pair("name", "HiMind")
-        .append_pair("endpoint", &endpoint)
-        .append_pair("apiKey", &credential.api_key)
-        .append_pair("model", model)
-        .append_pair("enabled", "true");
-    Ok(url.into())
+    let config = format!(
+        "model_provider = \"custom\"\nmodel = {}\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"HiMind\"\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+        toml_basic_string(preferred),
+        toml_basic_string(&endpoint),
+    );
+    let catalog = models
+        .iter()
+        .map(|model| json!({ "model": model, "displayName": model }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "auth": { "OPENAI_API_KEY": credential.api_key },
+        "config": config,
+        "modelCatalog": { "models": catalog },
+    })
+    .to_string())
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn write_cc_switch_provider(
+    path: &Path,
+    settings: &str,
+    website: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let connection = Connection::open(path)?;
+    let has_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_table {
+        return Err("CC Switch 数据库结构未就绪，请先打开一次 CC Switch".into());
+    }
+    let backup = backup_sqlite_database(&connection, path)?;
+    let transaction = connection.unchecked_transaction()?;
+    let was_current: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' AND is_current = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "DELETE FROM provider_endpoints WHERE app_type = 'codex' AND provider_id IN (SELECT id FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' AND id <> ?1)",
+        params![CC_SWITCH_PROVIDER_ID],
+    )?;
+    transaction.execute(
+        "DELETE FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' AND id <> ?1",
+        params![CC_SWITCH_PROVIDER_ID],
+    )?;
+    transaction.execute(
+        "INSERT INTO providers (id, app_type, name, settings_config, website_url, created_at, is_current)
+         VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id, app_type) DO UPDATE SET
+           name = excluded.name,
+           settings_config = excluded.settings_config,
+           website_url = excluded.website_url",
+        params![
+            CC_SWITCH_PROVIDER_ID,
+            MANAGED_VENDOR,
+            settings,
+            website,
+            unix_now_millis() as i64,
+            was_current
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(backup)
+}
+
+fn read_cc_switch_managed_models(path: &Path) -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    let connection = Connection::open(path)?;
+    let has_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_table {
+        return Ok(None);
+    }
+    let settings: Option<String> = connection.query_row(
+        "SELECT settings_config FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' ORDER BY CASE WHEN id = 'himind-codex' THEN 0 ELSE 1 END LIMIT 1",
+        [],
+        |row| row.get(0),
+    ).ok();
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    let parsed: Value = serde_json::from_str(&settings)?;
+    let models = parsed
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("model").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(models))
 }
 
 fn merge_workbuddy_models(
@@ -1554,53 +1669,18 @@ fn cc_switch_protocol_registered() -> bool {
     false
 }
 
-#[cfg(windows)]
-fn launch_sensitive_url(url: &str, executable: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    let script = if executable.is_some() {
-        "Start-Process -FilePath $env:HIMIND_CC_SWITCH_EXE -ArgumentList $env:HIMIND_EXTERNAL_URL"
-    } else {
-        "Start-Process -FilePath $env:HIMIND_EXTERNAL_URL"
-    };
-    let mut command = Command::new("powershell");
-    command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            script,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .env("HIMIND_EXTERNAL_URL", url);
-    if let Some(path) = executable {
-        command.env("HIMIND_CC_SWITCH_EXE", path);
-    }
-    let status = command.status()?;
-    if !status.success() {
-        return Err("无法打开 CC Switch 导入确认窗口".into());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn launch_sensitive_url(_url: &str, _executable: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    Err("CC Switch 一键导入目前仅支持 Windows".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        build_cc_switch_deep_link, build_vscode_enrollment_url, bundled_vscode_vsix_candidates,
-        chat_completions_url, compare_extension_versions, consume_vscode_enrollment,
-        create_vscode_enrollment, ensure_vscode_chat_provider_allowlist, legacy_workbuddy_model_id,
-        managed_workbuddy_model_ids, merge_workbuddy_models, migrate_workbuddy_sessions,
-        parse_vscode_extension_version, parse_vscode_import_status, push_vscode_registry_value,
-        remove_workbuddy_models, vscode_extension_install_required, workbuddy_model_id,
-        workbuddy_models_path_in, AIClientCredential, VSCODE_CHAT_PROVIDER_PROPOSAL,
-        VSCODE_EXTENSION_ID,
+        build_cc_switch_provider_settings, build_vscode_enrollment_url,
+        bundled_vscode_vsix_candidates, chat_completions_url, compare_extension_versions,
+        consume_vscode_enrollment, create_vscode_enrollment, ensure_vscode_chat_provider_allowlist,
+        legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
+        migrate_workbuddy_sessions, parse_vscode_extension_version, parse_vscode_import_status,
+        push_vscode_registry_value, read_cc_switch_managed_models, remove_workbuddy_models,
+        vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
+        write_cc_switch_provider, AIClientCredential, CC_SWITCH_PROVIDER_ID,
+        VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
     use serde_json::Value;
@@ -1634,28 +1714,108 @@ mod tests {
     }
 
     #[test]
-    fn encodes_cc_switch_provider_parameters() {
-        let value = build_cc_switch_deep_link(&credential(&["gpt-4.1"]), "gpt-4.1").unwrap();
-        let url = url::Url::parse(&value).unwrap();
-        let parameters = url
-            .query_pairs()
-            .into_owned()
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(url.scheme(), "ccswitch");
+    fn builds_cc_switch_settings_with_full_model_catalog() {
+        let value = build_cc_switch_provider_settings(
+            &credential(&["deepseek-v4-flash", "deepseek-v4-pro"]),
+            &["deepseek-v4-flash".to_string(), "deepseek-v4-pro".to_string()],
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        let settings: Value = serde_json::from_str(&value).unwrap();
         assert_eq!(
-            parameters.get("resource").map(String::as_str),
-            Some("provider")
-        );
-        assert_eq!(parameters.get("app").map(String::as_str), Some("codex"));
-        assert_eq!(
-            parameters.get("endpoint").map(String::as_str),
-            Some("https://ai.example.com/v1")
-        );
-        assert_eq!(
-            parameters.get("apiKey").map(String::as_str),
+            settings.pointer("/auth/OPENAI_API_KEY").and_then(Value::as_str),
             Some("test-secret-key")
         );
-        assert_eq!(parameters.get("model").map(String::as_str), Some("gpt-4.1"));
+        let config = settings.get("config").and_then(Value::as_str).unwrap();
+        assert!(config.contains("model_provider = \"custom\""));
+        assert!(config.contains("model = \"deepseek-v4-flash\""));
+        assert!(config.contains("base_url = \"https://ai.example.com/v1\""));
+        assert!(config.contains("wire_api = \"responses\""));
+        let models = settings
+            .pointer("/modelCatalog/models")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[1].get("model").and_then(Value::as_str),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn cc_switch_upsert_replaces_legacy_rows_and_keeps_current_flag() {
+        let directory = std::env::temp_dir().join(format!(
+            "himind-cc-switch-test-{}-{}",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("cc-switch.db");
+        {
+            let connection = super::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE providers (id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, settings_config TEXT NOT NULL, website_url TEXT, category TEXT, created_at INTEGER, sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT, meta TEXT NOT NULL DEFAULT '{}', is_current BOOLEAN NOT NULL DEFAULT 0, in_failover_queue BOOLEAN NOT NULL DEFAULT 0, cost_multiplier TEXT NOT NULL DEFAULT '1.0', limit_daily_usd TEXT, limit_monthly_usd TEXT, provider_type TEXT, PRIMARY KEY (id, app_type));
+                     CREATE TABLE provider_endpoints (app_type TEXT NOT NULL, provider_id TEXT NOT NULL, url TEXT NOT NULL);",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO providers (id, app_type, name, settings_config, is_current) VALUES ('himind-legacy', 'codex', 'HiMind', '{}', 1)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO provider_endpoints (app_type, provider_id, url) VALUES ('codex', 'himind-legacy', 'https://legacy.example')",
+                    [],
+                )
+                .unwrap();
+        }
+        let settings = build_cc_switch_provider_settings(
+            &credential(&["deepseek-v4-flash"]),
+            &["deepseek-v4-flash".to_string()],
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        let backup = write_cc_switch_provider(&path, &settings, "https://ai.example.com").unwrap();
+        assert!(backup.is_file());
+
+        let models = read_cc_switch_managed_models(&path).unwrap().unwrap();
+        assert_eq!(models, vec!["deepseek-v4-flash".to_string()]);
+
+        let connection = super::Connection::open(&path).unwrap();
+        let legacy_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM providers WHERE app_type = 'codex' AND id = 'himind-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0);
+        let (name, website, is_current): (String, String, i64) = connection
+            .query_row(
+                "SELECT name, website_url, is_current FROM providers WHERE app_type = 'codex' AND id = ?1",
+                super::params![CC_SWITCH_PROVIDER_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "HiMind");
+        assert_eq!(website, "https://ai.example.com");
+        assert_eq!(is_current, 1);
+
+        write_cc_switch_provider(&path, &settings, "https://ai.example.com").unwrap();
+        let (managed_count, still_current): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(is_current) FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(managed_count, 1);
+        assert_eq!(still_current, 1);
+
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

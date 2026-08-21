@@ -1422,6 +1422,9 @@ public static class HimindSunloginInput {
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref Point point);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     public static void LeftClick(int x, int y) {
@@ -1440,8 +1443,14 @@ public static class HimindSunloginInput {
 $pidValue = [int]$env:HIMIND_REMOTE_TARGET_PID
 $code = $env:HIMIND_REMOTE_CODE
 $password = $env:HIMIND_REMOTE_PASSWORD
-$deadline = (Get-Date).AddSeconds(12)
+# Wait until the Sunlogin main window is visible, restored, and has held a
+# stable size for several samples. Flutter windows expose a handle long
+# before the layout is ready, so sending input too early misses the fields.
+$deadline = (Get-Date).AddSeconds(15)
 $process = $null
+$stableSamples = 0
+$lastWidth = 0
+$lastHeight = 0
 do {
     $process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
     if ($null -eq $process -or $process.MainWindowHandle -eq 0) {
@@ -1450,11 +1459,48 @@ do {
             Select-Object -First 1
         if ($null -ne $process) { $pidValue = $process.Id }
     }
-    if ($null -ne $process -and $process.MainWindowHandle -ne 0) { break }
-    Start-Sleep -Milliseconds 250
+    if ($null -ne $process -and $process.MainWindowHandle -ne 0) {
+        $handle = $process.MainWindowHandle
+        if ([HimindSunloginInput]::IsIconic($handle)) {
+            [void][HimindSunloginInput]::ShowWindowAsync($handle, 9)
+            $stableSamples = 0
+            $lastWidth = 0
+            $lastHeight = 0
+        }
+        elseif ([HimindSunloginInput]::IsWindowVisible($handle)) {
+            $sample = New-Object HimindSunloginInput+Rect
+            if ([HimindSunloginInput]::GetClientRect($handle, [ref]$sample)) {
+                $sampleWidth = $sample.Right - $sample.Left
+                $sampleHeight = $sample.Bottom - $sample.Top
+                if ($sampleWidth -eq $lastWidth -and $sampleHeight -eq $lastHeight) { $stableSamples++ }
+                else { $stableSamples = 0 }
+                $lastWidth = $sampleWidth
+                $lastHeight = $sampleHeight
+                if ($stableSamples -ge 3 -and $sampleWidth -ge 700 -and $sampleHeight -ge 480) { break }
+            }
+        }
+    }
+    Start-Sleep -Milliseconds 300
 } while ((Get-Date) -lt $deadline)
 if ($null -eq $process -or $process.MainWindowHandle -eq 0) { exit 2 }
 
+# Restore and activate the window, then wait until it is actually in the
+# foreground and visible before sending any input.
+[void][HimindSunloginInput]::ShowWindowAsync($process.MainWindowHandle, 9)
+[void][HimindSunloginInput]::SetForegroundWindow($process.MainWindowHandle)
+[void][Microsoft.VisualBasic.Interaction]::AppActivate($pidValue)
+$foregroundDeadline = (Get-Date).AddSeconds(5)
+do {
+    Start-Sleep -Milliseconds 150
+    $foreground = [HimindSunloginInput]::GetForegroundWindow()
+    if ($foreground -eq $process.MainWindowHandle -and [HimindSunloginInput]::IsWindowVisible($process.MainWindowHandle)) { break }
+    [void][HimindSunloginInput]::SetForegroundWindow($process.MainWindowHandle)
+    [void][Microsoft.VisualBasic.Interaction]::AppActivate($pidValue)
+} while ((Get-Date) -lt $foregroundDeadline)
+Start-Sleep -Milliseconds 600
+
+# Re-measure the layout after restore; the Flutter canvas only reports its
+# final size once the window has settled.
 $client = New-Object HimindSunloginInput+Rect
 $origin = New-Object HimindSunloginInput+Point
 if (-not [HimindSunloginInput]::GetClientRect($process.MainWindowHandle, [ref]$client)) { exit 3 }
@@ -1462,11 +1508,6 @@ if (-not [HimindSunloginInput]::ClientToScreen($process.MainWindowHandle, [ref]$
 $width = $client.Right - $client.Left
 $height = $client.Bottom - $client.Top
 if ($width -lt 700 -or $height -lt 480) { exit 5 }
-
-[void][HimindSunloginInput]::ShowWindowAsync($process.MainWindowHandle, 9)
-[void][HimindSunloginInput]::SetForegroundWindow($process.MainWindowHandle)
-[void][Microsoft.VisualBasic.Interaction]::AppActivate($pidValue)
-Start-Sleep -Milliseconds 350
 
 function Point-X([double]$ratio) { return $origin.X + [int]($width * $ratio) }
 function Point-Y([double]$ratio) { return $origin.Y + [int]($height * $ratio) }
