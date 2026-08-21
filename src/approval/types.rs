@@ -28,7 +28,9 @@ pub enum RequestType {
 impl RequestType {
     pub fn default_mode(&self) -> ApprovalMode {
         match self {
-            Self::RemoteConnect => ApprovalMode::Manual,
+            // Connecting to a recorded remote endpoint is an explicit user action
+            // from the operations workbench; do not block it on a second approval.
+            Self::RemoteConnect => ApprovalMode::AutoApprove,
             Self::UploadCode => ApprovalMode::AutoApprove,
             Self::UploadPlaceholder => ApprovalMode::AutoApprove,
         }
@@ -62,10 +64,23 @@ pub struct ApprovalSettings {
     pub auto_start: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ApprovalMode, RequestType};
+
+    #[test]
+    fn remote_connect_is_auto_approved_by_default() {
+        assert!(matches!(
+            RequestType::RemoteConnect.default_mode(),
+            ApprovalMode::AutoApprove
+        ));
+    }
+}
+
 impl Default for ApprovalSettings {
     fn default() -> Self {
         let mut rules = HashMap::new();
-        rules.insert("remote_connect".to_string(), "manual".to_string());
+        rules.insert("remote_connect".to_string(), "auto_approve".to_string());
         rules.insert("upload_code".to_string(), "auto_approve".to_string());
         rules.insert("upload_placeholder".to_string(), "auto_approve".to_string());
         Self {

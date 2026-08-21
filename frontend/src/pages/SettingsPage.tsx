@@ -1,12 +1,13 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
-import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, MoreHorizontal, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Trash2, Wrench, X } from 'lucide-react';
+import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
+import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, MonitorUp, MoreHorizontal, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Trash2, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
-type SettingsSection = 'remote' | 'accounts' | 'tools' | 'general';
+type SettingsSection = 'remote' | 'remote_clients' | 'accounts' | 'tools' | 'general';
 
 const SETTINGS_SECTIONS = [
   { key: 'remote', label: '远程任务', description: '权限与审批', icon: ShieldCheck },
+  { key: 'remote_clients', label: '远控客户端', description: '向日葵与 ToDesk', icon: MonitorUp },
   { key: 'accounts', label: '账号', description: '内网和 SVN', icon: KeyRound },
   { key: 'tools', label: '工具', description: '本机编辑器', icon: Wrench },
   { key: 'general', label: '通用', description: '启动与更新', icon: Power },
@@ -188,12 +189,68 @@ export function SettingsPage({
   const [unityEditorSettings, setUnityEditorSettings] = useState<UnityEditorSettings | null>(null);
   const [editorFeedback, setEditorFeedback] = useState('');
   const [editorSaving, setEditorSaving] = useState(false);
+  const [remoteClients, setRemoteClients] = useState<RemoteClientOverview | null>(null);
+  const [remoteClientBusy, setRemoteClientBusy] = useState(false);
+  const [remoteClientFeedback, setRemoteClientFeedback] = useState('');
   const [pendingFullAccess, setPendingFullAccess] = useState<RemoteExecutionSettings | null>(null);
   const [section, setSection] = useState<SettingsSection>('remote');
   useEffect(() => {
     setUnityEditorSettings(settings?.editors || null);
     setUnityEditorPath(settings?.editors?.unity_editor_path || '');
   }, [settings?.editors]);
+
+  useEffect(() => {
+    let disposed = false;
+    void agentApi.remoteClients().then(result => {
+      if (!disposed) setRemoteClients(result);
+    }).catch(error => {
+      if (!disposed) setRemoteClientFeedback(error instanceof Error ? error.message : String(error));
+    });
+    return () => { disposed = true; };
+  }, []);
+
+  async function refreshRemoteClients() {
+    setRemoteClientBusy(true);
+    setRemoteClientFeedback('正在检测本机远控客户端');
+    try {
+      const result = await agentApi.detectRemoteClients();
+      setRemoteClients(result);
+      const configured = result.items.filter(item => item.auto_configured);
+      setRemoteClientFeedback(configured.length ? `已找到：${configured.map(item => item.name).join('、')}` : '检测完成');
+    } catch (error) {
+      setRemoteClientFeedback(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRemoteClientBusy(false);
+    }
+  }
+
+  async function chooseRemoteClient(vendor: RemoteClientVendor) {
+    setRemoteClientBusy(true);
+    setRemoteClientFeedback('');
+    try {
+      const picked = await agentApi.pickRemoteClient(vendor);
+      if (!picked.path?.trim()) return;
+      setRemoteClients(await agentApi.configureRemoteClient(vendor, picked.path));
+      setRemoteClientFeedback(`${vendor === 'todesk' ? 'ToDesk' : '向日葵'}路径已保存`);
+    } catch (error) {
+      setRemoteClientFeedback(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRemoteClientBusy(false);
+    }
+  }
+
+  async function clearRemoteClient(vendor: RemoteClientVendor) {
+    setRemoteClientBusy(true);
+    setRemoteClientFeedback('');
+    try {
+      setRemoteClients(await agentApi.configureRemoteClient(vendor, ''));
+      setRemoteClientFeedback('路径已清除');
+    } catch (error) {
+      setRemoteClientFeedback(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRemoteClientBusy(false);
+    }
+  }
 
   async function chooseUnityEditor() {
     const result = await agentApi.pickUnityEditor();
@@ -313,7 +370,7 @@ export function SettingsPage({
             <section className="card settings-section">
               <div className="card-header">操作审批</div>
               <div className="card-body setting-list">
-                <SettingRow title="远程协助" description="收到远程控制或协助请求时的处理方式"><select aria-label="远程协助审批模式" value={settings.rules?.remote_connect || 'manual'} onChange={event => onRuleChange('remote_connect', event.target.value)}><option value="manual">每次询问</option><option value="auto_approve">自动允许</option><option value="auto_deny">自动拒绝</option></select></SettingRow>
+                <SettingRow title="远程协助" description="运维工作台的一键直连自动放行，不弹出审批窗口"><Pill kind="success">自动允许</Pill></SettingRow>
                 <SettingRow title="文件上传" description="收到代码或制品上传请求时的处理方式"><select aria-label="文件上传审批模式" value={settings.rules?.upload_code || 'manual'} onChange={event => onRuleChange('upload_code', event.target.value)}><option value="manual">每次询问</option><option value="auto_approve">自动允许</option><option value="auto_deny">自动拒绝</option></select></SettingRow>
                 <SettingRow title="审批超时" description="未响应时自动拒绝请求"><select aria-label="审批超时" value={settings.timeout_seconds} onChange={event => onTimeoutChange(Number(event.target.value))}><option value="15">15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option><option value="120">120 秒</option></select></SettingRow>
               </div>
@@ -340,6 +397,28 @@ export function SettingsPage({
               </div> : <div className="account-row"><div className="account-icon"><Database size={17} /></div><div><span>公司 SVN</span><strong>尚未配置个人账号</strong></div><button className="btn btn-primary" onClick={onOpenSvnModal}>配置账号</button></div>}
               <div className="security-note compact"><ShieldCheck size={16} /><span>密码只保存在当前 Windows 用户的本地加密存储中。</span></div>
             </div>
+          </section> : null}
+
+          {section === 'remote_clients' ? <section className="card settings-section remote-client-agent-card">
+            <div className="card-header">
+              <div><span>本机远控客户端</span></div>
+              <button className="btn" disabled={remoteClientBusy} onClick={() => void refreshRemoteClients()}><RefreshCw size={14} className={remoteClientBusy ? 'spin' : undefined} />重新检测</button>
+            </div>
+            <div className="remote-client-agent-list">
+              {(remoteClients?.items || []).map((item: RemoteClientStatus) => <div className="remote-client-agent-row" key={item.vendor}>
+                <div className="remote-client-agent-main">
+                  <div className="remote-client-agent-title"><strong>{item.name}</strong><Pill kind={item.available ? 'success' : 'warn'}>{item.available ? '已就绪' : '未找到'}</Pill></div>
+                  <code title={item.resolved_path || item.configured_path || ''}>{item.resolved_path || item.configured_path || '未检测到可用程序'}</code>
+                  <small>{remoteClientSourceLabel(item)}</small>
+                </div>
+                <div className="actions-row remote-client-agent-actions">
+                  <button className="btn" disabled={remoteClientBusy} onClick={() => void chooseRemoteClient(item.vendor)}><FolderOpen size={14} />选择程序</button>
+                  {item.configured_path ? <button className="btn btn-danger-quiet" disabled={remoteClientBusy} onClick={() => void clearRemoteClient(item.vendor)}><RotateCcw size={14} />清除路径</button> : null}
+                </div>
+              </div>)}
+            </div>
+            {!remoteClients?.items.length && !remoteClientBusy ? <div className="empty-state">尚未读取本机远控客户端状态</div> : null}
+            {remoteClientFeedback ? <div className="inline-feedback visible" role="status">{remoteClientFeedback}</div> : null}
           </section> : null}
 
           {section === 'tools' ? <section className="card settings-section unity-editor-card">
@@ -406,6 +485,17 @@ export function SettingsPage({
       {pendingRuntimeUninstall ? <RuntimeUninstallConfirmation onClose={() => setPendingRuntimeUninstall(false)} onConfirm={() => { setPendingRuntimeUninstall(false); void startBuiltinAIRuntimeOperation('uninstall'); }} /> : null}
     </>
   );
+}
+
+function remoteClientSourceLabel(item: RemoteClientStatus) {
+  if (item.configured_by === 'manual') return '手动配置';
+  if (item.configured_by === 'auto') return '自动配置';
+  if (item.source === 'running_process') return '运行中客户端';
+  if (item.source === 'registry') return '注册表';
+  if (item.source === 'start_menu') return '开始菜单';
+  if (item.source === 'standard_directory') return '标准目录';
+  if (item.source === 'path') return '系统 PATH';
+  return '未找到';
 }
 
 function runtimeActionLabel(operation: string) {

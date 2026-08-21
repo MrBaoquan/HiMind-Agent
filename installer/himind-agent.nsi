@@ -148,8 +148,12 @@ Section "HiMind Agent 核心组件" SEC_AGENT
     SetOutPath "$INSTDIR"
   !endif
 
-  SetOutPath "$INSTDIR\current"
+  SetOutPath "$INSTDIR\versions\${PRODUCT_VERSION}"
   File "${RELEASE}\himind-agent.exe"
+  SetOutPath "$INSTDIR"
+  FileOpen $0 "$INSTDIR\active-version" w
+  FileWrite $0 "${PRODUCT_VERSION}$\r$\n"
+  FileClose $0
 
   SetOutPath "$INSTDIR\resources\vscode"
   File /oname=himind-ai.vsix "${VSCODE_EXTENSION_VSIX}"
@@ -198,6 +202,7 @@ Section "Uninstall"
   DeleteRegKey HKCU "${PRODUCT_REGISTRY_KEY}"
   Delete "$DESKTOP\HiMind Agent.lnk"
   RMDir /r "$INSTDIR\current"
+  RMDir /r "$INSTDIR\versions"
   RMDir /r "$INSTDIR\previous"
   RMDir /r "$INSTDIR\logs"
   RMDir /r "$INSTDIR\resources"
@@ -205,5 +210,6 @@ Section "Uninstall"
   Delete "$INSTDIR\himind-agent-launcher.exe"
   Delete "$INSTDIR\himind-agent-updater.exe"
   Delete "$INSTDIR\himind-agent.ico"
+  Delete "$INSTDIR\active-version"
   Delete "$INSTDIR\uninstall.exe"
 SectionEnd

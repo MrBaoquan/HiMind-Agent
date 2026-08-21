@@ -20,18 +20,20 @@ cargo build --release
 1. `GET /health`：本地服务、原生文件夹选择、打开文件夹、远控客户端唤起和登录状态能力。
 2. `GET /pick-folder`：打开 Windows 原生文件夹选择器。
 3. `GET /open-folder?path=`：调用 Windows Explorer 打开指定路径。
-4. `POST /remote-connect`：接收一次性远控工具、设备码、验证码，复制设备码并唤起本机向日葵或 ToDesk；可通过 `HIMIND_SUNLOGIN_CLI` / `HIMIND_SUNLOGIN_ARGS` 或 `HIMIND_TODESK_CLI` / `HIMIND_TODESK_ARGS` 配置厂商 CLI 模板。
-5. `GET /login-status`：返回本机 Agent 是否已保存可复用的内网登录。
-6. `POST /login`：由 Dashboard 本地 Agent 卡片提交内网账号密码，保存到本机当前用户配置。
-7. `POST /logout`：清除本机 Agent 已保存的内网登录。
-8. `GET /open-login`：打开内网页面，供用户手工查看或确认登录状态。
-9. `GET /capabilities`：返回 Capability Gateway 已注册的内置能力描述、风险等级和参数 Schema。
-10. `POST /capabilities/invoke`：通过 Capability Gateway 调用受控能力，当前已接入健康状态、登录状态、打开文件夹、插件列表、插件 Manifest 查询和已声明插件能力调用。
-11. `GET /plugins`：扫描 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/` 并返回本机插件 Registry 状态。
-12. `GET /plugins/manifest?plugin_id=`：返回指定插件的 Manifest、能力和权限摘要。
-13. `POST /plugins/install|update|uninstall|enable|disable`：已预留本地接口，当前在 Distribution 策略与制品校验接入前返回 `not_implemented`。
-14. `GET /ai-provider-import/status`：读取 VS Code、CC Switch 和 WorkBuddy 的 HiMind AI 导入状态。
-15. `POST /ai-provider-import/cancel`：取消指定客户端的 HiMind AI 导入；WorkBuddy 和 CC Switch 会在变更前创建备份，VS Code 由官方扩展清除 SecretStorage 凭据。
+4. `POST /remote-connect`：接收一次性远控工具、设备码、验证码；这是运维工作台用户主动点击的一键直连动作，不进入审批队列，优先复用或唤起本机向日葵 / ToDesk。连接参数支持 `HIMIND_SUNLOGIN_CLI` / `HIMIND_SUNLOGIN_ARGS`、`HIMIND_TODESK_CLI` / `HIMIND_TODESK_ARGS`，并兼容旧的 `PROJECT_DASHBOARD_*` 变量。
+5. `GET /remote-clients`、`POST /remote-clients/detect`：读取或重新检测本机向日葵 / ToDesk。没有已保存路径时，Agent 会依次检查运行中进程、注册表、开始菜单、标准安装目录和系统 `PATH`，并把首个有效程序写入 `agent-state.json` 同目录下的 `agent-remote-clients.json`，作为该机器的默认路径。
+6. `POST /remote-clients/configure`、`GET /pick-remote-client`：手动选择并保存客户端程序。手动路径优先于自动发现，失效时也不会被静默覆盖；管理员仍可用 `HIMIND_*_CLI` 环境变量作最高优先级覆盖。
+7. `GET /login-status`：返回本机 Agent 是否已保存可复用的内网登录。
+8. `POST /login`：由 Dashboard 本地 Agent 卡片提交内网账号密码，保存到本机当前用户配置。
+9. `POST /logout`：清除本机 Agent 已保存的内网登录。
+10. `GET /open-login`：打开内网页面，供用户手工查看或确认登录状态。
+11. `GET /capabilities`：返回 Capability Gateway 已注册的内置能力描述、风险等级和参数 Schema。
+12. `POST /capabilities/invoke`：通过 Capability Gateway 调用受控能力，当前已接入健康状态、登录状态、打开文件夹、插件列表、插件 Manifest 查询和已声明插件能力调用。
+13. `GET /plugins`：扫描 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/` 并返回本机插件 Registry 状态。
+14. `GET /plugins/manifest?plugin_id=`：返回指定插件的 Manifest、能力和权限摘要。
+15. `POST /plugins/install|update|uninstall|enable|disable`：已预留本地接口，当前在 Distribution 策略与制品校验接入前返回 `not_implemented`。
+16. `GET /ai-provider-import/status`：读取 VS Code、CC Switch 和 WorkBuddy 的 HiMind AI 导入状态。
+17. `POST /ai-provider-import/cancel`：取消指定客户端的 HiMind AI 导入；WorkBuddy 和 CC Switch 会在变更前创建备份，VS Code 由官方扩展清除 SecretStorage 凭据。
 
 Agent 主窗口已提供“本机插件”页：左侧选择当前设备已安装插件，右侧查看该插件的本机状态、错误、功能页面、权限和已注册能力，并可打开独立插件窗口、创建桌面快捷方式或打开插件目录；页面通过 Tauri 命令直接读取本机注册表和 Gateway，避免主窗口 WebView 再 fetch 自身 `127.0.0.1` 服务。安装、升级、启停、卸载、回滚和版本策略统一由 Dashboard 组织控制面负责，不在 Agent 主窗口重复提供占位入口。
 

@@ -1,5 +1,7 @@
 pub(crate) mod ai_clients;
 pub(crate) mod ai_provider_import;
+pub(crate) mod builtin_ai_gateway;
+pub(crate) mod builtin_ai_model_sync;
 pub(crate) mod builtin_ai_proxy;
 pub(crate) mod builtin_ai_sync;
 pub(crate) mod commands;
@@ -9,6 +11,7 @@ pub mod http;
 pub(crate) mod identity;
 pub(crate) mod mcp_settings;
 pub(crate) mod plugin_manager;
+pub(crate) mod remote_clients;
 pub(crate) mod remote_execution;
 pub(crate) mod security;
 pub mod service;

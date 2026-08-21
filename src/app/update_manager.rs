@@ -136,10 +136,18 @@ pub(crate) fn status_path(agent_state_path: &Path) -> PathBuf {
     agent_state_path.with_file_name("agent-update-state.json")
 }
 
+fn read_status_file(path: &Path) -> Result<AgentUpdateStatus, Box<dyn Error>> {
+    let bytes = fs::read(path)?;
+    let bytes = bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes.as_slice());
+    Ok(serde_json::from_slice::<AgentUpdateStatus>(bytes)?)
+}
+
 pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn Error>> {
     let path = status_path(agent_state_path);
     let mut status = if path.is_file() {
-        serde_json::from_slice::<AgentUpdateStatus>(&fs::read(path)?)?
+        read_status_file(&path)?
     } else {
         AgentUpdateStatus::default()
     };
@@ -147,6 +155,17 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
     status.current_version = crate::VERSION.to_string();
     if status.channel.trim().is_empty() {
         status.channel = default_channel();
+        changed = true;
+    }
+    if status.available_version == crate::VERSION
+        && !status.available_version.is_empty()
+        && status.status != "idle"
+    {
+        // The update may have completed before the previous status write. Do
+        // not keep showing the just-installed version as an available update.
+        clear_release(&mut status);
+        status.status = "idle".to_string();
+        status.last_error.clear();
         changed = true;
     }
     if status.status == "installing" && status.available_version == crate::VERSION {
@@ -658,6 +677,10 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
     status.status = "installing".to_string();
     status.last_error.clear();
     save(&options.state_path, &status)?;
+    // DSH runs as a child process and may reconnect its MCP bridge while the
+    // updater replaces the Agent executable. Stop it before the Agent exits
+    // so it cannot survive as an orphan and keep the current binary locked.
+    crate::app::ui::stop_builtin_ai_process();
     if let Err(error) = crate::app::system::schedule_agent_replace_and_restart(
         Path::new(&status.staged_agent_path),
         &staged_package,
@@ -673,7 +696,10 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
         return Err(error);
     }
     thread::spawn(|| {
-        thread::sleep(Duration::from_millis(500));
+        // Legacy updaters ignore wait_pid. Exit before their built-in 300 ms
+        // handoff delay elapses so they can start the new Agent without using
+        // the old taskkill /T path.
+        thread::sleep(Duration::from_millis(100));
         std::process::exit(0);
     });
     Ok(status)
@@ -702,13 +728,7 @@ fn verify_staged_sha256(path: &Path, expected: &str) -> Result<(), Box<dyn Error
 
 fn staging_directory() -> Result<PathBuf, Box<dyn Error>> {
     let executable = std::env::current_exe()?;
-    let executable_dir = executable.parent().ok_or("Agent 程序目录不可用")?;
-    let installation_root =
-        if executable_dir.file_name().and_then(|value| value.to_str()) == Some("current") {
-            executable_dir.parent().unwrap_or(executable_dir)
-        } else {
-            executable_dir
-        };
+    let installation_root = crate::install_layout::installation_root_from_executable(&executable);
     Ok(installation_root.join("staging"))
 }
 
@@ -815,6 +835,30 @@ mod tests {
 
         assert_eq!(loaded.current_version, crate::VERSION);
         assert_eq!(persisted.current_version, crate::VERSION);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_accepts_utf8_bom_and_clears_completed_release() {
+        let root = temporary_test_root("utf8-bom");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let mut status = AgentUpdateStatus::default();
+        status.status = "installing".to_string();
+        status.current_version = "0.3.25".to_string();
+        status.available_version = crate::VERSION.to_string();
+        status.release_id = "completed-release".to_string();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend(serde_json::to_vec_pretty(&status).unwrap());
+        fs::write(status_path(&state_path), bytes).unwrap();
+
+        let loaded = load(&state_path).unwrap();
+        let persisted = fs::read(status_path(&state_path)).unwrap();
+
+        assert_eq!(loaded.status, "idle");
+        assert_eq!(loaded.current_version, crate::VERSION);
+        assert!(loaded.available_version.is_empty());
+        assert!(!persisted.starts_with(&[0xEF, 0xBB, 0xBF]));
         let _ = fs::remove_dir_all(root);
     }
 

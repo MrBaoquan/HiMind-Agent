@@ -92,6 +92,25 @@ export type RemoteExecutionSettings = {
     default_provider: 'himind.builtin' | 'auto' | 'personal.codex' | 'personal.github-copilot';
 };
 
+export type RemoteClientVendor = 'sunlogin' | 'todesk';
+
+export type RemoteClientStatus = {
+    vendor: RemoteClientVendor;
+    name: string;
+    available: boolean;
+    configured_path?: string;
+    configured_by?: 'manual' | 'auto' | string;
+    configured_valid?: boolean;
+    resolved_path?: string;
+    source?: string;
+    auto_configured?: boolean;
+};
+
+export type RemoteClientOverview = {
+    items: RemoteClientStatus[];
+    settings_file?: string;
+};
+
 export type BuiltinAIRuntimeStatus = {
     provider: 'himind.builtin' | string;
     status: 'ready' | 'unavailable' | string;
@@ -123,6 +142,37 @@ export type BuiltinAIRuntimeInstallationStatus = {
 export type BuiltinAIToolContextSummary = {
     skills: number;
     mcp_services: number;
+};
+
+export type BuiltinAiModelSyncResult = {
+    status: 'unchanged' | 'updated' | 'restarted' | 'restart_required' | string;
+    model_count: number;
+    restarted: boolean;
+    session_url: string;
+};
+
+export type BuiltinAIRuntimeSession = {
+    id: string;
+    conversation_id?: string;
+    owner_user_id: string;
+    agent_id: string;
+    provider: string;
+    provider_session_id: string;
+    workspace_ref?: string;
+    status: string;
+    generation: number;
+    capabilities: Record<string, boolean>;
+    metadata: Record<string, unknown>;
+    last_heartbeat_at: string;
+    created_at: string;
+    updated_at: string;
+};
+
+export type BuiltinAIRuntimeActivity = {
+    session: BuiltinAIRuntimeSession;
+    conversation?: { id: string; title: string; status: string; updated_at: string };
+    endpoints?: { channel: string; conversation_type: string; status: string }[];
+    latest_turn?: { role: string; content: string; surface?: string; created_at: string };
 };
 
 export type BuiltinAIMcpServer = {
@@ -836,6 +886,7 @@ export const agentApi = {
     setUpdatePreferences: (autoCheck: boolean, autoDownload: boolean) => invoke<AgentUpdateStatus>('set_agent_update_preferences', { autoCheck, autoDownload }),
     installUpdate: () => invoke<AgentUpdateStatus>('install_agent_update'),
     dashboardIdentity: () => invoke<DashboardIdentityStatus>('get_dashboard_identity_status'),
+    builtinAiActivity: () => invoke<{ items: BuiltinAIRuntimeActivity[] }>('get_builtin_ai_activity'),
     startDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('start_dashboard_authorization'),
     dashboardAuthorizationProgress: () => invoke<DashboardAuthorizationProgress>('get_dashboard_authorization_progress'),
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
@@ -849,6 +900,10 @@ export const agentApi = {
     settings: () => invoke<ApprovalSettings>('get_approval_settings'),
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
     saveRemoteExecutionSettings: (settings: RemoteExecutionSettings, fullAccessConfirmed = false) => invoke<RemoteExecutionSettings>('save_remote_execution_settings', { settings, fullAccessConfirmed }),
+    remoteClients: () => invoke<RemoteClientOverview>('get_remote_clients'),
+    detectRemoteClients: () => invoke<RemoteClientOverview>('detect_remote_clients'),
+    configureRemoteClient: (vendor: RemoteClientVendor, path: string) => invoke<RemoteClientOverview>('configure_remote_client', { vendor, path }),
+    pickRemoteClient: (vendor: RemoteClientVendor) => invoke<{ path?: string | null }>('pick_remote_client', { vendor }),
     builtinAiRuntimeStatus: () => invoke<BuiltinAIRuntimeStatus>('get_builtin_ai_runtime_status'),
     builtinAiRuntimeInstallationStatus: () => invoke<BuiltinAIRuntimeInstallationStatus>('get_builtin_ai_runtime_installation_status'),
     checkBuiltinAiRuntimeUpdate: () => invoke<BuiltinAIRuntimeInstallationStatus>('check_builtin_ai_runtime_update'),
@@ -860,6 +915,7 @@ export const agentApi = {
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
     startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install') => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation }),
     startBuiltinAiSession: () => invoke<string>('start_builtin_ai_session'),
+    syncBuiltinAiModels: () => invoke<BuiltinAiModelSyncResult>('sync_builtin_ai_models'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),

@@ -596,8 +596,10 @@ function App() {
     setLoginModalOpen(true);
   }
 
-  const content = (() => {
-    if (page === 'builtin-ai') return <BuiltinAiPage
+  // Keep the embedded AI page mounted while navigating elsewhere. Destroying
+  // the iframe on every navigation loses the runtime's browser state and
+  // forces a full session reload when the user comes back.
+  const builtinAiContent = <BuiltinAiPage
       identity={dashboardIdentity}
       authorization={dashboardAuthorization}
       authorizationBusy={aiOperation === 'identity'}
@@ -614,6 +616,9 @@ function App() {
         mcp_services: 1,
       }}
     />;
+
+  const content = (() => {
+    if (page === 'builtin-ai') return null;
     if (page === 'dashboard') return <DashboardPage
       status={status}
       approvals={approvals}
@@ -784,7 +789,10 @@ function App() {
       onQuit={() => { void agentApi.quitAgent(); }}
     >
       <NotificationCenter messages={messages} onClose={dismissNotification} />
-      {content}
+      <div className={`builtin-ai-page-host ${page === 'builtin-ai' ? 'active' : 'inactive'}`} aria-hidden={page !== 'builtin-ai'}>
+        {builtinAiContent}
+      </div>
+      {page !== 'builtin-ai' ? content : null}
     </Shell>
   );
 }

@@ -7,6 +7,7 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::api::distribution::ExtensionDesiredState;
 use crate::api::types::AgentTaskHistoryItem;
+use crate::app::remote_clients;
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
     is_agent_auto_start_enabled, local_agent_executable_metadata, open_agent_install_directory,
@@ -142,6 +143,28 @@ pub(crate) async fn get_dashboard_identity_status(
     tauri::async_runtime::spawn_blocking(move || crate::app::identity::identity_status(&options))
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_builtin_ai_activity(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let (agent_id, token, client) =
+        dashboard_agent_user_client(&state, crate::api::oauth::AI_CONVERSATION_SCOPE)?;
+    let response = client
+        .get(format!(
+            "{}/api/integrations/ai/runtime/sessions/activity",
+            state.dashboard_base.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", "himind-agent")
+        .send()
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Dashboard returned HTTP {}", response.status()));
+    }
+    response.json().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -473,6 +496,44 @@ pub(crate) fn save_remote_execution_settings(
         },
     );
     Ok(settings)
+}
+
+#[tauri::command]
+pub(crate) fn get_remote_clients(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    remote_clients::overview(&state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn detect_remote_clients(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    remote_clients::overview(&state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn configure_remote_client(
+    state: State<'_, AgentState>,
+    vendor: String,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    remote_clients::configure(&vendor, &path, &state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn pick_remote_client(vendor: String) -> Result<serde_json::Value, String> {
+    let title = if vendor.to_ascii_lowercase().contains("todesk") {
+        "选择 ToDesk 客户端程序"
+    } else {
+        "选择向日葵客户端程序"
+    };
+    let path = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter("Windows 可执行文件", &["exe"])
+        .pick_file()
+        .map(|value| value.to_string_lossy().to_string());
+    Ok(json!({ "path": path }))
 }
 
 #[tauri::command]
@@ -813,6 +874,31 @@ pub(crate) async fn start_builtin_ai_session(
             Err(present_builtin_ai_start_error(&error))
         }
     }
+}
+
+#[tauri::command]
+pub(crate) async fn sync_builtin_ai_models(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::builtin_ai_model_sync::BuiltinAiModelSyncResult, String> {
+    let options = state.options.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::app::ui::sync_builtin_ai_models(&options)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    match &result {
+        Ok(value) => state.approval_manager.add_log(
+            "info",
+            &format!(
+                "HiMind AI 模型同步完成：{} 个模型，状态={}",
+                value.model_count, value.status
+            ),
+        ),
+        Err(error) => state
+            .approval_manager
+            .add_log("warn", &format!("HiMind AI 模型同步失败：{error}")),
+    }
+    result
 }
 
 #[tauri::command]

@@ -1081,15 +1081,27 @@ pub fn publish_software_release(
             ])
             .send()?,
     )?;
-    let product_exists = products["items"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .any(|item| item["product_key"] == request.product_id)
-        })
-        .unwrap_or(false);
-    if !product_exists {
+    let existing_product = products["items"].as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|item| item["product_key"] == request.product_id)
+    });
+    if let Some(product) = existing_product {
+        let existing_type = product["product_type"].as_str().unwrap_or_default();
+        if existing_type != request.product_type {
+            return Err(format!(
+                "Dashboard product {} has type {}, expected {}",
+                request.product_id,
+                if existing_type.is_empty() {
+                    "<missing>"
+                } else {
+                    existing_type
+                },
+                request.product_type
+            )
+            .into());
+        }
+    } else {
         collaboration_json::<serde_json::Value>(
             client
                 .post(format!("{api_base}/api/distribution/products"))
@@ -1572,5 +1584,50 @@ mod tests {
         assert!(captured.iter().all(|request| request
             .to_ascii_lowercase()
             .contains("authorization: bearer secret-access-token")));
+    }
+
+    #[test]
+    fn software_release_publish_rejects_existing_product_type_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).unwrap();
+            let body = r#"{"items":[{"product_key":"himind-agent","product_type":"desktop_app"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let request = SoftwareReleasePublishRequest {
+            workspace_root: ".".to_string(),
+            artifact_path: "himind-agent-update.zip".to_string(),
+            product_id: "himind-agent".to_string(),
+            product_name: "HiMind Agent".to_string(),
+            product_type: "desktop_agent".to_string(),
+            version: "0.3.22".to_string(),
+            channel: "stable".to_string(),
+            platform: "windows".to_string(),
+            architecture: "x64".to_string(),
+            package_type: "directory-zip".to_string(),
+            release_notes: String::new(),
+            mandatory: false,
+            rollout_percent: 100,
+            confirmed: true,
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let error = publish_software_release(
+            &client,
+            &format!("http://{address}"),
+            "agent-test",
+            "secret-access-token",
+            &request,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains(
+            "Dashboard product himind-agent has type desktop_app, expected desktop_agent"
+        ));
     }
 }

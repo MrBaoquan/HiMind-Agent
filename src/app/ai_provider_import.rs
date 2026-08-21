@@ -10,9 +10,9 @@ use std::error::Error;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 #[cfg(windows)]
@@ -26,6 +26,7 @@ use crate::Options;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MANAGED_VENDOR: &str = "HiMind";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
+const VSCODE_CHAT_PROVIDER_PROPOSAL: &str = "chatProvider";
 const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 60;
 const VSCODE_ENROLLMENT_HANDOFF_FILE: &str = "vscode-enrollment-v2.json";
 const VSCODE_IMPORT_STATUS_FILE: &str = "vscode-import-status.json";
@@ -53,6 +54,7 @@ struct VSCodeEnrollmentHandoff<'a> {
 
 static VSCODE_ENROLLMENTS: OnceLock<Mutex<HashMap<String, PendingVSCodeEnrollment>>> =
     OnceLock::new();
+static VSCODE_EXTENSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AIProviderImportRequest {
@@ -324,7 +326,9 @@ fn import_workbuddy(
 
 fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
     let path = vscode_import_status_path(options);
-    let client_detected = locate_vscode_cli()
+    let cli = locate_vscode_cli();
+    let client_detected = cli.is_some();
+    let extension_installed = cli
         .and_then(|cli| installed_vscode_extension_version(&cli).ok().flatten())
         .is_some();
     let imported = path.is_file();
@@ -340,10 +344,13 @@ fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
             format!("VS Code 已同步 {} 个 HiMind 模型", status.models.len())
         } else if imported {
             "VS Code 已保存 HiMind AI 凭据，等待扩展同步模型状态".to_string()
-        } else if client_detected {
+        } else if extension_installed {
             "已安装 HiMind AI 扩展，尚未检测到导入记录".to_string()
+        } else if client_detected {
+            "已检测到 VS Code，尚未安装 HiMind AI 扩展".to_string()
         } else {
-            "未检测到 VS Code HiMind AI 扩展".to_string()
+            "未检测到 VS Code，请先安装；便携版可将 HIMIND_VSCODE_CLI 配置为 bin\\code.cmd"
+                .to_string()
         },
         config_path: path.to_string_lossy().to_string(),
         models: status.models,
@@ -938,7 +945,12 @@ struct VSCodeExtensionManifest {
 }
 
 fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
-    let cli = locate_vscode_cli().ok_or("未检测到 VS Code，请先安装 VS Code 后再导入 HiMind AI")?;
+    let _lock = VSCODE_EXTENSION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "VS Code 导入锁不可用")?;
+    let cli = locate_vscode_cli()
+        .ok_or("未检测到 VS Code，请先安装；便携版可配置 HIMIND_VSCODE_CLI 指向 bin\\code.cmd")?;
     let vsix = bundled_vscode_vsix_path()?;
     let bundled_version = read_vscode_vsix_version(&vsix)?;
     let installed_version = installed_vscode_extension_version(&cli)?;
@@ -946,7 +958,7 @@ fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
         vscode_extension_install_required(installed_version.as_deref(), &bundled_version)?;
     if install_required {
         install_vscode_extension(&cli, &vsix)?;
-        let installed = installed_vscode_extension_version(&cli)?
+        let installed = wait_for_vscode_extension_version(&cli)?
             .ok_or("VS Code CLI 已返回安装成功，但未检测到 HiMind AI 扩展")?;
         if compare_extension_versions(&installed, &bundled_version)? == Ordering::Less {
             return Err(format!(
@@ -955,56 +967,340 @@ fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
             .into());
         }
     }
+    ensure_vscode_chat_provider_allowlist(&cli)?;
     Ok(cli)
 }
 
-fn locate_vscode_cli() -> Option<PathBuf> {
-    let mut stable_candidates = Vec::new();
-    let mut insiders_candidates = Vec::new();
-    if let Some(value) = env::var_os("HIMIND_VSCODE_CLI") {
-        stable_candidates.push(PathBuf::from(value));
+/// Reconcile a previously imported VS Code installation after Agent startup.
+/// VS Code updates install a new version directory and replace product.json;
+/// repairing here keeps the provider available after ordinary upgrades without
+/// requiring the user to repeat the import flow.
+pub(crate) fn reconcile_vscode_import(options: &Options) {
+    if !vscode_import_status_path(options).is_file() {
+        return;
     }
-    stable_candidates.push(PathBuf::from("code"));
+    let _ = std::thread::Builder::new()
+        .name("himind-vscode-reconcile".to_string())
+        .spawn(|| match ensure_vscode_extension() {
+            Ok(_) => {}
+            Err(error) => eprintln!("VS Code HiMind import reconciliation skipped: {error}"),
+        });
+}
+
+/// The Language Model Chat Provider API is still a VS Code proposal. Unlike a
+/// launch flag, the product allowlist survives ordinary desktop launches and
+/// window restarts. Keep the change local to the installed VS Code version and
+/// retain a timestamped backup so an update or uninstall can restore the file.
+fn ensure_vscode_chat_provider_allowlist(cli: &Path) -> Result<(), Box<dyn Error>> {
+    let install_root = cli
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("无法定位 VS Code 安装目录")?;
+    let mut product_paths = Vec::new();
+    let direct = install_root.join("resources/app/product.json");
+    if direct.is_file() {
+        product_paths.push(direct);
+    }
+    if let Ok(entries) = fs::read_dir(install_root) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("resources/app/product.json");
+            if candidate.is_file() {
+                product_paths.push(candidate);
+            }
+        }
+    }
+    product_paths.sort();
+    product_paths.dedup();
+    if product_paths.is_empty() {
+        return Err("无法找到 VS Code product.json，无法持久启用 HiMind 模型 Provider".into());
+    }
+    for product_path in product_paths {
+        let original = fs::read(&product_path)?;
+        let mut product: Value = serde_json::from_slice(&original)
+            .map_err(|error| format!("VS Code product.json 格式无效：{error}"))?;
+        if !product
+            .get("extensionEnabledApiProposals")
+            .is_some_and(Value::is_object)
+        {
+            product["extensionEnabledApiProposals"] = json!({});
+        }
+        let proposals = product
+            .get_mut("extensionEnabledApiProposals")
+            .and_then(Value::as_object_mut)
+            .ok_or("VS Code product.json 的 extensionEnabledApiProposals 格式无效")?;
+        let entry = proposals
+            .entry(VSCODE_EXTENSION_ID.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let list = entry
+            .as_array_mut()
+            .ok_or("VS Code product.json 的 HiMind API 白名单格式无效")?;
+        if list
+            .iter()
+            .any(|item| item.as_str() == Some(VSCODE_CHAT_PROVIDER_PROPOSAL))
+        {
+            continue;
+        }
+        list.push(Value::String(VSCODE_CHAT_PROVIDER_PROPOSAL.to_string()));
+
+        let backup = product_path.with_file_name(format!(
+            "product.json.himind-backup-{}.json",
+            unix_now_millis()
+        ));
+        fs::copy(&product_path, &backup)?;
+        let temporary = product_path.with_file_name("product.json.himind.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(&product)?)?;
+        if let Err(error) =
+            fs::remove_file(&product_path).and_then(|_| fs::rename(&temporary, &product_path))
+        {
+            let _ = fs::remove_file(&temporary);
+            let _ = fs::copy(&backup, &product_path);
+            return Err(format!(
+                "无法更新 VS Code product.json（备份位于 {}）：{error}",
+                backup.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn locate_vscode_cli() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(value) = env::var_os("HIMIND_VSCODE_CLI") {
+        candidates.push(PathBuf::from(value));
+    }
+    candidates.extend(vscode_running_process_candidates());
+    candidates.extend(vscode_registry_candidates());
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
         let root = PathBuf::from(local_app_data).join("Programs");
-        stable_candidates.push(root.join("Microsoft VS Code/bin/code.cmd"));
-        insiders_candidates.push(root.join("Microsoft VS Code Insiders/bin/code-insiders.cmd"));
+        candidates.push(root.join("Microsoft VS Code/bin/code.cmd"));
+        candidates.push(root.join("Microsoft VS Code Insiders/bin/code-insiders.cmd"));
     }
     for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Some(program_files) = env::var_os(variable) {
             let root = PathBuf::from(program_files);
-            stable_candidates.push(root.join("Microsoft VS Code/bin/code.cmd"));
-            insiders_candidates.push(root.join("Microsoft VS Code Insiders/bin/code-insiders.cmd"));
+            candidates.push(root.join("Microsoft VS Code/bin/code.cmd"));
+            candidates.push(root.join("Microsoft VS Code Insiders/bin/code-insiders.cmd"));
         }
     }
     if cfg!(windows) {
-        stable_candidates.push(PathBuf::from(r"C:\Programs\Microsoft VS Code\bin\code.cmd"));
-        insiders_candidates.push(PathBuf::from(
+        candidates.push(PathBuf::from(r"C:\Programs\Microsoft VS Code\bin\code.cmd"));
+        candidates.push(PathBuf::from(
             r"C:\Programs\Microsoft VS Code Insiders\bin\code-insiders.cmd",
         ));
     }
-    insiders_candidates.push(PathBuf::from("code-insiders"));
-    stable_candidates.extend(insiders_candidates);
+    candidates.extend(vscode_path_candidates());
+    candidates.push(PathBuf::from("code"));
+    candidates.push(PathBuf::from("code-insiders"));
 
     let mut seen = HashSet::new();
-    stable_candidates.into_iter().find(|candidate| {
+    candidates.into_iter().find_map(|candidate| {
         let key = candidate.to_string_lossy().to_ascii_lowercase();
-        seen.insert(key) && vscode_cli_available(candidate)
+        if !seen.insert(key) {
+            return None;
+        }
+        resolve_vscode_cli_candidate(&candidate)
     })
 }
 
-fn vscode_cli_available(cli: &Path) -> bool {
-    vscode_command(cli)
-        .arg("--version")
+fn resolve_vscode_cli_candidate(candidate: &Path) -> Option<PathBuf> {
+    if candidate.components().count() == 1 {
+        return vscode_path_command(candidate);
+    }
+    vscode_cli_available(candidate).then(|| candidate.to_path_buf())
+}
+
+#[cfg(windows)]
+fn vscode_path_command(command: &Path) -> Option<PathBuf> {
+    let output = Command::new("where.exe")
+        .arg(command)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .find(|path| vscode_cli_available(path))
+}
+
+#[cfg(not(windows))]
+fn vscode_path_command(command: &Path) -> Option<PathBuf> {
+    vscode_cli_available(command).then(|| command.to_path_buf())
+}
+
+fn vscode_path_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in [
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+    ] {
+        let Some(root) = env::var_os(root).map(PathBuf::from) else {
+            continue;
+        };
+        for relative in [
+            "Microsoft VS Code/bin/code.cmd",
+            "Microsoft VS Code Insiders/bin/code-insiders.cmd",
+            "scoop/apps/vscode/current/bin/code.cmd",
+            "scoop/apps/vscode-insiders/current/bin/code-insiders.cmd",
+        ] {
+            candidates.push(root.join(relative));
+        }
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn vscode_running_process_candidates() -> Vec<PathBuf> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('Code.exe','Code - Insiders.exe') -and $_.ExecutablePath } | Select-Object -ExpandProperty ExecutablePath",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| vscode_cli_from_executable(Path::new(value)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn vscode_running_process_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn vscode_registry_candidates() -> Vec<PathBuf> {
+    use winreg::enums::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    };
+    use winreg::RegKey;
+
+    let mut candidates = Vec::new();
+    for (root, key_path) in [
+        (
+            RegKey::predef(HKEY_CURRENT_USER),
+            r"Software\Microsoft\Windows\CurrentVersion\App Paths",
+        ),
+        (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"Software\Microsoft\Windows\CurrentVersion\App Paths",
+        ),
+    ] {
+        for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+            for executable in ["Code.exe", "code-insiders.exe"] {
+                if let Ok(key) = root
+                    .open_subkey_with_flags(format!(r"{key_path}\{executable}"), KEY_READ | view)
+                {
+                    if let Ok(value) = key.get_value::<String, _>("") {
+                        push_vscode_registry_value(&mut candidates, &value);
+                    }
+                }
+            }
+        }
+    }
+    for (root, key_path) in [
+        (
+            RegKey::predef(HKEY_CURRENT_USER),
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+    ] {
+        for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+            let Ok(uninstall) = root.open_subkey_with_flags(key_path, KEY_READ | view) else {
+                continue;
+            };
+            for child_name in uninstall.enum_keys().flatten() {
+                let Ok(child) = uninstall.open_subkey_with_flags(&child_name, KEY_READ | view)
+                else {
+                    continue;
+                };
+                let display_name = child
+                    .get_value::<String, _>("DisplayName")
+                    .unwrap_or_default();
+                if !display_name
+                    .to_ascii_lowercase()
+                    .contains("visual studio code")
+                {
+                    continue;
+                }
+                for value_name in ["InstallLocation", "DisplayIcon", "UninstallString"] {
+                    if let Ok(value) = child.get_value::<String, _>(value_name) {
+                        push_vscode_registry_value(&mut candidates, &value);
+                    }
+                }
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(not(windows))]
+fn vscode_registry_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn push_vscode_registry_value(candidates: &mut Vec<PathBuf>, value: &str) {
+    let trimmed = value.trim().trim_matches('"');
+    let path = if let Some(end) = trimmed.to_ascii_lowercase().find(".exe") {
+        PathBuf::from(trimmed[..end + 4].trim_matches('"'))
+    } else {
+        PathBuf::from(trimmed)
+    };
+    let looks_like_executable = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("exe"));
+    if path.is_dir() || !looks_like_executable {
+        candidates.push(path.join("bin/code.cmd"));
+        candidates.push(path.join("bin/code-insiders.cmd"));
+    } else if let Some(cli) = vscode_cli_from_executable(&path) {
+        candidates.push(cli);
+    }
+}
+
+fn vscode_cli_from_executable(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name().and_then(|value| value.to_str())?;
+    let cli = if name.eq_ignore_ascii_case("code.exe") {
+        "code.cmd"
+    } else if name.eq_ignore_ascii_case("code-insiders.exe")
+        || name.eq_ignore_ascii_case("code - insiders.exe")
+    {
+        "code-insiders.cmd"
+    } else {
+        return None;
+    };
+    Some(path.parent()?.join("bin").join(cli))
+}
+
+fn vscode_cli_available(cli: &Path) -> bool {
+    run_vscode_command(vscode_command(cli).arg("--version"), Duration::from_secs(3))
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
 fn installed_vscode_extension_version(cli: &Path) -> Result<Option<String>, Box<dyn Error>> {
-    let output = vscode_command(cli)
-        .args(["--list-extensions", "--show-versions"])
-        .output()?;
+    let output = run_vscode_command(
+        vscode_command(cli).args(["--list-extensions", "--show-versions"]),
+        Duration::from_secs(8),
+    )?;
     if !output.status.success() {
         return Err(format!(
             "无法检查 VS Code 扩展：{}",
@@ -1013,6 +1309,18 @@ fn installed_vscode_extension_version(cli: &Path) -> Result<Option<String>, Box<
         .into());
     }
     parse_vscode_extension_version(&String::from_utf8_lossy(&output.stdout)).map_err(Into::into)
+}
+
+fn wait_for_vscode_extension_version(cli: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    for attempt in 0..5 {
+        if let Some(version) = installed_vscode_extension_version(cli)? {
+            return Ok(Some(version));
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    Ok(None)
 }
 
 fn parse_vscode_extension_version(output: &str) -> Result<Option<String>, String> {
@@ -1084,6 +1392,16 @@ fn bundled_vscode_vsix_candidates(
                 candidates.push(install_root.join("resources/vscode/himind-ai.vsix"));
             }
         }
+        if directory
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("versions"))
+        {
+            if let Some(install_root) = directory.parent().and_then(Path::parent) {
+                candidates.push(install_root.join("resources/vscode/himind-ai.vsix"));
+            }
+        }
         candidates.push(directory.join("resources/vscode/himind-ai.vsix"));
     }
     if let Some(root) = repository_root {
@@ -1116,11 +1434,13 @@ fn read_vscode_vsix_version(path: &Path) -> Result<String, Box<dyn Error>> {
 }
 
 fn install_vscode_extension(cli: &Path, vsix: &Path) -> Result<(), Box<dyn Error>> {
-    let output = vscode_command(cli)
-        .arg("--install-extension")
-        .arg(vsix)
-        .arg("--force")
-        .output()?;
+    let output = run_vscode_command(
+        vscode_command(cli)
+            .arg("--install-extension")
+            .arg(vsix)
+            .arg("--force"),
+        Duration::from_secs(30),
+    )?;
     if !output.status.success() {
         return Err(format!(
             "HiMind AI 扩展安装失败：{}",
@@ -1142,6 +1462,23 @@ fn command_error_detail(stdout: &[u8], stderr: &[u8]) -> String {
         "VS Code CLI 未返回错误详情".to_string()
     } else {
         detail.chars().take(500).collect()
+    }
+}
+
+fn run_vscode_command(command: &mut Command, timeout: Duration) -> Result<Output, Box<dyn Error>> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("VS Code CLI 执行超时（{} 秒）", timeout.as_secs()).into());
+        }
+        std::thread::sleep(Duration::from_millis(40));
     }
 }
 
@@ -1258,10 +1595,12 @@ mod tests {
     use super::{
         build_cc_switch_deep_link, build_vscode_enrollment_url, bundled_vscode_vsix_candidates,
         chat_completions_url, compare_extension_versions, consume_vscode_enrollment,
-        create_vscode_enrollment, legacy_workbuddy_model_id, managed_workbuddy_model_ids,
-        merge_workbuddy_models, migrate_workbuddy_sessions, parse_vscode_extension_version,
-        parse_vscode_import_status, remove_workbuddy_models, vscode_extension_install_required,
-        workbuddy_model_id, workbuddy_models_path_in, AIClientCredential,
+        create_vscode_enrollment, ensure_vscode_chat_provider_allowlist, legacy_workbuddy_model_id,
+        managed_workbuddy_model_ids, merge_workbuddy_models, migrate_workbuddy_sessions,
+        parse_vscode_extension_version, parse_vscode_import_status, push_vscode_registry_value,
+        remove_workbuddy_models, vscode_extension_install_required, workbuddy_model_id,
+        workbuddy_models_path_in, AIClientCredential, VSCODE_CHAT_PROVIDER_PROPOSAL,
+        VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
     use serde_json::Value;
@@ -1370,6 +1709,88 @@ mod tests {
         assert!(!vscode_extension_install_required(Some("0.1.8"), "0.1.8").unwrap());
         assert!(!vscode_extension_install_required(Some("0.2.0"), "0.1.8").unwrap());
         assert!(vscode_extension_install_required(None, "0.1.8").unwrap());
+    }
+
+    #[test]
+    fn persists_chat_provider_allowlist_for_an_installed_vscode_version() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-vscode-product-{}-{}",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        let product_path = root.join("version/resources/app/product.json");
+        let cli = root.join("bin/code.cmd");
+        std::fs::create_dir_all(product_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(
+            &product_path,
+            serde_json::to_vec(&serde_json::json!({
+                "extensionEnabledApiProposals": {"GitHub.copilot-chat": ["chatProvider"]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ensure_vscode_chat_provider_allowlist(&cli).unwrap();
+        let product: Value =
+            serde_json::from_slice(&std::fs::read(&product_path).unwrap()).unwrap();
+        assert_eq!(
+            product["extensionEnabledApiProposals"][VSCODE_EXTENSION_ID],
+            serde_json::json!([VSCODE_CHAT_PROVIDER_PROPOSAL])
+        );
+        assert!(std::fs::read_dir(product_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("product.json.himind-backup-")));
+        ensure_vscode_chat_provider_allowlist(&cli).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_chat_provider_allowlist_when_product_field_is_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-vscode-product-missing-{}-{}",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        let product_path = root.join("resources/app/product.json");
+        let cli = root.join("bin/code.cmd");
+        std::fs::create_dir_all(product_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&product_path, br#"{"quality":"stable"}"#).unwrap();
+
+        ensure_vscode_chat_provider_allowlist(&cli).unwrap();
+        let product: Value =
+            serde_json::from_slice(&std::fs::read(&product_path).unwrap()).unwrap();
+        assert_eq!(
+            product["extensionEnabledApiProposals"][VSCODE_EXTENSION_ID],
+            serde_json::json!([VSCODE_CHAT_PROVIDER_PROPOSAL])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derives_cli_candidates_from_registry_install_values() {
+        let mut candidates = Vec::new();
+        push_vscode_registry_value(
+            &mut candidates,
+            r#"C:\Users\example\AppData\Local\Programs\Microsoft VS Code\Code.exe"#,
+        );
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with(r"bin\code.cmd")));
+
+        candidates.clear();
+        push_vscode_registry_value(
+            &mut candidates,
+            r#"C:\Users\example\AppData\Local\Programs\Microsoft VS Code"#,
+        );
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with(r"bin\code.cmd")));
     }
 
     #[test]

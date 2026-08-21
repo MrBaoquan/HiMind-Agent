@@ -79,6 +79,16 @@ pub(crate) struct BuiltinAIRuntimeEvent {
     pub label: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub outcome: String,
+    /// The original DSH server-request correlation. It is only present for
+    /// approval/question waits and is echoed verbatim by a later response.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_rpc_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub approval_id: String,
+    /// Sanitized question metadata (question text/options only; no tool
+    /// arguments or internal runtime payloads).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_payload: Option<Value>,
     pub occurred_at_ms: i64,
 }
 
@@ -111,8 +121,13 @@ pub(crate) struct BuiltinAIToolContextSummary {
 pub(crate) struct BuiltinAIInteractiveLaunch {
     pub executable: PathBuf,
     pub home: PathBuf,
+    pub user_id: String,
     pub api_key: String,
     pub base_url: String,
+    pub default_model: String,
+    pub models: Vec<String>,
+    pub credential_fingerprint: String,
+    pub catalog_fingerprint: String,
     pub permission_mode: &'static str,
 }
 
@@ -269,8 +284,13 @@ impl AIRuntimeAdapter for DeepSeekHarnessAdapter {
             BuiltinAIInteractiveLaunch {
                 executable: launch.executable,
                 home: launch.home,
+                user_id: launch.user_id,
                 api_key: launch.api_key,
                 base_url: launch.base_url,
+                default_model: launch.default_model,
+                models: launch.models,
+                credential_fingerprint: launch.credential_fingerprint,
+                catalog_fingerprint: launch.catalog_fingerprint,
                 permission_mode: launch.permission_mode,
             }
         })

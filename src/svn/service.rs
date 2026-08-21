@@ -705,6 +705,31 @@ fn svn_remote_item(
     .map(|value| value.trim().to_string())
 }
 
+fn verify_existing_target_working_copy(
+    source: &Path,
+    target_repository_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<(u64, usize), Box<dyn Error>> {
+    let source_uuid = svn_item(source, "repos-uuid")?.trim().to_string();
+    let target_uuid = svn_remote_item(target_repository_url, "repos-uuid", username, password)?;
+    if source_uuid.is_empty() || target_uuid.trim().is_empty() {
+        return Err("target exhibit repository UUID could not be verified".into());
+    }
+    if source_uuid != target_uuid.trim() {
+        return Err("local SVN working copy belongs to a different repository instance".into());
+    }
+    let local_revision = svn_item(source, "revision")?.trim().parse::<u64>()?;
+    let remote_revision = svn_remote_item(target_repository_url, "revision", username, password)?
+        .trim()
+        .parse::<u64>()?;
+    if remote_revision < local_revision {
+        return Err("target repository revision is older than the local working copy".into());
+    }
+    let change_count = svn_status_change_count(source)?;
+    Ok((remote_revision, change_count))
+}
+
 fn same_svn_url(left: &str, right: &str) -> bool {
     left.trim_end_matches('/')
         .eq_ignore_ascii_case(right.trim_end_matches('/'))
@@ -1136,12 +1161,39 @@ where
     if source_is_working_copy {
         let source_repository_url = svn_item(&source, "url")?;
         let target_repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
-        if request.force_migration
-            && source_repository_url
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(target_repository_url.trim_end_matches('/'))
-        {
-            return Err("source and target exhibit repositories must be different".into());
+        if same_svn_url(&source_repository_url, &target_repository_url) {
+            // A browser retry can arrive after the previous import already
+            // replaced the local .svn metadata.  Never rebuild a working copy
+            // that is already on the requested target, even when the stale
+            // request still carries force_migration=true.  Verify the
+            // repository UUID before returning success so a deleted and
+            // recreated repository at the same URL cannot be mistaken for
+            // the original working copy.
+            let (connection, password) = load_company_svn_secret()?;
+            let (revision, change_count) = verify_existing_target_working_copy(
+                &source,
+                &target_repository_url,
+                &connection.username,
+                &password,
+            )?;
+            progress(100, "本地工程已关联当前展项 SVN 仓库")?;
+            return Ok(json!({
+                "ok": true,
+                "imported": false,
+                "linked_existing": true,
+                "adopted_existing_working_copy": false,
+                "idempotent_existing_target": true,
+                "project_id": project_id,
+                "exhibit_id": exhibit_id,
+                "repository_url": target_repository_url,
+                "source_repository_url": source_repository_url,
+                "workspace_path": source,
+                "revision": revision,
+                "change_count": change_count,
+                "old_remote_status": "reachable",
+                "backup_retained": false,
+                "force_migration": request.force_migration
+            }));
         }
         let old_remote_status = probe_svn_remote(&source_repository_url, Duration::from_secs(5));
         match old_remote_status.as_str() {
@@ -1195,6 +1247,12 @@ where
     // archive cannot change unnoticed while the repository is being prepared.
     let source_stability_before =
         migration_source_stability_summary(&source, &snapshot.external_roots, &transformed_paths)?;
+    let source_summary = migration_tree_summary(
+        &source,
+        &snapshot.external_roots,
+        &transformed_paths,
+        &ignore_policy,
+    )?;
     progress(
         20,
         &format!(
@@ -1240,7 +1298,7 @@ where
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis()
     ));
-    let working_copy = temp_root.join("target");
+    let mut working_copy = temp_root.join("target");
     std::fs::create_dir_all(&temp_root)?;
     let result = (|| -> Result<Value, Box<dyn Error>> {
         cancel()?;
@@ -1257,7 +1315,16 @@ where
             cancel,
         )?;
         let mut target_was_empty = !working_copy_contains_content(&working_copy)?;
-        if request.force_migration && !target_was_empty {
+        let target_already_matches_source = request.force_migration
+            && !target_was_empty
+            && svn_status_change_count(&working_copy)? == 0
+            && migration_tree_summary(
+                &working_copy,
+                &snapshot.external_roots,
+                &transformed_paths,
+                &ignore_policy,
+            )? == source_summary;
+        if request.force_migration && !target_was_empty && !target_already_matches_source {
             progress(40, "正在清空目标展项仓库内容并准备强制重建")?;
             clear_working_copy_content(&working_copy)?;
             if working_copy_contains_content(&working_copy)? {
@@ -1275,13 +1342,18 @@ where
                 source_stability_before.file_count
             ),
         )?;
-        let source_summary = copy_migration_tree(
+        let copied_source_summary = copy_migration_tree(
             &source,
             &working_copy,
             &snapshot.external_roots,
             &transformed_paths,
             &ignore_policy,
         )?;
+        if copied_source_summary != source_summary {
+            return Err(
+                "source project changed while preparing migration; refusing to continue".into(),
+            );
+        }
         let source_stability_after = migration_source_stability_summary(
             &source,
             &snapshot.external_roots,
@@ -1360,41 +1432,72 @@ where
         }
 
         progress(80, "目标仓库提交完成，正在校验文件和版本")?;
-        if let Err(error) = run_svn_authenticated_cancelable(
-            [
-                "update".to_string(),
-                "--ignore-externals".to_string(),
-                working_copy.to_string_lossy().to_string(),
-            ],
-            &connection.username,
-            &password,
-            cancel,
-        ) {
+        let local_verification = (|| -> Result<(), Box<dyn Error>> {
+            run_svn_authenticated_cancelable(
+                [
+                    "update".to_string(),
+                    "--ignore-externals".to_string(),
+                    working_copy.to_string_lossy().to_string(),
+                ],
+                &connection.username,
+                &password,
+                cancel,
+            )?;
+            verify_migration_working_copy(
+                &working_copy,
+                &repository_url,
+                &target_uuid,
+                &source_summary,
+                &snapshot.external_roots,
+                &transformed_paths,
+                &ignore_policy,
+                "target exhibit repository",
+            )
+        })();
+        if let Err(error) = local_verification {
             if let Some(commit_error) = commit_response_error.as_ref() {
-                return Err(format!(
-                    "SVN commit result is uncertain: {commit_error}; server verification update failed: {error}"
-                )
-                .into());
+                // A timeout can leave the staging working copy dirty even when
+                // the SVN server committed the transaction atomically. Never
+                // infer the authoritative result from that temporary status.
+                // Re-check from a fresh checkout, then use that clean metadata
+                // for local adoption if the server tree matches the source.
+                cancel()?;
+                progress(82, "临时工作副本状态异常，正在独立核验服务端内容")?;
+                match verify_remote_migration_checkout(
+                    &temp_root,
+                    &repository_url,
+                    &target_uuid,
+                    &source_summary,
+                    &snapshot.external_roots,
+                    &transformed_paths,
+                    &ignore_policy,
+                    &connection.username,
+                    &password,
+                    cancel,
+                ) {
+                    Ok(remote_working_copy) => {
+                        working_copy = remote_working_copy;
+                        record_svn_diagnostic_event(
+                            "svn_cli",
+                            "commit",
+                            "recovered_by_independent_checkout",
+                            "temporary_working_copy_verification_failed",
+                            1,
+                            1,
+                            None,
+                            0,
+                        );
+                    }
+                    Err(remote_error) => {
+                        return Err(format!(
+                            "SVN commit result is uncertain: {commit_error}; server content verification failed: {error}; independent server checkout failed: {remote_error}"
+                        )
+                        .into());
+                    }
+                }
+            } else {
+                return Err(error);
             }
-            return Err(error);
-        }
-        if let Err(error) = verify_migration_working_copy(
-            &working_copy,
-            &repository_url,
-            &target_uuid,
-            &source_summary,
-            &snapshot.external_roots,
-            &transformed_paths,
-            &ignore_policy,
-            "target exhibit repository",
-        ) {
-            if let Some(commit_error) = commit_response_error.as_ref() {
-                return Err(format!(
-                    "SVN commit result is uncertain: {commit_error}; server content verification failed: {error}"
-                )
-                .into());
-            }
-            return Err(error);
         }
         if commit_response_error.is_some() {
             record_svn_diagnostic_event(
@@ -2307,6 +2410,54 @@ fn verify_migration_working_copy(
         .into());
     }
     Ok(())
+}
+
+/// Verify an uncertain commit from a fresh checkout instead of trusting the
+/// temporary staging working copy.  An SVN commit is atomic on the server, but
+/// the client may time out after the server has accepted it and leave the
+/// staging copy with thousands of pending client-side changes.
+fn verify_remote_migration_checkout<F>(
+    temp_root: &Path,
+    repository_url: &str,
+    expected_uuid: &str,
+    expected_summary: &MigrationTreeSummary,
+    external_roots: &[PathBuf],
+    transformed_paths: &BTreeSet<PathBuf>,
+    ignore_policy: &MigrationIgnorePolicy,
+    username: &str,
+    password: &str,
+    cancel: &mut F,
+) -> Result<PathBuf, Box<dyn Error>>
+where
+    F: FnMut() -> Result<(), Box<dyn Error>>,
+{
+    let remote_working_copy = temp_root.join("remote-verification");
+    if remote_working_copy.exists() {
+        std::fs::remove_dir_all(&remote_working_copy)?;
+    }
+    cancel()?;
+    run_svn_authenticated_cancelable(
+        [
+            "checkout".to_string(),
+            "--ignore-externals".to_string(),
+            repository_url.to_string(),
+            remote_working_copy.to_string_lossy().to_string(),
+        ],
+        username,
+        password,
+        cancel,
+    )?;
+    verify_migration_working_copy(
+        &remote_working_copy,
+        repository_url,
+        expected_uuid,
+        expected_summary,
+        external_roots,
+        transformed_paths,
+        ignore_policy,
+        "target exhibit repository (fresh server checkout)",
+    )?;
+    Ok(remote_working_copy)
 }
 
 fn verify_migration_ignored_paths_unversioned(
@@ -5723,6 +5874,69 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_commit_verification_uses_a_fresh_server_checkout() {
+        let svn = find_svn_executable().unwrap();
+        let svnadmin = svn.with_file_name("svnadmin.exe");
+        if !svnadmin.is_file() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "himind-uncertain-commit-verification-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let repository = root.join("repository");
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(Command::new(&svnadmin)
+            .args(["create", repository.to_string_lossy().as_ref()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap()
+            .success());
+        let repository_url = Url::from_file_path(&repository).unwrap().to_string();
+        assert!(Command::new(&svn)
+            .args([
+                "checkout",
+                &repository_url,
+                staging.to_string_lossy().as_ref(),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(staging.join("project.txt"), "server content").unwrap();
+        run_svn_in_directory(&staging, ["add", "project.txt"]).unwrap();
+        run_svn_in_directory(&staging, ["commit", "-m", "uncertain verification test"]).unwrap();
+        let policy = normalized_ignore_policy(&MigrationIgnorePolicy::default());
+        let expected = migration_tree_summary(&staging, &[], &BTreeSet::new(), &policy).unwrap();
+        let uuid = svn_item(&staging, "repos-uuid").unwrap();
+        let mut cancel = || Ok(());
+        let verified = verify_remote_migration_checkout(
+            &root,
+            &repository_url,
+            &uuid,
+            &expected,
+            &[],
+            &BTreeSet::new(),
+            &policy,
+            "",
+            "",
+            &mut cancel,
+        )
+        .unwrap();
+        assert_eq!(svn_status_change_count(&verified).unwrap(), 0);
+        assert_eq!(
+            migration_tree_summary(&verified, &[], &BTreeSet::new(), &policy).unwrap(),
+            expected
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn adopts_verified_working_copy_metadata_without_a_second_checkout() {
         let svn = find_svn_executable().unwrap();
         let svnadmin = svn.with_file_name("svnadmin.exe");
@@ -5786,6 +6000,63 @@ mod tests {
         assert_eq!(
             svn_status_change_count_after_adoption(&source, &[], &policy).unwrap(),
             1
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verifies_idempotent_existing_target_by_repository_uuid() {
+        let svn = find_svn_executable().unwrap();
+        let svnadmin = svn.with_file_name("svnadmin.exe");
+        if !svnadmin.is_file() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "himind-existing-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let repository = root.join("repository");
+        let replacement = root.join("replacement");
+        let working_copy = root.join("working-copy");
+        std::fs::create_dir_all(&root).unwrap();
+        for path in [&repository, &replacement] {
+            assert!(Command::new(&svnadmin)
+                .args(["create", path.to_string_lossy().as_ref()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let repository_url = Url::from_file_path(&repository).unwrap().to_string();
+        let replacement_url = Url::from_file_path(&replacement).unwrap().to_string();
+        assert!(Command::new(&svn)
+            .args([
+                "checkout",
+                &repository_url,
+                working_copy.to_string_lossy().as_ref()
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(working_copy.join("project.txt"), "content").unwrap();
+        run_svn_in_directory(&working_copy, ["add", "project.txt"]).unwrap();
+        run_svn_in_directory(&working_copy, ["commit", "-m", "initial"]).unwrap();
+
+        let (revision, change_count) =
+            verify_existing_target_working_copy(&working_copy, &repository_url, "", "").unwrap();
+        assert!(revision > 0);
+        assert_eq!(change_count, 0);
+        assert!(
+            verify_existing_target_working_copy(&working_copy, &replacement_url, "", "")
+                .unwrap_err()
+                .to_string()
+                .contains("different repository instance")
         );
 
         std::fs::remove_dir_all(root).unwrap();

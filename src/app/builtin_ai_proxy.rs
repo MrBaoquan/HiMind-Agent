@@ -1,5 +1,7 @@
 use base64::Engine;
 use rand::RngCore;
+use reqwest::blocking::Client;
+use serde_json::json;
 use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -15,6 +17,18 @@ const HTML_RESPONSE_LIMIT: usize = 1024 * 1024;
 const OBSERVED_FRAME_LIMIT: u64 = 4 * 1024 * 1024;
 const SESSION_QUERY: &str = "himind_session";
 const SESSION_COOKIE: &str = "himind_ai_session";
+// WebView2 treats Secure cookies on the `localhost` HTTP origin as a secure
+// local context. Using the numeric loopback host can cause the browser session
+// cookie to be rejected, leaving the embedded runtime on a permanent 403.
+const BROWSER_HOST: &str = "localhost";
+// DSH's model selector prefers the optional display name over the provider
+// and model id. Keep the user-facing label tied to the real catalog id so a
+// managed HiMind provider cannot turn `deepseek-v4-flash` into `HiMind-v4`.
+fn model_profile_entry(model: &str) -> Value {
+    let model = model.trim();
+    json!({ "id": model, "name": model })
+}
+
 const RUNTIME_BRAND_BRIDGE: &str = r#"<style data-himind-runtime-brand>
 button:has(> svg[viewBox="0 0 182 24"]) > svg {
   display: none !important;
@@ -30,7 +44,6 @@ button:has(> svg[viewBox="0 0 182 24"])::before {
 (() => {
   const replacements = [
     [/DeepSeek Harness/gi, 'HiMind AI'],
-    [/\bdeepseek\b/gi, 'HiMind'],
     [/\bHARNESS\b/g, 'AI'],
   ];
   const replace = (value) => replacements.reduce(
@@ -85,6 +98,11 @@ pub(crate) struct BuiltinAiProxy {
     listener: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct BuiltinAiProxyControl {
+    url: String,
+}
+
 impl BuiltinAiProxy {
     pub(crate) fn start(
         upstream_url: &str,
@@ -101,7 +119,7 @@ impl BuiltinAiProxy {
             .map_err(|error| format!("无法读取 HiMind AI 本机入口：{error}"))?
             .port();
         let token = random_token();
-        let url = format!("http://127.0.0.1:{port}/?{SESSION_QUERY}={token}");
+        let url = format!("http://{BROWSER_HOST}:{port}/?{SESSION_QUERY}={token}");
         let shutdown = Arc::new(AtomicBool::new(false));
         let listener_shutdown = Arc::clone(&shutdown);
         let listener_token = token.clone();
@@ -149,12 +167,266 @@ impl BuiltinAiProxy {
         &self.url
     }
 
+    pub(crate) fn control(&self) -> BuiltinAiProxyControl {
+        BuiltinAiProxyControl {
+            url: self.url.clone(),
+        }
+    }
+
     pub(crate) fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Some(listener) = self.listener.take() {
             let _ = listener.join();
         }
     }
+}
+
+impl BuiltinAiProxyControl {
+    /// Synchronize the Agent-owned provider through DSH's public API carrier.
+    /// The initial browser handshake is important: DSH keeps its own session
+    /// cookie in addition to the Agent proxy cookie, so calling the upstream
+    /// port directly is intentionally avoided.
+    pub(crate) fn sync_model_catalog(
+        &self,
+        default_model: &str,
+        base_url: &str,
+        models: &[String],
+    ) -> Result<(), String> {
+        let default_model = default_model.trim();
+        let base_url = base_url.trim();
+        if default_model.is_empty() || base_url.is_empty() || models.is_empty() {
+            return Err("HiMind AI 模型目录为空".to_string());
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|error| format!("创建 DSH 模型同步客户端失败: {error}"))?;
+        let described = self.call_api(&client, "settings.describe", json!({}))?;
+        let namespaces = described
+            .get("result")
+            .and_then(|result| result.get("ok").and_then(Value::as_bool).filter(|ok| *ok))
+            .and_then(|_| {
+                described
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+            })
+            .and_then(|value| value.get("namespaces"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| "DSH 设置目录不可用".to_string())?;
+
+        let provider_profile = json!({
+            "displayName": "HiMind AI",
+            "apiKeyEnv": "DEEPSEEK_API_KEY",
+            "api": "openai-completions",
+            "baseURL": base_url,
+            "models": models
+                .iter()
+                .map(|model| model_profile_entry(model))
+                .filter(|model| model.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()))
+                .collect::<Vec<_>>(),
+        });
+        let llm_revision = namespace_revision(namespaces, "llm-pi-ai");
+        self.mutate_settings(
+            &client,
+            "llm-pi-ai",
+            vec![json!({
+                "op": "set",
+                "path": ["providers", "himind-proxy"],
+                "value": provider_profile,
+            })],
+            llm_revision,
+        )?;
+
+        // A user-selected provider remains untouched. The built-in DeepSeek
+        // default is migrated to the managed route, while an existing HiMind
+        // model remains user-owned. Only an empty HiMind model is initialized
+        // from the current service default.
+        let default_namespace = namespaces
+            .iter()
+            .find(|item| item.get("ns").and_then(Value::as_str) == Some("agent-default-model"));
+        let current_provider = default_namespace
+            .and_then(|item| item.get("user"))
+            .and_then(|value| value.get("provider"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let current_model = default_namespace
+            .and_then(|item| item.get("user"))
+            .and_then(|value| value.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if should_initialize_managed_model(current_provider, current_model) {
+            let revision = default_namespace
+                .and_then(|item| item.get("revision"))
+                .and_then(Value::as_i64);
+            self.mutate_settings(
+                &client,
+                "agent-default-model",
+                vec![
+                    json!({ "op": "set", "path": ["provider"], "value": "himind-proxy" }),
+                    json!({ "op": "set", "path": ["model"], "value": default_model }),
+                ],
+                revision,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn call_api(&self, client: &Client, method: &str, payload: Value) -> Result<Value, String> {
+        let mut endpoint =
+            url::Url::parse(&self.url).map_err(|_| "HiMind AI 本机地址无效".to_string())?;
+        let session = endpoint
+            .query_pairs()
+            .find(|(name, _)| name == SESSION_QUERY)
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "HiMind AI 本机会话令牌不可用".to_string())?;
+        endpoint.set_path(&format!("/api/{method}"));
+        endpoint.set_query(None);
+        let request = json!({
+            "type": "client-request",
+            "rpcId": format!("himind-sync-{}", unix_millis()),
+            "method": method,
+            "payload": payload,
+        });
+        let response = client
+            .post(endpoint)
+            // WebView2 accepts the Secure localhost cookie. Reqwest follows
+            // standard HTTP cookie rules, so carry the short-lived local
+            // session explicitly for the Agent-to-proxy control request.
+            .header(
+                reqwest::header::COOKIE,
+                format!("{SESSION_COOKIE}={session}"),
+            )
+            .json(&request)
+            .send()
+            .map_err(|error| format!("DSH {method} 请求失败: {error}"))?;
+        let status = response.status();
+        let body = response
+            .json::<Value>()
+            .map_err(|error| format!("DSH {method} 响应无效: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("DSH {method} 返回 HTTP {status}"));
+        }
+        Ok(body)
+    }
+
+    /// Send a control request through the authenticated local DSH carrier.
+    /// Runtime command names are intentionally kept at the gateway boundary;
+    /// this method only owns transport/session-cookie handling.
+    pub(crate) fn call_runtime_api(&self, method: &str, payload: Value) -> Result<Value, String> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|error| format!("创建 DSH 控制客户端失败: {error}"))?;
+        self.call_api(&client, method, payload)
+    }
+
+    /// Answer a DSH server-request. Unlike ordinary runtime calls this is a
+    /// client-response envelope and therefore is intentionally not routed
+    /// through the client-request method dispatcher.
+    pub(crate) fn respond_runtime_request(
+        &self,
+        rpc_id: &str,
+        result_value: Value,
+    ) -> Result<Value, String> {
+        let rpc_id = rpc_id.trim();
+        if rpc_id.is_empty() {
+            return Err("DSH client-response requires rpcId".to_string());
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|error| format!("创建 DSH 响应客户端失败: {error}"))?;
+        let mut endpoint =
+            url::Url::parse(&self.url).map_err(|_| "HiMind AI 本机地址无效".to_string())?;
+        let session = endpoint
+            .query_pairs()
+            .find(|(name, _)| name == SESSION_QUERY)
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "HiMind AI 本机会话令牌不可用".to_string())?;
+        endpoint.set_path("/api/respond");
+        endpoint.set_query(None);
+        let response = client
+            .post(endpoint)
+            .header(
+                reqwest::header::COOKIE,
+                format!("{SESSION_COOKIE}={session}"),
+            )
+            .json(&json!({
+                "type": "client-response",
+                "rpcId": rpc_id,
+                "result": {"ok": true, "value": result_value},
+            }))
+            .send()
+            .map_err(|error| format!("DSH client-response 请求失败: {error}"))?;
+        let status = response.status();
+        let body = response
+            .json::<Value>()
+            .map_err(|error| format!("DSH client-response 响应无效: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("DSH client-response 返回 HTTP {status}"));
+        }
+        Ok(body)
+    }
+
+    /// Probe only the shape/availability of a DSH RPC. Probes use a shorter
+    /// timeout so a degraded local runtime cannot delay Agent startup or the
+    /// command claim loop.
+    pub(crate) fn probe_runtime_api(&self, method: &str, payload: Value) -> Result<Value, String> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|error| format!("创建 DSH 能力探测客户端失败: {error}"))?;
+        self.call_api(&client, method, payload)
+    }
+
+    fn mutate_settings(
+        &self,
+        client: &Client,
+        namespace: &str,
+        ops: Vec<Value>,
+        revision: Option<i64>,
+    ) -> Result<(), String> {
+        let mut payload = json!({ "ns": namespace, "ops": ops });
+        if let Some(revision) = revision {
+            payload["expectedRevision"] = json!(revision);
+        }
+        let response = self.call_api(client, "settings.mutate", payload)?;
+        let result = response
+            .get("result")
+            .ok_or_else(|| "DSH 设置同步响应缺少结果".to_string())?;
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        let message = result
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("DSH 设置同步被拒绝");
+        Err(message.to_string())
+    }
+}
+
+fn namespace_revision(namespaces: &[Value], namespace: &str) -> Option<i64> {
+    namespaces
+        .iter()
+        .find(|item| item.get("ns").and_then(Value::as_str) == Some(namespace))
+        .and_then(|item| item.get("revision"))
+        .and_then(Value::as_i64)
+}
+
+fn should_initialize_managed_model(provider: &str, model: &str) -> bool {
+    provider.trim().is_empty()
+        || provider == "deepseek-official"
+        || (provider == "himind-proxy" && model.trim().is_empty())
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 impl Drop for BuiltinAiProxy {
@@ -836,6 +1108,50 @@ mod tests {
         assert!(customized.contains("data-himind-runtime-brand"));
         assert!(customized.contains("svg[viewBox=\"0 0 182 24\"]"));
         assert!(customized.contains("MutationObserver"));
+    }
+
+    #[test]
+    fn runtime_brand_bridge_does_not_rewrite_model_names() {
+        assert!(RUNTIME_BRAND_BRIDGE.contains("[/DeepSeek Harness/gi, 'HiMind AI']"));
+        assert!(!RUNTIME_BRAND_BRIDGE.contains("[/\\bdeepseek\\b/gi, 'HiMind']"));
+        assert!(!RUNTIME_BRAND_BRIDGE.contains("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn model_profile_entry_preserves_the_real_id_as_display_name() {
+        let entry = model_profile_entry(" deepseek-v4-flash ");
+        assert_eq!(
+            entry.get("id").and_then(Value::as_str),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            entry.get("name").and_then(Value::as_str),
+            Some("deepseek-v4-flash")
+        );
+        assert!(!entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("himind"));
+    }
+
+    #[test]
+    fn existing_himind_model_is_not_replaced_by_service_default() {
+        assert!(!should_initialize_managed_model(
+            "himind-proxy",
+            "deepseek-v4-flash"
+        ));
+        assert!(should_initialize_managed_model("himind-proxy", ""));
+        assert!(should_initialize_managed_model("", ""));
+        assert!(should_initialize_managed_model(
+            "deepseek-official",
+            "deepseek-chat"
+        ));
+        assert!(!should_initialize_managed_model(
+            "personal-deepseek",
+            "deepseek-chat"
+        ));
     }
 
     #[test]

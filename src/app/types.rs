@@ -30,6 +30,12 @@ pub struct RemoteConnectRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RemoteClientConfigureRequest {
+    pub vendor: String,
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ProjectWorkspaceRequest {
     pub path: String,
     pub engine_type: Option<String>,

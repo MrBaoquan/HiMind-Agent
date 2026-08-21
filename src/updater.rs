@@ -1,14 +1,17 @@
+mod install_layout;
+
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::env;
 use std::error::Error;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -24,8 +27,19 @@ struct UpdateArgs {
     target_version: String,
     local_port: u16,
     state_path: PathBuf,
+    #[serde(default)]
     old_pid: u32,
+    #[serde(default)]
+    wait_pid: u32,
     arguments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdaterReplacementArgs {
+    operation: String,
+    parent_pid: u32,
+    staged_package: PathBuf,
+    staged_directory: PathBuf,
 }
 
 fn main() {
@@ -37,7 +51,11 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let raw = env::args().nth(1).ok_or("update arguments are required")?;
-    let args = serde_json::from_str::<UpdateArgs>(&raw)?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw)?;
+    if value.get("operation").and_then(|value| value.as_str()) == Some("replace_updater") {
+        return replace_running_updater(serde_json::from_value(value)?);
+    }
+    let args = serde_json::from_value::<UpdateArgs>(value)?;
     let result = run_update(&args);
     if let Err(error) = &result {
         let _ = mark_install_failed_if_pending(&args, &error.to_string());
@@ -46,45 +64,66 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
-    let current = fs::canonicalize(&args.current_executable)?;
-    let staged = fs::canonicalize(&args.staged_executable)?;
+    log_update(
+        args,
+        &format!(
+            "开始更新：{} -> {}，current={}，staged={}",
+            args.from_version,
+            args.target_version,
+            args.current_executable.display(),
+            args.staged_executable.display()
+        ),
+    );
+    let current = plain_path(&fs::canonicalize(&args.current_executable)?);
+    let staged = plain_path(&fs::canonicalize(&args.staged_executable)?);
     if !staged.is_file()
         || current == staged
-        || current.file_name().and_then(|value| value.to_str()) != Some("himind-agent.exe")
-        || current
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|value| value.to_str())
-            != Some("current")
+        || current.file_name().and_then(|value| value.to_str()) != Some(install_layout::AGENT_FILE)
     {
         return Err("invalid staged Agent executable".into());
     }
-    let root = installation_root(&current);
+    let root = install_layout::installation_root_from_executable(&current);
     if !staged_path_allowed(&staged, &root) {
         return Err("staged Agent executable is outside the installation root".into());
     }
     let staged_updater =
-        canonical_staged_helper(&args.staged_updater, "himind-agent-updater.exe", &root)?;
+        canonical_staged_helper(&args.staged_updater, install_layout::UPDATER_FILE, &root)?;
     let staged_launcher =
-        canonical_staged_helper(&args.staged_launcher, "himind-agent-launcher.exe", &root)?;
+        canonical_staged_helper(&args.staged_launcher, install_layout::LAUNCHER_FILE, &root)?;
     let staged_package = canonical_staged_path(&args.staged_package, &root)?;
-    if !stop_running_agents(&current, args.old_pid) {
-        return Err("安装目录下仍有 Agent 进程运行，更新超时".into());
-    }
-    let current_dir = root.join("current");
-    let previous_dir = root.join("previous");
-    fs::create_dir_all(&current_dir)?;
-    fs::create_dir_all(&previous_dir)?;
-    let current_target = current_dir.join("himind-agent.exe");
-    let previous_target = previous_dir.join("himind-agent.exe");
-    rotate_version(&current_target, &previous_target, &staged)?;
+    wait_for_old_agent_exit(args)?;
+    let had_active_version = install_layout::read_active_version(&root)?.is_some();
+    let target_dir =
+        install_layout::prepare_version_directory(&root, &args.target_version, &staged)?;
+    let target = target_dir.join(install_layout::AGENT_FILE);
     let _ = fs::remove_file(&staged);
-    thread::sleep(Duration::from_millis(1200));
-    if launch_and_confirm(&args, &current_target, &args.target_version) {
-        if let Err(error) =
-            update_helpers_after_health(&root, &staged_updater, &staged_launcher, &staged_package)
-        {
-            let detail = format!("Agent 已更新，但辅助程序将在后续更新中重试：{error}");
+    thread::sleep(Duration::from_millis(300));
+    if launch_and_confirm(&args, &target, &args.target_version) {
+        log_update(
+            args,
+            &format!("新 Agent 健康检查通过：{}", target.display()),
+        );
+        if !had_active_version {
+            if let Err(error) = replace_helper(
+                &root.join(install_layout::LAUNCHER_FILE),
+                &root.join("himind-agent-launcher.previous.exe"),
+                &staged_launcher,
+            ) {
+                let _ = terminate_process_for_path(&target);
+                let _ = fs::remove_dir_all(&target_dir);
+                let _ = launch_and_confirm(args, &current, &args.from_version);
+                return Err(format!("首次迁移无法更新稳定 launcher：{error}").into());
+            }
+        }
+        if let Err(error) = install_layout::write_active_version(&root, &args.target_version) {
+            let _ = terminate_process_for_path(&target);
+            let _ = fs::remove_dir_all(&target_dir);
+            let _ = launch_and_confirm(args, &current, &args.from_version);
+            return Err(format!("写入 Agent 活动版本指针失败：{error}").into());
+        }
+        let _ = fs::remove_file(&staged_launcher);
+        if let Err(error) = schedule_updater_self_replace(&root, &staged_updater, &staged_package) {
+            let detail = format!("Agent 已更新，但 updater 将在后续更新中重试：{error}");
             let _ = update_local_status(args, "idle", "");
             let _ = report_update_result(args, "update_success", &detail);
             return Ok(());
@@ -93,25 +132,19 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
         let _ = report_update_result(args, "update_success", "");
         return Ok(());
     }
-    if previous_target.exists() {
-        restore_previous(&current_target, &previous_target)?;
-        if launch_and_confirm(&args, &current_target, &args.from_version) {
-            let _ = report_update_result(
-                &args,
-                "rolled_back",
-                "new Agent failed health check; previous restored",
-            );
-            let _ = update_local_status(&args, "rolled_back", "新版本启动检查失败，已恢复上一版本");
-            return Err("new Agent failed health check and was rolled back".into());
-        }
-    }
-    let _ = report_update_result(
-        &args,
-        "update_failed",
-        "new Agent failed health check and rollback health check failed",
+    log_update(
+        args,
+        "新 Agent 健康检查失败，开始保留当前版本并恢复旧 Agent",
     );
-    let _ = update_local_status(&args, "failed", "新版本与回滚版本均未通过启动检查");
-    Err("Agent update failed and previous version could not be confirmed".into())
+    let _ = fs::remove_dir_all(&target_dir);
+    let _ = launch_and_confirm(args, &current, &args.from_version);
+    let _ = report_update_result(
+        args,
+        "rolled_back",
+        "new Agent failed health check; previous version kept",
+    );
+    let _ = update_local_status(args, "rolled_back", "新版本启动检查失败，已保留当前版本");
+    Err("new Agent failed health check; previous version was kept".into())
 }
 
 fn mark_install_failed_if_pending(args: &UpdateArgs, error: &str) -> Result<(), Box<dyn Error>> {
@@ -119,7 +152,7 @@ fn mark_install_failed_if_pending(args: &UpdateArgs, error: &str) -> Result<(), 
     if !path.is_file() {
         return Ok(());
     }
-    let value = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path)?)?;
+    let value = read_json_value(&path)?;
     if value.get("status").and_then(|value| value.as_str()) != Some("installing") {
         return Ok(());
     }
@@ -131,7 +164,7 @@ fn update_local_status(args: &UpdateArgs, status: &str, error: &str) -> Result<(
     if !path.is_file() {
         return Ok(());
     }
-    let mut value = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&path)?)?;
+    let mut value = read_json_value(&path)?;
     value["status"] = serde_json::Value::String(status.to_string());
     value["last_error"] = serde_json::Value::String(error.to_string());
     value["current_version"] = serde_json::Value::String(if status == "idle" {
@@ -173,30 +206,34 @@ fn update_local_status(args: &UpdateArgs, status: &str, error: &str) -> Result<(
     Ok(())
 }
 
-fn rotate_version(current: &Path, previous: &Path, staged: &Path) -> Result<(), Box<dyn Error>> {
-    let backup = previous.with_extension("staging");
-    if current.exists() {
-        let _ = fs::remove_file(&backup);
-        let _ = fs::remove_file(previous);
-        fs::copy(current, &backup)?;
-        fs::rename(&backup, previous)?;
-    }
-    fs::copy(staged, current)?;
-    Ok(())
-}
-
-fn restore_previous(current: &Path, previous: &Path) -> Result<(), Box<dyn Error>> {
-    fs::copy(previous, current)?;
-    Ok(())
+fn read_json_value(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    let bytes = fs::read(path)?;
+    let bytes = bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes.as_slice());
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 fn launch_and_confirm(args: &UpdateArgs, executable: &Path, expected_version: &str) -> bool {
-    let child = Command::new(executable)
+    let root = install_layout::installation_root_from_executable(executable);
+    let trusted_keys = root.join("trusted-keys");
+    let mut command = Command::new(executable);
+    command
         .args(&args.arguments)
-        .current_dir(executable.parent().unwrap_or(Path::new(".")))
-        .spawn();
-    let Ok(child) = child else {
-        return false;
+        .current_dir(&root)
+        .env("HIMIND_REQUIRE_SIGNED_UPDATES", "true");
+    if trusted_keys.is_dir() {
+        command.env("HIMIND_TRUSTED_SIGNING_KEYS_DIR", trusted_keys);
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            log_update(
+                args,
+                &format!("启动 Agent 失败：{}：{}", executable.display(), error),
+            );
+            return false;
+        }
     };
     if wait_for_health(
         args.local_port,
@@ -208,8 +245,39 @@ fn launch_and_confirm(args: &UpdateArgs, executable: &Path, expected_version: &s
     ) {
         return true;
     }
-    let _ = terminate(child.id());
+    log_update(
+        args,
+        &format!(
+            "Agent 未通过健康检查：path={}，expected_version={}，pid={}",
+            executable.display(),
+            expected_version,
+            child.id()
+        ),
+    );
+    let _ = terminate_single(child.id());
     false
+}
+
+fn wait_for_old_agent_exit(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
+    let pid = if args.wait_pid != 0 {
+        args.wait_pid
+    } else {
+        args.old_pid
+    };
+    if pid == 0 || pid == std::process::id() || !process_exists(pid) {
+        return Ok(());
+    }
+    log_update(args, &format!("等待旧 Agent 退出：pid={pid}"));
+    if wait_for_process_exit(pid, Duration::from_secs(10)) {
+        return Ok(());
+    }
+    log_update(args, &format!("旧 Agent 未自行退出，终止主进程：pid={pid}"));
+    terminate_single(pid)?;
+    if wait_for_process_exit(pid, Duration::from_secs(5)) {
+        Ok(())
+    } else {
+        Err(format!("旧 Agent 进程未能退出：pid={pid}").into())
+    }
 }
 
 fn report_update_result(
@@ -230,7 +298,7 @@ fn report_update_result(
     if !state_path.is_file() {
         return Ok(());
     }
-    let mut state = serde_json::from_str::<DistributionState>(&fs::read_to_string(state_path)?)?;
+    let mut state = serde_json::from_value::<DistributionState>(read_json_value(&state_path)?)?;
     if state.token.trim().is_empty() && !state.token_protected.trim().is_empty() {
         state.token = unprotect_secret_for_current_user(&state.token_protected)?;
     }
@@ -299,47 +367,25 @@ fn canonical_staged_helper(
 }
 
 fn canonical_staged_path(path: &Path, installation_root: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let canonical = fs::canonicalize(path)?;
+    let canonical = plain_path(&fs::canonicalize(path)?);
     if !canonical.is_file() || !staged_path_allowed(&canonical, installation_root) {
         return Err("staged update file is outside the installation root".into());
     }
     Ok(canonical)
 }
 
-fn update_helpers_after_health(
-    root: &Path,
-    staged_updater: &Path,
-    staged_launcher: &Path,
-    staged_package: &Path,
-) -> Result<(), Box<dyn Error>> {
-    let launcher = root.join("himind-agent-launcher.exe");
-    let launcher_backup = root.join("himind-agent-launcher.previous.exe");
-    let launcher_existed = launcher.is_file();
-    let mut errors = Vec::new();
-    match replace_helper(&launcher, &launcher_backup, staged_launcher) {
-        Ok(()) => {
-            let _ = fs::remove_file(staged_launcher);
-        }
-        Err(error) => errors.push(format!("launcher update failed: {error}")),
+// fs::canonicalize returns \\?\-prefixed verbatim paths, but Win32_Process
+// ExecutablePath and PowerShell cmdlets use plain Win32 paths. Normalize
+// canonicalized paths so process matching and helper scripts keep working.
+fn plain_path(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
     }
-
-    if let Err(error) = schedule_updater_self_replace(root, staged_updater, staged_package) {
-        errors.push(format!("updater update failed: {error}"));
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest.to_string());
     }
-    if errors.is_empty() {
-        return Ok(());
-    }
-    if errors
-        .iter()
-        .any(|error| error.contains("launcher update failed"))
-    {
-        if launcher_existed && launcher_backup.is_file() {
-            let _ = fs::copy(&launcher_backup, &launcher);
-        } else {
-            let _ = fs::remove_file(&launcher);
-        }
-    }
-    Err(errors.join("; ").into())
+    path.to_path_buf()
 }
 
 fn replace_helper(target: &Path, backup: &Path, staged: &Path) -> Result<(), Box<dyn Error>> {
@@ -370,76 +416,68 @@ fn schedule_updater_self_replace(
     staged_package: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let target = root.join("himind-agent-updater.exe");
-    let backup = root.join("himind-agent-updater.previous.exe");
     let next = root.join("himind-agent-updater.next.exe");
-    let updater_pid = std::process::id();
-    let cleanup_artifact = format!(
-        "; Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue",
-        powershell_escape_single_quoted(&staged_package.to_string_lossy())
-    );
-    let cleanup_directory = staged_updater
-        .parent()
-        .map(|path| {
-            format!(
-                "; Remove-Item -LiteralPath '{}' -Recurse -Force -ErrorAction SilentlyContinue",
-                powershell_escape_single_quoted(&path.to_string_lossy())
-            )
-        })
-        .unwrap_or_default();
-    let script = format!(
-        "$ErrorActionPreference='Stop'; Copy-Item -LiteralPath '{}' -Destination '{}' -Force; if (Test-Path -LiteralPath '{}') {{ Copy-Item -LiteralPath '{}' -Destination '{}' -Force }}; $running = Get-Process -Id {} -ErrorAction SilentlyContinue; if ($running) {{ Wait-Process -Id {} -Timeout 30 }}; try {{ Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue; Move-Item -LiteralPath '{}' -Destination '{}' -Force{}{} }} catch {{ if (Test-Path -LiteralPath '{}') {{ Copy-Item -LiteralPath '{}' -Destination '{}' -Force }}; throw }}",
-        powershell_escape_single_quoted(&staged_updater.to_string_lossy()),
-        powershell_escape_single_quoted(&next.to_string_lossy()),
-        powershell_escape_single_quoted(&target.to_string_lossy()),
-        powershell_escape_single_quoted(&target.to_string_lossy()),
-        powershell_escape_single_quoted(&backup.to_string_lossy()),
-        updater_pid,
-        updater_pid,
-        powershell_escape_single_quoted(&target.to_string_lossy()),
-        powershell_escape_single_quoted(&next.to_string_lossy()),
-        powershell_escape_single_quoted(&target.to_string_lossy()),
-        cleanup_artifact,
-        cleanup_directory,
-        powershell_escape_single_quoted(&backup.to_string_lossy()),
-        powershell_escape_single_quoted(&backup.to_string_lossy()),
-        powershell_escape_single_quoted(&target.to_string_lossy()),
-    );
-    for shell in ["pwsh", "powershell"] {
-        if Command::new(shell)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &script,
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .is_ok()
-        {
-            return Ok(());
-        }
+    let _ = fs::remove_file(&next);
+    fs::copy(staged_updater, &next)?;
+    let payload = serde_json::json!({
+        "operation": "replace_updater",
+        "parent_pid": std::process::id(),
+        "staged_package": staged_package,
+        "staged_directory": staged_updater.parent().unwrap_or(root),
+    });
+    Command::new(&next)
+        .arg(payload.to_string())
+        .current_dir(root)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    if !target.is_file() {
+        return Err("installed Agent updater is missing".into());
     }
-    Err("failed to schedule Agent updater self replacement".into())
+    Ok(())
+}
+
+fn replace_running_updater(args: UpdaterReplacementArgs) -> Result<(), Box<dyn Error>> {
+    if args.operation != "replace_updater" || args.parent_pid == 0 {
+        return Err("invalid updater replacement request".into());
+    }
+    let current = plain_path(&fs::canonicalize(env::current_exe()?)?);
+    if current.file_name().and_then(|value| value.to_str()) != Some("himind-agent-updater.next.exe")
+    {
+        return Err("updater replacement must run from the staged helper".into());
+    }
+    let root = current
+        .parent()
+        .ok_or("updater installation root is unavailable")?;
+    let target = root.join(install_layout::UPDATER_FILE);
+    let backup = root.join("himind-agent-updater.previous.exe");
+    if !wait_for_process_exit(args.parent_pid, Duration::from_secs(30)) {
+        return Err("timed out waiting for the previous updater to exit".into());
+    }
+    let temporary = root.join("himind-agent-updater.replacing.exe");
+    let _ = fs::remove_file(&temporary);
+    fs::copy(&current, &temporary)?;
+    if target.is_file() {
+        let _ = fs::remove_file(&backup);
+        fs::copy(&target, &backup)?;
+    }
+    install_layout::replace_file(&temporary, &target)?;
+    let _ = fs::remove_file(&args.staged_package);
+    if args.staged_directory.starts_with(root.join("staging")) {
+        let _ = fs::remove_dir_all(&args.staged_directory);
+    }
+    Ok(())
 }
 
 fn powershell_escape_single_quoted(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn installation_root(executable: &Path) -> PathBuf {
-    executable
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(executable)
-        .to_path_buf()
-}
-
 fn staged_path_allowed(staged: &Path, installation_root: &Path) -> bool {
     let canonical_root =
         fs::canonicalize(installation_root).unwrap_or_else(|_| installation_root.to_path_buf());
-    staged.starts_with(&canonical_root)
+    let root = plain_path(&canonical_root);
+    let staged = plain_path(staged);
+    staged.starts_with(&root)
 }
 
 fn wait_for_health(
@@ -455,23 +493,49 @@ fn wait_for_health(
         Err(_) => return false,
     };
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_observation = "尚未收到本地服务响应".to_string();
     while Instant::now() < deadline {
-        if let Ok(response) = client.get(format!("http://127.0.0.1:{port}/health")).send() {
-            if response.status().is_success() {
-                if let Ok(payload) = response.json::<serde_json::Value>() {
-                    if health_matches_update(&payload, target_version, executable, state_path) {
-                        return true;
+        match client.get(format!("http://127.0.0.1:{port}/health")).send() {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    last_observation = format!("/health 返回 HTTP {}", response.status());
+                } else {
+                    match response.json::<serde_json::Value>() {
+                        Ok(payload) => {
+                            last_observation = health_mismatch_reason(
+                                &payload,
+                                target_version,
+                                executable,
+                                state_path,
+                            );
+                            if last_observation == "ok" {
+                                return true;
+                            }
+                        }
+                        Err(error) => {
+                            last_observation = format!("/health 响应不是合法 JSON：{error}");
+                        }
                     }
                 }
             }
+            Err(error) => {
+                last_observation = format!("连接本地 /health 失败：{error}");
+            }
         }
         if !executable.exists() {
+            append_update_log(state_path, "健康检查中止：目标 Agent 可执行文件已不存在");
             return false;
         }
         thread::sleep(Duration::from_millis(500));
     }
+    append_update_log(
+        state_path,
+        &format!(
+            "健康检查超时：port={}，expected_version={}，pid={}，最后观测={}",
+            port, target_version, pid, last_observation
+        ),
+    );
     let _ = api_base;
-    let _ = pid;
     false
 }
 
@@ -481,45 +545,86 @@ fn health_matches_update(
     executable: &Path,
     state_path: &Path,
 ) -> bool {
-    if target_version.trim().is_empty()
-        || payload.get("status").and_then(|value| value.as_str()) != Some("online")
-        || payload.get("version").and_then(|value| value.as_str()) != Some(target_version)
-        || !state_path.is_file()
-    {
-        return false;
+    health_mismatch_reason(payload, target_version, executable, state_path) == "ok"
+}
+
+fn health_mismatch_reason(
+    payload: &serde_json::Value,
+    target_version: &str,
+    executable: &Path,
+    state_path: &Path,
+) -> String {
+    if target_version.trim().is_empty() {
+        return "目标版本为空".to_string();
+    }
+    if payload.get("status").and_then(|value| value.as_str()) != Some("online") {
+        return format!(
+            "Agent 状态不是 online：{}",
+            payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("缺失")
+        );
+    }
+    if payload.get("version").and_then(|value| value.as_str()) != Some(target_version) {
+        return format!(
+            "Agent 版本不一致：实际={}，期望={}",
+            payload
+                .get("version")
+                .and_then(|value| value.as_str())
+                .unwrap_or("缺失"),
+            target_version
+        );
+    }
+    if !state_path.is_file() {
+        return format!("Agent 状态文件不存在：{}", state_path.display());
     }
     let Some(reported_path) = payload
         .get("executable_path")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
     else {
-        return false;
+        return "健康信息缺少 executable_path".to_string();
     };
     match (
         fs::canonicalize(executable),
         fs::canonicalize(Path::new(reported_path)),
     ) {
-        (Ok(expected), Ok(actual)) => expected == actual,
-        _ => false,
+        (Ok(expected), Ok(actual)) if plain_path(&expected) == plain_path(&actual) => {
+            "ok".to_string()
+        }
+        (Ok(expected), Ok(actual)) => format!(
+            "Agent 执行路径不一致：实际={}，期望={}",
+            plain_path(&actual).display(),
+            plain_path(&expected).display()
+        ),
+        (Err(error), _) => format!("无法解析目标 Agent 路径：{error}"),
+        (_, Err(error)) => format!("无法解析健康信息中的执行路径：{error}"),
     }
 }
 
-fn stop_running_agents(current_executable: &Path, old_pid: u32) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        let mut pids = running_agent_pids(current_executable);
-        if old_pid != 0 && process_exists(old_pid) && !pids.contains(&old_pid) {
-            pids.push(old_pid);
-        }
-        if pids.is_empty() {
-            return true;
-        }
-        for pid in pids {
-            let _ = terminate(pid);
-        }
-        thread::sleep(Duration::from_millis(200));
+fn log_update(context: &UpdateArgs, message: &str) {
+    append_update_log(&context.state_path, message);
+}
+
+fn append_update_log(state_path: &Path, message: &str) {
+    let Some(root) = state_path.parent().and_then(Path::parent) else {
+        return;
+    };
+    let log_path = root.join("logs").join("agent-updater.log");
+    let Some(parent) = log_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
     }
-    false
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "{timestamp} {message}");
+    }
 }
 
 fn running_agent_pids(current_executable: &Path) -> Vec<u32> {
@@ -556,43 +661,71 @@ fn process_exists(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn terminate(pid: u32) -> Result<(), Box<dyn Error>> {
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_exists(pid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    !process_exists(pid)
+}
+
+fn terminate_single(pid: u32) -> Result<(), Box<dyn Error>> {
     Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .args(["/PID", &pid.to_string(), "/F"])
         .output()?;
+    Ok(())
+}
+
+fn terminate_process_for_path(executable: &Path) -> Result<(), Box<dyn Error>> {
+    for pid in running_agent_pids(executable) {
+        let _ = terminate_single(pid);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::install_layout::{
+        prepare_version_directory, read_active_version, write_active_version,
+    };
     use super::{
-        canonical_staged_helper, health_matches_update, replace_helper, restore_previous,
-        rotate_version, staged_path_allowed,
+        canonical_staged_helper, health_matches_update, plain_path, read_json_value,
+        replace_helper, staged_path_allowed,
     };
     use serde_json::json;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn rotates_and_restores_agent_versions() {
+    fn installs_version_side_by_side_and_switches_pointer() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("himind-updater-test-{unique}"));
-        fs::create_dir_all(&root).unwrap();
-        let current = root.join("current.exe");
-        let previous = root.join("previous.exe");
-        let staged = root.join("staged.exe");
-        fs::write(&current, b"old").unwrap();
+        fs::create_dir_all(root.join("current")).unwrap();
+        fs::write(root.join("current/himind-agent.exe"), b"old").unwrap();
+        let staged = root.join("staging-agent.exe");
         fs::write(&staged, b"new").unwrap();
 
-        rotate_version(&current, &previous, &staged).unwrap();
-        assert_eq!(fs::read(&current).unwrap(), b"new");
-        assert_eq!(fs::read(&previous).unwrap(), b"old");
-
-        restore_previous(&current, &previous).unwrap();
-        assert_eq!(fs::read(&current).unwrap(), b"old");
+        let version_dir = prepare_version_directory(&root, "0.4.0", &staged).unwrap();
+        write_active_version(&root, "0.4.0").unwrap();
+        assert_eq!(
+            fs::read(version_dir.join("himind-agent.exe")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            read_active_version(&root).unwrap().as_deref(),
+            Some("0.4.0")
+        );
+        assert_eq!(
+            fs::read(root.join("current/himind-agent.exe")).unwrap(),
+            b"old"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -613,6 +746,42 @@ mod tests {
 
         assert!(!staged_path_allowed(&staged, &unrelated_root));
         let _ = fs::remove_file(staged_path);
+    }
+
+    #[test]
+    fn plain_path_strips_verbatim_prefixes() {
+        use super::plain_path;
+        assert_eq!(
+            plain_path(Path::new(r"\\?\C:\Program Files\HiMind\agent.exe")),
+            PathBuf::from(r"C:\Program Files\HiMind\agent.exe")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\server\share\agent.exe")),
+            PathBuf::from(r"\\server\share\agent.exe")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"C:\Program Files\HiMind\agent.exe")),
+            PathBuf::from(r"C:\Program Files\HiMind\agent.exe")
+        );
+    }
+
+    #[test]
+    fn reads_utf8_bom_json() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("himind-updater-bom-{unique}.json"));
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend(br#"{"status":"installing"}"#);
+        fs::write(&path, bytes).unwrap();
+
+        let value = read_json_value(&path).unwrap();
+        assert_eq!(
+            value.get("status").and_then(|v| v.as_str()),
+            Some("installing")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -664,7 +833,7 @@ mod tests {
 
         let validated =
             canonical_staged_helper(&staged, "himind-agent-launcher.exe", &root).unwrap();
-        assert_eq!(validated, fs::canonicalize(&staged).unwrap());
+        assert_eq!(validated, plain_path(&fs::canonicalize(&staged).unwrap()));
         assert!(canonical_staged_helper(&wrong_name, "himind-agent-launcher.exe", &root).is_err());
 
         let target = root.join("himind-agent-launcher.exe");

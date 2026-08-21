@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
-import { ArrowUpRight, Blocks, CircleAlert, Download, LoaderCircle, LogIn, MessageCircle, RefreshCw, Settings } from 'lucide-react';
-import { agentApi, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIToolContextSummary, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
+import { Activity, ArrowUpRight, Blocks, CircleAlert, Download, LoaderCircle, LogIn, MessageCircle, RefreshCw, Settings } from 'lucide-react';
+import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIToolContextSummary, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
 import { errorDetail } from '../types';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 
@@ -38,9 +38,25 @@ export function BuiltinAiPage({
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [connectionError, setConnectionError] = useState('');
   const [extensionsOpen, setExtensionsOpen] = useState(false);
+  const [syncingModels, setSyncingModels] = useState(false);
+  const [modelSyncMessage, setModelSyncMessage] = useState('');
   const [runtimeInstallation, setRuntimeInstallation] = useState<BuiltinAIRuntimeInstallationStatus | null>(null);
+  const [activityOpen, setActivityOpen] = useState(false);
+  const [runtimeSessions, setRuntimeSessions] = useState<BuiltinAIRuntimeActivity[]>([]);
+  const [activityError, setActivityError] = useState('');
   const authorizationActive = authorization?.state === 'starting' || authorization?.state === 'pending';
   const runtimeReady = runtimeInstallation?.runtime.status === 'ready' && runtimeInstallation.runtime.compatible;
+
+  const refreshActivity = useCallback(async () => {
+    if (!identity?.authorized) return;
+    try {
+      const result = await agentApi.builtinAiActivity();
+      setRuntimeSessions(result.items || []);
+      setActivityError('');
+    } catch (error) {
+      setActivityError(errorDetail(error));
+    }
+  }, [identity?.authorized]);
 
   const refreshRuntimeInstallation = useCallback(async () => {
     try {
@@ -75,6 +91,13 @@ export function BuiltinAiPage({
   }, [refreshRuntimeInstallation]);
 
   useEffect(() => {
+    if (!identity?.authorized) return;
+    void refreshActivity();
+    const timer = window.setInterval(() => void refreshActivity(), 8000);
+    return () => window.clearInterval(timer);
+  }, [identity?.authorized, refreshActivity]);
+
+  useEffect(() => {
     if (runtimeInstallation?.state !== 'working') return;
     const timer = window.setInterval(() => { void refreshRuntimeInstallation(); }, 700);
     return () => window.clearInterval(timer);
@@ -100,6 +123,26 @@ export function BuiltinAiPage({
     void connect();
   }, [connect, connecting, connectionError, identity?.authorized, runtimeReady, sessionUrl]);
 
+  const syncModels = useCallback(async () => {
+    if (!sessionUrl || syncingModels) return;
+    setSyncingModels(true);
+    setModelSyncMessage('');
+    try {
+      const result = await agentApi.syncBuiltinAiModels();
+      if (result.session_url && result.session_url !== sessionUrl) {
+        setSessionUrl(result.session_url);
+        setFrameLoaded(false);
+      }
+      setModelSyncMessage(result.status === 'updated' || result.status === 'restarted'
+        ? `已同步 ${result.model_count} 个模型`
+        : '模型已是最新');
+    } catch (error) {
+      setModelSyncMessage('同步失败，请稍后重试');
+    } finally {
+      setSyncingModels(false);
+    }
+  }, [sessionUrl, syncingModels]);
+
   return (
     <section className="builtin-ai-page" aria-label="HiMind AI">
       <header className="builtin-ai-toolbar">
@@ -108,8 +151,13 @@ export function BuiltinAiPage({
           <div><h2>HiMind AI</h2><span>{sessionUrl ? '已连接' : '智能工作助手'}</span></div>
         </div>
         <div className="builtin-ai-toolbar-actions">
+          <button type="button" className="builtin-ai-tools-button" onClick={() => void syncModels()} disabled={!sessionUrl || syncingModels} title="同步可用模型">
+            <RefreshCw className={syncingModels ? 'spin' : ''} size={15} />{syncingModels ? '同步中' : '同步模型'}
+          </button>
           <button type="button" className="builtin-ai-tools-button" onClick={onOpenAiConnections} title="管理 AI 服务"><Settings size={15} />AI 服务</button>
           <button type="button" className={`builtin-ai-tools-button ${extensionsOpen ? 'active' : ''}`} onClick={() => setExtensionsOpen(true)} title="管理扩展"><Blocks size={15} />扩展</button>
+          <button type="button" className={`builtin-ai-tools-button ${activityOpen ? 'active' : ''}`} onClick={() => { setActivityOpen(open => !open); void refreshActivity(); }} title="查看协同活动"><Activity size={15} />活动</button>
+          {modelSyncMessage ? <span className="builtin-ai-sync-message" role="status">{modelSyncMessage}</span> : null}
           {sessionUrl ? <span className="builtin-ai-online"><i />可用</span> : null}
         </div>
       </header>
@@ -118,13 +166,16 @@ export function BuiltinAiPage({
         {sessionUrl ? (
           <>
             {!frameLoaded ? <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在打开会话" description="马上就好" /> : null}
-            <iframe
-              className={frameLoaded ? 'loaded' : ''}
-              title="HiMind AI 会话"
-              src={sessionUrl}
-              onLoad={() => setFrameLoaded(true)}
-              referrerPolicy="no-referrer"
-            />
+            <div className="builtin-ai-session-shell">
+              <iframe
+                className={frameLoaded ? 'loaded' : ''}
+                title="HiMind AI 会话"
+                src={sessionUrl}
+                onLoad={() => setFrameLoaded(true)}
+                referrerPolicy="no-referrer"
+              />
+              {activityOpen ? <RuntimeActivityPanel sessions={runtimeSessions} error={activityError} onRefresh={() => void refreshActivity()} /> : null}
+            </div>
           </>
         ) : authorizationActive ? (
           <WorkspaceStatus
@@ -192,6 +243,35 @@ export function BuiltinAiPage({
       />
     </section>
   );
+}
+
+function RuntimeActivityPanel({ sessions, error, onRefresh }: { sessions: BuiltinAIRuntimeActivity[]; error: string; onRefresh: () => void }) {
+  return <aside className="builtin-ai-activity-panel" aria-label="协同活动">
+    <header><div><strong>协同活动</strong><span>Dashboard、钉钉与本机运行状态</span></div><button type="button" className="btn btn-icon" title="刷新活动" aria-label="刷新活动" onClick={onRefresh}><RefreshCw size={14} /></button></header>
+    {error ? <div className="builtin-ai-activity-message error" role="alert">{error}</div> : null}
+    {!error && !sessions.length ? <div className="builtin-ai-activity-message">尚未发现可追踪的 DSH 会话</div> : null}
+    <div className="builtin-ai-activity-list">{sessions.map(activity => <div className="builtin-ai-activity-item" key={activity.session.id}>
+      <div className="builtin-ai-activity-item-head"><span className={`builtin-ai-activity-dot ${activity.session.status}`} /><strong>{activity.conversation?.title || activity.session.provider}</strong><span>{runtimeSessionStatusLabel(activity.session.status)}</span></div>
+      <code>{activity.session.provider_session_id}</code>
+      <small>{activity.conversation ? `入口：${activity.endpoints?.map(endpoint => endpoint.channel).join('、') || '本机'}` : '等待首条活动关联会话'} · {formatActivityTime(activity.session.last_heartbeat_at)}</small>
+      {activity.latest_turn ? <p className="builtin-ai-activity-preview">{activity.latest_turn.content}</p> : null}
+    </div>)}</div>
+  </aside>;
+}
+
+function runtimeSessionStatusLabel(status: string) {
+  if (status === 'online') return '在线';
+  if (status === 'idle') return '空闲';
+  if (status === 'degraded') return '降级';
+  if (status === 'offline') return '离线';
+  if (status === 'revoked') return '已撤销';
+  return status;
+}
+
+function formatActivityTime(value: string) {
+  if (!value) return '刚刚';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function WorkspaceStatus({ icon, title, description, actions, tone = 'default' }: { icon: ReactNode; title: string; description: string; actions?: ReactNode; tone?: 'default' | 'error' }) {

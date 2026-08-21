@@ -18,6 +18,7 @@ mod app;
 mod approval;
 mod capability;
 mod extension_projects;
+mod install_layout;
 mod mcp;
 mod plugin_authoring;
 mod remote;
@@ -52,7 +53,9 @@ use svn::types::{
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
 
-pub(crate) const VERSION: &str = "0.3.16";
+// Keep the runtime health version aligned with the version stamped into the
+// updater package. Cargo is the source of truth for both binaries.
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PluginViewLaunch {

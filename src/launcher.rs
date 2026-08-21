@@ -1,7 +1,9 @@
+mod install_layout;
+
 use std::env;
 use std::error::Error;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn main() {
     if let Err(error) = run() {
@@ -15,10 +17,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .parent()
         .ok_or("Agent launcher directory is unavailable")?
         .to_path_buf();
-    let executable = root.join("current").join("himind-agent.exe");
-    if !executable.is_file() {
-        return Err(format!("installed Agent is missing: {}", executable.display()).into());
-    }
+    let executable = install_layout::resolve_agent_path(&root)?;
     let state_path = root.join("data").join("agent-state.json");
     if let Some(parent) = state_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -31,16 +30,26 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut command = Command::new(executable);
-    command
-        .args(arguments)
-        .arg("--state")
-        .arg(state_path)
-        .current_dir(&root);
+    let mcp_mode = arguments.iter().any(|argument| argument == "--mcp");
+    command.args(&arguments).current_dir(&root);
+    if !arguments.iter().any(|argument| argument == "--state") {
+        command.arg("--state").arg(state_path);
+    }
     if trusted_keys.is_dir() && env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").is_none() {
         command.env("HIMIND_TRUSTED_SIGNING_KEYS_DIR", trusted_keys);
     }
     if env::var_os("HIMIND_REQUIRE_SIGNED_UPDATES").is_none() {
         command.env("HIMIND_REQUIRE_SIGNED_UPDATES", "true");
+    }
+    if mcp_mode {
+        // MCP clients own the stdio contract. The launcher must stay attached
+        // until the selected Agent exits and must propagate its exit code.
+        command.stdin(Stdio::inherit());
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+        let mut child = command.spawn()?;
+        let status = child.wait()?;
+        std::process::exit(status.code().unwrap_or(1));
     }
     command.spawn()?;
     Ok(())
@@ -111,7 +120,7 @@ fn unique_argument_value<'a>(
 }
 
 fn installed_layout_is_valid(root: &Path) -> bool {
-    root.join("current").join("himind-agent.exe").is_file()
+    install_layout::resolve_agent_path(root).is_ok()
         && root.join("himind-agent-launcher.exe").is_file()
         && root.join("himind-agent-updater.exe").is_file()
         && root.join("himind-agent.ico").is_file()

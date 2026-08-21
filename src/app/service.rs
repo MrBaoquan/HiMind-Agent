@@ -19,7 +19,7 @@ use std::num::NonZeroIsize;
 use crate::api::client::verify_local_agent_ticket;
 use crate::app::ai_provider_import::{
     cancel as cancel_ai_provider_import, consume_vscode_enrollment, import as import_ai_provider,
-    status as ai_provider_import_status, AIProviderImportRequest,
+    reconcile_vscode_import, status as ai_provider_import_status, AIProviderImportRequest,
 };
 use crate::app::http::{
     local_tree_json, query_param, set_response_origin, split_target, write_local_response,
@@ -32,7 +32,7 @@ use crate::app::system::{
 };
 use crate::app::types::{
     AgentEnrollmentRequest, BrowserTextCaptureRequest, EngineeringSyncRequest, LocalLoginRequest,
-    ProjectWorkspaceRequest, RemoteConnectRequest,
+    ProjectWorkspaceRequest, RemoteClientConfigureRequest, RemoteConnectRequest,
 };
 use crate::capability::service::CapabilityGateway;
 use crate::capability::types::{CapabilityInvokeRequest, InvocationContext};
@@ -113,6 +113,17 @@ pub(crate) fn start_background_services(
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     approval_mgr: Option<Arc<ApprovalManager>>,
 ) -> Result<(), Box<dyn Error>> {
+    // A VS Code update replaces its versioned product.json. Repair an existing
+    // HiMind enrollment before serving the Dashboard so ordinary Agent startup
+    // restores the persistent provider allowlist automatically.
+    reconcile_vscode_import(options);
+    let reconcile_options = options.clone();
+    let _ = thread::Builder::new()
+        .name("himind-vscode-reconcile-loop".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            reconcile_vscode_import(&reconcile_options);
+        });
     let listener = match TcpListener::bind(("127.0.0.1", options.local_port)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -504,6 +515,29 @@ fn handle_local_http(
                 "application/json",
             )
         }
+        ("GET", "/pick-remote-client") => {
+            let vendor = query_param(&query, "vendor").unwrap_or_default();
+            let title = format!("选择{}客户端程序", if vendor.contains("todesk") { "ToDesk" } else { "向日葵" });
+            #[cfg(windows)]
+            let dialog_parent = foreground_dialog_parent();
+            let dialog = rfd::FileDialog::new()
+                .set_title(&title)
+                .add_filter("Windows 可执行文件", &["exe"]);
+            let dialog = if let Some(parent) = dialog_parent.as_ref() {
+                dialog.set_parent(parent)
+            } else {
+                dialog
+            };
+            let path = dialog
+                .pick_file()
+                .map(|item| item.to_string_lossy().to_string());
+            write_local_response(
+                &mut stream,
+                200,
+                &json!({ "path": path }).to_string(),
+                "application/json",
+            )
+        }
         ("POST", "/stage-file") => {
             let upload_id = crate::app::security::header_value(&request, "x-upload-id").unwrap_or_default();
             let encoded_file_name = crate::app::security::header_value(&request, "x-file-name").unwrap_or_default();
@@ -712,10 +746,54 @@ fn handle_local_http(
                     )
                 }
             };
-            match launch_remote_connection(&payload) {
+            match launch_remote_connection(&payload, &options.state_path) {
                 Ok(value) => {
                     write_local_response(&mut stream, 200, &value.to_string(), "application/json")
                 }
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
+        ("GET", "/remote-clients") => match crate::app::remote_clients::overview(&options.state_path) {
+            Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+            Err(error) => write_local_response(
+                &mut stream,
+                400,
+                &json!({ "error": error.to_string() }).to_string(),
+                "application/json",
+            ),
+        },
+        ("POST", "/remote-clients/detect") => match crate::app::remote_clients::overview(&options.state_path) {
+            Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+            Err(error) => write_local_response(
+                &mut stream,
+                400,
+                &json!({ "error": error.to_string() }).to_string(),
+                "application/json",
+            ),
+        },
+        ("POST", "/remote-clients/configure") => {
+            let payload: RemoteClientConfigureRequest = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "error": format!("invalid remote client configuration: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            match crate::app::remote_clients::configure(
+                &payload.vendor,
+                &payload.path,
+                &options.state_path,
+            ) {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
                 Err(error) => write_local_response(
                     &mut stream,
                     400,
@@ -1411,6 +1489,7 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
     match (method, path) {
         ("GET" | "POST", "/pick-folder") => Some("local.file.pick_folder"),
         ("GET" | "POST", "/pick-files") => Some("local.file.pick_files"),
+        ("GET", "/pick-remote-client") => Some("local.remote.clients.pick"),
         ("POST", "/stage-file") => Some("local.file.stage"),
         ("POST", "/stream-smb-file") => Some("local.file.stream_smb"),
         ("GET", "/tree") => Some("local.file.tree"),
@@ -1425,6 +1504,9 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
         ("POST", "/workspace-status") => Some("local.workspace.inspect"),
         ("POST", "/open-project") => Some("local.workspace.open"),
         ("POST", "/remote-connect") => Some("local.remote.connect"),
+        ("GET", "/remote-clients") => Some("local.remote.clients.read"),
+        ("POST", "/remote-clients/detect") => Some("local.remote.clients.detect"),
+        ("POST", "/remote-clients/configure") => Some("local.remote.clients.configure"),
         ("POST", "/ai-provider-import") => Some("local.ai.provider_import"),
         ("GET", "/ai-provider-import/status") => Some("local.ai.provider_import_status"),
         ("POST", "/ai-provider-import/cancel") => Some("local.ai.provider_import_cancel"),
@@ -1471,6 +1553,22 @@ mod local_operation_tests {
         assert_eq!(
             local_operation("POST", "/remote-connect"),
             Some("local.remote.connect")
+        );
+        assert_eq!(
+            local_operation("GET", "/remote-clients"),
+            Some("local.remote.clients.read")
+        );
+        assert_eq!(
+            local_operation("POST", "/remote-clients/detect"),
+            Some("local.remote.clients.detect")
+        );
+        assert_eq!(
+            local_operation("POST", "/remote-clients/configure"),
+            Some("local.remote.clients.configure")
+        );
+        assert_eq!(
+            local_operation("GET", "/pick-remote-client"),
+            Some("local.remote.clients.pick")
         );
         assert_eq!(
             local_operation("POST", "/plugins/update"),

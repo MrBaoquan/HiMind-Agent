@@ -70,7 +70,7 @@ struct ClientDefinition {
 }
 
 pub(crate) fn overview(options: &Options) -> Result<AiIntegrationOverview, Box<dyn Error>> {
-    let executable = env::current_exe()?;
+    let executable = stable_launcher_executable()?;
     let arguments = mcp_arguments(options);
     let clients = client_definitions()
         .into_iter()
@@ -90,7 +90,7 @@ pub(crate) fn configure(
     client_id: &str,
     reset_invalid: bool,
 ) -> Result<AiClientConfigurationResult, Box<dyn Error>> {
-    let executable = env::current_exe()?;
+    let executable = stable_launcher_executable()?;
     let arguments = mcp_arguments(options);
     let definition = find_client_definition(client_id)?;
     let original = if definition.path.exists() {
@@ -125,7 +125,7 @@ pub(crate) fn remove_configuration(
     options: &Options,
     client_id: &str,
 ) -> Result<AiClientConfigurationResult, Box<dyn Error>> {
-    let executable = env::current_exe()?;
+    let executable = stable_launcher_executable()?;
     let arguments = mcp_arguments(options);
     let definition = find_client_definition(client_id)?;
     if !definition.path.exists() {
@@ -159,7 +159,7 @@ pub(crate) fn test_connection(
     options: &Options,
 ) -> Result<McpConnectionTestResult, Box<dyn Error>> {
     let started = Instant::now();
-    let executable = env::current_exe()?;
+    let executable = stable_launcher_executable()?;
     let mut child = Command::new(executable)
         .args(mcp_arguments(options))
         .env("HIMIND_AI_CLIENT_ID", "agent-self-test")
@@ -224,6 +224,93 @@ pub(crate) fn test_connection(
             .unwrap_or_default(),
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+/// Move previously registered HiMind MCP entries from a versioned/legacy
+/// Agent executable to the stable root launcher. This is intentionally narrow:
+/// it only changes the command of the managed `himind-agent` server and keeps
+/// every client argument, environment value, and unrelated server untouched.
+pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
+    let current = env::current_exe()?;
+    let root = crate::install_layout::installation_root_from_executable(&current);
+    let stable_launcher = crate::install_layout::stable_launcher_for_executable(&current);
+    if !stable_launcher.is_file() {
+        return Ok(0);
+    }
+    let mut migrated = 0;
+    for definition in client_definitions() {
+        if !definition.path.is_file() {
+            continue;
+        }
+        let original = fs::read_to_string(&definition.path)?;
+        let updated = match definition.kind {
+            ConfigKind::CodexToml => {
+                let mut document = original.parse::<DocumentMut>()?;
+                let Some(server) = document
+                    .get_mut("mcp_servers")
+                    .and_then(Item::as_table_mut)
+                    .and_then(|servers| servers.get_mut(SERVER_ID))
+                    .and_then(Item::as_table_mut)
+                else {
+                    continue;
+                };
+                let command = server
+                    .get("command")
+                    .and_then(Item::as_str)
+                    .unwrap_or_default();
+                if !is_legacy_agent_command(command, &root, &stable_launcher) {
+                    continue;
+                }
+                server.insert(
+                    "command",
+                    value(stable_launcher.to_string_lossy().to_string()),
+                );
+                document.to_string()
+            }
+            ConfigKind::McpJson | ConfigKind::WorkBuddyJson => {
+                let mut root_value = serde_json::from_str::<Value>(&original)?;
+                let Some(server) = root_value
+                    .get_mut("mcpServers")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|servers| servers.get_mut(SERVER_ID))
+                    .and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                let command = server
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !is_legacy_agent_command(command, &root, &stable_launcher) {
+                    continue;
+                }
+                server.insert(
+                    "command".to_string(),
+                    Value::String(stable_launcher.to_string_lossy().to_string()),
+                );
+                format!("{}\n", serde_json::to_string_pretty(&root_value)?)
+            }
+        };
+        if normalized_text(&original) != normalized_text(&updated) {
+            backup_and_write(&definition.path, updated.as_bytes())?;
+            migrated += 1;
+        }
+    }
+    Ok(migrated)
+}
+
+fn is_legacy_agent_command(
+    command: &str,
+    installation_root: &Path,
+    stable_launcher: &Path,
+) -> bool {
+    let candidate = Path::new(command);
+    candidate
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("himind-agent.exe"))
+        && crate::install_layout::installation_root_from_executable(candidate) == installation_root
+        && !paths_equal(command, stable_launcher)
 }
 
 fn client_definitions() -> Vec<ClientDefinition> {
@@ -525,6 +612,12 @@ fn mcp_arguments(options: &Options) -> Vec<String> {
         "--state".to_string(),
         options.state_path.to_string_lossy().to_string(),
     ]
+}
+
+fn stable_launcher_executable() -> Result<PathBuf, Box<dyn Error>> {
+    Ok(crate::install_layout::stable_launcher_for_executable(
+        &env::current_exe()?,
+    ))
 }
 
 pub(crate) fn backup_and_write(

@@ -13,7 +13,5 @@
     trustedHosts: []
 
 # HiMind supplies a ready-to-use provider, while DSH remains the owner of model
-# selection and provider settings. ui-settings also provides settingsScope to
-# locale, theme, and conversation.
-- id: ui-agent-preset
-  disabled: true
+# selection and provider settings. Keep DSH's preset/plugin management surface
+# available so developers can inspect and extend the runtime directly.

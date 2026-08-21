@@ -1,6 +1,6 @@
 {
   "productName": "HiMind Agent",
-  "version": "0.3.16",
+  "version": "0.3.27",
   "identifier": "com.himind.agent",
   "build": {
     "frontendDist": "frontend/dist"
@@ -19,7 +19,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src http://127.0.0.1:*"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src http://127.0.0.1:* http://localhost:*"
     }
   },
   "bundle": {

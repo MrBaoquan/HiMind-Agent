@@ -15,6 +15,10 @@ use tauri::{
     Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
+use crate::app::builtin_ai_gateway::BuiltinAiCommandGateway;
+use crate::app::builtin_ai_model_sync::{
+    BuiltinAiModelSync, BuiltinAiModelSyncResult, ModelSyncSnapshot,
+};
 use crate::app::builtin_ai_proxy::BuiltinAiProxy;
 use crate::app::builtin_ai_sync::BuiltinAiEventSync;
 use crate::app::commands::AgentState;
@@ -26,6 +30,8 @@ struct BuiltinAiSession {
     child: Child,
     proxy: BuiltinAiProxy,
     event_sync: BuiltinAiEventSync,
+    model_sync: BuiltinAiModelSync,
+    command_gateway: BuiltinAiCommandGateway,
 }
 
 static BUILTIN_AI_SESSION: std::sync::OnceLock<Mutex<Option<BuiltinAiSession>>> =
@@ -139,6 +145,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_agent_update_preferences,
             super::commands::install_agent_update,
             super::commands::get_dashboard_identity_status,
+            super::commands::get_builtin_ai_activity,
             super::commands::start_dashboard_authorization,
             super::commands::get_dashboard_authorization_progress,
             super::commands::cancel_dashboard_authorization,
@@ -153,6 +160,10 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_approval_settings,
             super::commands::get_remote_execution_settings,
             super::commands::save_remote_execution_settings,
+            super::commands::get_remote_clients,
+            super::commands::detect_remote_clients,
+            super::commands::configure_remote_client,
+            super::commands::pick_remote_client,
             super::commands::get_builtin_ai_runtime_status,
             super::commands::get_builtin_ai_runtime_installation_status,
             super::commands::check_builtin_ai_runtime_update,
@@ -164,6 +175,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::install_builtin_ai_runtime,
             super::commands::start_builtin_ai_runtime_install,
             super::commands::start_builtin_ai_session,
+            super::commands::sync_builtin_ai_models,
             super::commands::set_approval_rule,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
@@ -254,6 +266,16 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                 service_worker_status,
                 Some(Arc::clone(&service_approval_manager)),
             )?;
+            match super::ai_clients::migrate_legacy_agent_commands() {
+                Ok(count) if count > 0 => service_approval_manager.add_log(
+                    "info",
+                    &format!("已将 {count} 个 AI 客户端连接迁移到稳定 Agent 入口"),
+                ),
+                Ok(_) => {}
+                Err(error) => service_approval_manager
+                    .add_log("warn", &format!("AI 客户端连接迁移未完成：{error}")),
+            }
+            start_pending_updater_repair(Arc::clone(&service_approval_manager));
             service_approval_manager
                 .add_log("info", &format!("Agent 已启动，本地服务: 127.0.0.1:{port}"));
             println!("local agent app service listening on http://127.0.0.1:{port}");
@@ -272,6 +294,31 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     builder.run(tauri::generate_context!())?;
 
     Ok(())
+}
+
+fn start_pending_updater_repair(approval_manager: Arc<ApprovalManager>) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    thread::spawn(move || {
+        for attempt in 0..30 {
+            thread::sleep(Duration::from_secs(1));
+            match crate::install_layout::repair_pending_updater(&executable) {
+                Ok(true) => {
+                    approval_manager.add_log("info", "Agent updater 已完成后台修复");
+                    return;
+                }
+                Ok(false) => return,
+                Err(error) if attempt < 29 => {
+                    let _ = error;
+                }
+                Err(error) => {
+                    approval_manager
+                        .add_log("warn", &format!("Agent updater 后台修复未完成：{error}"));
+                }
+            }
+        }
+    });
 }
 
 fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -686,12 +733,37 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
             ));
         }
     };
-    let (event_sync, observer) = BuiltinAiEventSync::start(options.clone());
+    let (event_sync, observer) = BuiltinAiEventSync::start(
+        options.clone(),
+        crate::app::builtin_ai_gateway::RuntimeCapabilities::conservative(),
+    );
     let proxy = BuiltinAiProxy::start(&url, Some(observer)).map_err(|error| {
         crate::runtime::process::terminate_process_tree(&mut child);
         let _ = child.wait();
         error
     })?;
+    let runtime_capabilities =
+        crate::app::builtin_ai_gateway::probe_builtin_ai_capabilities(&proxy.control());
+    event_sync.set_capabilities(runtime_capabilities);
+    // DSH settings are live. Apply the current managed catalog before the
+    // first browser paint so the selector never briefly shows stale models.
+    let _ =
+        proxy
+            .control()
+            .sync_model_catalog(&launch.default_model, &launch.base_url, &launch.models);
+    let model_sync = BuiltinAiModelSync::start(ModelSyncSnapshot {
+        user_id: launch.user_id,
+        default_model: launch.default_model,
+        base_url: launch.base_url.clone(),
+        models: launch.models,
+        credential_fingerprint: launch.credential_fingerprint,
+        catalog_fingerprint: launch.catalog_fingerprint,
+    });
+    let command_gateway = BuiltinAiCommandGateway::start(
+        options.clone(),
+        proxy.control(),
+        event_sync.capabilities_state(),
+    );
     let session_url = proxy.url().to_string();
     *builtin_ai_session()
         .lock()
@@ -699,6 +771,8 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         child,
         proxy,
         event_sync,
+        model_sync,
+        command_gateway,
     });
     Ok(session_url)
 }
@@ -742,12 +816,52 @@ fn builtin_ai_startup_error(
 pub(crate) fn stop_builtin_ai_process() {
     if let Ok(mut active) = builtin_ai_session().lock() {
         if let Some(mut session) = active.take() {
+            session.command_gateway.stop();
             session.proxy.stop();
             session.event_sync.stop();
             crate::runtime::process::terminate_process_tree(&mut session.child);
             let _ = session.child.wait();
         }
     }
+}
+
+/// Reconcile the active DSH process with the current Dashboard AI service.
+/// Model catalog changes are applied live; credential/route changes request a
+/// clean process restart so the new environment is used.
+pub(crate) fn sync_builtin_ai_models(
+    options: &Options,
+) -> Result<BuiltinAiModelSyncResult, String> {
+    let result = {
+        let active = builtin_ai_session()
+            .lock()
+            .map_err(|_| "HiMind AI 会话状态不可用")?;
+        let session = active
+            .as_ref()
+            .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?;
+        session
+            .model_sync
+            .sync_now(options, &session.proxy.control())?
+    };
+    if result.status == "restart_required" {
+        stop_builtin_ai_process();
+        let session_url = start_builtin_ai_session(options)?;
+        return Ok(BuiltinAiModelSyncResult {
+            status: "restarted".to_string(),
+            model_count: result.model_count,
+            restarted: true,
+            session_url,
+        });
+    }
+    let session_url = builtin_ai_session()
+        .lock()
+        .map_err(|_| "HiMind AI 会话状态不可用")?
+        .as_ref()
+        .map(|session| session.proxy.url().to_string())
+        .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?;
+    Ok(BuiltinAiModelSyncResult {
+        session_url,
+        ..result
+    })
 }
 
 pub(crate) fn plugin_view_window_label(plugin_id: &str, view_id: &str) -> String {
