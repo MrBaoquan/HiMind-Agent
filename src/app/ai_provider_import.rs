@@ -31,7 +31,10 @@ const CODEX_HIMIND_MODELS_FILE: &str = "himind-models.json";
 const CODEX_PROVIDER_ID: &str = "himind";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
 const VSCODE_CHAT_PROVIDER_PROPOSAL: &str = "chatProvider";
-const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 60;
+// Keep the handoff short-lived, but long enough for a cold VS Code process,
+// extension host startup and antivirus scanning on a first-use machine.
+const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 180;
+const MIN_SUPPORTED_VSCODE_VERSION: &str = "1.120.0";
 const VSCODE_ENROLLMENT_HANDOFF_FILE: &str = "vscode-enrollment-v2.json";
 const VSCODE_IMPORT_STATUS_FILE: &str = "vscode-import-status.json";
 
@@ -1445,6 +1448,7 @@ fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
         .map_err(|_| "VS Code 导入锁不可用")?;
     let cli = locate_vscode_cli()
         .ok_or("未检测到 VS Code，请先安装；便携版可配置 HIMIND_VSCODE_CLI 指向 bin\\code.cmd")?;
+    ensure_supported_vscode_version(&cli)?;
     let vsix = bundled_vscode_vsix_path()?;
     let bundled_version = read_vscode_vsix_version(&vsix)?;
     let installed_version = installed_vscode_extension_version(&cli)?;
@@ -1461,7 +1465,13 @@ fn ensure_vscode_extension() -> Result<PathBuf, Box<dyn Error>> {
             .into());
         }
     }
-    ensure_vscode_chat_provider_allowlist(&cli)?;
+    // The stable @himind participant remains usable when a system-wide VS
+    // Code install prevents a normal user from editing product.json. The
+    // proposed model picker is an enhancement, not a reason to fail the
+    // complete installation and enrollment flow.
+    if let Err(error) = ensure_vscode_chat_provider_allowlist(&cli) {
+        eprintln!("VS Code chatProvider allowlist skipped: {error}");
+    }
     Ok(cli)
 }
 
@@ -1790,6 +1800,39 @@ fn vscode_cli_available(cli: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn ensure_supported_vscode_version(cli: &Path) -> Result<(), Box<dyn Error>> {
+    let output = run_vscode_command(vscode_command(cli).arg("--version"), Duration::from_secs(5))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法读取 VS Code 版本：{}",
+            command_error_detail(&output.stdout, &output.stderr)
+        )
+        .into());
+    }
+    let version_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let version = parse_vscode_cli_version(&version_text)?;
+    let minimum = Version::parse(MIN_SUPPORTED_VSCODE_VERSION)?;
+    if version < minimum {
+        return Err(format!(
+            "当前 VS Code 版本为 {version}，HiMind AI 扩展要求 VS Code >= {minimum}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn parse_vscode_cli_version(output: &str) -> Result<Version, Box<dyn Error>> {
+    output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| Version::parse(line).ok())
+        .ok_or_else(|| "无法解析 VS Code 版本，请升级到支持的稳定版本".into())
+}
+
 fn installed_vscode_extension_version(cli: &Path) -> Result<Option<String>, Box<dyn Error>> {
     let output = run_vscode_command(
         vscode_command(cli).args(["--list-extensions", "--show-versions"]),
@@ -1802,16 +1845,91 @@ fn installed_vscode_extension_version(cli: &Path) -> Result<Option<String>, Box<
         )
         .into());
     }
-    parse_vscode_extension_version(&String::from_utf8_lossy(&output.stdout)).map_err(Into::into)
+    // Depending on the VS Code build and locale, extension listing output can
+    // be written to stdout or stderr. Parse both streams before falling back
+    // to the on-disk extension directory (portable VS Code does not always
+    // refresh the CLI index immediately after installation).
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if let Some(version) = parse_vscode_extension_version(&combined)? {
+        return Ok(Some(version));
+    }
+    find_vscode_extension_version(&vscode_extension_roots(cli))
+}
+
+fn vscode_extension_roots(cli: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let insiders = cli
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("insiders"));
+    let profile_dir = if insiders {
+        ".vscode-insiders"
+    } else {
+        ".vscode"
+    };
+    roots.push(user_home().join(profile_dir).join("extensions"));
+
+    // Portable VS Code keeps extensions below the product root rather than
+    // under the user's profile. The CLI path is <root>/bin/code(.cmd).
+    if let Some(root) = cli.parent().and_then(Path::parent) {
+        roots.push(root.join("data/extensions"));
+    }
+    roots
+}
+
+fn find_vscode_extension_version(roots: &[PathBuf]) -> Result<Option<String>, Box<dyn Error>> {
+    let mut best: Option<String> = None;
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("package.json");
+            let Ok(content) = fs::read_to_string(manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_str::<VSCodeExtensionManifest>(&content) else {
+                continue;
+            };
+            if !format!("{}.{}", manifest.publisher, manifest.name)
+                .eq_ignore_ascii_case(VSCODE_EXTENSION_ID)
+            {
+                continue;
+            }
+            if Version::parse(manifest.version.trim()).is_err() {
+                continue;
+            }
+            let replace = best.as_deref().is_none_or(|current| {
+                compare_extension_versions(&manifest.version, current)
+                    .map(|ordering| ordering == Ordering::Greater)
+                    .unwrap_or(false)
+            });
+            if replace {
+                best = Some(manifest.version.trim().to_string());
+            }
+        }
+    }
+    Ok(best)
 }
 
 fn wait_for_vscode_extension_version(cli: &Path) -> Result<Option<String>, Box<dyn Error>> {
-    for attempt in 0..5 {
+    // VS Code returns from --install-extension before its extension index is
+    // immediately visible to a second CLI invocation on slower machines.
+    // Keep polling long enough for portable and first-run installations.
+    for attempt in 0..20 {
         if let Some(version) = installed_vscode_extension_version(cli)? {
             return Ok(Some(version));
         }
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(250));
+        if attempt < 19 {
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
     Ok(None)
@@ -2064,15 +2182,17 @@ mod tests {
         build_cc_switch_provider_settings, build_codex_config_toml, build_codex_models_json,
         build_vscode_enrollment_url, bundled_vscode_vsix_candidates, chat_completions_url,
         compare_extension_versions, consume_vscode_enrollment, create_vscode_enrollment,
-        ensure_vscode_chat_provider_allowlist, legacy_workbuddy_model_id,
-        managed_workbuddy_model_ids, merge_workbuddy_models, migrate_workbuddy_sessions,
-        parse_vscode_extension_version, parse_vscode_import_status, push_vscode_registry_value,
-        read_cc_switch_managed_models, read_cc_switch_managed_settings, read_codex_model_catalog,
-        remove_workbuddy_models, strip_codex_himind, vscode_extension_install_required,
-        workbuddy_model_id, workbuddy_models_path_in, write_cc_switch_provider, AIClientCredential,
+        ensure_vscode_chat_provider_allowlist, find_vscode_extension_version,
+        legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
+        migrate_workbuddy_sessions, parse_vscode_cli_version, parse_vscode_extension_version,
+        parse_vscode_import_status, push_vscode_registry_value, read_cc_switch_managed_models,
+        read_cc_switch_managed_settings, read_codex_model_catalog, remove_workbuddy_models,
+        strip_codex_himind, vscode_extension_install_required, workbuddy_model_id,
+        workbuddy_models_path_in, write_cc_switch_provider, AIClientCredential,
         VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
+    use semver::Version;
     use serde_json::{json, Value};
     use std::cmp::Ordering;
     use std::path::{Path, PathBuf};
@@ -2452,6 +2572,36 @@ command = "uvx.exe"
             None
         );
         assert!(parse_vscode_extension_version("himind.himind-ai").is_err());
+    }
+
+    #[test]
+    fn parses_vscode_cli_version_from_multiline_output() {
+        assert_eq!(
+            parse_vscode_cli_version("1.120.2\ncommit-hash\nx64").unwrap(),
+            Version::parse("1.120.2").unwrap()
+        );
+        assert!(parse_vscode_cli_version("commit-hash\nx64").is_err());
+    }
+
+    #[test]
+    fn finds_vscode_extension_from_portable_extension_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-vscode-extensions-{}-{}",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        let extension = root.join("himind.himind-ai-0.1.15");
+        std::fs::create_dir_all(&extension).unwrap();
+        std::fs::write(
+            extension.join("package.json"),
+            br#"{"name":"himind-ai","publisher":"himind","version":"0.1.15"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_vscode_extension_version(&[root.clone()]).unwrap(),
+            Some("0.1.15".to_string())
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

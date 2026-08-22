@@ -22,6 +22,8 @@ struct UpdateArgs {
     staged_package: PathBuf,
     staged_updater: PathBuf,
     staged_launcher: PathBuf,
+    #[serde(default)]
+    staged_vscode_extension: Option<PathBuf>,
     api_base: String,
     from_version: String,
     target_version: String,
@@ -90,6 +92,21 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
         canonical_staged_helper(&args.staged_updater, install_layout::UPDATER_FILE, &root)?;
     let staged_launcher =
         canonical_staged_helper(&args.staged_launcher, install_layout::LAUNCHER_FILE, &root)?;
+    let staged_vscode_extension = args
+        .staged_vscode_extension
+        .as_ref()
+        .map(|path| -> Result<PathBuf, Box<dyn Error>> {
+            if path.file_name().and_then(|value| value.to_str()) != Some("himind-ai.vsix") {
+                return Err("invalid staged VS Code extension".into());
+            }
+            let canonical = canonical_staged_path(path, &root)?;
+            let size = fs::metadata(&canonical)?.len();
+            if size == 0 || size > 100 * 1024 * 1024 {
+                return Err("staged VS Code extension has an invalid size".into());
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
     let staged_package = canonical_staged_path(&args.staged_package, &root)?;
     wait_for_old_agent_exit(args)?;
     let had_active_version = install_layout::read_active_version(&root)?.is_some();
@@ -103,6 +120,14 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
             args,
             &format!("新 Agent 健康检查通过：{}", target.display()),
         );
+        if let Some(extension) = staged_vscode_extension.as_deref() {
+            if let Err(error) = install_vscode_extension(&root, extension) {
+                let _ = terminate_process_for_path(&target);
+                let _ = fs::remove_dir_all(&target_dir);
+                let _ = launch_and_confirm(args, &current, &args.from_version);
+                return Err(format!("更新 VS Code 扩展失败，已回滚 Agent：{error}").into());
+            }
+        }
         if !had_active_version {
             if let Err(error) = replace_helper(
                 &root.join(install_layout::LAUNCHER_FILE),
@@ -188,6 +213,7 @@ fn update_local_status(args: &UpdateArgs, status: &str, error: &str) -> Result<(
             "staged_agent_path",
             "staged_updater_path",
             "staged_launcher_path",
+            "staged_vscode_extension_path",
         ] {
             value[key] = serde_json::Value::String(String::new());
         }
@@ -372,6 +398,20 @@ fn canonical_staged_path(path: &Path, installation_root: &Path) -> Result<PathBu
         return Err("staged update file is outside the installation root".into());
     }
     Ok(canonical)
+}
+
+fn install_vscode_extension(root: &Path, staged: &Path) -> Result<(), Box<dyn Error>> {
+    let target_dir = root.join("resources").join("vscode");
+    fs::create_dir_all(&target_dir)?;
+    let temporary = target_dir.join(format!(".himind-ai-{}.vsix.installing", std::process::id()));
+    let target = target_dir.join("himind-ai.vsix");
+    let _ = fs::remove_file(&temporary);
+    fs::copy(staged, &temporary)?;
+    if let Err(error) = install_layout::replace_file(&temporary, &target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("无法更新内置 HiMind VSIX：{error}").into());
+    }
+    Ok(())
 }
 
 // fs::canonicalize returns \\?\-prefixed verbatim paths, but Win32_Process

@@ -16,7 +16,16 @@ use crate::Options;
 
 const BACKGROUND_CHECK_MIN_SECONDS: u64 = 30 * 60;
 const BACKGROUND_CHECK_JITTER_SECONDS: u64 = 30 * 60;
-const DIRECTORY_PACKAGE_FILES: [&str; 3] = [
+// The VSIX entry is optional for one transition release so already deployed
+// three-file Agents can still update. New Agents accept and stage the fourth
+// entry, allowing a later release to keep the Agent and extension in lockstep.
+const DIRECTORY_PACKAGE_FILES: [&str; 4] = [
+    "himind-agent.exe",
+    "himind-agent-updater.exe",
+    "himind-agent-launcher.exe",
+    "himind-ai.vsix",
+];
+const REQUIRED_DIRECTORY_PACKAGE_FILES: [&str; 3] = [
     "himind-agent.exe",
     "himind-agent-updater.exe",
     "himind-agent-launcher.exe",
@@ -74,6 +83,8 @@ pub(crate) struct AgentUpdateStatus {
     #[serde(default)]
     pub staged_launcher_path: String,
     #[serde(default)]
+    pub staged_vscode_extension_path: String,
+    #[serde(default)]
     pub last_checked_at: u64,
     #[serde(default)]
     pub last_error: String,
@@ -108,6 +119,7 @@ impl Default for AgentUpdateStatus {
             staged_agent_path: String::new(),
             staged_updater_path: String::new(),
             staged_launcher_path: String::new(),
+            staged_vscode_extension_path: String::new(),
             last_checked_at: 0,
             last_error: String::new(),
             auto_check: true,
@@ -543,6 +555,12 @@ fn prepare_staged_payload(
         .join("himind-agent-launcher.exe")
         .to_string_lossy()
         .to_string();
+    let extension_path = package_dir.join("himind-ai.vsix");
+    status.staged_vscode_extension_path = if extension_path.is_file() {
+        extension_path.to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
     Ok(())
 }
 
@@ -565,10 +583,16 @@ fn extract_directory_package(archive_path: &Path, target_dir: &Path) -> Result<(
 
     let result = (|| -> Result<(), Box<dyn Error>> {
         let mut archive = ZipArchive::new(File::open(archive_path)?)?;
-        if archive.len() != DIRECTORY_PACKAGE_FILES.len() {
-            return Err("Agent directory update package must contain exactly three files".into());
+        if archive.len() != REQUIRED_DIRECTORY_PACKAGE_FILES.len()
+            && archive.len() != DIRECTORY_PACKAGE_FILES.len()
+        {
+            return Err("Agent directory update package must contain three executables and may optionally contain himind-ai.vsix".into());
         }
         let allowed = DIRECTORY_PACKAGE_FILES.into_iter().collect::<HashSet<_>>();
+        let required = REQUIRED_DIRECTORY_PACKAGE_FILES
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
         let mut seen = HashSet::new();
         let mut total_size = 0_u64;
         for index in 0..archive.len() {
@@ -626,7 +650,7 @@ fn extract_directory_package(archive_path: &Path, target_dir: &Path) -> Result<(
                 .into());
             }
         }
-        if seen.len() != allowed.len() {
+        if !required.is_subset(&seen) {
             return Err("Agent directory update package is missing a required executable".into());
         }
         if target_dir.exists() {
@@ -647,6 +671,8 @@ fn staged_payload_available(status: &AgentUpdateStatus) -> bool {
         && Path::new(&status.staged_agent_path).is_file()
         && Path::new(&status.staged_updater_path).is_file()
         && Path::new(&status.staged_launcher_path).is_file()
+        && (status.staged_vscode_extension_path.is_empty()
+            || Path::new(&status.staged_vscode_extension_path).is_file())
 }
 
 fn clear_staged_paths(status: &mut AgentUpdateStatus) {
@@ -654,6 +680,7 @@ fn clear_staged_paths(status: &mut AgentUpdateStatus) {
     status.staged_agent_path.clear();
     status.staged_updater_path.clear();
     status.staged_launcher_path.clear();
+    status.staged_vscode_extension_path.clear();
 }
 
 pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Error>> {
@@ -686,6 +713,8 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
         &staged_package,
         Path::new(&status.staged_updater_path),
         Path::new(&status.staged_launcher_path),
+        (!status.staged_vscode_extension_path.is_empty())
+            .then(|| Path::new(&status.staged_vscode_extension_path)),
         &current_executable,
         options,
         &status.available_version,
@@ -966,6 +995,28 @@ mod tests {
         for name in DIRECTORY_PACKAGE_FILES {
             assert_eq!(fs::read(extracted.join(name)).unwrap(), name.as_bytes());
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_legacy_three_file_agent_directory_package() {
+        let root = temporary_test_root("legacy-extract");
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("agent.zip");
+        let entries = [
+            "himind-agent.exe",
+            "himind-agent-updater.exe",
+            "himind-agent-launcher.exe",
+        ];
+        write_test_archive(&archive_path, &entries).unwrap();
+        let extracted = root.join("payload");
+
+        extract_directory_package(&archive_path, &extracted).unwrap();
+
+        for name in entries {
+            assert!(extracted.join(name).is_file());
+        }
+        assert!(!extracted.join("himind-ai.vsix").exists());
         let _ = fs::remove_dir_all(root);
     }
 
