@@ -1985,22 +1985,32 @@ fn vscode_command(cli: &Path) -> Command {
 
 #[cfg(windows)]
 fn launch_vscode(cli: &Path, enrollment_url: &str) -> Result<(), Box<dyn Error>> {
-    let status = vscode_command(cli)
-        .args(["--reuse-window", "--open-url", enrollment_url])
-        .status()?;
-    if !status.success() {
-        return Err("无法唤起 VS Code 完成 HiMind 授权".into());
+    let output = run_vscode_command(
+        vscode_command(cli).args(["--reuse-window", "--open-url", enrollment_url]),
+        Duration::from_secs(15),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法唤起 VS Code 完成 HiMind 授权：{}",
+            command_error_detail(&output.stdout, &output.stderr)
+        )
+        .into());
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn launch_vscode(cli: &Path, enrollment_url: &str) -> Result<(), Box<dyn Error>> {
-    let status = vscode_command(cli)
-        .args(["--reuse-window", "--open-url", enrollment_url])
-        .status()?;
-    if !status.success() {
-        return Err("无法唤起 VS Code 完成 HiMind 授权".into());
+    let output = run_vscode_command(
+        vscode_command(cli).args(["--reuse-window", "--open-url", enrollment_url]),
+        Duration::from_secs(15),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法唤起 VS Code 完成 HiMind 授权：{}",
+            command_error_detail(&output.stdout, &output.stderr)
+        )
+        .into());
     }
     Ok(())
 }
