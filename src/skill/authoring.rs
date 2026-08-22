@@ -633,7 +633,11 @@ fn build_archive(
 ) -> Result<(), Box<dyn Error>> {
     let file = File::create(target)?;
     let mut writer = zip::ZipWriter::new(file);
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    // Candidate hashes are used for confirmation and submission identity.
+    // ZIP metadata must therefore be reproducible across repeated saves.
+    let options = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .last_modified_time(zip::DateTime::default());
     for (name, content) in files
         .iter()
         .map(|(name, content)| (name.as_str(), content.as_slice()))
