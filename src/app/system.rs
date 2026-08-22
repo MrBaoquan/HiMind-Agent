@@ -1029,11 +1029,62 @@ using System.Runtime.InteropServices;
 using System.Text;
 public static class HimindRemoteWindow {
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+    public static bool IsFocusedForProcess(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd)) return false;
+        var foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero) return false;
+        uint targetProcessId;
+        uint foregroundProcessId;
+        GetWindowThreadProcessId(hWnd, out targetProcessId);
+        GetWindowThreadProcessId(foreground, out foregroundProcessId);
+        return targetProcessId != 0 && targetProcessId == foregroundProcessId;
+    }
+    public static bool Focus(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd)) return false;
+        ShowWindowAsync(hWnd, 9);
+        var foreground = GetForegroundWindow();
+        uint ignoredTargetProcessId;
+        uint ignoredForegroundProcessId;
+        var targetThread = GetWindowThreadProcessId(hWnd, out ignoredTargetProcessId);
+        var currentThread = GetCurrentThreadId();
+        var foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out ignoredForegroundProcessId);
+        var attachedTarget = targetThread != 0 && targetThread != currentThread && AttachThreadInput(currentThread, targetThread, true);
+        var attachedForeground = foregroundThread != 0 && foregroundThread != currentThread && AttachThreadInput(currentThread, foregroundThread, true);
+        BringWindowToTop(hWnd);
+        SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, 0x0003);
+        SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, 0x0003);
+        SwitchToThisWindow(hWnd, true);
+        SetForegroundWindow(hWnd);
+        SetActiveWindow(hWnd);
+        SetFocus(hWnd);
+        var focused = false;
+        for (var attempt = 0; attempt < 4; attempt++) {
+            System.Threading.Thread.Sleep(150);
+            if (IsFocusedForProcess(hWnd)) { focused = true; break; }
+            BringWindowToTop(hWnd);
+            SwitchToThisWindow(hWnd, true);
+            SetForegroundWindow(hWnd);
+        }
+        if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+        if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+        return focused;
+    }
     public static bool Activate(string needle) {
         bool found = false;
         EnumWindows((hWnd, _) => {
@@ -1041,9 +1092,7 @@ public static class HimindRemoteWindow {
             var title = new StringBuilder(512);
             GetWindowText(hWnd, title, title.Capacity);
             if (title.ToString().IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) return true;
-            ShowWindowAsync(hWnd, 9);
-            SetForegroundWindow(hWnd);
-            found = true;
+            found = Focus(hWnd);
             return false;
         }, IntPtr.Zero);
         return found;
@@ -1422,9 +1471,58 @@ public static class HimindSunloginInput {
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref Point point);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int command);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+    public static bool IsFocusedForProcess(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd)) return false;
+        var foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero) return false;
+        uint targetProcessId;
+        uint foregroundProcessId;
+        GetWindowThreadProcessId(hWnd, out targetProcessId);
+        GetWindowThreadProcessId(foreground, out foregroundProcessId);
+        return targetProcessId != 0 && targetProcessId == foregroundProcessId;
+    }
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+    public static bool Focus(IntPtr hWnd) {
+        ShowWindowAsync(hWnd, 9);
+        var foreground = GetForegroundWindow();
+        uint ignoredTargetProcessId;
+        uint ignoredForegroundProcessId;
+        var targetThread = GetWindowThreadProcessId(hWnd, out ignoredTargetProcessId);
+        var currentThread = GetCurrentThreadId();
+        var foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out ignoredForegroundProcessId);
+        var attachedTarget = targetThread != 0 && targetThread != currentThread && AttachThreadInput(currentThread, targetThread, true);
+        var attachedForeground = foregroundThread != 0 && foregroundThread != currentThread && AttachThreadInput(currentThread, foregroundThread, true);
+        BringWindowToTop(hWnd);
+        SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, 0x0003);
+        SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, 0x0003);
+        SwitchToThisWindow(hWnd, true);
+        SetForegroundWindow(hWnd);
+        SetActiveWindow(hWnd);
+        SetFocus(hWnd);
+        var focused = false;
+        for (var attempt = 0; attempt < 4; attempt++) {
+            System.Threading.Thread.Sleep(150);
+            if (IsFocusedForProcess(hWnd)) { focused = true; break; }
+            BringWindowToTop(hWnd);
+            SwitchToThisWindow(hWnd, true);
+            SetForegroundWindow(hWnd);
+        }
+        if (attachedForeground) AttachThreadInput(currentThread, foregroundThread, false);
+        if (attachedTarget) AttachThreadInput(currentThread, targetThread, false);
+        return focused;
+    }
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     public static void LeftClick(int x, int y) {
@@ -1446,7 +1544,7 @@ $password = $env:HIMIND_REMOTE_PASSWORD
 # Wait until the Sunlogin main window is visible, restored, and has held a
 # stable size for several samples. Flutter windows expose a handle long
 # before the layout is ready, so sending input too early misses the fields.
-$deadline = (Get-Date).AddSeconds(15)
+$deadline = (Get-Date).AddSeconds(30)
 $process = $null
 $stableSamples = 0
 $lastWidth = 0
@@ -1486,17 +1584,17 @@ if ($null -eq $process -or $process.MainWindowHandle -eq 0) { exit 2 }
 
 # Restore and activate the window, then wait until it is actually in the
 # foreground and visible before sending any input.
-[void][HimindSunloginInput]::ShowWindowAsync($process.MainWindowHandle, 9)
-[void][HimindSunloginInput]::SetForegroundWindow($process.MainWindowHandle)
-[void][Microsoft.VisualBasic.Interaction]::AppActivate($pidValue)
+$null = [Microsoft.VisualBasic.Interaction]::AppActivate($pidValue)
+$focused = [HimindSunloginInput]::Focus($process.MainWindowHandle)
 $foregroundDeadline = (Get-Date).AddSeconds(5)
 do {
     Start-Sleep -Milliseconds 150
     $foreground = [HimindSunloginInput]::GetForegroundWindow()
-    if ($foreground -eq $process.MainWindowHandle -and [HimindSunloginInput]::IsWindowVisible($process.MainWindowHandle)) { break }
-    [void][HimindSunloginInput]::SetForegroundWindow($process.MainWindowHandle)
+    if ([HimindSunloginInput]::IsFocusedForProcess($process.MainWindowHandle)) { $focused = $true; break }
     [void][Microsoft.VisualBasic.Interaction]::AppActivate($pidValue)
+    $focused = [HimindSunloginInput]::Focus($process.MainWindowHandle)
 } while ((Get-Date) -lt $foregroundDeadline)
+if (-not $focused) { exit 6 }
 Start-Sleep -Milliseconds 600
 
 # Re-measure the layout after restore; the Flutter canvas only reports its
@@ -1511,27 +1609,49 @@ if ($width -lt 700 -or $height -lt 480) { exit 5 }
 
 function Point-X([double]$ratio) { return $origin.X + [int]($width * $ratio) }
 function Point-Y([double]$ratio) { return $origin.Y + [int]($height * $ratio) }
+function Abort-Input([string]$reason) {
+    Set-Clipboard -Value ''
+    Write-Error $reason
+    exit 6
+}
+function Ensure-Foreground() {
+    if (-not [HimindSunloginInput]::Focus($process.MainWindowHandle)) { return $false }
+    Start-Sleep -Milliseconds 80
+    return [HimindSunloginInput]::IsFocusedForProcess($process.MainWindowHandle)
+}
 function Paste-WithContextMenu([double]$xRatio, [double]$yRatio, [string]$value) {
+    if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground before paste' }
     Set-Clipboard -Value $value
     $x = Point-X $xRatio
     $y = Point-Y $yRatio
+    if (-not [HimindSunloginInput]::IsFocusedForProcess($process.MainWindowHandle)) {
+        Abort-Input 'sunlogin window lost foreground before context menu'
+    }
     [HimindSunloginInput]::RightClick($x, $y)
     Start-Sleep -Milliseconds 180
+    # Opening the context menu can change the foreground HWND. Do not call
+    # Focus here: reactivating the Flutter window would close the menu.
+    if (-not [HimindSunloginInput]::IsFocusedForProcess($process.MainWindowHandle)) {
+        Abort-Input 'sunlogin window lost foreground after context menu'
+    }
     [HimindSunloginInput]::LeftClick($x + 32, $y + 20)
     Start-Sleep -Milliseconds 220
 }
 
 # Restore the stable main page before targeting its fixed Flutter layout.
+if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground before navigation' }
 [HimindSunloginInput]::LeftClick((Point-X 0.08), (Point-Y 0.16))
 Start-Sleep -Milliseconds 650
 
 # Use the clear glyph so repeated requests replace the existing code.
+if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground before clearing code' }
 [HimindSunloginInput]::LeftClick((Point-X 0.475), (Point-Y 0.50))
 Start-Sleep -Milliseconds 100
 Paste-WithContextMenu 0.34 0.50 $code
 if (-not [string]::IsNullOrWhiteSpace($password)) {
     Paste-WithContextMenu 0.575 0.50 $password
 }
+if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground before submit' }
 [HimindSunloginInput]::LeftClick((Point-X 0.79), (Point-Y 0.50))
 Start-Sleep -Milliseconds 200
 Set-Clipboard -Value ''
@@ -1555,10 +1675,17 @@ exit 0
     if status.success() {
         Ok(true)
     } else {
-        Err(remote_connect_error(&format!(
-            "sunlogin GUI automation exited with code {}",
-            status.code().unwrap_or(-1)
-        )))
+        match status.code() {
+            Some(6) => Err(remote_connect_error(
+                "sunlogin window did not become the foreground window",
+            )),
+            Some(code) => Err(remote_connect_error(&format!(
+                "sunlogin GUI automation exited with code {code}"
+            ))),
+            None => Err(remote_connect_error(
+                "sunlogin GUI automation terminated unexpectedly",
+            )),
+        }
     }
 }
 

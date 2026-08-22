@@ -153,6 +153,22 @@ fn resolve_unlocked(
     let vendor = vendor_key(vendor)?;
     let configured = config_for(settings, vendor)?.clone();
     if let Some(path) = configured_path(vendor, &configured) {
+        let preferred = prefer_sunlogin_launcher(&path);
+        if vendor == "sunlogin" && preferred != path {
+            let mutable = configured.configured_by != CONFIGURED_BY_MANUAL;
+            if mutable {
+                *config_for_mut(settings, vendor)? = RemoteClientPathConfig {
+                    path: preferred.to_string_lossy().to_string(),
+                    configured_by: CONFIGURED_BY_AUTO.to_string(),
+                };
+                save_unlocked(agent_state_path, settings)?;
+            }
+            return Ok(Some(ResolvedRemoteClient {
+                path: preferred,
+                source: "configured".to_string(),
+                auto_configured: mutable,
+            }));
+        }
         return Ok(Some(ResolvedRemoteClient {
             path,
             source: if configured.configured_by == CONFIGURED_BY_MANUAL {
@@ -198,24 +214,30 @@ fn persist_discovered_unlocked(
 
 fn discover(vendor: &str) -> Option<(PathBuf, String)> {
     if let Some(path) = running_process_path(vendor) {
-        return Some((path, "running_process".to_string()));
+        return Some((
+            prefer_sunlogin_launcher(&path),
+            "running_process".to_string(),
+        ));
     }
     for path in registry_candidates(vendor) {
         if valid_executable(vendor, &path) {
-            return Some((path, "registry".to_string()));
+            return Some((prefer_sunlogin_launcher(&path), "registry".to_string()));
         }
     }
     for path in start_menu_candidates(vendor) {
         if valid_executable(vendor, &path) {
-            return Some((path, "start_menu".to_string()));
+            return Some((prefer_sunlogin_launcher(&path), "start_menu".to_string()));
         }
     }
     for path in standard_candidates(vendor) {
         if valid_executable(vendor, &path) {
-            return Some((path, "standard_directory".to_string()));
+            return Some((
+                prefer_sunlogin_launcher(&path),
+                "standard_directory".to_string(),
+            ));
         }
     }
-    path_candidate(vendor).map(|path| (path, "path".to_string()))
+    path_candidate(vendor).map(|path| (prefer_sunlogin_launcher(&path), "path".to_string()))
 }
 
 fn running_process_path(vendor: &str) -> Option<PathBuf> {
@@ -430,18 +452,53 @@ fn relative_executable_paths(vendor: &str) -> Vec<PathBuf> {
         .map(PathBuf::from)
         .collect();
     }
+    // Keep the bootstrap launcher ahead of its Flutter shell. Launching
+    // flutter\AweSun.exe directly while Sunlogin is fully stopped opens a
+    // blank/white window because the client services are not running; the
+    // top-level AweSun.exe bootstraps the UI correctly.
     [
-        r"Oray\SunLogin\SunloginClient\flutter\AweSun.exe",
         r"Oray\SunLogin\SunloginClient\AweSun.exe",
+        r"Oray\SunLogin\SunloginClient\flutter\AweSun.exe",
         r"Oray\SunLogin\SunloginClient\SunloginClient.exe",
-        r"Programs\Oray\SunLogin\SunloginClient\flutter\AweSun.exe",
         r"Sunlogin\SunloginClient.exe",
+        r"Programs\Oray\SunLogin\SunloginClient\AweSun.exe",
+        r"Programs\Oray\SunLogin\SunloginClient\flutter\AweSun.exe",
         r"AweSun.exe",
         r"SunloginClient.exe",
     ]
     .into_iter()
     .map(PathBuf::from)
     .collect()
+}
+
+/// Sunlogin's Flutter UI shell (`flutter\AweSun.exe`) renders a blank white
+/// window when launched without the client bootstrap. When a reference points
+/// at that shell, prefer the sibling launcher in the install root instead.
+fn prefer_sunlogin_launcher(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let parent = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name != "awesun.exe" || parent != "flutter" {
+        return path.to_path_buf();
+    }
+    if let Some(launcher) = path
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("AweSun.exe"))
+    {
+        if valid_executable("sunlogin", &launcher) {
+            return launcher;
+        }
+    }
+    path.to_path_buf()
 }
 
 fn executable_names(vendor: &str) -> Vec<&'static str> {
@@ -623,6 +680,55 @@ mod tests {
         let saved = load_unlocked(&state_path).unwrap();
         assert_eq!(saved.todesk.configured_by, CONFIGURED_BY_AUTO);
         assert_eq!(saved.todesk.path, executable.to_string_lossy());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sunlogin_flutter_shell_is_redirected_to_install_root_launcher() {
+        let root = test_root("sunlogin-launcher");
+        let flutter_dir = root.join("flutter");
+        fs::create_dir_all(&flutter_dir).unwrap();
+        let shell = flutter_dir.join("AweSun.exe");
+        let launcher = root.join("AweSun.exe");
+        fs::write(&shell, b"test-shell").unwrap();
+        fs::write(&launcher, b"test-launcher").unwrap();
+
+        let preferred = prefer_sunlogin_launcher(&shell);
+        assert_eq!(preferred, launcher);
+
+        // The same correction is persisted when an auto-configured reference
+        // points at the Flutter shell, so the next cold start uses the launcher.
+        let auto_state_path = root.join("auto-agent-state.json");
+        let mut auto_settings = RemoteClientSettings::default();
+        auto_settings.sunlogin = RemoteClientPathConfig {
+            path: shell.to_string_lossy().to_string(),
+            configured_by: CONFIGURED_BY_AUTO.to_string(),
+        };
+        let resolved = resolve_unlocked("sunlogin", &auto_state_path, &mut auto_settings)
+            .unwrap()
+            .expect("resolved sunlogin client");
+        assert_eq!(resolved.path, launcher);
+        assert!(resolved.auto_configured);
+        let saved = load_unlocked(&auto_state_path).unwrap();
+        assert_eq!(saved.sunlogin.path, launcher.to_string_lossy());
+        assert_eq!(saved.sunlogin.configured_by, CONFIGURED_BY_AUTO);
+
+        // A manual reference must be respected: report the launcher as the
+        // effective executable but do not rewrite the user's configured path.
+        let manual_state_path = root.join("manual-agent-state.json");
+        let mut manual_settings = RemoteClientSettings::default();
+        manual_settings.sunlogin = RemoteClientPathConfig {
+            path: shell.to_string_lossy().to_string(),
+            configured_by: CONFIGURED_BY_MANUAL.to_string(),
+        };
+        let resolved = resolve_unlocked("sunlogin", &manual_state_path, &mut manual_settings)
+            .unwrap()
+            .expect("resolved sunlogin client");
+        assert_eq!(resolved.path, launcher);
+        assert!(!resolved.auto_configured);
+        assert_eq!(manual_settings.sunlogin.path, shell.to_string_lossy());
+        assert_eq!(manual_settings.sunlogin.configured_by, CONFIGURED_BY_MANUAL);
+
         fs::remove_dir_all(root).unwrap();
     }
 }

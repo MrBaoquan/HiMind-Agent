@@ -864,16 +864,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .settings-content { min-width: 0; }
 .settings-section { margin-bottom: 14px; }
 .setting-list { padding: 0 14px; }
-.remote-client-agent-card .card-header > div { min-width: 0; display: grid; gap: 3px; }
-.remote-client-agent-list { display: grid; gap: 0; margin: 12px 14px 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.remote-client-agent-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px; border-bottom: 1px solid var(--border); }
-.remote-client-agent-row:last-child { border-bottom: 0; }
-.remote-client-agent-main { min-width: 0; display: grid; gap: 4px; }
-.remote-client-agent-title { display: flex; align-items: center; gap: 7px; }
-.remote-client-agent-main code { overflow: hidden; color: var(--text-secondary); font-family: Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.remote-client-agent-main small { color: var(--text-muted); font-size: 10px; }
-.remote-client-agent-actions { justify-content: flex-end; }
-.remote-client-agent-card > .inline-feedback { margin: 10px 14px 0; }
 .setting-row { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid #f0f1f3; }
 .setting-row:last-child { border-bottom: 0; }
 .setting-row > div:first-child { min-width: 0; }
@@ -1482,8 +1472,6 @@ tr:last-child td { border-bottom: 0; }
   .software-update-summary > div:last-child { border-bottom: 0; }
   .software-update-state { align-items: stretch; flex-direction: column; }
   .software-update-state .actions-row { justify-content: flex-end; flex-wrap: wrap; }
-  .remote-client-agent-row { grid-template-columns: 1fr; gap: 10px; }
-  .remote-client-agent-actions { justify-content: flex-start; }
 }
 
 @container agent-main (max-width: 720px) {

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use toml_edit::{value, DocumentMut, Item, Table};
 use url::Url;
 
 #[cfg(windows)]
@@ -26,6 +27,8 @@ use crate::Options;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MANAGED_VENDOR: &str = "HiMind";
 const CC_SWITCH_PROVIDER_ID: &str = "himind-codex";
+const CODEX_HIMIND_MODELS_FILE: &str = "himind-models.json";
+const CODEX_PROVIDER_ID: &str = "himind";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
 const VSCODE_CHAT_PROVIDER_PROPOSAL: &str = "chatProvider";
 const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 60;
@@ -123,9 +126,10 @@ pub(crate) fn import(
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     match request.target.trim() {
         "cc-switch" => import_cc_switch(options, expected_user_id),
+        "codex" => import_codex(options, expected_user_id),
         "workbuddy" => import_workbuddy(options, expected_user_id),
         "vscode" => import_vscode(options, expected_user_id),
-        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch 或 WorkBuddy".into()),
+        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch、Codex 或 WorkBuddy".into()),
     }
 }
 
@@ -134,6 +138,7 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
         targets: vec![
             vscode_import_status(options),
             cc_switch_import_status(),
+            codex_import_status(options),
             workbuddy_import_status(),
         ],
     }
@@ -146,8 +151,9 @@ pub(crate) fn cancel(
     match target.trim() {
         "vscode" => cancel_vscode(options),
         "cc-switch" => cancel_cc_switch(),
+        "codex" => cancel_codex(options),
         "workbuddy" => cancel_workbuddy(),
-        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch 或 WorkBuddy".into()),
+        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch、Codex 或 WorkBuddy".into()),
     }
 }
 
@@ -285,7 +291,9 @@ fn import_cc_switch(
     let credential = fetch_client_credential(options, expected_user_id, "cc-switch-import")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
-    let settings = build_cc_switch_provider_settings(&credential, &models, &preferred)?;
+    let existing = read_cc_switch_managed_settings(&path)?;
+    let settings =
+        build_cc_switch_provider_settings(&credential, &models, &preferred, existing.as_ref())?;
     let website = Url::parse(&credential.access.base_url)
         .map(|url| url.origin().ascii_serialization())
         .unwrap_or_default();
@@ -300,6 +308,310 @@ fn import_cc_switch(
         backup_path: backup.to_string_lossy().to_string(),
         client_detected,
     })
+}
+
+fn codex_config_path() -> PathBuf {
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(user_home);
+    if env::var_os("CODEX_HOME").is_none() {
+        home.join(".codex")
+    } else {
+        home
+    }
+}
+
+fn codex_himind_models_path() -> PathBuf {
+    codex_config_path().join(CODEX_HIMIND_MODELS_FILE)
+}
+
+// Codex 直连采用 DeepSeek 官方接入范式：model_catalog_json 指向独立模型目录，
+// Codex 重启后 /model 即可列出 HiMind 全量模型；key 按官方做法明文写入
+// experimental_bearer_token（仅本机 config.toml）。
+fn import_codex(
+    options: &Options,
+    expected_user_id: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let config_path = codex_config_path();
+    let models_path = codex_himind_models_path();
+    let client_detected = config_path.join("config.toml").is_file()
+        || config_path.join(CODEX_HIMIND_MODELS_FILE).is_file();
+    let credential = fetch_client_credential(options, expected_user_id, "codex-import")?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let catalog = build_codex_models_json(&models)?;
+    let config_file = config_path.join("config.toml");
+    let original_config = if config_file.is_file() {
+        fs::read_to_string(&config_file)?
+    } else {
+        String::new()
+    };
+    let config = build_codex_config_toml(&original_config, &credential, &models_path, &preferred)?;
+    let catalog_backup = backup_and_write(&models_path, catalog.as_bytes())?;
+    let config_backup = backup_and_write(&config_file, config.as_bytes())?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: "codex".to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: config_path
+            .join("config.toml")
+            .to_string_lossy()
+            .to_string(),
+        backup_path: config_backup
+            .or(catalog_backup)
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        client_detected,
+    })
+}
+
+fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> {
+    let mut catalog = Vec::new();
+    for (index, model) in models.iter().enumerate() {
+        let display = model
+            .split('-')
+            .map(capitalize)
+            .collect::<Vec<_>>()
+            .join(" ");
+        catalog.push(json!({
+            "slug": model,
+            "display_name": display,
+            "description": "HiMind 网关模型",
+            "context_window": 1048576,
+            "max_context_window": 1048576,
+            "effective_context_window_percent": 95,
+            "input_modalities": ["text"],
+            "supports_parallel_tool_calls": true,
+            "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text",
+            "supports_search_tool": true,
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "Fast responses with lighter reasoning"},
+                {"effort": "high", "description": "Extra high reasoning depth for complex problems"},
+                {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"}
+            ],
+            "default_verbosity": "low",
+            "support_verbosity": true,
+            "priority": (index + 1) as i64,
+            "visibility": "list",
+            "minimal_client_version": "0.144.0",
+            "supported_in_api": true,
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "comp_hash": 3000,
+            "multi_agent_version": "v2",
+            "use_responses_lite": false,
+            "supports_reasoning_summaries": true,
+            "reasoning_summary_format": "experimental",
+            "default_reasoning_summary": "none",
+            "shell_type": "shell_command"
+        }));
+    }
+    Ok(serde_json::to_string_pretty(&json!({ "models": catalog }))?)
+}
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+// config.toml 保留式合并：只接管 Codex 直连必需字段与 [model_providers.himind]，
+// mcp_servers、notify、marketplaces、plugins、[projects] 等用户配置原样保留。
+fn build_codex_config_toml(
+    original: &str,
+    credential: &AIClientCredential,
+    models_path: &Path,
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let endpoint = normalized_base_url(&credential.access.base_url)?;
+    let catalog_value = models_path.to_string_lossy().replace('\\', "/");
+    let mut document = original
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Codex config.toml 格式无效：{error}"))?;
+    document["model"] = value(preferred);
+    document["model_provider"] = value(CODEX_PROVIDER_ID);
+    document["preferred_auth_method"] = value("apikey");
+    document["forced_login_method"] = value("api");
+    document["model_reasoning_effort"] = value("high");
+    document["model_catalog_json"] = value(catalog_value.as_str());
+    let providers = document
+        .as_table_mut()
+        .entry("model_providers")
+        .or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        })
+        .as_table_mut()
+        .ok_or("既有 config.toml 的 model_providers 不是表")?;
+    let provider = providers
+        .entry(CODEX_PROVIDER_ID)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or("既有 config.toml 的 model_providers.himind 不是表")?;
+    provider["name"] = value(MANAGED_VENDOR);
+    provider["base_url"] = value(endpoint.as_str());
+    provider["wire_api"] = value("responses");
+    provider["experimental_bearer_token"] = value(credential.api_key.as_str());
+    Ok(document.to_string())
+}
+
+fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
+    let config_path = codex_config_path();
+    let config_file = config_path.join("config.toml");
+    let models_path = codex_himind_models_path();
+    let client_detected = config_file.is_file();
+    let models = read_codex_managed_models(&config_file, &models_path)
+        .ok()
+        .unwrap_or_default();
+    let imported = !models.is_empty() || codex_managed_provider_present(&config_file);
+    AIProviderImportStatus {
+        target: "codex".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported && models.is_empty() {
+            "检测到 Codex 已配置 HiMind 供应商，但缺少模型目录，请重新导入".to_string()
+        } else if imported {
+            format!(
+                "已写入 {} 个 HiMind 模型；重启 Codex 后可在 /model 选择",
+                models.len()
+            )
+        } else if client_detected {
+            "已检测到 Codex，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 Codex 配置目录，请先运行一次 Codex".to_string()
+        },
+        config_path: config_file.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+    }
+}
+
+fn codex_managed_provider_present(config_file: &Path) -> bool {
+    fs::read_to_string(config_file)
+        .ok()
+        .and_then(|text| text.parse::<DocumentMut>().ok())
+        .is_some_and(|document| {
+            document
+                .get("model_provider")
+                .and_then(|item| item.as_str())
+                == Some(CODEX_PROVIDER_ID)
+                || document
+                    .get("model_providers")
+                    .and_then(|item| item.as_table())
+                    .is_some_and(|table| table.contains_key(CODEX_PROVIDER_ID))
+        })
+}
+
+fn read_codex_model_catalog(models_path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let content = fs::read_to_string(models_path)?;
+    let root: Value = serde_json::from_str(&content)?;
+    Ok(root
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("slug").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn read_codex_managed_models(
+    config_file: &Path,
+    models_path: &Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    if !codex_managed_provider_present(config_file) || !models_path.is_file() {
+        return Ok(Vec::new());
+    }
+    read_codex_model_catalog(models_path)
+}
+
+fn cancel_codex(_options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let config_path = codex_config_path();
+    let config_file = config_path.join("config.toml");
+    let models_path = codex_himind_models_path();
+    let client_detected = config_file.is_file();
+    let original_config = if config_file.is_file() {
+        fs::read_to_string(&config_file)?
+    } else {
+        String::new()
+    };
+    let models_present = models_path.is_file();
+    let removed_models = if models_present {
+        read_codex_model_catalog(&models_path)
+            .unwrap_or_default()
+            .len()
+    } else {
+        0
+    };
+    let (updated, changed) = strip_codex_himind(&original_config, &models_path)?;
+    if changed {
+        backup_and_write(&config_file, updated.as_bytes())?;
+    }
+    if models_present {
+        fs::remove_file(&models_path)?;
+    }
+    let removed = changed || models_present;
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "codex".to_string(),
+        status: if removed { "cancelled" } else { "not_imported" }.to_string(),
+        changed: removed,
+        client_detected,
+        detail: if removed {
+            format!(
+                "已从 Codex 移除 HiMind 供应商{}",
+                if removed_models > 0 {
+                    format!("及 {removed_models} 个模型")
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            "Codex 当前没有 HiMind 导入记录".to_string()
+        },
+        backup_path: String::new(),
+    })
+}
+
+// 只移除 HiMind 明确写入的字段，保留用户其他配置；无法判定归属的字段不动。
+fn strip_codex_himind(config: &str, models_path: &Path) -> Result<(String, bool), Box<dyn Error>> {
+    let mut document = config.parse::<DocumentMut>()?;
+    let mut changed = false;
+    let catalog_target = models_path.to_string_lossy().replace('\\', "/");
+    if document
+        .get("model_catalog_json")
+        .and_then(|item| item.as_str())
+        .is_some_and(|value| value.replace('\\', "/") == catalog_target)
+    {
+        document.remove("model_catalog_json");
+        changed = true;
+    }
+    if let Some(providers) = document
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    {
+        if providers.remove(CODEX_PROVIDER_ID).is_some() {
+            changed = true;
+        }
+    }
+    if document
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        == Some(CODEX_PROVIDER_ID)
+    {
+        document.remove("model_provider");
+        changed = true;
+    }
+    Ok((document.to_string(), changed))
 }
 
 fn import_workbuddy(
@@ -571,31 +883,78 @@ fn preferred_model(credential: &AIClientCredential) -> Result<String, Box<dyn Er
 // cc-switch v3.16+ 以供应商 settings_config.modelCatalog 为模型列表唯一事实源：
 // 启用供应商时生成 ~/.codex/cc-switch-model-catalog.json 并注入 model_catalog_json，
 // Codex 重启后 /model 才能列出第三方模型；官方 deep link 协议无法携带该字段。
+// config.toml 采用保留式合并：HiMind 只接管 auth、默认模型、provider 端点与模型目录，
+// notify、mcp_servers 等用户在 cc-switch 中回填的自定义段原样保留。
 fn build_cc_switch_provider_settings(
     credential: &AIClientCredential,
     models: &[String],
     preferred: &str,
+    existing: Option<&Value>,
 ) -> Result<String, Box<dyn Error>> {
     let endpoint = normalized_base_url(&credential.access.base_url)?;
-    let config = format!(
-        "model_provider = \"custom\"\nmodel = {}\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"HiMind\"\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
-        toml_basic_string(preferred),
-        toml_basic_string(&endpoint),
-    );
+    let mut document =
+        match existing.and_then(|settings| settings.get("config").and_then(Value::as_str)) {
+            Some(text) => text
+                .parse::<DocumentMut>()
+                .map_err(|error| format!("CC Switch 既有 config.toml 格式无效：{error}"))?,
+            None => DocumentMut::default(),
+        };
+    document["model_provider"] = value("custom");
+    document["model"] = value(preferred);
+    if document.get("model_reasoning_effort").is_none() {
+        document["model_reasoning_effort"] = value("high");
+    }
+    if document.get("disable_response_storage").is_none() {
+        document["disable_response_storage"] = value(true);
+    }
+    let providers = document
+        .as_table_mut()
+        .entry("model_providers")
+        .or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        })
+        .as_table_mut()
+        .ok_or("CC Switch 既有 config 的 model_providers 不是表")?;
+    let provider = providers
+        .entry("custom")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or("CC Switch 既有 config 的 model_providers.custom 不是表")?;
+    provider["name"] = value(MANAGED_VENDOR);
+    provider["base_url"] = value(endpoint.as_str());
+    provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(true);
+
+    let previous_entries = existing
+        .and_then(|settings| settings.pointer("/modelCatalog/models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let catalog = models
         .iter()
-        .map(|model| json!({ "model": model, "displayName": model }))
+        .map(|model| {
+            previous_entries
+                .iter()
+                .find(|entry| entry.get("model").and_then(Value::as_str) == Some(model.as_str()))
+                .cloned()
+                .unwrap_or_else(|| json!({ "model": model, "displayName": model }))
+        })
         .collect::<Vec<_>>();
     Ok(json!({
         "auth": { "OPENAI_API_KEY": credential.api_key },
-        "config": config,
+        "config": document.to_string(),
         "modelCatalog": { "models": catalog },
     })
     .to_string())
 }
 
-fn toml_basic_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+// CC Switch 是长驻 GUI 且持有数据库连接，外部写库需等待其释放锁，否则 SQLITE_BUSY 立即失败。
+fn open_cc_switch_database(path: &Path) -> Result<Connection, Box<dyn Error>> {
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(Duration::from_secs(15))?;
+    Ok(connection)
 }
 
 fn write_cc_switch_provider(
@@ -603,7 +962,7 @@ fn write_cc_switch_provider(
     settings: &str,
     website: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let connection = Connection::open(path)?;
+    let connection = open_cc_switch_database(path)?;
     let has_table: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers')",
         [],
@@ -619,13 +978,24 @@ fn write_cc_switch_provider(
         [],
         |row| row.get(0),
     )?;
+    // CC Switch 是长驻 GUI，其内存供应商列表仍引用既有 HiMind 行的 id；复用该 id
+    // （优先 current 行）可避免“供应商不存在”的悬空引用，仅当没有历史行时才新建。
+    let target_id: String = transaction
+        .query_row(
+            "SELECT id FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%'
+             ORDER BY CASE WHEN is_current = 1 THEN 0 ELSE 1 END,
+                      CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+            params![CC_SWITCH_PROVIDER_ID],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| CC_SWITCH_PROVIDER_ID.to_string());
     transaction.execute(
         "DELETE FROM provider_endpoints WHERE app_type = 'codex' AND provider_id IN (SELECT id FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' AND id <> ?1)",
-        params![CC_SWITCH_PROVIDER_ID],
+        params![target_id],
     )?;
     transaction.execute(
         "DELETE FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' AND id <> ?1",
-        params![CC_SWITCH_PROVIDER_ID],
+        params![target_id],
     )?;
     transaction.execute(
         "INSERT INTO providers (id, app_type, name, settings_config, website_url, created_at, is_current)
@@ -635,7 +1005,7 @@ fn write_cc_switch_provider(
            settings_config = excluded.settings_config,
            website_url = excluded.website_url",
         params![
-            CC_SWITCH_PROVIDER_ID,
+            target_id,
             MANAGED_VENDOR,
             settings,
             website,
@@ -647,8 +1017,8 @@ fn write_cc_switch_provider(
     Ok(backup)
 }
 
-fn read_cc_switch_managed_models(path: &Path) -> Result<Option<Vec<String>>, Box<dyn Error>> {
-    let connection = Connection::open(path)?;
+fn read_cc_switch_managed_settings(path: &Path) -> Result<Option<Value>, Box<dyn Error>> {
+    let connection = open_cc_switch_database(path)?;
     let has_table: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers')",
         [],
@@ -657,28 +1027,37 @@ fn read_cc_switch_managed_models(path: &Path) -> Result<Option<Vec<String>>, Box
     if !has_table {
         return Ok(None);
     }
-    let settings: Option<String> = connection.query_row(
-        "SELECT settings_config FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' ORDER BY CASE WHEN id = 'himind-codex' THEN 0 ELSE 1 END LIMIT 1",
-        [],
-        |row| row.get(0),
-    ).ok();
-    let Some(settings) = settings else {
-        return Ok(None);
-    };
-    let parsed: Value = serde_json::from_str(&settings)?;
-    let models = parsed
-        .get("modelCatalog")
-        .and_then(|catalog| catalog.get("models"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("model").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(Some(models))
+    let settings: Option<String> = connection
+        .query_row(
+            "SELECT settings_config FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%' ORDER BY CASE WHEN id = 'himind-codex' THEN 0 ELSE 1 END LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    match settings {
+        Some(text) => Ok(Some(
+            serde_json::from_str(&text).map_err(|_| "CC Switch 中的 HiMind 供应商配置无法解析")?,
+        )),
+        None => Ok(None),
+    }
+}
+
+fn read_cc_switch_managed_models(path: &Path) -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    let settings = read_cc_switch_managed_settings(path)?;
+    Ok(Some(
+        settings
+            .as_ref()
+            .and_then(|value| value.pointer("/modelCatalog/models"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("model").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    ))
 }
 
 fn merge_workbuddy_models(
@@ -958,7 +1337,7 @@ fn cc_switch_database_path() -> PathBuf {
 }
 
 fn cc_switch_managed_provider_count(path: &Path) -> Result<usize, Box<dyn Error>> {
-    let connection = Connection::open(path)?;
+    let connection = open_cc_switch_database(path)?;
     let has_table: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='providers')",
         [],
@@ -1002,7 +1381,7 @@ fn cancel_cc_switch() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
             backup_path: String::new(),
         });
     }
-    let connection = Connection::open(&path)?;
+    let connection = open_cc_switch_database(&path)?;
     let backup = backup_sqlite_database(&connection, &path)?;
     let transaction = connection.unchecked_transaction()?;
     transaction.execute(
@@ -1672,18 +2051,19 @@ fn cc_switch_protocol_registered() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_cc_switch_provider_settings, build_vscode_enrollment_url,
-        bundled_vscode_vsix_candidates, chat_completions_url, compare_extension_versions,
-        consume_vscode_enrollment, create_vscode_enrollment, ensure_vscode_chat_provider_allowlist,
-        legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
-        migrate_workbuddy_sessions, parse_vscode_extension_version, parse_vscode_import_status,
-        push_vscode_registry_value, read_cc_switch_managed_models, remove_workbuddy_models,
-        vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
-        write_cc_switch_provider, AIClientCredential, CC_SWITCH_PROVIDER_ID,
+        build_cc_switch_provider_settings, build_codex_config_toml, build_codex_models_json,
+        build_vscode_enrollment_url, bundled_vscode_vsix_candidates, chat_completions_url,
+        compare_extension_versions, consume_vscode_enrollment, create_vscode_enrollment,
+        ensure_vscode_chat_provider_allowlist, legacy_workbuddy_model_id,
+        managed_workbuddy_model_ids, merge_workbuddy_models, migrate_workbuddy_sessions,
+        parse_vscode_extension_version, parse_vscode_import_status, push_vscode_registry_value,
+        read_cc_switch_managed_models, read_cc_switch_managed_settings, read_codex_model_catalog,
+        remove_workbuddy_models, strip_codex_himind, vscode_extension_install_required,
+        workbuddy_model_id, workbuddy_models_path_in, write_cc_switch_provider, AIClientCredential,
         VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::cmp::Ordering;
     use std::path::{Path, PathBuf};
 
@@ -1714,16 +2094,134 @@ mod tests {
     }
 
     #[test]
+    fn builds_codex_models_catalog_with_himind_models() {
+        let catalog = build_codex_models_json(&[
+            "deepseek-v4-flash".to_string(),
+            "deepseek-v4-pro".to_string(),
+        ])
+        .unwrap();
+        let root: Value = serde_json::from_str(&catalog).unwrap();
+        let models = root.get("models").and_then(Value::as_array).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0].get("slug").and_then(Value::as_str),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(models[0].get("priority").and_then(Value::as_i64), Some(1));
+        assert_eq!(models[1].get("priority").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            models[0].get("context_window").and_then(Value::as_i64),
+            Some(1048576)
+        );
+        assert_eq!(
+            models[0].get("visibility").and_then(Value::as_str),
+            Some("list")
+        );
+    }
+
+    #[test]
+    fn codex_config_merge_preserves_user_sections() {
+        let original = r#"model_reasoning_effort = "medium"
+
+notify = ["codex-notify.exe", "turn-ended"]
+
+[mcp_servers.unityMCP]
+type = "stdio"
+command = "uvx.exe"
+
+[model_providers.deepseek]
+name = "deepseek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+"#;
+        let config = build_codex_config_toml(
+            original,
+            &credential(&["deepseek-v4-flash"]),
+            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            "deepseek-v4-flash",
+        )
+        .unwrap();
+        assert!(config.contains("model_provider = \"himind\""));
+        assert!(config.contains("model = \"deepseek-v4-flash\""));
+        assert!(config.contains("preferred_auth_method = \"apikey\""));
+        assert!(config.contains("forced_login_method = \"api\""));
+        assert!(
+            config.contains("model_catalog_json = \"C:/Users/Admin/.codex/himind-models.json\"")
+        );
+        assert!(config.contains("[model_providers.himind]"));
+        assert!(config.contains("experimental_bearer_token = \"test-secret-key\""));
+        assert!(config.contains("base_url = \"https://ai.example.com/v1\""));
+        assert!(config.contains("model_reasoning_effort = \"high\""));
+        assert!(config.contains("notify = [\"codex-notify.exe\", \"turn-ended\"]"));
+        assert!(config.contains("[mcp_servers.unityMCP]"));
+        assert!(config.contains("[model_providers.deepseek]"));
+        assert!(config.contains("base_url = \"https://api.deepseek.com/\""));
+    }
+
+    #[test]
+    fn codex_config_merge_rejects_invalid_existing_toml() {
+        let error = build_codex_config_toml(
+            "model = [",
+            &credential(&["deepseek-v4-flash"]),
+            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            "deepseek-v4-flash",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Codex config.toml 格式无效"));
+    }
+
+    #[test]
+    fn codex_strip_only_removes_himind_owned_fields() {
+        let original = r#"model = "deepseek-v4-flash"
+model_provider = "himind"
+preferred_auth_method = "apikey"
+forced_login_method = "api"
+model_catalog_json = "C:/Users/Admin/.codex/himind-models.json"
+
+notify = ["codex-notify.exe"]
+
+[model_providers.himind]
+name = "HiMind"
+base_url = "https://himind.andcrane.com/gateway/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-x"
+
+[mcp_servers.unityMCP]
+command = "uvx.exe"
+"#;
+        let (updated, changed) = strip_codex_himind(
+            original,
+            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(!updated.contains("model_provider"));
+        assert!(!updated.contains("model_catalog_json"));
+        assert!(!updated.contains("[model_providers.himind]"));
+        assert!(!updated.contains("experimental_bearer_token"));
+        assert!(updated.contains("model = \"deepseek-v4-flash\""));
+        assert!(updated.contains("preferred_auth_method = \"apikey\""));
+        assert!(updated.contains("notify = [\"codex-notify.exe\"]"));
+        assert!(updated.contains("[mcp_servers.unityMCP]"));
+    }
+
+    #[test]
     fn builds_cc_switch_settings_with_full_model_catalog() {
         let value = build_cc_switch_provider_settings(
             &credential(&["deepseek-v4-flash", "deepseek-v4-pro"]),
-            &["deepseek-v4-flash".to_string(), "deepseek-v4-pro".to_string()],
+            &[
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-pro".to_string(),
+            ],
             "deepseek-v4-flash",
+            None,
         )
         .unwrap();
         let settings: Value = serde_json::from_str(&value).unwrap();
         assert_eq!(
-            settings.pointer("/auth/OPENAI_API_KEY").and_then(Value::as_str),
+            settings
+                .pointer("/auth/OPENAI_API_KEY")
+                .and_then(Value::as_str),
             Some("test-secret-key")
         );
         let config = settings.get("config").and_then(Value::as_str).unwrap();
@@ -1743,7 +2241,98 @@ mod tests {
     }
 
     #[test]
-    fn cc_switch_upsert_replaces_legacy_rows_and_keeps_current_flag() {
+    fn cc_switch_merge_rejects_invalid_existing_toml() {
+        let existing = json!({"config": "model = ["});
+        let error = build_cc_switch_provider_settings(
+            &credential(&["deepseek-v4-flash"]),
+            &["deepseek-v4-flash".to_string()],
+            "deepseek-v4-flash",
+            Some(&existing),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("CC Switch 既有 config.toml 格式无效"));
+    }
+
+    #[test]
+    fn codex_model_catalog_can_be_read_without_config() {
+        let path = std::env::temp_dir().join(format!(
+            "himind-codex-models-test-{}-{}.json",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"models":[{"slug":"deepseek-v4-flash"},{"slug":"deepseek-v4-pro"}]}"#,
+        )
+        .unwrap();
+        let models = read_codex_model_catalog(&path).unwrap();
+        assert_eq!(
+            models,
+            vec![
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-pro".to_string()
+            ]
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cc_switch_merge_preserves_user_config_and_catalog_metadata() {
+        let existing = json!({
+            "auth": { "OPENAI_API_KEY": "stale-key" },
+            "config": "model_provider = \"custom\"\nmodel = \"old-model\"\nmodel_reasoning_effort = \"medium\"\ndisable_response_storage = true\n\nnotify = [\"codex-notify.exe\", \"turn-ended\"]\n\n[model_providers.custom]\nname = \"HiMind\"\nbase_url = \"https://old.example/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n\n[mcp_servers.unityMCP]\ntype = \"stdio\"\ncommand = \"uvx.exe\"\n",
+            "modelCatalog": {
+                "models": [
+                    { "model": "deepseek-v4-flash", "displayName": "Flash 自定义名", "contextWindow": 131072 }
+                ]
+            }
+        });
+        let value = build_cc_switch_provider_settings(
+            &credential(&["deepseek-v4-flash", "deepseek-v4-pro"]),
+            &[
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-pro".to_string(),
+            ],
+            "deepseek-v4-flash",
+            Some(&existing),
+        )
+        .unwrap();
+        let settings: Value = serde_json::from_str(&value).unwrap();
+        assert_eq!(
+            settings
+                .pointer("/auth/OPENAI_API_KEY")
+                .and_then(Value::as_str),
+            Some("test-secret-key")
+        );
+        let config = settings.get("config").and_then(Value::as_str).unwrap();
+        assert!(config.contains("model = \"deepseek-v4-flash\""));
+        assert!(config.contains("base_url = \"https://ai.example.com/v1\""));
+        assert!(config.contains("model_reasoning_effort = \"medium\""));
+        assert!(config.contains("notify = [\"codex-notify.exe\", \"turn-ended\"]"));
+        assert!(config.contains("[mcp_servers.unityMCP]"));
+        let models = settings
+            .pointer("/modelCatalog/models")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0].get("displayName").and_then(Value::as_str),
+            Some("Flash 自定义名")
+        );
+        assert_eq!(
+            models[0].get("contextWindow").and_then(Value::as_i64),
+            Some(131072)
+        );
+        assert_eq!(
+            models[1].get("displayName").and_then(Value::as_str),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn cc_switch_upsert_reuses_legacy_id_and_keeps_current_flag() {
         let directory = std::env::temp_dir().join(format!(
             "himind-cc-switch-test-{}-{}",
             std::process::id(),
@@ -1776,6 +2365,7 @@ mod tests {
             &credential(&["deepseek-v4-flash"]),
             &["deepseek-v4-flash".to_string()],
             "deepseek-v4-flash",
+            None,
         )
         .unwrap();
         let backup = write_cc_switch_provider(&path, &settings, "https://ai.example.com").unwrap();
@@ -1783,23 +2373,18 @@ mod tests {
 
         let models = read_cc_switch_managed_models(&path).unwrap().unwrap();
         assert_eq!(models, vec!["deepseek-v4-flash".to_string()]);
+        assert!(read_cc_switch_managed_settings(&path).unwrap().is_some());
 
         let connection = super::Connection::open(&path).unwrap();
-        let legacy_count: i64 = connection
+        // 复用既有 himind-% 行的 id，避免 CC Switch 内存引用悬空
+        let (id, name, website, is_current): (String, String, String, i64) = connection
             .query_row(
-                "SELECT COUNT(*) FROM providers WHERE app_type = 'codex' AND id = 'himind-legacy'",
+                "SELECT id, name, website_url, is_current FROM providers WHERE app_type = 'codex' AND id LIKE 'himind-%'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(legacy_count, 0);
-        let (name, website, is_current): (String, String, i64) = connection
-            .query_row(
-                "SELECT name, website_url, is_current FROM providers WHERE app_type = 'codex' AND id = ?1",
-                super::params![CC_SWITCH_PROVIDER_ID],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
+        assert_eq!(id, "himind-legacy");
         assert_eq!(name, "HiMind");
         assert_eq!(website, "https://ai.example.com");
         assert_eq!(is_current, 1);
