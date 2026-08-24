@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
+    inspect_project_workspace, launch_project_workspace, launch_remote_connection,
     launch_workspace_build, local_agent_executable_metadata, open_folder,
     signed_agent_updates_required, trusted_agent_update_key_ids,
 };
+use crate::app::types::{ProjectWorkspaceRequest, RemoteConnectRequest};
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, registry_json, scan_plugins,
 };
-use crate::capability::types::{CapabilityDescriptor, InvocationContext};
+use crate::capability::types::{CapabilityAvailability, CapabilityDescriptor, InvocationContext};
 use crate::store::credentials::{local_login_status_json, local_login_status_value};
 use crate::store::types::LocalWorkerStatus;
 use crate::svn::service::{
@@ -39,6 +41,9 @@ enum CapabilityHandler {
     InnerAdminLoginStatus,
     SystemOpenFolder,
     WorkspaceBuild,
+    WorkspaceStatus,
+    WorkspaceOpen,
+    RemoteConnect,
     SvnConnectionList,
     SvnConnectionTest,
     SvnWorkspaceCheckout,
@@ -99,6 +104,13 @@ impl CapabilityGateway {
         Ok(self
             .registry()?
             .into_values()
+            .filter(|registration| {
+                self.options.mode().control_plane_enabled()
+                    || registration
+                        .descriptor
+                        .availability
+                        .available_without_control_plane()
+            })
             .map(|registration| registration.descriptor)
             .collect())
     }
@@ -155,6 +167,58 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::WorkspaceBuild,
+            ),
+            registration(
+                "exhibit.workspace.status.local",
+                "读取本机工程状态",
+                "检查本机工程目录、引擎编辑器和构建入口是否可用。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "engine_type": { "type": ["string", "null"] },
+                        "engine_version": { "type": ["string", "null"] }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceStatus,
+            ),
+            registration(
+                "workspace.open.local",
+                "打开本机工程",
+                "使用本机已配置的 Unity 或 Unreal 编辑器打开工程。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "engine_type": { "type": ["string", "null"] },
+                        "engine_version": { "type": ["string", "null"] }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceOpen,
+            ),
+            registration(
+                "remote.connect",
+                "连接远程设备",
+                "使用本机配置的远程客户端连接指定设备。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "vendor": { "type": "string" },
+                        "code": { "type": "string" },
+                        "password": { "type": ["string", "null"] },
+                        "label": { "type": ["string", "null"] }
+                    },
+                    "required": ["vendor", "code"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::RemoteConnect,
             ),
             registration(
                 "svn.connection.list",
@@ -542,7 +606,8 @@ impl CapabilityGateway {
             media_registration("media.job.cancel", "取消媒体任务", "取消仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
         ];
 
-        for item in builtins {
+        for mut item in builtins {
+            item.descriptor.availability = availability_for_handler(&item.handler);
             insert_registration(&mut registry, item)?;
         }
 
@@ -563,6 +628,7 @@ impl CapabilityGateway {
                                 description: capability.description,
                                 risk_level: capability.risk_level,
                                 source: format!("plugin:{}", plugin.id),
+                                availability: CapabilityAvailability::Local,
                                 input_schema: capability.input_schema,
                             },
                             handler: CapabilityHandler::PluginCapability(capability_id),
@@ -580,6 +646,23 @@ impl CapabilityGateway {
         capability_id: &str,
         input: Value,
     ) -> Result<Value, Box<dyn Error>> {
+        let registration = self
+            .registry()?
+            .remove(capability_id)
+            .ok_or_else(|| format!("capability not found: {capability_id}"))?;
+        if matches!(
+            registration.descriptor.availability,
+            CapabilityAvailability::ControlPlane
+        ) && !self.options.mode().control_plane_enabled()
+        {
+            return Err(serde_json::json!({
+                "code": "control_plane_required",
+                "capability_id": capability_id,
+                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换 Connected 模式并重启 Agent"
+            })
+            .to_string()
+            .into());
+        }
         if is_svn_admin_capability(capability_id)
             && context.source != crate::capability::types::InvocationSource::DashboardWorker
         {
@@ -590,10 +673,6 @@ impl CapabilityGateway {
         if let Some(scope) = required_platform_scope(capability_id) {
             crate::api::oauth::platform_access_token(&self.options, scope)?;
         }
-        let registration = self
-            .registry()?
-            .remove(capability_id)
-            .ok_or_else(|| format!("capability not found: {capability_id}"))?;
         let _invocation_metadata = (
             context.source.as_str(),
             context.principal.as_str(),
@@ -606,6 +685,9 @@ impl CapabilityGateway {
             CapabilityHandler::InnerAdminLoginStatus => Ok(local_login_status_json()),
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
             CapabilityHandler::WorkspaceBuild => self.build_workspace(input),
+            CapabilityHandler::WorkspaceStatus => self.workspace_status(input),
+            CapabilityHandler::WorkspaceOpen => self.workspace_open(input),
+            CapabilityHandler::RemoteConnect => self.remote_connect(input),
             CapabilityHandler::SvnConnectionList => Ok(json!({ "items": list_connections()? })),
             CapabilityHandler::SvnConnectionTest => self.test_svn_connection(input),
             CapabilityHandler::SvnWorkspaceCheckout => {
@@ -687,7 +769,13 @@ impl CapabilityGateway {
         json!({
             "status": "online",
             "version": VERSION,
-            "mode": "local-app",
+            "mode": self.options.mode().as_str(),
+            "dashboard_enabled": self.options.mode().dashboard_enabled(),
+            "control_plane": json!({
+                "kind": self.options.mode().control_plane(),
+                "enabled": self.options.mode().control_plane_enabled(),
+                "worker_online": worker["dashboard_worker_online"],
+            }),
             "native_folder_picker": true,
             "tree_api": true,
             "open_folder": true,
@@ -763,6 +851,29 @@ impl CapabilityGateway {
             return Err("target_path is required".into());
         }
         launch_workspace_build(target_path)
+    }
+
+    fn workspace_status(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let request: ProjectWorkspaceRequest = serde_json::from_value(input)?;
+        inspect_project_workspace(
+            &request.path,
+            request.engine_type.as_deref(),
+            request.engine_version.as_deref(),
+        )
+    }
+
+    fn workspace_open(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let request: ProjectWorkspaceRequest = serde_json::from_value(input)?;
+        launch_project_workspace(
+            &request.path,
+            request.engine_type.as_deref(),
+            request.engine_version.as_deref(),
+        )
+    }
+
+    fn remote_connect(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let request: RemoteConnectRequest = serde_json::from_value(input)?;
+        launch_remote_connection(&request, &self.options.state_path)
     }
 
     fn plugin_manifest(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -1021,6 +1132,41 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
     }
 }
 
+fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailability {
+    match handler {
+        CapabilityHandler::AuthoringIdentity
+        | CapabilityHandler::SkillCandidateSave
+        | CapabilityHandler::SkillCandidateTest
+        | CapabilityHandler::SkillSubmissionSubmit
+        | CapabilityHandler::SkillSubmissionStatus
+        | CapabilityHandler::PluginCandidateSave
+        | CapabilityHandler::PluginCandidateTest
+        | CapabilityHandler::PluginSubmissionSubmit
+        | CapabilityHandler::PluginSubmissionStatus
+        | CapabilityHandler::SoftwareDistributionPublish
+        | CapabilityHandler::DashboardContextResolve
+        | CapabilityHandler::DashboardProjectContext
+        | CapabilityHandler::DashboardExhibitContext
+        | CapabilityHandler::DashboardMyWorkSummary
+        | CapabilityHandler::DashboardKnowledgeSearch
+        | CapabilityHandler::MediaSubmit(_, _)
+        | CapabilityHandler::MediaJobGet
+        | CapabilityHandler::MediaJobCancel => CapabilityAvailability::ControlPlane,
+        CapabilityHandler::SvnConnectionTest
+        | CapabilityHandler::SvnWorkspaceCheckout
+        | CapabilityHandler::SvnWorkspaceStatus
+        | CapabilityHandler::MigrationSourceScan
+        | CapabilityHandler::SvnWorkspaceUpdate
+        | CapabilityHandler::SvnWorkspaceOpen => CapabilityAvailability::NetworkService,
+        CapabilityHandler::SvnRepositoryCreate
+        | CapabilityHandler::SvnExhibitRepositoryPathCreate
+        | CapabilityHandler::SvnExhibitRepositoryInitialize
+        | CapabilityHandler::SvnProjectExhibitsAccessEnsure => CapabilityAvailability::ControlPlane,
+        CapabilityHandler::PluginCapability(_) => CapabilityAvailability::Local,
+        _ => CapabilityAvailability::Local,
+    }
+}
+
 fn validate_distribution_publish_request(
     request: &crate::api::distribution::SoftwareReleasePublishRequest,
 ) -> Result<(), Box<dyn Error>> {
@@ -1097,6 +1243,7 @@ fn registration(
             description: description.to_string(),
             risk_level: risk_level.to_string(),
             source: "builtin".to_string(),
+            availability: CapabilityAvailability::Local,
             input_schema,
         },
         handler,
@@ -1113,6 +1260,7 @@ fn dashboard_business_registration(
 ) -> CapabilityRegistration {
     let mut item = registration(id, name, description, risk_level, input_schema, handler);
     item.descriptor.source = "plugin:com.himind.dashboard-business".to_string();
+    item.descriptor.availability = CapabilityAvailability::ControlPlane;
     item
 }
 
@@ -1126,6 +1274,7 @@ fn dashboard_knowledge_registration(
 ) -> CapabilityRegistration {
     let mut item = registration(id, name, description, risk_level, input_schema, handler);
     item.descriptor.source = "plugin:com.himind.knowledge".to_string();
+    item.descriptor.availability = CapabilityAvailability::ControlPlane;
     item
 }
 
@@ -1139,6 +1288,7 @@ fn media_registration(
 ) -> CapabilityRegistration {
     let mut item = registration(id, name, description, risk_level, input_schema, handler);
     item.descriptor.source = "builtin:himind-media".to_string();
+    item.descriptor.availability = CapabilityAvailability::ControlPlane;
     item
 }
 
@@ -1301,5 +1451,81 @@ mod tests {
             required_platform_scope("knowledge.search.v1"),
             Some(crate::api::oauth::AI_CONVERSATION_SCOPE)
         );
+    }
+
+    #[test]
+    fn independent_mode_rejects_dashboard_worker_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-capability-independent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut options = crate::Options::from_env();
+        options.state_path = root.join("agent-state.json");
+        crate::app::runtime_mode::save(
+            &options.state_path,
+            crate::app::runtime_mode::AgentMode::Independent,
+        )
+        .unwrap();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let error = gateway
+            .invoke(
+                &InvocationContext::new(
+                    crate::capability::types::InvocationSource::LocalHttp,
+                    "local-user",
+                ),
+                "project.repository.create",
+                json!({}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("control_plane_required"));
+        assert!(error.contains("当前运行模式不支持"));
+        let visible = gateway
+            .list_capabilities(&InvocationContext::new(
+                crate::capability::types::InvocationSource::LocalHttp,
+                "local-user",
+            ))
+            .unwrap();
+        assert!(visible.iter().any(|item| item.id == "system.health"));
+        assert!(visible
+            .iter()
+            .any(|item| item.id == "exhibit.workspace.status.local"));
+        assert!(visible.iter().any(|item| item.id == "svn.connection.test"));
+        assert!(!visible.iter().any(|item| item.id == "context.resolve"));
+        assert!(!visible.iter().any(|item| item.id == "media.image.generate"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connected_mode_exposes_control_plane_capabilities_without_hiding_local_ones() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-capability-connected-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut options = crate::Options::from_env();
+        options.state_path = root.join("agent-state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let visible = gateway
+            .list_capabilities(&InvocationContext::new(
+                crate::capability::types::InvocationSource::LocalHttp,
+                "local-user",
+            ))
+            .unwrap();
+        assert!(visible.iter().any(|item| item.id == "system.health"));
+        assert!(visible.iter().any(|item| item.id == "context.resolve"));
+        assert!(visible.iter().any(|item| item.id == "media.image.generate"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

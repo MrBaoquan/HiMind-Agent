@@ -1,10 +1,16 @@
-import { ArrowUpRight, CheckCircle2, LogIn, LogOut, RefreshCw, ShieldCheck, X } from 'lucide-react';
-import { Pill } from './Common';
+import { ArrowUpRight, CheckCircle2, CircleAlert, LogIn, LogOut, RefreshCw, X } from 'lucide-react';
 import type { DashboardAuthorizationProgress, DashboardIdentityStatus } from '../services/agentApi';
 
 type DashboardIdentityPanelProps = {
   identity: DashboardIdentityStatus | null;
   authorization: DashboardAuthorizationProgress | null;
+  workerOnline: boolean;
+  dashboardEnabled: boolean;
+  workerStatusTitle: string;
+  workerHealthDescription: string;
+  pendingApprovals: number;
+  remoteExecutionEnabled: boolean;
+  aiToolSummary: string;
   busy?: boolean;
   onStartAuthorization: () => void;
   onCancelAuthorization: () => void;
@@ -17,6 +23,13 @@ type DashboardIdentityPanelProps = {
 export function DashboardIdentityPanel({
   identity,
   authorization,
+  workerOnline,
+  dashboardEnabled,
+  workerStatusTitle,
+  workerHealthDescription,
+  pendingApprovals,
+  remoteExecutionEnabled,
+  aiToolSummary,
   busy,
   onStartAuthorization,
   onCancelAuthorization,
@@ -26,26 +39,36 @@ export function DashboardIdentityPanel({
   authorizationDisabledReason,
 }: DashboardIdentityPanelProps) {
   const flowActive = authorization?.state === 'starting' || authorization?.state === 'pending';
-  const [label, kind] = identityLabel(identity);
   const name = identity?.user_name || identity?.user_id || '尚未登录工作台';
+  const ready = dashboardEnabled && workerOnline && identity?.authorized;
+  const statusLabel = !dashboardEnabled ? '未启用' : ready ? '已就绪' : identity?.authorized ? workerStatusTitle : '需要登录';
+  const statusDescription = ready
+    ? '账号已登录 · 本机 Agent 已就绪'
+    : !dashboardEnabled
+      ? '独立模式下 Dashboard 服务未启用。'
+      : identity?.authorized
+      ? workerHealthDescription
+      : identityDescription(identity);
   return (
-    <section className="card identity-panel" id="account-authorization">
-      <div className="card-header">
-        <span>HiMind 工作台账号</span>
-        <Pill kind={kind}>{label}</Pill>
-      </div>
-      <div className="identity-body">
-        <div className={`identity-avatar ${identity?.authorized ? 'authorized' : ''}`}>
-          {identity?.authorized ? <CheckCircle2 size={21} /> : <ShieldCheck size={21} />}
+    <section className={`workspace-status-panel ${ready ? 'ready' : 'attention'}`} id="account-authorization">
+      <div className="workspace-status-body">
+        <div className={`workspace-status-icon ${ready ? 'ready' : 'attention'}`} aria-hidden="true">
+          {ready ? <CheckCircle2 size={25} /> : <CircleAlert size={25} />}
         </div>
-        <div className="identity-copy">
+        <div className="workspace-status-copy">
+          <div className="workspace-status-kicker"><span>HiMind 工作台</span><span className={`workspace-status-pill ${ready ? 'ready' : 'attention'}`}><i />{statusLabel}</span></div>
           <strong>{name}</strong>
-          <span>{identityDescription(identity)}</span>
+          <span>{statusDescription}</span>
         </div>
         <div className="identity-actions">
           <button className="btn btn-icon" title="刷新账号状态" aria-label="刷新账号状态" disabled={busy} onClick={onRefresh}><RefreshCw size={15} /></button>
-          {identity?.authorized ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />退出登录</button> : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || identity?.state === 'not_enrolled' || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />登录 HiMind</button>}
+          {dashboardEnabled ? (identity?.authorized ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />退出登录</button> : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || identity?.state === 'not_enrolled' || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />登录 HiMind</button>) : null}
         </div>
+      </div>
+      <div className="workspace-status-metrics" aria-label="Agent 运行状态">
+        <div><span>待审批</span><strong className={pendingApprovals ? 'warning-text' : ''}>{pendingApprovals}</strong></div>
+        <div><span>远程任务</span><strong>{remoteExecutionEnabled ? '已开启' : '已关闭'}</strong></div>
+        <div><span>AI 工具</span><strong>{aiToolSummary}</strong></div>
       </div>
       {flowActive ? (
         <div className="authorization-flow">
@@ -59,43 +82,14 @@ export function DashboardIdentityPanel({
           </div>
         </div>
       ) : null}
-      {identity ? (
-        <details className="identity-technical">
-          <summary>账号详情</summary>
-          <div className="identity-technical-grid">
-            <div><span>工作台地址</span><code>{identity.dashboard_base || '--'}</code></div>
-            <div><span>Agent ID</span><code>{identity.agent_id || '--'}</code></div>
-            <div><span>用户 ID</span><code>{identity.user_id || '--'}</code></div>
-            <div><span>授权范围</span><code>{identity.scopes.length ? identity.scopes.join(' · ') : '--'}</code></div>
-            <div><span>SVN 账号</span><code>{identity.svn_username ? `${identity.svn_username} · ${svnProvisioningLabel(identity.svn_provisioning_status)}` : '--'}</code></div>
-            {identity.svn_provisioning_error ? <div><span>SVN 开通状态</span><code>{identity.svn_provisioning_error}</code></div> : null}
-            {identity.error ? <div><span>故障详情</span><code>{identity.error}</code></div> : null}
-          </div>
-        </details>
-      ) : null}
     </section>
   );
-}
-
-function svnProvisioningLabel(status: string) {
-  return ({ ready: '已就绪', local_error: '本机配置失败', provisioning: '正在开通', waiting_user_agent: '等待本机 Agent', waiting_admin_agent: '等待本机 Agent', failed: '等待重试', unmanaged: '未托管' } as Record<string, string>)[status] || status || '等待同步';
-}
-
-function identityLabel(identity: DashboardIdentityStatus | null): [string, 'success' | 'warn' | 'danger' | 'neutral'] {
-  if (!identity) return ['读取中', 'neutral'];
-  if (identity.state === 'authorized') return ['已登录', 'success'];
-  if (identity.state === 'dashboard_unavailable') return ['暂时离线', 'warn'];
-  if (identity.state === 'not_authorized') return ['未登录', 'warn'];
-  if (identity.state === 'not_enrolled') return ['设备未绑定', 'danger'];
-  if (identity.state === 'insufficient_scope') return ['权限不足', 'danger'];
-  return ['需要处理', 'danger'];
 }
 
 function identityDescription(identity: DashboardIdentityStatus | null) {
   if (!identity) return '正在确认工作台账号';
   if (identity.state === 'authorized') {
-    if (identity.svn_provisioning_status && identity.svn_provisioning_status !== 'ready') return `账号已登录，SVN 账号${svnProvisioningLabel(identity.svn_provisioning_status)}`;
-    return identity.online_verified ? '账号状态正常' : '账号已在这台电脑上登录';
+    return identity.online_verified ? '账号已连接，工作台可用' : '账号已在这台电脑上登录';
   }
   if (identity.state === 'dashboard_unavailable') return '授权仍然有效，但暂时无法连接工作台';
   if (identity.state === 'not_enrolled') return '请先从工作台安装或重新连接 HiMind Agent';

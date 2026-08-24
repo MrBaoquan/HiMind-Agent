@@ -27,6 +27,7 @@ type SkillsWorkspacePageProps = {
   error: string | null;
   marketplace: OrganizationSkillCatalogItem[];
   marketplaceError: string | null;
+	dashboardEnabled: boolean;
 	desired: ExtensionDesiredState | null;
 	desiredLoading: boolean;
 	desiredError: string | null;
@@ -45,11 +46,13 @@ type SkillsWorkspacePageProps = {
   onRepair: (skillId: string) => void;
   onUninstall: (skillId: string) => void;
   onOpenDirectory: (path: string) => void;
+  onImportLocal: () => void;
+  onImportGithub: (repository: string, reference: string, subpath: string) => Promise<void>;
 };
 
 type ViewKey = 'marketplace' | 'installed' | 'system';
 
-export function SkillsWorkspacePage({ catalog, status, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onOpenDirectory }: SkillsWorkspacePageProps) {
+export function SkillsWorkspacePage({ catalog, status, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onOpenDirectory, onImportLocal, onImportGithub }: SkillsWorkspacePageProps) {
   const [query, setQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [marketplaceItems, setMarketplaceItems] = useState<OrganizationSkillCatalogItem[]>(marketplace);
@@ -57,6 +60,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   const [marketplacePage, setMarketplacePage] = useState(1);
   const [marketplaceLoading, setMarketplaceLoading] = useState(false);
   const [view, setView] = useState<ViewKey>(() => {
+    if (!dashboardEnabled) return 'installed';
     try {
       const stored = window.localStorage.getItem('himind-agent.skills-view');
       return stored === 'marketplace' || stored === 'system' ? stored : 'installed';
@@ -67,10 +71,16 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   const [pendingUninstall, setPendingUninstall] = useState<CodexSkillStatusItem | null>(null);
   const [installPlan, setInstallPlan] = useState<SkillInstallPlan | null>(null);
   const [planError, setPlanError] = useState('');
+  const [githubOpen, setGithubOpen] = useState(false);
+  const [githubRepository, setGithubRepository] = useState('');
+  const [githubReference, setGithubReference] = useState('main');
+  const [githubSubpath, setGithubSubpath] = useState('');
+  const [githubBusy, setGithubBusy] = useState(false);
+  const [githubError, setGithubError] = useState('');
   const [planLoading, setPlanLoading] = useState(false);
   const items = status?.items || [];
 	const installedById = useMemo(() => new Map(items.filter(item => ['installed', 'outdated', 'modified'].includes(item.client_state)).map(item => [item.record.manifest.id, item])), [items]);
-	const localItems = useMemo(() => items.filter(item => item.client_state !== 'not_installed' && !isManagedSkill(item, desired, marketplace)), [desired, items, marketplace]);
+	const localItems = useMemo(() => dashboardEnabled ? items.filter(item => item.client_state !== 'not_installed' && !isManagedSkill(item, desired, marketplace)) : items.filter(item => item.client_state !== 'not_installed'), [dashboardEnabled, desired, items, marketplace]);
 	const systemSkillCount = useMemo(() => {
 	  const ids = new Set((desired?.items || []).filter(item => item.asset_kind === 'skill' && isManagedPolicy(item)).map(item => item.asset_key));
 	  items.filter(item => item.record.manifest.scope === 'builtin').forEach(item => ids.add(item.record.manifest.id));
@@ -81,7 +91,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
 	const visibleMarket = marketplaceItems;
 
   useEffect(() => {
-    if (view !== 'marketplace') return;
+    if (!dashboardEnabled || view !== 'marketplace') return;
     let active = true;
     const timer = window.setTimeout(async () => {
       setMarketplaceLoading(true);
@@ -107,7 +117,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
       }
     }, 180);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [categoryFilter, marketplace, onQueryMarketplace, query, view]);
+  }, [categoryFilter, dashboardEnabled, marketplace, onQueryMarketplace, query, view]);
 
   async function loadMoreMarketplace() {
     if (marketplaceLoading || marketplaceItems.length >= marketplaceTotal) return;
@@ -134,6 +144,9 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
 
   useEffect(() => { setDetailOpen(false); }, [view]);
   useEffect(() => { try { window.localStorage.setItem('himind-agent.skills-view', view); } catch { /* storage is optional */ } }, [view]);
+  useEffect(() => {
+    if (!dashboardEnabled && view !== 'installed') setView('installed');
+  }, [dashboardEnabled, view]);
 
   const filteredItems = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -165,6 +178,8 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
         title="技能"
         description="安装和管理 AI 技能"
         actions={<>
+          <button className="btn" title="从 GitHub 导入 Skill" onClick={() => { setGithubError(''); setGithubOpen(true); }}><Link2 size={15} />GitHub 导入</button>
+          <button className="btn" title="导入本地 Skill" onClick={onImportLocal}><FolderOpen size={15} />导入本地 Skill</button>
           {view === 'installed' ? <button className="btn btn-primary" onClick={onSyncAll} disabled={isBusy || !items.length}><RefreshCw className={busyAction === 'sync-all' ? 'spin' : ''} size={16} />{busyAction === 'sync-all' ? '正在更新' : '更新全部'}</button> : null}
           {view === 'installed' ? <button className="btn btn-icon" title="打开技能目录" aria-label="打开技能目录" onClick={() => status?.target_root && onOpenDirectory(status.target_root)} disabled={!status?.target_root}><FolderOpen size={16} /></button> : null}
           <button className="btn btn-icon" title="刷新状态" aria-label="刷新状态" onClick={onRefresh} disabled={isBusy}><RefreshCw size={16} /></button>
@@ -176,19 +191,19 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
       {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>技能状态读取失败</strong><span>{error}</span></div></div> : null}
 
       {status?.target_mode === 'preview' && view !== 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>未找到 AI 工具的技能目录，当前安装仅在 HiMind Agent 中可用。</span></div> : null}
-	  {marketplaceError && view === 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{marketplaceError}</span></div> : null}
+	  {dashboardEnabled && marketplaceError && view === 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{marketplaceError}</span></div> : null}
 	  <div className="plugin-toolbar skill-view-toolbar"><div className="plugin-tabs" role="tablist" aria-label="技能视图">
-	    <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button>
+	    {dashboardEnabled ? <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button> : null}
 	    <button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{installedCount}</span></button>
-	    <button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>受管理 <span>{systemSkillCount}</span></button>
+	    {dashboardEnabled ? <button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>受管理 <span>{systemSkillCount}</span></button> : null}
 	  </div><div className="skill-sync-compact"><span>安装方式</span><div className="segmented-control" role="group" aria-label="技能安装方式"><button type="button" title="复制文件" aria-label="复制文件" aria-pressed={syncMode === 'copy'} className={syncMode === 'copy' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('copy')}><Files size={13} />复制</button><button type="button" title="软链接" aria-label="软链接" aria-pressed={syncMode === 'symlink'} className={syncMode === 'symlink' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('symlink')}><Link2 size={13} />链接</button></div></div></div>
 
-      {view === 'system' ? <ManagedCapabilitiesPanel assetKind="skill" desired={desired} loading={desiredLoading} error={desiredError} registry={pluginRegistry} skillStatus={status} /> : <section className={`skill-workspace ${view === 'marketplace' ? 'skill-marketplace-workspace' : ''} ${view === 'marketplace' && !visibleMarket.length ? 'catalog-empty-workspace' : ''} compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
+      {dashboardEnabled && view === 'system' ? <ManagedCapabilitiesPanel assetKind="skill" desired={desired} loading={desiredLoading} error={desiredError} registry={pluginRegistry} skillStatus={status} /> : <section className={`skill-workspace ${view === 'marketplace' ? 'skill-marketplace-workspace' : ''} ${view === 'marketplace' && !visibleMarket.length ? 'catalog-empty-workspace' : ''} compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
         <aside className="skill-browser">
           <div className="skill-browser-tools">
             <label className="skill-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索技能" /></label>
           </div>
-          {view === 'marketplace' ? <div className="market-category-block skill-marketplace-category"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">技能功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部技能（{marketplace.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="技能功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部技能<span>{marketplace.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div> : null}
+		  {dashboardEnabled && view === 'marketplace' ? <div className="market-category-block skill-marketplace-category"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">技能功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部技能（{marketplace.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="技能功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部技能<span>{marketplace.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div> : null}
           {view === 'marketplace' ? <div className="plugin-catalog-result"><span>{marketplaceTotal} 个结果</span>{marketplaceLoading ? <span className="spinner" /> : null}</div> : null}
           <div className="skill-browser-list">
 			{view === 'marketplace' ? visibleMarket.map(item => <MarketSkillListItem key={item.skill_id} item={item} installed={installedById.get(item.skill_id)} selected={item.skill_id === selectedMarket?.skill_id} onSelect={id => { setSelectedId(id); setDetailOpen(true); }} />) : filteredItems.map(item => <SkillListItem key={item.record.manifest.id} item={item} selected={item.record.manifest.id === selected?.record.manifest.id} onSelect={id => { setSelectedId(id); setDetailOpen(true); }} />)}
@@ -210,6 +225,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
         <div className="skill-dialog-actions"><button className="btn" onClick={() => setPendingUninstall(null)}>取消</button><button className="btn btn-danger" disabled={isBusy || pendingUninstall.modified_files.length > 0} onClick={() => { onUninstall(pendingUninstall.record.manifest.id); setPendingUninstall(null); }}><Trash2 size={15} />确认卸载</button></div>
       </div></div> : null}
 	  {installPlan || planError ? <InstallPlanDialog plan={installPlan} error={planError} currentVersion={installPlan ? installedById.get(installPlan.skill.skill_id)?.record.manifest.version : undefined} busy={isBusy} onClose={() => { setInstallPlan(null); setPlanError(''); }} onInstall={(optionalIds) => { if (installPlan) onInstallMarketplace(installPlan.skill.skill_id, installPlan.skill.version, optionalIds); setInstallPlan(null); }} /> : null}
+	  {githubOpen ? <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="github-skill-title"><div className="modal-header"><div><h3 id="github-skill-title">从 GitHub 导入 Skill</h3><p>仅下载固定 ref 的仓库内容，并校验 Skill Manifest、声明文件和 checksums。</p></div><button className="btn btn-icon" aria-label="关闭" title="关闭" onClick={() => setGithubOpen(false)}><X size={16} /></button></div><div className="modal-body"><div className="field-group"><label className="field-label" htmlFor="github-skill-repository">仓库</label><input id="github-skill-repository" value={githubRepository} onChange={event => setGithubRepository(event.target.value)} placeholder="owner/repo" /></div><div className="field-group"><label className="field-label" htmlFor="github-skill-reference">Tag / Commit</label><input id="github-skill-reference" value={githubReference} onChange={event => setGithubReference(event.target.value)} placeholder="main 或 v1.0.0" /></div><div className="field-group"><label className="field-label" htmlFor="github-skill-subpath">子目录（可选）</label><input id="github-skill-subpath" value={githubSubpath} onChange={event => setGithubSubpath(event.target.value)} placeholder="skills/example" /></div>{githubError ? <div className="inline-feedback visible" role="status">{githubError}</div> : null}<div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={() => setGithubOpen(false)}>取消</button><button className="btn btn-primary" disabled={githubBusy || !githubRepository.trim() || !githubReference.trim()} onClick={async () => { setGithubBusy(true); setGithubError(''); try { await onImportGithub(githubRepository.trim(), githubReference.trim(), githubSubpath.trim()); setGithubOpen(false); } catch (error) { setGithubError(error instanceof Error ? error.message : 'GitHub Skill 导入失败'); } finally { setGithubBusy(false); } }}>{githubBusy ? '导入中...' : '导入 Skill'}</button></div></div></div></div></div> : null}
     </div>
   );
 }

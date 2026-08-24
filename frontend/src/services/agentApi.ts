@@ -8,10 +8,26 @@ export type AgentStatus = {
     dashboard_agent_id?: string;
     local_port?: number;
     mode?: string;
+    effective_mode?: string;
+    pending_mode?: string;
+    requires_restart?: boolean;
+    dashboard_enabled?: boolean;
+    control_plane?: {
+        kind: 'none' | 'dashboard' | string;
+        enabled: boolean;
+    };
     login_account?: string;
     login_label?: string;
     profile?: string;
     current_task?: CurrentTaskStatus | null;
+};
+
+export type AgentModeSettings = {
+    mode: 'connected' | 'independent' | string;
+    effective_mode: 'connected' | 'independent' | string;
+    pending_mode: 'connected' | 'independent' | string;
+    dashboard_enabled: boolean;
+    requires_restart: boolean;
 };
 
 export type CurrentTaskStatus = {
@@ -424,6 +440,7 @@ export type CapabilityItem = {
     source?: string;
     risk_level?: string;
     description?: string;
+    availability?: 'local' | 'network_service' | 'control_plane' | string;
 };
 
 export type SkillScope = 'builtin' | 'organization' | 'user';
@@ -878,6 +895,8 @@ export function invoke<T>(command: string, args?: Record<string, unknown>): Prom
 
 export const agentApi = {
     status: () => invoke<AgentStatus>('get_agent_status'),
+    agentMode: () => invoke<AgentModeSettings>('get_agent_mode'),
+    setAgentMode: (mode: AgentModeSettings['mode']) => invoke<AgentModeSettings>('set_agent_mode', { mode }),
     taskHistory: (limit = 50) => invoke<AgentTaskHistoryItem[]>('get_agent_task_history', { limit }),
     updateStatus: () => invoke<AgentUpdateStatus>('get_agent_update_status'),
     checkUpdate: () => invoke<AgentUpdateStatus>('check_agent_update'),
@@ -920,6 +939,8 @@ export const agentApi = {
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),
     plugins: () => invoke<PluginRegistry>('get_plugin_registry'),
+    importLocalPlugin: () => invoke<PluginRegistry>('import_local_plugin'),
+    importGithubPlugin: (repository: string, reference: string, subpath = '') => invoke<PluginRegistry>('import_github_plugin', { repository, reference, subpath }),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
     queryPluginCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<PluginCatalogItem>>('query_plugin_catalog', { q, category, page, pageSize }),
@@ -947,6 +968,8 @@ export const agentApi = {
     pluginVersions: (pluginId: string) => invoke<PluginCatalogItem[]>('get_plugin_versions', { pluginId }),
     planPluginInstall: (pluginId: string, version?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version }),
     skillCatalog: () => invoke<SkillCatalogResponse>('get_skill_catalog'),
+    importLocalSkill: () => invoke<SkillRecord>('import_local_skill'),
+    importGithubSkill: (repository: string, reference: string, subpath = '') => invoke<SkillRecord>('import_github_skill', { repository, reference, subpath }),
     organizationSkillCatalog: () => invoke<OrganizationSkillCatalogItem[]>('get_organization_skill_catalog'),
     queryOrganizationSkillCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<OrganizationSkillCatalogItem>>('query_organization_skill_catalog', { q, category, page, pageSize }),
     skillVersions: (skillId: string) => invoke<OrganizationSkillCatalogItem[]>('get_skill_versions', { skillId }),

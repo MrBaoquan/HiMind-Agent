@@ -13,7 +13,9 @@ cargo build --release
 .\target\release\himind-agent.exe --local-app --local-port 18181
 ```
 
-该模式会启动系统托盘图标和 `http://127.0.0.1:18181` 本地服务，并同时启动 Dashboard worker 轮询。Dashboard Web 通过该服务调用 Windows 原生文件夹选择、打开所在文件夹、唤起远控客户端和后续内网登录状态反馈；任务领取、扫描和打包由同一个托盘进程中的 worker 完成。
+该模式会启动系统托盘图标和 `http://127.0.0.1:18181` 本地服务。默认 `Connected` 模式会额外启动 Dashboard Worker；如需把 Agent 作为独立 AI Harness 使用，可在设置面板选择 `Independent`，重启后保留本机 AI、技能、插件、MCP、工程和远程设备能力，不启动组织控制面 Worker。两种模式共享同一套 Agent 协议、Capability Gateway 和本机实现。
+
+运行模式持久化在 Agent 状态目录旁的 `agent-preferences.json`，模式切换必须重启进程，避免同一进程内出现服务边界不一致。Independent 不是离线模式，仍可访问 GitHub、第三方 AI Provider 和原生 DSH 网络服务；组织调度、策略、审计、组织商城和 Dashboard AI 服务属于 Connected 模式的可选控制面能力。
 
 本地服务当前接口：
 
@@ -28,14 +30,14 @@ cargo build --release
 9. `POST /logout`：清除本机 Agent 已保存的内网登录。
 10. `GET /open-login`：打开内网页面，供用户手工查看或确认登录状态。
 11. `GET /capabilities`：返回 Capability Gateway 已注册的内置能力描述、风险等级和参数 Schema。
-12. `POST /capabilities/invoke`：通过 Capability Gateway 调用受控能力，当前已接入健康状态、登录状态、打开文件夹、插件列表、插件 Manifest 查询和已声明插件能力调用。
+12. `POST /capabilities/invoke`：通过 Capability Gateway 调用受控能力，当前已接入健康状态、登录状态、打开文件夹、工程状态/打开工程、远程连接、插件列表、插件 Manifest 查询和已声明插件能力调用。能力描述包含 `availability`：`local`、`network_service` 或 `control_plane`；Independent 会隐藏并拒绝最后一类能力。
 13. `GET /plugins`：扫描 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/` 并返回本机插件 Registry 状态。
 14. `GET /plugins/manifest?plugin_id=`：返回指定插件的 Manifest、能力和权限摘要。
 15. `POST /plugins/install|update|uninstall|enable|disable`：已预留本地接口，当前在 Distribution 策略与制品校验接入前返回 `not_implemented`。
 16. `GET /ai-provider-import/status`：读取 VS Code、CC Switch 和 WorkBuddy 的 HiMind AI 导入状态。
 17. `POST /ai-provider-import/cancel`：取消指定客户端的 HiMind AI 导入；WorkBuddy 和 CC Switch 会在变更前创建备份，VS Code 由官方扩展清除 SecretStorage 凭据。
 
-Agent 主窗口已提供“本机插件”页：左侧选择当前设备已安装插件，右侧查看该插件的本机状态、错误、功能页面、权限和已注册能力，并可打开独立插件窗口、创建桌面快捷方式或打开插件目录；页面通过 Tauri 命令直接读取本机注册表和 Gateway，避免主窗口 WebView 再 fetch 自身 `127.0.0.1` 服务。安装、升级、启停、卸载、回滚和版本策略统一由 Dashboard 组织控制面负责，不在 Agent 主窗口重复提供占位入口。
+Agent 主窗口已提供“本机插件”页：左侧选择当前设备已安装插件，右侧查看该插件的本机状态、错误、功能页面、权限和已注册能力，并可打开独立插件窗口、创建桌面快捷方式或打开插件目录；页面通过 Tauri 命令直接读取本机注册表和 Gateway，避免主窗口 WebView 再 fetch 自身 `127.0.0.1` 服务。插件和 Skill 可从本地包或固定 GitHub ref 导入，Independent 不依赖组织商城；组织安装策略、审批、分发和审核仍由 Connected 模式的控制面负责。
 
 Agent 主窗口前端采用 React + TypeScript + Vite：`frontend/src/` 按 Shell、通用组件、页面和服务层组织，生产构建输出到 `frontend/dist` 并由 Tauri 打包。界面使用 Lucide 标准图标和适配 `900 × 640` 默认窗口的紧凑桌面控制台布局；低于 `740px` 时侧栏收为图标栏，本机插件页采用列表/详情主从布局，日志在自身容器内滚动。
 

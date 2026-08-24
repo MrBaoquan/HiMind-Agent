@@ -41,6 +41,7 @@ impl BuiltinAiModelSync {
         options: &Options,
         proxy: &BuiltinAiProxyControl,
     ) -> Result<BuiltinAiModelSyncResult, String> {
+        require_dashboard_model_sync(options)?;
         let previous = self
             .snapshot
             .lock()
@@ -75,6 +76,14 @@ impl BuiltinAiModelSync {
             restarted: false,
             session_url: String::new(),
         })
+    }
+}
+
+fn require_dashboard_model_sync(options: &Options) -> Result<(), String> {
+    if options.mode().dashboard_enabled() {
+        Ok(())
+    } else {
+        Err(crate::app::runtime_mode::control_plane_required_error())
     }
 }
 
@@ -134,7 +143,9 @@ fn fingerprint(values: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::managed_models;
+    use super::{managed_models, require_dashboard_model_sync};
+    use crate::app::runtime_mode::AgentMode;
+    use crate::Options;
 
     #[test]
     fn managed_models_keeps_default_first_and_removes_duplicates() {
@@ -145,5 +156,13 @@ mod tests {
             ),
             vec!["primary", "fast"]
         );
+    }
+
+    #[test]
+    fn model_sync_rejects_independent_mode_before_remote_access() {
+        let mut options = Options::from_env();
+        options.effective_mode = AgentMode::Independent;
+        let error = require_dashboard_model_sync(&options).unwrap_err();
+        assert!(error.contains("control_plane_required"));
     }
 }

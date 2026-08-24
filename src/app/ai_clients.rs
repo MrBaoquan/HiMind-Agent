@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
+use crate::runtime::process::configure_hidden_process;
 use crate::Options;
 
 const SERVER_ID: &str = "himind-agent";
@@ -160,13 +161,15 @@ pub(crate) fn test_connection(
 ) -> Result<McpConnectionTestResult, Box<dyn Error>> {
     let started = Instant::now();
     let executable = stable_launcher_executable()?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(mcp_arguments(options))
         .env("HIMIND_AI_CLIENT_ID", "agent-self-test")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    configure_hidden_process(&mut command);
+    let mut child = command.spawn()?;
     {
         let stdin = child
             .stdin
@@ -731,13 +734,14 @@ fn executable_responds(name: &str, arguments: &[&str]) -> bool {
     let Some(executable) = find_executable(name) else {
         return false;
     };
-    let Ok(mut child) = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    else {
+        .stderr(Stdio::piped());
+    configure_hidden_process(&mut command);
+    let Ok(mut child) = command.spawn() else {
         return false;
     };
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -828,20 +832,49 @@ fn workbuddy_start_menu_link_exists() -> bool {
 
 #[cfg(target_os = "windows")]
 fn workbuddy_registry_entry_exists() -> bool {
+    use winreg::enums::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    };
+    use winreg::RegKey;
+
     [
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-        r"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        (
+            RegKey::predef(HKEY_CURRENT_USER),
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
     ]
     .iter()
-    .any(|path| {
-        Command::new("reg.exe")
-            .args(["query", path, "/s", "/f", "WorkBuddy"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+    .any(|(root, path)| {
+        [KEY_WOW64_64KEY, KEY_WOW64_32KEY].iter().any(|view| {
+            let Ok(uninstall) = root.open_subkey_with_flags(path, KEY_READ | *view) else {
+                return false;
+            };
+            uninstall.enum_keys().flatten().any(|child_name| {
+                let Ok(child) = uninstall.open_subkey_with_flags(&child_name, KEY_READ | *view)
+                else {
+                    return false;
+                };
+                let mut values = vec![child_name];
+                for value_name in [
+                    "DisplayName",
+                    "Publisher",
+                    "InstallLocation",
+                    "DisplayIcon",
+                    "UninstallString",
+                ] {
+                    if let Ok(value) = child.get_value::<String, _>(value_name) {
+                        values.push(value);
+                    }
+                }
+                values
+                    .iter()
+                    .any(|value| value.to_ascii_lowercase().contains("workbuddy"))
+            })
+        })
     })
 }
 

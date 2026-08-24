@@ -7,6 +7,7 @@ type ExtensionTab = 'mcp' | 'plugins' | 'skills';
 
 type Props = {
   open: boolean;
+  dashboardEnabled: boolean;
   toolSummary: BuiltinAIToolContextSummary;
   onClose: () => void;
   onRuntimeChanged: () => void;
@@ -31,7 +32,7 @@ const emptyServer = (): BuiltinAIMcpServer => ({
   enabled: true,
 });
 
-export function BuiltinAiExtensionsDialog({ open, toolSummary, onClose, onRuntimeChanged, onToolContextChanged, onOpenPlugins, onOpenSkills }: Props) {
+export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary, onClose, onRuntimeChanged, onToolContextChanged, onOpenPlugins, onOpenSkills }: Props) {
   const [tab, setTab] = useState<ExtensionTab>('mcp');
   const [servers, setServers] = useState<BuiltinAIMcpServer[]>([]);
   const [draft, setDraft] = useState<BuiltinAIMcpServer | null>(null);
@@ -204,8 +205,8 @@ export function BuiltinAiExtensionsDialog({ open, toolSummary, onClose, onRuntim
           </div>
         ) : null}
 
-        {tab === 'plugins' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Puzzle size={22} /></span><div><h4>AI 对话插件</h4><p>内置对话插件可在会话左下角的“设置”中配置，插件清单会随 HiMind AI 运行时更新。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />保留原生插件设置</span><span><Check size={14} />个人扩展不受组织清单限制</span></div></div><div className="builtin-ai-extension-action"><strong>Agent 插件</strong><span>安装、停用或卸载本机能力插件</span><button type="button" className="btn" onClick={onOpenPlugins}><Puzzle size={15} />管理 Agent 插件</button></div></div> : null}
-        {tab === 'skills' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Bot size={22} /></span><div><h4>技能</h4><p>HiMind AI 会使用本机已安装的技能，也支持当前工作区提供的技能。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />已安装 {toolSummary.skills} 项</span><span><Check size={14} />组织能力在调用时校验权限</span></div></div><div className="builtin-ai-extension-action"><strong>技能管理</strong><span>浏览、安装或更新技能</span><button type="button" className="btn" onClick={onOpenSkills}><Wrench size={15} />打开技能</button></div></div> : null}
+        {tab === 'plugins' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Puzzle size={22} /></span><div><h4>AI 对话插件</h4><p>内置对话插件可在会话左下角的“设置”中配置，插件清单会随 HiMind AI 运行时更新。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />保留原生插件设置</span>{dashboardEnabled ? <span><Check size={14} />个人扩展不受组织清单限制</span> : <span><Check size={14} />本机插件独立运行</span>}</div></div><div className="builtin-ai-extension-action"><strong>Agent 插件</strong><span>安装、停用或卸载本机能力插件</span><button type="button" className="btn" onClick={onOpenPlugins}><Puzzle size={15} />管理 Agent 插件</button></div></div> : null}
+        {tab === 'skills' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Bot size={22} /></span><div><h4>技能</h4><p>HiMind AI 会使用本机已安装的技能，也支持当前工作区提供的技能。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />已安装 {toolSummary.skills} 项</span><span><Check size={14} />{dashboardEnabled ? '组织能力在调用时校验权限' : '本机技能可直接使用'}</span></div></div><div className="builtin-ai-extension-action"><strong>技能管理</strong><span>浏览、安装或更新技能</span><button type="button" className="btn" onClick={onOpenSkills}><Wrench size={15} />打开技能</button></div></div> : null}
 
         {error ? <div className="builtin-ai-extension-feedback error" role="alert"><CircleAlert size={15} /><span>{error}</span><button type="button" title="重新读取" aria-label="重新读取" onClick={() => void loadServers()}><RefreshCw size={14} /></button></div> : null}
         {notice ? <div className="builtin-ai-extension-feedback success" role="status"><Check size={15} /><span>{notice}</span></div> : null}

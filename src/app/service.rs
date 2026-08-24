@@ -16,7 +16,7 @@ use raw_window_handle::{
 #[cfg(windows)]
 use std::num::NonZeroIsize;
 
-use crate::api::client::verify_local_agent_ticket;
+use crate::api::client::{verify_local_agent_ticket, LocalAgentTicketPrincipal};
 use crate::app::ai_provider_import::{
     cancel as cancel_ai_provider_import, consume_vscode_enrollment, import as import_ai_provider,
     reconcile_vscode_import, status as ai_provider_import_status, AIProviderImportRequest,
@@ -26,16 +26,13 @@ use crate::app::http::{
 };
 use crate::app::security::LocalRequestSecurity;
 use crate::app::status::local_worker_snapshot;
-use crate::app::system::{
-    capture_browser_page_text, inspect_project_workspace, launch_project_workspace,
-    launch_remote_connection, open_url,
-};
+use crate::app::system::{capture_browser_page_text, open_url};
 use crate::app::types::{
     AgentEnrollmentRequest, BrowserTextCaptureRequest, EngineeringSyncRequest, LocalLoginRequest,
     ProjectWorkspaceRequest, RemoteClientConfigureRequest, RemoteConnectRequest,
 };
 use crate::capability::service::CapabilityGateway;
-use crate::capability::types::{CapabilityInvokeRequest, InvocationContext};
+use crate::capability::types::{CapabilityInvokeRequest, InvocationContext, InvocationSource};
 use crate::remote::client::inner_admin_base;
 use crate::remote::sync::{fetch_engineering_projects, fetch_selected_engineering_exhibits};
 use crate::store::credentials::{
@@ -84,7 +81,11 @@ pub(crate) fn run_local_app(options: Options) -> Result<(), Box<dyn Error>> {
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
         dashboard_agent_id: String::new(),
-        dashboard_worker_error: "正在连接 Dashboard 任务 Worker".to_string(),
+        dashboard_worker_error: if options.mode().dashboard_enabled() {
+            "正在连接 Dashboard 任务 Worker".to_string()
+        } else {
+            String::new()
+        },
         local_service_online: false,
         local_service_error: String::new(),
         distribution_update_available: false,
@@ -116,14 +117,16 @@ pub(crate) fn start_background_services(
     // A VS Code update replaces its versioned product.json. Repair an existing
     // HiMind enrollment before serving the Dashboard so ordinary Agent startup
     // restores the persistent provider allowlist automatically.
-    reconcile_vscode_import(options);
-    let reconcile_options = options.clone();
-    let _ = thread::Builder::new()
-        .name("himind-vscode-reconcile-loop".to_string())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            reconcile_vscode_import(&reconcile_options);
-        });
+    if options.mode().dashboard_enabled() {
+        reconcile_vscode_import(options);
+        let reconcile_options = options.clone();
+        let _ = thread::Builder::new()
+            .name("himind-vscode-reconcile-loop".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                reconcile_vscode_import(&reconcile_options);
+            });
+    }
     let listener = match TcpListener::bind(("127.0.0.1", options.local_port)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -139,12 +142,17 @@ pub(crate) fn start_background_services(
         state.local_service_error.clear();
     }
 
-    let worker_opts = options.clone();
-    let ws = Arc::clone(&worker_status);
-    let mgr = approval_mgr.clone();
-    thread::spawn(move || {
-        worker::run_supervisor(worker_opts, ws, mgr);
-    });
+    if options.mode().dashboard_enabled() {
+        let worker_opts = options.clone();
+        let ws = Arc::clone(&worker_status);
+        let mgr = approval_mgr.clone();
+        thread::spawn(move || {
+            worker::run_supervisor(worker_opts, ws, mgr);
+        });
+    } else if let Ok(mut state) = worker_status.lock() {
+        state.dashboard_worker_online = false;
+        state.dashboard_worker_error.clear();
+    }
 
     let http_ws = Arc::clone(&worker_status);
     let http_opts = options.clone();
@@ -226,54 +234,71 @@ fn handle_local_http(
     }
     let mut local_principal = None;
     if let Some(operation) = local_operation(method, &path) {
-        let ticket = crate::app::security::header_value(&request, "x-himind-local-ticket")
-            .unwrap_or_default();
-        if ticket.is_empty() {
-            return write_local_response(
-                &mut stream,
-                401,
-                &json!({ "error": "local Agent ticket is required" }).to_string(),
-                "application/json",
-            );
-        }
-        let snapshot = local_worker_snapshot(&worker_status);
-        let agent_id = snapshot
-            .get("dashboard_agent_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if agent_id.is_empty() || options.agent_credential().is_empty() {
-            return write_local_response(
-                &mut stream,
-                503,
-                &json!({ "error": "Dashboard Agent is not authenticated" }).to_string(),
-                "application/json",
-            );
-        }
-        match verify_local_agent_ticket(
-            &Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()?,
-            &options.api_base,
-            agent_id,
-            ticket,
-            operation,
-            &options.agent_credential(),
-        ) {
-            Ok(principal) => local_principal = Some(principal),
-            Err(error) => {
+        if !options.mode().dashboard_enabled() {
+            local_principal = Some(LocalAgentTicketPrincipal {
+                user_id: "local-user".to_string(),
+                session_id_hash: "independent-mode".to_string(),
+                agent_id: "local".to_string(),
+                capability: operation.to_string(),
+            });
+        } else {
+            let ticket = crate::app::security::header_value(&request, "x-himind-local-ticket")
+                .unwrap_or_default();
+            if ticket.is_empty() {
                 return write_local_response(
                     &mut stream,
-                    403,
-                    &json!({ "error": format!("local Agent ticket rejected: {error}") })
-                        .to_string(),
+                    401,
+                    &json!({ "error": "local Agent ticket is required" }).to_string(),
                     "application/json",
                 );
+            }
+            let snapshot = local_worker_snapshot(&worker_status);
+            let agent_id = snapshot
+                .get("dashboard_agent_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if agent_id.is_empty() || options.agent_credential().is_empty() {
+                return write_local_response(
+                    &mut stream,
+                    503,
+                    &json!({ "error": "Dashboard Agent is not authenticated" }).to_string(),
+                    "application/json",
+                );
+            }
+            match verify_local_agent_ticket(
+                &Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()?,
+                &options.api_base,
+                agent_id,
+                ticket,
+                operation,
+                &options.agent_credential(),
+            ) {
+                Ok(principal) => local_principal = Some(principal),
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        403,
+                        &json!({ "error": format!("local Agent ticket rejected: {error}") })
+                            .to_string(),
+                        "application/json",
+                    );
+                }
             }
         }
     }
     let gateway = CapabilityGateway::new(options.clone(), Arc::clone(&worker_status));
     match (method, path.as_str()) {
         ("POST", "/enroll") => {
+            if !options.mode().dashboard_enabled() {
+                return write_local_response(
+                    &mut stream,
+                    400,
+                    &crate::app::runtime_mode::control_plane_required_error(),
+                    "application/json",
+                );
+            }
             let payload: AgentEnrollmentRequest = match serde_json::from_str(body) {
                 Ok(value) => value,
                 Err(error) => {
@@ -349,6 +374,14 @@ fn handle_local_http(
             }
         }
         ("POST", "/vscode/enrollment/exchange") => {
+            if !options.mode().dashboard_enabled() {
+                return write_local_response(
+                    &mut stream,
+                    400,
+                    &crate::app::runtime_mode::control_plane_required_error(),
+                    "application/json",
+                );
+            }
             #[derive(serde::Deserialize)]
             struct ExchangeRequest {
                 code: String,
@@ -392,47 +425,55 @@ fn handle_local_http(
                     )
                 }
             };
-            if payload.ticket.trim().is_empty() {
-                return write_local_response(
-                    &mut stream,
-                    401,
-                    &json!({ "error": "local Agent ticket is required" }).to_string(),
-                    "application/json",
-                );
-            }
-            let snapshot = local_worker_snapshot(&worker_status);
-            let agent_id = snapshot
-                .get("dashboard_agent_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            if agent_id.is_empty() || options.agent_credential().is_empty() {
-                return write_local_response(
-                    &mut stream,
-                    503,
-                    &json!({ "error": "Dashboard Agent is not authenticated" }).to_string(),
-                    "application/json",
-                );
-            }
-            let principal = match verify_local_agent_ticket(
-                &Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
-                &options.api_base,
-                agent_id,
-                &payload.ticket,
-                &payload.capability_id,
-                &options.agent_credential(),
-            ) {
-                Ok(principal) => principal,
-                Err(error) => {
+            let invocation = if !options.mode().dashboard_enabled() {
+                InvocationContext::new(
+                    crate::capability::types::InvocationSource::LocalHttp,
+                    "local-user",
+                )
+            } else {
+                if payload.ticket.trim().is_empty() {
                     return write_local_response(
                         &mut stream,
-                        403,
-                        &json!({ "error": format!("local Agent ticket rejected: {error}") }).to_string(),
+                        401,
+                        &json!({ "error": "local Agent ticket is required" }).to_string(),
                         "application/json",
-                    )
+                    );
                 }
+                let snapshot = local_worker_snapshot(&worker_status);
+                let agent_id = snapshot
+                    .get("dashboard_agent_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if agent_id.is_empty() || options.agent_credential().is_empty() {
+                    return write_local_response(
+                        &mut stream,
+                        503,
+                        &json!({ "error": "Dashboard Agent is not authenticated" }).to_string(),
+                        "application/json",
+                    );
+                }
+                let principal = match verify_local_agent_ticket(
+                    &Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
+                    &options.api_base,
+                    agent_id,
+                    &payload.ticket,
+                    &payload.capability_id,
+                    &options.agent_credential(),
+                ) {
+                    Ok(principal) => principal,
+                    Err(error) => {
+                        return write_local_response(
+                            &mut stream,
+                            403,
+                            &json!({ "error": format!("local Agent ticket rejected: {error}") }).to_string(),
+                            "application/json",
+                        )
+                    }
+                };
+                InvocationContext::dashboard_user(&principal.user_id, &principal.session_id_hash)
             };
             match gateway.invoke(
-                &InvocationContext::dashboard_user(&principal.user_id, &principal.session_id_hash),
+                &invocation,
                 &payload.capability_id,
                 payload.input,
             ) {
@@ -718,7 +759,11 @@ fn handle_local_http(
                 Ok(value) => value,
                 Err(error) => return write_local_response(&mut stream, 400, &json!({ "error": format!("invalid workspace payload: {error}") }).to_string(), "application/json"),
             };
-            match inspect_project_workspace(&payload.path, payload.engine_type.as_deref(), payload.engine_version.as_deref()) {
+            match gateway.invoke(
+                &local_http_invocation_context(local_principal.as_ref()),
+                "exhibit.workspace.status.local",
+                serde_json::to_value(payload)?,
+            ) {
                 Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
                 Err(error) => write_local_response(&mut stream, 400, &json!({ "error": error.to_string() }).to_string(), "application/json"),
             }
@@ -728,7 +773,11 @@ fn handle_local_http(
                 Ok(value) => value,
                 Err(error) => return write_local_response(&mut stream, 400, &json!({ "error": format!("invalid workspace payload: {error}") }).to_string(), "application/json"),
             };
-            match launch_project_workspace(&payload.path, payload.engine_type.as_deref(), payload.engine_version.as_deref()) {
+            match gateway.invoke(
+                &local_http_invocation_context(local_principal.as_ref()),
+                "workspace.open.local",
+                serde_json::to_value(payload)?,
+            ) {
                 Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
                 Err(error) => write_local_response(&mut stream, 400, &json!({ "error": error.to_string() }).to_string(), "application/json"),
             }
@@ -746,7 +795,11 @@ fn handle_local_http(
                     )
                 }
             };
-            match launch_remote_connection(&payload, &options.state_path) {
+            match gateway.invoke(
+                &local_http_invocation_context(local_principal.as_ref()),
+                "remote.connect",
+                serde_json::to_value(payload)?,
+            ) {
                 Ok(value) => {
                     write_local_response(&mut stream, 200, &value.to_string(), "application/json")
                 }
@@ -803,6 +856,14 @@ fn handle_local_http(
             }
         }
         ("POST", "/ai-provider-import") => {
+            if !options.mode().dashboard_enabled() {
+                return write_local_response(
+                    &mut stream,
+                    400,
+                    &crate::app::runtime_mode::control_plane_required_error(),
+                    "application/json",
+                );
+            }
             let payload: AIProviderImportRequest = match serde_json::from_str(body) {
                 Ok(value) => value,
                 Err(error) => {
@@ -1501,9 +1562,9 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
             | "/plugins/disable",
         ) => Some("local.plugin.manage"),
         ("GET" | "POST", "/open-folder") => Some("local.file.open_folder"),
-        ("POST", "/workspace-status") => Some("local.workspace.inspect"),
-        ("POST", "/open-project") => Some("local.workspace.open"),
-        ("POST", "/remote-connect") => Some("local.remote.connect"),
+        ("POST", "/workspace-status") => Some("exhibit.workspace.status.local"),
+        ("POST", "/open-project") => Some("workspace.open.local"),
+        ("POST", "/remote-connect") => Some("remote.connect"),
         ("GET", "/remote-clients") => Some("local.remote.clients.read"),
         ("POST", "/remote-clients/detect") => Some("local.remote.clients.detect"),
         ("POST", "/remote-clients/configure") => Some("local.remote.clients.configure"),
@@ -1518,6 +1579,22 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
         ("POST", "/login") => Some("local.inner_admin.login"),
         ("POST", "/logout") => Some("local.inner_admin.logout"),
         _ => None,
+    }
+}
+
+fn local_http_invocation_context(
+    principal: Option<&LocalAgentTicketPrincipal>,
+) -> InvocationContext {
+    match principal {
+        Some(principal) => {
+            let mut context = InvocationContext::new(
+                InvocationSource::LocalHttp,
+                format!("dashboard-user:{}", principal.user_id.trim()),
+            );
+            context.session_id_hash = principal.session_id_hash.clone();
+            context
+        }
+        None => InvocationContext::local_http(),
     }
 }
 
@@ -1552,7 +1629,7 @@ mod local_operation_tests {
     fn maps_sensitive_local_routes_to_stable_operations() {
         assert_eq!(
             local_operation("POST", "/remote-connect"),
-            Some("local.remote.connect")
+            Some("remote.connect")
         );
         assert_eq!(
             local_operation("GET", "/remote-clients"),

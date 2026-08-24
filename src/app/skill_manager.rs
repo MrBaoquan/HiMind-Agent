@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 const MAX_SKILL_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SKILL_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SKILL_ARCHIVE_ENTRIES: usize = 20_000;
 
 pub(crate) type SkillPluginInstallAction = plugin_manager::PluginDependencyAction;
 
@@ -50,6 +52,78 @@ pub(crate) fn install(
     skill_id: &str,
 ) -> Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> {
     install_with_dependencies(options, agent_id, skill_id, None, &[])
+}
+
+/// Installs a local .hmskill archive or unpacked user-managed Skill package.
+pub(crate) fn install_local_package(path: &Path) -> Result<SkillRecord, Box<dyn Error>> {
+    install_local_package_from_source(path, "local")
+}
+
+pub(crate) fn install_local_package_from_source(
+    path: &Path,
+    source_kind: &str,
+) -> Result<SkillRecord, Box<dyn Error>> {
+    let source = path.canonicalize()?;
+    if !source.is_file() && !source.is_dir() {
+        return Err("本地 Skill 路径不存在".into());
+    }
+    let staging = env::temp_dir().join(format!("himind-local-skill-{}", unique_suffix()));
+    let package_root = if source.is_dir() {
+        source.clone()
+    } else {
+        if !source
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("hmskill"))
+        {
+            return Err("本地 Skill 文件必须是 .hmskill".into());
+        }
+        if fs::metadata(&source)?.len() > MAX_SKILL_ARCHIVE_BYTES {
+            return Err("本地 Skill 包超过 16 MiB 限制".into());
+        }
+        extract_archive(&source, &staging)?;
+        staging.clone()
+    };
+    let result = (|| {
+        validate_package_size(&package_root)?;
+        verify_checksums(&package_root)?;
+        verify_declared_contents(&package_root)?;
+        let manifest = validate_skill_package_root(&package_root)?;
+        let store = SkillStore::new();
+        match manifest.scope {
+            crate::skill::types::SkillScope::User => {
+                store.install_user_package(&package_root, &manifest.id, &manifest.version)
+            }
+            crate::skill::types::SkillScope::Organization => {
+                // Public GitHub packages may use the marketplace's
+                // organization scope. Imported copies are still local,
+                // user-managed assets and never receive Dashboard policy.
+                let record = store.install_organization_package(
+                    &package_root,
+                    &manifest.id,
+                    &manifest.version,
+                )?;
+                store.apply_management_policy(
+                    &manifest.id,
+                    &SkillManagementPolicy {
+                        management: "user_managed".to_string(),
+                        source: source_kind.trim().to_string(),
+                        assignment_id: String::new(),
+                        reason: "从 GitHub 导入".to_string(),
+                        allow_uninstall: true,
+                    },
+                )?;
+                Ok(record)
+            }
+            crate::skill::types::SkillScope::Builtin => {
+                Err("本地 Skill 不允许覆盖内置 Skill".into())
+            }
+        }
+    })();
+    if staging.exists() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    result
 }
 
 pub(crate) fn plan_install(
@@ -296,8 +370,18 @@ fn verify_signature(path: &Path, item: &SkillCatalogItem) -> Result<(), Box<dyn 
 pub(crate) fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(target)?;
     let mut archive = ZipArchive::new(File::open(archive_path)?)?;
+    if archive.len() > MAX_SKILL_ARCHIVE_ENTRIES {
+        return Err("Skill ZIP 文件数量超过 20000 个限制".into());
+    }
+    let mut extracted_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
+        extracted_bytes = extracted_bytes
+            .checked_add(entry.size())
+            .ok_or("Skill ZIP 解压大小溢出")?;
+        if extracted_bytes > MAX_SKILL_EXTRACTED_BYTES {
+            return Err("Skill ZIP 解压后超过 64 MiB 限制".into());
+        }
         let relative = entry
             .enclosed_name()
             .ok_or("Skill ZIP 包含非法路径")?
@@ -387,6 +471,28 @@ pub(crate) fn verify_declared_contents(root: &Path) -> Result<(), Box<dyn Error>
             .replace('\\', "/");
         if relative != "checksums.sha256" && !declared.contains(&relative) {
             return Err(format!("Skill 包含 Manifest 未声明的文件: {relative}").into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_package_size(root: &Path) -> Result<(), Box<dyn Error>> {
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        file_count += 1;
+        if file_count > MAX_SKILL_ARCHIVE_ENTRIES {
+            return Err("Skill 包文件数量超过 20000 个限制".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(entry.metadata()?.len())
+            .ok_or("Skill 包大小溢出")?;
+        if total_bytes > MAX_SKILL_EXTRACTED_BYTES {
+            return Err("Skill 包内容超过 64 MiB 限制".into());
         }
     }
     Ok(())

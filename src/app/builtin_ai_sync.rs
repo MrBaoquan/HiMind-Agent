@@ -36,6 +36,17 @@ impl BuiltinAiEventSync {
         options: Options,
         initial_capabilities: RuntimeCapabilities,
     ) -> (Self, EventObserver) {
+        if !options.mode().dashboard_enabled() {
+            let capabilities = Arc::new(Mutex::new(initial_capabilities));
+            return (
+                Self {
+                    shutdown: Arc::new(AtomicBool::new(true)),
+                    capabilities,
+                    worker: None,
+                },
+                Arc::new(|_| {}),
+            );
+        }
         let (sender, receiver) = mpsc::sync_channel::<BuiltinAIRuntimeEvent>(EVENT_QUEUE_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let capabilities = Arc::new(Mutex::new(initial_capabilities));
@@ -52,6 +63,9 @@ impl BuiltinAiEventSync {
             let mut last_heartbeat = Instant::now();
             let mut heartbeat_target: Option<RuntimeHeartbeatTarget> = None;
             while !worker_shutdown.load(Ordering::Acquire) {
+                if !options.mode().dashboard_enabled() {
+                    break;
+                }
                 match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(event) => {
                         if let Some(target) = upload_with_retry(
@@ -183,6 +197,12 @@ fn upload_event(
     capabilities: &Arc<Mutex<RuntimeCapabilities>>,
     event: &BuiltinAIRuntimeEvent,
 ) -> Result<Option<RuntimeHeartbeatTarget>, UploadError> {
+    if !options.mode().dashboard_enabled() {
+        return Err(UploadError {
+            message: "当前运行模式不支持会话同步".to_string(),
+            transient: false,
+        });
+    }
     let access =
         crate::api::oauth::platform_access_token(options, crate::api::oauth::AI_CONVERSATION_SCOPE)
             .map_err(|error| UploadError {

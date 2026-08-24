@@ -296,11 +296,26 @@ fn run_skill_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn 
 }
 
 fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let state = api::client::load_agent_state(&options.state_path)?;
-    options.set_agent_credential(&state.credential);
+    let state = api::client::load_agent_state(&options.state_path).ok();
+    if let Some(state) = state.as_ref() {
+        options.set_agent_credential(&state.credential);
+    }
     match arguments.first().map(String::as_str) {
         Some("list") => println!("{}", capability::plugin::registry_json()?),
+        Some("import-local") if arguments.len() == 2 => {
+            app::plugin_manager::install_local_package(std::path::Path::new(&arguments[1]))?;
+            println!("{}", capability::plugin::registry_json()?);
+        }
+        Some("import-github") if (arguments.len() == 3 || arguments.len() == 4) => {
+            let registry = app::github_source::import_plugin(
+                &arguments[1],
+                &arguments[2],
+                arguments.get(3).map(String::as_str).unwrap_or_default(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&registry)?);
+        }
         Some("install") if arguments.len() == 2 => {
+            let state = state.as_ref().ok_or("plugin install requires Dashboard enrollment")?;
             app::plugin_manager::install(options, &state.agent_id, &arguments[1], None)?
         }
         Some("uninstall") if arguments.len() == 2 => {
@@ -340,15 +355,18 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             );
         }
         _ => {
-            return Err("usage: himind-agent plugin <list|install|uninstall|enable|disable|rollback|invoke> [plugin-id|capability-id json]".into())
+            return Err("usage: himind-agent plugin <list|import-local path|import-github owner/repo ref [subpath]|install|uninstall|enable|disable|rollback|invoke> [plugin-id|capability-id json]".into())
         }
     }
-    if let Some(plugin_id) = arguments.get(1).filter(|_| {
-        matches!(
-            arguments.first().map(String::as_str),
-            Some("install" | "uninstall" | "enable" | "disable" | "rollback")
-        )
-    }) {
+    if let (Some(state), Some(plugin_id)) = (
+        state.as_ref(),
+        arguments.get(1).filter(|_| {
+            matches!(
+                arguments.first().map(String::as_str),
+                Some("install" | "uninstall" | "enable" | "disable" | "rollback")
+            )
+        }),
+    ) {
         let action = arguments[0].as_str();
         let _ =
             app::plugin_manager::report_status(options, &state.agent_id, plugin_id, action, "", "");
@@ -360,6 +378,10 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
 pub(crate) struct Options {
     api_base: String,
     state_path: PathBuf,
+    /// The control-plane mode captured when this process starts. Runtime
+    /// settings are persisted for the next launch and must not mutate the
+    /// live service graph halfway through a process lifetime.
+    effective_mode: app::runtime_mode::AgentMode,
     once: bool,
     interval_seconds: u64,
     local_app: bool,
@@ -373,6 +395,18 @@ pub(crate) struct Options {
 }
 
 impl Options {
+    /// Returns the mode used by every service in this process.
+    pub(crate) fn mode(&self) -> app::runtime_mode::AgentMode {
+        self.effective_mode
+    }
+
+    /// Returns the mode persisted by the settings panel. It is intentionally
+    /// separate from `mode()` because the persisted value becomes effective
+    /// only after the next process start.
+    pub(crate) fn pending_mode(&self) -> app::runtime_mode::AgentMode {
+        app::runtime_mode::load(&self.state_path)
+    }
+
     pub(crate) fn plugin_view_launch(&self) -> Option<PluginViewLaunch> {
         parse_plugin_view_launch(&env::args().collect::<Vec<_>>())
     }
@@ -391,6 +425,7 @@ impl Options {
         let mut local_port = 18181;
         let mut reenroll = false;
         let enrollment_token = env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
+        let mut mode_override = None;
 
         let args: Vec<String> = env::args().collect();
         let mut i = 1;
@@ -406,6 +441,12 @@ impl Options {
                 }
                 "--once" => once = true,
                 "--local-app" => local_app = true,
+                "--mode" if i + 1 < args.len() => {
+                    // This is a process-local debugging override. The panel
+                    // remains the product setting and is persisted separately.
+                    mode_override = app::runtime_mode::AgentMode::parse(&args[i + 1]);
+                    i += 1;
+                }
                 "--reenroll" => reenroll = true,
                 "--interval" if i + 1 < args.len() => {
                     interval_seconds = args[i + 1].parse().unwrap_or(10);
@@ -423,9 +464,11 @@ impl Options {
         if let Some(parent) = state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let effective_mode = mode_override.unwrap_or_else(|| app::runtime_mode::load(&state_path));
         Self {
             api_base: api_base.trim_end_matches('/').to_string(),
             state_path,
+            effective_mode,
             once,
             interval_seconds,
             local_app,

@@ -5,6 +5,7 @@ import { errorDetail } from '../types';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 
 type BuiltinAiPageProps = {
+  independentMode: boolean;
   identity: DashboardIdentityStatus | null;
   authorization: DashboardAuthorizationProgress | null;
   authorizationBusy: boolean;
@@ -20,6 +21,7 @@ type BuiltinAiPageProps = {
 };
 
 export function BuiltinAiPage({
+  independentMode: independentModeFromStatus,
   identity,
   authorization,
   authorizationBusy,
@@ -44,11 +46,13 @@ export function BuiltinAiPage({
   const [activityOpen, setActivityOpen] = useState(false);
   const [runtimeSessions, setRuntimeSessions] = useState<BuiltinAIRuntimeActivity[]>([]);
   const [activityError, setActivityError] = useState('');
+  const independentMode = independentModeFromStatus || identity?.state === 'independent';
+  const canStartSession = Boolean(identity?.authorized || independentMode);
   const authorizationActive = authorization?.state === 'starting' || authorization?.state === 'pending';
   const runtimeReady = runtimeInstallation?.runtime.status === 'ready' && runtimeInstallation.runtime.compatible;
 
   const refreshActivity = useCallback(async () => {
-    if (!identity?.authorized) return;
+    if (!identity?.authorized || independentMode) return;
     try {
       const result = await agentApi.builtinAiActivity();
       setRuntimeSessions(result.items || []);
@@ -56,7 +60,7 @@ export function BuiltinAiPage({
     } catch (error) {
       setActivityError(errorDetail(error));
     }
-  }, [identity?.authorized]);
+  }, [identity?.authorized, independentMode]);
 
   const refreshRuntimeInstallation = useCallback(async () => {
     try {
@@ -119,9 +123,9 @@ export function BuiltinAiPage({
   }, [connecting]);
 
   useEffect(() => {
-    if (!identity?.authorized || !runtimeReady || sessionUrl || connecting || connectionError) return;
+    if (!canStartSession || !runtimeReady || sessionUrl || connecting || connectionError) return;
     void connect();
-  }, [connect, connecting, connectionError, identity?.authorized, runtimeReady, sessionUrl]);
+  }, [canStartSession, connect, connecting, connectionError, runtimeReady, sessionUrl]);
 
   const syncModels = useCallback(async () => {
     if (!sessionUrl || syncingModels) return;
@@ -148,17 +152,16 @@ export function BuiltinAiPage({
       <header className="builtin-ai-toolbar">
         <div className="builtin-ai-title">
           <span className="builtin-ai-mark"><MessageCircle size={17} /></span>
-          <div><h2>HiMind AI</h2><span>{sessionUrl ? '已连接' : '智能工作助手'}</span></div>
+          <div><h2>HiMind AI</h2><span>智能工作助手</span></div>
         </div>
         <div className="builtin-ai-toolbar-actions">
-          <button type="button" className="builtin-ai-tools-button" onClick={() => void syncModels()} disabled={!sessionUrl || syncingModels} title="同步可用模型">
+          {!independentMode ? <button type="button" className="builtin-ai-tools-button" onClick={() => void syncModels()} disabled={!sessionUrl || syncingModels} title="同步可用模型">
             <RefreshCw className={syncingModels ? 'spin' : ''} size={15} />{syncingModels ? '同步中' : '同步模型'}
-          </button>
+          </button> : null}
           <button type="button" className="builtin-ai-tools-button" onClick={onOpenAiConnections} title="管理 AI 服务"><Settings size={15} />AI 服务</button>
           <button type="button" className={`builtin-ai-tools-button ${extensionsOpen ? 'active' : ''}`} onClick={() => setExtensionsOpen(true)} title="管理扩展"><Blocks size={15} />扩展</button>
-          <button type="button" className={`builtin-ai-tools-button ${activityOpen ? 'active' : ''}`} onClick={() => { setActivityOpen(open => !open); void refreshActivity(); }} title="查看协同活动"><Activity size={15} />活动</button>
+          {!independentMode ? <button type="button" className={`builtin-ai-tools-button ${activityOpen ? 'active' : ''}`} onClick={() => { setActivityOpen(open => !open); void refreshActivity(); }} title="查看协同活动"><Activity size={15} />活动</button> : null}
           {modelSyncMessage ? <span className="builtin-ai-sync-message" role="status">{modelSyncMessage}</span> : null}
-          {sessionUrl ? <span className="builtin-ai-online"><i />可用</span> : null}
         </div>
       </header>
 
@@ -177,7 +180,7 @@ export function BuiltinAiPage({
               {activityOpen ? <RuntimeActivityPanel sessions={runtimeSessions} error={activityError} onRefresh={() => void refreshActivity()} /> : null}
             </div>
           </>
-        ) : authorizationActive ? (
+        ) : !independentMode && authorizationActive ? (
           <WorkspaceStatus
             icon={<LogIn size={22} />}
             title={authorization?.state === 'starting' ? '正在打开登录页面' : '请在浏览器中确认登录'}
@@ -187,9 +190,9 @@ export function BuiltinAiPage({
               <button type="button" className="btn" onClick={onCancelAuthorization}>取消</button>
             </>}
           />
-        ) : identity === null ? (
+        ) : identity === null && !independentMode ? (
           <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在准备 HiMind AI" description="正在检查账号状态" />
-        ) : !identity.authorized ? (
+        ) : identity && !identity.authorized && !independentMode ? (
           <WorkspaceStatus
             icon={<LogIn size={22} />}
             title="登录后开始对话"
@@ -230,6 +233,7 @@ export function BuiltinAiPage({
       </div>
       <BuiltinAiExtensionsDialog
         open={extensionsOpen}
+        dashboardEnabled={!independentMode}
         toolSummary={toolSummary}
         onClose={() => setExtensionsOpen(false)}
         onRuntimeChanged={() => {
@@ -310,6 +314,12 @@ function runtimeActionLabel(operation: string) {
 function presentConnectionError(error: unknown) {
   const detail = errorDetail(error);
   const normalized = detail.toLowerCase();
+  if (normalized.includes('independent mode')
+    || normalized.includes('dsh 原生')
+    || normalized.includes('settings.yaml')
+    || (normalized.includes('provider') && normalized.includes('原生服务配置'))) {
+    return '请先完成 DSH 原生 Provider 配置（settings.yaml），再开始对话。';
+  }
   if (normalized.includes('登录 himind')) return '当前登录状态已失效，请重新登录。';
   if (normalized.includes('ai 服务')) return '当前账号暂未分配可用的 AI 服务，请联系管理员。';
   if (normalized.includes('运行时') && normalized.includes('修复')) return 'HiMind AI 运行时需要修复，请在设置中处理。';

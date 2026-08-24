@@ -5,6 +5,7 @@ import type { AiClientIntegration, AiIntegrationOverview, DashboardIdentityStatu
 
 type AiConnectionsPageProps = {
   identity: DashboardIdentityStatus | null;
+  dashboardEnabled: boolean;
   integration: AiIntegrationOverview | null;
   testResult: McpConnectionTestResult | null;
   busyAction: string | null;
@@ -18,6 +19,7 @@ type AiConnectionsPageProps = {
 
 export function AiConnectionsPage({
   identity,
+  dashboardEnabled,
   integration,
   testResult,
   busyAction,
@@ -68,7 +70,7 @@ export function AiConnectionsPage({
         </div>
       ) : null}
 
-      {!identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>尚未登录 HiMind</strong><span>注册 MCP 服务不受影响；使用工作台数据前需要登录。</span></div><button className="btn" onClick={onOpenAccount}>登录 HiMind</button></div> : null}
+      {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>尚未登录 HiMind</strong><span>注册 MCP 服务不受影响；使用工作台数据前需要登录。</span></div><button className="btn" onClick={onOpenAccount}>登录 HiMind</button></div> : null}
 
       <section className="ai-client-section">
         <div className="ai-section-heading">

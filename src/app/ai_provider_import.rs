@@ -647,10 +647,15 @@ fn import_workbuddy(
 
 fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
     let path = vscode_import_status_path(options);
-    let cli = locate_vscode_cli();
+    // Status reads must stay side-effect free. The import path performs the
+    // CLI version and extension checks when the user explicitly imports; a
+    // periodic dashboard refresh only inspects known paths on disk.
+    let cli = locate_vscode_cli_for_status();
     let client_detected = cli.is_some();
-    let extension_installed = cli
-        .and_then(|cli| installed_vscode_extension_version(&cli).ok().flatten())
+    let extension_roots = vscode_extension_roots_for_status(cli.as_deref());
+    let extension_installed = find_vscode_extension_version(&extension_roots)
+        .ok()
+        .flatten()
         .is_some();
     let imported = path.is_file();
     let status = fs::read_to_string(&path)
@@ -1607,6 +1612,28 @@ fn locate_vscode_cli() -> Option<PathBuf> {
     })
 }
 
+fn locate_vscode_cli_for_status() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(value) = env::var_os("HIMIND_VSCODE_CLI") {
+        candidates.push(PathBuf::from(value));
+    }
+    candidates.extend(vscode_registry_candidates());
+    candidates.extend(vscode_path_candidates());
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path) {
+            candidates.push(directory.join("code.cmd"));
+            candidates.push(directory.join("code-insiders.cmd"));
+            candidates.push(directory.join("code"));
+            candidates.push(directory.join("code-insiders"));
+        }
+    }
+    let mut seen = HashSet::new();
+    candidates.into_iter().find(|candidate| {
+        let key = candidate.to_string_lossy().to_ascii_lowercase();
+        seen.insert(key) && candidate.is_file()
+    })
+}
+
 fn resolve_vscode_cli_candidate(candidate: &Path) -> Option<PathBuf> {
     if candidate.components().count() == 1 {
         return vscode_path_command(candidate);
@@ -1879,6 +1906,21 @@ fn vscode_extension_roots(cli: &Path) -> Vec<PathBuf> {
         roots.push(root.join("data/extensions"));
     }
     roots
+}
+
+fn vscode_extension_roots_for_status(cli: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![
+        user_home().join(".vscode").join("extensions"),
+        user_home().join(".vscode-insiders").join("extensions"),
+    ];
+    if let Some(cli) = cli {
+        roots.extend(vscode_extension_roots(cli));
+    }
+    let mut seen = HashSet::new();
+    roots
+        .into_iter()
+        .filter(|root| seen.insert(root.to_string_lossy().to_ascii_lowercase()))
+        .collect()
 }
 
 fn find_vscode_extension_version(roots: &[PathBuf]) -> Result<Option<String>, Box<dyn Error>> {

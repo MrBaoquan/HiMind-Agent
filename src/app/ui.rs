@@ -31,7 +31,7 @@ struct BuiltinAiSession {
     proxy: BuiltinAiProxy,
     event_sync: BuiltinAiEventSync,
     model_sync: BuiltinAiModelSync,
-    command_gateway: BuiltinAiCommandGateway,
+    command_gateway: Option<BuiltinAiCommandGateway>,
 }
 
 static BUILTIN_AI_SESSION: std::sync::OnceLock<Mutex<Option<BuiltinAiSession>>> =
@@ -54,7 +54,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
         dashboard_agent_id: String::new(),
-        dashboard_worker_error: "正在连接 Dashboard 任务 Worker".to_string(),
+        dashboard_worker_error: if options.mode().dashboard_enabled() {
+            "正在连接 Dashboard 任务 Worker".to_string()
+        } else {
+            String::new()
+        },
         local_service_online: false,
         local_service_error: String::new(),
         distribution_update_available: false,
@@ -138,6 +142,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         })
         .invoke_handler(tauri::generate_handler![
             super::commands::get_agent_status,
+            super::commands::get_agent_mode,
+            super::commands::set_agent_mode,
             super::commands::get_agent_update_status,
             super::commands::check_agent_update,
             super::commands::download_agent_update,
@@ -185,6 +191,10 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_inner_admin_page,
             super::commands::open_agent_directory,
             super::commands::show_main_window,
+            super::commands::window_start_dragging,
+            super::commands::window_minimize,
+            super::commands::window_toggle_maximize,
+            super::commands::window_close,
             super::commands::quit_agent,
             super::commands::set_auto_start,
             super::commands::pick_unity_editor,
@@ -196,6 +206,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_svn_connection,
             super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
+            super::commands::import_local_plugin,
+            super::commands::import_github_plugin,
             super::commands::get_extension_desired_state,
             super::commands::get_agent_task_history,
             super::commands::get_plugin_catalog,
@@ -208,6 +220,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_plugin_enabled,
             super::commands::get_agent_capabilities,
             super::commands::get_skill_catalog,
+            super::commands::import_local_skill,
+            super::commands::import_github_skill,
             super::commands::get_organization_skill_catalog,
             super::commands::query_organization_skill_catalog,
             super::commands::get_skill_versions,
@@ -669,10 +683,10 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         Command::new(&launch.executable)
     };
     command
-        .args(["--profile", "himind", "--host", "127.0.0.1", "--port", "0"])
+        .args(["--profile", "himind", "--patch"])
+        .arg(&launch.agent_patch)
+        .args(["--host", "127.0.0.1", "--port", "0"])
         .env("DSH_HOME", &launch.home)
-        .env("DEEPSEEK_API_KEY", &launch.api_key)
-        .env("DEEPSEEK_BASE_URL", &launch.base_url)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
         .env("DSH_PERMISSION_MODE", launch.permission_mode)
         .env("NO_COLOR", "1")
@@ -680,9 +694,12 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::runtime::process::remove_himind_secret_environment(&mut command);
-    command
-        .env("DEEPSEEK_API_KEY", &launch.api_key)
-        .env("DEEPSEEK_BASE_URL", &launch.base_url);
+    if let Some(api_key_env) = launch.api_key_env.as_deref() {
+        command.env(api_key_env, &launch.api_key);
+    }
+    if !launch.base_url.trim().is_empty() {
+        command.env("DEEPSEEK_BASE_URL", &launch.base_url);
+    }
     crate::runtime::process::configure_hidden_process(&mut command);
     let mut child = command
         .spawn()
@@ -745,12 +762,15 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
     let runtime_capabilities =
         crate::app::builtin_ai_gateway::probe_builtin_ai_capabilities(&proxy.control());
     event_sync.set_capabilities(runtime_capabilities);
-    // DSH settings are live. Apply the current managed catalog before the
-    // first browser paint so the selector never briefly shows stale models.
-    let _ =
-        proxy
-            .control()
-            .sync_model_catalog(&launch.default_model, &launch.base_url, &launch.models);
+    // Connected mode owns the Dashboard-backed model catalog. Independent
+    // mode leaves provider and model selection entirely in native DSH config.
+    if options.mode().dashboard_enabled() {
+        let _ = proxy.control().sync_model_catalog(
+            &launch.default_model,
+            &launch.base_url,
+            &launch.models,
+        );
+    }
     let model_sync = BuiltinAiModelSync::start(ModelSyncSnapshot {
         user_id: launch.user_id,
         default_model: launch.default_model,
@@ -759,11 +779,13 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         credential_fingerprint: launch.credential_fingerprint,
         catalog_fingerprint: launch.catalog_fingerprint,
     });
-    let command_gateway = BuiltinAiCommandGateway::start(
-        options.clone(),
-        proxy.control(),
-        event_sync.capabilities_state(),
-    );
+    let command_gateway = options.mode().dashboard_enabled().then(|| {
+        BuiltinAiCommandGateway::start(
+            options.clone(),
+            proxy.control(),
+            event_sync.capabilities_state(),
+        )
+    });
     let session_url = proxy.url().to_string();
     *builtin_ai_session()
         .lock()
@@ -816,7 +838,9 @@ fn builtin_ai_startup_error(
 pub(crate) fn stop_builtin_ai_process() {
     if let Ok(mut active) = builtin_ai_session().lock() {
         if let Some(mut session) = active.take() {
-            session.command_gateway.stop();
+            if let Some(command_gateway) = session.command_gateway.as_mut() {
+                command_gateway.stop();
+            }
             session.proxy.stop();
             session.event_sync.stop();
             crate::runtime::process::terminate_process_tree(&mut session.child);

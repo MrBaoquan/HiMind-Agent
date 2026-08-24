@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 100_000;
 
 #[derive(Default)]
 pub(crate) struct LocalPluginStatus {
@@ -81,6 +83,9 @@ pub(crate) fn report_status(
     from_version: &str,
     error: &str,
 ) -> Result<(), Box<dyn Error>> {
+    if !options.mode().dashboard_enabled() {
+        return Ok(());
+    }
     flush_status_outbox(options, agent_id);
     let local = local_status(plugin_id);
     let status = if error.is_empty() {
@@ -107,6 +112,9 @@ pub(crate) fn report_status(
 }
 
 fn send_status(options: &Options, record: &PluginStatusRecord) -> Result<(), Box<dyn Error>> {
+    if !options.mode().dashboard_enabled() {
+        return Ok(());
+    }
     let credential = options.agent_credential();
     if record.agent_id.is_empty() || credential.is_empty() {
         return Err("Agent 尚未完成 Dashboard 配对".into());
@@ -238,6 +246,156 @@ pub(crate) fn install(
         compensate_plugin_changes(&changes);
         return Err(format!("记录插件依赖失败：{error}").into());
     }
+    Ok(())
+}
+
+/// Installs a locally supplied .hmpkg archive or unpacked plugin directory.
+/// No Dashboard catalog or credential is consulted in this path.
+pub(crate) fn install_local_package(path: &Path) -> Result<(), Box<dyn Error>> {
+    install_local_package_from_source(path, "local")
+}
+
+pub(crate) fn install_local_package_from_source(
+    path: &Path,
+    source_kind: &str,
+) -> Result<(), Box<dyn Error>> {
+    let source = path.canonicalize()?;
+    if !source.is_file() && !source.is_dir() {
+        return Err("本地插件路径不存在".into());
+    }
+    let temporary_archive =
+        env::temp_dir().join(format!("himind-local-plugin-{}.hmpkg", unique_suffix()));
+    let archive_path = if source.is_dir() {
+        if let Err(error) = pack_local_plugin_directory(&source, &temporary_archive) {
+            let _ = fs::remove_file(&temporary_archive);
+            return Err(error);
+        }
+        temporary_archive.as_path()
+    } else {
+        if !source
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("hmpkg"))
+        {
+            return Err("本地插件文件必须是 .hmpkg".into());
+        }
+        source.as_path()
+    };
+    if fs::metadata(archive_path)?.len() > MAX_PLUGIN_ARCHIVE_BYTES {
+        if temporary_archive.exists() {
+            let _ = fs::remove_file(&temporary_archive);
+        }
+        return Err("本地插件包超过 512 MiB 限制".into());
+    }
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let manifest = read_plugin_manifest_from_archive(archive_path)?;
+        ensure_agent_version_supported(&manifest.min_agent_version)?;
+        let item = PluginCatalogItem {
+            plugin_id: manifest.id.clone(),
+            name: manifest.name.clone(),
+            description: manifest.description.clone(),
+            author_name: manifest.author.clone(),
+            categories: Vec::new(),
+            review_status: "local".to_string(),
+            governance: "optional".to_string(),
+            version: manifest.version.clone(),
+            release_notes: manifest.release_notes.clone(),
+            published_at: String::new(),
+            min_agent_version: manifest.min_agent_version.clone(),
+            channel: "local".to_string(),
+            artifact_id: String::new(),
+            file_name: source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("local.hmpkg")
+                .to_string(),
+            file_size: fs::metadata(archive_path)?.len(),
+            sha256: String::new(),
+            signature: String::new(),
+            signature_key_id: String::new(),
+            signature_algorithm: String::new(),
+            download_url: String::new(),
+            source: source_kind.trim().to_string(),
+            assignment: "optional".to_string(),
+            management: "user_managed".to_string(),
+            install_mode: "prompt".to_string(),
+            organization_reason: String::new(),
+            managed: false,
+            allow_disable: true,
+            allow_uninstall: true,
+            capability_ids: manifest
+                .capabilities
+                .iter()
+                .map(|item| item.id.clone())
+                .collect(),
+            permissions: manifest.permissions.clone(),
+            view_count: manifest.contributes.views.len(),
+            plugin_dependencies: manifest
+                .plugin_dependencies
+                .iter()
+                .map(|item| SkillPluginDependency {
+                    plugin_id: item.plugin_id.clone(),
+                    required: item.required,
+                    min_version: item.min_version.clone(),
+                })
+                .collect(),
+        };
+        install_archive(archive_path, &item)
+    })();
+    if temporary_archive.exists() {
+        let _ = fs::remove_file(&temporary_archive);
+    }
+    result
+}
+
+fn read_plugin_manifest_from_archive(path: &Path) -> Result<PluginManifest, Box<dyn Error>> {
+    let mut archive = ZipArchive::new(File::open(path)?)?;
+    let mut entry = archive
+        .by_name("plugin.json")
+        .map_err(|_| "插件包缺少 plugin.json")?;
+    let mut content = String::new();
+    entry.read_to_string(&mut content)?;
+    Ok(serde_json::from_str(
+        content.trim_start_matches('\u{feff}'),
+    )?)
+}
+
+fn pack_local_plugin_directory(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    let file = File::create(target)?;
+    let mut archive = zip::ZipWriter::new(file);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut file_count = 0_usize;
+    let mut source_bytes = 0_u64;
+    for entry in walkdir::WalkDir::new(source)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path == source || path.is_dir() {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(source)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.starts_with('.') && relative != "." {
+            continue;
+        }
+        file_count += 1;
+        if file_count > MAX_PLUGIN_ARCHIVE_ENTRIES {
+            return Err("本地插件文件数量超过 100000 个限制".into());
+        }
+        source_bytes = source_bytes
+            .checked_add(entry.metadata()?.len())
+            .ok_or("本地插件大小溢出")?;
+        if source_bytes > MAX_PLUGIN_EXTRACTED_BYTES {
+            return Err("本地插件内容超过 512 MiB 限制".into());
+        }
+        archive.start_file(relative, options)?;
+        archive.write_all(&fs::read(path)?)?;
+    }
+    archive.finish()?;
     Ok(())
 }
 
@@ -876,14 +1034,27 @@ fn verify_signature(path: &Path, item: &PluginCatalogItem) -> Result<(), Box<dyn
 }
 
 fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), Box<dyn Error>> {
+    if fs::metadata(archive_path)?.len() > MAX_PLUGIN_ARCHIVE_BYTES {
+        return Err("插件制品超过 512 MiB 限制".into());
+    }
     let root = plugin_root(&item.plugin_id)?;
     fs::create_dir_all(root.join("versions"))?;
     let staging = root.join(format!("staging-{}", unique_suffix()));
     fs::create_dir_all(&staging)?;
     let result = (|| {
         let mut archive = ZipArchive::new(File::open(archive_path)?)?;
+        if archive.len() > MAX_PLUGIN_ARCHIVE_ENTRIES {
+            return Err("插件 ZIP 文件数量超过 100000 个限制".into());
+        }
+        let mut extracted_bytes = 0_u64;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
+            extracted_bytes = extracted_bytes
+                .checked_add(entry.size())
+                .ok_or("插件 ZIP 解压大小溢出")?;
+            if extracted_bytes > MAX_PLUGIN_EXTRACTED_BYTES {
+                return Err("插件 ZIP 解压后超过 512 MiB 限制".into());
+            }
             let relative = entry
                 .enclosed_name()
                 .ok_or("插件 ZIP 包含非法路径")?
@@ -1458,6 +1629,7 @@ mod tests {
         let options = crate::Options {
             api_base: "http://127.0.0.1:1".to_string(),
             state_path: state_path.clone(),
+            effective_mode: crate::app::runtime_mode::AgentMode::Connected,
             once: false,
             interval_seconds: 10,
             local_app: false,

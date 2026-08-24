@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct LocalLoginRequest {
@@ -21,7 +21,7 @@ pub struct EngineeringSyncRequest {
     pub project_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RemoteConnectRequest {
     pub vendor: String,
     pub code: String,
@@ -35,7 +35,7 @@ pub struct RemoteClientConfigureRequest {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ProjectWorkspaceRequest {
     pub path: String,
     pub engine_type: Option<String>,

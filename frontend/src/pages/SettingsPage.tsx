@@ -1,12 +1,13 @@
-import { useEffect, useState, type ReactNode } from 'react';
-import { agentApi, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
-import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, MoreHorizontal, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Trash2, Wrench, X } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { agentApi, type AgentModeSettings, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
+import { Bot, Database, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, Monitor, MoreHorizontal, Power, RefreshCw, RotateCcw, Save, ShieldAlert, ShieldCheck, Trash2, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
-type SettingsSection = 'remote' | 'accounts' | 'tools' | 'general';
+type SettingsSection = 'remote' | 'remote-tools' | 'accounts' | 'tools' | 'general';
 
 const SETTINGS_SECTIONS = [
   { key: 'remote', label: '远程任务', description: '权限与审批', icon: ShieldCheck },
+  { key: 'remote-tools', label: '远控工具', description: '路径配置', icon: Monitor },
   { key: 'accounts', label: '账号', description: '内网和 SVN', icon: KeyRound },
   { key: 'tools', label: '工具', description: '本机编辑器', icon: Wrench },
   { key: 'general', label: '通用', description: '启动与更新', icon: Power },
@@ -15,6 +16,7 @@ const SETTINGS_SECTIONS = [
 export function SettingsPage({
   settings,
   remoteExecutionSettings,
+  remoteClients,
   loginState,
   loginModalOpen,
   loginUsername,
@@ -27,6 +29,7 @@ export function SettingsPage({
   onLogoutLogin,
   onOpenInnerAdmin,
   onRemoteExecutionChange,
+  onRemoteClientsChange,
   onRuleChange,
   onTimeoutChange,
   onAutoStartChange,
@@ -51,6 +54,7 @@ export function SettingsPage({
 }: {
   settings: ApprovalSettings | null;
   remoteExecutionSettings: RemoteExecutionSettings | null;
+  remoteClients: RemoteClientOverview | null;
   loginState: LoginState | null;
   loginModalOpen: boolean;
   loginUsername: string;
@@ -63,6 +67,7 @@ export function SettingsPage({
   onLogoutLogin: () => void;
   onOpenInnerAdmin: () => void;
   onRemoteExecutionChange: (settings: RemoteExecutionSettings, fullAccessConfirmed?: boolean) => void;
+  onRemoteClientsChange: (overview: RemoteClientOverview) => void;
   onRuleChange: (requestType: string, mode: string) => void;
   onTimeoutChange: (seconds: number) => void;
   onAutoStartChange: (enabled: boolean) => void;
@@ -189,11 +194,60 @@ export function SettingsPage({
   const [editorFeedback, setEditorFeedback] = useState('');
   const [editorSaving, setEditorSaving] = useState(false);
   const [pendingFullAccess, setPendingFullAccess] = useState<RemoteExecutionSettings | null>(null);
+  const [agentMode, setAgentMode] = useState<AgentModeSettings | null>(null);
+  const [agentModeBusy, setAgentModeBusy] = useState(false);
+  const [agentModeFeedback, setAgentModeFeedback] = useState('');
+  const [remoteClientDrafts, setRemoteClientDrafts] = useState<Record<RemoteClientVendor, string>>({ sunlogin: '', todesk: '' });
+  const remoteClientDraftsInitialized = useRef(false);
+  const [remoteClientBusy, setRemoteClientBusy] = useState<RemoteClientVendor | 'detect' | null>(null);
+  const [remoteClientFeedback, setRemoteClientFeedback] = useState<Record<RemoteClientVendor, string>>({ sunlogin: '', todesk: '' });
   const [section, setSection] = useState<SettingsSection>('remote');
   useEffect(() => {
     setUnityEditorSettings(settings?.editors || null);
     setUnityEditorPath(settings?.editors?.unity_editor_path || '');
   }, [settings?.editors]);
+  useEffect(() => {
+    if (!remoteClients) return;
+    const nextDrafts = remoteClientDraftsFromOverview(remoteClients);
+    setRemoteClientDrafts(current => {
+      if (!remoteClientDraftsInitialized.current) {
+        remoteClientDraftsInitialized.current = true;
+        return { ...current, ...nextDrafts };
+      }
+      return REMOTE_CLIENT_OPTIONS.reduce((drafts, option) => {
+        const persistedPath = remoteClients.items.find(item => item.vendor === option.vendor)?.configured_path || '';
+        const localPath = current[option.vendor] || '';
+        return { ...drafts, [option.vendor]: localPath === persistedPath ? nextDrafts[option.vendor] : localPath };
+      }, { ...current });
+    });
+  }, [remoteClients]);
+  useEffect(() => {
+    let active = true;
+    void agentApi.agentMode().then(value => { if (active) setAgentMode(value); }).catch(error => {
+      if (active) setAgentModeFeedback(error instanceof Error ? error.message : '运行模式读取失败');
+    });
+    return () => { active = false; };
+  }, []);
+
+  async function changeAgentMode(mode: 'connected' | 'independent') {
+    if (!agentMode || agentMode.mode === mode || agentModeBusy) return;
+    const title = mode === 'independent' ? '开启独立模式？' : '切回 Connected 模式？';
+    const message = mode === 'independent'
+      ? '独立模式不会启动 Dashboard Worker，但仍可使用 DSH 原生 AI、技能、插件、MCP 和本机能力。保存后需重启 Agent。'
+      : 'Connected 模式会重新启用 Dashboard Worker。保存后需重启 Agent。';
+    if (!window.confirm(`${title}\n\n${message}`)) return;
+    setAgentModeBusy(true);
+    setAgentModeFeedback('');
+    try {
+      const next = await agentApi.setAgentMode(mode);
+      setAgentMode(next);
+      setAgentModeFeedback('已保存，重启 Agent 后生效');
+    } catch (error) {
+      setAgentModeFeedback(error instanceof Error ? error.message : '运行模式保存失败');
+    } finally {
+      setAgentModeBusy(false);
+    }
+  }
 
   async function chooseUnityEditor() {
     const result = await agentApi.pickUnityEditor();
@@ -216,6 +270,50 @@ export function SettingsPage({
       setEditorFeedback('无法保存，请确认 Unity.exe 路径后重试');
     } finally {
       setEditorSaving(false);
+    }
+  }
+
+  async function detectRemoteClients() {
+    if (remoteClientBusy) return;
+    setRemoteClientBusy('detect');
+    setRemoteClientFeedback({ sunlogin: '', todesk: '' });
+    try {
+      const overview = await agentApi.detectRemoteClients();
+      onRemoteClientsChange(overview);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '自动检测失败，请手动选择客户端路径';
+      setRemoteClientFeedback({ sunlogin: message, todesk: message });
+    } finally {
+      setRemoteClientBusy(null);
+    }
+  }
+
+  async function chooseRemoteClient(vendor: RemoteClientVendor) {
+    try {
+      const result = await agentApi.pickRemoteClient(vendor);
+      if (result.path) {
+        setRemoteClientDrafts(current => ({ ...current, [vendor]: result.path || '' }));
+        setRemoteClientFeedback(current => ({ ...current, [vendor]: '' }));
+      }
+    } catch (error) {
+      setRemoteClientFeedback(current => ({ ...current, [vendor]: error instanceof Error ? error.message : '无法打开文件选择器' }));
+    }
+  }
+
+  async function saveRemoteClient(vendor: RemoteClientVendor, path = remoteClientDrafts[vendor]) {
+    if (remoteClientBusy) return;
+    setRemoteClientBusy(vendor);
+    setRemoteClientFeedback(current => ({ ...current, [vendor]: '' }));
+    try {
+      const overview = await agentApi.configureRemoteClient(vendor, path);
+      onRemoteClientsChange(overview);
+      const savedPath = overview.items.find(item => item.vendor === vendor)?.configured_path || '';
+      setRemoteClientDrafts(current => ({ ...current, [vendor]: savedPath }));
+      setRemoteClientFeedback(current => ({ ...current, [vendor]: '' }));
+    } catch (error) {
+      setRemoteClientFeedback(current => ({ ...current, [vendor]: error instanceof Error ? error.message : '保存失败，请确认路径指向客户端程序' }));
+    } finally {
+      setRemoteClientBusy(null);
     }
   }
 
@@ -320,6 +418,15 @@ export function SettingsPage({
             </section>
           </> : null}
 
+          {section === 'remote-tools' ? <section className="card settings-section remote-client-settings">
+              <div className="card-header"><span>远控工具</span><div className="card-header-actions"><button type="button" className="btn btn-icon" title="重新检测" aria-label="重新检测远控工具" disabled={remoteClientBusy !== null} onClick={() => void detectRemoteClients()}>{remoteClientBusy === 'detect' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button></div></div>
+            <div className="remote-client-body">
+              <div className="remote-client-list">
+                {REMOTE_CLIENT_OPTIONS.map(option => <RemoteClientCard key={option.vendor} option={option} status={remoteClients?.items.find(item => item.vendor === option.vendor)} path={remoteClientDrafts[option.vendor]} busy={remoteClientBusy === option.vendor} feedback={remoteClientFeedback[option.vendor]} onPathChange={path => { setRemoteClientDrafts(current => ({ ...current, [option.vendor]: path })); setRemoteClientFeedback(current => ({ ...current, [option.vendor]: '' })); }} onPick={() => void chooseRemoteClient(option.vendor)} onSave={() => void saveRemoteClient(option.vendor)} onClear={() => void saveRemoteClient(option.vendor, '')} />)}
+              </div>
+            </div>
+          </section> : null}
+
           {section === 'accounts' ? <section className="card settings-section settings-credentials">
             <div className="card-header">账号</div>
             <div className="credential-section">
@@ -367,6 +474,23 @@ export function SettingsPage({
           </section> : null}
 
           {section === 'general' ? <>
+            <section className="card settings-section">
+              <div className="card-header"><span>运行模式</span><Pill kind={agentMode?.mode === 'independent' ? 'success' : 'neutral'}>{agentMode?.mode === 'independent' ? 'Independent' : 'Connected'}</Pill></div>
+              <div className="card-body setting-list">
+                <SettingRow title="Agent 运行模式" description="默认连接 Dashboard；独立模式保留本机 AI、技能、插件、MCP 和工程能力。">
+                  <div className="mode-options" role="radiogroup" aria-label="Agent 运行模式">
+                    <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>Connected</span></label>
+                    <label className={agentMode?.mode === 'independent' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'independent'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('independent')} /><span>Independent</span></label>
+                  </div>
+                </SettingRow>
+                {agentMode ? <div className="mode-state-summary" role="status">
+                  <span>当前生效：{agentMode.effective_mode === 'independent' ? 'Independent' : 'Connected'}</span>
+                  <span>重启后：{agentMode.pending_mode === 'independent' ? 'Independent' : 'Connected'}</span>
+                  {agentMode.requires_restart ? <strong>重启 Agent 后切换</strong> : null}
+                </div> : null}
+                {agentModeFeedback ? <div className="inline-feedback visible" role="status">{agentModeFeedback}</div> : null}
+              </div>
+            </section>
             <section className="card settings-section">
               <div className="card-header">软件更新</div>
               <div className="software-update-summary">
@@ -494,6 +618,51 @@ function SettingRow({ title, description, children }: { title: string; descripti
     <div className="setting-row">
       <div><div className="label-text">{title}</div><div className="label-desc">{description}</div></div>
       <div className="setting-control">{children}</div>
+    </div>
+  );
+}
+
+const REMOTE_CLIENT_OPTIONS = [
+  { vendor: 'todesk', name: 'ToDesk', description: 'ToDesk 远程协助客户端' },
+  { vendor: 'sunlogin', name: '向日葵', description: '向日葵远程控制客户端' },
+] satisfies { vendor: RemoteClientVendor; name: string; description: string }[];
+
+function remoteClientDraftsFromOverview(overview: RemoteClientOverview): Record<RemoteClientVendor, string> {
+  return overview.items.reduce((drafts, item) => ({ ...drafts, [item.vendor]: item.configured_path || '' }), { sunlogin: '', todesk: '' } as Record<RemoteClientVendor, string>);
+}
+
+function RemoteClientCard({ option, status, path, busy, feedback, onPathChange, onPick, onSave, onClear }: {
+  option: { vendor: RemoteClientVendor; name: string; description: string };
+  status?: RemoteClientStatus;
+  path: string;
+  busy: boolean;
+  feedback: string;
+  onPathChange: (path: string) => void;
+  onPick: () => void;
+  onSave: () => void;
+  onClear: () => void;
+}) {
+  const persistedPath = status?.configured_path || '';
+  const detectedPath = status?.resolved_path || '';
+  const configuredInvalid = Boolean(persistedPath && status?.configured_valid === false);
+  const dirty = path.trim() !== persistedPath;
+  return (
+    <div className={`remote-client-row${configuredInvalid ? ' invalid' : ''}`}>
+      <div className="remote-client-heading">
+        <div className="remote-client-icon"><Monitor size={16} /></div>
+        <strong>{option.name}</strong>
+      </div>
+      <div className="remote-client-path-input">
+        <input id={`remote-client-${option.vendor}`} aria-label={`${option.name}路径`} value={path} onChange={event => onPathChange(event.target.value)} placeholder={detectedPath || `选择 ${option.name}.exe`} title={path || detectedPath || ''} />
+        <button type="button" className="btn btn-icon" title={`选择 ${option.name} 程序`} aria-label={`选择 ${option.name} 程序`} disabled={busy} onClick={onPick}><FolderOpen size={16} /></button>
+      </div>
+      <div className="remote-client-footer">
+        {feedback ? <span className="inline-feedback visible" role="status">{feedback}</span> : null}
+        <div className="remote-client-actions">
+          {status?.configured_by === 'manual' ? <button type="button" className="btn btn-danger-quiet" title="清除手动路径" aria-label={`清除 ${option.name} 手动路径`} disabled={busy} onClick={onClear}><Trash2 size={14} /></button> : null}
+          <button type="button" className="btn btn-icon btn-primary" title="保存路径" aria-label={`保存 ${option.name} 路径`} disabled={busy || !dirty || (!path.trim() && !persistedPath)} onClick={onSave}>{busy ? <LoaderCircle size={14} className="spin" /> : <Save size={14} />}</button>
+        </div>
+      </div>
     </div>
   );
 }

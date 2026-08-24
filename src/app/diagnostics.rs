@@ -173,6 +173,7 @@ mod tests {
         let options = Options {
             api_base: "http://user:password@127.0.0.1:18083?token=secret".to_string(),
             state_path,
+            effective_mode: crate::app::runtime_mode::AgentMode::Connected,
             once: false,
             interval_seconds: 10,
             local_app: true,

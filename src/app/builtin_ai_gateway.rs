@@ -99,6 +99,9 @@ impl BuiltinAiCommandGateway {
             };
             let mut last_capability_probe = Instant::now() - CAPABILITY_PROBE_INTERVAL;
             while !worker_shutdown.load(Ordering::Acquire) {
+                if !options.mode().dashboard_enabled() {
+                    break;
+                }
                 if last_capability_probe.elapsed() >= CAPABILITY_PROBE_INTERVAL {
                     if let Ok(access) = platform_access_token(&options, AI_CONVERSATION_SCOPE) {
                         refresh_runtime_capabilities(
@@ -148,6 +151,9 @@ fn poll_and_execute(
     control: &BuiltinAiProxyControl,
     shutdown: &AtomicBool,
 ) -> bool {
+    if !options.mode().dashboard_enabled() {
+        return false;
+    }
     let access = match platform_access_token(options, AI_CONVERSATION_SCOPE) {
         Ok(access) => access,
         Err(error) => {

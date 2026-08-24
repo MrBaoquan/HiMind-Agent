@@ -1,13 +1,11 @@
-import { ArrowUpRight, CheckCircle2, CircleAlert, Download, FolderOpen, LoaderCircle, RefreshCw, Settings2, ShieldCheck } from 'lucide-react';
+import { ArrowUpRight, CheckCircle2, CircleAlert, Download, LoaderCircle, RefreshCw, Sparkles } from 'lucide-react';
 import { PageHeader, Pill } from '../components/Common';
 import { DashboardIdentityPanel } from '../components/DashboardIdentityPanel';
-import type { AgentStatus, AgentUpdateStatus, AiIntegrationOverview, ApprovalItem, ApprovalSettings, DashboardAuthorizationProgress, DashboardIdentityStatus, LoginState, RemoteExecutionSettings } from '../services/agentApi';
+import type { AgentStatus, AgentUpdateStatus, AiIntegrationOverview, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, RemoteExecutionSettings } from '../services/agentApi';
 
 type DashboardPageProps = {
   status: AgentStatus | null;
   approvals: ApprovalItem[];
-  settings: ApprovalSettings | null;
-  loginState: LoginState | null;
   remoteExecutionSettings: RemoteExecutionSettings | null;
   aiIntegration: AiIntegrationOverview | null;
   identity: DashboardIdentityStatus | null;
@@ -16,8 +14,6 @@ type DashboardPageProps = {
   updateStatus: AgentUpdateStatus | null;
   updateBusy: boolean;
   onOpenDashboard: () => void;
-  onOpenAgentDirectory: () => void;
-  onOpenSettings: () => void;
   onStartAuthorization: () => void;
   onCancelAuthorization: () => void;
   onOpenAuthorization: () => void;
@@ -31,8 +27,6 @@ type DashboardPageProps = {
 export function DashboardPage({
   status,
   approvals,
-  settings,
-  loginState,
   remoteExecutionSettings,
   aiIntegration,
   identity,
@@ -41,8 +35,6 @@ export function DashboardPage({
   updateStatus,
   updateBusy,
   onOpenDashboard,
-  onOpenAgentDirectory,
-  onOpenSettings,
   onStartAuthorization,
   onCancelAuthorization,
   onOpenAuthorization,
@@ -56,16 +48,52 @@ export function DashboardPage({
     return <div className="page-loading"><span className="spinner" />正在读取 Agent 状态</div>;
   }
 
-  const loginConfigured = loginState?.status === 'credentials_configured';
+  const independentMode = status.mode === 'independent' || status.dashboard_enabled === false;
   const workerOnline = status.dashboard_worker_online;
-  const workerIssue = describeWorkerIssue(status.dashboard_worker_error);
+  if (independentMode) {
+    return (
+      <div className="dashboard-page">
+        <PageHeader title="概览" description="HiMind Agent 当前状态" />
+        {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
+        <section className="workspace-status-panel ready independent-status-panel">
+          <div className="workspace-status-body">
+            <div className="workspace-status-icon ready" aria-hidden="true"><Sparkles size={25} /></div>
+            <div className="workspace-status-copy">
+              <div className="workspace-status-kicker"><span>HiMind Agent</span><span className="workspace-status-pill ready"><i />独立运行</span></div>
+              <strong>本机 AI 工作区已就绪</strong>
+              <span>HiMind AI、技能、插件、MCP 和本机执行能力均可直接使用。</span>
+            </div>
+          </div>
+          <div className="workspace-status-metrics" aria-label="本机运行状态">
+            <div><span>待审批</span><strong>{approvals.length}</strong></div>
+            <div><span>本机服务</span><strong>已就绪</strong></div>
+            <div><span>AI 工具</span><strong>{aiIntegration?.clients.filter(client => client.detected && client.state === 'configured').length || 0} 已连接</strong></div>
+          </div>
+        </section>
+        <section className="overview-facts" aria-label="运行信息">
+          <div><span>版本</span><strong>v{status.version}</strong></div>
+          <div><span>运行档</span><strong>{status.profile || 'production'}</strong></div>
+          <div><span>本地服务</span><strong>:{status.local_port || 18181}</strong></div>
+          <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
+        </section>
+      </div>
+    );
+  }
+  const workerIssue = status.mode === 'independent'
+    ? {
+      title: 'Independent Mode 已启用',
+      description: 'Dashboard Worker 未启动。DSH 原生 AI、技能、插件、MCP 和本机能力仍可独立使用。',
+      healthDescription: '当前 Agent 作为独立 AI Harness 运行，不参与 Dashboard 任务调度。',
+      requiresEnrollment: false,
+    }
+    : describeWorkerIssue(status.dashboard_worker_error);
   const aiReadyCount = aiIntegration?.clients.filter(client => client.detected && client.state === 'configured').length || 0;
   const aiInstalledCount = aiIntegration?.clients.filter(client => client.detected).length || 0;
   return (
     <div className="dashboard-page">
       <PageHeader
-        title={identity?.authorized && identity.user_name ? `${identity.user_name}的执行端` : 'HiMind Agent'}
-        description="数字分身通过这台电脑调用已授权的 AI 工具与业务能力，并把执行结果回写到 HiMind 工作台。"
+        title="概览"
+        description="HiMind Agent 当前状态"
         actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
@@ -73,6 +101,13 @@ export function DashboardPage({
       <DashboardIdentityPanel
         identity={identity}
         authorization={authorization}
+        workerOnline={workerOnline}
+        dashboardEnabled={status.dashboard_enabled !== false}
+        workerStatusTitle={workerIssue.title}
+        workerHealthDescription={workerIssue.healthDescription}
+        pendingApprovals={approvals.length}
+        remoteExecutionEnabled={Boolean(remoteExecutionSettings?.enabled)}
+        aiToolSummary={aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已注册` : '未安装'}
         busy={identityBusy}
         onStartAuthorization={onStartAuthorization}
         onCancelAuthorization={onCancelAuthorization}
@@ -81,30 +116,12 @@ export function DashboardPage({
         onRevoke={onRevokeAuthorization}
         authorizationDisabledReason={workerIssue.requiresEnrollment ? workerIssue.description : undefined}
       />
-      <section className="health-panel">
-        <div className={`health-icon ${workerOnline ? 'success' : 'danger'}`}>{workerOnline ? <CheckCircle2 size={25} /> : <CircleAlert size={25} />}</div>
-        <div className="health-copy">
-          <span className="eyebrow">运行状态</span>
-          <h3>{workerOnline ? '数字分身执行端运行正常' : '连接需要处理'}</h3>
-          <p>{workerOnline ? '已连接工作台，等待数字分身下发任务。' : workerIssue.healthDescription}</p>
-        </div>
-        <div className="health-metrics">
-          <div><span>待审批</span><strong className={approvals.length ? 'warning-text' : ''}>{approvals.length}</strong></div>
-          <div><span>远程任务</span><strong>{remoteExecutionSettings?.enabled ? '已开启' : '已关闭'}</strong></div>
-          <div><span>AI 工具</span><strong>{aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已注册` : '未安装'}</strong></div>
-        </div>
+      <section className="overview-facts" aria-label="运行信息">
+        <div><span>版本</span><strong>v{status.version}</strong></div>
+        <div><span>运行档</span><strong>{status.profile || 'production'}</strong></div>
+        <div><span>本地服务</span><strong>:{status.local_port || 18181}</strong></div>
+        <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
       </section>
-      <details className="overview-technical">
-        <summary><ShieldCheck size={16} /><span><strong>设备信息</strong><small>版本与本机连接</small></span><Pill kind={loginConfigured ? 'success' : 'warn'}>{loginConfigured ? '账号已配置' : '账号待配置'}</Pill></summary>
-        <div className="overview-technical-grid">
-          <div><span>内网账号</span><strong>{status.login_account || status.login_label || '未配置'}</strong></div>
-          <div><span>审批超时</span><strong>{settings?.timeout_seconds || 30} 秒</strong></div>
-          <div><span>运行档</span><strong>{status.profile || 'production'}</strong></div>
-          <div><span>本地端口</span><strong>{status.local_port || 18181}</strong></div>
-          <div><span>Agent 版本</span><strong>v{status.version}</strong></div>
-        </div>
-        <div className="overview-technical-actions"><button className="btn" onClick={onOpenAgentDirectory}><FolderOpen size={16} />程序目录</button><button className="btn" onClick={onOpenSettings}><Settings2 size={16} />打开设置</button></div>
-      </details>
     </div>
   );
 }

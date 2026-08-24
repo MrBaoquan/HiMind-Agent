@@ -60,6 +60,10 @@ pub(crate) fn run_loop(
     worker_status: Option<Arc<Mutex<LocalWorkerStatus>>>,
     approval_mgr: Option<Arc<ApprovalManager>>,
 ) -> Result<(), Box<dyn Error>> {
+    if !options.mode().dashboard_enabled() {
+        set_status(&worker_status, false, "", "");
+        return Ok(());
+    }
     let connect_started = Instant::now();
     if let Some(logs) = approval_mgr.as_ref() {
         logs.add_log("info", "Dashboard Worker 开始连接");
@@ -154,6 +158,10 @@ pub(crate) fn run_loop(
         let mut last_identity_error = String::new();
         let mut last_heartbeat_error = String::new();
         while !heartbeat_stop_for_thread.load(Ordering::Relaxed) {
+            if !heartbeat_options.mode().dashboard_enabled() {
+                set_status(&heartbeat_status, false, "", "");
+                break;
+            }
             if heartbeat_options.identity_generation() != identity_generation {
                 heartbeat_restart_requested.store(true, Ordering::SeqCst);
                 break;
@@ -310,6 +318,9 @@ pub(crate) fn run_loop(
     let update_thread = thread::spawn(move || {
         let mut distribution_state = distribution_state;
         while !update_stop_for_thread.load(Ordering::Relaxed) {
+            if !update_options.mode().dashboard_enabled() {
+                break;
+            }
             if distribution_state.is_none() {
                 distribution_state = match load_distribution_client(
                     &update_client,
@@ -353,6 +364,9 @@ pub(crate) fn run_loop(
     let reconcile_thread = thread::spawn(move || {
         let mut generation = String::new();
         while !reconcile_stop_for_thread.load(Ordering::Relaxed) {
+            if !reconcile_options.mode().dashboard_enabled() {
+                break;
+            }
             if let Err(error) = crate::app::extension_reconciler::reconcile(
                 &reconcile_options,
                 &reconcile_agent_id,
@@ -374,6 +388,9 @@ pub(crate) fn run_loop(
     };
 
     loop {
+        if !options.mode().dashboard_enabled() {
+            return Ok(());
+        }
         if restart_requested.load(Ordering::SeqCst)
             || options.identity_generation() != identity_generation
         {
@@ -437,11 +454,16 @@ pub(crate) fn run_supervisor(
             approval_mgr.clone(),
         ) {
             Ok(()) => {
+                let independent = !options.mode().dashboard_enabled();
                 set_status(
                     &Some(Arc::clone(&worker_status)),
                     false,
                     "",
-                    "Dashboard 任务 Worker 已停止",
+                    if independent {
+                        ""
+                    } else {
+                        "Dashboard 任务 Worker 已停止"
+                    },
                 );
                 break;
             }

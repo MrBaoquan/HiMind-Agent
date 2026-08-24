@@ -117,6 +117,7 @@ fn dashboard_agent_user_client(
     state: &AgentState,
     required_scope: &str,
 ) -> Result<(String, String, reqwest::blocking::Client), String> {
+    require_dashboard(state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -135,10 +136,21 @@ fn dashboard_agent_user_client(
     Ok((agent_id, access.token, client))
 }
 
+fn require_dashboard(state: &AgentState) -> Result<(), String> {
+    if state.options.mode().dashboard_enabled() {
+        Ok(())
+    } else {
+        Err(crate::app::runtime_mode::control_plane_required_error())
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn get_dashboard_identity_status(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardIdentityStatus, String> {
+    if !state.options.mode().dashboard_enabled() {
+        return Ok(crate::app::identity::independent_status(&state.options));
+    }
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || crate::app::identity::identity_status(&options))
         .await
@@ -171,6 +183,7 @@ pub(crate) fn get_builtin_ai_activity(
 pub(crate) fn start_dashboard_authorization(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
+    require_dashboard(&state)?;
     crate::app::identity::start_authorization(
         state.options.clone(),
         Arc::clone(&state.dashboard_authorization),
@@ -182,6 +195,7 @@ pub(crate) fn start_dashboard_authorization(
 pub(crate) fn get_dashboard_authorization_progress(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
+    require_dashboard(&state)?;
     Ok(crate::app::identity::authorization_progress(
         &state.dashboard_authorization,
     ))
@@ -191,6 +205,7 @@ pub(crate) fn get_dashboard_authorization_progress(
 pub(crate) fn cancel_dashboard_authorization(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
+    require_dashboard(&state)?;
     crate::app::identity::cancel_authorization(&state.dashboard_authorization)
 }
 
@@ -198,6 +213,7 @@ pub(crate) fn cancel_dashboard_authorization(
 pub(crate) fn open_dashboard_authorization_page(
     state: State<'_, AgentState>,
 ) -> Result<(), String> {
+    require_dashboard(&state)?;
     let progress = crate::app::identity::authorization_progress(&state.dashboard_authorization);
     if progress.verification_uri_complete.trim().is_empty() {
         return Err("当前没有可打开的 Dashboard 授权页面".to_string());
@@ -209,6 +225,7 @@ pub(crate) fn open_dashboard_authorization_page(
 pub(crate) async fn revoke_dashboard_authorization(
     state: State<'_, AgentState>,
 ) -> Result<(), String> {
+    require_dashboard(&state)?;
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::api::oauth::revoke_authorization(&options).map_err(|error| error.to_string())
@@ -294,7 +311,15 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
     Ok(json!({
         "status": "online",
         "version": VERSION,
-        "mode": "local-app",
+        "mode": state.options.mode().as_str(),
+        "effective_mode": state.options.mode().as_str(),
+        "pending_mode": state.options.pending_mode().as_str(),
+        "requires_restart": state.options.mode() != state.options.pending_mode(),
+        "dashboard_enabled": state.options.mode().dashboard_enabled(),
+        "control_plane": {
+            "kind": state.options.mode().control_plane(),
+            "enabled": state.options.mode().control_plane_enabled(),
+        },
         "local_port": state.port,
         "dashboard_base": state.dashboard_base,
         "executable_name": executable["name"],
@@ -310,6 +335,57 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
         "pending_approvals": pending.len(),
         "current_task": current_task,
     }))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AgentModeSettings {
+    /// The value shown in settings. This is the pending value when a restart
+    /// is required, so the panel can reflect the user's choice immediately.
+    pub mode: String,
+    pub effective_mode: String,
+    pub pending_mode: String,
+    pub dashboard_enabled: bool,
+    pub requires_restart: bool,
+}
+
+#[tauri::command]
+pub(crate) fn get_agent_mode(state: State<'_, AgentState>) -> Result<AgentModeSettings, String> {
+    let effective = state.options.mode();
+    let pending = state.options.pending_mode();
+    Ok(AgentModeSettings {
+        mode: pending.as_str().to_string(),
+        effective_mode: effective.as_str().to_string(),
+        pending_mode: pending.as_str().to_string(),
+        dashboard_enabled: pending.dashboard_enabled(),
+        requires_restart: effective != pending,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn set_agent_mode(
+    state: State<'_, AgentState>,
+    mode: String,
+) -> Result<AgentModeSettings, String> {
+    let previous = state.options.mode();
+    let mode = crate::app::runtime_mode::AgentMode::parse(&mode)
+        .ok_or_else(|| "运行模式只能是 connected 或 independent".to_string())?;
+    crate::app::runtime_mode::save(&state.state_path, mode).map_err(|error| error.to_string())?;
+    if previous != mode {
+        // Do not leave a session started under the previous control-plane
+        // policy running while the user is switching modes.
+        crate::app::ui::stop_builtin_ai_process();
+    }
+    state.approval_manager.add_log(
+        "info",
+        &format!("Agent 运行模式已设置为 {}，重启后生效", mode.as_str()),
+    );
+    Ok(AgentModeSettings {
+        mode: mode.as_str().to_string(),
+        effective_mode: previous.as_str().to_string(),
+        pending_mode: mode.as_str().to_string(),
+        dashboard_enabled: mode.dashboard_enabled(),
+        requires_restart: previous != mode,
+    })
 }
 
 #[tauri::command]
@@ -880,6 +956,7 @@ pub(crate) async fn start_builtin_ai_session(
 pub(crate) async fn sync_builtin_ai_models(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::builtin_ai_model_sync::BuiltinAiModelSyncResult, String> {
+    require_dashboard(&state)?;
     let options = state.options.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         crate::app::ui::sync_builtin_ai_models(&options)
@@ -960,6 +1037,13 @@ pub(crate) fn validate_builtin_ai_mcp_server(
 
 fn present_builtin_ai_start_error(error: &str) -> String {
     let normalized = error.to_lowercase();
+    if normalized.contains("independent mode")
+        || normalized.contains("dsh 原生")
+        || normalized.contains("settings.yaml")
+        || (normalized.contains("provider") && normalized.contains("原生服务配置"))
+    {
+        return "请先完成 DSH 原生 Provider 配置（settings.yaml），再开始对话".to_string();
+    }
     if normalized.contains("运行时尚未安装")
         || normalized.contains("runtime is not installed")
         || normalized.contains("runtime is unavailable")
@@ -1006,6 +1090,32 @@ pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
         let _ = window.set_focus();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn window_start_dragging(window: WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn window_minimize(window: WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn window_toggle_maximize(window: WebviewWindow) -> Result<(), String> {
+    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    if maximized {
+        window.unmaximize().map_err(|error| error.to_string())
+    } else {
+        window.maximize().map_err(|error| error.to_string())
+    }
+}
+
+#[tauri::command]
+pub(crate) fn window_close(window: WebviewWindow) -> Result<(), String> {
+    // Keep the Agent resident in the tray, matching the native close behavior.
+    window.hide().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1165,9 +1275,42 @@ pub(crate) fn get_plugin_registry() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+pub(crate) fn import_local_plugin() -> Result<serde_json::Value, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导入本地 HiMind 插件")
+        .add_filter("HiMind 插件", &["hmpkg"])
+        .pick_file()
+        .or_else(|| {
+            rfd::FileDialog::new()
+                .set_title("选择 HiMind 插件目录")
+                .pick_folder()
+        })
+    else {
+        return Err("已取消导入插件".to_string());
+    };
+    crate::app::plugin_manager::install_local_package(&path).map_err(|error| error.to_string())?;
+    registry_json().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_github_plugin(
+    repository: String,
+    reference: String,
+    subpath: Option<String>,
+) -> Result<serde_json::Value, String> {
+    crate::app::github_source::import_plugin(
+        &repository,
+        &reference,
+        subpath.as_deref().unwrap_or(""),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn get_extension_desired_state(
     state: State<'_, AgentState>,
 ) -> Result<ExtensionDesiredState, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1196,6 +1339,7 @@ pub(crate) fn get_agent_task_history(
     state: State<'_, AgentState>,
     limit: Option<usize>,
 ) -> Result<Vec<AgentTaskHistoryItem>, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1248,9 +1392,43 @@ pub(crate) fn get_skill_catalog(state: State<'_, AgentState>) -> Result<serde_js
 }
 
 #[tauri::command]
+pub(crate) fn import_local_skill() -> Result<serde_json::Value, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导入本地 HiMind Skill")
+        .add_filter("HiMind Skill", &["hmskill"])
+        .pick_file()
+        .or_else(|| {
+            rfd::FileDialog::new()
+                .set_title("选择 HiMind Skill 目录")
+                .pick_folder()
+        })
+    else {
+        return Err("已取消导入 Skill".to_string());
+    };
+    let record = crate::app::skill_manager::install_local_package(&path)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(record).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_github_skill(
+    repository: String,
+    reference: String,
+    subpath: Option<String>,
+) -> Result<serde_json::Value, String> {
+    crate::app::github_source::import_skill(
+        &repository,
+        &reference,
+        subpath.as_deref().unwrap_or(""),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn get_organization_skill_catalog(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1267,6 +1445,7 @@ pub(crate) fn query_organization_skill_catalog(
     page_size: usize,
     state: State<'_, AgentState>,
 ) -> Result<crate::api::distribution::SkillCatalogPage, String> {
+    require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
@@ -1334,6 +1513,7 @@ pub(crate) fn create_extension_project(
     input: crate::extension_projects::CreateExtensionProjectInput,
     state: State<'_, AgentState>,
 ) -> Result<crate::extension_projects::ExtensionProject, String> {
+    require_dashboard(&state)?;
     let identity = crate::app::identity::identity_status(&state.options);
     if !identity.authorized || identity.user_name.trim().is_empty() {
         return Err("请先授权 HiMind 工作台账号，再新建扩展项目".to_string());
@@ -1364,6 +1544,7 @@ pub(crate) fn remove_extension_project(project_id: String) -> Result<(), String>
 pub(crate) fn list_extension_collaboration_projects(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::AgentExtensionProject>, String> {
+    require_dashboard(&state)?;
     let (agent_id, token, client) =
         dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
     crate::api::distribution::extension_projects(&client, &state.dashboard_base, &agent_id, &token)
@@ -1377,6 +1558,9 @@ pub(crate) fn update_extension_project_source(
     sync_remote: Option<bool>,
     state: State<'_, AgentState>,
 ) -> Result<crate::extension_projects::ExtensionProject, String> {
+    if sync_remote.unwrap_or(true) {
+        require_dashboard(&state)?;
+    }
     let project = crate::extension_projects::get(&project_id).map_err(|error| error.to_string())?;
     if sync_remote.unwrap_or(true) {
         let (agent_id, token, client) =
@@ -1399,6 +1583,7 @@ pub(crate) fn get_extension_collaboration(
     product_key: String,
     state: State<'_, AgentState>,
 ) -> Result<crate::api::distribution::ExtensionCollaboration, String> {
+    require_dashboard(&state)?;
     let (agent_id, token, client) =
         dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
     crate::api::distribution::extension_collaboration(
@@ -1531,6 +1716,7 @@ pub(crate) fn import_skill_candidate(
     parent_submission_id: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
+    require_dashboard(&state)?;
     let identity = crate::app::identity::identity_status(&state.options);
     if !identity.authorized || identity.user_name.trim().is_empty() {
         return Err("请先授权 HiMind 工作台账号，再导入 Skill 候选".to_string());
@@ -1604,6 +1790,7 @@ pub(crate) fn confirm_plugin_draft(
 pub(crate) fn list_plugin_submissions(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginSubmissionStatus>, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1634,6 +1821,7 @@ pub(crate) fn submit_plugin_draft(
     version: String,
     state: State<'_, AgentState>,
 ) -> Result<crate::plugin_authoring::PluginDraft, String> {
+    require_dashboard(&state)?;
     let draft =
         crate::plugin_authoring::read(&plugin_id, &version).map_err(|error| error.to_string())?;
     if !confirm_authoring_submission(
@@ -1657,6 +1845,7 @@ pub(crate) fn submit_plugin_draft(
 pub(crate) fn list_skill_submissions(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::SkillSubmissionStatus>, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1686,6 +1875,7 @@ pub(crate) fn save_skill_draft(
     mut input: crate::skill::authoring::SkillDraftInput,
     state: State<'_, AgentState>,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
+    require_dashboard(&state)?;
     let identity = crate::app::identity::identity_status(&state.options);
     if !identity.authorized || identity.user_name.trim().is_empty() {
         return Err("请先授权 HiMind 工作台账号，再保存 Skill 候选".to_string());
@@ -1727,6 +1917,7 @@ pub(crate) fn submit_skill_draft(
     version: String,
     state: State<'_, AgentState>,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
+    require_dashboard(&state)?;
     let draft =
         crate::skill::authoring::read(&skill_id, &version).map_err(|error| error.to_string())?;
     if !confirm_authoring_submission(
@@ -1767,6 +1958,7 @@ pub(crate) fn install_organization_skill(
     optional_plugin_ids: Option<Vec<String>>,
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1800,6 +1992,7 @@ pub(crate) fn plan_organization_skill_install(
     version: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<crate::app::skill_manager::SkillInstallPlan, String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -1819,6 +2012,7 @@ pub(crate) fn get_skill_versions(
     skill_id: String,
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
+    require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
@@ -1955,14 +2149,22 @@ fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_js
 }
 
 #[tauri::command]
-pub(crate) fn open_folder(path: String) -> Result<(), String> {
-    open_system_folder(&path).map_err(|e| e.to_string())
+pub(crate) fn open_folder(state: State<'_, AgentState>, path: String) -> Result<(), String> {
+    CapabilityGateway::new(state.options.clone(), Arc::clone(&state.worker_status))
+        .invoke(
+            &InvocationContext::tauri(),
+            "system.open_folder",
+            json!({ "path": path }),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub(crate) fn get_plugin_catalog(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
+    require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
@@ -1988,6 +2190,7 @@ pub(crate) fn query_plugin_catalog(
     page_size: usize,
     state: State<'_, AgentState>,
 ) -> Result<crate::api::distribution::PluginCatalogPage, String> {
+    require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
@@ -2019,6 +2222,7 @@ pub(crate) fn get_plugin_versions(
     plugin_id: String,
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
+    require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
@@ -2048,6 +2252,7 @@ pub(crate) fn plan_plugin_install(
     plugin_id: String,
     version: Option<String>,
 ) -> Result<crate::app::plugin_manager::PluginInstallPlan, String> {
+    require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
         .get("dashboard_agent_id")
@@ -2068,6 +2273,7 @@ pub(crate) fn install_plugin(
     plugin_id: String,
     version: Option<String>,
 ) -> Result<(), String> {
+    require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
@@ -2326,6 +2532,7 @@ pub(crate) fn invoke_plugin_view_capability(
     let options = Options {
         api_base: state.dashboard_base.clone(),
         state_path: state.state_path.clone(),
+        effective_mode: state.options.mode(),
         once: false,
         interval_seconds: 10,
         local_app: true,
@@ -2347,4 +2554,26 @@ pub(crate) fn invoke_plugin_view_capability(
             input,
         )
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::present_builtin_ai_start_error;
+
+    #[test]
+    fn independent_dsh_configuration_errors_are_actionable() {
+        let message = present_builtin_ai_start_error(
+            "Independent Mode 需要 DSH 原生 Provider 配置，请先在 settings.yaml 配置 Provider",
+        );
+        assert!(message.contains("DSH 原生 Provider"));
+        assert!(message.contains("settings.yaml"));
+    }
+
+    #[test]
+    fn connected_ai_errors_keep_existing_login_guidance() {
+        assert_eq!(
+            present_builtin_ai_start_error("AI credential missing scope"),
+            "需要登录 HiMind 账号后才能开始对话"
+        );
+    }
 }

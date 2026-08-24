@@ -60,6 +60,25 @@ pub(crate) struct DashboardAuthorizationFlow {
     progress: DashboardAuthorizationProgress,
 }
 
+pub(crate) fn independent_status(options: &Options) -> DashboardIdentityStatus {
+    DashboardIdentityStatus {
+        state: "independent".to_string(),
+        authorized: false,
+        online_verified: false,
+        dashboard_base: options.api_base.clone(),
+        user_name: String::new(),
+        user_id: String::new(),
+        agent_id: String::new(),
+        scopes: Vec::new(),
+        refresh_expires_at: 0,
+        last_verified_at: 0,
+        svn_username: String::new(),
+        svn_provisioning_status: String::new(),
+        svn_provisioning_error: String::new(),
+        error: String::new(),
+    }
+}
+
 pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
     let agent_id = load_agent_state(&options.state_path)
         .map(|state| state.agent_id)

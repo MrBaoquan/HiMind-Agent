@@ -259,15 +259,47 @@ impl SkillStore {
         expected_id: &str,
         expected_version: &str,
     ) -> Result<SkillRecord, Box<dyn Error>> {
+        self.install_scoped_package(
+            package_root,
+            expected_id,
+            expected_version,
+            SkillScope::Organization,
+            "商城 Skill 必须使用 organization scope",
+        )
+    }
+
+    pub(crate) fn install_user_package(
+        &self,
+        package_root: &Path,
+        expected_id: &str,
+        expected_version: &str,
+    ) -> Result<SkillRecord, Box<dyn Error>> {
+        self.install_scoped_package(
+            package_root,
+            expected_id,
+            expected_version,
+            SkillScope::User,
+            "本地 Skill 必须使用 user scope",
+        )
+    }
+
+    fn install_scoped_package(
+        &self,
+        package_root: &Path,
+        expected_id: &str,
+        expected_version: &str,
+        scope: SkillScope,
+        scope_error: &str,
+    ) -> Result<SkillRecord, Box<dyn Error>> {
         self.bootstrap_builtin_skills()?;
         let manifest = validate_skill_package_root(package_root)?;
-        if manifest.scope != SkillScope::Organization {
-            return Err("商城 Skill 必须使用 organization scope".into());
+        if manifest.scope != scope {
+            return Err(scope_error.into());
         }
         if manifest.id != expected_id || manifest.version != expected_version {
             return Err("Skill Manifest ID 或版本与发布记录不一致".into());
         }
-        let skill_root = self.skill_root_for_scope(&SkillScope::Organization, expected_id);
+        let skill_root = self.skill_root_for_scope(&manifest.scope, expected_id);
         let versions_root = skill_root.join("versions");
         fs::create_dir_all(&versions_root)?;
         let staging = skill_root.join(format!("staging-{}", now_stamp()));

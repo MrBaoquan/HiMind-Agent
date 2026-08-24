@@ -41,9 +41,18 @@ const UPDATE_CHECK_TIMEOUT_SECONDS: u64 = 30;
 const INTERACTIVE_PERMISSION_MODE: &str = "workspace-write";
 const HIMIND_PROFILE: &str = "himind";
 const HIMIND_HEADLESS_PROFILE: &str = "himind-headless";
-const HIMIND_MCP_SERVER_NAME: &str = "himind";
+// Reserved for the Agent-owned bridge. Keep this namespace distinct from
+// user-managed DSH MCP servers and make the ownership visible in diagnostics.
+const HIMIND_MCP_SERVER_NAME: &str = "himind-agent";
+const HIMIND_MCP_ROW_ID: &str = "himind-agent-mcp";
+const HIMIND_SKILL_ROW_ID: &str = "himind-agent-skill-filesystem";
+const HIMIND_PERSONAL_MCP_ROW_PREFIX: &str = "himind-agent-personal-mcp-";
 const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
+const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
+const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
+const HIMIND_AGENT_PATCH_MARKER: &str =
+    "# Agent-owned context. This layer is regenerated for each new HiMind AI session.";
 const DSH_SETTINGS_MIGRATION_MARKER: &str = ".himind-dsh-settings-v2";
 const INTERACTIVE_HOME_DIRECTORY: &str = "interactive";
 const INTERACTIVE_HOME_MIGRATION_MARKER: &str = ".himind-interactive-home-v1.json";
@@ -92,7 +101,9 @@ pub(crate) struct InteractiveLaunch {
     pub home: PathBuf,
     pub user_id: String,
     pub api_key: String,
+    pub api_key_env: Option<String>,
     pub base_url: String,
+    pub agent_patch: PathBuf,
     pub default_model: String,
     pub models: Vec<String>,
     pub credential_fingerprint: String,
@@ -452,6 +463,15 @@ struct UserModelSelection {
     model: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeDshProviderConfig {
+    provider: String,
+    model: String,
+    api_key_env: Option<String>,
+    base_url: String,
+    models: Vec<String>,
+}
+
 pub(crate) fn probe() -> RuntimeInstallationReport {
     let resolved = resolve_executable();
     let executable = resolved.as_ref().ok();
@@ -670,6 +690,13 @@ pub(crate) fn uninstall_with_progress(
 pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
+    if !options.mode().dashboard_enabled() {
+        return prepare_independent_interactive_launch(
+            options,
+            executable.to_string_lossy().to_string(),
+            version,
+        );
+    }
     let delegated =
         crate::api::oauth::platform_access_token(options, crate::api::oauth::AI_CONVERSATION_SCOPE)
             .map_err(|error| error.to_string())?;
@@ -694,17 +721,143 @@ pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<Interactiv
         run_id: "interactive".to_string(),
     };
     ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
+    let agent_patch = agent_overlay_path(&home);
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
         user_id: delegated.user_id,
         api_key: credential.api_key,
+        api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
         base_url: credential.access.base_url,
+        agent_patch,
         default_model: model.clone(),
         models: models.clone(),
         credential_fingerprint: sync_snapshot.credential_fingerprint,
         catalog_fingerprint: sync_snapshot.catalog_fingerprint,
         permission_mode: INTERACTIVE_PERMISSION_MODE,
+    })
+}
+
+fn prepare_independent_interactive_launch(
+    options: &Options,
+    executable: String,
+    version: String,
+) -> Result<InteractiveLaunch, String> {
+    let home = native_dsh_home(&version)?;
+    let settings_path = home.join("settings.yaml");
+    let source = fs::read_to_string(&settings_path).map_err(|error| {
+        format!(
+            "Independent Mode 需要 DSH 原生 Provider 配置，请先在 {} 配置 settings.yaml ({error})",
+            settings_path.display()
+        )
+    })?;
+    let provider_config = parse_native_dsh_provider_config(&source)?;
+    let api_key = match provider_config.api_key_env.as_deref() {
+        Some(api_key_env) => env::var(api_key_env).map_err(|_| {
+            format!(
+                "DSH Provider {} 需要环境变量 {api_key_env}，请先完成原生服务配置",
+                provider_config.provider
+            )
+        })?,
+        None => String::new(),
+    };
+    let invocation = Invocation {
+        executable: executable.clone().into(),
+        args: Vec::new(),
+        workspace: std::env::current_dir().map_err(|error| error.to_string())?,
+        home: home.clone(),
+        api_key: api_key.clone(),
+        base_url: provider_config.base_url.clone(),
+        model: provider_config.model.clone(),
+        models: provider_config.models.clone(),
+        permission_mode: INTERACTIVE_PERMISSION_MODE,
+        run_id: "interactive".to_string(),
+    };
+    ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
+    let agent_patch = agent_overlay_path(&home);
+    Ok(InteractiveLaunch {
+        executable: PathBuf::from(executable),
+        home,
+        user_id: "local".to_string(),
+        api_key,
+        api_key_env: provider_config.api_key_env,
+        base_url: provider_config.base_url,
+        agent_patch,
+        default_model: provider_config.model,
+        models: provider_config.models,
+        credential_fingerprint: String::new(),
+        catalog_fingerprint: String::new(),
+        permission_mode: INTERACTIVE_PERMISSION_MODE,
+    })
+}
+
+fn parse_native_dsh_provider_config(source: &str) -> Result<NativeDshProviderConfig, String> {
+    let document = serde_yaml::from_str::<YamlValue>(source)
+        .map_err(|error| format!("读取 DSH 原生 Provider 配置失败: {error}"))?;
+    let root = document
+        .as_mapping()
+        .ok_or("DSH 原生 settings.yaml 必须是对象")?;
+    let selection = root
+        .get(YamlValue::String("agent-default-model".to_string()))
+        .and_then(YamlValue::as_mapping);
+    let provider = selection
+        .and_then(|value| value.get(YamlValue::String("provider".to_string())))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Independent Mode 需要在 DSH settings.yaml 配置 agent-default-model.provider")?;
+    let selected_model = selection
+        .and_then(|value| value.get(YamlValue::String("model".to_string())))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Independent Mode 需要在 DSH settings.yaml 配置 agent-default-model.model")?;
+    let providers = root
+        .get(YamlValue::String("llm-pi-ai".to_string()))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|value| value.get(YamlValue::String("providers".to_string())))
+        .and_then(YamlValue::as_mapping)
+        .ok_or("DSH settings.yaml 缺少 llm-pi-ai.providers")?;
+    let provider_config = providers
+        .get(YamlValue::String(provider.to_string()))
+        .and_then(YamlValue::as_mapping)
+        .ok_or_else(|| format!("DSH settings.yaml 未找到 Provider: {provider}"))?;
+    let api_key_env = provider_config
+        .get(YamlValue::String("apiKeyEnv".to_string()))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let base_url = provider_config
+        .get(YamlValue::String("baseURL".to_string()))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let mut models = vec![selected_model.to_string()];
+    if let Some(values) = provider_config
+        .get(YamlValue::String("models".to_string()))
+        .and_then(YamlValue::as_sequence)
+    {
+        models.extend(values.iter().filter_map(|value| {
+            value
+                .as_mapping()
+                .and_then(|item| item.get(YamlValue::String("id".to_string())))
+                .and_then(YamlValue::as_str)
+                .or_else(|| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }));
+    }
+    let mut seen = HashSet::new();
+    models.retain(|model| seen.insert(model.clone()));
+    Ok(NativeDshProviderConfig {
+        provider: provider.to_string(),
+        model: selected_model.to_string(),
+        api_key_env,
+        base_url: base_url.to_string(),
+        models,
     })
 }
 
@@ -1222,6 +1375,8 @@ fn build_invocation(
         args: vec![
             OsString::from("--profile"),
             OsString::from(HIMIND_HEADLESS_PROFILE),
+            OsString::from("--patch"),
+            agent_overlay_path(&home).into_os_string(),
             OsString::from(prompt),
         ],
         workspace,
@@ -1282,6 +1437,7 @@ fn ensure_home_config(invocation: &Invocation, options: &Options) -> Result<(), 
     migrate_legacy_managed_settings(&invocation.home)?;
     ensure_himind_profile(&invocation.home, options, invocation)?;
     ensure_himind_headless_profile(&invocation.home, options, invocation)?;
+    ensure_agent_overlay(&invocation.home, options, invocation)?;
     Ok(())
 }
 
@@ -1321,8 +1477,8 @@ fn ensure_himind_headless_profile(
 
 fn ensure_profile_files(
     home: &Path,
-    options: &Options,
-    invocation: &Invocation,
+    _options: &Options,
+    _invocation: &Invocation,
     profile_name: &str,
     package_json: &str,
     pnpm_workspace: &str,
@@ -1341,18 +1497,143 @@ fn ensure_profile_files(
             fs::write(path, content)?;
         }
     }
-    fs::write(
-        profile.join("cordis.patch.yml"),
-        render_himind_profile_patch_from_base(
-            home,
-            options,
-            &invocation.model,
-            &invocation.base_url,
-            &invocation.models,
-            base_patch,
-        )?,
-    )?;
+    ensure_profile_patch(&profile.join("cordis.patch.yml"), base_patch)?;
     Ok(())
+}
+
+fn ensure_profile_patch(path: &Path, base_patch: &str) -> Result<(), Box<dyn Error>> {
+    if !path.is_file() {
+        fs::write(path, base_patch)?;
+        return Ok(());
+    }
+    migrate_managed_profile_patch(path)
+}
+
+fn migrate_managed_profile_patch(path: &Path) -> Result<(), Box<dyn Error>> {
+    let source = fs::read_to_string(path)?;
+    if !source.contains(HIMIND_AGENT_PATCH_MARKER) && !source.contains("serverName: \"himind\"") {
+        return Ok(());
+    }
+    let Ok(document) = serde_yaml::from_str::<YamlValue>(&source) else {
+        // Do not destroy a user-authored file that is currently invalid; DSH
+        // will report its native parse error and the user can repair it.
+        return Ok(());
+    };
+    let Some(rows) = document.as_sequence() else {
+        return Ok(());
+    };
+    let filtered: Vec<YamlValue> = rows.iter().filter_map(strip_managed_patch_row).collect();
+    if filtered.as_slice() == rows.as_slice() {
+        return Ok(());
+    }
+    fs::write(path, serde_yaml::to_string(&filtered)?)?;
+    Ok(())
+}
+
+fn strip_managed_patch_row(row: &YamlValue) -> Option<YamlValue> {
+    let Some(mapping) = row.as_mapping() else {
+        return Some(row.clone());
+    };
+    let id = mapping
+        .get(YamlValue::String("id".to_string()))
+        .and_then(YamlValue::as_str)
+        .unwrap_or_default();
+    if matches!(
+        id,
+        "agent-default-model" | "llm-pi-ai" | "himind-mcp" | "himind-skill-filesystem"
+    ) || id == HIMIND_MCP_ROW_ID
+        || id == HIMIND_SKILL_ROW_ID
+        || id.starts_with("personal-mcp-")
+        || id.starts_with(HIMIND_PERSONAL_MCP_ROW_PREFIX)
+    {
+        return None;
+    }
+    let Some(inserted) = mapping
+        .get(YamlValue::String("insert".to_string()))
+        .and_then(YamlValue::as_sequence)
+    else {
+        return Some(row.clone());
+    };
+    let kept: Vec<YamlValue> = inserted
+        .iter()
+        .filter_map(strip_managed_patch_row)
+        .collect();
+    if kept.as_slice() == inserted.as_slice() {
+        return Some(row.clone());
+    }
+    let mut updated = mapping.clone();
+    updated.insert(
+        YamlValue::String("insert".to_string()),
+        YamlValue::Sequence(kept),
+    );
+    Some(YamlValue::Mapping(updated))
+}
+
+fn agent_overlay_path(home: &Path) -> PathBuf {
+    home.join(HIMIND_AGENT_OVERLAY_DIR)
+        .join(HIMIND_AGENT_OVERLAY_FILE)
+}
+
+fn ensure_agent_overlay(
+    home: &Path,
+    options: &Options,
+    invocation: &Invocation,
+) -> Result<(), Box<dyn Error>> {
+    validate_agent_mcp_namespace(home)?;
+    let path = agent_overlay_path(home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let overlay = render_himind_agent_overlay(
+        home,
+        options,
+        &invocation.model,
+        &invocation.base_url,
+        &invocation.models,
+    )?;
+    fs::write(path, overlay)?;
+    Ok(())
+}
+
+fn validate_agent_mcp_namespace(home: &Path) -> Result<(), Box<dyn Error>> {
+    for path in [
+        home.join("cordis.patch.yml"),
+        home.join("profiles")
+            .join(HIMIND_PROFILE)
+            .join("cordis.patch.yml"),
+        home.join("profiles")
+            .join(HIMIND_HEADLESS_PROFILE)
+            .join("cordis.patch.yml"),
+    ] {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(document) = serde_yaml::from_str::<YamlValue>(&fs::read_to_string(&path)?) else {
+            continue;
+        };
+        if yaml_contains_server_name(&document, HIMIND_MCP_SERVER_NAME) {
+            return Err(format!(
+                "DSH MCP serverName 已被用户配置占用: {HIMIND_MCP_SERVER_NAME} ({})，请改用其他名称",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn yaml_contains_server_name(value: &YamlValue, target: &str) -> bool {
+    match value {
+        YamlValue::Sequence(values) => values
+            .iter()
+            .any(|value| yaml_contains_server_name(value, target)),
+        YamlValue::Mapping(values) => values.iter().any(|(key, value)| {
+            key.as_str() == Some("serverName") && value.as_str().is_some_and(|name| name == target)
+                || yaml_contains_server_name(key, target)
+                || yaml_contains_server_name(value, target)
+        }),
+        _ => false,
+    }
 }
 
 fn merge_profile_package(path: &Path, defaults: &str) -> Result<(), Box<dyn Error>> {
@@ -1427,6 +1708,16 @@ fn render_himind_profile_patch(
     )
 }
 
+fn render_himind_agent_overlay(
+    home: &Path,
+    options: &Options,
+    default_model: &str,
+    base_url: &str,
+    models: &[String],
+) -> Result<String, Box<dyn Error>> {
+    render_himind_profile_patch_from_base(home, options, default_model, base_url, models, "")
+}
+
 fn render_himind_profile_patch_from_base(
     home: &Path,
     options: &Options,
@@ -1438,9 +1729,17 @@ fn render_himind_profile_patch_from_base(
     let executable = crate::install_layout::stable_launcher_for_executable(&env::current_exe()?);
     let args = himind_mcp_arguments(options);
     let mut patch = base_patch.trim_end().to_string();
-    append_managed_model_profile(&mut patch, home, default_model, base_url, models)?;
+    if options.mode().dashboard_enabled() {
+        append_managed_model_profile(&mut patch, home, default_model, base_url, models)?;
+    } else {
+        patch.push_str(
+            "\n\n# Independent Mode: provider and model selection remain owned by DSH settings.yaml.\n",
+        );
+    }
     patch.push_str("\n\n# Agent-owned context. This layer is regenerated for each new HiMind AI session.\n- insert:\n");
-    patch.push_str("    - id: himind-mcp\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        transport: stdio\n");
+    patch.push_str(&format!(
+        "    - id: {HIMIND_MCP_ROW_ID}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        transport: stdio\n"
+    ));
     patch.push_str(&format!(
         "        serverName: {}\n        command: {}\n        args:\n",
         yaml_scalar(HIMIND_MCP_SERVER_NAME),
@@ -1457,7 +1756,7 @@ fn render_himind_profile_patch_from_base(
         append_personal_mcp_row(&mut patch, &server);
     }
     patch.push_str(&format!(
-        "\n    - id: himind-skill-filesystem\n      name: '@deepseek-ai/dsh-skill-filesystem'\n      config:\n        providerName: himind-managed\n        includeDefaultRoots: false\n        customSkillDirs:\n          - {}\n        watch: false\n",
+        "\n    - id: {HIMIND_SKILL_ROW_ID}\n      name: '@deepseek-ai/dsh-skill-filesystem'\n      config:\n        providerName: himind-managed\n        includeDefaultRoots: true\n        customSkillDirs:\n          - {}\n        watch: false\n",
         yaml_scalar(&home.join(HIMIND_SKILL_ADAPTER_DIR).to_string_lossy()),
     ));
     Ok(patch)
@@ -1569,7 +1868,7 @@ fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
 
 fn append_personal_mcp_row(patch: &mut String, server: &crate::app::mcp_settings::McpServerConfig) {
     patch.push_str(&format!(
-        "\n    - id: personal-mcp-{}\n      name: '@deepseek-ai/dsh-mcp-client'\n",
+        "\n    - id: {HIMIND_PERSONAL_MCP_ROW_PREFIX}{}\n      name: '@deepseek-ai/dsh-mcp-client'\n",
         server.server_name
     ));
     if !server.enabled {
@@ -1842,6 +2141,16 @@ fn dsh_home(version: &str) -> Result<PathBuf, String> {
     Ok(root.join(INTERACTIVE_HOME_DIRECTORY))
 }
 
+fn native_dsh_home(version: &str) -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os(DSH_HOME_ENV).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(value));
+    }
+    if let Some(user_profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(user_profile).join(".dsh"));
+    }
+    dsh_home(version)
+}
+
 fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
     let root = env::var_os(DSH_HOME_ROOT_ENV)
         .filter(|value| !value.is_empty())
@@ -2028,11 +2337,11 @@ fn first_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_run_home, dsh_skill_name, ensure_interactive_home, first_line, managed_model_catalog,
-        merge_profile_package, migrate_legacy_managed_settings, parse_runtime_version,
-        remove_managed_runtime, render_himind_profile_patch, render_himind_profile_patch_from_base,
-        safe_relative_path, safe_segment, strip_yaml_frontmatter, versioned_home,
-        InteractiveEventProjector,
+        dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
+        managed_model_catalog, merge_profile_package, migrate_legacy_managed_settings,
+        parse_native_dsh_provider_config, parse_runtime_version, remove_managed_runtime,
+        render_himind_profile_patch, render_himind_profile_patch_from_base, safe_relative_path,
+        safe_segment, strip_yaml_frontmatter, versioned_home, InteractiveEventProjector,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
@@ -2045,6 +2354,26 @@ mod tests {
         assert_eq!(
             parse_runtime_version("dsh 0.1.0-rc.6\n"),
             Some("0.1.0-rc.6".to_string())
+        );
+    }
+
+    #[test]
+    fn native_dsh_provider_config_reads_selected_provider_and_catalog() {
+        let config = parse_native_dsh_provider_config(
+            "agent-default-model:\n  provider: personal-deepseek\n  model: deepseek-chat\nllm-pi-ai:\n  providers:\n    personal-deepseek:\n      displayName: Personal DeepSeek\n      apiKeyEnv: PERSONAL_DEEPSEEK_API_KEY\n      api: openai-completions\n      baseURL: https://api.example.test/v1\n      models:\n        - id: deepseek-chat\n        - id: deepseek-reasoner\n        - local-compatible\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.provider, "personal-deepseek");
+        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(
+            config.api_key_env.as_deref(),
+            Some("PERSONAL_DEEPSEEK_API_KEY")
+        );
+        assert_eq!(config.base_url, "https://api.example.test/v1");
+        assert_eq!(
+            config.models,
+            vec!["deepseek-chat", "deepseek-reasoner", "local-compatible"]
         );
     }
 
@@ -2174,7 +2503,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_profile_adds_agent_mcp_and_himind_skills_without_default_roots() {
+    fn managed_profile_adds_agent_mcp_and_himind_skills_without_disabling_dsh_roots() {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
@@ -2193,16 +2522,108 @@ mod tests {
         assert!(patch.contains("id: \"model-fast\""));
         assert!(patch.contains("- id: \"model-default\"\n            name: \"model-default\""));
         assert!(patch.contains("- id: \"model-fast\"\n            name: \"model-fast\""));
-        assert!(patch.contains("id: himind-mcp"));
+        assert!(patch.contains("id: himind-agent-mcp"));
         assert!(patch.contains("name: '@deepseek-ai/dsh-mcp-client'"));
         assert!(patch.contains("HIMIND_AI_CLIENT_ID: \"himind-ai\""));
-        assert!(patch.contains("id: himind-skill-filesystem"));
+        assert!(patch.contains("id: himind-agent-skill-filesystem"));
         assert!(patch.contains("providerName: himind-managed"));
-        assert!(patch.contains("includeDefaultRoots: false"));
+        assert!(patch.contains("includeDefaultRoots: true"));
         assert!(
             patch.contains("C:/HiMind/runtime-home\\\\himind-skills")
                 || patch.contains("C:/HiMind/runtime-home/himind-skills")
         );
+    }
+
+    #[test]
+    fn existing_managed_profile_patch_is_migrated_without_losing_user_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-profile-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("cordis.patch.yml");
+        let mut old = render_himind_profile_patch(
+            &root,
+            &crate::Options::from_env(),
+            "model-default",
+            "https://gateway.example/v1",
+            &["model-default".to_string()],
+        )
+        .unwrap();
+        old.push_str("\n- id: user-owned-row\n  config:\n    enabled: true\n");
+        std::fs::write(&path, old).unwrap();
+
+        ensure_profile_patch(
+            &path,
+            include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
+        )
+        .unwrap();
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("id: user-owned-row"));
+        assert!(!migrated.contains("id: agent-default-model"));
+        assert!(!migrated.contains("serverName: \"himind\""));
+        assert!(!migrated.contains("serverName: \"himind-agent\""));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_mcp_namespace_conflicts_are_rejected_before_dsh_boot() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-mcp-namespace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("profiles/himind")).unwrap();
+        std::fs::write(
+            root.join("profiles/himind/cordis.patch.yml"),
+            "- id: user-mcp\n  config:\n    serverName: himind-agent\n",
+        )
+        .unwrap();
+        let error = super::validate_agent_mcp_namespace(&root).unwrap_err();
+        assert!(error.to_string().contains("himind-agent"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn independent_profile_does_not_inject_dashboard_provider() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-independent-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut options = crate::Options::from_env();
+        options.api_base = "https://dashboard.example".to_string();
+        options.state_path = root.join("agent-state.json");
+        crate::app::runtime_mode::save(
+            &options.state_path,
+            crate::app::runtime_mode::AgentMode::Independent,
+        )
+        .unwrap();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        let profile = render_himind_profile_patch(
+            &root,
+            &options,
+            "local-model",
+            "https://provider.example/v1",
+            &["local-model".to_string()],
+        )
+        .unwrap();
+        assert!(!profile.contains("provider: himind-proxy"));
+        assert!(profile.contains("id: himind-agent-mcp"));
+        assert!(profile.contains("Independent Mode"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2316,8 +2737,8 @@ mod tests {
             &["model-default".to_string()],
         )
         .unwrap();
-        assert!(patch.contains("id: himind-mcp"));
-        assert!(patch.contains("id: personal-mcp-project-tools"));
+        assert!(patch.contains("id: himind-agent-mcp"));
+        assert!(patch.contains("id: himind-agent-personal-mcp-project-tools"));
         assert!(patch.contains("serverName: \"project-tools\""));
         assert!(patch.contains("command: \"node\""));
         assert!(patch.contains("\"API_KEY\": \"local-secret\""));
@@ -2481,8 +2902,8 @@ mod tests {
             include_str!("../../runtime-profiles/himind-headless/cordis.patch.yml"),
         )
         .unwrap();
-        assert!(profile.contains("id: himind-mcp"));
-        assert!(profile.contains("id: himind-skill-filesystem"));
+        assert!(profile.contains("id: himind-agent-mcp"));
+        assert!(profile.contains("id: himind-agent-skill-filesystem"));
         assert!(profile.contains("id: agent-default-model"));
         assert!(profile.contains("id: llm-pi-ai"));
         assert!(!profile.contains("id: web-runtime"));

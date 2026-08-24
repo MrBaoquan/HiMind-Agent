@@ -14,6 +14,7 @@
         "height": 680,
         "minWidth": 1000,
         "visible": false,
+        "decorations": false,
         "resizable": true,
         "center": true
       }

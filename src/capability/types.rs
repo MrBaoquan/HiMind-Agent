@@ -11,7 +11,25 @@ pub(crate) struct CapabilityDescriptor {
     pub description: String,
     pub risk_level: String,
     pub source: String,
+    pub availability: CapabilityAvailability,
     pub input_schema: Value,
+}
+
+/// Describes which runtime boundary a capability needs. A capability can be
+/// network-backed without being owned by the organization control plane; only
+/// `ControlPlane` is hidden when the Agent is running as an individual tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CapabilityAvailability {
+    Local,
+    NetworkService,
+    ControlPlane,
+}
+
+impl CapabilityAvailability {
+    pub(crate) fn available_without_control_plane(self) -> bool {
+        !matches!(self, Self::ControlPlane)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +81,7 @@ impl InvocationContext {
     }
 
     pub(crate) fn local_http() -> Self {
-        Self::new(InvocationSource::LocalHttp, "local-dashboard")
+        Self::new(InvocationSource::LocalHttp, "local-agent")
     }
 
     pub(crate) fn tauri() -> Self {
@@ -100,7 +118,7 @@ mod tests {
         let second = InvocationContext::local_http();
 
         assert_eq!(first.source.as_str(), "local_http");
-        assert_eq!(first.principal, "local-dashboard");
+        assert_eq!(first.principal, "local-agent");
         assert_ne!(first.request_id, second.request_id);
     }
 

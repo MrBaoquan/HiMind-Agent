@@ -17,6 +17,20 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             let capability_facts = capability_facts_for_cli(options)?;
             print_json(client_status_json(VERSION, &capability_facts)?)?
         }
+        Some("import-local") if arguments.len() == 2 => {
+            let record = crate::app::skill_manager::install_local_package(
+                std::path::Path::new(&arguments[1]),
+            )?;
+            print_json(serde_json::to_value(record)?)?
+        }
+        Some("import-github") if arguments.len() == 3 || arguments.len() == 4 => {
+            let record = crate::app::github_source::import_skill(
+                &arguments[1],
+                &arguments[2],
+                arguments.get(3).map(String::as_str).unwrap_or_default(),
+            )?;
+            print_json(record)?
+        }
         Some("sync") => {
             let capability_facts = capability_facts_for_cli(options)?;
             print_json(client_sync_json(VERSION, &capability_facts)?)?
@@ -99,7 +113,7 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         }
         _ => {
             return Err(
-				"usage: himind-agent skill <catalog|market|status|sync|plan <skill-id>|install <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
+                "usage: himind-agent skill <catalog|import-local path|import-github owner/repo ref [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
             )
         }
     }

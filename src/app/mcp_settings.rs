@@ -7,7 +7,13 @@ use std::path::{Path, PathBuf};
 use crate::store::{atomic_file, credentials};
 
 const SCHEMA_VERSION: u32 = 1;
-const RESERVED_SERVER_NAME: &str = "himind";
+const RESERVED_SERVER_NAME: &str = "himind-agent";
+const LEGACY_RESERVED_SERVER_NAME: &str = "himind";
+
+fn is_reserved_server_name(value: &str) -> bool {
+    value.eq_ignore_ascii_case(RESERVED_SERVER_NAME)
+        || value.eq_ignore_ascii_case(LEGACY_RESERVED_SERVER_NAME)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct McpServerConfig {
@@ -130,7 +136,7 @@ pub(crate) fn upsert(
 
 pub(crate) fn remove(agent_state_path: &Path, server_name: &str) -> Result<bool, Box<dyn Error>> {
     let server_name = server_name.trim();
-    if server_name.eq_ignore_ascii_case(RESERVED_SERVER_NAME) {
+    if is_reserved_server_name(server_name) {
         return Err("HiMind 内置 MCP 服务不能删除".into());
     }
     let path = settings_path(agent_state_path);
@@ -213,8 +219,8 @@ fn validate(server: &McpServerConfig) -> Result<(), Box<dyn Error>> {
     {
         return Err("MCP 服务名称只能包含字母、数字、下划线和短横线，长度不超过 32 个字符".into());
     }
-    if name.eq_ignore_ascii_case(RESERVED_SERVER_NAME) {
-        return Err("himind 是 HiMind 内置 MCP 服务名称，请换一个名称".into());
+    if is_reserved_server_name(name) {
+        return Err("himind-agent 是 HiMind 内置 MCP 服务名称，请换一个名称".into());
     }
     if !matches!(server.transport.as_str(), "stdio" | "streamable-http") {
         return Err("MCP 传输方式必须是 stdio 或 Streamable HTTP".into());

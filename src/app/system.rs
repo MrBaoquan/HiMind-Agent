@@ -503,6 +503,7 @@ fn powershell_failure(prefix: &str, output: &std::process::Output) -> String {
 pub(crate) fn open_url(url: &str) -> Result<(), Box<dyn Error>> {
     std::process::Command::new("cmd")
         .args(["/C", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }

@@ -9,7 +9,7 @@ export function ApprovalsPage({ approvals, onRefresh, onRespond }: {
 }) {
   return (
     <>
-      <PageHeader title="审批" description="处理后台敏感操作请求；运维工作台的一键直连不进入此列表。" actions={<IconButton icon={RefreshCw} label="刷新审批" onClick={onRefresh} />} />
+      <PageHeader title="审批" description="处理需要确认的敏感操作请求。" actions={<IconButton icon={RefreshCw} label="刷新审批" onClick={onRefresh} />} />
       <div className="card">
         <div className="card-header"><span>待处理请求</span><span className="section-count">{approvals.length}</span></div>
         <div className="card-body">
