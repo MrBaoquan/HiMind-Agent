@@ -177,7 +177,7 @@ mod tests {
             once: false,
             interval_seconds: 10,
             local_app: true,
-            local_port: 18182,
+            local_port: 18082,
             reenroll: false,
             enrollment_token: String::new(),
             agent_credential: Arc::new(RwLock::new(String::new())),
