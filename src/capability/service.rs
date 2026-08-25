@@ -72,6 +72,9 @@ enum CapabilityHandler {
     PluginCandidateTest,
     PluginSubmissionSubmit,
     PluginSubmissionStatus,
+    ExtensionReviewQueue,
+    ExtensionReviewGet,
+    ExtensionReviewDecide,
     SoftwareDistributionPublish,
     DashboardContextResolve,
     DashboardProjectContext,
@@ -527,6 +530,58 @@ impl CapabilityGateway {
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::PluginSubmissionStatus,
             ),
+            registration(
+                "extension.review.queue",
+                "扩展审核队列",
+                "读取待审核的 Skill 与插件提交，要求当前 Dashboard 用户具备管理员审核权限。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["all", "skill", "plugin"] },
+                        "query": { "type": "string" },
+                        "page": { "type": "integer", "minimum": 1 },
+                        "page_size": { "type": "integer", "minimum": 1, "maximum": 200 }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionReviewQueue,
+            ),
+            registration(
+                "extension.review.get",
+                "查看扩展审核详情",
+                "读取指定 Skill 或插件提交的制品、测试报告和自动审核结果。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["skill", "plugin"] },
+                        "id": { "type": "string" }
+                    },
+                    "required": ["kind", "id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionReviewGet,
+            ),
+            registration(
+                "extension.review.decide",
+                "审核并上架扩展",
+                "提交审核决定；approve_publish 会由 Dashboard 对不可变制品签名并发布，changes_requested/rejected 必须填写意见。",
+                "admin_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["skill", "plugin"] },
+                        "id": { "type": "string" },
+                        "artifact_id": { "type": "string" },
+                        "action": { "type": "string", "enum": ["approve_publish", "changes_requested", "rejected"] },
+                        "note": { "type": "string", "maxLength": 4000 }
+                    },
+                    "required": ["kind", "id", "artifact_id", "action"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionReviewDecide,
+            ),
             registration_versioned(
                 "software.distribution.release.publish",
                 "1.1.0",
@@ -777,6 +832,9 @@ impl CapabilityGateway {
             CapabilityHandler::PluginCandidateTest => self.test_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionSubmit => self.submit_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
+            CapabilityHandler::ExtensionReviewQueue => self.extension_review_queue(input),
+            CapabilityHandler::ExtensionReviewGet => self.extension_review_get(input),
+            CapabilityHandler::ExtensionReviewDecide => self.extension_review_decide(input),
             CapabilityHandler::SoftwareDistributionPublish => {
                 self.publish_software_release(context, input)
             }
@@ -1072,14 +1130,6 @@ impl CapabilityGateway {
         if draft.tested_at.is_none() {
             return Err("Skill 候选包尚未完成测试".into());
         }
-        if !confirm_submission(
-            "Skill",
-            &draft.manifest.name,
-            &version,
-            &draft.candidate_sha256,
-        ) {
-            return Err("用户取消了 Skill 提审".into());
-        }
         if draft.confirmed_at.is_none() {
             crate::skill::authoring::confirm(&id, &version)?;
         }
@@ -1121,14 +1171,6 @@ impl CapabilityGateway {
         if draft.tested_at.is_none() {
             return Err("插件候选包尚未完成测试".into());
         }
-        if !confirm_submission(
-            "插件",
-            &draft.manifest.name,
-            &version,
-            &draft.candidate_sha256,
-        ) {
-            return Err("用户取消了插件提审".into());
-        }
         if draft.confirmed_at.is_none() {
             crate::plugin_authoring::confirm(&id, &version)?;
         }
@@ -1154,6 +1196,94 @@ impl CapabilityGateway {
             json!({ "items": crate::api::distribution::plugin_submissions(
             &client, &self.options.api_base, &agent_id, &access.token
         )? }),
+        )
+    }
+
+    fn extension_review_queue(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let agent_id = self.load_paired_agent()?;
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::RELEASE_MANAGE_SCOPE,
+        )?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        crate::api::distribution::extension_review_queue(
+            &client,
+            &self.options.api_base,
+            &agent_id,
+            &access.token,
+            &input,
+        )
+    }
+
+    fn extension_review_get(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (kind, id) = extension_review_identity(&input)?;
+        let agent_id = self.load_paired_agent()?;
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::RELEASE_MANAGE_SCOPE,
+        )?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        crate::api::distribution::extension_review_get(
+            &client,
+            &self.options.api_base,
+            &agent_id,
+            &access.token,
+            &kind,
+            &id,
+        )
+    }
+
+    fn extension_review_decide(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (kind, id) = extension_review_identity(&input)?;
+        let artifact_id = input
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let note = input
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if artifact_id.is_empty() {
+            return Err("artifact_id is required".into());
+        }
+        if !matches!(action, "approve_publish" | "changes_requested" | "rejected") {
+            return Err("action must be approve_publish, changes_requested, or rejected".into());
+        }
+        if matches!(action, "changes_requested" | "rejected") && note.is_empty() {
+            return Err("note is required for changes_requested or rejected".into());
+        }
+        if note.chars().count() > 4000 {
+            return Err("note is too long".into());
+        }
+        let agent_id = self.load_paired_agent()?;
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::RELEASE_MANAGE_SCOPE,
+        )?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        crate::api::distribution::extension_review_decide(
+            &client,
+            &self.options.api_base,
+            &agent_id,
+            &access.token,
+            &kind,
+            &id,
+            artifact_id,
+            action,
+            note,
         )
     }
 
@@ -1205,16 +1335,26 @@ fn authoring_identity(input: &Value) -> Result<(String, String), Box<dyn Error>>
     Ok((id, version))
 }
 
-fn confirm_submission(kind: &str, name: &str, version: &str, sha256: &str) -> bool {
-    matches!(
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title(format!("确认提交{kind}审核"))
-            .set_description(format!("名称：{name}\n版本：{version}\nSHA-256：{sha256}\n\n提交后候选制品不可变，是否继续？"))
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show(),
-        rfd::MessageDialogResult::Yes
-    )
+fn extension_review_identity(input: &Value) -> Result<(String, String), Box<dyn Error>> {
+    let kind = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(kind.as_str(), "skill" | "plugin") {
+        return Err("kind must be skill or plugin".into());
+    }
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if id.is_empty() || id.len() > 200 || id.contains('/') || id.contains('\\') {
+        return Err("id is required and must be a review identifier".into());
+    }
+    Ok((kind, id))
 }
 
 fn requires_native_software_confirmation(context: &InvocationContext) -> bool {
@@ -1256,6 +1396,9 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         | "extension.skill.submission.status"
         | "extension.plugin.submission.submit"
         | "extension.plugin.submission.status" => Some(crate::api::oauth::CREATIVE_SUBMIT_SCOPE),
+        "extension.review.queue" | "extension.review.get" | "extension.review.decide" => {
+            Some(crate::api::oauth::RELEASE_MANAGE_SCOPE)
+        }
         "software.distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
         "context.resolve" | "project.context.get" | "exhibit.context.get" | "work.my_summary" => {
             Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
@@ -1284,6 +1427,9 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::SkillSubmissionStatus
         | CapabilityHandler::PluginSubmissionSubmit
         | CapabilityHandler::PluginSubmissionStatus
+        | CapabilityHandler::ExtensionReviewQueue
+        | CapabilityHandler::ExtensionReviewGet
+        | CapabilityHandler::ExtensionReviewDecide
         | CapabilityHandler::SoftwareDistributionPublish
         | CapabilityHandler::DashboardContextResolve
         | CapabilityHandler::DashboardProjectContext

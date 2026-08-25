@@ -834,6 +834,97 @@ pub fn plugin_submissions(
         .items)
 }
 
+/// Read the Dashboard administrator review queue through the Agent's delegated
+/// OAuth identity. The response is kept as JSON so new review metadata can be
+/// added server-side without requiring an Agent release.
+pub fn extension_review_queue(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut query: Vec<(String, String)> = Vec::new();
+    if let Some(kind) = input.get("kind").and_then(|value| value.as_str()) {
+        if !kind.trim().is_empty() && kind != "all" {
+            query.push(("kind".to_string(), kind.trim().to_string()));
+        }
+    }
+    if let Some(value) = input.get("query").and_then(|value| value.as_str()) {
+        if !value.trim().is_empty() {
+            query.push(("q".to_string(), value.trim().to_string()));
+        }
+    }
+    for key in ["page", "page_size"] {
+        if let Some(value) = input.get(key).and_then(|value| value.as_i64()) {
+            if value > 0 {
+                query.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    review_json(
+        client
+            .get(format!("{api_base}/api/distribution/review-queue"))
+            .query(&query)
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )
+}
+
+pub fn extension_review_get(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    kind: &str,
+    review_id: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    review_json(
+        client
+            .get(format!(
+                "{api_base}/api/distribution/reviews/{}/{}",
+                encode_path_segment(kind),
+                encode_path_segment(review_id)
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .send()?,
+    )
+}
+
+pub fn extension_review_decide(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    kind: &str,
+    review_id: &str,
+    artifact_id: &str,
+    action: &str,
+    note: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    review_json(
+        client
+            .post(format!(
+                "{api_base}/api/distribution/reviews/{}/{}/decision",
+                encode_path_segment(kind),
+                encode_path_segment(review_id)
+            ))
+            .bearer_auth(access_token)
+            .header("X-HiMind-Agent-ID", agent_id)
+            .header("X-HiMind-AI-Client", ai_client_id())
+            .json(&json!({
+                "action": action,
+                "note": note,
+                "artifact_id": artifact_id,
+            }))
+            .send()?,
+    )
+}
+
 pub fn extension_collaboration(
     client: &Client,
     api_base: &str,
@@ -1049,6 +1140,19 @@ fn collaboration_json<T: DeserializeOwned>(response: Response) -> Result<T, Box<
         .ok()
         .and_then(|value| value["error"].as_str().map(str::to_string))
         .unwrap_or_else(|| format!("Dashboard request failed: {status}"));
+    Err(message.into())
+}
+
+fn review_json(response: Response) -> Result<serde_json::Value, Box<dyn Error>> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response.json()?);
+    }
+    let message = response
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|value| value["error"].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("Dashboard review request failed: {status}"));
     Err(message.into())
 }
 
