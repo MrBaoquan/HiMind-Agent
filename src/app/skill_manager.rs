@@ -1,6 +1,6 @@
 use crate::api::distribution::{skill_catalog, skill_versions, SkillCatalogItem};
 use crate::app::plugin_manager;
-use crate::app::system::{validate_signature_metadata, verify_rsa_pss_sha256};
+use crate::app::system::verify_extension_artifact_signature;
 use crate::skill::manifest::{validate_relative_package_path, validate_skill_package_root};
 use crate::skill::resolver::compare_versions;
 use crate::skill::store::{SkillManagementPolicy, SkillStore};
@@ -123,6 +123,65 @@ pub(crate) fn install_local_package_from_source(
     if staging.exists() {
         let _ = fs::remove_dir_all(staging);
     }
+    result
+}
+
+/// Installs a Skill release from a configured public extension source.
+/// Public sources never receive organization management authority.
+pub(crate) fn install_public_catalog_item(
+    item: &SkillCatalogItem,
+    require_signature: bool,
+) -> Result<SkillRecord, Box<dyn Error>> {
+    if item.management != "user_managed" || item.assignment != "optional" || item.managed {
+        return Err("公共扩展源不能授予组织管理策略".into());
+    }
+    ensure_supported(item)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .user_agent("HiMind-Agent")
+        .build()?;
+    let archive = download_public(&client, item, require_signature)?;
+    let staging = env::temp_dir().join(format!("himind-public-skill-{}", unique_suffix()));
+    let result = (|| {
+        extract_archive(&archive, &staging)?;
+        validate_package_size(&staging)?;
+        verify_checksums(&staging)?;
+        verify_declared_contents(&staging)?;
+        let manifest = validate_skill_package_root(&staging)?;
+        if manifest.id != item.skill_id || manifest.version != item.version {
+            return Err("Skill Manifest ID 或版本与扩展源记录不一致".into());
+        }
+        let store = SkillStore::new();
+        let record = match manifest.scope {
+            crate::skill::types::SkillScope::User => {
+                store.install_user_package(&staging, &manifest.id, &manifest.version)?
+            }
+            crate::skill::types::SkillScope::Organization => {
+                let record = store.install_organization_package(
+                    &staging,
+                    &manifest.id,
+                    &manifest.version,
+                )?;
+                store.apply_management_policy(
+                    &manifest.id,
+                    &SkillManagementPolicy {
+                        management: "user_managed".to_string(),
+                        source: item.source.clone(),
+                        assignment_id: String::new(),
+                        reason: "来自 GitHub 扩展源".to_string(),
+                        allow_uninstall: true,
+                    },
+                )?;
+                record
+            }
+            crate::skill::types::SkillScope::Builtin => {
+                return Err("公共扩展源不允许覆盖内置 Skill".into())
+            }
+        };
+        Ok(record)
+    })();
+    let _ = fs::remove_file(archive);
+    let _ = fs::remove_dir_all(staging);
     result
 }
 
@@ -280,6 +339,7 @@ fn ensure_supported(item: &SkillCatalogItem) -> Result<(), Box<dyn Error>> {
         client.eq_ignore_ascii_case("codex")
             || client.eq_ignore_ascii_case("github-copilot")
             || client.eq_ignore_ascii_case("workbuddy")
+            || client.eq_ignore_ascii_case("himind-ai")
     }) {
         return Err("该 Skill 当前不支持本机已实现的 AI 客户端适配器".into());
     }
@@ -349,22 +409,65 @@ fn download(
         let _ = fs::remove_file(&path);
         return Err("Skill 制品 SHA-256 校验失败".into());
     }
-    verify_signature(&path, item)?;
-    Ok(path)
-}
-
-fn verify_signature(path: &Path, item: &SkillCatalogItem) -> Result<(), Box<dyn Error>> {
-    validate_signature_metadata(
+    verify_extension_artifact_signature(
+        &path,
         &item.signature,
         &item.signature_key_id,
         &item.signature_algorithm,
         true,
     )?;
-    let trusted =
-        env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").ok_or("未配置 Skill 商城受信公钥目录")?;
-    let pem =
-        fs::read_to_string(PathBuf::from(trusted).join(format!("{}.pem", item.signature_key_id)))?;
-    verify_rsa_pss_sha256(path, &pem, &item.signature)
+    Ok(path)
+}
+
+fn download_public(
+    client: &Client,
+    item: &SkillCatalogItem,
+    require_signature: bool,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if item.file_size == 0 || item.file_size > MAX_SKILL_ARCHIVE_BYTES {
+        return Err("Skill 制品大小无效或超过 16 MiB 限制".into());
+    }
+    let url = url::Url::parse(&item.download_url)?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return Err("公共 Skill 制品必须使用 github.com 的 HTTPS Release 地址".into());
+    }
+    let mut response = client.get(url).send()?.error_for_status()?;
+    let path = env::temp_dir().join(format!("himind-public-skill-{}.hmskill", unique_suffix()));
+    let mut file = File::create(&path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = response.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_SKILL_ARCHIVE_BYTES || total > item.file_size {
+            let _ = fs::remove_file(&path);
+            return Err("Skill 制品实际大小超过发布记录".into());
+        }
+        file.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+    }
+    file.flush()?;
+    if total != item.file_size {
+        let _ = fs::remove_file(&path);
+        return Err("Skill 制品实际大小与发布记录不一致".into());
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&item.sha256) {
+        let _ = fs::remove_file(&path);
+        return Err("Skill 制品 SHA-256 校验失败".into());
+    }
+    verify_extension_artifact_signature(
+        &path,
+        &item.signature,
+        &item.signature_key_id,
+        &item.signature_algorithm,
+        require_signature,
+    )?;
+    Ok(path)
 }
 
 pub(crate) fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
@@ -508,8 +611,86 @@ fn unique_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{verify_checksums, verify_declared_contents};
+    use crate::api::distribution::SkillCatalogItem;
+    use crate::app::system::verify_extension_artifact_signature;
     use sha2::{Digest, Sha256};
     use std::fs;
+
+    fn catalog_skill() -> SkillCatalogItem {
+        SkillCatalogItem {
+            skill_id: "com.himind.skill.unsigned".to_string(),
+            name: "未签名 Skill".to_string(),
+            description: String::new(),
+            author_name: String::new(),
+            categories: vec![],
+            version: "1.0.0".to_string(),
+            release_notes: String::new(),
+            published_at: String::new(),
+            min_agent_version: String::new(),
+            supported_clients: vec!["codex".to_string(), "github-copilot".to_string()],
+            capability_ids: vec![],
+            plugin_dependencies: vec![],
+            risk_summary: String::new(),
+            channel: "stable".to_string(),
+            artifact_id: String::new(),
+            file_name: "skill.hmskill".to_string(),
+            file_size: 1,
+            sha256: "0".repeat(64),
+            signature: String::new(),
+            signature_key_id: String::new(),
+            signature_algorithm: String::new(),
+            download_url: "https://github.com/Owner/repo/releases/download/v1/skill.hmskill"
+                .to_string(),
+            source: "github:test".to_string(),
+            assignment: "optional".to_string(),
+            management: "user_managed".to_string(),
+            install_mode: "prompt".to_string(),
+            organization_reason: String::new(),
+            managed: false,
+            allow_disable: true,
+            allow_uninstall: true,
+        }
+    }
+
+    #[test]
+    fn unsigned_skill_is_allowed_only_when_the_source_policy_is_optional() {
+        let path = std::env::temp_dir().join(format!(
+            "himind-skill-signature-policy-test-{}",
+            super::unique_suffix()
+        ));
+        fs::write(&path, b"unsigned skill").unwrap();
+        let mut item = catalog_skill();
+
+        assert!(verify_extension_artifact_signature(
+            &path,
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            false
+        )
+        .is_ok());
+        assert!(verify_extension_artifact_signature(
+            &path,
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            true
+        )
+        .is_err());
+
+        item.signature = "c2ln".to_string();
+        item.signature_key_id = "missing-key".to_string();
+        item.signature_algorithm = "rsa-pss-sha256".to_string();
+        assert!(verify_extension_artifact_signature(
+            &path,
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            false
+        )
+        .is_err());
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn verifies_skill_checksums_and_rejects_unlisted_files() {

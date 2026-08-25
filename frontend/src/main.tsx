@@ -13,7 +13,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -42,6 +42,8 @@ function App() {
   const [dashboardAuthorization, setDashboardAuthorization] = useState<DashboardAuthorizationProgress | null>(null);
   const [aiIntegration, setAiIntegration] = useState<AiIntegrationOverview | null>(null);
   const [builtinAiToolContext, setBuiltinAiToolContext] = useState<BuiltinAIToolContextSummary | null>(null);
+  const [builtinAiActivated, setBuiltinAiActivated] = useState(false);
+  const [builtinAiWorkspaceRequest, setBuiltinAiWorkspaceRequest] = useState<{ target: BuiltinAiWorkspaceTarget; revision: number }>({ target: null, revision: 0 });
   const [mcpTestResult, setMcpTestResult] = useState<McpConnectionTestResult | null>(null);
   const [aiOperation, setAiOperation] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
@@ -70,6 +72,11 @@ function App() {
   const [skillError, setSkillError] = useState<string | null>(null);
   const [skillOperation, setSkillOperation] = useState<string | null>(null);
   const [extensionProjects, setExtensionProjects] = useState<ExtensionProject[]>([]);
+  const [extensionWorkspace, setExtensionWorkspace] = useState<ExtensionWorkspaceSettings>({ configured: false, valid: false, root: '', catalog_path: '', repository: '', default_branch: '', extension_count: 0, error: '' });
+  const [extensionSources, setExtensionSources] = useState<ExtensionSourceSettings>({ schema_version: 1, sources: [] });
+  const [extensionSourceSnapshot, setExtensionSourceSnapshot] = useState<ExtensionSourceSnapshot | null>(null);
+  const [extensionSourcesLoading, setExtensionSourcesLoading] = useState(false);
+  const [extensionSourcesError, setExtensionSourcesError] = useState('');
   const [extensionRemoteProjects, setExtensionRemoteProjects] = useState<ExtensionRemoteProject[]>([]);
   const [extensionInvitations, setExtensionInvitations] = useState<ExtensionCollaborationInvitation[]>([]);
   const [developmentOperation, setDevelopmentOperation] = useState<string | null>(null);
@@ -94,6 +101,9 @@ function App() {
     const current = statusRef.current || status;
     if (!current) return false;
     return current.mode !== 'independent' && current.dashboard_enabled !== false;
+  }
+  function extensionMarketEnabled() {
+    return dashboardEnabled() || extensionSources.sources.some(source => source.enabled);
   }
   async function refreshUpdateStatus() { setUpdateStatus(await agentApi.updateStatus()); }
   async function refreshDashboardIdentity() {
@@ -200,9 +210,7 @@ function App() {
       ]);
       setPluginRegistry(registry);
       setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
-      if (!dashboardEnabled()) {
-        setPluginCatalog([]);
-      } else try {
+      try {
         const catalog = await withTimeout(agentApi.pluginCatalog(), '插件市场');
         setPluginCatalog(Array.isArray(catalog) ? catalog : []);
       } catch (error) {
@@ -242,7 +250,7 @@ function App() {
     const [catalogResult, statusResult, marketResult] = await Promise.allSettled([
       withTimeout(agentApi.skillCatalog(), '本地 Skill 目录'),
       withTimeout(agentApi.codexSkillStatus(), 'Codex Skill 状态'),
-      dashboardEnabled() ? withTimeout(agentApi.organizationSkillCatalog(), '组织 Skill 商城') : Promise.resolve([] as OrganizationSkillCatalogItem[]),
+      withTimeout(agentApi.organizationSkillCatalog(), '技能市场'),
     ]);
     const errors: string[] = [];
     if (catalogResult.status === 'fulfilled') {
@@ -262,28 +270,94 @@ function App() {
 	  setSkillMarketError(null);
 	} else {
 	  setOrganizationSkills([]);
-	  setSkillMarketError(dashboardEnabled() ? formatError(marketResult.reason, '组织商城暂不可用') : null);
+	  setSkillMarketError(formatError(marketResult.reason, '技能市场暂不可用'));
 	}
     setSkillError(errors.length ? errors.join('；') : null);
   }
 
   async function refreshDevelopment() {
-    const [projects, remoteProjects, pluginDraftResult, pluginSubmissionResult, skillDraftResult, skillSubmissionResult, invitationResult] = await Promise.allSettled([
+    const [projects, pluginDraftResult, skillDraftResult] = await Promise.allSettled([
       agentApi.extensionProjects(),
-      agentApi.extensionCollaborationProjects(),
       agentApi.pluginDrafts(),
-      agentApi.pluginSubmissions(),
       agentApi.skillDrafts(),
+    ]);
+    try { setExtensionWorkspace(await agentApi.extensionWorkspace()); }
+    catch (error) { console.error('Extension workspace unavailable', error); }
+    if (projects.status === 'fulfilled') setExtensionProjects(projects.value || []);
+    if (pluginDraftResult.status === 'fulfilled') setPluginDrafts(pluginDraftResult.value || []);
+    if (skillDraftResult.status === 'fulfilled') setSkillDrafts(skillDraftResult.value || []);
+    if (!dashboardEnabled()) {
+      setExtensionRemoteProjects([]);
+      setPluginSubmissions([]);
+      setSkillSubmissions([]);
+      setExtensionInvitations([]);
+      return;
+    }
+    const [remoteProjects, pluginSubmissionResult, skillSubmissionResult, invitationResult] = await Promise.allSettled([
+      agentApi.extensionCollaborationProjects(),
+      agentApi.pluginSubmissions(),
       agentApi.skillSubmissions(),
       agentApi.extensionCollaborationInvitations(),
     ]);
-    if (projects.status === 'fulfilled') setExtensionProjects(projects.value || []);
     if (remoteProjects.status === 'fulfilled') setExtensionRemoteProjects(remoteProjects.value || []);
-    if (pluginDraftResult.status === 'fulfilled') setPluginDrafts(pluginDraftResult.value || []);
     if (pluginSubmissionResult.status === 'fulfilled') setPluginSubmissions(pluginSubmissionResult.value || []);
-    if (skillDraftResult.status === 'fulfilled') setSkillDrafts(skillDraftResult.value || []);
     if (skillSubmissionResult.status === 'fulfilled') setSkillSubmissions(skillSubmissionResult.value || []);
     if (invitationResult.status === 'fulfilled') setExtensionInvitations(invitationResult.value || []);
+  }
+  async function refreshExtensionSourceSettings() {
+    setExtensionSources(await agentApi.extensionSources());
+  }
+  async function refreshExtensionSources() {
+    setExtensionSourcesLoading(true);
+    setExtensionSourcesError('');
+    try {
+      const settings = await agentApi.extensionSources();
+      setExtensionSources(settings);
+      try {
+        setExtensionSourceSnapshot(await agentApi.extensionSourceSnapshot());
+      } catch (error) {
+        setExtensionSourceSnapshot(null);
+        setExtensionSourcesError(formatError(error, '扩展源刷新失败'));
+      }
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
+  async function addExtensionSource(name: string, repository: string, reference: string, catalogPath: string, verification: ExtensionSourceConfig['verification']) {
+    setExtensionSourcesLoading(true);
+    try {
+      setExtensionSources(await agentApi.addExtensionSource(name, repository, reference, catalogPath, verification));
+      await refreshExtensionSources();
+      await Promise.all([refreshPlugins(), refreshSkills()]);
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
+  async function updateExtensionSource(source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) {
+    setExtensionSourcesLoading(true);
+    try {
+      setExtensionSources(await agentApi.updateExtensionSource(source.id, enabled, autoUpdate, verification));
+      await refreshExtensionSources();
+      await Promise.all([refreshPlugins(), refreshSkills()]);
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
+  async function removeExtensionSource(sourceId: string) {
+    setExtensionSourcesLoading(true);
+    try {
+      setExtensionSources(await agentApi.removeExtensionSource(sourceId));
+      await refreshExtensionSources();
+      await Promise.all([refreshPlugins(), refreshSkills()]);
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
+  async function selectExtensionWorkspace() {
+    const workspace = await agentApi.selectExtensionWorkspace();
+    setExtensionWorkspace(workspace);
+    await refreshDevelopment();
+    notify('success', `已选择扩展聚合仓库，共 ${workspace.extension_count} 个扩展`);
   }
 
   async function refreshReviewProgress() {
@@ -322,7 +396,9 @@ function App() {
       refreshPlugins(),
       refreshSkills(),
       refreshLogs(),
-      ...(connected ? [refreshExtensionDesiredState(), refreshDevelopment(), refreshExtensionProjects(), refreshExtensionInvitations()] : []),
+      refreshDevelopment(),
+      refreshExtensionSourceSettings(),
+      ...(connected ? [refreshExtensionDesiredState()] : []),
     ]);
     for (const result of results) {
       if (result.status === 'rejected') throw result.reason;
@@ -465,7 +541,60 @@ function App() {
     }
   }
 
-  function openBuiltinAi() { setPage('builtin-ai'); }
+  async function openBuiltinAi(project?: ExtensionProject) {
+    if (project) {
+      try {
+        await agentApi.prepareExtensionAuthoring();
+        await Promise.all([refreshPlugins(), refreshSkills()]);
+      } catch (error) {
+        notify('error', formatError(error, '扩展创作助手尚未就绪，请检查扩展源'));
+        return;
+      }
+    }
+    if (project) {
+      setBuiltinAiWorkspaceRequest(current => {
+        if (current.target?.kind === 'project' && current.target.projectId === project.id) return current;
+        return {
+          target: { kind: 'project', projectId: project.id, name: project.name, path: project.workspace_path },
+          revision: current.revision + 1,
+        };
+      });
+    }
+    setBuiltinAiActivated(true);
+    setPage('builtin-ai');
+  }
+
+  async function invalidateBuiltinAiToolContext() {
+    try {
+      await agentApi.reloadBuiltinAiToolContext();
+    } catch (error) {
+      console.error('HiMind AI 工具上下文刷新失败', error);
+    }
+    setBuiltinAiWorkspaceRequest(current => ({ ...current, revision: current.revision + 1 }));
+  }
+
+  async function openExtensionWorkspaceAi() {
+    if (!extensionWorkspace.valid) {
+      notify('error', extensionWorkspace.error || '请先选择有效的扩展聚合仓库');
+      return;
+    }
+    try {
+      await agentApi.prepareExtensionAuthoring();
+      await Promise.all([refreshPlugins(), refreshSkills()]);
+    } catch (error) {
+      notify('error', formatError(error, '扩展创作助手尚未就绪，请检查扩展源'));
+      return;
+    }
+    setBuiltinAiWorkspaceRequest(current => {
+      if (current.target?.kind === 'extension-workspace' && current.target.path === extensionWorkspace.root) return current;
+      return {
+        target: { kind: 'extension-workspace', name: '扩展聚合仓库', path: extensionWorkspace.root },
+        revision: current.revision + 1,
+      };
+    });
+    setBuiltinAiActivated(true);
+    setPage('builtin-ai');
+  }
 
   async function runSkillOperation(key: string, action: () => Promise<string>, fallback: string) {
     if (skillOperation) return;
@@ -642,11 +771,13 @@ function App() {
       onOpenAiConnections={() => setPage('ai')}
       onOpenPlugins={() => setPage('plugins')}
       onOpenSkills={() => setPage('skills')}
-      onToolContextChanged={() => { void refreshBuiltinAiToolContext(); }}
+      onToolContextChanged={() => { void refreshBuiltinAiToolContext(); void invalidateBuiltinAiToolContext(); }}
       toolSummary={builtinAiToolContext || {
         skills: skillCatalog?.items?.length || 0,
         mcp_services: 1,
       }}
+      workspaceTarget={builtinAiWorkspaceRequest.target}
+      workspaceRequestRevision={builtinAiWorkspaceRequest.revision}
     />;
 
   const content = (() => {
@@ -685,7 +816,7 @@ function App() {
       onTest={testMcpConnection}
     />;
     if (page === 'approvals') return <ApprovalsPage approvals={approvals} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} />;
-    if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} dashboardEnabled={dashboardEnabled()} desired={extensionDesiredState} desiredLoading={extensionDesiredLoading} desiredError={extensionDesiredError} skillStatus={skillStatus} onQueryCatalog={agentApi.queryPluginCatalog} onRefresh={() => run(async () => { await Promise.all([refreshExtensionDesiredState(), refreshPlugins()]); })} onLoadVersions={agentApi.pluginVersions} onPlanInstall={agentApi.planPluginInstall} onImportLocal={() => run(async () => { const registry = await agentApi.importLocalPlugin(); setPluginRegistry(registry); }, '本地插件已导入', '导入本地插件失败')} onImportGithub={async (repository, reference, subpath) => { const registry = await agentApi.importGithubPlugin(repository, reference, subpath); setPluginRegistry(registry); notify('success', 'GitHub 插件已导入'); }} onInstall={(pluginId, version) => run(async () => { await agentApi.installPlugin(pluginId, version); await refreshPlugins(); }, `已安装插件${version ? ` v${version}` : ''}`, '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); }, enabled ? '插件已启用' : '插件已停用', '更新插件状态失败')} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
+    if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} dashboardEnabled={dashboardEnabled()} marketEnabled={extensionMarketEnabled()} desired={extensionDesiredState} desiredLoading={extensionDesiredLoading} desiredError={extensionDesiredError} skillStatus={skillStatus} onQueryCatalog={agentApi.queryPluginCatalog} onRefresh={() => run(async () => { await Promise.all([refreshExtensionDesiredState(), refreshPlugins()]); })} onLoadVersions={agentApi.pluginVersions} onPlanInstall={agentApi.planPluginInstall} onImportLocal={() => run(async () => { const registry = await agentApi.importLocalPlugin(); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); }, '本地插件已导入', '导入本地插件失败')} onImportGithub={async (repository, reference, subpath) => { const registry = await agentApi.importGithubPlugin(repository, reference, subpath); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub 插件已导入'); }} onInstall={(pluginId, version) => run(async () => { await agentApi.installPlugin(pluginId, version); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, `已安装插件${version ? ` v${version}` : ''}`, '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, enabled ? '插件已启用' : '插件已停用', '更新插件状态失败')} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}
       status={skillStatus}
@@ -693,6 +824,7 @@ function App() {
       marketplace={organizationSkills}
       marketplaceError={skillMarketError}
 	  dashboardEnabled={dashboardEnabled()}
+	  marketEnabled={extensionMarketEnabled()}
 	  desired={extensionDesiredState}
 	  desiredLoading={extensionDesiredLoading}
 	  desiredError={extensionDesiredError}
@@ -704,6 +836,7 @@ function App() {
       onSyncAll={() => runSkillOperation('sync-all', async () => {
         const result = await agentApi.syncCodexSkills();
         await refreshSkills();
+        await invalidateBuiltinAiToolContext();
         const copilot = result.clients?.['github-copilot'];
         const workbuddy = result.clients?.workbuddy;
         const blocked = result.blocked.length + (copilot?.blocked.length || 0) + (workbuddy?.blocked.length || 0);
@@ -712,6 +845,7 @@ function App() {
       onSyncSkill={(skillId) => runSkillOperation(`sync:${skillId}`, async () => {
         const result = await agentApi.syncCodexSkill(skillId);
         await refreshSkills();
+        await invalidateBuiltinAiToolContext();
         return result.rendered.state === 'skipped' ? '技能已是最新版本' : '技能已安装';
       }, '安装技能失败')}
       syncMode={skillStatus?.sync_mode || 'copy'}
@@ -719,6 +853,7 @@ function App() {
         await agentApi.setSkillSyncMode(mode);
         await agentApi.syncCodexSkills();
         await refreshSkills();
+        await invalidateBuiltinAiToolContext();
         return '安装方式已更新';
       }, '更新安装方式失败')}
       onPlanMarketplace={agentApi.planOrganizationSkillInstall}
@@ -726,23 +861,32 @@ function App() {
       onInstallMarketplace={(skillId, version, optionalPluginIds) => runSkillOperation(`market:${skillId}`, async () => {
         const result = await agentApi.installOrganizationSkill(skillId, version, optionalPluginIds);
         await refreshSkills();
-        return `已从组织商城安装 ${result.record.manifest.name} v${result.record.manifest.version}`;
+        await invalidateBuiltinAiToolContext();
+        return `已安装 ${result.record.manifest.name} v${result.record.manifest.version}`;
       }, '安装技能失败')}
       onRepair={(skillId) => runSkillOperation(`repair:${skillId}`, async () => {
         const result = await agentApi.repairCodexSkill(skillId, true);
         await refreshSkills();
+        await invalidateBuiltinAiToolContext();
         return result.backup_root ? '技能已修复，原修改已保留为备份' : '技能已重新安装';
       }, '修复技能失败')}
       onUninstall={(skillId) => runSkillOperation(`uninstall:${skillId}`, async () => {
         const result = await agentApi.uninstallCodexSkill(skillId);
         await refreshSkills();
+        await invalidateBuiltinAiToolContext();
         return result.removed.removed ? `已卸载 ${result.removed.skill_id}` : `未卸载 ${result.removed.skill_id}`;
       }, '卸载技能失败')}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path), '目录已打开', '打开目录失败')}
-      onImportLocal={() => run(async () => { const record = await agentApi.importLocalSkill(); await refreshSkills(); return record; }, '本地 Skill 已导入', '导入本地 Skill 失败')}
-      onImportGithub={async (repository, reference, subpath) => { await agentApi.importGithubSkill(repository, reference, subpath); await refreshSkills(); notify('success', 'GitHub Skill 已导入'); }}
+      onImportLocal={() => run(async () => { const record = await agentApi.importLocalSkill(); await refreshSkills(); await invalidateBuiltinAiToolContext(); return record; }, '本地 Skill 已导入', '导入本地 Skill 失败')}
+      onImportGithub={async (repository, reference, subpath) => { await agentApi.importGithubSkill(repository, reference, subpath); await refreshSkills(); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub Skill 已导入'); }}
     />;
     if (page === 'development') return <ExtensionDevelopmentPage
+      dashboardEnabled={dashboardEnabled()}
+      workspace={extensionWorkspace}
+      extensionSources={extensionSources}
+      extensionSourceSnapshot={extensionSourceSnapshot}
+      extensionSourcesLoading={extensionSourcesLoading}
+      extensionSourcesError={extensionSourcesError}
       projects={extensionProjects}
       remoteProjects={extensionRemoteProjects}
       invitations={extensionInvitations}
@@ -754,6 +898,11 @@ function App() {
       availablePlugins={availablePlugins}
       busyAction={developmentOperation}
       onRefresh={() => run(refreshDevelopment, undefined, '刷新扩展项目失败')}
+      onRefreshSources={refreshExtensionSources}
+      onAddSource={addExtensionSource}
+      onUpdateSourceConfig={updateExtensionSource}
+      onRemoveSource={removeExtensionSource}
+      onSelectWorkspace={() => run(selectExtensionWorkspace, undefined, '选择扩展仓库失败')}
       onCreate={async (input: CreateExtensionProjectInput) => {
         if (developmentOperation) return;
         setDevelopmentOperation('create');
@@ -768,9 +917,22 @@ function App() {
           setDevelopmentOperation(null);
         }
       }}
-      onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProject(); await refreshDevelopment(); }, '项目已加入工作台', '打开扩展项目失败')}
+      onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProjects(); await refreshDevelopment(); }, '项目或聚合仓库已加入工作台', '打开扩展项目失败')}
       onAssociateProject={(project: ExtensionRemoteProject) => runDevelopmentOperation(`associate:${project.product_key}`, async () => { await agentApi.associateExtensionProject(project); await refreshDevelopment(); }, '本地项目已关联', '关联本地项目失败')}
-      onBuild={(projectId) => runDevelopmentOperation(`build:${projectId}`, async () => { const candidate = await agentApi.buildExtensionProject(projectId); await refreshDevelopment(); if (candidate.kind === 'plugin') await refreshPlugins(); }, '构建完成', '构建失败')}
+      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, async () => {
+        onProgress?.('building');
+        const candidate = await agentApi.buildExtensionProject(projectId);
+        onProgress?.('activating');
+        if (candidate.kind === 'plugin') {
+          await agentApi.testPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+        } else {
+          await agentApi.testSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+        }
+        onProgress?.('refreshing');
+        await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
+      }, '构建完成，已启用到本机 AI 工具', '构建或启用失败')}
+      onDevelopWithAi={(project) => { void openBuiltinAi(project); }}
+      onDevelopWorkspace={() => { void openExtensionWorkspaceAi(); }}
       onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else await agentApi.submitSkillDraft(extensionId, version); await refreshDevelopment(); }, '已提交 HiMind 工作台审核', '提交审核失败')}
       onOpenFolder={(path) => run(() => agentApi.openFolder(path), '项目目录已打开', '打开项目目录失败')}
       onRemove={(projectId) => runDevelopmentOperation(`remove:${projectId}`, async () => { await agentApi.removeExtensionProject(projectId); await refreshDevelopment(); }, '项目已移出工作台', '移出项目失败')}
@@ -816,14 +978,14 @@ function App() {
       onLoadTaskHistory={agentApi.taskHistory}
       onNavigate={setPage}
       onOpenDashboard={() => run(agentApi.openDashboard)}
-      onOpenBuiltinAi={openBuiltinAi}
+      onOpenBuiltinAi={() => { void openBuiltinAi(); }}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}
       onOpenAgentDirectory={() => run(agentApi.openAgentDirectory, 'Agent 文件夹已打开', '打开 Agent 文件夹失败')}
       onQuit={() => { void agentApi.quitAgent(); }}
     >
       <NotificationCenter messages={messages} onClose={dismissNotification} />
       <div className={`builtin-ai-page-host ${page === 'builtin-ai' ? 'active' : 'inactive'}`} aria-hidden={page !== 'builtin-ai'}>
-        {builtinAiContent}
+        {builtinAiActivated ? builtinAiContent : null}
       </div>
       {page !== 'builtin-ai' ? content : null}
     </Shell>

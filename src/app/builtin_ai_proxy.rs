@@ -5,6 +5,7 @@ use serde_json::json;
 use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -182,6 +183,32 @@ impl BuiltinAiProxy {
 }
 
 impl BuiltinAiProxyControl {
+    /// Register an Agent-selected project as a native DSH Workspace and create
+    /// its blank session before the browser loads. DSH then applies its own
+    /// recent-Workspace selection policy and opens the intended project.
+    pub(crate) fn start_workspace_session(&self, workspace: &Path) -> Result<String, String> {
+        let workspace_path = crate::extension_workspace::display_path(workspace);
+        let response =
+            self.call_runtime_api("workspace.create", json!({ "path": workspace_path }))?;
+        let workspace_value = runtime_result_value(&response, "注册 DSH 工作区")?;
+        let workspace_id = workspace_value
+            .get("workspace")
+            .and_then(|workspace| workspace.get("workspaceId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "DSH 工作区响应缺少 workspaceId".to_string())?;
+
+        let response =
+            self.call_runtime_api("session.create", json!({ "workspaceId": workspace_id }))?;
+        let session_value = runtime_result_value(&response, "创建 DSH 项目会话")?;
+        session_value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "DSH 项目会话响应缺少 sessionId".to_string())
+    }
+
     /// Synchronize the Agent-owned provider through DSH's public API carrier.
     /// The initial browser handshake is important: DSH keeps its own session
     /// cookie in addition to the Agent proxy cookie, so calling the upstream
@@ -406,6 +433,28 @@ impl BuiltinAiProxyControl {
             .unwrap_or("DSH 设置同步被拒绝");
         Err(message.to_string())
     }
+}
+
+fn runtime_result_value<'a>(response: &'a Value, operation: &str) -> Result<&'a Value, String> {
+    let result = response
+        .get("result")
+        .ok_or_else(|| format!("{operation}响应缺少结果"))?;
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return result
+            .get("value")
+            .ok_or_else(|| format!("{operation}响应缺少值"));
+    }
+    let code = result
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let message = result
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("DSH 拒绝了请求");
+    Err(format!("{operation}失败（{code}）：{message}"))
 }
 
 fn namespace_revision(namespaces: &[Value], namespace: &str) -> Option<i64> {
@@ -1134,6 +1183,33 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .contains("himind"));
+    }
+
+    #[test]
+    fn runtime_result_value_accepts_success_and_preserves_payload() {
+        let response = json!({
+            "result": {
+                "ok": true,
+                "value": {"workspace": {"workspaceId": "workspace-1"}}
+            }
+        });
+
+        let value = runtime_result_value(&response, "注册 DSH 工作区").unwrap();
+        assert_eq!(value["workspace"]["workspaceId"], "workspace-1");
+    }
+
+    #[test]
+    fn runtime_result_value_reports_dsh_business_error() {
+        let response = json!({
+            "result": {
+                "ok": false,
+                "error": {"code": "workspace-invalid-path", "message": "path is invalid"}
+            }
+        });
+
+        let error = runtime_result_value(&response, "注册 DSH 工作区").unwrap_err();
+        assert!(error.contains("workspace-invalid-path"));
+        assert!(error.contains("path is invalid"));
     }
 
     #[test]

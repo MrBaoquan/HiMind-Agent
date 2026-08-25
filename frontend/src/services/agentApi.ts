@@ -282,6 +282,60 @@ export type ExtensionDesiredState = {
     items: ExtensionDesiredItem[];
 };
 
+export type ExtensionSourceConfig = {
+    id: string;
+    name: string;
+    repository: string;
+    reference: string;
+    catalog_path: string;
+    enabled: boolean;
+    auto_update: boolean;
+    verification: 'required' | 'optional';
+};
+
+export type ExtensionSourceSettings = {
+    schema_version: number;
+    sources: ExtensionSourceConfig[];
+};
+
+export type ExtensionSourceStatus = {
+    source: ExtensionSourceConfig;
+    state: 'ready' | 'unavailable' | string;
+    plugin_count: number;
+    skill_count: number;
+    generation: string;
+    using_cache: boolean;
+    error: string;
+};
+
+export type ExtensionFeaturePack = {
+    id: string;
+    name: string;
+    plugin_ids: string[];
+    skill_ids: string[];
+};
+
+export type ExtensionSourceSnapshot = {
+    plugins: PluginCatalogItem[];
+    skills: OrganizationSkillCatalogItem[];
+    feature_packs: ExtensionFeaturePack[];
+    sources: ExtensionSourceStatus[];
+};
+
+export type ExtensionProvenance = {
+    asset_kind: 'plugin' | 'skill' | string;
+    asset_key: string;
+    version: string;
+    source_id: string;
+    repository: string;
+    reference: string;
+    catalog_path: string;
+    artifact_url: string;
+    sha256: string;
+    signature_key_id: string;
+    auto_update: boolean;
+};
+
 export type PluginItem = {
     id: string;
     name?: string;
@@ -304,6 +358,8 @@ export type PluginItem = {
     failure_count?: number;
     circuit_open?: boolean;
     governance?: 'required' | 'managed' | 'optional' | 'blocked';
+    availability?: 'local' | 'network_service' | 'control_plane' | string;
+    source?: string;
     permissions?: string[];
     plugin_dependencies?: SkillPluginDependency[];
     capabilities?: PluginCapability[];
@@ -691,6 +747,22 @@ export type AuthoringSkillTestResult = {
 
 export type ExtensionProjectKind = 'plugin' | 'skill';
 
+export type ExtensionWorkspaceSettings = {
+    configured: boolean;
+    valid: boolean;
+    root: string;
+    catalog_path: string;
+    repository: string;
+    default_branch: string;
+    extension_count: number;
+    error: string;
+};
+
+export type BuiltinAiWorkspaceTarget =
+  | { kind: 'project'; projectId: string; name: string; path: string }
+  | { kind: 'extension-workspace'; name: string; path: string }
+  | null;
+
 export type ExtensionProject = {
     id: string;
     kind: ExtensionProjectKind;
@@ -931,9 +1003,10 @@ export const agentApi = {
     saveBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<BuiltinAIMcpServer>('save_builtin_ai_mcp_server', { server }),
     deleteBuiltinAiMcpServer: (serverName: string) => invoke<boolean>('delete_builtin_ai_mcp_server', { serverName }),
     validateBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<void>('validate_builtin_ai_mcp_server', { server }),
+    reloadBuiltinAiToolContext: () => invoke<void>('reload_builtin_ai_tool_context'),
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
     startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install') => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation }),
-    startBuiltinAiSession: () => invoke<string>('start_builtin_ai_session'),
+    startBuiltinAiSession: (target?: { projectId?: string; extensionWorkspace?: boolean }) => invoke<string>('start_builtin_ai_session', target || {}),
     syncBuiltinAiModels: () => invoke<BuiltinAiModelSyncResult>('sync_builtin_ai_models'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
@@ -942,16 +1015,25 @@ export const agentApi = {
     importLocalPlugin: () => invoke<PluginRegistry>('import_local_plugin'),
     importGithubPlugin: (repository: string, reference: string, subpath = '') => invoke<PluginRegistry>('import_github_plugin', { repository, reference, subpath }),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),
+    extensionSources: () => invoke<ExtensionSourceSettings>('get_extension_sources'),
+    addExtensionSource: (name: string, repository: string, reference: string, catalogPath?: string, verification: ExtensionSourceConfig['verification'] = 'required') => invoke<ExtensionSourceSettings>('add_extension_source', { name, repository, reference, catalogPath, verification }),
+    updateExtensionSource: (sourceId: string, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => invoke<ExtensionSourceSettings>('update_extension_source', { sourceId, enabled, autoUpdate, verification }),
+    removeExtensionSource: (sourceId: string) => invoke<ExtensionSourceSettings>('remove_extension_source', { sourceId }),
+    extensionSourceSnapshot: () => invoke<ExtensionSourceSnapshot>('get_extension_source_snapshot'),
+    extensionProvenance: () => invoke<ExtensionProvenance[]>('get_extension_provenance'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
     queryPluginCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<PluginCatalogItem>>('query_plugin_catalog', { q, category, page, pageSize }),
     pluginDrafts: () => invoke<AuthoringPluginDraft[]>('list_plugin_drafts'),
     pluginSubmissions: () => invoke<PluginSubmissionStatus[]>('list_plugin_submissions'),
     extensionProjects: () => invoke<ExtensionProject[]>('list_extension_projects'),
+    extensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('get_extension_workspace'),
+    selectExtensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('select_extension_workspace'),
     extensionCollaborationProjects: () => invoke<ExtensionRemoteProject[]>('list_extension_collaboration_projects'),
-    openExtensionProject: () => invoke<ExtensionProject>('open_extension_project'),
+    openExtensionProjects: () => invoke<ExtensionProject[]>('open_extension_projects'),
     associateExtensionProject: (project: ExtensionRemoteProject) => invoke<ExtensionProject>('associate_extension_project', { input: { kind: project.product_type === 'agent_plugin' ? 'plugin' : 'skill', extension_id: project.product_key, source_repository: project.source_repository, source_default_branch: project.source_default_branch, source_subdirectory: project.source_subdirectory, source_commit: '' } }),
     createExtensionProject: (input: CreateExtensionProjectInput) => invoke<ExtensionProject>('create_extension_project', { input }),
     buildExtensionProject: (projectId: string) => invoke<ExtensionCandidate>('build_extension_project', { projectId }),
+    prepareExtensionAuthoring: () => invoke<void>('prepare_extension_authoring'),
     removeExtensionProject: (projectId: string) => invoke('remove_extension_project', { projectId }),
     updateExtensionProjectSource: (projectId: string, input: ExtensionProjectSourceInput, syncRemote = true) => invoke<ExtensionProject>('update_extension_project_source', { projectId, input, syncRemote }),
     extensionCollaboration: (productKey: string) => invoke<ExtensionCollaboration>('get_extension_collaboration', { productKey }),

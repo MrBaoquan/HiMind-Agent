@@ -2,7 +2,7 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::Value;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::api::types::{RuntimeInstallationReport, Task};
 use crate::runtime::{deepseek_harness, AgentRunEnvelope, PROVIDER_BUILTIN};
@@ -40,6 +40,7 @@ trait AIRuntimeAdapter: Sync {
     fn prepare_interactive_launch(
         &self,
         options: &Options,
+        workspace: Option<&Path>,
     ) -> Result<BuiltinAIInteractiveLaunch, String>;
     fn interactive_tool_context_summary(
         &self,
@@ -121,6 +122,7 @@ pub(crate) struct BuiltinAIToolContextSummary {
 pub(crate) struct BuiltinAIInteractiveLaunch {
     pub executable: PathBuf,
     pub home: PathBuf,
+    pub workspace: PathBuf,
     pub user_id: String,
     pub api_key: String,
     pub api_key_env: Option<String>,
@@ -198,8 +200,9 @@ pub(crate) fn uninstall_with_progress(
 
 pub(crate) fn prepare_interactive_launch(
     options: &Options,
+    workspace: Option<&Path>,
 ) -> Result<BuiltinAIInteractiveLaunch, String> {
-    active_adapter().prepare_interactive_launch(options)
+    active_adapter().prepare_interactive_launch(options, workspace)
 }
 
 pub(crate) fn interactive_tool_context_summary(
@@ -281,11 +284,13 @@ impl AIRuntimeAdapter for DeepSeekHarnessAdapter {
     fn prepare_interactive_launch(
         &self,
         options: &Options,
+        workspace: Option<&Path>,
     ) -> Result<BuiltinAIInteractiveLaunch, String> {
-        deepseek_harness::prepare_interactive_launch(options).map(|launch| {
+        deepseek_harness::prepare_interactive_launch(options, workspace).map(|launch| {
             BuiltinAIInteractiveLaunch {
                 executable: launch.executable,
                 home: launch.home,
+                workspace: launch.workspace,
                 user_id: launch.user_id,
                 api_key: launch.api_key,
                 api_key_env: launch.api_key_env,

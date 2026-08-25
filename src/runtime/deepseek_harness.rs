@@ -99,6 +99,7 @@ pub(crate) struct DeepSeekHarnessRuntimeUpdateStatus {
 pub(crate) struct InteractiveLaunch {
     pub executable: PathBuf,
     pub home: PathBuf,
+    pub workspace: PathBuf,
     pub user_id: String,
     pub api_key: String,
     pub api_key_env: Option<String>,
@@ -463,7 +464,7 @@ struct UserModelSelection {
     model: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NativeDshProviderConfig {
     provider: String,
     model: String,
@@ -687,14 +688,19 @@ pub(crate) fn uninstall_with_progress(
     Ok(status())
 }
 
-pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<InteractiveLaunch, String> {
+pub(crate) fn prepare_interactive_launch(
+    options: &Options,
+    workspace: Option<&Path>,
+) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
+    let workspace = interactive_workspace(workspace)?;
     if !options.mode().dashboard_enabled() {
         return prepare_independent_interactive_launch(
             options,
             executable.to_string_lossy().to_string(),
             version,
+            workspace,
         );
     }
     let delegated =
@@ -711,7 +717,7 @@ pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<Interactiv
     let invocation = Invocation {
         executable: executable.clone(),
         args: Vec::new(),
-        workspace: std::env::current_dir().map_err(|error| error.to_string())?,
+        workspace: workspace.clone(),
         home: home.clone(),
         api_key: credential.api_key.clone(),
         base_url: credential.access.base_url.clone(),
@@ -725,6 +731,7 @@ pub(crate) fn prepare_interactive_launch(options: &Options) -> Result<Interactiv
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
+        workspace,
         user_id: delegated.user_id,
         api_key: credential.api_key,
         api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
@@ -742,29 +749,18 @@ fn prepare_independent_interactive_launch(
     options: &Options,
     executable: String,
     version: String,
+    workspace: PathBuf,
 ) -> Result<InteractiveLaunch, String> {
     let home = native_dsh_home(&version)?;
-    let settings_path = home.join("settings.yaml");
-    let source = fs::read_to_string(&settings_path).map_err(|error| {
-        format!(
-            "Independent Mode 需要 DSH 原生 Provider 配置，请先在 {} 配置 settings.yaml ({error})",
-            settings_path.display()
-        )
-    })?;
-    let provider_config = parse_native_dsh_provider_config(&source)?;
+    let provider_config = native_dsh_provider_config(&home);
     let api_key = match provider_config.api_key_env.as_deref() {
-        Some(api_key_env) => env::var(api_key_env).map_err(|_| {
-            format!(
-                "DSH Provider {} 需要环境变量 {api_key_env}，请先完成原生服务配置",
-                provider_config.provider
-            )
-        })?,
+        Some(api_key_env) => env::var(api_key_env).unwrap_or_default(),
         None => String::new(),
     };
     let invocation = Invocation {
         executable: executable.clone().into(),
         args: Vec::new(),
-        workspace: std::env::current_dir().map_err(|error| error.to_string())?,
+        workspace: workspace.clone(),
         home: home.clone(),
         api_key: api_key.clone(),
         base_url: provider_config.base_url.clone(),
@@ -778,6 +774,7 @@ fn prepare_independent_interactive_launch(
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
+        workspace,
         user_id: "local".to_string(),
         api_key,
         api_key_env: provider_config.api_key_env,
@@ -789,6 +786,28 @@ fn prepare_independent_interactive_launch(
         catalog_fingerprint: String::new(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
     })
+}
+
+fn native_dsh_provider_config(home: &Path) -> NativeDshProviderConfig {
+    let settings_path = home.join("settings.yaml");
+    fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|source| parse_native_dsh_provider_config(&source).ok())
+        .unwrap_or_default()
+}
+
+fn interactive_workspace(workspace: Option<&Path>) -> Result<PathBuf, String> {
+    let workspace = match workspace {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("HiMind AI 工作目录不可用: {error}"))?;
+    if !workspace.is_dir() {
+        return Err("HiMind AI 工作目录必须是本机目录".to_string());
+    }
+    Ok(workspace)
 }
 
 fn parse_native_dsh_provider_config(source: &str) -> Result<NativeDshProviderConfig, String> {
@@ -870,7 +889,7 @@ pub(crate) fn interactive_tool_context_summary(
         .filter(|server| server.enabled)
         .count();
     Ok(InteractiveToolContextSummary {
-        skills: himind_skill_records()
+        skills: himind_skill_records(options)
             .map_err(|error| error.to_string())?
             .len(),
         // The managed profile injects the Agent's local MCP bridge for every
@@ -1433,7 +1452,7 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
 
 fn ensure_home_config(invocation: &Invocation, options: &Options) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&invocation.home)?;
-    ensure_himind_skill_adapter(&invocation.home)?;
+    ensure_himind_skill_adapter(&invocation.home, options)?;
     migrate_legacy_managed_settings(&invocation.home)?;
     ensure_himind_profile(&invocation.home, options, invocation)?;
     ensure_himind_headless_profile(&invocation.home, options, invocation)?;
@@ -1590,6 +1609,7 @@ fn ensure_agent_overlay(
         &invocation.model,
         &invocation.base_url,
         &invocation.models,
+        &invocation.workspace,
     )?;
     fs::write(path, overlay)?;
     Ok(())
@@ -1705,6 +1725,7 @@ fn render_himind_profile_patch(
         base_url,
         models,
         include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
+        None,
     )
 }
 
@@ -1714,8 +1735,17 @@ fn render_himind_agent_overlay(
     default_model: &str,
     base_url: &str,
     models: &[String],
+    workspace: &Path,
 ) -> Result<String, Box<dyn Error>> {
-    render_himind_profile_patch_from_base(home, options, default_model, base_url, models, "")
+    render_himind_profile_patch_from_base(
+        home,
+        options,
+        default_model,
+        base_url,
+        models,
+        "",
+        Some(workspace),
+    )
 }
 
 fn render_himind_profile_patch_from_base(
@@ -1725,6 +1755,7 @@ fn render_himind_profile_patch_from_base(
     base_url: &str,
     models: &[String],
     base_patch: &str,
+    workspace: Option<&Path>,
 ) -> Result<String, Box<dyn Error>> {
     let executable = crate::install_layout::stable_launcher_for_executable(&env::current_exe()?);
     let args = himind_mcp_arguments(options);
@@ -1749,9 +1780,19 @@ fn render_himind_profile_patch_from_base(
         patch.push_str(&format!("          - {}\n", yaml_scalar(&argument)));
     }
     patch.push_str(&format!(
-        "        env:\n          HIMIND_AI_CLIENT_ID: {}\n        failOnStartupError: false\n        reconnect:\n          enabled: true\n          initialDelayMs: 500\n          maxDelayMs: 30000\n          maxAttempts: 5\n",
+        "        env:\n          HIMIND_AI_CLIENT_ID: {}\n          HIMIND_AGENT_PROFILE: {}\n",
         yaml_scalar(HIMIND_MCP_CLIENT_ID),
+        yaml_scalar(&crate::store::paths::profile_name()),
     ));
+    if let Some(workspace) = workspace {
+        patch.push_str(&format!(
+            "          HIMIND_AI_WORKSPACE: {}\n",
+            yaml_scalar(&workspace.to_string_lossy()),
+        ));
+    }
+    patch.push_str(
+        "        failOnStartupError: false\n        reconnect:\n          enabled: true\n          initialDelayMs: 500\n          maxDelayMs: 30000\n          maxAttempts: 5\n",
+    );
     for server in crate::app::mcp_settings::load(&options.state_path)? {
         append_personal_mcp_row(&mut patch, &server);
     }
@@ -1934,8 +1975,8 @@ fn himind_mcp_arguments(options: &Options) -> Vec<String> {
     ]
 }
 
-fn ensure_himind_skill_adapter(home: &Path) -> Result<(), Box<dyn Error>> {
-    let records = himind_skill_records()?;
+fn ensure_himind_skill_adapter(home: &Path, options: &Options) -> Result<(), Box<dyn Error>> {
+    let records = himind_skill_records(options)?;
     let target = home.join(HIMIND_SKILL_ADAPTER_DIR);
     let staging = home.join(format!(
         ".{HIMIND_SKILL_ADAPTER_DIR}-staging-{}-{}",
@@ -1966,10 +2007,79 @@ fn ensure_himind_skill_adapter(home: &Path) -> Result<(), Box<dyn Error>> {
     result
 }
 
-fn himind_skill_records() -> Result<Vec<SkillRecord>, Box<dyn Error>> {
+fn himind_skill_records(options: &Options) -> Result<Vec<SkillRecord>, Box<dyn Error>> {
     let store = SkillStore::new();
     store.bootstrap_builtin_skills()?;
-    store.list_records()
+    // Skill discovery is an enhancement to the DSH launch. A malformed or
+    // temporarily unavailable capability registry must not prevent the AI
+    // session itself from starting; readiness filtering will conservatively
+    // omit skills that cannot be proven usable in that case.
+    let capability_facts = crate::skill::capability_facts_from_gateway(
+        options,
+        std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::types::LocalWorkerStatus::default(),
+        )),
+        &crate::capability::types::InvocationContext::new(
+            crate::capability::types::InvocationSource::Mcp,
+            "himind-ai",
+        ),
+    )
+    .unwrap_or_default();
+    Ok(store
+        .list_records()?
+        .into_iter()
+        // DSH is a first-class Skill client. A package that only targets
+        // another client must remain available to that client, but must not
+        // be copied into the HiMind AI runtime and counted as usable there.
+        .filter(|record| {
+            record.current
+                && skill_manifest_ready_for_himind_ai(&record.manifest, &capability_facts)
+        })
+        .filter(|record| required_plugin_dependencies_ready(&record.manifest.plugin_dependencies))
+        .collect())
+}
+
+fn skill_manifest_ready_for_himind_ai(
+    manifest: &crate::skill::types::SkillManifest,
+    capability_facts: &[crate::skill::resolver::CapabilityFact],
+) -> bool {
+    manifest
+        .supported_clients
+        .iter()
+        .any(|client| client.eq_ignore_ascii_case(HIMIND_MCP_CLIENT_ID))
+        && crate::skill::resolver::SkillReadiness::resolve(
+            manifest,
+            capability_facts,
+            crate::VERSION,
+            HIMIND_MCP_CLIENT_ID,
+        )
+        .state
+            != "blocked"
+}
+
+fn required_plugin_dependencies_ready(
+    dependencies: &[crate::skill::types::SkillPluginDependency],
+) -> bool {
+    dependencies
+        .iter()
+        .filter(|dependency| dependency.required)
+        .all(|dependency| {
+            let Ok(Some(plugin)) = crate::capability::plugin::find_plugin(&dependency.plugin_id)
+            else {
+                return false;
+            };
+            if !plugin.enabled || plugin.error.is_some() {
+                return false;
+            }
+            dependency
+                .min_version
+                .as_deref()
+                .map(|minimum| {
+                    crate::skill::resolver::compare_versions(&plugin.version, minimum)
+                        != std::cmp::Ordering::Less
+                })
+                .unwrap_or(true)
+        })
 }
 
 fn copy_skill_package(record: &SkillRecord, destination: &Path) -> Result<(), Box<dyn Error>> {
@@ -2144,9 +2254,6 @@ fn dsh_home(version: &str) -> Result<PathBuf, String> {
 fn native_dsh_home(version: &str) -> Result<PathBuf, String> {
     if let Some(value) = env::var_os(DSH_HOME_ENV).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
-    }
-    if let Some(user_profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(user_profile).join(".dsh"));
     }
     dsh_home(version)
 }
@@ -2339,9 +2446,11 @@ mod tests {
     use super::{
         dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
         managed_model_catalog, merge_profile_package, migrate_legacy_managed_settings,
-        parse_native_dsh_provider_config, parse_runtime_version, remove_managed_runtime,
-        render_himind_profile_patch, render_himind_profile_patch_from_base, safe_relative_path,
-        safe_segment, strip_yaml_frontmatter, versioned_home, InteractiveEventProjector,
+        native_dsh_provider_config, parse_native_dsh_provider_config, parse_runtime_version,
+        remove_managed_runtime, render_himind_agent_overlay, render_himind_profile_patch,
+        render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
+        skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter, versioned_home,
+        InteractiveEventProjector,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
@@ -2375,6 +2484,49 @@ mod tests {
             config.models,
             vec!["deepseek-chat", "deepseek-reasoner", "local-compatible"]
         );
+    }
+
+    #[test]
+    fn independent_dsh_launch_allows_missing_native_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-independent-dsh-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(
+            native_dsh_provider_config(&root),
+            super::NativeDshProviderConfig::default()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn independent_dsh_launch_allows_incomplete_native_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-independent-dsh-incomplete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("settings.yaml"), "theme:\n  mode: dark\n").unwrap();
+
+        assert_eq!(
+            native_dsh_provider_config(&root),
+            super::NativeDshProviderConfig::default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("settings.yaml")).unwrap(),
+            "theme:\n  mode: dark\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2525,6 +2677,7 @@ mod tests {
         assert!(patch.contains("id: himind-agent-mcp"));
         assert!(patch.contains("name: '@deepseek-ai/dsh-mcp-client'"));
         assert!(patch.contains("HIMIND_AI_CLIENT_ID: \"himind-ai\""));
+        assert!(!patch.contains("HIMIND_AI_WORKSPACE:"));
         assert!(patch.contains("id: himind-agent-skill-filesystem"));
         assert!(patch.contains("providerName: himind-managed"));
         assert!(patch.contains("includeDefaultRoots: true"));
@@ -2532,6 +2685,26 @@ mod tests {
             patch.contains("C:/HiMind/runtime-home\\\\himind-skills")
                 || patch.contains("C:/HiMind/runtime-home/himind-skills")
         );
+    }
+
+    #[test]
+    fn project_overlay_passes_workspace_only_to_agent_mcp() {
+        let mut options = crate::Options::from_env();
+        options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        let workspace = std::path::Path::new("C:/HiMind/extensions/demo-plugin");
+        let patch = render_himind_agent_overlay(
+            std::path::Path::new("C:/HiMind/runtime-home"),
+            &options,
+            "model-default",
+            "https://gateway.example/v1",
+            &["model-default".to_string()],
+            workspace,
+        )
+        .unwrap();
+
+        assert!(patch.contains("HIMIND_AI_WORKSPACE:"));
+        assert!(patch.contains("C:/HiMind/extensions/demo-plugin"));
+        assert_eq!(patch.matches("HIMIND_AI_WORKSPACE:").count(), 1);
     }
 
     #[test]
@@ -2765,6 +2938,41 @@ mod tests {
     }
 
     #[test]
+    fn himind_skill_adapter_only_accepts_supported_ready_skills() {
+        let mut manifest = crate::skill::types::SkillManifest {
+            id: "com.example.skill".to_string(),
+            name: "Example".to_string(),
+            author: String::new(),
+            categories: Vec::new(),
+            version: "1.0.0".to_string(),
+            scope: crate::skill::types::SkillScope::User,
+            description: String::new(),
+            release_notes: String::new(),
+            min_agent_version: String::new(),
+            supported_clients: vec!["codex".to_string()],
+            capabilities: Vec::new(),
+            plugin_dependencies: Vec::new(),
+            risk_summary: String::new(),
+            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
+        };
+        assert!(!skill_manifest_ready_for_himind_ai(&manifest, &[]));
+
+        manifest.supported_clients.push("himind-ai".to_string());
+        assert!(skill_manifest_ready_for_himind_ai(&manifest, &[]));
+
+        manifest
+            .capabilities
+            .push(crate::skill::types::SkillCapabilityDependency {
+                id: "missing.capability".to_string(),
+                required: true,
+                min_version: None,
+                max_version: None,
+                provider: None,
+            });
+        assert!(!skill_manifest_ready_for_himind_ai(&manifest, &[]));
+    }
+
+    #[test]
     fn interactive_catalog_starts_with_the_default_and_removes_duplicates() {
         let credential = AIUserCredential {
             active_entitlement_id: "entitlement".to_string(),
@@ -2900,6 +3108,7 @@ mod tests {
             "https://gateway.example/v1",
             &["model-default".to_string(), "model-fast".to_string()],
             include_str!("../../runtime-profiles/himind-headless/cordis.patch.yml"),
+            None,
         )
         .unwrap();
         assert!(profile.contains("id: himind-agent-mcp"));

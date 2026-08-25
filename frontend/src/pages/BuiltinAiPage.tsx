@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, Blocks, CircleAlert, Download, LoaderCircle, LogIn, MessageCircle, RefreshCw, Settings } from 'lucide-react';
-import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIToolContextSummary, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
+import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
 import { errorDetail } from '../types';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 
@@ -18,6 +18,8 @@ type BuiltinAiPageProps = {
   onOpenSkills: () => void;
   onToolContextChanged: () => void;
   toolSummary: BuiltinAIToolContextSummary;
+  workspaceTarget: BuiltinAiWorkspaceTarget;
+  workspaceRequestRevision: number;
 };
 
 export function BuiltinAiPage({
@@ -34,6 +36,8 @@ export function BuiltinAiPage({
   onOpenSkills,
   onToolContextChanged,
   toolSummary,
+  workspaceTarget,
+  workspaceRequestRevision,
 }: BuiltinAiPageProps) {
   const [sessionUrl, setSessionUrl] = useState('');
   const [connecting, setConnecting] = useState(false);
@@ -46,6 +50,7 @@ export function BuiltinAiPage({
   const [activityOpen, setActivityOpen] = useState(false);
   const [runtimeSessions, setRuntimeSessions] = useState<BuiltinAIRuntimeActivity[]>([]);
   const [activityError, setActivityError] = useState('');
+  const handledWorkspaceRequest = useRef(0);
   const independentMode = independentModeFromStatus || identity?.state === 'independent';
   const canStartSession = Boolean(identity?.authorized || independentMode);
   const authorizationActive = authorization?.state === 'starting' || authorization?.state === 'pending';
@@ -113,14 +118,28 @@ export function BuiltinAiPage({
     setConnectionError('');
     setFrameLoaded(false);
     try {
-      setSessionUrl(await agentApi.startBuiltinAiSession());
+      const request = workspaceTarget?.kind === 'project'
+        ? { projectId: workspaceTarget.projectId }
+        : workspaceTarget?.kind === 'extension-workspace'
+          ? { extensionWorkspace: true }
+          : undefined;
+      setSessionUrl(await agentApi.startBuiltinAiSession(request));
     } catch (error) {
       setSessionUrl('');
       setConnectionError(presentConnectionError(error));
     } finally {
       setConnecting(false);
     }
-  }, [connecting]);
+  }, [connecting, workspaceTarget]);
+
+  useEffect(() => {
+    if (!workspaceRequestRevision || connecting || handledWorkspaceRequest.current === workspaceRequestRevision) return;
+    handledWorkspaceRequest.current = workspaceRequestRevision;
+    setSessionUrl('');
+    setConnectionError('');
+    setFrameLoaded(false);
+    void connect();
+  }, [connect, connecting, workspaceRequestRevision]);
 
   useEffect(() => {
     if (!canStartSession || !runtimeReady || sessionUrl || connecting || connectionError) return;
@@ -152,7 +171,7 @@ export function BuiltinAiPage({
       <header className="builtin-ai-toolbar">
         <div className="builtin-ai-title">
           <span className="builtin-ai-mark"><MessageCircle size={17} /></span>
-          <div><h2>HiMind AI</h2><span>智能工作助手</span></div>
+          <div><h2>HiMind AI</h2><span>{workspaceTarget ? `正在开发：${workspaceTarget.name}` : '智能工作助手'}</span></div>
         </div>
         <div className="builtin-ai-toolbar-actions">
           {!independentMode ? <button type="button" className="builtin-ai-tools-button" onClick={() => void syncModels()} disabled={!sessionUrl || syncingModels} title="同步可用模型">

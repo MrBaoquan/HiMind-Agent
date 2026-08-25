@@ -48,6 +48,9 @@ pub(crate) fn updater_path(root: &Path) -> PathBuf {
 }
 
 pub(crate) fn stable_launcher_for_executable(executable: &Path) -> PathBuf {
+    if !is_installed_agent_executable(executable) {
+        return executable.to_path_buf();
+    }
     let root = installation_root_from_executable(executable);
     let launcher = launcher_path(&root);
     if launcher.is_file() {
@@ -55,6 +58,21 @@ pub(crate) fn stable_launcher_for_executable(executable: &Path) -> PathBuf {
     } else {
         executable.to_path_buf()
     }
+}
+
+fn is_installed_agent_executable(executable: &Path) -> bool {
+    let Some(parent) = executable.parent() else {
+        return false;
+    };
+    parent
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("current"))
+        || parent
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("versions"))
 }
 
 pub(crate) fn read_active_version(root: &Path) -> Result<Option<String>, Box<dyn Error>> {
@@ -214,7 +232,7 @@ fn wide_path(path: &Path) -> Vec<u16> {
 mod tests {
     use super::{
         active_agent_path, installation_root_from_executable, repair_pending_updater,
-        resolve_agent_path, write_active_version,
+        resolve_agent_path, stable_launcher_for_executable, write_active_version,
     };
     use std::fs;
     use std::path::Path;
@@ -276,6 +294,46 @@ mod tests {
             installation_root_from_executable(Path::new(r"C:\HiMind\current\himind-agent.exe")),
             Path::new(r"C:\HiMind")
         );
+    }
+
+    #[test]
+    fn stable_launcher_is_used_only_for_an_installed_agent_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-layout-launcher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agent = root.join("versions/0.4.0/himind-agent.exe");
+        let launcher = root.join("himind-agent-launcher.exe");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"agent").unwrap();
+        fs::write(&launcher, b"launcher").unwrap();
+
+        assert_eq!(stable_launcher_for_executable(&agent), launcher);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn development_agent_does_not_use_a_sibling_launcher() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-layout-development-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agent = root.join("target/release/himind-agent.exe");
+        let launcher = root.join("target/release/himind-agent-launcher.exe");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"agent").unwrap();
+        fs::write(launcher, b"launcher").unwrap();
+
+        assert_eq!(stable_launcher_for_executable(&agent), agent);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

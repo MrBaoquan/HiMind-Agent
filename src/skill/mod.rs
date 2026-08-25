@@ -108,6 +108,13 @@ pub(crate) fn sync_record_to_supported_clients(
             "codex" => codex::sync_record_json(record, agent_version, capability_facts)?,
             "github-copilot" => copilot::sync_record_json(record, agent_version, capability_facts)?,
             "workbuddy" => workbuddy::sync_record_json(record, agent_version, capability_facts)?,
+            "himind-ai" => json!({
+                "client_id": "himind-ai",
+                "installed": true,
+                "status": "ready",
+                "source_root": record.version_root,
+                "activation": "next_session",
+            }),
             _ => return Err(format!("Agent 尚未实现 Skill 客户端适配器: {client}").into()),
         };
         clients.insert(normalized, rendered);
@@ -151,6 +158,11 @@ fn uninstall_supported_clients_impl(
             "codex" => codex::uninstall_json(skill_id)?,
             "github-copilot" => copilot::uninstall_json(skill_id)?,
             "workbuddy" => workbuddy::uninstall_json(skill_id)?,
+            "himind-ai" => json!({
+                "client_id": "himind-ai",
+                "skill_id": skill_id,
+                "removed": true,
+            }),
             _ => return Err(format!("Agent 尚未实现 Skill 客户端适配器: {client}").into()),
         };
         clients.insert(normalized, removed);

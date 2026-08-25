@@ -57,7 +57,7 @@ pub(crate) fn verify_agent_package_signature(
     if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
         return Ok(());
     }
-    let public_key = trusted_agent_update_public_key(key_id)?;
+    let public_key = trusted_signing_public_key(key_id)?;
     verify_rsa_pss_sha256(staged_package, &public_key, signature)
 }
 
@@ -68,8 +68,23 @@ pub(crate) fn verify_runtime_component_signature(
     algorithm: &str,
 ) -> Result<(), Box<dyn Error>> {
     validate_signature_metadata(signature.trim(), key_id.trim(), algorithm.trim(), true)?;
-    let public_key = trusted_agent_update_public_key(key_id.trim())?;
+    let public_key = trusted_signing_public_key(key_id.trim())?;
     verify_rsa_pss_sha256(staged_package, &public_key, signature.trim())
+}
+
+pub(crate) fn verify_extension_artifact_signature(
+    artifact_path: &Path,
+    signature: &str,
+    key_id: &str,
+    algorithm: &str,
+    require_signed: bool,
+) -> Result<(), Box<dyn Error>> {
+    validate_signature_metadata(signature, key_id, algorithm, require_signed)?;
+    if signature.trim().is_empty() {
+        return Ok(());
+    }
+    let public_key = trusted_signing_public_key(key_id)?;
+    verify_rsa_pss_sha256(artifact_path, &public_key, signature)
 }
 
 pub(crate) fn signed_agent_updates_required() -> bool {
@@ -87,7 +102,7 @@ pub(crate) fn trusted_agent_update_key_ids() -> Vec<String> {
     }
 }
 
-fn trusted_agent_update_public_key(key_id: &str) -> Result<String, Box<dyn Error>> {
+pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn Error>> {
     if let Some(trusted_dir) = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR") {
         let public_key_path = PathBuf::from(trusted_dir).join(format!("{key_id}.pem"));
         if public_key_path.is_file() {
@@ -98,7 +113,7 @@ fn trusted_agent_update_public_key(key_id: &str) -> Result<String, Box<dyn Error
     {
         return Ok(EMBEDDED_UPDATE_PUBLIC_KEY_PEM.to_string());
     }
-    Err(format!("未找到受信的 Agent 更新公钥：{key_id}").into())
+    Err(format!("未找到受信的签名公钥：{key_id}").into())
 }
 
 pub(crate) fn verify_rsa_pss_sha256(
@@ -111,7 +126,7 @@ pub(crate) fn verify_rsa_pss_sha256(
     let digest = Sha256::digest(std::fs::read(artifact_path)?);
     public_key
         .verify(Pss::new::<Sha256>(), &digest, &signature_bytes)
-        .map_err(|_| "Agent 更新包签名验证失败".into())
+        .map_err(|_| "制品签名验证失败".into())
 }
 
 pub(crate) fn validate_signature_metadata(
@@ -122,20 +137,20 @@ pub(crate) fn validate_signature_metadata(
 ) -> Result<(), Box<dyn Error>> {
     if signature.is_empty() && key_id.is_empty() && algorithm.is_empty() {
         return if require_signed {
-            Err("Agent 更新策略要求签名，但更新包未提供签名".into())
+            Err("签名策略要求制品提供签名，但制品未提供签名".into())
         } else {
             Ok(())
         };
     }
     if signature.is_empty() || key_id.is_empty() || algorithm != "rsa-pss-sha256" {
-        return Err("Agent 更新签名元数据不完整或算法不受支持".into());
+        return Err("制品签名元数据不完整或算法不受支持".into());
     }
     if key_id.len() > 64
         || !key_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err("Agent 更新签名 key ID 无效".into());
+        return Err("制品签名 key ID 无效".into());
     }
     Ok(())
 }
@@ -1884,7 +1899,7 @@ mod tests {
             .expect("signature key id is required");
         assert_eq!(key_id, EMBEDDED_UPDATE_KEY_ID.trim());
         assert_eq!(metadata["signature_algorithm"], "rsa-pss-sha256");
-        let public_key = trusted_agent_update_public_key(key_id).expect("key must be trusted");
+        let public_key = trusted_signing_public_key(key_id).expect("key must be trusted");
         verify_rsa_pss_sha256(
             Path::new(&artifact_path),
             &public_key,

@@ -7,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[cfg(windows)]
 use raw_window_handle::{
@@ -149,9 +150,32 @@ pub(crate) fn start_background_services(
         thread::spawn(move || {
             worker::run_supervisor(worker_opts, ws, mgr);
         });
-    } else if let Ok(mut state) = worker_status.lock() {
-        state.dashboard_worker_online = false;
-        state.dashboard_worker_error.clear();
+    } else {
+        if let Ok(mut state) = worker_status.lock() {
+            state.dashboard_worker_online = false;
+            state.dashboard_worker_error.clear();
+        }
+        let independent_options = options.clone();
+        let _ = thread::Builder::new()
+            .name("himind-extension-reconcile-loop".to_string())
+            .spawn(move || {
+                let mut generation = String::new();
+                loop {
+                    match crate::app::extension_orchestrator::reconcile(
+                        &independent_options,
+                        "",
+                        &mut generation,
+                    ) {
+                        Ok(updated) => {
+                            for item in updated {
+                                eprintln!("independent extension updated: {item}");
+                            }
+                        }
+                        Err(error) => eprintln!("independent extension reconcile failed: {error}"),
+                    }
+                    thread::sleep(Duration::from_secs(300));
+                }
+            });
     }
 
     let http_ws = Arc::clone(&worker_status);

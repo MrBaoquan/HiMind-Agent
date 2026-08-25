@@ -38,6 +38,8 @@ pub(crate) struct PluginCapabilityManifest {
     pub input_schema: Value,
     #[serde(default = "default_risk_level")]
     pub risk_level: String,
+    #[serde(default)]
+    pub availability: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -112,6 +114,10 @@ pub(crate) struct PluginRegistryItem {
     pub runtime: String,
     pub min_agent_version: String,
     pub governance: String,
+    #[serde(default)]
+    pub availability: String,
+    #[serde(default)]
+    pub source: String,
     pub status: String,
     pub enabled: bool,
     pub path: String,
@@ -321,6 +327,14 @@ fn builtin_plugin(
     capability_ids: &[&str],
     permissions: &[&str],
 ) -> PluginRegistryItem {
+    let availability = if matches!(
+        id,
+        "com.himind.dashboard-business" | "com.himind.knowledge" | "com.himind.builtin.smb"
+    ) {
+        "control_plane"
+    } else {
+        "local"
+    };
     PluginRegistryItem {
         id: id.to_string(),
         name: name.to_string(),
@@ -331,6 +345,8 @@ fn builtin_plugin(
         runtime: "builtin".to_string(),
         min_agent_version: crate::VERSION.to_string(),
         governance: "required".to_string(),
+        availability: availability.to_string(),
+        source: "builtin".to_string(),
         status: "installed".to_string(),
         enabled: true,
         path: String::new(),
@@ -347,6 +363,7 @@ fn builtin_plugin(
                 description: description.to_string(),
                 input_schema: Value::Null,
                 risk_level: "builtin_policy".to_string(),
+                availability: "local".to_string(),
             })
             .collect(),
         permissions: permissions
@@ -476,6 +493,23 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             let health_root = plugin_health_root(&path, development, &manifest.id);
             let health = read_plugin_health(&health_root);
             let circuit_open = health.failure_count >= PLUGIN_FAILURE_THRESHOLD;
+            let source = fs::read_to_string(path.join("current").join("policy.json"))
+                .ok()
+                .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                .and_then(|value| {
+                    value
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| {
+                    if development {
+                        "development".to_string()
+                    } else {
+                        "local".to_string()
+                    }
+                });
+            let availability = manifest_availability(&manifest);
             PluginRegistryItem {
                 id: manifest.id,
                 name: manifest.name,
@@ -486,6 +520,8 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 runtime: manifest.runtime,
                 min_agent_version: manifest.min_agent_version,
                 governance,
+                availability,
+                source,
                 status: validation
                     .as_ref()
                     .map(|_| {
@@ -528,6 +564,8 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             runtime: String::new(),
             min_agent_version: String::new(),
             governance: "optional".to_string(),
+            availability: "local".to_string(),
+            source: "local".to_string(),
             status: "failed".to_string(),
             enabled: false,
             path: path.to_string_lossy().to_string(),
@@ -546,6 +584,34 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             failure_count: 0,
             circuit_open: false,
         },
+    }
+}
+
+fn manifest_availability(manifest: &PluginManifest) -> String {
+    let dashboard_permission = manifest
+        .permissions
+        .iter()
+        .any(|permission| permission == "network.dashboard.public");
+    let mut has_local = false;
+    let mut has_network = false;
+    let mut has_control_plane = false;
+    for capability in &manifest.capabilities {
+        match capability.availability.trim().to_ascii_lowercase().as_str() {
+            "control_plane" | "dashboard" => has_control_plane = true,
+            "network_service" | "network" => has_network = true,
+            "local" => has_local = true,
+            _ if dashboard_permission => has_control_plane = true,
+            _ => has_local = true,
+        }
+    }
+    if has_local {
+        "local".to_string()
+    } else if has_network {
+        "network_service".to_string()
+    } else if has_control_plane || dashboard_permission {
+        "control_plane".to_string()
+    } else {
+        "local".to_string()
     }
 }
 
@@ -575,7 +641,16 @@ fn development_entry_metadata(root: &std::path::Path, entry: &str) -> Option<(Op
 }
 
 pub(crate) fn registry_json() -> Result<Value, Box<dyn Error>> {
-    let items = scan_plugins()?;
+    registry_json_for_control_plane(true)
+}
+
+pub(crate) fn registry_json_for_control_plane(
+    control_plane_enabled: bool,
+) -> Result<Value, Box<dyn Error>> {
+    let items = scan_plugins()?
+        .into_iter()
+        .filter(|item| control_plane_enabled || item.availability != "control_plane")
+        .collect::<Vec<_>>();
     Ok(json!({
         "items": items,
         "total": items.len(),
@@ -656,6 +731,7 @@ pub(crate) fn reset_plugin_health(plugin_id: &str) -> Result<(), Box<dyn Error>>
 pub(crate) fn invoke_plugin_capability(
     capability_id: &str,
     input: Value,
+    trusted_dashboard_url: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
     let plugin = scan_plugins()?
         .into_iter()
@@ -669,25 +745,27 @@ pub(crate) fn invoke_plugin_capability(
         })
         .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
 
-    invoke_plugin_capability_for_item(&plugin, capability_id, input)
+    invoke_plugin_capability_for_item(&plugin, capability_id, input, trusted_dashboard_url)
 }
 
 pub(crate) fn invoke_plugin_capability_for_plugin(
     plugin_id: &str,
     capability_id: &str,
     input: Value,
+    trusted_dashboard_url: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
     let plugin = scan_plugins()?
         .into_iter()
         .find(|item| item.id == plugin_id && item.enabled)
         .ok_or_else(|| format!("plugin not found or unavailable: {plugin_id}"))?;
-    invoke_plugin_capability_for_item(&plugin, capability_id, input)
+    invoke_plugin_capability_for_item(&plugin, capability_id, input, trusted_dashboard_url)
 }
 
 fn invoke_plugin_capability_for_item(
     plugin: &PluginRegistryItem,
     capability_id: &str,
     input: Value,
+    trusted_dashboard_url: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
     let capability = plugin
         .capabilities
@@ -701,7 +779,13 @@ fn invoke_plugin_capability_for_item(
         return Err("plugin invocation limit reached".into());
     }
 
-    let result = invoke_plugin_process(&plugin, capability_id, input);
+    let result = invoke_plugin_process(
+        &plugin,
+        capability,
+        capability_id,
+        input,
+        trusted_dashboard_url,
+    );
     let health_root = plugin_health_root(
         std::path::Path::new(&plugin.path),
         plugin.development,
@@ -718,8 +802,10 @@ fn invoke_plugin_capability_for_item(
 
 fn invoke_plugin_process(
     plugin: &PluginRegistryItem,
+    capability: &PluginCapabilityManifest,
     capability_id: &str,
     input: Value,
+    trusted_dashboard_url: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
     if plugin.status != "installed" {
         return Err(format!("plugin is not installed: {}", plugin.id).into());
@@ -736,11 +822,23 @@ fn invoke_plugin_process(
         "params": input,
     });
 
-    let mut child = Command::new(entry)
+    let mut command = Command::new(entry);
+    command
         .current_dir(plugin_execution_dir(&plugin))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_remove("HIMIND_CONTROL_PLANE_URL")
+        .env_remove("HIMIND_DASHBOARD_URL")
+        .env_remove("HIMIND_API_BASE");
+    if let Some(url) = trusted_plugin_dashboard_url(plugin, capability, trusted_dashboard_url) {
+        // The Agent owns the trusted endpoint. Plugins never select or persist
+        // an arbitrary control-plane URL supplied by the AI caller.
+        command
+            .env("HIMIND_CONTROL_PLANE_URL", url)
+            .env("HIMIND_DASHBOARD_URL", url);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start plugin {}: {error}", plugin.id))?;
 
@@ -817,6 +915,24 @@ fn invoke_plugin_process(
         return Err(format!("plugin error: {error}").into());
     }
     Ok(response.get("result").cloned().unwrap_or(response))
+}
+
+fn trusted_plugin_dashboard_url<'a>(
+    plugin: &PluginRegistryItem,
+    capability: &PluginCapabilityManifest,
+    trusted_dashboard_url: Option<&'a str>,
+) -> Option<&'a str> {
+    let control_plane_capability = matches!(
+        capability.availability.trim().to_ascii_lowercase().as_str(),
+        "control_plane" | "dashboard"
+    );
+    let dashboard_permission = plugin
+        .permissions
+        .iter()
+        .any(|permission| permission == "network.dashboard.public");
+    trusted_dashboard_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty() && control_plane_capability && dashboard_permission)
 }
 
 fn validate_input_schema(schema: &Value, input: &Value) -> Result<(), Box<dyn Error>> {
@@ -1074,6 +1190,108 @@ mod tests {
         assert_eq!(item.version, "1.2.3");
         assert_eq!(item.release_notes, "新增本机详情更新说明。");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mixed_plugin_remains_visible_when_it_has_local_capabilities() {
+        let manifest = parse_plugin_manifest(
+            r#"{
+            "id":"com.himind.mixed-test",
+            "name":"混合能力测试",
+            "version":"1.0.0",
+            "permissions":["network.dashboard.public"],
+            "capabilities":[
+                {"id":"mixed.inspect","availability":"local"},
+                {"id":"mixed.publish","availability":"control_plane"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(manifest_availability(&manifest), "local");
+    }
+
+    #[test]
+    fn dashboard_only_plugin_is_control_plane() {
+        let manifest = parse_plugin_manifest(
+            r#"{
+            "id":"com.himind.dashboard-test",
+            "name":"控制面能力测试",
+            "version":"1.0.0",
+            "permissions":["network.dashboard.public"],
+            "capabilities":[{"id":"dashboard.read","availability":"control_plane"}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(manifest_availability(&manifest), "control_plane");
+    }
+
+    #[test]
+    fn dashboard_url_is_injected_only_for_permitted_control_plane_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-plugin-dashboard-environment-{}",
+            next_request_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
+                "id":"com.himind.dashboard-environment-test",
+                "name":"控制面环境测试",
+                "version":"1.0.0",
+                "runtime":"process-jsonrpc-stdio",
+                "permissions":["network.dashboard.public"],
+                "capabilities":[
+                    {"id":"distribution.resolve","availability":"control_plane"},
+                    {"id":"distribution.inspect","availability":"local"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let plugin = read_plugin_item(root.clone(), false);
+        let resolve = plugin
+            .capabilities
+            .iter()
+            .find(|item| item.id == "distribution.resolve")
+            .unwrap();
+        let inspect = plugin
+            .capabilities
+            .iter()
+            .find(|item| item.id == "distribution.inspect")
+            .unwrap();
+
+        assert_eq!(
+            trusted_plugin_dashboard_url(&plugin, resolve, Some("https://dashboard.example")),
+            Some("https://dashboard.example")
+        );
+        assert_eq!(
+            trusted_plugin_dashboard_url(&plugin, inspect, Some("https://dashboard.example")),
+            None
+        );
+        assert_eq!(trusted_plugin_dashboard_url(&plugin, resolve, None), None);
+
+        let mut unpermitted = plugin.clone();
+        unpermitted.permissions.clear();
+        assert_eq!(
+            trusted_plugin_dashboard_url(&unpermitted, resolve, Some("https://dashboard.example")),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn independent_registry_hides_control_plane_builtins() {
+        let registry = registry_json_for_control_plane(false).unwrap();
+        let items = registry["items"].as_array().unwrap();
+        assert!(items
+            .iter()
+            .any(|item| item["id"] == "com.himind.builtin.svn"));
+        assert!(!items
+            .iter()
+            .any(|item| item["id"] == "com.himind.dashboard-business"));
+        assert!(!items
+            .iter()
+            .any(|item| item["id"] == "com.himind.knowledge"));
+        assert_eq!(registry["total"].as_u64().unwrap(), items.len() as u64);
     }
 
     #[test]

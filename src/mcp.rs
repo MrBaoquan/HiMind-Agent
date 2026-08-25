@@ -160,6 +160,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn test_gateway() -> CapabilityGateway {
+        test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Connected)
+    }
+
+    fn test_gateway_for_mode(mode: crate::app::runtime_mode::AgentMode) -> CapabilityGateway {
         let mut options = Options::from_env();
         options.api_base = "http://127.0.0.1:9".to_string();
         options.state_path = std::env::temp_dir().join(format!(
@@ -167,6 +171,7 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("unnamed")
         ));
+        options.effective_mode = mode;
         CapabilityGateway::new(
             options,
             Arc::new(Mutex::new(LocalWorkerStatus {
@@ -231,5 +236,28 @@ mod tests {
         assert_eq!(result["isError"], true);
         let message = result["content"][0]["text"].as_str().unwrap();
         assert!(!message.contains("capability not found"), "{message}");
+    }
+
+    #[test]
+    fn independent_mcp_exposes_local_authoring_and_hides_control_plane() {
+        let gateway = test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let result = handle_request(&gateway, "tools/list", json!({})).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.plugin.candidate.save"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.skill.candidate.test"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.workspace.current"));
+        assert!(tools.iter().any(|tool| tool["name"] == "plugin.list"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "knowledge.search.v1"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.plugin.submission.submit"));
     }
 }

@@ -275,7 +275,7 @@ export function Shell({ currentPage, approvalCount, identity, dashboardEnabled, 
               ))}
             </div>
           ))}
-          {dashboardEnabled ? <div className="sidebar-developer">
+          <div className="sidebar-developer">
             <span className="sidebar-section-label">开发</span>
             {developerNavItems.map(item => (
               <button
@@ -291,7 +291,7 @@ export function Shell({ currentPage, approvalCount, identity, dashboardEnabled, 
                 <span>{item.label}</span>
               </button>
             ))}
-          </div> : null}
+          </div>
         </nav>
         {dashboardEnabled ? <button className={`sidebar-account ${identity?.authorized ? 'authorized' : ''}`} type="button" onClick={() => { onNavigate('dashboard'); window.setTimeout(() => document.getElementById('account-authorization')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0); }} title="HiMind 账号">
           <CircleUserRound size={18} />

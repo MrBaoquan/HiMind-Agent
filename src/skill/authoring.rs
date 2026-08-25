@@ -2,8 +2,9 @@ use crate::skill::manifest::{
     validate_relative_package_path, validate_skill_id, validate_skill_manifest,
 };
 use crate::skill::resolver::{compare_versions, CapabilityFact, SkillReadiness};
+use crate::skill::store::{SkillManagementPolicy, SkillStore};
 use crate::skill::types::{
-    SkillCapabilityDependency, SkillManifest, SkillPluginDependency, SkillRecord, SkillScope,
+    SkillCapabilityDependency, SkillManifest, SkillPluginDependency, SkillScope,
 };
 use crate::Options;
 use crate::VERSION;
@@ -455,13 +456,22 @@ pub(crate) fn test(
         .into());
     }
     let package_root = draft_version_root(skill_id, version).join("package");
-    let record = SkillRecord {
-        manifest: draft.manifest.clone(),
-        root: draft_version_root(skill_id, version),
-        version_root: package_root,
-        current: true,
-        previous_version: None,
-    };
+    let store = SkillStore::new();
+    let record = store.install_organization_package(
+        &package_root,
+        &draft.manifest.id,
+        &draft.manifest.version,
+    )?;
+    store.apply_management_policy(
+        &draft.manifest.id,
+        &SkillManagementPolicy {
+            management: "user_managed".to_string(),
+            source: "authoring_candidate".to_string(),
+            assignment_id: String::new(),
+            reason: "本机候选测试".to_string(),
+            allow_uninstall: true,
+        },
+    )?;
     let clients =
         crate::skill::sync_record_to_supported_clients(&record, VERSION, capability_facts)?;
     let codex = clients

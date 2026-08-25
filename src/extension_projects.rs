@@ -7,6 +7,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEVELOPMENT_TOOLS_PLUGIN_ID: &str = "com.himind.extension-development-tools";
@@ -56,7 +57,9 @@ pub(crate) struct ExtensionProject {
     pub name: String,
     pub description: String,
     pub version: String,
-    pub workspace_path: PathBuf,
+    /// UTF-8 display path for the Tauri/JSON boundary. Keep the internal
+    /// registry as PathBuf so filesystem operations remain lossless.
+    pub workspace_path: String,
     pub workspace_available: bool,
     pub source: String,
     pub source_repository: String,
@@ -119,6 +122,7 @@ pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
     let path = registry_path();
     let mut records = read_records(&path)?;
     let mut changed = migrate_legacy_projects(&mut records);
+    changed |= merge_shared_workspace_projects(&mut records);
 
     for record in &mut records {
         if !record.workspace_path.is_dir() {
@@ -146,8 +150,89 @@ pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
     Ok(records.into_iter().map(ExtensionProject::from).collect())
 }
 
+/// Reconciles the selected aggregate Git workspace into the current Agent profile.
+/// The source directory is shared, while this registry (and all drafts/candidates)
+/// remains profile-local. Existing manually registered projects are preserved.
+fn merge_shared_workspace_projects(records: &mut Vec<ProjectRecord>) -> bool {
+    let mut changed = false;
+    if !crate::extension_workspace::settings().valid {
+        return false;
+    }
+    let discovered_items = crate::extension_workspace::discover();
+    let discovered_ids: std::collections::HashSet<String> = discovered_items
+        .iter()
+        .map(|item| format!("{}:{}", item.kind, item.id))
+        .collect();
+    let before = records.len();
+    records
+        .retain(|record| record.source != "git_workspace" || discovered_ids.contains(&record.id));
+    changed |= records.len() != before;
+    for discovered in discovered_items {
+        let Ok(mut candidate) = project_record_from_path(&discovered.path, "git_workspace") else {
+            continue;
+        };
+        if candidate.extension_id != discovered.id {
+            continue;
+        }
+        candidate.source_repository = discovered.source_repository.clone();
+        candidate.source_default_branch = discovered.source_default_branch.clone();
+        candidate.source_subdirectory = discovered.source_subdirectory.clone();
+        let Some(existing) = records.iter_mut().find(|record| record.id == candidate.id) else {
+            records.push(candidate);
+            changed = true;
+            continue;
+        };
+        // Do not replace a developer's explicitly opened workspace. Once a record
+        // came from the shared catalog, keep its path synchronized with the catalog.
+        if existing.source == "git_workspace" || existing.workspace_path == candidate.workspace_path
+        {
+            if existing.kind != candidate.kind
+                || existing.extension_id != candidate.extension_id
+                || existing.name != candidate.name
+                || existing.description != candidate.description
+                || existing.version != candidate.version
+                || existing.workspace_path != candidate.workspace_path
+                || existing.source != "git_workspace"
+                || existing.source_repository != candidate.source_repository
+                || existing.source_default_branch != candidate.source_default_branch
+                || existing.source_subdirectory != candidate.source_subdirectory
+            {
+                let source_commit = existing.source_commit.clone();
+                *existing = candidate;
+                existing.source_commit = source_commit;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 pub(crate) fn get(project_id: &str) -> Result<ExtensionProject, Box<dyn Error>> {
     Ok(find_record(project_id)?.into())
+}
+
+pub(crate) fn current_workspace() -> Result<Value, Box<dyn Error>> {
+    let workspace = current_workspace_path()?;
+    let project = project_record_from_path(&workspace, "ai_workspace")
+        .ok()
+        .map(ExtensionProject::from);
+    let kind = project
+        .as_ref()
+        .map(|item| item.kind.as_str())
+        .unwrap_or("directory");
+    Ok(json!({
+        "workspace_root": crate::extension_workspace::display_path(&workspace),
+        "kind": kind,
+        "project": project,
+    }))
+}
+
+pub(crate) fn current_workspace_path() -> Result<PathBuf, Box<dyn Error>> {
+    Ok(env::var_os("HIMIND_AI_WORKSPACE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(env::current_dir()?)
+        .canonicalize()?)
 }
 
 pub(crate) fn register(path: &Path) -> Result<ExtensionProject, Box<dyn Error>> {
@@ -261,7 +346,7 @@ pub(crate) fn create(
                 "author": author.trim(),
                 "categories": [category],
                 "release_notes": release_notes,
-                "supported_clients": ["codex", "github-copilot", "workbuddy"],
+                "supported_clients": ["himind-ai", "codex", "github-copilot", "workbuddy"],
             }),
         )?,
     };
@@ -275,6 +360,12 @@ pub(crate) fn create(
 pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Error>> {
     let project = find_record(project_id)?;
     let workspace = project.workspace_path.canonicalize()?;
+    // The commit is provenance metadata for Dashboard submissions; developers do not need to manage it.
+    if !project.source_repository.trim().is_empty() {
+        if let Some(commit) = git_head(&workspace) {
+            let _ = update_source_commit(project_id, &commit);
+        }
+    }
     cleanup_temporary_candidates(&workspace);
     let extension = match project.kind {
         ExtensionProjectKind::Plugin => "hmpkg",
@@ -327,6 +418,34 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
     result
 }
 
+fn update_source_commit(project_id: &str, commit: &str) -> Result<(), Box<dyn Error>> {
+    let path = registry_path();
+    let mut records = read_records(&path)?;
+    let Some(record) = records.iter_mut().find(|record| record.id == project_id) else {
+        return Ok(());
+    };
+    if record.source_commit == commit {
+        return Ok(());
+    }
+    record.source_commit = commit.to_string();
+    record.updated_at = now_stamp();
+    write_records(&path, &records)
+}
+
+fn git_head(workspace: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!commit.is_empty()).then_some(commit)
+}
+
 pub(crate) fn remove(project_id: &str) -> Result<(), Box<dyn Error>> {
     let path = registry_path();
     let mut records = read_records(&path)?;
@@ -362,6 +481,7 @@ fn invoke_development_tool(capability_id: &str, input: Value) -> Result<Value, B
         DEVELOPMENT_TOOLS_PLUGIN_ID,
         capability_id,
         input,
+        None,
     )
     .map_err(|error| friendly_tool_error(&error.to_string()).into())
 }
@@ -589,7 +709,7 @@ impl From<ProjectRecord> for ExtensionProject {
             name: value.name,
             description: value.description,
             version: value.version,
-            workspace_path: value.workspace_path,
+            workspace_path: crate::extension_workspace::display_path(&value.workspace_path),
             source: value.source,
             source_repository: value.source_repository,
             source_default_branch: value.source_default_branch,

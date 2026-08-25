@@ -1,5 +1,6 @@
 use std::{
     io::{BufRead, BufReader},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -28,6 +29,8 @@ use crate::Options;
 
 struct BuiltinAiSession {
     child: Child,
+    workspace: PathBuf,
+    focus_workspace: bool,
     proxy: BuiltinAiProxy,
     event_sync: BuiltinAiEventSync,
     model_sync: BuiltinAiModelSync,
@@ -178,6 +181,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::save_builtin_ai_mcp_server,
             super::commands::delete_builtin_ai_mcp_server,
             super::commands::validate_builtin_ai_mcp_server,
+            super::commands::reload_builtin_ai_tool_context,
             super::commands::install_builtin_ai_runtime,
             super::commands::start_builtin_ai_runtime_install,
             super::commands::start_builtin_ai_session,
@@ -206,6 +210,12 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_svn_connection,
             super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
+            super::commands::get_extension_sources,
+            super::commands::add_extension_source,
+            super::commands::update_extension_source,
+            super::commands::remove_extension_source,
+            super::commands::get_extension_source_snapshot,
+            super::commands::get_extension_provenance,
             super::commands::import_local_plugin,
             super::commands::import_github_plugin,
             super::commands::get_extension_desired_state,
@@ -228,10 +238,13 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::install_organization_skill,
             super::commands::plan_organization_skill_install,
             super::commands::list_extension_projects,
-            super::commands::open_extension_project,
+            super::commands::get_extension_workspace,
+            super::commands::select_extension_workspace,
+            super::commands::open_extension_projects,
             super::commands::associate_extension_project,
             super::commands::create_extension_project,
             super::commands::build_extension_project,
+            super::commands::prepare_extension_authoring,
             super::commands::remove_extension_project,
             super::commands::list_extension_collaboration_projects,
             super::commands::update_extension_project_source,
@@ -652,25 +665,44 @@ pub(crate) fn open_plugin_view(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn start_builtin_ai_session(options: &Options) -> Result<String, String> {
-    if let Some(session) = builtin_ai_session()
+pub(crate) fn start_builtin_ai_session(
+    options: &Options,
+    workspace: Option<&Path>,
+) -> Result<String, String> {
+    let focus_workspace = workspace.is_some();
+    let workspace = requested_builtin_ai_workspace(workspace)?;
+    {
+        let active = builtin_ai_session()
+            .lock()
+            .map_err(|_| "HiMind AI 会话状态不可用")?;
+        if let Some(session) = active.as_ref() {
+            if session.workspace == workspace && session.focus_workspace == focus_workspace {
+                return Ok(session.proxy.url().to_string());
+            }
+        }
+    }
+    if builtin_ai_session()
         .lock()
         .map_err(|_| "HiMind AI 会话状态不可用")?
-        .as_ref()
+        .is_some()
     {
-        return Ok(session.proxy.url().to_string());
+        stop_builtin_ai_process();
     }
     if builtin_ai_starting().swap(true, Ordering::AcqRel) {
         return Err("HiMind AI 正在启动，请稍后重试".to_string());
     }
 
-    let result = start_builtin_ai_session_inner(options);
+    let result = start_builtin_ai_session_inner(options, &workspace, focus_workspace);
     builtin_ai_starting().store(false, Ordering::Release);
     result
 }
 
-fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
-    let launch = crate::runtime::builtin::prepare_interactive_launch(options)?;
+fn start_builtin_ai_session_inner(
+    options: &Options,
+    workspace: &Path,
+    focus_workspace: bool,
+) -> Result<String, String> {
+    let launch = crate::runtime::builtin::prepare_interactive_launch(options, Some(workspace))?;
     let mut command = if launch
         .executable
         .extension()
@@ -686,6 +718,7 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         .args(["--profile", "himind", "--patch"])
         .arg(&launch.agent_patch)
         .args(["--host", "127.0.0.1", "--port", "0"])
+        .current_dir(&launch.workspace)
         .env("DSH_HOME", &launch.home)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
         .env("DSH_PERMISSION_MODE", launch.permission_mode)
@@ -754,11 +787,19 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         options.clone(),
         crate::app::builtin_ai_gateway::RuntimeCapabilities::conservative(),
     );
-    let proxy = BuiltinAiProxy::start(&url, Some(observer)).map_err(|error| {
+    let mut proxy = BuiltinAiProxy::start(&url, Some(observer)).map_err(|error| {
         crate::runtime::process::terminate_process_tree(&mut child);
         let _ = child.wait();
         error
     })?;
+    if focus_workspace {
+        if let Err(error) = proxy.control().start_workspace_session(&launch.workspace) {
+            proxy.stop();
+            crate::runtime::process::terminate_process_tree(&mut child);
+            let _ = child.wait();
+            return Err(format!("无法进入扩展项目工作区：{error}"));
+        }
+    }
     let runtime_capabilities =
         crate::app::builtin_ai_gateway::probe_builtin_ai_capabilities(&proxy.control());
     event_sync.set_capabilities(runtime_capabilities);
@@ -787,16 +828,33 @@ fn start_builtin_ai_session_inner(options: &Options) -> Result<String, String> {
         )
     });
     let session_url = proxy.url().to_string();
+    let workspace = launch.workspace.clone();
     *builtin_ai_session()
         .lock()
         .map_err(|_| "HiMind AI 会话状态不可用")? = Some(BuiltinAiSession {
         child,
+        workspace,
+        focus_workspace,
         proxy,
         event_sync,
         model_sync,
         command_gateway,
     });
     Ok(session_url)
+}
+
+fn requested_builtin_ai_workspace(workspace: Option<&Path>) -> Result<PathBuf, String> {
+    let workspace = match workspace {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|error| error.to_string())?,
+    };
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("HiMind AI 工作目录不可用: {error}"))?;
+    if !workspace.is_dir() {
+        return Err("HiMind AI 工作目录必须是本机目录".to_string());
+    }
+    Ok(workspace)
 }
 
 fn append_builtin_ai_diagnostic(diagnostics: &Arc<Mutex<Vec<String>>>, line: &str) {
@@ -855,20 +913,25 @@ pub(crate) fn stop_builtin_ai_process() {
 pub(crate) fn sync_builtin_ai_models(
     options: &Options,
 ) -> Result<BuiltinAiModelSyncResult, String> {
-    let result = {
+    let (result, workspace, focus_workspace) = {
         let active = builtin_ai_session()
             .lock()
             .map_err(|_| "HiMind AI 会话状态不可用")?;
         let session = active
             .as_ref()
             .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?;
-        session
-            .model_sync
-            .sync_now(options, &session.proxy.control())?
+        (
+            session
+                .model_sync
+                .sync_now(options, &session.proxy.control())?,
+            session.workspace.clone(),
+            session.focus_workspace,
+        )
     };
     if result.status == "restart_required" {
         stop_builtin_ai_process();
-        let session_url = start_builtin_ai_session(options)?;
+        let session_url =
+            start_builtin_ai_session(options, focus_workspace.then_some(workspace.as_path()))?;
         return Ok(BuiltinAiModelSyncResult {
             status: "restarted".to_string(),
             model_count: result.model_count,

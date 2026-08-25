@@ -2,8 +2,10 @@ use crate::api::distribution::{
     plugin_catalog, plugin_versions, report_plugin_status, PluginCatalogItem, PluginStatusReport,
     SkillPluginDependency,
 };
-use crate::app::system::{validate_signature_metadata, verify_rsa_pss_sha256};
-use crate::capability::plugin::{is_builtin_plugin, plugin_registry_dir, PluginManifest};
+use crate::app::system::verify_extension_artifact_signature;
+use crate::capability::plugin::{
+    is_builtin_plugin, parse_plugin_manifest, plugin_registry_dir, PluginManifest,
+};
 use crate::skill::resolver::compare_versions;
 use crate::store::plugin_outbox::{
     list as list_statuses, remove as remove_status, store as store_status, PluginStatusRecord,
@@ -348,6 +350,86 @@ pub(crate) fn install_local_package_from_source(
     result
 }
 
+/// Checks dependencies for a user-managed package without contacting the
+/// Dashboard catalog. This is used by GitHub imports so a package either has
+/// a complete local dependency graph or fails before changing the registry.
+pub(crate) fn validate_local_dependencies(manifest: &PluginManifest) -> Result<(), Box<dyn Error>> {
+    let installed = crate::capability::plugin::scan_plugins()?
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut visiting = HashSet::new();
+    for dependency in &manifest.plugin_dependencies {
+        validate_local_dependency(
+            &dependency.plugin_id,
+            &dependency.min_version,
+            dependency.required,
+            &installed,
+            &mut visiting,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_local_plugin_package_dependencies(
+    package_root: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let content = fs::read_to_string(package_root.join("plugin.json"))?;
+    let manifest = parse_plugin_manifest(content.trim_start_matches('\u{feff}'))?;
+    validate_local_dependencies(&manifest)
+}
+
+fn validate_local_dependency(
+    plugin_id: &str,
+    minimum_version: &str,
+    required: bool,
+    installed: &HashMap<String, crate::capability::plugin::PluginRegistryItem>,
+    visiting: &mut HashSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(item) = installed.get(plugin_id) else {
+        return if required {
+            Err(format!("缺少必需插件依赖：{plugin_id}，请先安装依赖插件").into())
+        } else {
+            Ok(())
+        };
+    };
+    if !visiting.insert(plugin_id.to_string()) {
+        return Err(format!("插件依赖存在循环：{plugin_id}").into());
+    }
+    let result = (|| {
+        if !item.enabled {
+            if required {
+                return Err(format!("必需插件依赖不可用：{plugin_id}").into());
+            }
+            return Ok(());
+        }
+        if !minimum_version.trim().is_empty()
+            && compare_versions(&item.version, minimum_version) == Ordering::Less
+        {
+            if required {
+                return Err(format!(
+                    "插件依赖 {plugin_id} 版本过低，需要 v{minimum_version}，当前为 v{}",
+                    item.version
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        for dependency in &item.plugin_dependencies {
+            validate_local_dependency(
+                &dependency.plugin_id,
+                &dependency.min_version,
+                required && dependency.required,
+                installed,
+                visiting,
+            )?;
+        }
+        Ok(())
+    })();
+    visiting.remove(plugin_id);
+    result
+}
+
 fn read_plugin_manifest_from_archive(path: &Path) -> Result<PluginManifest, Box<dyn Error>> {
     let mut archive = ZipArchive::new(File::open(path)?)?;
     let mut entry = archive
@@ -503,6 +585,30 @@ fn install_catalog_item(
     }
     ensure_agent_version_supported(&item.min_agent_version)?;
     let archive = download(client, options, agent_id, item)?;
+    let result = install_archive(&archive, item);
+    let _ = fs::remove_file(archive);
+    result
+}
+
+/// Installs a plugin release from a configured public extension source.
+/// The caller must normalize policy fields before invoking this function.
+pub(crate) fn install_public_catalog_item(
+    item: &PluginCatalogItem,
+    require_signature: bool,
+) -> Result<(), Box<dyn Error>> {
+    if item.governance != "optional"
+        || item.management != "user_managed"
+        || item.assignment != "optional"
+        || item.managed
+    {
+        return Err("公共扩展源不能授予组织管理策略".into());
+    }
+    ensure_agent_version_supported(&item.min_agent_version)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .user_agent("HiMind-Agent")
+        .build()?;
+    let archive = download_public(&client, item, require_signature)?;
     let result = install_archive(&archive, item);
     let _ = fs::remove_file(archive);
     result
@@ -1010,27 +1116,72 @@ fn download(
         )
         .into());
     }
-    verify_signature(&path, item)?;
-    Ok(path)
-}
-
-fn verify_signature(path: &Path, item: &PluginCatalogItem) -> Result<(), Box<dyn Error>> {
-    let require_signed = env::var("HIMIND_REQUIRE_SIGNED_UPDATES")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    validate_signature_metadata(
+    verify_extension_artifact_signature(
+        &path,
         &item.signature,
         &item.signature_key_id,
         &item.signature_algorithm,
-        require_signed,
+        true,
     )?;
-    if item.signature.is_empty() {
-        return Ok(());
+    Ok(path)
+}
+
+fn download_public(
+    client: &Client,
+    item: &PluginCatalogItem,
+    require_signature: bool,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if item.file_size == 0 || item.file_size > MAX_PLUGIN_ARCHIVE_BYTES {
+        return Err("插件制品大小无效或超过 512 MiB 限制".into());
     }
-    let trusted = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").ok_or("未配置插件受信公钥目录")?;
-    let pem =
-        fs::read_to_string(PathBuf::from(trusted).join(format!("{}.pem", item.signature_key_id)))?;
-    verify_rsa_pss_sha256(path, &pem, &item.signature)
+    let url = url::Url::parse(&item.download_url)?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return Err("公共插件制品必须使用 github.com 的 HTTPS Release 地址".into());
+    }
+    let mut response = client.get(url).send()?.error_for_status()?;
+    if response
+        .content_length()
+        .map(|size| size > item.file_size || size > MAX_PLUGIN_ARCHIVE_BYTES)
+        .unwrap_or(false)
+    {
+        return Err("插件制品响应大小超过发布记录".into());
+    }
+    let path = env::temp_dir().join(format!("himind-public-plugin-{}.hmpkg", unique_suffix()));
+    let mut file = File::create(&path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = response.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_PLUGIN_ARCHIVE_BYTES || total > item.file_size {
+            let _ = fs::remove_file(&path);
+            return Err("插件制品实际大小超过发布记录".into());
+        }
+        file.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+    }
+    file.flush()?;
+    if total != item.file_size {
+        let _ = fs::remove_file(&path);
+        return Err("插件制品实际大小与发布记录不一致".into());
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&item.sha256) {
+        let _ = fs::remove_file(&path);
+        return Err("插件制品 SHA-256 校验失败".into());
+    }
+    verify_extension_artifact_signature(
+        &path,
+        &item.signature,
+        &item.signature_key_id,
+        &item.signature_algorithm,
+        require_signature,
+    )?;
+    Ok(path)
 }
 
 fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), Box<dyn Error>> {
@@ -1278,6 +1429,7 @@ mod tests {
         rollback_root, set_enabled, set_owner_references_in, uninstall, verify_plugin_checksums,
     };
     use crate::api::distribution::{PluginCatalogItem, SkillPluginDependency};
+    use crate::app::system::verify_extension_artifact_signature;
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Read, Write};
@@ -1338,6 +1490,45 @@ mod tests {
             view_count: 0,
             plugin_dependencies: dependencies,
         }
+    }
+
+    #[test]
+    fn unsigned_plugin_is_allowed_only_when_the_source_policy_is_optional() {
+        let path = std::env::temp_dir().join(format!(
+            "himind-plugin-signature-policy-test-{}",
+            super::unique_suffix()
+        ));
+        fs::write(&path, b"unsigned plugin").unwrap();
+        let mut item = catalog_plugin("com.himind.test.unsigned", "未签名插件", "1.0.0", vec![]);
+
+        assert!(verify_extension_artifact_signature(
+            &path,
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            false
+        )
+        .is_ok());
+        assert!(verify_extension_artifact_signature(
+            &path,
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            true
+        )
+        .is_err());
+
+        item.signature = "c2ln".to_string();
+        item.signature_algorithm = "rsa-pss-sha256".to_string();
+        assert!(verify_extension_artifact_signature(
+            &path,
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            false
+        )
+        .is_err());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

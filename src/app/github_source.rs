@@ -17,6 +17,7 @@ pub(crate) fn import_plugin(
     let root = download_source(repository, reference)?;
     let result = (|| {
         let package = package_root(&root, subpath, "plugin.json")?;
+        crate::app::plugin_manager::validate_local_plugin_package_dependencies(&package)?;
         crate::app::plugin_manager::install_local_package_from_source(&package, "github")?;
         crate::capability::plugin::registry_json().map_err(Into::into)
     })();

@@ -32,6 +32,7 @@ type SkillsWorkspacePageProps = {
 	desiredLoading: boolean;
 	desiredError: string | null;
 	pluginRegistry: PluginRegistry | null;
+	marketEnabled: boolean;
 	onQueryMarketplace: (q: string, category: string, page?: number, pageSize?: number) => Promise<CatalogPage<OrganizationSkillCatalogItem>>;
 	availablePlugins: PluginCatalogItem[];
   busyAction: string | null;
@@ -52,7 +53,7 @@ type SkillsWorkspacePageProps = {
 
 type ViewKey = 'marketplace' | 'installed' | 'system';
 
-export function SkillsWorkspacePage({ catalog, status, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onOpenDirectory, onImportLocal, onImportGithub }: SkillsWorkspacePageProps) {
+export function SkillsWorkspacePage({ catalog, status, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, marketEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onOpenDirectory, onImportLocal, onImportGithub }: SkillsWorkspacePageProps) {
   const [query, setQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [marketplaceItems, setMarketplaceItems] = useState<OrganizationSkillCatalogItem[]>(marketplace);
@@ -60,10 +61,11 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   const [marketplacePage, setMarketplacePage] = useState(1);
   const [marketplaceLoading, setMarketplaceLoading] = useState(false);
   const [view, setView] = useState<ViewKey>(() => {
-    if (!dashboardEnabled) return 'installed';
     try {
       const stored = window.localStorage.getItem('himind-agent.skills-view');
-      return stored === 'marketplace' || stored === 'system' ? stored : 'installed';
+      if (stored === 'marketplace' && marketEnabled) return 'marketplace';
+      if (stored === 'system' && dashboardEnabled) return 'system';
+      return 'installed';
     } catch { return 'installed'; }
   });
   const [selectedId, setSelectedId] = useState('');
@@ -91,7 +93,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
 	const visibleMarket = marketplaceItems;
 
   useEffect(() => {
-    if (!dashboardEnabled || view !== 'marketplace') return;
+    if (!marketEnabled || view !== 'marketplace') return;
     let active = true;
     const timer = window.setTimeout(async () => {
       setMarketplaceLoading(true);
@@ -117,7 +119,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
       }
     }, 180);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [categoryFilter, dashboardEnabled, marketplace, onQueryMarketplace, query, view]);
+  }, [categoryFilter, marketEnabled, marketplace, onQueryMarketplace, query, view]);
 
   async function loadMoreMarketplace() {
     if (marketplaceLoading || marketplaceItems.length >= marketplaceTotal) return;
@@ -145,8 +147,8 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   useEffect(() => { setDetailOpen(false); }, [view]);
   useEffect(() => { try { window.localStorage.setItem('himind-agent.skills-view', view); } catch { /* storage is optional */ } }, [view]);
   useEffect(() => {
-    if (!dashboardEnabled && view !== 'installed') setView('installed');
-  }, [dashboardEnabled, view]);
+    if ((!marketEnabled && view === 'marketplace') || (!dashboardEnabled && view === 'system')) setView('installed');
+  }, [dashboardEnabled, marketEnabled, view]);
 
   const filteredItems = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -191,9 +193,9 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
       {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>技能状态读取失败</strong><span>{error}</span></div></div> : null}
 
       {status?.target_mode === 'preview' && view !== 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>未找到 AI 工具的技能目录，当前安装仅在 HiMind Agent 中可用。</span></div> : null}
-	  {dashboardEnabled && marketplaceError && view === 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{marketplaceError}</span></div> : null}
+	  {marketEnabled && marketplaceError && view === 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{marketplaceError}</span></div> : null}
 	  <div className="plugin-toolbar skill-view-toolbar"><div className="plugin-tabs" role="tablist" aria-label="技能视图">
-	    {dashboardEnabled ? <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button> : null}
+	    {marketEnabled ? <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button> : null}
 	    <button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{installedCount}</span></button>
 	    {dashboardEnabled ? <button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>受管理 <span>{systemSkillCount}</span></button> : null}
 	  </div><div className="skill-sync-compact"><span>安装方式</span><div className="segmented-control" role="group" aria-label="技能安装方式"><button type="button" title="复制文件" aria-label="复制文件" aria-pressed={syncMode === 'copy'} className={syncMode === 'copy' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('copy')}><Files size={13} />复制</button><button type="button" title="软链接" aria-label="软链接" aria-pressed={syncMode === 'symlink'} className={syncMode === 'symlink' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('symlink')}><Link2 size={13} />链接</button></div></div></div>
@@ -203,7 +205,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
           <div className="skill-browser-tools">
             <label className="skill-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索技能" /></label>
           </div>
-		  {dashboardEnabled && view === 'marketplace' ? <div className="market-category-block skill-marketplace-category"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">技能功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部技能（{marketplace.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="技能功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部技能<span>{marketplace.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div> : null}
+		  {marketEnabled && view === 'marketplace' ? <div className="market-category-block skill-marketplace-category"><div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div><label className="market-category-select"><span className="sr-only">技能功能分类</span><select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}><option value="all">全部技能（{marketplace.length}）</option>{FUNCTIONAL_CATEGORIES.map(category => <option value={category.id} key={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}</select></label><nav className="market-category-nav" aria-label="技能功能分类"><button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部技能<span>{marketplace.length}</span></button>{FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}</nav></div> : null}
           {view === 'marketplace' ? <div className="plugin-catalog-result"><span>{marketplaceTotal} 个结果</span>{marketplaceLoading ? <span className="spinner" /> : null}</div> : null}
           <div className="skill-browser-list">
 			{view === 'marketplace' ? visibleMarket.map(item => <MarketSkillListItem key={item.skill_id} item={item} installed={installedById.get(item.skill_id)} selected={item.skill_id === selectedMarket?.skill_id} onSelect={id => { setSelectedId(id); setDetailOpen(true); }} />) : filteredItems.map(item => <SkillListItem key={item.record.manifest.id} item={item} selected={item.record.manifest.id === selected?.record.manifest.id} onSelect={id => { setSelectedId(id); setDetailOpen(true); }} />)}

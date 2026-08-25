@@ -165,6 +165,7 @@ pub(crate) fn test_connection(
     command
         .args(mcp_arguments(options))
         .env("HIMIND_AI_CLIENT_ID", "agent-self-test")
+        .env("HIMIND_AGENT_PROFILE", crate::store::paths::profile_name())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -462,7 +463,13 @@ fn configuration_matches(
                 .and_then(|table| table.get("HIMIND_AI_CLIENT_ID"))
                 .and_then(Item::as_str)
                 == Some(definition.id);
-            Ok(command_matches && args_match && client_matches)
+            let profile_matches = server
+                .get("env")
+                .and_then(Item::as_table_like)
+                .and_then(|table| table.get("HIMIND_AGENT_PROFILE"))
+                .and_then(Item::as_str)
+                == Some(crate::store::paths::profile_name().as_str());
+            Ok(command_matches && args_match && client_matches && profile_matches)
         }
         ConfigKind::McpJson | ConfigKind::WorkBuddyJson => {
             let root: Value = serde_json::from_str(&content)?;
@@ -491,7 +498,11 @@ fn configuration_matches(
                 .pointer("/env/HIMIND_AI_CLIENT_ID")
                 .and_then(Value::as_str)
                 == Some(definition.id);
-            Ok(command_matches && args_match && client_matches)
+            let profile_matches = server
+                .pointer("/env/HIMIND_AGENT_PROFILE")
+                .and_then(Value::as_str)
+                == Some(crate::store::paths::profile_name().as_str());
+            Ok(command_matches && args_match && client_matches && profile_matches)
         }
     }
 }
@@ -522,6 +533,10 @@ fn merge_codex_config(
     server.insert("args", value(args));
     let mut environment = Table::new();
     environment.insert("HIMIND_AI_CLIENT_ID", value(client_id));
+    environment.insert(
+        "HIMIND_AGENT_PROFILE",
+        value(crate::store::paths::profile_name()),
+    );
     server.insert("env", Item::Table(environment));
     servers.insert(SERVER_ID, Item::Table(server));
     Ok(document.to_string())
@@ -589,7 +604,10 @@ fn merge_json_config(
         "type": "stdio",
         "command": executable.to_string_lossy(),
         "args": arguments,
-        "env": { "HIMIND_AI_CLIENT_ID": client_id }
+        "env": {
+            "HIMIND_AI_CLIENT_ID": client_id,
+            "HIMIND_AGENT_PROFILE": crate::store::paths::profile_name()
+        }
     });
     if workbuddy {
         server["timeout"] = json!(60);

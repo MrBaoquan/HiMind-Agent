@@ -147,6 +147,14 @@ Section "HiMind Agent 核心组件" SEC_AGENT
     File /oname=${SIGNING_KEY_ID}.pem "${TRUSTED_PUBLIC_KEY}"
     SetOutPath "$INSTDIR"
   !endif
+  !ifdef TRUSTED_EXTENSION_PUBLIC_KEY
+    !ifndef EXTENSION_SIGNING_KEY_ID
+      !error "EXTENSION_SIGNING_KEY_ID is required with TRUSTED_EXTENSION_PUBLIC_KEY"
+    !endif
+    SetOutPath "$INSTDIR\trusted-keys"
+    File /oname=${EXTENSION_SIGNING_KEY_ID}.pem "${TRUSTED_EXTENSION_PUBLIC_KEY}"
+    SetOutPath "$INSTDIR"
+  !endif
 
   SetOutPath "$INSTDIR\versions\${PRODUCT_VERSION}"
   File "${RELEASE}\himind-agent.exe"

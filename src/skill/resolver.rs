@@ -57,19 +57,13 @@ impl SkillReadiness {
             ));
         }
 
-        let mut missing_optional = 0_usize;
         for dependency in &manifest.capabilities {
             let resolution = resolve_dependency(dependency, capability_facts);
-            if resolution.state == "blocked" {
+            if resolution.required && resolution.state == "blocked" {
                 state = "blocked".to_string();
-                if resolution.required {
-                    reasons.push(format!("missing required capability: {}", resolution.id));
-                } else {
-                    missing_optional += 1;
-                }
-            } else if resolution.state == "degraded" && state == "ready" {
+                reasons.push(format!("missing required capability: {}", resolution.id));
+            } else if resolution.required && resolution.state == "degraded" && state == "ready" {
                 state = "degraded".to_string();
-                missing_optional += 1;
             }
             dependencies.push(resolution);
         }
@@ -77,10 +71,6 @@ impl SkillReadiness {
         if !reasons.is_empty() && state == "ready" {
             state = "degraded".to_string();
         }
-        if missing_optional > 0 && state == "ready" {
-            state = "degraded".to_string();
-        }
-
         Self {
             state,
             reasons,
@@ -174,4 +164,71 @@ pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
         }
     }
     Ordering::Equal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skill::types::{SkillCapabilityDependency, SkillManifest, SkillScope};
+
+    fn manifest(capabilities: Vec<SkillCapabilityDependency>) -> SkillManifest {
+        SkillManifest {
+            id: "com.himind.skill.test".to_string(),
+            name: "测试技能".to_string(),
+            author: "测试作者".to_string(),
+            categories: Vec::new(),
+            version: "1.0.0".to_string(),
+            scope: SkillScope::User,
+            description: String::new(),
+            release_notes: String::new(),
+            min_agent_version: "0.3.0".to_string(),
+            supported_clients: vec!["codex".to_string()],
+            capabilities,
+            plugin_dependencies: Vec::new(),
+            risk_summary: String::new(),
+            contents: Vec::new(),
+        }
+    }
+
+    fn dependency(id: &str, required: bool) -> SkillCapabilityDependency {
+        SkillCapabilityDependency {
+            id: id.to_string(),
+            required,
+            min_version: Some("1.0.0".to_string()),
+            max_version: None,
+            provider: Some("agent".to_string()),
+        }
+    }
+
+    #[test]
+    fn missing_optional_capability_does_not_degrade_skill_readiness() {
+        let readiness = SkillReadiness::resolve(
+            &manifest(vec![dependency("extension.submission.submit", false)]),
+            &[],
+            "0.3.32",
+            "codex",
+        );
+
+        assert_eq!(readiness.state, "ready");
+        assert!(readiness.reasons.is_empty());
+        assert_eq!(readiness.dependencies[0].state, "degraded");
+        assert!(!readiness.dependencies[0].required);
+    }
+
+    #[test]
+    fn missing_required_capability_blocks_skill_readiness() {
+        let readiness = SkillReadiness::resolve(
+            &manifest(vec![dependency("extension.plugin.build", true)]),
+            &[],
+            "0.3.32",
+            "codex",
+        );
+
+        assert_eq!(readiness.state, "blocked");
+        assert_eq!(
+            readiness.reasons,
+            vec!["missing required capability: extension.plugin.build"]
+        );
+        assert_eq!(readiness.dependencies[0].state, "blocked");
+    }
 }

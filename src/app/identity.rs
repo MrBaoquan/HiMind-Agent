@@ -10,6 +10,14 @@ use crate::approval::manager::ApprovalManager;
 use crate::Options;
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct AuthoringIdentity {
+    pub user_name: String,
+    pub user_id: String,
+    pub online_verified: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DashboardIdentityStatus {
     pub state: String,
     pub authorized: bool,
@@ -76,6 +84,32 @@ pub(crate) fn independent_status(options: &Options) -> DashboardIdentityStatus {
         svn_provisioning_status: String::new(),
         svn_provisioning_error: String::new(),
         error: String::new(),
+    }
+}
+
+/// Dashboard identity enriches connected submissions but is not required for
+/// local extension scaffolding, validation, packaging, or candidate tests.
+pub(crate) fn authoring_identity(options: &Options) -> AuthoringIdentity {
+    if options.mode().dashboard_enabled() {
+        let dashboard = identity_status(options);
+        if dashboard.authorized && !dashboard.user_name.trim().is_empty() {
+            return AuthoringIdentity {
+                user_name: dashboard.user_name,
+                user_id: dashboard.user_id,
+                online_verified: dashboard.online_verified,
+                source: "dashboard".to_string(),
+            };
+        }
+    }
+    AuthoringIdentity {
+        user_name: std::env::var("HIMIND_AGENT_AUTHOR_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "本地开发者".to_string()),
+        user_id: String::new(),
+        online_verified: false,
+        source: "local".to_string(),
     }
 }
 

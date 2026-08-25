@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +38,9 @@ pub struct SoftwareReleasePublishRequest {
     pub mandatory: bool,
     #[serde(default = "default_full_rollout")]
     pub rollout_percent: i64,
+    pub inspection_receipt: String,
+    pub expected_size: u64,
+    pub expected_sha256: String,
     pub confirmed: bool,
 }
 
@@ -1069,6 +1072,35 @@ pub fn publish_software_release(
     access_token: &str,
     request: &SoftwareReleasePublishRequest,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let artifact_file = File::open(&request.artifact_path)?;
+    let artifact_size = artifact_file.metadata()?.len();
+    let file_name = Path::new(&request.artifact_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("artifact file name is invalid")?
+        .to_string();
+    publish_software_release_with_artifact(
+        client,
+        api_base,
+        agent_id,
+        access_token,
+        request,
+        artifact_file,
+        artifact_size,
+        file_name,
+    )
+}
+
+pub fn publish_software_release_with_artifact(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    request: &SoftwareReleasePublishRequest,
+    artifact_file: File,
+    artifact_size: u64,
+    file_name: String,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let products = collaboration_json::<serde_json::Value>(
         client
             .get(format!("{api_base}/api/distribution/products"))
@@ -1144,12 +1176,7 @@ pub fn publish_software_release(
         .ok_or_else(|| format!("Dashboard channel not found: {}", request.channel))?
         .to_string();
 
-    let file_name = Path::new(&request.artifact_path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or("artifact file name is invalid")?
-        .to_string();
-    let artifact_part = Part::file(&request.artifact_path)?.file_name(file_name);
+    let artifact_part = Part::reader_with_length(artifact_file, artifact_size).file_name(file_name);
     let artifact = collaboration_json::<serde_json::Value>(
         client
             .post(format!("{api_base}/api/distribution/artifacts"))
@@ -1548,6 +1575,10 @@ mod tests {
             release_notes: "Broker test".to_string(),
             mandatory: false,
             rollout_percent: 100,
+            inspection_receipt: "inspection_test_receipt_00000000000000000000000000000000"
+                .to_string(),
+            expected_size: fs::metadata(&artifact).unwrap().len(),
+            expected_sha256: String::new(),
             confirmed: true,
         };
         let client = Client::builder()
@@ -1597,9 +1628,16 @@ mod tests {
             let body = r#"{"items":[{"product_key":"himind-agent","product_type":"desktop_app"}]}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
+        let root = std::env::temp_dir().join(format!(
+            "himind-release-type-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("himind-agent-update.zip");
+        fs::write(&artifact, b"agent-update").unwrap();
         let request = SoftwareReleasePublishRequest {
-            workspace_root: ".".to_string(),
-            artifact_path: "himind-agent-update.zip".to_string(),
+            workspace_root: root.to_string_lossy().to_string(),
+            artifact_path: artifact.to_string_lossy().to_string(),
             product_id: "himind-agent".to_string(),
             product_name: "HiMind Agent".to_string(),
             product_type: "desktop_agent".to_string(),
@@ -1611,6 +1649,10 @@ mod tests {
             release_notes: String::new(),
             mandatory: false,
             rollout_percent: 100,
+            inspection_receipt: "inspection_test_receipt_00000000000000000000000000000000"
+                .to_string(),
+            expected_size: fs::metadata(&artifact).unwrap().len(),
+            expected_sha256: String::new(),
             confirmed: true,
         };
         let client = Client::builder()
@@ -1626,6 +1668,8 @@ mod tests {
         )
         .unwrap_err();
         server.join().unwrap();
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_dir(root);
         assert!(error.to_string().contains(
             "Dashboard product himind-agent has type desktop_app, expected desktop_agent"
         ));

@@ -367,7 +367,7 @@ pub(crate) fn run_loop(
             if !reconcile_options.mode().dashboard_enabled() {
                 break;
             }
-            if let Err(error) = crate::app::extension_reconciler::reconcile(
+            if let Err(error) = crate::app::extension_orchestrator::reconcile(
                 &reconcile_options,
                 &reconcile_agent_id,
                 &mut generation,

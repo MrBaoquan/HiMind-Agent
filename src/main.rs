@@ -18,6 +18,7 @@ mod app;
 mod approval;
 mod capability;
 mod extension_projects;
+mod extension_workspace;
 mod install_layout;
 mod mcp;
 mod plugin_authoring;
@@ -301,10 +302,20 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         options.set_agent_credential(&state.credential);
     }
     match arguments.first().map(String::as_str) {
-        Some("list") => println!("{}", capability::plugin::registry_json()?),
+        Some("list") => println!(
+            "{}",
+            capability::plugin::registry_json_for_control_plane(
+                options.mode().control_plane_enabled(),
+            )?
+        ),
         Some("import-local") if arguments.len() == 2 => {
             app::plugin_manager::install_local_package(std::path::Path::new(&arguments[1]))?;
-            println!("{}", capability::plugin::registry_json()?);
+            println!(
+                "{}",
+                capability::plugin::registry_json_for_control_plane(
+                    options.mode().control_plane_enabled(),
+                )?
+            );
         }
         Some("import-github") if (arguments.len() == 3 || arguments.len() == 4) => {
             let registry = app::github_source::import_plugin(

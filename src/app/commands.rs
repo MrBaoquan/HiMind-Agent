@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -14,7 +15,7 @@ use crate::app::system::{
     open_folder as open_system_folder, open_url, set_agent_auto_start,
 };
 use crate::approval::manager::ApprovalManager;
-use crate::capability::plugin::registry_json;
+use crate::capability::plugin::{registry_json, registry_json_for_control_plane};
 use crate::capability::service::CapabilityGateway;
 use crate::capability::types::InvocationContext;
 use crate::remote::client::inner_admin_base;
@@ -311,6 +312,7 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
     Ok(json!({
         "status": "online",
         "version": VERSION,
+        "profile": crate::store::paths::profile_name(),
         "mode": state.options.mode().as_str(),
         "effective_mode": state.options.mode().as_str(),
         "pending_mode": state.options.pending_mode().as_str(),
@@ -929,20 +931,62 @@ pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), St
 #[tauri::command]
 pub(crate) async fn start_builtin_ai_session(
     state: State<'_, AgentState>,
+    project_id: Option<String>,
+    extension_workspace: Option<bool>,
 ) -> Result<String, String> {
     if !crate::runtime::builtin::status().compatible {
         return Err("HiMind AI 运行时尚未安装，请先安装 HiMind AI 运行时".to_string());
     }
+    let extension_workspace = extension_workspace.unwrap_or(false);
+    if extension_workspace && project_id.is_some() {
+        return Err("不能同时指定扩展项目和扩展聚合仓库".to_string());
+    }
+    let project = project_id
+        .as_deref()
+        .map(crate::extension_projects::get)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if project
+        .as_ref()
+        .is_some_and(|item| !item.workspace_available)
+    {
+        return Err("扩展项目目录当前不可用".to_string());
+    }
+    let workspace = if extension_workspace {
+        let settings = crate::extension_workspace::settings();
+        if !settings.valid {
+            let message = if settings.error.trim().is_empty() {
+                "扩展聚合仓库当前不可用，请先在扩展页面选择有效目录。".to_string()
+            } else {
+                settings.error
+            };
+            return Err(message);
+        }
+        Some(PathBuf::from(settings.root))
+    } else {
+        project
+            .as_ref()
+            .map(|item| PathBuf::from(&item.workspace_path))
+    };
+    let project_name = project
+        .as_ref()
+        .map(|item| item.name.clone())
+        .or_else(|| extension_workspace.then(|| "扩展聚合仓库".to_string()));
     let options = state.options.clone();
     let logs = Arc::clone(&state.approval_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::app::ui::start_builtin_ai_session(&options)
+        crate::app::ui::start_builtin_ai_session(&options, workspace.as_deref())
     })
     .await
     .map_err(|error| error.to_string())?;
     match result {
         Ok(session_url) => {
-            logs.add_log("info", "HiMind AI 会话已启动");
+            logs.add_log(
+                "info",
+                &project_name
+                    .map(|name| format!("HiMind AI 已进入扩展项目: {name}"))
+                    .unwrap_or_else(|| "HiMind AI 会话已启动".to_string()),
+            );
             Ok(session_url)
         }
         Err(error) => {
@@ -1035,15 +1079,16 @@ pub(crate) fn validate_builtin_ai_mcp_server(
     crate::app::mcp_settings::validate_config(&server)
 }
 
+#[tauri::command]
+pub(crate) fn reload_builtin_ai_tool_context(state: State<'_, AgentState>) {
+    crate::app::ui::stop_builtin_ai_process();
+    state
+        .approval_manager
+        .add_log("info", "HiMind AI 工具上下文已更新");
+}
+
 fn present_builtin_ai_start_error(error: &str) -> String {
     let normalized = error.to_lowercase();
-    if normalized.contains("independent mode")
-        || normalized.contains("dsh 原生")
-        || normalized.contains("settings.yaml")
-        || (normalized.contains("provider") && normalized.contains("原生服务配置"))
-    {
-        return "请先完成 DSH 原生 Provider 配置（settings.yaml），再开始对话".to_string();
-    }
     if normalized.contains("运行时尚未安装")
         || normalized.contains("runtime is not installed")
         || normalized.contains("runtime is unavailable")
@@ -1270,12 +1315,76 @@ pub(crate) fn test_svn_connection(
 }
 
 #[tauri::command]
-pub(crate) fn get_plugin_registry() -> Result<serde_json::Value, String> {
-    registry_json().map_err(|e| e.to_string())
+pub(crate) fn get_plugin_registry(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    registry_json_for_control_plane(state.options.mode().control_plane_enabled())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub(crate) fn import_local_plugin() -> Result<serde_json::Value, String> {
+pub(crate) fn get_extension_sources(
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    crate::app::extension_source::settings().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn add_extension_source(
+    name: String,
+    repository: String,
+    reference: String,
+    catalog_path: Option<String>,
+    verification: Option<String>,
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    crate::app::extension_source::add_github_source(
+        &name,
+        &repository,
+        &reference,
+        catalog_path.as_deref(),
+        verification.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn update_extension_source(
+    source_id: String,
+    enabled: bool,
+    auto_update: bool,
+    verification: Option<String>,
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    crate::app::extension_source::update_source(
+        &source_id,
+        enabled,
+        auto_update,
+        verification.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn remove_extension_source(
+    source_id: String,
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    crate::app::extension_source::remove_source(&source_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_extension_source_snapshot(
+) -> Result<crate::app::extension_source::ExtensionSourceSnapshot, String> {
+    crate::app::extension_source::refresh_snapshot().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_extension_provenance(
+) -> Result<Vec<crate::app::extension_source::ExtensionProvenance>, String> {
+    crate::app::extension_source::list_provenance().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_local_plugin(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("导入本地 HiMind 插件")
         .add_filter("HiMind 插件", &["hmpkg"])
@@ -1289,7 +1398,8 @@ pub(crate) fn import_local_plugin() -> Result<serde_json::Value, String> {
         return Err("已取消导入插件".to_string());
     };
     crate::app::plugin_manager::install_local_package(&path).map_err(|error| error.to_string())?;
-    registry_json().map_err(|error| error.to_string())
+    registry_json_for_control_plane(state.options.mode().control_plane_enabled())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1428,13 +1538,7 @@ pub(crate) fn import_github_skill(
 pub(crate) fn get_organization_skill_catalog(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
-    require_dashboard(&state)?;
-    let agent_id = local_worker_snapshot(&state.worker_status)
-        .get("dashboard_agent_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    crate::app::skill_manager::catalog(&state.options, &agent_id).map_err(|error| error.to_string())
+    merged_skill_catalog(&state)
 }
 
 #[tauri::command]
@@ -1445,31 +1549,8 @@ pub(crate) fn query_organization_skill_catalog(
     page_size: usize,
     state: State<'_, AgentState>,
 ) -> Result<crate::api::distribution::SkillCatalogPage, String> {
-    require_dashboard(&state)?;
-    let snapshot = local_worker_snapshot(&state.worker_status);
-    let agent_id = snapshot
-        .get("dashboard_agent_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let credential = state.options.agent_credential();
-    if agent_id.is_empty() || credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|error| error.to_string())?;
-    crate::api::distribution::skill_catalog_page(
-        &client,
-        &state.dashboard_base,
-        agent_id,
-        &credential,
-        &q,
-        &category,
-        page.clamp(1, 10_000),
-        page_size.clamp(1, 100),
-    )
-    .map_err(|error| error.to_string())
+    let items = filter_skill_catalog(merged_skill_catalog(&state)?, &q, &category);
+    Ok(catalog_page(items, page, page_size))
 }
 
 #[tauri::command]
@@ -1484,15 +1565,40 @@ pub(crate) fn list_extension_projects(
 }
 
 #[tauri::command]
-pub(crate) fn open_extension_project() -> Result<crate::extension_projects::ExtensionProject, String>
-{
+pub(crate) fn get_extension_workspace() -> crate::extension_workspace::ExtensionWorkspaceSettings {
+    crate::extension_workspace::settings()
+}
+
+#[tauri::command]
+pub(crate) fn select_extension_workspace(
+) -> Result<crate::extension_workspace::ExtensionWorkspaceSettings, String> {
     let Some(path) = rfd::FileDialog::new()
-        .set_title("选择 HiMind 插件或技能项目")
+        .set_title("选择 HiMind 扩展聚合仓库")
+        .pick_folder()
+    else {
+        return Err("已取消选择扩展聚合仓库".to_string());
+    };
+    crate::extension_workspace::select(&path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn open_extension_projects(
+) -> Result<Vec<crate::extension_projects::ExtensionProject>, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择 HiMind 项目或扩展聚合仓库")
         .pick_folder()
     else {
         return Err("已取消打开扩展项目".to_string());
     };
-    crate::extension_projects::register(&path).map_err(|error| error.to_string())
+    if path.join("extensions.json").is_file() {
+        crate::extension_workspace::select(&path).map_err(|error| error.to_string())?;
+        return crate::extension_projects::list().map_err(|error| error.to_string());
+    }
+    crate::extension_projects::register(&path)
+        .map(|project| vec![project])
+        .map_err(|error| {
+            format!("请选择包含 plugin.json、skill.json 或 extensions.json 的目录：{error}")
+        })
 }
 
 #[tauri::command]
@@ -1513,11 +1619,7 @@ pub(crate) fn create_extension_project(
     input: crate::extension_projects::CreateExtensionProjectInput,
     state: State<'_, AgentState>,
 ) -> Result<crate::extension_projects::ExtensionProject, String> {
-    require_dashboard(&state)?;
-    let identity = crate::app::identity::identity_status(&state.options);
-    if !identity.authorized || identity.user_name.trim().is_empty() {
-        return Err("请先授权 HiMind 工作台账号，再新建扩展项目".to_string());
-    }
+    let identity = crate::app::identity::authoring_identity(&state.options);
     let Some(parent) = rfd::FileDialog::new()
         .set_title("选择项目保存位置")
         .pick_folder()
@@ -1533,6 +1635,11 @@ pub(crate) fn build_extension_project(
     project_id: String,
 ) -> Result<crate::extension_projects::ExtensionCandidate, String> {
     crate::extension_projects::build(&project_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn prepare_extension_authoring() -> Result<(), String> {
+    crate::app::extension_source::ensure_authoring_feature().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1714,13 +1821,7 @@ pub(crate) fn respond_extension_collaboration_invitation(
 pub(crate) fn import_skill_candidate(
     revision_of_version: Option<String>,
     parent_submission_id: Option<String>,
-    state: State<'_, AgentState>,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
-    require_dashboard(&state)?;
-    let identity = crate::app::identity::identity_status(&state.options);
-    if !identity.authorized || identity.user_name.trim().is_empty() {
-        return Err("请先授权 HiMind 工作台账号，再导入 Skill 候选".to_string());
-    }
     let Some(path) = rfd::FileDialog::new()
         .set_title("选择 HiMind Skill 候选包")
         .add_filter("HiMind Skill 包", &["hmskill"])
@@ -1958,6 +2059,26 @@ pub(crate) fn install_organization_skill(
     optional_plugin_ids: Option<Vec<String>>,
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
+    let source_item = merged_skill_catalog(&state)?
+        .into_iter()
+        .find(|item| item.skill_id == skill_id && item.source.starts_with("github:"));
+    if source_item.is_some() {
+        let (catalog_item, record) =
+            crate::app::extension_source::install_skill(&skill_id, version.as_deref())
+                .map_err(|error| error.to_string())?;
+        let capability_facts = skill_capability_facts(&state)?;
+        let rendered =
+            crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
+                .map_err(|error| error.to_string())?;
+        return Ok(serde_json::json!({
+            "catalog_item": catalog_item,
+            "record": record,
+            "codex": rendered.get("codex"),
+            "github_copilot": rendered.get("github-copilot"),
+            "workbuddy": rendered.get("workbuddy"),
+            "clients": rendered,
+        }));
+    }
     require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
@@ -1992,6 +2113,13 @@ pub(crate) fn plan_organization_skill_install(
     version: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<crate::app::skill_manager::SkillInstallPlan, String> {
+    let source_item = merged_skill_catalog(&state)?
+        .into_iter()
+        .find(|item| item.skill_id == skill_id && item.source.starts_with("github:"));
+    if source_item.is_some() {
+        return crate::app::extension_source::plan_skill(&skill_id, version.as_deref())
+            .map_err(|error| error.to_string());
+    }
     require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
@@ -2012,6 +2140,13 @@ pub(crate) fn get_skill_versions(
     skill_id: String,
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
+    if merged_skill_catalog(&state)?
+        .into_iter()
+        .any(|item| item.skill_id == skill_id && item.source.starts_with("github:"))
+    {
+        return crate::app::extension_source::skill_versions(&skill_id)
+            .map_err(|error| error.to_string());
+    }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
@@ -2148,6 +2283,149 @@ fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_js
     Ok(codex)
 }
 
+fn merged_plugin_catalog(
+    state: &AgentState,
+) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
+    let source_snapshot =
+        crate::app::extension_source::snapshot().map_err(|error| error.to_string())?;
+    let mut items = source_snapshot
+        .plugins
+        .into_iter()
+        .map(|item| (item.plugin_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    if state.options.mode().dashboard_enabled() {
+        let worker = local_worker_snapshot(&state.worker_status);
+        let agent_id = worker
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let credential = state.options.agent_credential();
+        if !agent_id.is_empty() && !credential.is_empty() {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build();
+            let dashboard = match client {
+                Ok(client) => crate::api::distribution::plugin_catalog(
+                    &client,
+                    &state.dashboard_base,
+                    agent_id,
+                    &credential,
+                )
+                .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            match dashboard {
+                Ok(catalog) => {
+                    for item in catalog {
+                        items.insert(item.plugin_id.clone(), item);
+                    }
+                }
+                Err(error) if items.is_empty() => return Err(error.to_string()),
+                Err(_) => {}
+            }
+        } else if items.is_empty() {
+            return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        }
+    }
+    let mut result = items.into_values().collect::<Vec<_>>();
+    result.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    Ok(result)
+}
+
+fn merged_skill_catalog(
+    state: &AgentState,
+) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
+    let source_snapshot =
+        crate::app::extension_source::snapshot().map_err(|error| error.to_string())?;
+    let mut items = source_snapshot
+        .skills
+        .into_iter()
+        .map(|item| (item.skill_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    if state.options.mode().dashboard_enabled() {
+        let worker = local_worker_snapshot(&state.worker_status);
+        let agent_id = worker
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let credential = state.options.agent_credential();
+        if !agent_id.is_empty() && !credential.is_empty() {
+            match crate::app::skill_manager::catalog(&state.options, agent_id) {
+                Ok(catalog) => {
+                    for item in catalog {
+                        items.insert(item.skill_id.clone(), item);
+                    }
+                }
+                Err(error) if items.is_empty() => return Err(error.to_string()),
+                Err(_) => {}
+            }
+        } else if items.is_empty() {
+            return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        }
+    }
+    let mut result = items.into_values().collect::<Vec<_>>();
+    result.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+    Ok(result)
+}
+
+fn filter_plugin_catalog(
+    items: Vec<crate::api::distribution::PluginCatalogItem>,
+    query: &str,
+    category: &str,
+) -> Vec<crate::api::distribution::PluginCatalogItem> {
+    let query = query.trim().to_ascii_lowercase();
+    items
+        .into_iter()
+        .filter(|item| {
+            (query.is_empty()
+                || format!("{} {} {}", item.plugin_id, item.name, item.description)
+                    .to_ascii_lowercase()
+                    .contains(&query))
+                && (category.is_empty()
+                    || category == "all"
+                    || item.categories.iter().any(|value| value == category))
+        })
+        .collect()
+}
+
+fn filter_skill_catalog(
+    items: Vec<crate::api::distribution::SkillCatalogItem>,
+    query: &str,
+    category: &str,
+) -> Vec<crate::api::distribution::SkillCatalogItem> {
+    let query = query.trim().to_ascii_lowercase();
+    items
+        .into_iter()
+        .filter(|item| {
+            (query.is_empty()
+                || format!("{} {} {}", item.skill_id, item.name, item.description)
+                    .to_ascii_lowercase()
+                    .contains(&query))
+                && (category.is_empty()
+                    || category == "all"
+                    || item.categories.iter().any(|value| value == category))
+        })
+        .collect()
+}
+
+fn catalog_page<T>(
+    items: Vec<T>,
+    page: usize,
+    page_size: usize,
+) -> crate::api::distribution::CatalogPage<T> {
+    let page = page.clamp(1, 10_000);
+    let page_size = page_size.clamp(1, 100);
+    let total = items.len();
+    let offset = (page - 1).saturating_mul(page_size);
+    let items = items.into_iter().skip(offset).take(page_size).collect();
+    crate::api::distribution::CatalogPage {
+        items,
+        total,
+        page,
+        page_size,
+    }
+}
+
 #[tauri::command]
 pub(crate) fn open_folder(state: State<'_, AgentState>, path: String) -> Result<(), String> {
     CapabilityGateway::new(state.options.clone(), Arc::clone(&state.worker_status))
@@ -2164,22 +2442,7 @@ pub(crate) fn open_folder(state: State<'_, AgentState>, path: String) -> Result<
 pub(crate) fn get_plugin_catalog(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
-    require_dashboard(&state)?;
-    let snapshot = local_worker_snapshot(&state.worker_status);
-    let agent_id = snapshot
-        .get("dashboard_agent_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let credential = state.options.agent_credential();
-    if agent_id.is_empty() || credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|error| error.to_string())?;
-    crate::api::distribution::plugin_catalog(&client, &state.dashboard_base, agent_id, &credential)
-        .map_err(|error| error.to_string())
+    merged_plugin_catalog(&state)
 }
 
 #[tauri::command]
@@ -2190,31 +2453,8 @@ pub(crate) fn query_plugin_catalog(
     page_size: usize,
     state: State<'_, AgentState>,
 ) -> Result<crate::api::distribution::PluginCatalogPage, String> {
-    require_dashboard(&state)?;
-    let snapshot = local_worker_snapshot(&state.worker_status);
-    let agent_id = snapshot
-        .get("dashboard_agent_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let credential = state.options.agent_credential();
-    if agent_id.is_empty() || credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|error| error.to_string())?;
-    crate::api::distribution::plugin_catalog_page(
-        &client,
-        &state.dashboard_base,
-        agent_id,
-        &credential,
-        &q,
-        &category,
-        page.clamp(1, 10_000),
-        page_size.clamp(1, 100),
-    )
-    .map_err(|error| error.to_string())
+    let items = filter_plugin_catalog(merged_plugin_catalog(&state)?, &q, &category);
+    Ok(catalog_page(items, page, page_size))
 }
 
 #[tauri::command]
@@ -2222,6 +2462,13 @@ pub(crate) fn get_plugin_versions(
     plugin_id: String,
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
+    if merged_plugin_catalog(&state)?
+        .into_iter()
+        .any(|item| item.plugin_id == plugin_id && item.source.starts_with("github:"))
+    {
+        return crate::app::extension_source::plugin_versions(&plugin_id)
+            .map_err(|error| error.to_string());
+    }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
@@ -2252,6 +2499,13 @@ pub(crate) fn plan_plugin_install(
     plugin_id: String,
     version: Option<String>,
 ) -> Result<crate::app::plugin_manager::PluginInstallPlan, String> {
+    if merged_plugin_catalog(&state)?
+        .iter()
+        .any(|item| item.plugin_id == plugin_id && item.source.starts_with("github:"))
+    {
+        return crate::app::extension_source::plan_plugin(&plugin_id, version.as_deref())
+            .map_err(|error| error.to_string());
+    }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
     let agent_id = snapshot
@@ -2273,6 +2527,14 @@ pub(crate) fn install_plugin(
     plugin_id: String,
     version: Option<String>,
 ) -> Result<(), String> {
+    if merged_plugin_catalog(&state)?
+        .iter()
+        .any(|item| item.plugin_id == plugin_id && item.source.starts_with("github:"))
+    {
+        return crate::app::extension_source::install_plugin(&plugin_id, version.as_deref())
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+    }
     require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
         .get("dashboard_agent_id")
@@ -2419,6 +2681,7 @@ pub(crate) fn unregister_development_plugin(plugin_id: String) -> Result<(), Str
 
 #[tauri::command]
 pub(crate) fn invoke_development_plugin(
+    state: State<'_, AgentState>,
     plugin_id: String,
     capability_id: String,
     input: serde_json::Value,
@@ -2437,10 +2700,28 @@ pub(crate) fn invoke_development_plugin(
     {
         return Err("Capability 未在插件 Manifest 中声明".to_string());
     }
+    let capability = plugin
+        .capabilities
+        .iter()
+        .find(|item| item.id == capability_id)
+        .expect("capability existence checked above");
+    let control_plane_capability = matches!(
+        capability.availability.trim().to_ascii_lowercase().as_str(),
+        "control_plane" | "dashboard"
+    );
+    if control_plane_capability && !state.options.mode().control_plane_enabled() {
+        return Err(crate::app::runtime_mode::control_plane_required_error());
+    }
+    let trusted_dashboard_url = state
+        .options
+        .mode()
+        .control_plane_enabled()
+        .then_some(state.options.api_base.as_str());
     let result = crate::capability::plugin::invoke_plugin_capability_for_plugin(
         &plugin_id,
         &capability_id,
         input,
+        trusted_dashboard_url,
     );
     let duration_ms = started.elapsed().as_millis() as u64;
     Ok(match result {
@@ -2559,15 +2840,6 @@ pub(crate) fn invoke_plugin_view_capability(
 #[cfg(test)]
 mod tests {
     use super::present_builtin_ai_start_error;
-
-    #[test]
-    fn independent_dsh_configuration_errors_are_actionable() {
-        let message = present_builtin_ai_start_error(
-            "Independent Mode 需要 DSH 原生 Provider 配置，请先在 settings.yaml 配置 Provider",
-        );
-        assert!(message.contains("DSH 原生 Provider"));
-        assert!(message.contains("settings.yaml"));
-    }
 
     #[test]
     fn connected_ai_errors_keep_existing_login_guidance() {

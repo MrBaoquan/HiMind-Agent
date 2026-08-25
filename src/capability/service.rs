@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::app::status::local_worker_snapshot;
@@ -12,7 +12,12 @@ use crate::app::system::{
 };
 use crate::app::types::{ProjectWorkspaceRequest, RemoteConnectRequest};
 use crate::capability::plugin::{
-    find_plugin, invoke_plugin_capability, registry_json, scan_plugins,
+    find_plugin, invoke_plugin_capability, invoke_plugin_capability_for_plugin,
+    registry_json_for_control_plane, scan_plugins,
+};
+use crate::capability::software_distribution::{
+    attach_inspection_receipt, consume_inspection_receipt, verify_inspection_receipt,
+    VerifiedSoftwareArtifact,
 };
 use crate::capability::types::{CapabilityAvailability, CapabilityDescriptor, InvocationContext};
 use crate::store::credentials::{local_login_status_json, local_login_status_value};
@@ -38,6 +43,7 @@ pub(crate) struct CapabilityGateway {
 enum CapabilityHandler {
     SystemHealth,
     AuthoringIdentity,
+    ExtensionWorkspaceCurrent,
     InnerAdminLoginStatus,
     SystemOpenFolder,
     WorkspaceBuild,
@@ -121,10 +127,26 @@ impl CapabilityGateway {
             registration(
                 "extension.authoring.identity",
                 "扩展创作身份",
-                "返回当前已授权的 HiMind 工作台创作者身份，用于生成插件和 Skill Manifest。",
+                "返回当前 Agent 的创作者身份，用于生成插件和 Skill Manifest。",
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::AuthoringIdentity,
+            ),
+            registration(
+                "extension.workspace.current",
+                "当前扩展工作区",
+                "返回 AI 会话当前工作目录，以及检测到的 HiMind 插件或 Skill 项目身份。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::ExtensionWorkspaceCurrent,
+            ),
+            registration(
+                "workspace.current",
+                "当前 AI 工作区",
+                "返回 AI 会话当前工作目录，以及检测到的 HiMind 项目身份。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::ExtensionWorkspaceCurrent,
             ),
             registration(
                 "system.health",
@@ -389,7 +411,7 @@ impl CapabilityGateway {
             registration(
                 "plugin.list",
                 "插件列表",
-                "读取本机插件注册表状态；当前阶段返回内置插件骨架。",
+                "读取当前运行模式下可用的本机插件注册表状态。",
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::PluginList,
@@ -505,8 +527,9 @@ impl CapabilityGateway {
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::PluginSubmissionStatus,
             ),
-            registration(
+            registration_versioned(
                 "software.distribution.release.publish",
+                "1.1.0",
                 "发布软件版本",
                 "使用 Agent 内部短时委托身份创建软件产品、上传制品并发布版本；AI 和插件均无法读取凭据。",
                 "network_write",
@@ -520,9 +543,13 @@ impl CapabilityGateway {
                         "channel": {"type":"string"}, "platform": {"type":"string"}, "architecture": {"type":"string"},
                         "package_type": {"type":"string", "enum":["directory-zip","apk","unity-addressables","content"]},
                         "release_notes": {"type":"string"}, "mandatory": {"type":"boolean"},
-                        "rollout_percent": {"type":"integer", "minimum":1, "maximum":100}, "confirmed": {"type":"boolean"}
+                        "rollout_percent": {"type":"integer", "minimum":1, "maximum":100},
+                        "inspection_receipt": {"type":"string", "minLength": 32},
+                        "expected_size": {"type":"integer", "minimum":1},
+                        "expected_sha256": {"type":"string", "pattern":"^[0-9a-fA-F]{64}$"},
+                        "confirmed": {"type":"boolean"}
                     },
-                    "required": ["workspace_root","artifact_path","product_id","product_name","version","platform","architecture","package_type","confirmed"],
+                    "required": ["workspace_root","artifact_path","product_id","product_name","version","platform","architecture","package_type","inspection_receipt","expected_size","expected_sha256","confirmed"],
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SoftwareDistributionPublish,
@@ -616,8 +643,9 @@ impl CapabilityGateway {
                 .into_iter()
                 .filter(|item| item.enabled && item.runtime == "process-jsonrpc-stdio")
             {
-                for capability in plugin.capabilities {
-                    let capability_id = capability.id;
+                for capability in &plugin.capabilities {
+                    let availability = plugin_capability_availability(&plugin, &capability);
+                    let capability_id = capability.id.clone();
                     insert_registration(
                         &mut registry,
                         CapabilityRegistration {
@@ -625,11 +653,11 @@ impl CapabilityGateway {
                                 id: capability_id.clone(),
                                 version: plugin.version.clone(),
                                 name: capability.description.clone(),
-                                description: capability.description,
-                                risk_level: capability.risk_level,
+                                description: capability.description.clone(),
+                                risk_level: capability.risk_level.clone(),
                                 source: format!("plugin:{}", plugin.id),
-                                availability: CapabilityAvailability::Local,
-                                input_schema: capability.input_schema,
+                                availability,
+                                input_schema: capability.input_schema.clone(),
                             },
                             handler: CapabilityHandler::PluginCapability(capability_id),
                         },
@@ -682,6 +710,9 @@ impl CapabilityGateway {
         match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
+            CapabilityHandler::ExtensionWorkspaceCurrent => {
+                crate::extension_projects::current_workspace()
+            }
             CapabilityHandler::InnerAdminLoginStatus => Ok(local_login_status_json()),
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
             CapabilityHandler::WorkspaceBuild => self.build_workspace(input),
@@ -725,20 +756,30 @@ impl CapabilityGateway {
                     EnsureProjectExhibitsAccessRequest,
                 >(input)?)
             }
-            CapabilityHandler::PluginList => registry_json(),
+            CapabilityHandler::PluginList => {
+                registry_json_for_control_plane(self.options.mode().control_plane_enabled())
+            }
             CapabilityHandler::PluginManifest => self.plugin_manifest(input),
-            CapabilityHandler::PluginInvoke => self.plugin_invoke(input),
-            CapabilityHandler::SkillCandidateSave => self.save_skill_candidate(input),
+            CapabilityHandler::PluginInvoke => self.plugin_invoke(context, input),
+            CapabilityHandler::SkillCandidateSave => {
+                validate_mcp_candidate_package(context, capability_id, &input)?;
+                self.save_skill_candidate(input)
+            }
             CapabilityHandler::SkillCandidateTest => self.test_skill_candidate(input),
             CapabilityHandler::SkillSubmissionSubmit => self.submit_skill_candidate(input),
             CapabilityHandler::SkillSubmissionStatus => self.skill_submission_status(),
-            CapabilityHandler::PluginCandidateSave => Ok(serde_json::to_value(
-                crate::plugin_authoring::save(serde_json::from_value(input)?)?,
-            )?),
+            CapabilityHandler::PluginCandidateSave => {
+                validate_mcp_candidate_package(context, capability_id, &input)?;
+                Ok(serde_json::to_value(crate::plugin_authoring::save(
+                    serde_json::from_value(input)?,
+                )?)?)
+            }
             CapabilityHandler::PluginCandidateTest => self.test_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionSubmit => self.submit_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
-            CapabilityHandler::SoftwareDistributionPublish => self.publish_software_release(input),
+            CapabilityHandler::SoftwareDistributionPublish => {
+                self.publish_software_release(context, input)
+            }
             CapabilityHandler::DashboardContextResolve => {
                 crate::api::dashboard_business::resolve_context(&self.options, input)
             }
@@ -759,7 +800,12 @@ impl CapabilityGateway {
             }
             CapabilityHandler::MediaJobGet => crate::api::media::get(&self.options, input),
             CapabilityHandler::MediaJobCancel => crate::api::media::cancel(&self.options, input),
-            CapabilityHandler::PluginCapability(id) => invoke_plugin_capability(&id, input),
+            CapabilityHandler::PluginCapability(id) => {
+                validate_mcp_capability_workspace(context, &id, &input)?;
+                let output =
+                    invoke_plugin_capability(&id, input.clone(), self.trusted_dashboard_url())?;
+                finalize_plugin_capability(context, &id, &input, output)
+            }
         }
     }
 
@@ -802,26 +848,17 @@ impl CapabilityGateway {
     }
 
     fn current_authoring_identity(&self) -> Result<Value, Box<dyn Error>> {
-        let identity = crate::app::identity::identity_status(&self.options);
-        if !identity.authorized
-            || identity.user_id.trim().is_empty()
-            || identity.user_name.trim().is_empty()
-        {
-            return Err("请先在 HiMind Agent 中授权工作台账号".into());
-        }
+        let identity = crate::app::identity::authoring_identity(&self.options);
         Ok(json!({
             "user_id": identity.user_id,
             "user_name": identity.user_name,
             "online_verified": identity.online_verified,
-            "scopes": identity.scopes
+            "source": identity.source,
+            "scopes": []
         }))
     }
 
     fn save_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
-        let identity = crate::app::identity::identity_status(&self.options);
-        if !identity.authorized || identity.user_name.trim().is_empty() {
-            return Err("请先在 HiMind Agent 中授权工作台账号".into());
-        }
         Ok(serde_json::to_value(
             crate::skill::authoring::import_package(serde_json::from_value(input)?)?,
         )?)
@@ -886,8 +923,14 @@ impl CapabilityGateway {
             return Err("plugin_id is required".into());
         }
         match find_plugin(plugin_id)? {
-            Some(item) => Ok(json!({ "plugin": item })),
+            Some(item)
+                if self.options.mode().control_plane_enabled()
+                    || item.availability != "control_plane" =>
+            {
+                Ok(json!({ "plugin": item }))
+            }
             None => Err(format!("plugin not found: {plugin_id}").into()),
+            Some(_) => Err(format!("plugin not found: {plugin_id}").into()),
         }
     }
 
@@ -895,7 +938,11 @@ impl CapabilityGateway {
         test_connection()
     }
 
-    fn plugin_invoke(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+    fn plugin_invoke(
+        &self,
+        context: &InvocationContext,
+        input: Value,
+    ) -> Result<Value, Box<dyn Error>> {
         let capability_id = input
             .get("capability_id")
             .and_then(|value| value.as_str())
@@ -904,11 +951,58 @@ impl CapabilityGateway {
         if capability_id.is_empty() {
             return Err("capability_id is required".into());
         }
+        let plugin = scan_plugins()?
+            .into_iter()
+            .find(|item| {
+                item.enabled
+                    && item.runtime == "process-jsonrpc-stdio"
+                    && item
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability.id == capability_id)
+            })
+            .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
+        let capability = plugin
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == capability_id)
+            .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
+        if matches!(
+            plugin_capability_availability(&plugin, capability),
+            CapabilityAvailability::ControlPlane
+        ) && !self.options.mode().control_plane_enabled()
+        {
+            return Err(serde_json::json!({
+                "code": "control_plane_required",
+                "capability_id": capability_id,
+                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换 Connected 模式并重启 Agent"
+            })
+            .to_string()
+            .into());
+        }
         let params = input.get("input").cloned().unwrap_or_else(|| json!({}));
-        invoke_plugin_capability(capability_id, params)
+        validate_mcp_capability_workspace(context, capability_id, &params)?;
+        let output = invoke_plugin_capability_for_plugin(
+            &plugin.id,
+            capability_id,
+            params.clone(),
+            self.trusted_dashboard_url(),
+        )?;
+        finalize_plugin_capability(context, capability_id, &params, output)
     }
 
-    fn publish_software_release(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+    fn trusted_dashboard_url(&self) -> Option<&str> {
+        self.options
+            .mode()
+            .control_plane_enabled()
+            .then_some(self.options.api_base.as_str())
+    }
+
+    fn publish_software_release(
+        &self,
+        context: &InvocationContext,
+        input: Value,
+    ) -> Result<Value, Box<dyn Error>> {
         let mut request = serde_json::from_value::<
             crate::api::distribution::SoftwareReleasePublishRequest,
         >(input)?;
@@ -920,11 +1014,21 @@ impl CapabilityGateway {
         request.platform = request.platform.trim().to_ascii_lowercase();
         request.architecture = request.architecture.trim().to_ascii_lowercase();
         request.package_type = request.package_type.trim().to_ascii_lowercase();
+        request.expected_sha256 = request.expected_sha256.trim().to_ascii_lowercase();
         validate_distribution_publish_request(&request)?;
-        request.artifact_path =
-            canonical_workspace_file(&request.workspace_root, &request.artifact_path)?
-                .to_string_lossy()
-                .to_string();
+        validate_mcp_capability_workspace(
+            context,
+            "software.distribution.release.publish",
+            &serde_json::json!({ "workspace_root": request.workspace_root.clone() }),
+        )?;
+        let verified = verify_inspection_receipt(context, &request)?;
+        if requires_native_software_confirmation(context)
+            && !confirm_software_publish(&request, &verified)
+        {
+            return Err("用户取消了软件版本发布".into());
+        }
+        consume_inspection_receipt(&verified)?;
+        request.artifact_path = verified.artifact_path.to_string_lossy().to_string();
         let access = crate::api::oauth::platform_access_token(
             &self.options,
             crate::api::oauth::RELEASE_MANAGE_SCOPE,
@@ -933,12 +1037,15 @@ impl CapabilityGateway {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10 * 60))
             .build()?;
-        crate::api::distribution::publish_software_release(
+        crate::api::distribution::publish_software_release_with_artifact(
             &client,
             &self.options.api_base,
             &agent_id,
             &access.token,
             &request,
+            verified.file,
+            verified.size,
+            verified.file_name,
         )
     }
 
@@ -1110,6 +1217,39 @@ fn confirm_submission(kind: &str, name: &str, version: &str, sha256: &str) -> bo
     )
 }
 
+fn requires_native_software_confirmation(context: &InvocationContext) -> bool {
+    context.source == crate::capability::types::InvocationSource::Mcp
+}
+
+fn confirm_software_publish(
+    request: &crate::api::distribution::SoftwareReleasePublishRequest,
+    artifact: &VerifiedSoftwareArtifact,
+) -> bool {
+    matches!(
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("确认发布软件版本")
+            .set_description(format!(
+                "产品：{} ({})\n版本：{}\n渠道：{}\n目标：{}/{}/{}\n文件：{}\n大小：{} 字节\nSHA-256：{}\n强制更新：{}\n灰度比例：{}%\n\n该操作会创建不可变制品并发布到组织分发服务，是否继续？",
+                request.product_name,
+                request.product_id,
+                request.version,
+                request.channel,
+                request.platform,
+                request.architecture,
+                request.package_type,
+                artifact.file_name,
+                artifact.size,
+                artifact.sha256,
+                if request.mandatory { "是" } else { "否" },
+                request.rollout_percent,
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show(),
+        rfd::MessageDialogResult::Yes
+    )
+}
+
 fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
     match capability_id {
         "extension.skill.submission.submit"
@@ -1135,12 +1275,13 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
 fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailability {
     match handler {
         CapabilityHandler::AuthoringIdentity
+        | CapabilityHandler::ExtensionWorkspaceCurrent
         | CapabilityHandler::SkillCandidateSave
         | CapabilityHandler::SkillCandidateTest
-        | CapabilityHandler::SkillSubmissionSubmit
-        | CapabilityHandler::SkillSubmissionStatus
         | CapabilityHandler::PluginCandidateSave
-        | CapabilityHandler::PluginCandidateTest
+        | CapabilityHandler::PluginCandidateTest => CapabilityAvailability::Local,
+        CapabilityHandler::SkillSubmissionSubmit
+        | CapabilityHandler::SkillSubmissionStatus
         | CapabilityHandler::PluginSubmissionSubmit
         | CapabilityHandler::PluginSubmissionStatus
         | CapabilityHandler::SoftwareDistributionPublish
@@ -1167,6 +1308,135 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
     }
 }
 
+fn plugin_capability_availability(
+    plugin: &crate::capability::plugin::PluginRegistryItem,
+    capability: &crate::capability::plugin::PluginCapabilityManifest,
+) -> CapabilityAvailability {
+    match capability.availability.trim().to_ascii_lowercase().as_str() {
+        "control_plane" | "dashboard" => CapabilityAvailability::ControlPlane,
+        "network_service" | "network" => CapabilityAvailability::NetworkService,
+        "local" => CapabilityAvailability::Local,
+        _ if plugin
+            .permissions
+            .iter()
+            .any(|permission| permission == "network.dashboard.public") =>
+        {
+            CapabilityAvailability::ControlPlane
+        }
+        _ => CapabilityAvailability::Local,
+    }
+}
+
+fn finalize_plugin_capability(
+    context: &InvocationContext,
+    capability_id: &str,
+    input: &Value,
+    output: Value,
+) -> Result<Value, Box<dyn Error>> {
+    if capability_id == "software.distribution.artifact.inspect" {
+        attach_inspection_receipt(context, input, output)
+    } else {
+        Ok(output)
+    }
+}
+
+fn validate_mcp_capability_workspace(
+    context: &InvocationContext,
+    capability_id: &str,
+    input: &Value,
+) -> Result<(), Box<dyn Error>> {
+    if context.source != crate::capability::types::InvocationSource::Mcp {
+        return Ok(());
+    }
+    let extension_scoped = capability_id.starts_with("extension.");
+    let software_scoped = matches!(
+        capability_id,
+        "software.distribution.project.inspect"
+            | "software.distribution.artifact.inspect"
+            | "software.distribution.release.publish"
+    );
+    if !extension_scoped && !software_scoped {
+        return Ok(());
+    }
+    let Some(workspace_root) = input
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return if software_scoped {
+            Err("软件分发能力必须提供当前 AI 工作区 workspace_root".into())
+        } else {
+            Ok(())
+        };
+    };
+    let current = crate::extension_projects::current_workspace_path()?;
+    if software_scoped {
+        validate_software_workspace_root(&current, workspace_root)
+    } else {
+        validate_extension_workspace_root(&current, workspace_root)
+    }
+}
+
+fn validate_mcp_candidate_package(
+    context: &InvocationContext,
+    capability_id: &str,
+    input: &Value,
+) -> Result<(), Box<dyn Error>> {
+    if context.source != crate::capability::types::InvocationSource::Mcp
+        || !matches!(
+            capability_id,
+            "extension.plugin.candidate.save" | "extension.skill.candidate.save"
+        )
+    {
+        return Ok(());
+    }
+    let package_path = input
+        .get("package_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("package_path is required")?;
+    let current = crate::extension_projects::current_workspace_path()?;
+    let package = Path::new(package_path).canonicalize()?;
+    if !package.is_file() || !package.starts_with(&current) {
+        return Err("候选包必须位于当前 AI 扩展工作区内".into());
+    }
+    Ok(())
+}
+
+fn validate_extension_workspace_root(
+    current: &Path,
+    requested: &str,
+) -> Result<(), Box<dyn Error>> {
+    let requested = Path::new(requested).canonicalize()?;
+    if requested != current {
+        return Err(serde_json::json!({
+            "code": "extension_workspace_mismatch",
+            "message": "workspace_root 必须与 extension.workspace.current 返回的当前 AI 工作区一致"
+        })
+        .to_string()
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_software_workspace_root(
+    current: &Path,
+    requested: &str,
+) -> Result<(), Box<dyn Error>> {
+    let requested = Path::new(requested).canonicalize()?;
+    if requested != current {
+        return Err(serde_json::json!({
+            "code": "software_workspace_mismatch",
+            "message": "workspace_root 必须与 workspace.current 返回的当前 AI 工作区一致"
+        })
+        .to_string()
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_distribution_publish_request(
     request: &crate::api::distribution::SoftwareReleasePublishRequest,
 ) -> Result<(), Box<dyn Error>> {
@@ -1188,6 +1458,16 @@ fn validate_distribution_publish_request(
     }
     if request.product_name.trim().is_empty() || request.version.trim().is_empty() {
         return Err("product_name 和 version 不能为空".into());
+    }
+    if request.inspection_receipt.trim().is_empty()
+        || request.expected_size == 0
+        || request.expected_sha256.len() != 64
+        || !request
+            .expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("发布必须携带有效的制品预检凭证、大小和 SHA-256".into());
     }
     if !matches!(
         request.product_type.as_str(),
@@ -1212,23 +1492,28 @@ fn validate_distribution_publish_request(
     Ok(())
 }
 
-fn canonical_workspace_file(workspace_root: &str, target: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let root = Path::new(workspace_root).canonicalize()?;
-    let requested = Path::new(target);
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    }
-    .canonicalize()?;
-    if !candidate.starts_with(&root) || !candidate.is_file() {
-        return Err("制品必须是 workspace_root 内的普通文件".into());
-    }
-    Ok(candidate)
-}
-
 fn registration(
     id: &str,
+    name: &str,
+    description: &str,
+    risk_level: &str,
+    input_schema: Value,
+    handler: CapabilityHandler,
+) -> CapabilityRegistration {
+    registration_versioned(
+        id,
+        "1.0.0",
+        name,
+        description,
+        risk_level,
+        input_schema,
+        handler,
+    )
+}
+
+fn registration_versioned(
+    id: &str,
+    version: &str,
     name: &str,
     description: &str,
     risk_level: &str,
@@ -1238,7 +1523,7 @@ fn registration(
     CapabilityRegistration {
         descriptor: CapabilityDescriptor {
             id: id.to_string(),
-            version: "1.0.0".to_string(),
+            version: version.to_string(),
             name: name.to_string(),
             description: description.to_string(),
             risk_level: risk_level.to_string(),
@@ -1486,6 +1771,18 @@ mod tests {
             .to_string();
         assert!(error.contains("control_plane_required"));
         assert!(error.contains("当前运行模式不支持"));
+        let local_error = gateway
+            .invoke(
+                &InvocationContext::new(
+                    crate::capability::types::InvocationSource::Mcp,
+                    "ai-client:himind-ai",
+                ),
+                "extension.skill.candidate.save",
+                json!({ "package_path": root.join("missing.hmskill") }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(!local_error.contains("control_plane_required"));
         let visible = gateway
             .list_capabilities(&InvocationContext::new(
                 crate::capability::types::InvocationSource::LocalHttp,
@@ -1527,5 +1824,67 @@ mod tests {
         assert!(visible.iter().any(|item| item.id == "context.resolve"));
         assert!(visible.iter().any(|item| item.id == "media.image.generate"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extension_development_workspace_must_match_the_ai_session_root() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-extension-workspace-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let current = workspace.canonicalize().unwrap();
+
+        validate_extension_workspace_root(&current, workspace.to_str().unwrap()).unwrap();
+        let error = validate_extension_workspace_root(&current, outside.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("extension_workspace_mismatch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn software_distribution_workspace_must_match_the_ai_session_root() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-software-workspace-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let current = workspace.canonicalize().unwrap();
+
+        validate_software_workspace_root(&current, workspace.to_str().unwrap()).unwrap();
+        let error = validate_software_workspace_root(&current, outside.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("software_workspace_mismatch"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_mcp_software_publish_requires_native_confirmation() {
+        let mcp = InvocationContext::new(
+            crate::capability::types::InvocationSource::Mcp,
+            "ai-client:test",
+        );
+        let cli = InvocationContext::new(
+            crate::capability::types::InvocationSource::Cli,
+            "local-cli",
+        );
+        assert!(requires_native_software_confirmation(&mcp));
+        assert!(!requires_native_software_confirmation(&cli));
     }
 }
