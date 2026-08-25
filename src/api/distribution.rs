@@ -744,15 +744,14 @@ pub fn submit_skill(
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
-    Ok(client
+    let response = client
         .post(format!("{api_base}/api/agent/skills/submissions"))
         .bearer_auth(access_token)
         .header("X-HiMind-Agent-ID", agent_id)
         .header("X-HiMind-AI-Client", ai_client_id())
         .multipart(form)
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?)
+        .send()?;
+    parse_submission_response(response)
 }
 
 pub fn skill_submissions(
@@ -806,15 +805,35 @@ pub fn submit_plugin(
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
-    Ok(client
+    let response = client
         .post(format!("{api_base}/api/agent/plugins/submissions"))
         .bearer_auth(access_token)
         .header("X-HiMind-Agent-ID", agent_id)
         .header("X-HiMind-AI-Client", ai_client_id())
         .multipart(form)
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?)
+        .send()?;
+    parse_submission_response(response)
+}
+
+fn parse_submission_response(
+    response: reqwest::blocking::Response,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| body.trim().to_string());
+        return Err(format!("HTTP status {}: {}", status, detail).into());
+    }
+    Ok(serde_json::from_str(&body)?)
 }
 
 pub fn plugin_submissions(
