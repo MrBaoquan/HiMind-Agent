@@ -100,12 +100,15 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
         </div>
 
         {formOpen ? <section className="extension-source-form">
-          <div className="field-group"><label className="field-label" htmlFor="extension-source-repository">GitHub 仓库</label><input id="extension-source-repository" value={repository} onChange={event => setRepository(event.target.value)} placeholder="owner/repository" /></div>
-          <div className="extension-source-form-row">
-            <div className="field-group"><label className="field-label" htmlFor="extension-source-name">名称</label><input id="extension-source-name" value={name} onChange={event => setName(event.target.value)} placeholder="可选" /></div>
-            <div className="field-group"><label className="field-label" htmlFor="extension-source-reference">分支或 Tag</label><input id="extension-source-reference" value={reference} onChange={event => setReference(event.target.value)} /></div>
-          </div>
-          <details className="extension-source-advanced"><summary>高级设置</summary><div className="extension-source-advanced-fields"><div className="field-group"><label className="field-label" htmlFor="extension-source-catalog">目录文件</label><input id="extension-source-catalog" value={catalogPath} onChange={event => setCatalogPath(event.target.value)} /></div><div className="field-group"><label className="field-label" htmlFor="extension-source-verification">来源校验</label><select id="extension-source-verification" value={verification} onChange={event => setVerification(event.target.value as ExtensionSourceConfig['verification'])}><option value="required">仅安装可信签名</option><option value="optional">允许用户自定义制品</option></select><small>选择用户自定义时，已有签名仍会严格校验。</small></div></div></details>
+          <div className="field-group"><label className="field-label" htmlFor="extension-source-repository">GitHub 仓库链接</label><input id="extension-source-repository" value={repository} onChange={event => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" /></div>
+          <details className="extension-source-advanced"><summary>高级设置</summary><div className="extension-source-advanced-fields">
+            <div className="extension-source-form-row">
+              <div className="field-group"><label className="field-label" htmlFor="extension-source-name">名称</label><input id="extension-source-name" value={name} onChange={event => setName(event.target.value)} placeholder="自动使用仓库名称" /></div>
+              <div className="field-group"><label className="field-label" htmlFor="extension-source-reference">分支或 Tag</label><input id="extension-source-reference" value={reference} onChange={event => setReference(event.target.value)} placeholder="main" /></div>
+            </div>
+            <div className="field-group"><label className="field-label" htmlFor="extension-source-catalog">目录文件</label><input id="extension-source-catalog" value={catalogPath} onChange={event => setCatalogPath(event.target.value)} placeholder=".himind/catalog.json" /></div>
+            <div className="field-group"><label className="field-label" htmlFor="extension-source-verification">来源校验</label><select id="extension-source-verification" value={verification} onChange={event => setVerification(event.target.value as ExtensionSourceConfig['verification'])}><option value="required">仅安装可信签名</option><option value="optional">允许用户自定义制品</option></select><small>选择用户自定义时，已有签名仍会严格校验。</small></div>
+          </div></details>
           <div className="extension-source-form-actions"><button className="btn" onClick={() => setFormOpen(false)}>取消</button><button className="btn btn-primary" disabled={loading || !repository.trim() || !reference.trim() || !catalogPath.trim()} onClick={() => void addSource()}>保存</button></div>
         </section> : null}
 

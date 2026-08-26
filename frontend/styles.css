@@ -1349,6 +1349,7 @@ tr:last-child td { border-bottom: 0; }
 .extension-source-advanced { margin-top: 2px; }
 .extension-source-advanced summary { color: var(--text-muted); cursor: pointer; font-size: 11px; }
 .extension-source-advanced-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, .8fr); gap: 10px; margin-top: 10px; }
+.extension-source-advanced-fields .extension-source-form-row { grid-column: 1 / -1; }
 .extension-source-advanced .field-group { margin: 0; }
 .extension-source-advanced .field-group small { color: var(--text-muted); font-size: 9px; line-height: 1.45; }
 .extension-source-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
