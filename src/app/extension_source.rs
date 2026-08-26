@@ -144,9 +144,25 @@ pub(crate) fn add_github_source(
     catalog_path: Option<&str>,
     verification: Option<&str>,
 ) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
-    let repository = normalize_repository(repository)?;
-    let reference = validate_reference(reference)?;
-    let catalog_path = validate_catalog_path(catalog_path.unwrap_or(DEFAULT_CATALOG_PATH))?;
+    let parsed = crate::app::github_source::parse_source_url(repository)?;
+    let repository = parsed.repository;
+    let reference = if !parsed.reference.is_empty() {
+        parsed.reference
+    } else {
+        validate_reference(reference)?
+    };
+    let requested_catalog_path = catalog_path.unwrap_or(DEFAULT_CATALOG_PATH).trim();
+    let catalog_path =
+        if !parsed.subpath.is_empty() && requested_catalog_path == DEFAULT_CATALOG_PATH {
+            let path = if parsed.subpath.ends_with(".json") {
+                parsed.subpath
+            } else {
+                format!("{}/.himind/catalog.json", parsed.subpath)
+            };
+            validate_catalog_path(&path)?
+        } else {
+            validate_catalog_path(requested_catalog_path)?
+        };
     let verification = source_verification(&repository, verification)?;
     let id = source_id(&repository, &reference, &catalog_path);
     let mut current = settings()?;
@@ -1126,20 +1142,7 @@ fn source_id(repository: &str, reference: &str, catalog_path: &str) -> String {
 }
 
 fn normalize_repository(value: &str) -> Result<String, Box<dyn Error>> {
-    let value = value.trim().trim_end_matches('/').trim_end_matches(".git");
-    let value = value
-        .strip_prefix("https://github.com/")
-        .or_else(|| value.strip_prefix("http://github.com/"))
-        .unwrap_or(value);
-    let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() != 2
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(is_github_segment_byte))
-    {
-        return Err("GitHub 仓库必须是 owner/repo 或 github.com/owner/repo".into());
-    }
-    Ok(format!("{}/{}", parts[0], parts[1]))
+    Ok(crate::app::github_source::parse_source_url(value)?.repository)
 }
 
 fn validate_reference(value: &str) -> Result<String, Box<dyn Error>> {
@@ -1188,10 +1191,6 @@ fn validate_asset_key(value: &str) -> Result<(), Box<dyn Error>> {
         return Err("扩展 ID 无效".into());
     }
     Ok(())
-}
-
-fn is_github_segment_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 fn settings_schema_version() -> u32 {
@@ -1243,6 +1242,11 @@ mod tests {
     fn validates_source_identity_and_paths() {
         assert_eq!(
             normalize_repository("https://github.com/Owner/repo.git").unwrap(),
+            "Owner/repo"
+        );
+        assert_eq!(
+            normalize_repository("https://github.com/Owner/repo.git?path=/extensions#v1.0.0")
+                .unwrap(),
             "Owner/repo"
         );
         assert!(normalize_repository("https://example.com/Owner/repo").is_err());

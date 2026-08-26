@@ -1985,11 +1985,12 @@ fn ensure_himind_skill_adapter(home: &Path, options: &Options) -> Result<(), Box
     ));
     fs::create_dir_all(&staging)?;
     let result = (|| -> Result<(), Box<dyn Error>> {
+        let mut names = HashSet::new();
         for record in &records {
-            let name = dsh_skill_name(&record.manifest.id);
+            let source = fs::read_to_string(record.version_root.join("SKILL.md"))?;
+            let name = dsh_skill_name(&record.manifest.id, &source, &mut names);
             let destination = staging.join(&name);
             copy_skill_package(record, &destination)?;
-            let source = fs::read_to_string(record.version_root.join("SKILL.md"))?;
             fs::write(
                 destination.join("SKILL.md"),
                 render_dsh_skill(record, &name, &source),
@@ -2142,27 +2143,84 @@ fn strip_yaml_frontmatter(source: &str) -> &str {
     source
 }
 
-fn dsh_skill_name(skill_id: &str) -> String {
-    let mut slug = String::new();
-    let mut previous_dash = false;
-    for byte in skill_id.bytes() {
-        if byte.is_ascii_alphanumeric() {
-            slug.push((byte as char).to_ascii_lowercase());
-            previous_dash = false;
-        } else if !previous_dash {
-            slug.push('-');
-            previous_dash = true;
-        }
+fn dsh_skill_name(skill_id: &str, source: &str, used: &mut HashSet<String>) -> String {
+    let candidate = frontmatter_skill_name(source)
+        .and_then(|name| normalize_dsh_skill_name(&name))
+        .unwrap_or_else(|| {
+            let slug = skill_id.rsplit('.').next().unwrap_or(skill_id);
+            normalize_dsh_skill_name(slug).unwrap_or_else(|| "skill".to_string())
+        });
+    let candidate = shorten_dsh_skill_name(&candidate);
+    if used.insert(candidate.clone()) {
+        return candidate;
     }
-    let slug = slug.trim_matches('-');
+
+    // Names are normally unique. Keep collisions deterministic while adding
+    // only a short suffix instead of exposing the full namespaced Skill ID.
     let mut digest = Sha256::new();
     digest.update(skill_id.as_bytes());
     let digest = format!("{:x}", digest.finalize());
-    format!(
-        "himind-{}-{}",
-        if slug.is_empty() { "skill" } else { slug },
-        &digest[..10]
-    )
+    let base = candidate.chars().take(32).collect::<String>();
+    for length in 6..=12 {
+        let name = format!("{}-{}", base.trim_end_matches('-'), &digest[..length]);
+        if used.insert(name.clone()) {
+            return name;
+        }
+    }
+    format!("{}-{}", base.trim_end_matches('-'), &digest[..16])
+}
+
+fn frontmatter_skill_name(source: &str) -> Option<String> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut lines = source.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("name:") {
+            let value = value.trim();
+            let value = value.trim_matches(|character| character == '\'' || character == '"');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_dsh_skill_name(value: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut previous_dash = false;
+    for byte in value.trim().bytes() {
+        if byte.is_ascii_alphanumeric() {
+            result.push((byte as char).to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash {
+            result.push('-');
+            previous_dash = true;
+        }
+    }
+    let result = result.trim_matches('-').to_string();
+    if result.is_empty() || result.len() > 48 || result.starts_with("himind-com-himind-") {
+        return None;
+    }
+    Some(result)
+}
+
+fn shorten_dsh_skill_name(value: &str) -> String {
+    match value {
+        "develop-himind-plugins" => "plugin-dev".to_string(),
+        "develop-himind-skills" => "skill-dev".to_string(),
+        "software-distribution" => "software-dist".to_string(),
+        "unihper-unity-development" => "unity-dev".to_string(),
+        "git-svn-commit-summary" => "commit-summary".to_string(),
+        "image-delivery-preflight" => "image-preflight".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn yaml_scalar(value: &str) -> String {
@@ -2455,7 +2513,7 @@ mod tests {
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
 
     #[test]
     fn extracts_first_non_empty_version_line() {
@@ -2922,8 +2980,13 @@ mod tests {
 
     #[test]
     fn himind_skill_adapter_uses_valid_stable_names_and_one_frontmatter_block() {
-        let name = dsh_skill_name("com.himind.skill.example_tool");
-        assert!(name.starts_with("himind-com-himind-skill-example-tool-"));
+        let mut used = HashSet::new();
+        let name = dsh_skill_name(
+            "com.himind.skill.develop-himind-plugins",
+            "---\nname: develop-himind-plugins\ndescription: test\n---\n# Test",
+            &mut used,
+        );
+        assert_eq!(name, "plugin-dev");
         assert!(name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
@@ -2934,7 +2997,33 @@ mod tests {
             .trim(),
             "# Body"
         );
-        assert_eq!(name, dsh_skill_name("com.himind.skill.example_tool"));
+        let mut used = HashSet::new();
+        assert_eq!(
+            name,
+            dsh_skill_name(
+                "com.himind.skill.develop-himind-plugins",
+                "---\nname: develop-himind-plugins\ndescription: test\n---\n# Test",
+                &mut used,
+            )
+        );
+    }
+
+    #[test]
+    fn himind_skill_adapter_only_hashes_name_collisions() {
+        let mut used = HashSet::new();
+        let first = dsh_skill_name(
+            "com.example.skill.one",
+            "---\nname: shared\ndescription: one\n---\n# One",
+            &mut used,
+        );
+        let second = dsh_skill_name(
+            "com.other.skill.two",
+            "---\nname: shared\ndescription: two\n---\n# Two",
+            &mut used,
+        );
+        assert_eq!(first, "shared");
+        assert!(second.starts_with("shared-"));
+        assert!(second.len() <= 39);
     }
 
     #[test]

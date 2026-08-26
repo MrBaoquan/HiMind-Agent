@@ -48,7 +48,7 @@ type SkillsWorkspacePageProps = {
   onUninstall: (skillId: string) => void;
   onOpenDirectory: (path: string) => void;
   onImportLocal: () => void;
-  onImportGithub: (repository: string, reference: string, subpath: string) => Promise<void>;
+  onImportGithub: (sourceUrl: string) => Promise<void>;
 };
 
 type ViewKey = 'marketplace' | 'installed' | 'system';
@@ -74,9 +74,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   const [installPlan, setInstallPlan] = useState<SkillInstallPlan | null>(null);
   const [planError, setPlanError] = useState('');
   const [githubOpen, setGithubOpen] = useState(false);
-  const [githubRepository, setGithubRepository] = useState('');
-  const [githubReference, setGithubReference] = useState('main');
-  const [githubSubpath, setGithubSubpath] = useState('');
+  const [githubSourceUrl, setGithubSourceUrl] = useState('');
   const [githubBusy, setGithubBusy] = useState(false);
   const [githubError, setGithubError] = useState('');
   const [planLoading, setPlanLoading] = useState(false);
@@ -227,7 +225,7 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
         <div className="skill-dialog-actions"><button className="btn" onClick={() => setPendingUninstall(null)}>取消</button><button className="btn btn-danger" disabled={isBusy || pendingUninstall.modified_files.length > 0} onClick={() => { onUninstall(pendingUninstall.record.manifest.id); setPendingUninstall(null); }}><Trash2 size={15} />确认卸载</button></div>
       </div></div> : null}
 	  {installPlan || planError ? <InstallPlanDialog plan={installPlan} error={planError} currentVersion={installPlan ? installedById.get(installPlan.skill.skill_id)?.record.manifest.version : undefined} busy={isBusy} onClose={() => { setInstallPlan(null); setPlanError(''); }} onInstall={(optionalIds) => { if (installPlan) onInstallMarketplace(installPlan.skill.skill_id, installPlan.skill.version, optionalIds); setInstallPlan(null); }} /> : null}
-	  {githubOpen ? <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="github-skill-title"><div className="modal-header"><div><h3 id="github-skill-title">从 GitHub 导入 Skill</h3><p>仅下载固定 ref 的仓库内容，并校验 Skill Manifest、声明文件和 checksums。</p></div><button className="btn btn-icon" aria-label="关闭" title="关闭" onClick={() => setGithubOpen(false)}><X size={16} /></button></div><div className="modal-body"><div className="field-group"><label className="field-label" htmlFor="github-skill-repository">仓库</label><input id="github-skill-repository" value={githubRepository} onChange={event => setGithubRepository(event.target.value)} placeholder="owner/repo" /></div><div className="field-group"><label className="field-label" htmlFor="github-skill-reference">Tag / Commit</label><input id="github-skill-reference" value={githubReference} onChange={event => setGithubReference(event.target.value)} placeholder="main 或 v1.0.0" /></div><div className="field-group"><label className="field-label" htmlFor="github-skill-subpath">子目录（可选）</label><input id="github-skill-subpath" value={githubSubpath} onChange={event => setGithubSubpath(event.target.value)} placeholder="skills/example" /></div>{githubError ? <div className="inline-feedback visible" role="status">{githubError}</div> : null}<div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={() => setGithubOpen(false)}>取消</button><button className="btn btn-primary" disabled={githubBusy || !githubRepository.trim() || !githubReference.trim()} onClick={async () => { setGithubBusy(true); setGithubError(''); try { await onImportGithub(githubRepository.trim(), githubReference.trim(), githubSubpath.trim()); setGithubOpen(false); } catch (error) { setGithubError(error instanceof Error ? error.message : 'GitHub Skill 导入失败'); } finally { setGithubBusy(false); } }}>{githubBusy ? '导入中...' : '导入 Skill'}</button></div></div></div></div></div> : null}
+	  {githubOpen ? <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="github-skill-title"><div className="modal-header"><div><h3 id="github-skill-title">从 GitHub 导入 Skill</h3><p>粘贴仓库链接即可；子目录和版本可按 UPM 方式写在链接中。</p></div><button className="btn btn-icon" aria-label="关闭" title="关闭" onClick={() => setGithubOpen(false)}><X size={16} /></button></div><div className="modal-body"><div className="field-group"><label className="field-label" htmlFor="github-skill-source-url">GitHub 链接</label><input id="github-skill-source-url" value={githubSourceUrl} onChange={event => setGithubSourceUrl(event.target.value)} placeholder="https://github.com/owner/repository.git?path=/skills/example#v1.0.0" /></div>{githubError ? <div className="inline-feedback visible" role="status">{githubError}</div> : null}<div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={() => setGithubOpen(false)}>取消</button><button className="btn btn-primary" disabled={githubBusy || !githubSourceUrl.trim()} onClick={async () => { setGithubBusy(true); setGithubError(''); try { await onImportGithub(githubSourceUrl.trim()); setGithubOpen(false); } catch (error) { setGithubError(error instanceof Error ? error.message : 'GitHub Skill 导入失败'); } finally { setGithubBusy(false); } }}>{githubBusy ? '导入中...' : '导入 Skill'}</button></div></div></div></div></div> : null}
     </div>
   );
 }

@@ -317,10 +317,10 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 )?
             );
         }
-        Some("import-github") if (arguments.len() == 3 || arguments.len() == 4) => {
+        Some("import-github") if (arguments.len() >= 2 && arguments.len() <= 4) => {
             let registry = app::github_source::import_plugin(
                 &arguments[1],
-                &arguments[2],
+                arguments.get(2).map(String::as_str).unwrap_or_default(),
                 arguments.get(3).map(String::as_str).unwrap_or_default(),
             )?;
             println!("{}", serde_json::to_string_pretty(&registry)?);
@@ -366,7 +366,7 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             );
         }
         _ => {
-            return Err("usage: himind-agent plugin <list|import-local path|import-github owner/repo ref [subpath]|install|uninstall|enable|disable|rollback|invoke> [plugin-id|capability-id json]".into())
+            return Err("usage: himind-agent plugin <list|import-local path|import-github github-url [ref] [subpath]|install|uninstall|enable|disable|rollback|invoke> [plugin-id|capability-id json]".into())
         }
     }
     if let (Some(state), Some(plugin_id)) = (

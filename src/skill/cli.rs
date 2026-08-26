@@ -23,10 +23,10 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             )?;
             print_json(serde_json::to_value(record)?)?
         }
-        Some("import-github") if arguments.len() == 3 || arguments.len() == 4 => {
+        Some("import-github") if arguments.len() >= 2 && arguments.len() <= 4 => {
             let record = crate::app::github_source::import_skill(
                 &arguments[1],
-                &arguments[2],
+                arguments.get(2).map(String::as_str).unwrap_or_default(),
                 arguments.get(3).map(String::as_str).unwrap_or_default(),
             )?;
             print_json(record)?
@@ -113,7 +113,7 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         }
         _ => {
             return Err(
-                "usage: himind-agent skill <catalog|import-local path|import-github owner/repo ref [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
+                "usage: himind-agent skill <catalog|import-local path|import-github github-url [ref] [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
             )
         }
     }

@@ -1417,6 +1417,11 @@ pub(crate) fn import_github_plugin(
 }
 
 #[tauri::command]
+pub(crate) fn import_github_plugin_url(source_url: String) -> Result<serde_json::Value, String> {
+    crate::app::github_source::import_plugin(&source_url, "", "").map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn get_extension_desired_state(
     state: State<'_, AgentState>,
 ) -> Result<ExtensionDesiredState, String> {
@@ -1532,6 +1537,11 @@ pub(crate) fn import_github_skill(
         subpath.as_deref().unwrap_or(""),
     )
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_github_skill_url(source_url: String) -> Result<serde_json::Value, String> {
+    crate::app::github_source::import_skill(&source_url, "", "").map_err(|error| error.to_string())
 }
 
 #[tauri::command]
