@@ -1,3 +1,4 @@
+use crate::skill::clients::manifest_supports_client;
 use crate::skill::types::{SkillCapabilityDependency, SkillManifest};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -37,11 +38,7 @@ impl SkillReadiness {
         let mut reasons = Vec::new();
         let mut dependencies = Vec::new();
 
-        if !manifest.supported_clients.is_empty()
-            && !manifest
-                .supported_clients
-                .iter()
-                .any(|item| item.eq_ignore_ascii_case(client_id))
+        if !manifest.supported_clients.is_empty() && !manifest_supports_client(manifest, client_id)
         {
             state = "blocked".to_string();
             reasons.push(format!("unsupported client: {client_id}"));

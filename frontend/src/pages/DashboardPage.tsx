@@ -1,13 +1,13 @@
 import { ArrowUpRight, CheckCircle2, CircleAlert, Download, LoaderCircle, RefreshCw, Sparkles } from 'lucide-react';
 import { PageHeader, Pill } from '../components/Common';
 import { DashboardIdentityPanel } from '../components/DashboardIdentityPanel';
-import type { AgentStatus, AgentUpdateStatus, AiIntegrationOverview, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, RemoteExecutionSettings } from '../services/agentApi';
+import type { AgentStatus, AgentUpdateStatus, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, McpTargetDescriptor, RemoteExecutionSettings } from '../services/agentApi';
 
 type DashboardPageProps = {
   status: AgentStatus | null;
   approvals: ApprovalItem[];
   remoteExecutionSettings: RemoteExecutionSettings | null;
-  aiIntegration: AiIntegrationOverview | null;
+  mcpTargets: McpTargetDescriptor[];
   identity: DashboardIdentityStatus | null;
   authorization: DashboardAuthorizationProgress | null;
   identityBusy: boolean;
@@ -28,7 +28,7 @@ export function DashboardPage({
   status,
   approvals,
   remoteExecutionSettings,
-  aiIntegration,
+  mcpTargets,
   identity,
   authorization,
   identityBusy,
@@ -67,7 +67,7 @@ export function DashboardPage({
           <div className="workspace-status-metrics" aria-label="本机运行状态">
             <div><span>待审批</span><strong>{approvals.length}</strong></div>
             <div><span>本机服务</span><strong>已就绪</strong></div>
-            <div><span>AI 工具</span><strong>{aiIntegration?.clients.filter(client => client.detected && client.state === 'configured').length || 0} 已连接</strong></div>
+            <div><span>AI 工具</span><strong>{mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected && target.state === 'configured').length} 已连接</strong></div>
           </div>
         </section>
         <section className="overview-facts" aria-label="运行信息">
@@ -79,16 +79,9 @@ export function DashboardPage({
       </div>
     );
   }
-  const workerIssue = status.mode === 'independent'
-    ? {
-      title: 'Independent Mode 已启用',
-      description: 'Dashboard Worker 未启动。DSH 原生 AI、技能、插件、MCP 和本机能力仍可独立使用。',
-      healthDescription: '当前 Agent 作为独立 AI Harness 运行，不参与 Dashboard 任务调度。',
-      requiresEnrollment: false,
-    }
-    : describeWorkerIssue(status.dashboard_worker_error);
-  const aiReadyCount = aiIntegration?.clients.filter(client => client.detected && client.state === 'configured').length || 0;
-  const aiInstalledCount = aiIntegration?.clients.filter(client => client.detected).length || 0;
+  const workerIssue = describeWorkerIssue(status.dashboard_worker_error);
+  const aiReadyCount = mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected && target.state === 'configured').length;
+  const aiInstalledCount = mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected).length;
   return (
     <div className="dashboard-page">
       <PageHeader

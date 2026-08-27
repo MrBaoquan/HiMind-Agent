@@ -16,17 +16,19 @@ use crate::Options;
 
 const BACKGROUND_CHECK_MIN_SECONDS: u64 = 30 * 60;
 const BACKGROUND_CHECK_JITTER_SECONDS: u64 = 30 * 60;
-// The VSIX entry is optional for one transition release so already deployed
-// three-file Agents can still update. New Agents accept and stage the fourth
-// entry, allowing a later release to keep the Agent and extension in lockstep.
-const DIRECTORY_PACKAGE_FILES: [&str; 4] = [
+// The MCP companion is part of the Agent runtime contract. VSIX remains
+// optional, but every directory package must carry the console companion so a
+// release cannot silently regress stdio MCP clients.
+const DIRECTORY_PACKAGE_FILES: [&str; 5] = [
     "himind-agent.exe",
+    "himind-agent-mcp.exe",
     "himind-agent-updater.exe",
     "himind-agent-launcher.exe",
     "himind-ai.vsix",
 ];
-const REQUIRED_DIRECTORY_PACKAGE_FILES: [&str; 3] = [
+const REQUIRED_DIRECTORY_PACKAGE_FILES: [&str; 4] = [
     "himind-agent.exe",
+    "himind-agent-mcp.exe",
     "himind-agent-updater.exe",
     "himind-agent-launcher.exe",
 ];
@@ -79,6 +81,8 @@ pub(crate) struct AgentUpdateStatus {
     #[serde(default)]
     pub staged_agent_path: String,
     #[serde(default)]
+    pub staged_mcp_path: String,
+    #[serde(default)]
     pub staged_updater_path: String,
     #[serde(default)]
     pub staged_launcher_path: String,
@@ -117,6 +121,7 @@ impl Default for AgentUpdateStatus {
             progress_percent: 0,
             staged_package_path: String::new(),
             staged_agent_path: String::new(),
+            staged_mcp_path: String::new(),
             staged_updater_path: String::new(),
             staged_launcher_path: String::new(),
             staged_vscode_extension_path: String::new(),
@@ -547,6 +552,10 @@ fn prepare_staged_payload(
         .join("himind-agent.exe")
         .to_string_lossy()
         .to_string();
+    status.staged_mcp_path = package_dir
+        .join("himind-agent-mcp.exe")
+        .to_string_lossy()
+        .to_string();
     status.staged_updater_path = package_dir
         .join("himind-agent-updater.exe")
         .to_string_lossy()
@@ -586,7 +595,7 @@ fn extract_directory_package(archive_path: &Path, target_dir: &Path) -> Result<(
         if archive.len() != REQUIRED_DIRECTORY_PACKAGE_FILES.len()
             && archive.len() != DIRECTORY_PACKAGE_FILES.len()
         {
-            return Err("Agent directory update package must contain three executables and may optionally contain himind-ai.vsix".into());
+            return Err("Agent directory update package must contain Agent, MCP companion and helper executables; himind-ai.vsix is optional".into());
         }
         let allowed = DIRECTORY_PACKAGE_FILES.into_iter().collect::<HashSet<_>>();
         let required = REQUIRED_DIRECTORY_PACKAGE_FILES
@@ -669,6 +678,7 @@ fn staged_payload_available(status: &AgentUpdateStatus) -> bool {
     status.package_type == "directory-zip"
         && Path::new(&status.staged_package_path).is_file()
         && Path::new(&status.staged_agent_path).is_file()
+        && Path::new(&status.staged_mcp_path).is_file()
         && Path::new(&status.staged_updater_path).is_file()
         && Path::new(&status.staged_launcher_path).is_file()
         && (status.staged_vscode_extension_path.is_empty()
@@ -678,6 +688,7 @@ fn staged_payload_available(status: &AgentUpdateStatus) -> bool {
 fn clear_staged_paths(status: &mut AgentUpdateStatus) {
     status.staged_package_path.clear();
     status.staged_agent_path.clear();
+    status.staged_mcp_path.clear();
     status.staged_updater_path.clear();
     status.staged_launcher_path.clear();
     status.staged_vscode_extension_path.clear();
@@ -710,6 +721,7 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
     crate::app::ui::stop_builtin_ai_process();
     if let Err(error) = crate::app::system::schedule_agent_replace_and_restart(
         Path::new(&status.staged_agent_path),
+        Path::new(&status.staged_mcp_path),
         &staged_package,
         Path::new(&status.staged_updater_path),
         Path::new(&status.staged_launcher_path),
@@ -999,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_three_file_agent_directory_package() {
+    fn rejects_agent_directory_package_without_mcp_companion() {
         let root = temporary_test_root("legacy-extract");
         fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("agent.zip");
@@ -1011,12 +1023,7 @@ mod tests {
         write_test_archive(&archive_path, &entries).unwrap();
         let extracted = root.join("payload");
 
-        extract_directory_package(&archive_path, &extracted).unwrap();
-
-        for name in entries {
-            assert!(extracted.join(name).is_file());
-        }
-        assert!(!extracted.join("himind-ai.vsix").exists());
+        assert!(extract_directory_package(&archive_path, &extracted).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

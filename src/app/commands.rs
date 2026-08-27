@@ -19,7 +19,7 @@ use crate::capability::plugin::{registry_json, registry_json_for_control_plane};
 use crate::capability::service::CapabilityGateway;
 use crate::capability::types::InvocationContext;
 use crate::remote::client::inner_admin_base;
-use crate::skill::{catalog_json, codex_repair_json};
+use crate::skill::catalog_json;
 use crate::store::credentials::{
     clear_local_inner_admin_credentials, local_login_status_json, local_unity_editor_settings,
     save_local_inner_admin_credentials, save_local_unity_editor_path,
@@ -240,51 +240,127 @@ pub(crate) async fn revoke_dashboard_authorization(
 }
 
 #[tauri::command]
-pub(crate) fn get_ai_integration_overview(
-    state: State<'_, AgentState>,
-) -> Result<crate::app::ai_clients::AiIntegrationOverview, String> {
-    crate::app::ai_clients::overview(&state.options).map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub(crate) fn register_ai_client_mcp_server(
-    state: State<'_, AgentState>,
-    client_id: String,
-    reset_invalid: Option<bool>,
-) -> Result<crate::app::ai_clients::AiClientConfigurationResult, String> {
-    let result = crate::app::ai_clients::configure(
-        &state.options,
-        &client_id,
-        reset_invalid.unwrap_or(false),
-    )
-    .map_err(|error| error.to_string())?;
-    state
-        .approval_manager
-        .add_log("info", &format!("已注册 AI 客户端 MCP 服务: {client_id}"));
-    Ok(result)
-}
-
-#[tauri::command]
-pub(crate) fn unregister_ai_client_mcp_server(
-    state: State<'_, AgentState>,
-    client_id: String,
-) -> Result<crate::app::ai_clients::AiClientConfigurationResult, String> {
-    let result = crate::app::ai_clients::remove_configuration(&state.options, &client_id)
-        .map_err(|error| error.to_string())?;
-    state.approval_manager.add_log(
-        "info",
-        &format!("已取消注册 AI 客户端 MCP 服务: {client_id}"),
-    );
-    Ok(result)
-}
-
-#[tauri::command]
 pub(crate) async fn test_mcp_connection(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::ai_clients::McpConnectionTestResult, String> {
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::app::ai_clients::test_connection(&options).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn get_mcp_registry_snapshot(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::mcp_registry::McpRegistrySnapshot, String> {
+    crate::app::mcp_registry::public_snapshot(&state.state_path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_mcp_targets(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::app::mcp_targets::McpTargetDescriptor>, String> {
+    crate::app::mcp_targets::list(&state.options).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn inspect_mcp_target(
+    state: State<'_, AgentState>,
+    target_id: String,
+) -> Result<serde_json::Value, String> {
+    crate::app::mcp_targets::inspect(&state.options, &target_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn plan_mcp_registration(
+    state: State<'_, AgentState>,
+    target_id: String,
+) -> Result<crate::app::mcp_registry::McpRegistrationPlan, String> {
+    crate::app::mcp_targets::plan(&state.options, &target_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn apply_mcp_registration(
+    state: State<'_, AgentState>,
+    target_id: String,
+    reset_invalid: Option<bool>,
+) -> Result<crate::app::mcp_targets::McpTargetOperationResult, String> {
+    let result =
+        crate::app::mcp_targets::apply(&state.options, &target_id, reset_invalid.unwrap_or(false))
+            .map_err(|error| error.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", &format!("已应用 MCP 注册目标: {target_id}"));
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn apply_all_mcp_registrations(
+    state: State<'_, AgentState>,
+    detected_only: Option<bool>,
+    reset_invalid: Option<bool>,
+) -> Result<crate::app::mcp_targets::McpTargetBatchResult, String> {
+    let result = crate::app::mcp_targets::apply_all(
+        &state.options,
+        detected_only.unwrap_or(true),
+        reset_invalid.unwrap_or(false),
+    )
+    .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "已批量应用 MCP 注册目标: {} 成功, {} 失败",
+            result.results.len(),
+            result.failures.len()
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn remove_mcp_registration(
+    state: State<'_, AgentState>,
+    target_id: String,
+) -> Result<crate::app::mcp_targets::McpTargetOperationResult, String> {
+    let result = crate::app::mcp_targets::remove(&state.options, &target_id)
+        .map_err(|error| error.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", &format!("已移除 MCP 注册目标: {target_id}"));
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn remove_all_mcp_registrations(
+    state: State<'_, AgentState>,
+    detected_only: Option<bool>,
+) -> Result<crate::app::mcp_targets::McpTargetBatchResult, String> {
+    let result = crate::app::mcp_targets::remove_all(&state.options, detected_only.unwrap_or(true))
+        .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "已批量移除 MCP 注册目标: {} 成功, {} 失败",
+            result.results.len(),
+            result.failures.len()
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) async fn test_mcp_server(
+    state: State<'_, AgentState>,
+    server_id: String,
+) -> Result<crate::app::mcp_probe::McpProbeResult, String> {
+    let state_path = state.state_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let server = crate::app::mcp_registry::get(&state_path, &server_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("MCP server not found: {server_id}"))?;
+        Ok(crate::app::mcp_probe::probe_report(&server))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1037,16 +1113,16 @@ pub(crate) async fn get_builtin_ai_tool_context_summary(
 #[tauri::command]
 pub(crate) fn get_builtin_ai_mcp_servers(
     state: State<'_, AgentState>,
-) -> Result<Vec<crate::app::mcp_settings::McpServerConfig>, String> {
-    crate::app::mcp_settings::load(&state.state_path).map_err(|error| error.to_string())
+) -> Result<Vec<crate::app::mcp_registry::McpServerConfig>, String> {
+    crate::app::mcp_registry::list_configs(&state.state_path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub(crate) fn save_builtin_ai_mcp_server(
     state: State<'_, AgentState>,
-    server: crate::app::mcp_settings::McpServerConfig,
-) -> Result<crate::app::mcp_settings::McpServerConfig, String> {
-    let server = crate::app::mcp_settings::upsert(&state.state_path, server)
+    server: crate::app::mcp_registry::McpServerConfig,
+) -> Result<crate::app::mcp_registry::McpServerConfig, String> {
+    let server = crate::app::mcp_registry::upsert_config(&state.state_path, server)
         .map_err(|error| error.to_string())?;
     crate::app::ui::stop_builtin_ai_process();
     state.approval_manager.add_log(
@@ -1061,7 +1137,7 @@ pub(crate) fn delete_builtin_ai_mcp_server(
     state: State<'_, AgentState>,
     server_name: String,
 ) -> Result<bool, String> {
-    let removed = crate::app::mcp_settings::remove(&state.state_path, &server_name)
+    let removed = crate::app::mcp_registry::remove_config(&state.state_path, &server_name)
         .map_err(|error| error.to_string())?;
     if removed {
         crate::app::ui::stop_builtin_ai_process();
@@ -1074,9 +1150,9 @@ pub(crate) fn delete_builtin_ai_mcp_server(
 
 #[tauri::command]
 pub(crate) fn validate_builtin_ai_mcp_server(
-    server: crate::app::mcp_settings::McpServerConfig,
+    server: crate::app::mcp_registry::McpServerConfig,
 ) -> Result<(), String> {
-    crate::app::mcp_settings::validate_config(&server)
+    crate::app::mcp_registry::validate_config(&server)
 }
 
 #[tauri::command]
@@ -2232,14 +2308,23 @@ pub(crate) fn sync_codex_skill(
     let clients =
         crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
             .map_err(|error| error.to_string())?;
-    let mut codex = clients
-        .get("codex")
-        .cloned()
-        .ok_or_else(|| "该 Skill 未声明支持 Codex".to_string())?;
-    if let Some(object) = codex.as_object_mut() {
+    let mut primary = primary_skill_client(&clients)
+        .ok_or_else(|| "该 Skill 未声明任何 Agent 支持的 AI 客户端".to_string())?;
+    if let Some(object) = primary.as_object_mut() {
         object.insert("clients".to_string(), serde_json::json!(clients));
     }
-    Ok(codex)
+    Ok(primary)
+}
+
+#[tauri::command]
+pub(crate) fn sync_skill_client(
+    skill_id: String,
+    client_id: String,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let capability_facts = skill_capability_facts(&state)?;
+    crate::skill::sync_skill_client_json(&skill_id, &client_id, VERSION, &capability_facts)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2249,37 +2334,71 @@ pub(crate) fn repair_codex_skill(
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
     let capability_facts = skill_capability_facts(&state)?;
-    codex_repair_json(
-        &skill_id,
+    let store = crate::skill::store::SkillStore::new();
+    store
+        .bootstrap_builtin_skills()
+        .map_err(|error| error.to_string())?;
+    let record = store
+        .get_record(&skill_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    let clients = crate::skill::repair_record_for_supported_clients(
+        &record,
         preserve_modified.unwrap_or(true),
         VERSION,
         &capability_facts,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|error| error.to_string())?;
+    let mut primary = primary_skill_client(&clients)
+        .ok_or_else(|| "该 Skill 未声明任何 Agent 支持的 AI 客户端".to_string())?;
+    let backup_root = clients.values().find_map(|client| {
+        client
+            .get("backup_root")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    if let Some(object) = primary.as_object_mut() {
+        object.insert("clients".to_string(), serde_json::json!(clients));
+        object.insert("backup_root".to_string(), serde_json::json!(backup_root));
+    }
+    Ok(primary)
 }
 
 #[tauri::command]
 pub(crate) fn uninstall_codex_skill(skill_id: String) -> Result<serde_json::Value, String> {
-    let removed = crate::skill::uninstall_supported_clients_json(&skill_id)
+    let clients = crate::skill::uninstall_supported_clients_json(&skill_id)
+        .map_err(|error| error.to_string())?;
+    let store = crate::skill::store::SkillStore::new();
+    let removed = store
+        .remove_installed_skill(&skill_id)
         .map_err(|error| error.to_string())?;
     crate::app::plugin_manager::remove_owner_references(&format!("skill:{skill_id}"));
-    let mut codex = removed
-        .get("clients")
-        .and_then(|clients| clients.get("codex"))
-        .cloned()
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "client_id": "codex",
-                "removed": {"skill_id": skill_id, "removed": false}
-            })
-        });
-    if let Some(object) = codex.as_object_mut() {
-        object.insert(
-            "clients".to_string(),
-            removed.get("clients").cloned().unwrap_or_default(),
-        );
-    }
-    Ok(codex)
+    Ok(serde_json::json!({
+        "client_id": "agent",
+        "target_root": store.root().to_string_lossy().to_string(),
+        "target_source": "agent-skill-store",
+        "target_configured": true,
+        "removed": {
+            "skill_id": skill_id,
+            "removed": removed,
+        },
+        "clients": clients.get("clients").cloned().unwrap_or_default(),
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn unregister_skill_client(
+    skill_id: String,
+    client_id: String,
+) -> Result<serde_json::Value, String> {
+    crate::skill::unregister_skill_client_json(&skill_id, &client_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn unregister_skill_clients(skill_id: String) -> Result<serde_json::Value, String> {
+    crate::skill::unregister_skill_clients_json(&skill_id).map_err(|error| error.to_string())
 }
 
 fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -2291,6 +2410,15 @@ fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_js
         object.insert("clients".to_string(), clients);
     }
     Ok(codex)
+}
+
+fn primary_skill_client(
+    clients: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    ["codex", "himind-ai"]
+        .into_iter()
+        .find_map(|client_id| clients.get(client_id).cloned())
+        .or_else(|| clients.values().next().cloned())
 }
 
 fn merged_plugin_catalog(

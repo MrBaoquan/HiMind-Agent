@@ -336,10 +336,8 @@ fn ensure_supported(item: &SkillCatalogItem) -> Result<(), Box<dyn Error>> {
         return Err("该 Skill 已被组织禁止安装".into());
     }
     if !item.supported_clients.iter().any(|client| {
-        client.eq_ignore_ascii_case("codex")
-            || client.eq_ignore_ascii_case("github-copilot")
-            || client.eq_ignore_ascii_case("workbuddy")
-            || client.eq_ignore_ascii_case("himind-ai")
+        client.eq_ignore_ascii_case(crate::skill::clients::PORTABLE_PROFILE_ID)
+            || crate::skill::clients::is_portable_client(client)
     }) {
         return Err("该 Skill 当前不支持本机已实现的 AI 客户端适配器".into());
     }

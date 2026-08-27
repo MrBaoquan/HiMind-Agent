@@ -447,33 +447,6 @@ export type DashboardAuthorizationProgress = {
     user_id: string;
 };
 
-export type AiClientIntegration = {
-    id: 'github-copilot' | 'codex' | 'workbuddy' | string;
-    name: string;
-    detected: boolean;
-    detection_message: string;
-    state: 'configured' | 'not_configured' | 'needs_repair' | 'invalid_config' | string;
-    config_path: string;
-    config_directory: string;
-    config_format: 'JSON' | 'TOML' | string;
-    config_preview: string;
-    error: string;
-};
-
-export type AiIntegrationOverview = {
-    protocol: string;
-    server_id: string;
-    command: string;
-    args: string[];
-    clients: AiClientIntegration[];
-};
-
-export type AiClientConfigurationResult = {
-    client: AiClientIntegration;
-    changed: boolean;
-    backup_path: string;
-};
-
 export type McpConnectionTestResult = {
     ok: boolean;
     server_name: string;
@@ -481,6 +454,62 @@ export type McpConnectionTestResult = {
     protocol_version: string;
     capability_count: number;
     duration_ms: number;
+};
+
+export type McpRegistrySnapshot = {
+    schema_version: number;
+    servers: Array<Record<string, unknown>>;
+};
+
+export type McpTargetDescriptor = {
+    id: string;
+    name: string;
+    kind: string;
+    detected: boolean;
+    detection_message: string;
+    config_path: string;
+    config_directory: string;
+    config_format: string;
+    state: string;
+    supported_transports: string[];
+    supports_auto_configure: boolean;
+    supports_skills: boolean;
+    skill_client_id: string;
+    skill_client_name: string;
+    restart_required: boolean;
+    manual_snippet: string;
+    config_preview: string;
+    error: string;
+};
+
+export type McpRegistrationPlan = {
+    target_id: string;
+    action: 'create' | 'update' | 'remove' | 'noop' | 'unsupported' | string;
+    write_required: boolean;
+    backup_required: boolean;
+    restart_required: boolean;
+    configured_server_id: string;
+    warnings: string[];
+};
+
+export type McpTargetOperationResult = {
+    target: McpTargetDescriptor;
+    changed: boolean;
+    backup_path: string;
+    message: string;
+};
+
+export type McpTargetBatchResult = {
+    results: McpTargetOperationResult[];
+    failures: Array<{ target_id: string; target_name: string; error: string }>;
+    skipped_target_ids: string[];
+};
+
+export type McpProbeResult = McpConnectionTestResult & {
+    transport: string;
+    tool_count: number;
+    error_kind: string;
+    error: string;
 };
 
 export type PluginViewContribution = {
@@ -567,8 +596,9 @@ export type CodexSkillStatusItem = {
     rendered_root: string;
     rendered: boolean;
     rendered_valid: boolean;
-    client_state: 'not_installed' | 'installed' | 'outdated' | 'modified' | 'blocked' | 'unsupported' | 'failed';
+    client_state: 'not_installed' | 'installed' | 'outdated' | 'modified' | 'managed_elsewhere' | 'blocked' | 'unsupported' | 'failed';
     installed_version?: string | null;
+    managing_profile?: string | null;
     available_version: string;
     last_synced_at?: string | null;
     managed_files: string[];
@@ -892,11 +922,16 @@ export type SkillSubmissionStatus = {
 
 export type CodexSkillStatusResponse = {
     client_id: string;
+    client_name?: string;
+    client_detected?: boolean;
+    skill_standard?: string;
+    support_level?: 'official' | 'verified' | 'compatible' | string;
+    support_note?: string;
     target_root: string;
     target_source: string;
     target_configured: boolean;
     target_exists: boolean;
-  target_mode: 'configured' | 'detected' | 'preview';
+  target_mode: 'builtin' | 'configured' | 'detected' | 'preview';
   sync_mode?: 'copy' | 'symlink';
     items: CodexSkillStatusItem[];
     clients?: Record<string, CodexSkillStatusResponse>;
@@ -951,6 +986,29 @@ export type CodexSkillUninstallResponse = {
     clients?: Record<string, CodexSkillUninstallResponse>;
 };
 
+export type SkillClientUnregisterResponse = {
+    skill_id: string;
+    client_id: string;
+    client_name?: string;
+    target_root?: string | null;
+    target_source?: string | null;
+    target_configured?: boolean;
+    removed: {
+        skill_id: string;
+        removed: boolean;
+    };
+    state?: 'managed_elsewhere' | 'unsupported' | 'builtin' | string;
+    managing_profile?: string | null;
+    reason?: string | null;
+};
+
+export type SkillClientsUnregisterResponse = {
+    skill_id: string;
+    removed_count: number;
+    results: Record<string, SkillClientUnregisterResponse>;
+    failures: Record<string, string>;
+};
+
 export type CodexSkillActionResponse = {
     client_id: string;
     target_root: string;
@@ -983,10 +1041,16 @@ export const agentApi = {
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
     openDashboardAuthorizationPage: () => invoke('open_dashboard_authorization_page'),
     revokeDashboardAuthorization: () => invoke('revoke_dashboard_authorization'),
-    aiIntegration: () => invoke<AiIntegrationOverview>('get_ai_integration_overview'),
-    registerAiClientMcpServer: (clientId: string, resetInvalid = false) => invoke<AiClientConfigurationResult>('register_ai_client_mcp_server', { clientId, resetInvalid }),
-    unregisterAiClientMcpServer: (clientId: string) => invoke<AiClientConfigurationResult>('unregister_ai_client_mcp_server', { clientId }),
     testMcpConnection: () => invoke<McpConnectionTestResult>('test_mcp_connection'),
+    mcpRegistry: () => invoke<McpRegistrySnapshot>('get_mcp_registry_snapshot'),
+    mcpTargets: () => invoke<McpTargetDescriptor[]>('get_mcp_targets'),
+    inspectMcpTarget: (targetId: string) => invoke<Record<string, unknown>>('inspect_mcp_target', { targetId }),
+    planMcpRegistration: (targetId: string) => invoke<McpRegistrationPlan>('plan_mcp_registration', { targetId }),
+    applyMcpRegistration: (targetId: string, resetInvalid = false) => invoke<McpTargetOperationResult>('apply_mcp_registration', { targetId, resetInvalid }),
+    applyAllMcpRegistrations: (detectedOnly = true, resetInvalid = false) => invoke<McpTargetBatchResult>('apply_all_mcp_registrations', { detectedOnly, resetInvalid }),
+    removeMcpRegistration: (targetId: string) => invoke<McpTargetOperationResult>('remove_mcp_registration', { targetId }),
+    removeAllMcpRegistrations: (detectedOnly = true) => invoke<McpTargetBatchResult>('remove_all_mcp_registrations', { detectedOnly }),
+    testMcpServer: (serverId: string) => invoke<McpProbeResult>('test_mcp_server', { serverId }),
     approvals: () => invoke<ApprovalItem[]>('get_pending_approvals'),
     settings: () => invoke<ApprovalSettings>('get_approval_settings'),
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
@@ -1070,8 +1134,11 @@ export const agentApi = {
     setSkillSyncMode: (mode: SkillSyncSettings['mode']) => invoke<SkillSyncSettings>('set_skill_sync_mode', { mode }),
     syncCodexSkills: () => invoke<CodexSkillSyncResponse>('sync_codex_skills'),
     syncCodexSkill: (skillId: string) => invoke<CodexSkillActionResponse>('sync_codex_skill', { skillId }),
+    syncSkillClient: (skillId: string, clientId: string) => invoke<CodexSkillActionResponse>('sync_skill_client', { skillId, clientId }),
     repairCodexSkill: (skillId: string, preserveModified = true) => invoke<CodexSkillActionResponse>('repair_codex_skill', { skillId, preserveModified }),
     uninstallCodexSkill: (skillId: string) => invoke<CodexSkillUninstallResponse>('uninstall_codex_skill', { skillId }),
+    unregisterSkillClient: (skillId: string, clientId: string) => invoke<SkillClientUnregisterResponse>('unregister_skill_client', { skillId, clientId }),
+    unregisterSkillClients: (skillId: string) => invoke<SkillClientsUnregisterResponse>('unregister_skill_clients', { skillId }),
     openFolder: (path: string) => invoke('open_folder', { path }),
     installPlugin: (pluginId: string, version?: string) => invoke('install_plugin', { pluginId, version }),
     uninstallPlugin: (pluginId: string) => invoke('uninstall_plugin', { pluginId }),

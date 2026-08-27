@@ -339,5 +339,6 @@ function pillKind(state: string): 'success' | 'warn' | 'danger' {
 
 function formatClients(items?: string[]) {
   if (!items?.length) return '--';
+  if (items.includes('agent-skills') || items.some(item => !['himind-ai'].includes(item))) return 'Agent Skills';
   return items.join(', ');
 }

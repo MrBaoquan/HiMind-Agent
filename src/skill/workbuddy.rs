@@ -49,6 +49,23 @@ pub(crate) fn sync_record_json(
     )
 }
 
+pub(crate) fn repair_json(
+    skill_id: &str,
+    preserve_modified: bool,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    copilot::repair_for_target(
+        CLIENT_ID,
+        CLIENT_NAME,
+        resolve_target(&SkillStore::new()),
+        skill_id,
+        preserve_modified,
+        agent_version,
+        capability_facts,
+    )
+}
+
 pub(crate) fn uninstall_json(skill_id: &str) -> Result<serde_json::Value, Box<dyn Error>> {
     copilot::uninstall_for_target(
         CLIENT_ID,

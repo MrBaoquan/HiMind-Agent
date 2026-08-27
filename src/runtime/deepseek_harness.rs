@@ -883,7 +883,7 @@ fn parse_native_dsh_provider_config(source: &str) -> Result<NativeDshProviderCon
 pub(crate) fn interactive_tool_context_summary(
     options: &Options,
 ) -> Result<InteractiveToolContextSummary, String> {
-    let personal_mcp = crate::app::mcp_settings::load(&options.state_path)
+    let personal_mcp = crate::app::mcp_registry::list(&options.state_path)
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|server| server.enabled)
@@ -1757,7 +1757,7 @@ fn render_himind_profile_patch_from_base(
     base_patch: &str,
     workspace: Option<&Path>,
 ) -> Result<String, Box<dyn Error>> {
-    let executable = crate::install_layout::stable_launcher_for_executable(&env::current_exe()?);
+    let executable = himind_mcp_executable()?;
     let args = himind_mcp_arguments(options);
     let mut patch = base_patch.trim_end().to_string();
     if options.mode().dashboard_enabled() {
@@ -1793,7 +1793,7 @@ fn render_himind_profile_patch_from_base(
     patch.push_str(
         "        failOnStartupError: false\n        reconnect:\n          enabled: true\n          initialDelayMs: 500\n          maxDelayMs: 30000\n          maxAttempts: 5\n",
     );
-    for server in crate::app::mcp_settings::load(&options.state_path)? {
+    for server in crate::app::mcp_registry::list(&options.state_path)? {
         append_personal_mcp_row(&mut patch, &server);
     }
     patch.push_str(&format!(
@@ -1907,20 +1907,23 @@ fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn append_personal_mcp_row(patch: &mut String, server: &crate::app::mcp_settings::McpServerConfig) {
+fn append_personal_mcp_row(patch: &mut String, server: &crate::app::mcp_registry::McpServerSpec) {
     patch.push_str(&format!(
         "\n    - id: {HIMIND_PERSONAL_MCP_ROW_PREFIX}{}\n      name: '@deepseek-ai/dsh-mcp-client'\n",
-        server.server_name
+        server.stable_id
     ));
     if !server.enabled {
         patch.push_str("      disabled: true\n");
     }
     patch.push_str(&format!(
         "      config:\n        transport: {}\n        serverName: {}\n",
-        yaml_scalar(&server.transport),
-        yaml_scalar(&server.server_name),
+        yaml_scalar(server.transport.as_str()),
+        yaml_scalar(&server.stable_id),
     ));
-    if server.transport == "stdio" {
+    if matches!(
+        server.transport,
+        crate::app::mcp_registry::McpTransport::Stdio
+    ) {
         patch.push_str(&format!(
             "        command: {}\n",
             yaml_scalar(&server.command)
@@ -1973,6 +1976,37 @@ fn himind_mcp_arguments(options: &Options) -> Vec<String> {
         "--state".to_string(),
         options.state_path.to_string_lossy().to_string(),
     ]
+}
+
+fn himind_mcp_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let current = env::current_exe()?;
+    let mut candidates = Vec::new();
+    if let Some(parent) = current.parent() {
+        candidates.push(crate::install_layout::companion_mcp_path(&current));
+        // `cargo test` runs from target/{debug,release}/deps while the binary
+        // companion is emitted one directory above the test harness.
+        if let Some(target_profile) = parent.parent() {
+            candidates.push(target_profile.join(crate::install_layout::MCP_FILE));
+        }
+        if let Ok(root) =
+            crate::install_layout::installation_root_from_executable(&current).canonicalize()
+        {
+            if let Ok(path) = crate::install_layout::resolve_mcp_path(&root) {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.dedup();
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return Ok(path);
+    }
+    // Unit tests do not need to spawn MCP and may run without a companion.
+    // Production/debug application launches fail clearly instead of silently
+    // selecting the GUI-subsystem Agent.
+    if cfg!(debug_assertions) {
+        return Ok(current);
+    }
+    Err("HiMind Agent MCP console companion is missing; rebuild or reinstall the same Agent version".into())
 }
 
 fn ensure_himind_skill_adapter(home: &Path, options: &Options) -> Result<(), Box<dyn Error>> {
@@ -2029,9 +2063,8 @@ fn himind_skill_records(options: &Options) -> Result<Vec<SkillRecord>, Box<dyn E
     Ok(store
         .list_records()?
         .into_iter()
-        // DSH is a first-class Skill client. A package that only targets
-        // another client must remain available to that client, but must not
-        // be copied into the HiMind AI runtime and counted as usable there.
+        // HiMind AI consumes the same portable Agent Skills packages as the
+        // external clients. Client-specific internal packages remain scoped.
         .filter(|record| {
             record.current
                 && skill_manifest_ready_for_himind_ai(&record.manifest, &capability_facts)
@@ -2044,10 +2077,7 @@ fn skill_manifest_ready_for_himind_ai(
     manifest: &crate::skill::types::SkillManifest,
     capability_facts: &[crate::skill::resolver::CapabilityFact],
 ) -> bool {
-    manifest
-        .supported_clients
-        .iter()
-        .any(|client| client.eq_ignore_ascii_case(HIMIND_MCP_CLIENT_ID))
+    crate::skill::clients::manifest_supports_client(manifest, HIMIND_MCP_CLIENT_ID)
         && crate::skill::resolver::SkillReadiness::resolve(
             manifest,
             capability_facts,
@@ -3027,7 +3057,7 @@ mod tests {
     }
 
     #[test]
-    fn himind_skill_adapter_only_accepts_supported_ready_skills() {
+    fn himind_skill_adapter_accepts_portable_ready_skills() {
         let mut manifest = crate::skill::types::SkillManifest {
             id: "com.example.skill".to_string(),
             name: "Example".to_string(),
@@ -3044,7 +3074,7 @@ mod tests {
             risk_summary: String::new(),
             contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
         };
-        assert!(!skill_manifest_ready_for_himind_ai(&manifest, &[]));
+        assert!(skill_manifest_ready_for_himind_ai(&manifest, &[]));
 
         manifest.supported_clients.push("himind-ai".to_string());
         assert!(skill_manifest_ready_for_himind_ai(&manifest, &[]));

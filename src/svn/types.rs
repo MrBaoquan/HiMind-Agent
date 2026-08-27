@@ -94,11 +94,15 @@ pub(crate) struct CreateRepositoryRequest {
     #[serde(default)]
     pub project_name: String,
     pub hook_endpoint: String,
+    #[serde(default)]
+    pub repository_access: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EnsureProjectExhibitsAccessRequest {
     pub project_id: String,
+    #[serde(default)]
+    pub repository_access: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -114,6 +118,8 @@ pub(crate) struct PreviewProjectAclRequest {
     pub project_id: String,
     pub managed_paths: Vec<String>,
     pub desired_entries: Vec<ProjectAclEntry>,
+    #[serde(default)]
+    pub repository_access: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +129,8 @@ pub(crate) struct ApplyProjectAclRequest {
     pub managed_paths: Vec<String>,
     pub desired_entries: Vec<ProjectAclEntry>,
     pub expected_current_digest: String,
+    #[serde(default)]
+    pub repository_access: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,4 +138,6 @@ pub(crate) struct ReconcileProjectAclRequest {
     pub project_id: String,
     pub managed_paths: Vec<String>,
     pub desired_entries: Vec<ProjectAclEntry>,
+    #[serde(default)]
+    pub repository_access: String,
 }

@@ -13,7 +13,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AgentStatus, type AgentUpdateStatus, type AiIntegrationOverview, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AgentStatus, type AgentUpdateStatus, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -40,11 +40,11 @@ function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [dashboardIdentity, setDashboardIdentity] = useState<DashboardIdentityStatus | null>(null);
   const [dashboardAuthorization, setDashboardAuthorization] = useState<DashboardAuthorizationProgress | null>(null);
-  const [aiIntegration, setAiIntegration] = useState<AiIntegrationOverview | null>(null);
   const [builtinAiToolContext, setBuiltinAiToolContext] = useState<BuiltinAIToolContextSummary | null>(null);
   const [builtinAiActivated, setBuiltinAiActivated] = useState(false);
   const [builtinAiWorkspaceRequest, setBuiltinAiWorkspaceRequest] = useState<{ target: BuiltinAiWorkspaceTarget; revision: number }>({ target: null, revision: 0 });
   const [mcpTestResult, setMcpTestResult] = useState<McpConnectionTestResult | null>(null);
+  const [mcpTargets, setMcpTargets] = useState<McpTargetDescriptor[]>([]);
   const [aiOperation, setAiOperation] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [settings, setSettings] = useState<ApprovalSettings | null>(null);
@@ -114,7 +114,7 @@ function App() {
       try { await refreshSvnConnections(); } catch (error) { console.error(error); }
     }
   }
-  async function refreshAiIntegration() { setAiIntegration(await agentApi.aiIntegration()); }
+  async function refreshMcpTargets() { setMcpTargets(await agentApi.mcpTargets()); }
   async function refreshBuiltinAiToolContext() {
     try {
       setBuiltinAiToolContext(await agentApi.builtinAiToolContextSummary());
@@ -249,7 +249,7 @@ function App() {
   async function refreshSkills() {
     const [catalogResult, statusResult, marketResult] = await Promise.allSettled([
       withTimeout(agentApi.skillCatalog(), '本地 Skill 目录'),
-      withTimeout(agentApi.codexSkillStatus(), 'Codex Skill 状态'),
+      withTimeout(agentApi.codexSkillStatus(), 'AI 工具技能状态'),
       withTimeout(agentApi.organizationSkillCatalog(), '技能市场'),
     ]);
     const errors: string[] = [];
@@ -263,7 +263,7 @@ function App() {
       setSkillStatus(statusResult.value);
     } else {
       setSkillStatus(null);
-      errors.push(formatError(statusResult.reason, 'Codex 技能状态读取失败'));
+      errors.push(formatError(statusResult.reason, 'AI 工具技能状态读取失败'));
     }
 	if (marketResult.status === 'fulfilled') {
 	  setOrganizationSkills(Array.isArray(marketResult.value) ? marketResult.value : []);
@@ -389,7 +389,7 @@ function App() {
     const results = await Promise.allSettled([
       refreshUpdateStatus(),
       refreshDashboardIdentity(),
-      refreshAiIntegration(),
+      refreshMcpTargets(),
       refreshBuiltinAiToolContext(),
       refreshApprovals(),
       refreshSettingsPageData(),
@@ -504,7 +504,7 @@ function App() {
         if (progress.state === 'authorized') {
           stopped = true;
           window.clearInterval(timer);
-          await Promise.all([refreshDashboardIdentity(), refreshAiIntegration()]);
+          await refreshDashboardIdentity();
           notify('success', progress.user_name ? `已登录工作台账号：${progress.user_name}` : '工作台账号授权成功');
         } else if (['denied', 'expired', 'failed', 'canceled'].includes(progress.state)) {
           stopped = true;
@@ -682,29 +682,65 @@ function App() {
     }
   }
 
-  async function registerAiClientMcpServer(clientId: string, resetInvalid = false) {
+  async function applyMcpTarget(targetId: string, resetInvalid = false) {
     if (aiOperation) return;
-    setAiOperation(`register:${clientId}`);
+    setAiOperation(`target:${targetId}`);
     try {
-      const result = await agentApi.registerAiClientMcpServer(clientId, resetInvalid);
-      await refreshAiIntegration();
-      notify('success', result.changed ? `已在 ${result.client.name} 注册 HiMind MCP 服务，请重启 ${result.client.name}` : `${result.client.name} 的 MCP 服务已注册`);
+      const result = await agentApi.applyMcpRegistration(targetId, resetInvalid);
+      await refreshMcpTargets();
+      notify('success', result.changed ? `${result.target.name} 的 MCP 注册已更新` : `${result.target.name} 的 MCP 注册已就绪`);
     } catch (error) {
-      notify('error', friendlyConnectionError(error, 'MCP 服务注册失败，请关闭对应 AI 工具后重试。'));
+      notify('error', friendlyConnectionError(error, 'MCP 注册失败，请关闭对应 AI 工具后重试。'));
     } finally {
       setAiOperation(null);
     }
   }
 
-  async function unregisterAiClientMcpServer(clientId: string) {
+  async function removeMcpTarget(targetId: string) {
     if (aiOperation) return;
-    setAiOperation(`unregister:${clientId}`);
+    setAiOperation(`remove:${targetId}`);
     try {
-      const result = await agentApi.unregisterAiClientMcpServer(clientId);
-      await refreshAiIntegration();
-      notify('success', result.changed ? `已取消 ${result.client.name} 的 HiMind MCP 服务注册` : `${result.client.name} 当前未注册 HiMind MCP 服务`);
+      const result = await agentApi.removeMcpRegistration(targetId);
+      await refreshMcpTargets();
+      notify('success', result.changed ? `${result.target.name} 的 MCP 注册已移除` : `${result.target.name} 当前没有 HiMind MCP 注册`);
     } catch (error) {
-      notify('error', friendlyConnectionError(error, '取消 MCP 服务注册失败，请关闭对应 AI 工具后重试。'));
+      notify('error', friendlyConnectionError(error, '取消注册失败，请关闭对应 AI 工具后重试。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
+  async function applyAllMcpTargets() {
+    if (aiOperation) return;
+    setAiOperation('apply-all');
+    try {
+      const result = await agentApi.applyAllMcpRegistrations(true, false);
+      await refreshMcpTargets();
+      if (result.failures.length) {
+        notify('error', `已注册 ${result.results.length} 个 AI 工具，${result.failures.length} 个需要单独处理`);
+      } else {
+        notify('success', result.results.length ? `已完成 ${result.results.length} 个 AI 工具的 MCP 注册` : '已发现的 AI 工具均已注册');
+      }
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '批量注册 MCP 服务失败。'));
+    } finally {
+      setAiOperation(null);
+    }
+  }
+
+  async function removeAllMcpTargets() {
+    if (aiOperation) return;
+    setAiOperation('remove-all');
+    try {
+      const result = await agentApi.removeAllMcpRegistrations(true);
+      await refreshMcpTargets();
+      if (result.failures.length) {
+        notify('error', `已取消 ${result.results.length} 个注册，${result.failures.length} 个需处理`);
+      } else {
+        notify('success', result.results.length ? `已取消 ${result.results.length} 个注册` : '没有可取消的注册');
+      }
+    } catch (error) {
+      notify('error', friendlyConnectionError(error, '取消注册失败。'));
     } finally {
       setAiOperation(null);
     }
@@ -786,7 +822,7 @@ function App() {
       status={status}
       approvals={approvals}
       remoteExecutionSettings={remoteExecutionSettings}
-      aiIntegration={aiIntegration}
+      mcpTargets={mcpTargets}
       identity={dashboardIdentity}
       authorization={dashboardAuthorization}
       identityBusy={aiOperation === 'identity'}
@@ -805,13 +841,15 @@ function App() {
     if (page === 'ai') return <AiConnectionsPage
       identity={dashboardIdentity}
       dashboardEnabled={dashboardEnabled()}
-      integration={aiIntegration}
       testResult={mcpTestResult}
       busyAction={aiOperation}
       onOpenAccount={() => setPage('dashboard')}
-      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshAiIntegration()]); })}
-      onRegister={registerAiClientMcpServer}
-      onUnregister={unregisterAiClientMcpServer}
+      targets={mcpTargets}
+      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshMcpTargets()]); })}
+      onApplyTarget={applyMcpTarget}
+      onApplyAll={applyAllMcpTargets}
+      onRemoveAll={removeAllMcpTargets}
+      onRemoveTarget={removeMcpTarget}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
       onTest={testMcpConnection}
     />;
@@ -820,6 +858,7 @@ function App() {
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}
       status={skillStatus}
+      mcpTargets={mcpTargets}
       error={skillError}
       marketplace={organizationSkills}
       marketplaceError={skillMarketError}
@@ -837,17 +876,23 @@ function App() {
         const result = await agentApi.syncCodexSkills();
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        const copilot = result.clients?.['github-copilot'];
-        const workbuddy = result.clients?.workbuddy;
-        const blocked = result.blocked.length + (copilot?.blocked.length || 0) + (workbuddy?.blocked.length || 0);
-        return blocked ? `技能更新完成，${blocked} 项需要处理` : '技能已更新';
-      }, '更新技能失败')}
+        const blocked = result.clients
+          ? Object.values(result.clients).reduce((count, client) => count + client.blocked.length, 0)
+          : result.blocked.length;
+        return blocked ? `技能同步完成，${blocked} 项需要处理` : '技能已同步';
+      }, '技能同步失败')}
       onSyncSkill={(skillId) => runSkillOperation(`sync:${skillId}`, async () => {
         const result = await agentApi.syncCodexSkill(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        return result.rendered.state === 'skipped' ? '技能已是最新版本' : '技能已安装';
-      }, '安装技能失败')}
+        return result.rendered.state === 'skipped' ? '技能已注册' : '技能注册完成';
+      }, '注册技能失败')}
+      onSyncSkillClient={(skillId, clientId) => runSkillOperation(`register:${clientId}:${skillId}`, async () => {
+        const result = await agentApi.syncSkillClient(skillId, clientId);
+        await refreshSkills();
+        await invalidateBuiltinAiToolContext();
+        return result.rendered?.state === 'skipped' ? '技能已是最新版本' : '技能已注册';
+      }, '注册技能失败')}
       syncMode={skillStatus?.sync_mode || 'copy'}
       onSetSyncMode={(mode: SkillSyncSettings['mode']) => runSkillOperation('sync-mode', async () => {
         await agentApi.setSkillSyncMode(mode);
@@ -870,6 +915,19 @@ function App() {
         await invalidateBuiltinAiToolContext();
         return result.backup_root ? '技能已修复，原修改已保留为备份' : '技能已重新安装';
       }, '修复技能失败')}
+      onUnregisterClient={(skillId, clientId) => runSkillOperation(`unregister:${clientId}:${skillId}`, async () => {
+        const result = await agentApi.unregisterSkillClient(skillId, clientId);
+        await refreshSkills();
+        await invalidateBuiltinAiToolContext();
+        return result.removed.removed ? `${result.client_name || clientId} 已取消注册` : `${result.client_name || clientId} 当前未注册`;
+      }, '取消注册失败')}
+      onUnregisterClients={(skillId) => runSkillOperation(`unregister-all:${skillId}`, async () => {
+        const result = await agentApi.unregisterSkillClients(skillId);
+        await refreshSkills();
+        await invalidateBuiltinAiToolContext();
+        const failures = Object.keys(result.failures || {}).length;
+        return failures ? `已取消 ${result.removed_count} 个注册，${failures} 个需处理` : `已取消 ${result.removed_count} 个注册`;
+      }, '取消注册失败')}
       onUninstall={(skillId) => runSkillOperation(`uninstall:${skillId}`, async () => {
         const result = await agentApi.uninstallCodexSkill(skillId);
         await refreshSkills();
@@ -879,6 +937,7 @@ function App() {
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path), '目录已打开', '打开目录失败')}
       onImportLocal={() => run(async () => { const record = await agentApi.importLocalSkill(); await refreshSkills(); await invalidateBuiltinAiToolContext(); return record; }, '本地 Skill 已导入', '导入本地 Skill 失败')}
       onImportGithub={async (sourceUrl) => { await agentApi.importGithubSkill(sourceUrl); await refreshSkills(); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub Skill 已导入'); }}
+      onOpenAiConnections={() => setPage('ai')}
     />;
     if (page === 'development') return <ExtensionDevelopmentPage
       dashboardEnabled={dashboardEnabled()}

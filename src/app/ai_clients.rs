@@ -14,34 +14,10 @@ use crate::Options;
 
 const SERVER_ID: &str = "himind-agent";
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct AiClientIntegration {
-    pub id: String,
-    pub name: String,
-    pub detected: bool,
-    pub detection_message: String,
-    pub state: String,
-    pub config_path: String,
-    pub config_directory: String,
-    pub config_format: String,
-    pub config_preview: String,
-    pub error: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct AiIntegrationOverview {
-    pub protocol: String,
-    pub server_id: String,
+#[derive(Debug, Clone)]
+pub(crate) struct AgentMcpLaunchSpec {
     pub command: String,
     pub args: Vec<String>,
-    pub clients: Vec<AiClientIntegration>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct AiClientConfigurationResult {
-    pub client: AiClientIntegration,
-    pub changed: bool,
-    pub backup_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,28 +46,32 @@ struct ClientDefinition {
     kind: ConfigKind,
 }
 
-pub(crate) fn overview(options: &Options) -> Result<AiIntegrationOverview, Box<dyn Error>> {
-    let executable = stable_launcher_executable()?;
+pub(crate) fn launch_spec(options: &Options) -> Result<AgentMcpLaunchSpec, Box<dyn Error>> {
+    let executable = mcp_executable()?;
     let arguments = mcp_arguments(options);
-    let clients = client_definitions()
-        .into_iter()
-        .map(|definition| integration_status(&definition, &executable, &arguments))
-        .collect();
-    Ok(AiIntegrationOverview {
-        protocol: "MCP stdio".to_string(),
-        server_id: SERVER_ID.to_string(),
+    Ok(AgentMcpLaunchSpec {
         command: executable.to_string_lossy().to_string(),
         args: arguments,
-        clients,
     })
+}
+
+pub(crate) fn targets(
+    options: &Options,
+) -> Result<Vec<super::mcp_target_types::McpTargetDescriptor>, Box<dyn Error>> {
+    let executable = mcp_executable()?;
+    let arguments = mcp_arguments(options);
+    Ok(client_definitions()
+        .into_iter()
+        .map(|definition| integration_status(&definition, &executable, &arguments))
+        .collect())
 }
 
 pub(crate) fn configure(
     options: &Options,
     client_id: &str,
     reset_invalid: bool,
-) -> Result<AiClientConfigurationResult, Box<dyn Error>> {
-    let executable = stable_launcher_executable()?;
+) -> Result<super::mcp_target_types::McpTargetOperationResult, Box<dyn Error>> {
+    let executable = mcp_executable()?;
     let arguments = mcp_arguments(options);
     let definition = find_client_definition(client_id)?;
     let original = if definition.path.exists() {
@@ -113,27 +93,29 @@ pub(crate) fn configure(
     } else {
         None
     };
-    Ok(AiClientConfigurationResult {
-        client: integration_status(&definition, &executable, &arguments),
+    Ok(super::mcp_target_types::McpTargetOperationResult {
+        target: integration_status(&definition, &executable, &arguments),
         changed,
         backup_path: backup_path
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
+        message: "目标客户端 MCP 配置已应用".to_string(),
     })
 }
 
 pub(crate) fn remove_configuration(
     options: &Options,
     client_id: &str,
-) -> Result<AiClientConfigurationResult, Box<dyn Error>> {
-    let executable = stable_launcher_executable()?;
+) -> Result<super::mcp_target_types::McpTargetOperationResult, Box<dyn Error>> {
+    let executable = mcp_executable()?;
     let arguments = mcp_arguments(options);
     let definition = find_client_definition(client_id)?;
     if !definition.path.exists() {
-        return Ok(AiClientConfigurationResult {
-            client: integration_status(&definition, &executable, &arguments),
+        return Ok(super::mcp_target_types::McpTargetOperationResult {
+            target: integration_status(&definition, &executable, &arguments),
             changed: false,
             backup_path: String::new(),
+            message: "目标客户端没有配置文件".to_string(),
         });
     }
     let original = fs::read_to_string(&definition.path)?;
@@ -147,98 +129,56 @@ pub(crate) fn remove_configuration(
     } else {
         None
     };
-    Ok(AiClientConfigurationResult {
-        client: integration_status(&definition, &executable, &arguments),
+    Ok(super::mcp_target_types::McpTargetOperationResult {
+        target: integration_status(&definition, &executable, &arguments),
         changed,
         backup_path: backup_path
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
+        message: "目标客户端 MCP 配置已移除".to_string(),
     })
 }
 
 pub(crate) fn test_connection(
     options: &Options,
 ) -> Result<McpConnectionTestResult, Box<dyn Error>> {
-    let started = Instant::now();
-    let executable = stable_launcher_executable()?;
-    let mut command = Command::new(executable);
-    command
-        .args(mcp_arguments(options))
-        .env("HIMIND_AI_CLIENT_ID", "agent-self-test")
-        .env("HIMIND_AGENT_PROFILE", crate::store::paths::profile_name())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_hidden_process(&mut command);
-    let mut child = command.spawn()?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or("MCP self-test stdin is unavailable")?;
-        stdin.write_all(
-            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"himind-agent-self-test","version":"1"}}}
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-"#,
-        )?;
-    }
-    drop(child.stdin.take());
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "MCP self-test failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let stdout = String::from_utf8(output.stdout)?;
-    let mut initialize = None;
-    let mut tools = None;
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        let response: Value = serde_json::from_str(line)?;
-        match response.get("id").and_then(Value::as_i64) {
-            Some(1) => initialize = response.get("result").cloned(),
-            Some(2) => tools = response.get("result").cloned(),
-            _ => {}
-        }
-    }
-    let initialize = initialize.ok_or("MCP initialize response is missing")?;
-    let tools = tools.ok_or("MCP tools/list response is missing")?;
+    let executable = mcp_executable()?;
+    let env = std::collections::BTreeMap::from([
+        (
+            "HIMIND_AI_CLIENT_ID".to_string(),
+            "agent-self-test".to_string(),
+        ),
+        (
+            "HIMIND_AGENT_PROFILE".to_string(),
+            crate::store::paths::profile_name(),
+        ),
+    ]);
+    let probe = crate::app::mcp_probe::probe_stdio_command(
+        &executable.to_string_lossy(),
+        &mcp_arguments(options),
+        &env,
+        None,
+        Duration::from_secs(10),
+    )?;
     Ok(McpConnectionTestResult {
-        ok: true,
-        server_name: initialize
-            .pointer("/serverInfo/name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        server_version: initialize
-            .pointer("/serverInfo/version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        protocol_version: initialize
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        capability_count: tools
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or_default(),
-        duration_ms: started.elapsed().as_millis(),
+        ok: probe.ok,
+        server_name: probe.server_name,
+        server_version: probe.server_version,
+        protocol_version: probe.protocol_version,
+        capability_count: probe.tool_count,
+        duration_ms: probe.duration_ms,
     })
 }
 
-/// Move previously registered HiMind MCP entries from a versioned/legacy
-/// Agent executable to the stable root launcher. This is intentionally narrow:
-/// it only changes the command of the managed `himind-agent` server and keeps
-/// every client argument, environment value, and unrelated server untouched.
+/// Move previously registered HiMind MCP entries from a GUI Agent executable
+/// to the correct console entry. Installed layouts use the stable launcher;
+/// development layouts use the sibling MCP companion. This is intentionally
+/// narrow: only the managed `himind-agent` command changes.
 pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
     let current = env::current_exe()?;
     let root = crate::install_layout::installation_root_from_executable(&current);
-    let stable_launcher = crate::install_layout::stable_launcher_for_executable(&current);
-    if !stable_launcher.is_file() {
+    let mcp_entry = mcp_executable()?;
+    if !mcp_entry.is_file() {
         return Ok(0);
     }
     let mut migrated = 0;
@@ -262,13 +202,10 @@ pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
                     .get("command")
                     .and_then(Item::as_str)
                     .unwrap_or_default();
-                if !is_legacy_agent_command(command, &root, &stable_launcher) {
+                if !is_legacy_agent_command(command, &root, &mcp_entry) {
                     continue;
                 }
-                server.insert(
-                    "command",
-                    value(stable_launcher.to_string_lossy().to_string()),
-                );
+                server.insert("command", value(mcp_entry.to_string_lossy().to_string()));
                 document.to_string()
             }
             ConfigKind::McpJson | ConfigKind::WorkBuddyJson => {
@@ -285,12 +222,12 @@ pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if !is_legacy_agent_command(command, &root, &stable_launcher) {
+                if !is_legacy_agent_command(command, &root, &mcp_entry) {
                     continue;
                 }
                 server.insert(
                     "command".to_string(),
-                    Value::String(stable_launcher.to_string_lossy().to_string()),
+                    Value::String(mcp_entry.to_string_lossy().to_string()),
                 );
                 format!("{}\n", serde_json::to_string_pretty(&root_value)?)
             }
@@ -303,18 +240,14 @@ pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
     Ok(migrated)
 }
 
-fn is_legacy_agent_command(
-    command: &str,
-    installation_root: &Path,
-    stable_launcher: &Path,
-) -> bool {
+fn is_legacy_agent_command(command: &str, installation_root: &Path, expected_entry: &Path) -> bool {
     let candidate = Path::new(command);
     candidate
         .file_name()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("himind-agent.exe"))
         && crate::install_layout::installation_root_from_executable(candidate) == installation_root
-        && !paths_equal(command, stable_launcher)
+        && !paths_equal(command, expected_entry)
 }
 
 fn client_definitions() -> Vec<ClientDefinition> {
@@ -377,7 +310,8 @@ fn integration_status(
     definition: &ClientDefinition,
     executable: &Path,
     arguments: &[String],
-) -> AiClientIntegration {
+) -> super::mcp_target_types::McpTargetDescriptor {
+    let skill_client = crate::skill::clients::client_for_mcp_target(definition.id);
     let preview = match definition.kind {
         ConfigKind::CodexToml => merge_codex_config("", executable, arguments, definition.id),
         ConfigKind::McpJson | ConfigKind::WorkBuddyJson => merge_json_config(
@@ -397,7 +331,7 @@ fn integration_status(
             Err(error) => ("invalid_config".to_string(), error.to_string()),
         }
     };
-    AiClientIntegration {
+    super::mcp_target_types::McpTargetDescriptor {
         id: definition.id.to_string(),
         name: definition.name.to_string(),
         detected: definition.detected,
@@ -421,6 +355,24 @@ fn integration_status(
             "JSON"
         }
         .to_string(),
+        kind: "ai_client".to_string(),
+        supported_transports: vec!["stdio".to_string()],
+        supports_auto_configure: true,
+        supports_skills: skill_client.is_some(),
+        skill_client_id: skill_client
+            .map(|value| value.0)
+            .unwrap_or_default()
+            .to_string(),
+        skill_client_name: skill_client
+            .map(|value| value.1)
+            .unwrap_or_default()
+            .to_string(),
+        restart_required: true,
+        manual_snippet: super::mcp_target_types::manual_snippet(
+            &executable.to_string_lossy(),
+            arguments,
+            definition.id,
+        ),
         config_preview: preview.unwrap_or_else(|error| format!("无法生成配置: {error}")),
         error,
     }
@@ -450,13 +402,13 @@ fn configuration_matches(
             let args_match = server
                 .get("args")
                 .and_then(Item::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str())
-                        .eq(arguments.iter().map(String::as_str))
-                })
-                .unwrap_or(false);
+                .is_some_and(|items| {
+                    items.len() == arguments.len()
+                        && items
+                            .iter()
+                            .zip(arguments)
+                            .all(|(item, expected)| item.as_str() == Some(expected.as_str()))
+                });
             let client_matches = server
                 .get("env")
                 .and_then(Item::as_table_like)
@@ -487,13 +439,13 @@ fn configuration_matches(
             let args_match = server
                 .get("args")
                 .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .eq(arguments.iter().map(String::as_str))
-                })
-                .unwrap_or(false);
+                .is_some_and(|items| {
+                    items.len() == arguments.len()
+                        && items
+                            .iter()
+                            .zip(arguments)
+                            .all(|(item, expected)| item.as_str() == Some(expected.as_str()))
+                });
             let client_matches = server
                 .pointer("/env/HIMIND_AI_CLIENT_ID")
                 .and_then(Value::as_str)
@@ -639,6 +591,24 @@ fn stable_launcher_executable() -> Result<PathBuf, Box<dyn Error>> {
     Ok(crate::install_layout::stable_launcher_for_executable(
         &env::current_exe()?,
     ))
+}
+
+fn mcp_executable() -> Result<PathBuf, Box<dyn Error>> {
+    let current = env::current_exe()?;
+    let launcher = crate::install_layout::stable_launcher_for_executable(&current);
+    if launcher.is_file() && launcher != current {
+        return Ok(launcher);
+    }
+    let companion = crate::install_layout::companion_mcp_path(&current);
+    if companion.is_file() {
+        return Ok(companion);
+    }
+    if cfg!(debug_assertions) {
+        // Test harnesses do not spawn a child process; retaining the current
+        // executable keeps pure config merge tests independent of build files.
+        return Ok(current);
+    }
+    Err("HiMind Agent MCP console companion is missing; rebuild or reinstall the same Agent version".into())
 }
 
 pub(crate) fn backup_and_write(

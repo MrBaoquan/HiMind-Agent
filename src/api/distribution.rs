@@ -1751,10 +1751,8 @@ mod tests {
             let body = r#"{"items":[{"product_key":"himind-agent","product_type":"desktop_app"}]}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
-        let root = std::env::temp_dir().join(format!(
-            "himind-release-type-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("himind-release-type-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let artifact = root.join("himind-agent-update.zip");
         fs::write(&artifact, b"agent-update").unwrap();

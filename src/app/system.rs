@@ -157,6 +157,7 @@ pub(crate) fn validate_signature_metadata(
 
 pub(crate) fn schedule_agent_replace_and_restart(
     staged_executable: &Path,
+    staged_mcp: &Path,
     staged_package: &Path,
     staged_updater: &Path,
     staged_launcher: &Path,
@@ -172,6 +173,7 @@ pub(crate) fn schedule_agent_replace_and_restart(
     }
     for (path, name) in [
         (staged_executable, "himind-agent.exe"),
+        (staged_mcp, "himind-agent-mcp.exe"),
         (staged_updater, "himind-agent-updater.exe"),
         (staged_launcher, "himind-agent-launcher.exe"),
     ] {
@@ -189,6 +191,7 @@ pub(crate) fn schedule_agent_replace_and_restart(
     let payload = serde_json::json!({
         "current_executable": current_executable,
         "staged_executable": staged_executable,
+        "staged_mcp": staged_mcp,
         "staged_package": staged_package,
         "staged_updater": staged_updater,
         "staged_launcher": staged_launcher,

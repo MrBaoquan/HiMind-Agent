@@ -424,8 +424,7 @@ pub(crate) fn test(
     ensure_candidate_unchanged(&draft)?;
     let mut client_readiness = BTreeMap::new();
     let mut readiness_blockers = Vec::new();
-    for client in &draft.manifest.supported_clients {
-        let client_id = client.trim().to_ascii_lowercase();
+    for client_id in crate::skill::active_client_ids_for_manifest(&draft.manifest) {
         if client_readiness.contains_key(&client_id) {
             continue;
         }
@@ -442,7 +441,8 @@ pub(crate) fn test(
         client_readiness.insert(client_id, readiness);
     }
     let readiness = client_readiness
-        .get("codex")
+        .get("himind-ai")
+        .or_else(|| client_readiness.get("codex"))
         .or_else(|| client_readiness.values().next())
         .cloned()
         .ok_or("Skill 未声明支持的 AI 客户端")?;
@@ -693,7 +693,7 @@ fn default_agent_version() -> String {
     VERSION.to_string()
 }
 fn default_clients() -> Vec<String> {
-    vec!["codex".to_string()]
+    vec![crate::skill::clients::PORTABLE_PROFILE_ID.to_string()]
 }
 
 #[cfg(test)]

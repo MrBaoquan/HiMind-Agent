@@ -18,6 +18,16 @@ use crate::Options;
 
 pub(crate) const PROFILE_SCOPE: &str = "agent.profile";
 pub(crate) const BUSINESS_CONTEXT_READ_SCOPE: &str = "business.context.read";
+pub(crate) const BUSINESS_PROJECT_READ_SCOPE: &str = "business.project.read";
+pub(crate) const BUSINESS_PROJECT_WRITE_SCOPE: &str = "business.project.write";
+pub(crate) const BUSINESS_EXHIBIT_READ_SCOPE: &str = "business.exhibit.read";
+pub(crate) const BUSINESS_EXHIBIT_WRITE_SCOPE: &str = "business.exhibit.write";
+pub(crate) const BUSINESS_PEOPLE_READ_SCOPE: &str = "business.people.read";
+pub(crate) const BUSINESS_PEOPLE_WRITE_SCOPE: &str = "business.people.write";
+pub(crate) const BUSINESS_REQUIREMENT_READ_SCOPE: &str = "business.requirement.read";
+pub(crate) const BUSINESS_REQUIREMENT_WRITE_SCOPE: &str = "business.requirement.write";
+pub(crate) const BUSINESS_WORKSPACE_READ_SCOPE: &str = "business.workspace.read";
+pub(crate) const BUSINESS_WORKSPACE_WRITE_SCOPE: &str = "business.workspace.write";
 pub(crate) const KNOWLEDGE_SEARCH_SCOPE: &str = "knowledge.search";
 pub(crate) const CREATIVE_SUBMIT_SCOPE: &str = "distribution.creative.submit";
 pub(crate) const RELEASE_MANAGE_SCOPE: &str = "distribution.release.manage";
@@ -342,7 +352,7 @@ pub(crate) fn begin_device_authorization(
             (
                 "scope",
                 &format!(
-                    "{PROFILE_SCOPE} {BUSINESS_CONTEXT_READ_SCOPE} {KNOWLEDGE_SEARCH_SCOPE} {AI_CONVERSATION_SCOPE} {MEDIA_SUBMIT_SCOPE} {MEDIA_READ_SCOPE} {MEDIA_CANCEL_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"
+                    "{PROFILE_SCOPE} {BUSINESS_CONTEXT_READ_SCOPE} {BUSINESS_PROJECT_READ_SCOPE} {BUSINESS_PROJECT_WRITE_SCOPE} {BUSINESS_EXHIBIT_READ_SCOPE} {BUSINESS_EXHIBIT_WRITE_SCOPE} {BUSINESS_PEOPLE_READ_SCOPE} {BUSINESS_PEOPLE_WRITE_SCOPE} {BUSINESS_REQUIREMENT_READ_SCOPE} {BUSINESS_REQUIREMENT_WRITE_SCOPE} {BUSINESS_WORKSPACE_READ_SCOPE} {BUSINESS_WORKSPACE_WRITE_SCOPE} {KNOWLEDGE_SEARCH_SCOPE} {AI_CONVERSATION_SCOPE} {MEDIA_SUBMIT_SCOPE} {MEDIA_READ_SCOPE} {MEDIA_CANCEL_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"
                 ),
             ),
             ("agent_id", state.agent_id.as_str()),

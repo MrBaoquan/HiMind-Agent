@@ -158,6 +158,7 @@ Section "HiMind Agent 核心组件" SEC_AGENT
 
   SetOutPath "$INSTDIR\versions\${PRODUCT_VERSION}"
   File "${RELEASE}\himind-agent.exe"
+  File "${RELEASE}\himind-agent-mcp.exe"
   SetOutPath "$INSTDIR"
   FileOpen $0 "$INSTDIR\active-version" w
   FileWrite $0 "${PRODUCT_VERSION}$\r$\n"

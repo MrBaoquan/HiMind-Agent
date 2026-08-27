@@ -19,6 +19,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 struct UpdateArgs {
     current_executable: PathBuf,
     staged_executable: PathBuf,
+    staged_mcp: PathBuf,
     staged_package: PathBuf,
     staged_updater: PathBuf,
     staged_launcher: PathBuf,
@@ -88,6 +89,7 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
     if !staged_path_allowed(&staged, &root) {
         return Err("staged Agent executable is outside the installation root".into());
     }
+    let staged_mcp = canonical_staged_helper(&args.staged_mcp, install_layout::MCP_FILE, &root)?;
     let staged_updater =
         canonical_staged_helper(&args.staged_updater, install_layout::UPDATER_FILE, &root)?;
     let staged_launcher =
@@ -110,10 +112,15 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
     let staged_package = canonical_staged_path(&args.staged_package, &root)?;
     wait_for_old_agent_exit(args)?;
     let had_active_version = install_layout::read_active_version(&root)?.is_some();
-    let target_dir =
-        install_layout::prepare_version_directory(&root, &args.target_version, &staged)?;
+    let target_dir = install_layout::prepare_version_directory(
+        &root,
+        &args.target_version,
+        &staged,
+        &staged_mcp,
+    )?;
     let target = target_dir.join(install_layout::AGENT_FILE);
     let _ = fs::remove_file(&staged);
+    let _ = fs::remove_file(&staged_mcp);
     thread::sleep(Duration::from_millis(300));
     if launch_and_confirm(&args, &target, &args.target_version) {
         log_update(
@@ -211,6 +218,7 @@ fn update_local_status(args: &UpdateArgs, status: &str, error: &str) -> Result<(
             "release_notes",
             "staged_package_path",
             "staged_agent_path",
+            "staged_mcp_path",
             "staged_updater_path",
             "staged_launcher_path",
             "staged_vscode_extension_path",
@@ -751,12 +759,18 @@ mod tests {
         fs::write(root.join("current/himind-agent.exe"), b"old").unwrap();
         let staged = root.join("staging-agent.exe");
         fs::write(&staged, b"new").unwrap();
+        let staged_mcp = root.join("staging-mcp.exe");
+        fs::write(&staged_mcp, b"mcp").unwrap();
 
-        let version_dir = prepare_version_directory(&root, "0.4.0", &staged).unwrap();
+        let version_dir = prepare_version_directory(&root, "0.4.0", &staged, &staged_mcp).unwrap();
         write_active_version(&root, "0.4.0").unwrap();
         assert_eq!(
             fs::read(version_dir.join("himind-agent.exe")).unwrap(),
             b"new"
+        );
+        assert_eq!(
+            fs::read(version_dir.join("himind-agent-mcp.exe")).unwrap(),
+            b"mcp"
         );
         assert_eq!(
             read_active_version(&root).unwrap().as_deref(),

@@ -29,8 +29,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             eprintln!("agent protocol registration repair failed: {error}");
         }
     }
-    let mut command = Command::new(executable);
     let mcp_mode = arguments.iter().any(|argument| argument == "--mcp");
+    // Release Agent is a GUI-subsystem binary on Windows. MCP clients require
+    // a console process with an attached stdio stream, so always select the
+    // same-version companion when the launcher is used for MCP.
+    let executable = if mcp_mode {
+        install_layout::resolve_mcp_path(&root).map_err(|error| {
+            format!(
+                "MCP console companion is unavailable; reinstall or update HiMind Agent: {error}"
+            )
+        })?
+    } else {
+        executable
+    };
+    let mut command = Command::new(executable);
     command.args(&arguments).current_dir(&root);
     if !arguments.iter().any(|argument| argument == "--state") {
         command.arg("--state").arg(state_path);

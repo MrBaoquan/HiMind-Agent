@@ -11,6 +11,7 @@ use crate::app::system::{
     signed_agent_updates_required, trusted_agent_update_key_ids,
 };
 use crate::app::types::{ProjectWorkspaceRequest, RemoteConnectRequest};
+use crate::app::{mcp_downstream::DownstreamMcpManager, mcp_registry, mcp_targets};
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, invoke_plugin_capability_for_plugin,
     registry_json_for_control_plane, scan_plugins,
@@ -37,6 +38,7 @@ use crate::{Options, VERSION};
 pub(crate) struct CapabilityGateway {
     options: Options,
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
+    downstream_mcp: DownstreamMcpManager,
 }
 
 #[derive(Clone)]
@@ -66,6 +68,9 @@ enum CapabilityHandler {
     PluginInvoke,
     SkillCandidateSave,
     SkillCandidateTest,
+    SkillClientRegister,
+    SkillClientUnregister,
+    SkillClientsUnregister,
     SkillSubmissionSubmit,
     SkillSubmissionStatus,
     PluginCandidateSave,
@@ -81,10 +86,48 @@ enum CapabilityHandler {
     DashboardExhibitContext,
     DashboardMyWorkSummary,
     DashboardKnowledgeSearch,
+    DashboardProjectList,
+    DashboardProjectCreate,
+    DashboardProjectUpdate,
+    DashboardProjectDelete,
+    DashboardExhibitList,
+    DashboardExhibitCreate,
+    DashboardExhibitUpdate,
+    DashboardExhibitDelete,
+    DashboardProjectManagersReplace,
+    DashboardProjectOwnersReplace,
+    DashboardExhibitCrewReplace,
+    DashboardProjectExhibitAttach,
+    DashboardProjectExhibitDetach,
+    DashboardExhibitWorkspaceGet,
+    DashboardExhibitWorkspaceBind,
+    DashboardExhibitWorkspaceCheckout,
+    DashboardPeopleSearch,
+    DashboardRequirementList,
+    DashboardRequirementGet,
+    DashboardRequirementCreate,
+    DashboardRequirementUpdate,
+    DashboardRequirementAssignmentUpdate,
+    DashboardRequirementCancel,
+    DashboardRequirementReopen,
+    DashboardRequirementReview,
+    DashboardRequirementComment,
     MediaSubmit(String, String),
     MediaJobGet,
     MediaJobCancel,
     PluginCapability(String),
+    DownstreamMcp(String),
+    McpServerList,
+    McpTargetList,
+    McpServerInspect,
+    McpServerUpsert,
+    McpServerRemove,
+    McpRegistrationPlan,
+    McpRegistrationApply,
+    McpRegistrationApplyAll,
+    McpRegistrationRemove,
+    McpRegistrationRemoveAll,
+    McpConnectionTest,
 }
 
 #[derive(Clone)]
@@ -96,6 +139,7 @@ struct CapabilityRegistration {
 impl CapabilityGateway {
     pub(crate) fn new(options: Options, worker_status: Arc<Mutex<LocalWorkerStatus>>) -> Self {
         Self {
+            downstream_mcp: DownstreamMcpManager::new(&options.state_path),
             options,
             worker_status,
         }
@@ -127,6 +171,160 @@ impl CapabilityGateway {
     fn registry(&self) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
         let mut registry = BTreeMap::new();
         let builtins = [
+            registration(
+                "mcp.server.list",
+                "MCP 服务列表",
+                "读取本机 MCP Registry 中配置的服务摘要，不返回环境变量和请求头明文。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::McpServerList,
+            ),
+            registration(
+                "mcp.server.inspect",
+                "查看 MCP 服务",
+                "读取指定 MCP 服务的非敏感配置和来源信息。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "server_id": { "type": "string" } },
+                    "required": ["server_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpServerInspect,
+            ),
+            registration(
+                "mcp.server.upsert",
+                "保存 MCP 服务",
+                "新增或更新本机 MCP 服务；敏感值只写入 Agent 本地加密存储，并在返回结果中脱敏。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "server_id": { "type": "string", "maxLength": 32 },
+                        "display_name": { "type": "string" },
+                        "transport": { "type": "string", "enum": ["stdio", "streamable-http"] },
+                        "command": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "cwd": { "type": "string" },
+                        "url": { "type": "string" },
+                        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "tool_call_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+                        "fail_on_startup_error": { "type": "boolean" },
+                        "reconnect": { "type": "boolean" },
+                        "enabled": { "type": "boolean" }
+                    },
+                    // `transport` is required for a new row, but optional when
+                    // patching an existing row; the handler keeps the stored
+                    // transport in that case.
+                    "required": ["server_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpServerUpsert,
+            ),
+            registration(
+                "mcp.server.remove",
+                "删除 MCP 服务",
+                "从本机 MCP Registry 删除指定个人服务，并让下一次 HiMind AI 会话重新加载配置。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": { "server_id": { "type": "string" } },
+                    "required": ["server_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpServerRemove,
+            ),
+            registration(
+                "mcp.target.list",
+                "AI 客户端目标列表",
+                "读取 Agent MCP 可注册的本机 AI 客户端及其已发现状态。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::McpTargetList,
+            ),
+            registration(
+                "mcp.registration.plan",
+                "规划 MCP 注册",
+                "计算 Agent MCP 注册到本机 AI 客户端所需的变更和风险提示。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "target_id": { "type": "string" } },
+                    "required": ["target_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpRegistrationPlan,
+            ),
+            registration(
+                "mcp.registration.apply",
+                "应用 MCP 注册",
+                "将 Agent MCP 注册到指定本机 AI 客户端，保留原配置并在写入前备份。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target_id": { "type": "string" },
+                        "reset_invalid": { "type": "boolean" }
+                    },
+                    "required": ["target_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpRegistrationApply,
+            ),
+            registration(
+                "mcp.registration.apply_all",
+                "批量应用 MCP 注册",
+                "将 Agent MCP 注册到已检测到的本机 AI 客户端；各目标独立执行并返回成功与失败明细。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "detected_only": { "type": "boolean" },
+                        "reset_invalid": { "type": "boolean" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpRegistrationApplyAll,
+            ),
+            registration(
+                "mcp.registration.remove",
+                "移除 MCP 注册",
+                "从指定本机 AI 客户端移除 Agent MCP 配置并保留备份。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": { "target_id": { "type": "string" } },
+                    "required": ["target_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpRegistrationRemove,
+            ),
+            registration(
+                "mcp.registration.remove_all",
+                "移除全部 MCP 注册",
+                "移除已检测 AI 工具中的 HiMind MCP 配置，保留原配置备份。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": { "detected_only": { "type": "boolean" } },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpRegistrationRemoveAll,
+            ),
+            registration(
+                "mcp.connection.test",
+                "测试 MCP 连接",
+                "真实执行 MCP initialize 和 tools/list，返回协议、版本、工具数和错误分类。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": { "server_id": { "type": "string" } },
+                    "required": ["server_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::McpConnectionTest,
+            ),
             registration(
                 "extension.authoring.identity",
                 "扩展创作身份",
@@ -474,6 +672,53 @@ impl CapabilityGateway {
                 CapabilityHandler::SkillCandidateTest,
             ),
             registration(
+                "extension.skill.client.register",
+                "注册 Skill 客户端",
+                "将指定 Skill 同步到一个 AI 工具；不影响其他客户端和 Agent Skill Store。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "skill_id": { "type": "string" },
+                        "client_id": { "type": "string" }
+                    },
+                    "required": ["skill_id", "client_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillClientRegister,
+            ),
+            registration(
+                "extension.skill.client.unregister",
+                "取消 Skill 客户端同步",
+                "仅移除指定 AI 工具中的 HiMind 托管 Skill 副本，保留 Skill 在 Agent Store 中继续供 HiMind AI 使用。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "skill_id": { "type": "string" },
+                        "client_id": { "type": "string" }
+                    },
+                    "required": ["skill_id", "client_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillClientUnregister,
+            ),
+            registration(
+                "extension.skill.clients.unregister",
+                "取消 Skill 全部客户端同步",
+                "独立移除指定 Skill 在全部外部 AI 工具中的 HiMind 托管副本，保留 Skill 在 Agent Store 中继续供 HiMind AI 使用。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "skill_id": { "type": "string" }
+                    },
+                    "required": ["skill_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillClientsUnregister,
+            ),
+            registration(
                 "extension.skill.submission.submit",
                 "提交 Skill 审核",
                 "显示本机候选包确认后，以绑定用户身份提交 Skill 审核。",
@@ -640,6 +885,10 @@ impl CapabilityGateway {
                 CapabilityHandler::DashboardProjectContext,
             ),
             dashboard_business_registration(
+                "business.project.get", "读取项目", "读取项目、展项、需求和健康度聚合事实。", "read_only",
+                json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectContext,
+            ),
+            dashboard_business_registration(
                 "exhibit.context.get",
                 "展项全景",
                 "读取展项 IP、设备、成员、需求和最近推进事件。",
@@ -653,12 +902,103 @@ impl CapabilityGateway {
                 CapabilityHandler::DashboardExhibitContext,
             ),
             dashboard_business_registration(
+                "business.exhibit.get", "读取展项", "读取展项成员、设备、需求和推进事件。", "read_only",
+                json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitContext,
+            ),
+            dashboard_business_registration(
                 "work.my_summary",
                 "我的工作摘要",
                 "读取当前用户负责或关注的项目、展项和需求摘要。",
                 "read_only",
                 json!({"type":"object","additionalProperties":false}),
                 CapabilityHandler::DashboardMyWorkSummary,
+            ),
+            dashboard_business_registration(
+                "business.project.list", "项目列表", "读取当前用户可见的项目列表。", "read_only",
+                json!({"type":"object","properties":{"q":{"type":"string"},"status":{"type":"string"},"scope":{"type":"string"},"page":{"type":"integer"},"page_size":{"type":"integer"}},"additionalProperties":false}), CapabilityHandler::DashboardProjectList,
+            ),
+            dashboard_business_registration(
+                "business.project.create", "创建项目", "创建项目并按 Dashboard 权限初始化项目责任人和仓库任务。", "network_write",
+                json!({"type":"object","properties":{"project_name":{"type":"string"},"scope_type":{"type":"string","enum":["organization","personal"]},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"project_manager_user_ids":{"type":"array","items":{"type":"string"}},"project_owner_user_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string"},"initial_engineering_name":{"type":"string"},"initial_engine_type":{"type":"string"},"agent_id":{"type":"string"}},"required":["project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectCreate,
+            ),
+            dashboard_business_registration(
+                "business.project.update", "更新项目", "更新项目资料、责任人和协作中心。", "network_write",
+                json!({"type":"object","properties":{"project_id":{"type":"string"},"project_name":{"type":"string"},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"project_manager_user_ids":{"type":"array","items":{"type":"string"}},"project_owner_user_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string"}},"required":["project_id","project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectUpdate,
+            ),
+            dashboard_business_registration(
+                "business.project.delete", "删除项目", "删除项目及其展项、工作区和项目关系。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectDelete,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.list", "展项列表", "读取当前用户可见的展项列表。", "read_only", json!({"type":"object","properties":{"q":{"type":"string"},"project":{"type":"string"},"engine":{"type":"string"},"page":{"type":"integer"},"page_size":{"type":"integer"}},"additionalProperties":false}), CapabilityHandler::DashboardExhibitList,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.create", "创建展项", "在项目下创建展项。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"resolution":{"type":"string"},"hall_id":{"type":"string"},"hall":{"type":"string"},"workload":{"type":"number"},"engineering_id":{"type":"string"},"developer_source":{"type":"string"},"edit_url":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"source_path":{"type":"string"},"release_path":{"type":"string"},"config_params":{"type":"array","items":{"type":"string"}},"code_uploads":{"type":"array","items":{"type":"string"}},"engine_type":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"note":{"type":"string"}},"required":["project_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCreate,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.update", "更新展项", "更新展项资料和项目归属。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"hall_id":{"type":"string"},"hall":{"type":"string"},"engine_type":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"note":{"type":"string"}},"required":["exhibit_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitUpdate,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.delete", "删除展项", "删除展项及其工作区、设备和关联关系。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitDelete,
+            ),
+            dashboard_business_registration(
+                "business.project.managers.replace", "配置项目经理", "全量替换项目经理。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectManagersReplace,
+            ),
+            dashboard_business_registration(
+                "business.project.owners.replace", "配置项目负责人", "全量替换项目负责人。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectOwnersReplace,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.crew.replace", "配置展项人员", "全量或部分替换展项制作人员和现场调试人员。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewReplace,
+            ),
+            dashboard_business_registration(
+                "business.project.exhibit.attach", "关联展项", "将展项关联到指定项目。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitAttach,
+            ),
+            dashboard_business_registration(
+                "business.project.exhibit.detach", "解除展项关联", "解除展项与项目的关联。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitDetach,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.workspace.get", "查看展项工作区", "读取展项在指定 Agent 上的本地工作区绑定。", "read_only", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"}},"required":["exhibit_id","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceGet,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.workspace.bind", "绑定展项工作区", "保存展项与 Agent 本地目录的绑定。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"},"local_path":{"type":"string"},"engine_version":{"type":"string"}},"required":["exhibit_id","agent_id","local_path"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceBind,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.workspace.checkout", "检出展项工作区", "检出展项 SVN 工作区并自动保存到 Dashboard 的工作区绑定。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"repository_url":{"type":"string"},"target_path":{"type":"string"},"agent_id":{"type":"string"},"engine_version":{"type":"string"}},"required":["project_id","exhibit_id","target_path","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceCheckout,
+            ),
+            dashboard_business_registration(
+                "business.people.search", "查询人员", "按姓名、用户 ID 或部门查询可用于项目和展项配置的人员。", "read_only",
+                json!({"type":"object","properties":{"q":{"type":"string","maxLength":100},"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"page":{"type":"integer","minimum":1},"page_size":{"type":"integer","minimum":1,"maximum":100}},"required":["q"],"additionalProperties":false}), CapabilityHandler::DashboardPeopleSearch,
+            ),
+            dashboard_business_registration(
+                "business.requirement.list", "需求列表", "读取展项需求及分配状态。", "read_only",
+                json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"status":{"type":"string","enum":["active","done","all"]},"mine":{"type":"boolean"},"page":{"type":"integer","minimum":1},"page_size":{"type":"integer","minimum":1,"maximum":100}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementList,
+            ),
+            dashboard_business_registration(
+                "business.requirement.get", "读取需求", "读取单个需求的完整内容、分配、评论和事件。", "read_only",
+                json!({"type":"object","properties":{"requirement_id":{"type":"string"}},"required":["requirement_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementGet,
+            ),
+            dashboard_business_registration(
+                "business.requirement.create", "创建需求", "在展项下创建需求并指派展项成员。", "network_write",
+                json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"title":{"type":"string","maxLength":200},"description":{"type":"string","maxLength":20000},"acceptance_criteria":{"type":"string","maxLength":10000},"category":{"type":"string","enum":["feature","bug","change","optimization","content","technical","support"]},"priority":{"type":"string","enum":["low","normal","high","urgent"]},"due_at":{"type":"string"},"assignee_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":50},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id","title","assignee_ids"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementCreate,
+            ),
+            dashboard_business_registration(
+                "business.requirement.update", "更新需求", "更新需求内容和指派成员，使用 version 防止覆盖他人修改。", "network_write",
+                json!({"type":"object","properties":{"requirement_id":{"type":"string"},"title":{"type":"string","maxLength":200},"description":{"type":"string","maxLength":20000},"acceptance_criteria":{"type":"string","maxLength":10000},"category":{"type":"string","enum":["feature","bug","change","optimization","content","technical","support"]},"priority":{"type":"string","enum":["low","normal","high","urgent"]},"due_at":{"type":"string"},"version":{"type":"integer","minimum":1},"assignee_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":50},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","title","version","assignee_ids"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementUpdate,
+            ),
+            dashboard_business_registration(
+                "business.requirement.assignment.update", "更新我的需求", "更新当前用户的需求进度、阻塞原因或交付说明。", "network_write",
+                json!({"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"type":"string","enum":["in_progress","blocked","submitted"]},"completion_note":{"type":"string","maxLength":10000},"blocked_reason":{"type":"string","maxLength":4000},"archive_when_done":{"type":"boolean"},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","status"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementAssignmentUpdate,
+            ),
+            dashboard_business_registration(
+                "business.requirement.cancel", "取消需求", "取消尚未完成的展项需求。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"}},"required":["requirement_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementCancel,
+            ),
+            dashboard_business_registration(
+                "business.requirement.reopen", "重新打开需求", "重新打开已完成或已取消的成员需求分配。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"user_id":{"type":"string"}},"required":["requirement_id","user_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementReopen,
+            ),
+            dashboard_business_registration(
+                "business.requirement.review", "验收需求", "验收或退回成员提交的需求交付。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"user_id":{"type":"string"},"action":{"type":"string","enum":["accept","return"]},"note":{"type":"string","maxLength":4000}},"required":["requirement_id","user_id","action","note"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementReview,
+            ),
+            dashboard_business_registration(
+                "business.requirement.comment", "评论需求", "向需求添加评论并通知参与者。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"content_markdown":{"type":"string","maxLength":10000},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","content_markdown"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementComment,
             ),
             dashboard_knowledge_registration(
                 "knowledge.search.v1",
@@ -720,6 +1060,24 @@ impl CapabilityGateway {
                 }
             }
         }
+        // User-managed MCP servers are discovered lazily and projected into
+        // the same gateway as built-in and plugin capabilities. Discovery
+        // failures are isolated to that downstream server.
+        if let Ok(downstream) = self.downstream_mcp.list_capabilities() {
+            for (descriptor, _) in downstream {
+                let capability_id = descriptor.id.clone();
+                if registry.contains_key(&capability_id) {
+                    continue;
+                }
+                insert_registration(
+                    &mut registry,
+                    CapabilityRegistration {
+                        descriptor,
+                        handler: CapabilityHandler::DownstreamMcp(capability_id),
+                    },
+                )?;
+            }
+        }
         Ok(registry)
     }
 
@@ -746,6 +1104,7 @@ impl CapabilityGateway {
             .to_string()
             .into());
         }
+        validate_capability_input_schema(&registration.descriptor.input_schema, &input)?;
         if is_svn_admin_capability(capability_id)
             && context.source != crate::capability::types::InvocationSource::DashboardWorker
         {
@@ -821,6 +1180,45 @@ impl CapabilityGateway {
                 self.save_skill_candidate(input)
             }
             CapabilityHandler::SkillCandidateTest => self.test_skill_candidate(input),
+            CapabilityHandler::SkillClientRegister => {
+                let skill_id = input
+                    .get("skill_id")
+                    .and_then(Value::as_str)
+                    .ok_or("skill_id is required")?;
+                let client_id = input
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .ok_or("client_id is required")?;
+                let capability_facts = crate::skill::capability_facts_from_gateway(
+                    &self.options,
+                    Arc::clone(&self.worker_status),
+                    context,
+                )?;
+                crate::skill::sync_skill_client_json(
+                    skill_id,
+                    client_id,
+                    VERSION,
+                    &capability_facts,
+                )
+            }
+            CapabilityHandler::SkillClientUnregister => {
+                let skill_id = input
+                    .get("skill_id")
+                    .and_then(Value::as_str)
+                    .ok_or("skill_id is required")?;
+                let client_id = input
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .ok_or("client_id is required")?;
+                crate::skill::unregister_skill_client_json(skill_id, client_id)
+            }
+            CapabilityHandler::SkillClientsUnregister => {
+                let skill_id = input
+                    .get("skill_id")
+                    .and_then(Value::as_str)
+                    .ok_or("skill_id is required")?;
+                crate::skill::unregister_skill_clients_json(skill_id)
+            }
             CapabilityHandler::SkillSubmissionSubmit => self.submit_skill_candidate(input),
             CapabilityHandler::SkillSubmissionStatus => self.skill_submission_status(),
             CapabilityHandler::PluginCandidateSave => {
@@ -853,6 +1251,127 @@ impl CapabilityGateway {
             CapabilityHandler::DashboardKnowledgeSearch => {
                 crate::api::dashboard_business::search_knowledge(&self.options, input)
             }
+            CapabilityHandler::DashboardProjectList => {
+                crate::api::dashboard_business::project_list(&self.options, input)
+            }
+            CapabilityHandler::DashboardProjectCreate => {
+                crate::api::dashboard_business::project_create(&self.options, input)
+            }
+            CapabilityHandler::DashboardProjectUpdate => {
+                crate::api::dashboard_business::project_update(&self.options, input)
+            }
+            CapabilityHandler::DashboardProjectDelete => {
+                crate::api::dashboard_business::project_delete(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitList => {
+                crate::api::dashboard_business::exhibit_list(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitCreate => {
+                crate::api::dashboard_business::exhibit_create(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitUpdate => {
+                crate::api::dashboard_business::exhibit_update(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitDelete => {
+                crate::api::dashboard_business::exhibit_delete(&self.options, input)
+            }
+            CapabilityHandler::DashboardProjectManagersReplace => {
+                crate::api::dashboard_business::project_people_replace(
+                    &self.options,
+                    input,
+                    "managers",
+                )
+            }
+            CapabilityHandler::DashboardProjectOwnersReplace => {
+                crate::api::dashboard_business::project_people_replace(
+                    &self.options,
+                    input,
+                    "owners",
+                )
+            }
+            CapabilityHandler::DashboardExhibitCrewReplace => {
+                crate::api::dashboard_business::exhibit_crew_replace(&self.options, input)
+            }
+            CapabilityHandler::DashboardProjectExhibitAttach => {
+                crate::api::dashboard_business::project_exhibit_association(
+                    &self.options,
+                    input,
+                    "attach",
+                )
+            }
+            CapabilityHandler::DashboardProjectExhibitDetach => {
+                crate::api::dashboard_business::project_exhibit_association(
+                    &self.options,
+                    input,
+                    "detach",
+                )
+            }
+            CapabilityHandler::DashboardExhibitWorkspaceGet => {
+                crate::api::dashboard_business::exhibit_workspace_get(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitWorkspaceBind => {
+                crate::api::dashboard_business::exhibit_workspace_bind(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitWorkspaceCheckout => {
+                let checkout_request: SvnCheckoutRequest = serde_json::from_value(input.clone())?;
+                let checkout = checkout_workspace(checkout_request)?;
+                let exhibit_id = input
+                    .get("exhibit_id")
+                    .and_then(Value::as_str)
+                    .ok_or("exhibit_id is required")?;
+                let agent_id = input
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .ok_or("agent_id is required")?;
+                let local_path = checkout
+                    .get("target_path")
+                    .cloned()
+                    .or_else(|| input.get("target_path").cloned())
+                    .ok_or("checkout did not return target_path")?;
+                let mut bind_input = json!({
+                    "exhibit_id": exhibit_id,
+                    "agent_id": agent_id,
+                    "local_path": local_path,
+                });
+                if let Some(engine_version) = input.get("engine_version") {
+                    bind_input["engine_version"] = engine_version.clone();
+                }
+                let binding = crate::api::dashboard_business::exhibit_workspace_bind(
+                    &self.options,
+                    bind_input,
+                )?;
+                Ok(json!({"checkout": checkout, "binding": binding}))
+            }
+            CapabilityHandler::DashboardPeopleSearch => {
+                crate::api::dashboard_business::people_search(&self.options, input)
+            }
+            CapabilityHandler::DashboardRequirementList => {
+                crate::api::dashboard_business::requirement_list(&self.options, input)
+            }
+            CapabilityHandler::DashboardRequirementGet => {
+                crate::api::dashboard_business::requirement_get(&self.options, input)
+            }
+            CapabilityHandler::DashboardRequirementCreate => {
+                crate::api::dashboard_business::requirement_create(&self.options, input)
+            }
+            CapabilityHandler::DashboardRequirementUpdate => {
+                crate::api::dashboard_business::requirement_update(&self.options, input)
+            }
+            CapabilityHandler::DashboardRequirementAssignmentUpdate => {
+                crate::api::dashboard_business::requirement_assignment_update(&self.options, input)
+            }
+            CapabilityHandler::DashboardRequirementCancel => {
+                crate::api::dashboard_business::requirement_action(&self.options, input, "cancel")
+            }
+            CapabilityHandler::DashboardRequirementReopen => {
+                crate::api::dashboard_business::requirement_action(&self.options, input, "reopen")
+            }
+            CapabilityHandler::DashboardRequirementReview => {
+                crate::api::dashboard_business::requirement_action(&self.options, input, "review")
+            }
+            CapabilityHandler::DashboardRequirementComment => {
+                crate::api::dashboard_business::requirement_action(&self.options, input, "comments")
+            }
             CapabilityHandler::MediaSubmit(kind, operation) => {
                 crate::api::media::submit(&self.options, &kind, &operation, input)
             }
@@ -863,6 +1382,142 @@ impl CapabilityGateway {
                 let output =
                     invoke_plugin_capability(&id, input.clone(), self.trusted_dashboard_url())?;
                 finalize_plugin_capability(context, &id, &input, output)
+            }
+            CapabilityHandler::DownstreamMcp(id) => self.downstream_mcp.invoke(&id, input),
+            CapabilityHandler::McpServerList => Ok(json!({
+                "registry": mcp_registry::public_snapshot(&self.options.state_path)?,
+                "targets": mcp_targets::list(&self.options)?,
+            })),
+            CapabilityHandler::McpServerInspect => {
+                let server_id = input
+                    .get("server_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(mcp_registry::inspect(&self.options.state_path, server_id)?)
+            }
+            CapabilityHandler::McpServerUpsert => {
+                // Treat an existing row as the baseline for partial updates.  MCP
+                // callers only see redacted secret metadata, so replacing an
+                // otherwise unchanged row from that snapshot must not erase
+                // credentials, command arguments, or transport details.
+                let existing = mcp_registry::get(
+                    &self.options.state_path,
+                    input
+                        .get("server_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )?
+                .map(|server| server.into_config());
+                let config = mcp_server_config_from_input(&input, existing.clone())?;
+                let changed = existing
+                    .as_ref()
+                    .map(|value| value != &config)
+                    .unwrap_or(true);
+                let server = if changed {
+                    mcp_registry::upsert_config(&self.options.state_path, config)?
+                } else {
+                    config
+                };
+                // A running DSH session snapshots the MCP overlay at startup.
+                // Stop only the locally owned session; the next one will read
+                // the updated Registry without requiring a Dashboard.
+                if changed {
+                    crate::app::ui::stop_builtin_ai_process();
+                }
+                Ok(json!({
+                    "server": mcp_registry::inspect(&self.options.state_path, &server.server_name)?,
+                    "changed": changed,
+                    "restart_required": changed
+                }))
+            }
+            CapabilityHandler::McpServerRemove => {
+                let server_id = input
+                    .get("server_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let removed = mcp_registry::remove_config(&self.options.state_path, server_id)?;
+                if removed {
+                    crate::app::ui::stop_builtin_ai_process();
+                }
+                Ok(json!({
+                    "server_id": server_id,
+                    "removed": removed,
+                    "restart_required": removed
+                }))
+            }
+            CapabilityHandler::McpTargetList => {
+                Ok(serde_json::to_value(mcp_targets::list(&self.options)?)?)
+            }
+            CapabilityHandler::McpRegistrationPlan => {
+                let target_id = input
+                    .get("target_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(serde_json::to_value(mcp_targets::plan(
+                    &self.options,
+                    target_id,
+                )?)?)
+            }
+            CapabilityHandler::McpRegistrationApply => {
+                let target_id = input
+                    .get("target_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let reset_invalid = input
+                    .get("reset_invalid")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(serde_json::to_value(mcp_targets::apply(
+                    &self.options,
+                    target_id,
+                    reset_invalid,
+                )?)?)
+            }
+            CapabilityHandler::McpRegistrationApplyAll => {
+                let detected_only = input
+                    .get("detected_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let reset_invalid = input
+                    .get("reset_invalid")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(serde_json::to_value(mcp_targets::apply_all(
+                    &self.options,
+                    detected_only,
+                    reset_invalid,
+                )?)?)
+            }
+            CapabilityHandler::McpRegistrationRemove => {
+                let target_id = input
+                    .get("target_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(serde_json::to_value(mcp_targets::remove(
+                    &self.options,
+                    target_id,
+                )?)?)
+            }
+            CapabilityHandler::McpRegistrationRemoveAll => {
+                let detected_only = input
+                    .get("detected_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                Ok(serde_json::to_value(mcp_targets::remove_all(
+                    &self.options,
+                    detected_only,
+                )?)?)
+            }
+            CapabilityHandler::McpConnectionTest => {
+                let server_id = input
+                    .get("server_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let server = mcp_registry::get(&self.options.state_path, server_id)?
+                    .ok_or_else(|| format!("MCP server not found: {server_id}"))?;
+                Ok(serde_json::to_value(crate::app::mcp_probe::probe_report(
+                    &server,
+                ))?)
             }
         }
     }
@@ -1400,8 +2055,45 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
             Some(crate::api::oauth::RELEASE_MANAGE_SCOPE)
         }
         "software.distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
-        "context.resolve" | "project.context.get" | "exhibit.context.get" | "work.my_summary" => {
+        "context.resolve" | "work.my_summary" => {
             Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
+        }
+        "project.context.get" | "business.project.get" => {
+            Some(crate::api::oauth::BUSINESS_PROJECT_READ_SCOPE)
+        }
+        "exhibit.context.get" | "business.exhibit.get" => {
+            Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE)
+        }
+        "business.project.list" => Some(crate::api::oauth::BUSINESS_PROJECT_READ_SCOPE),
+        "business.project.create" | "business.project.update" | "business.project.delete" => {
+            Some(crate::api::oauth::BUSINESS_PROJECT_WRITE_SCOPE)
+        }
+        "business.exhibit.list" => Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE),
+        "business.exhibit.create" | "business.exhibit.update" | "business.exhibit.delete" => {
+            Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE)
+        }
+        "business.project.managers.replace"
+        | "business.project.owners.replace"
+        | "business.exhibit.crew.replace" => Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE),
+        "business.people.search" => Some(crate::api::oauth::BUSINESS_PEOPLE_READ_SCOPE),
+        "business.requirement.list" | "business.requirement.get" => {
+            Some(crate::api::oauth::BUSINESS_REQUIREMENT_READ_SCOPE)
+        }
+        "business.requirement.create"
+        | "business.requirement.update"
+        | "business.requirement.assignment.update"
+        | "business.requirement.cancel"
+        | "business.requirement.reopen"
+        | "business.requirement.review"
+        | "business.requirement.comment" => {
+            Some(crate::api::oauth::BUSINESS_REQUIREMENT_WRITE_SCOPE)
+        }
+        "business.project.exhibit.attach" | "business.project.exhibit.detach" => {
+            Some(crate::api::oauth::BUSINESS_PROJECT_WRITE_SCOPE)
+        }
+        "business.exhibit.workspace.get" => Some(crate::api::oauth::BUSINESS_WORKSPACE_READ_SCOPE),
+        "business.exhibit.workspace.bind" | "business.exhibit.workspace.checkout" => {
+            Some(crate::api::oauth::BUSINESS_WORKSPACE_WRITE_SCOPE)
         }
         "knowledge.search.v1" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
         "media.image.generate"
@@ -1415,12 +2107,204 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
     }
 }
 
+// Validate every Gateway invocation, including built-ins and downstream MCP
+// projections. Plugin invocations perform the same check inside the plugin
+// runtime, but validating here gives all MCP callers one deterministic error
+// contract before any network, process or filesystem side effect occurs.
+fn validate_capability_input_schema(schema: &Value, input: &Value) -> Result<(), Box<dyn Error>> {
+    let Some(schema_object) = schema.as_object() else {
+        return Ok(());
+    };
+    if !schema_object
+        .get("type")
+        .map(|value| capability_schema_allows_type(value, "object"))
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
+    if !input.is_object() {
+        return Err("capability input must be an object".into());
+    }
+    validate_capability_value("capability input", schema, input)
+}
+
+fn validate_capability_value(
+    name: &str,
+    schema: &Value,
+    value: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let expected_types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(kind)) => vec![kind.as_str()],
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    if !expected_types.is_empty()
+        && !expected_types
+            .iter()
+            .any(|expected| capability_value_matches_type(expected, value))
+    {
+        return Err(format!("capability input property has invalid type: {name}").into());
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        if !values.iter().any(|candidate| candidate == value) {
+            return Err(format!("capability input property has invalid value: {name}").into());
+        }
+    }
+    if let Some(max_length) = schema.get("maxLength").and_then(Value::as_u64) {
+        if value
+            .as_str()
+            .map(|item| item.chars().count() as u64 > max_length)
+            .unwrap_or(false)
+        {
+            return Err(format!("capability input property is too long: {name}").into());
+        }
+    }
+    if let Some(min_length) = schema.get("minLength").and_then(Value::as_u64) {
+        if value
+            .as_str()
+            .map(|item| (item.chars().count() as u64) < min_length)
+            .unwrap_or(false)
+        {
+            return Err(format!("capability input property is too short: {name}").into());
+        }
+    }
+    if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
+        if let Some(text) = value.as_str() {
+            if !matches_capability_pattern(pattern, text) {
+                return Err(format!("capability input property has invalid format: {name}").into());
+            }
+        }
+    }
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+        if value
+            .as_f64()
+            .map(|number| number < minimum)
+            .unwrap_or(false)
+        {
+            return Err(format!("capability input property is below minimum: {name}").into());
+        }
+    }
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+        if value
+            .as_f64()
+            .map(|number| number > maximum)
+            .unwrap_or(false)
+        {
+            return Err(format!("capability input property exceeds maximum: {name}").into());
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        if let Some(values) = value.as_array() {
+            for (index, item) in values.iter().enumerate() {
+                validate_capability_value(&format!("{name}[{index}]"), items, item)?;
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for property in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(property) {
+                    return Err(format!("{name} is missing required property: {property}").into());
+                }
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+            if let Some(unknown) = object.keys().find(|key| {
+                properties
+                    .map(|items| !items.contains_key(*key))
+                    .unwrap_or(true)
+            }) {
+                return Err(format!("{name} contains unknown property: {unknown}").into());
+            }
+        }
+        if let Some(properties) = properties {
+            for (property, property_schema) in properties {
+                if let Some(value) = object.get(property) {
+                    validate_capability_value(
+                        &format!("{name}.{property}"),
+                        property_schema,
+                        value,
+                    )?;
+                }
+            }
+        }
+        if let Some(additional_schema) = schema
+            .get("additionalProperties")
+            .filter(|value| value.is_object())
+        {
+            for (property, value) in object {
+                if properties
+                    .map(|items| items.contains_key(property))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                validate_capability_value(&format!("{name}.{property}"), additional_schema, value)?;
+            }
+        }
+    }
+    if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64) {
+        if value
+            .as_array()
+            .map(|items| (items.len() as u64) < min_items)
+            .unwrap_or(false)
+        {
+            return Err(format!("capability input array has too few items: {name}").into());
+        }
+    }
+    if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
+        if value
+            .as_array()
+            .map(|items| items.len() as u64 > max_items)
+            .unwrap_or(false)
+        {
+            return Err(format!("capability input array has too many items: {name}").into());
+        }
+    }
+    Ok(())
+}
+
+fn capability_value_matches_type(expected: &str, value: &Value) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+fn capability_schema_allows_type(schema_type: &Value, expected: &str) -> bool {
+    match schema_type {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => true,
+    }
+}
+
+fn matches_capability_pattern(pattern: &str, value: &str) -> bool {
+    // The Gateway deliberately supports a small, deterministic subset instead
+    // of embedding a regex engine. This is the pattern used by release SHA-256
+    // inputs; unknown patterns remain advisory rather than blocking clients.
+    if pattern == "^[0-9a-fA-F]{64}$" {
+        return value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    true
+}
+
 fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailability {
     match handler {
         CapabilityHandler::AuthoringIdentity
         | CapabilityHandler::ExtensionWorkspaceCurrent
         | CapabilityHandler::SkillCandidateSave
         | CapabilityHandler::SkillCandidateTest
+        | CapabilityHandler::SkillClientRegister
+        | CapabilityHandler::SkillClientUnregister
+        | CapabilityHandler::SkillClientsUnregister
         | CapabilityHandler::PluginCandidateSave
         | CapabilityHandler::PluginCandidateTest => CapabilityAvailability::Local,
         CapabilityHandler::SkillSubmissionSubmit
@@ -1436,6 +2320,32 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::DashboardExhibitContext
         | CapabilityHandler::DashboardMyWorkSummary
         | CapabilityHandler::DashboardKnowledgeSearch
+        | CapabilityHandler::DashboardProjectList
+        | CapabilityHandler::DashboardProjectCreate
+        | CapabilityHandler::DashboardProjectUpdate
+        | CapabilityHandler::DashboardProjectDelete
+        | CapabilityHandler::DashboardExhibitList
+        | CapabilityHandler::DashboardExhibitCreate
+        | CapabilityHandler::DashboardExhibitUpdate
+        | CapabilityHandler::DashboardExhibitDelete
+        | CapabilityHandler::DashboardProjectManagersReplace
+        | CapabilityHandler::DashboardProjectOwnersReplace
+        | CapabilityHandler::DashboardExhibitCrewReplace
+        | CapabilityHandler::DashboardProjectExhibitAttach
+        | CapabilityHandler::DashboardProjectExhibitDetach
+        | CapabilityHandler::DashboardExhibitWorkspaceGet
+        | CapabilityHandler::DashboardExhibitWorkspaceBind
+        | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+        | CapabilityHandler::DashboardPeopleSearch
+        | CapabilityHandler::DashboardRequirementList
+        | CapabilityHandler::DashboardRequirementGet
+        | CapabilityHandler::DashboardRequirementCreate
+        | CapabilityHandler::DashboardRequirementUpdate
+        | CapabilityHandler::DashboardRequirementAssignmentUpdate
+        | CapabilityHandler::DashboardRequirementCancel
+        | CapabilityHandler::DashboardRequirementReopen
+        | CapabilityHandler::DashboardRequirementReview
+        | CapabilityHandler::DashboardRequirementComment
         | CapabilityHandler::MediaSubmit(_, _)
         | CapabilityHandler::MediaJobGet
         | CapabilityHandler::MediaJobCancel => CapabilityAvailability::ControlPlane,
@@ -1567,10 +2477,7 @@ fn validate_extension_workspace_root(
     Ok(())
 }
 
-fn validate_software_workspace_root(
-    current: &Path,
-    requested: &str,
-) -> Result<(), Box<dyn Error>> {
+fn validate_software_workspace_root(current: &Path, requested: &str) -> Result<(), Box<dyn Error>> {
     let requested = Path::new(requested).canonicalize()?;
     if requested != current {
         return Err(serde_json::json!({
@@ -1636,6 +2543,91 @@ fn validate_distribution_publish_request(
         return Err("不支持的 package_type".into());
     }
     Ok(())
+}
+
+fn mcp_server_config_from_input(
+    input: &Value,
+    existing: Option<crate::app::mcp_registry::McpServerConfig>,
+) -> Result<crate::app::mcp_registry::McpServerConfig, Box<dyn Error>> {
+    let object = input
+        .as_object()
+        .ok_or("MCP server input must be a JSON object")?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_string())
+    };
+    let server_name = text("server_id").unwrap_or_default();
+    if server_name.is_empty() {
+        return Err("server_id is required".into());
+    }
+    let transport = text("transport")
+        .or_else(|| existing.as_ref().map(|value| value.transport.clone()))
+        .unwrap_or_default();
+    if transport.is_empty() {
+        return Err("transport is required".into());
+    }
+    let args = object
+        .get("args")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
+    let env = match object.get("env") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => existing
+            .as_ref()
+            .map(|value| value.env.clone())
+            .unwrap_or_default(),
+    };
+    let headers = match object.get("headers") {
+        Some(value) => serde_json::from_value(value.clone())?,
+        None => existing
+            .as_ref()
+            .map(|value| value.headers.clone())
+            .unwrap_or_default(),
+    };
+    Ok(crate::app::mcp_registry::McpServerConfig {
+        server_name,
+        display_name: text("display_name")
+            .or_else(|| existing.as_ref().map(|value| value.display_name.clone()))
+            .unwrap_or_default(),
+        transport,
+        command: text("command")
+            .or_else(|| existing.as_ref().map(|value| value.command.clone()))
+            .unwrap_or_default(),
+        args: args
+            .or_else(|| existing.as_ref().map(|value| value.args.clone()))
+            .unwrap_or_default(),
+        env,
+        cwd: text("cwd")
+            .or_else(|| existing.as_ref().map(|value| value.cwd.clone()))
+            .unwrap_or_default(),
+        url: text("url")
+            .or_else(|| existing.as_ref().map(|value| value.url.clone()))
+            .unwrap_or_default(),
+        headers,
+        tool_call_timeout_ms: object
+            .get("tool_call_timeout_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| existing.as_ref().map(|value| value.tool_call_timeout_ms))
+            .unwrap_or(30_000),
+        fail_on_startup_error: object
+            .get("fail_on_startup_error")
+            .and_then(Value::as_bool)
+            .or_else(|| existing.as_ref().map(|value| value.fail_on_startup_error))
+            .unwrap_or(false),
+        reconnect: object
+            .get("reconnect")
+            .and_then(Value::as_bool)
+            .or_else(|| existing.as_ref().map(|value| value.reconnect))
+            .unwrap_or(true),
+        enabled: object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .or_else(|| existing.as_ref().map(|value| value.enabled))
+            .unwrap_or(true),
+    })
 }
 
 fn registration(
@@ -1845,6 +2837,124 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_input_uses_stable_id_and_safe_defaults() {
+        let config = mcp_server_config_from_input(
+            &json!({
+                "server_id": "local-tools",
+                "transport": "stdio",
+                "command": "node",
+                "args": ["server.js"],
+                "env": { "TOKEN": "secret" }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.server_name, "local-tools");
+        assert_eq!(config.transport, "stdio");
+        assert_eq!(config.tool_call_timeout_ms, 30_000);
+        assert!(config.reconnect);
+        assert!(config.enabled);
+        assert_eq!(config.env.get("TOKEN"), Some(&"secret".to_string()));
+    }
+
+    #[test]
+    fn mcp_server_input_preserves_omitted_existing_fields_and_secrets() {
+        let existing = mcp_server_config_from_input(
+            &json!({
+                "server_id": "local-tools",
+                "transport": "stdio",
+                "command": "node",
+                "args": ["server.js", "--port", "3210"],
+                "env": { "TOKEN": "secret" },
+                "cwd": "C:/tools",
+                "tool_call_timeout_ms": 12_000,
+                "enabled": true
+            }),
+            None,
+        )
+        .unwrap();
+        let updated = mcp_server_config_from_input(
+            &json!({
+                "server_id": "local-tools",
+                "transport": "stdio",
+                "display_name": "Local Tools"
+            }),
+            Some(existing.clone()),
+        )
+        .unwrap();
+        assert_eq!(updated.display_name, "Local Tools");
+        assert_eq!(updated.command, existing.command);
+        assert_eq!(updated.args, existing.args);
+        assert_eq!(updated.env, existing.env);
+        assert_eq!(updated.cwd, existing.cwd);
+        assert_eq!(updated.tool_call_timeout_ms, existing.tool_call_timeout_ms);
+    }
+
+    #[test]
+    fn capability_schema_validates_nested_objects_and_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": { "mode": { "type": "string", "enum": ["fast", "safe"] } },
+                    "required": ["mode"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["options"],
+            "additionalProperties": false
+        });
+
+        validate_capability_input_schema(
+            &schema,
+            &json!({
+                "options": { "mode": "safe" }
+            }),
+        )
+        .unwrap();
+        let missing = validate_capability_input_schema(
+            &schema,
+            &json!({
+                "options": {}
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing.contains("options is missing required property: mode"));
+        let unknown = validate_capability_input_schema(
+            &schema,
+            &json!({
+                "options": { "mode": "safe", "debug": true }
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unknown.contains("options contains unknown property: debug"));
+    }
+
+    #[test]
+    fn capability_schema_enforces_sha256_pattern() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" } },
+            "required": ["sha256"],
+            "additionalProperties": false
+        });
+        validate_capability_input_schema(
+            &schema,
+            &json!({
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }),
+        )
+        .unwrap();
+        assert!(
+            validate_capability_input_schema(&schema, &json!({ "sha256": "not-a-sha256" }))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn dashboard_business_capabilities_report_the_builtin_plugin_provider() {
         let item = dashboard_business_registration(
             "exhibit.context.get",
@@ -2026,10 +3136,8 @@ mod tests {
             crate::capability::types::InvocationSource::Mcp,
             "ai-client:test",
         );
-        let cli = InvocationContext::new(
-            crate::capability::types::InvocationSource::Cli,
-            "local-cli",
-        );
+        let cli =
+            InvocationContext::new(crate::capability::types::InvocationSource::Cli, "local-cli");
         assert!(requires_native_software_confirmation(&mcp));
         assert!(!requires_native_software_confirmation(&cli));
     }

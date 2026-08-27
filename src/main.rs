@@ -133,6 +133,11 @@ fn main() {
             eprintln!("runtime command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = mcp_cli_arguments() {
+        if let Err(error) = run_mcp_cli(&options, &arguments) {
+            eprintln!("mcp command failed: {error}");
+            std::process::exit(1);
+        }
     } else if mcp_mode {
         if let Err(error) = mcp::run(options) {
             eprintln!("agent mcp failed: {error}");
@@ -240,6 +245,104 @@ fn runtime_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "runtime")?;
     Some(arguments[index + 1..].to_vec())
+}
+
+fn mcp_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "mcp")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_mcp_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments.first().map(String::as_str) {
+        Some("list") => {
+            let payload = json!({
+                "servers": app::mcp_registry::public_snapshot(&options.state_path)?,
+                "targets": app::mcp_targets::list(options)?,
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        Some("targets") if arguments.len() == 1 => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_targets::list(options)?)?
+            );
+        }
+        Some("inspect") if arguments.len() == 2 => {
+            let id = &arguments[1];
+            match app::mcp_registry::inspect(&options.state_path, id) {
+                Ok(server) => println!("{}", serde_json::to_string_pretty(&server)?),
+                Err(_) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&app::mcp_targets::inspect(options, id)?)?
+                ),
+            }
+        }
+        Some("plan") if arguments.len() == 2 => println!(
+            "{}",
+            serde_json::to_string_pretty(&app::mcp_targets::plan(options, &arguments[1])?)?
+        ),
+        Some("apply") if arguments.len() == 2 || arguments.len() == 3 => {
+            let reset_invalid = arguments.get(2).is_some_and(|value| value == "--reset-invalid");
+            if arguments.len() == 3 && !reset_invalid {
+                return Err("usage: himind-agent mcp apply <target-id> [--reset-invalid]".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_targets::apply(
+                    options,
+                    &arguments[1],
+                    reset_invalid,
+                )?)?
+            );
+        }
+        Some("apply-all") => {
+            let detected_only = !arguments.iter().any(|value| value == "--include-undetected");
+            let reset_invalid = arguments.iter().any(|value| value == "--reset-invalid");
+            if arguments.iter().skip(1).any(|value| {
+                !matches!(value.as_str(), "--include-undetected" | "--reset-invalid")
+            }) {
+                return Err("usage: himind-agent mcp apply-all [--include-undetected] [--reset-invalid]".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_targets::apply_all(
+                    options,
+                    detected_only,
+                    reset_invalid,
+                )?)?
+            );
+        }
+        Some("remove") if arguments.len() == 2 => println!(
+            "{}",
+            serde_json::to_string_pretty(&app::mcp_targets::remove(options, &arguments[1])?)?
+        ),
+        Some("remove-all") => {
+            let detected_only = !arguments.iter().any(|value| value == "--include-undetected");
+            if arguments.iter().skip(1).any(|value| value != "--include-undetected") {
+                return Err("usage: himind-agent mcp remove-all [--include-undetected]".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_targets::remove_all(
+                    options,
+                    detected_only,
+                )?)?
+            );
+        }
+        Some("test") if arguments.len() == 2 => {
+            let server = app::mcp_registry::get(&options.state_path, &arguments[1])?
+                .ok_or_else(|| format!("MCP server not found: {}", arguments[1]))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_probe::probe_report(&server))?
+            );
+        }
+        _ => {
+            return Err("usage: himind-agent mcp <list|targets|inspect server-id|plan target-id|apply target-id [--reset-invalid]|apply-all [--include-undetected] [--reset-invalid]|remove target-id|remove-all [--include-undetected]|test server-id>".into())
+        }
+    }
+    Ok(())
 }
 
 fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -858,9 +961,12 @@ fn execute_task(
                 task.payload.clone().unwrap_or_else(|| json!({})),
             )?;
             let project_id = request.project_id.clone();
+            let repository_access = request.repository_access.clone();
             let repository = create_repository_with_post_commit_hook(request)?;
-            let access =
-                ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest { project_id })?;
+            let access = ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest {
+                project_id,
+                repository_access,
+            })?;
             Ok(json!({ "repository": repository, "exhibits_access": access }))
         }
         "project_repository_exhibits_access_ensure" => {

@@ -119,16 +119,16 @@ fn attach_inspection_receipt_in(
     let protected = crate::store::credentials::protect_secret_for_current_user(
         &serde_json::to_string(&receipt)?,
     )?;
-    crate::store::atomic_file::atomic_write(
-        &receipt_path(root, &token)?,
-        protected.as_bytes(),
-    )?;
+    crate::store::atomic_file::atomic_write(&receipt_path(root, &token)?, protected.as_bytes())?;
 
     let object = output
         .as_object_mut()
         .ok_or("制品检查结果必须是 JSON 对象")?;
     object.insert("inspection_receipt".to_string(), Value::String(token));
-    object.insert("inspection_expires_at".to_string(), receipt.expires_at.into());
+    object.insert(
+        "inspection_expires_at".to_string(),
+        receipt.expires_at.into(),
+    );
     object.insert("size".to_string(), size.into());
     object.insert("sha256".to_string(), Value::String(sha256));
     Ok(output)
@@ -140,8 +140,8 @@ fn verify_inspection_receipt_in(
     root: &Path,
 ) -> Result<VerifiedSoftwareArtifact, Box<dyn Error>> {
     let path = receipt_path(root, request.inspection_receipt.trim())?;
-    let protected = fs::read_to_string(&path)
-        .map_err(|_| "制品预检凭证不存在或已被使用，请重新检查制品")?;
+    let protected =
+        fs::read_to_string(&path).map_err(|_| "制品预检凭证不存在或已被使用，请重新检查制品")?;
     let receipt: ArtifactInspectionReceipt = serde_json::from_str(
         &crate::store::credentials::unprotect_secret_for_current_user(protected.trim())?,
     )?;
@@ -159,8 +159,14 @@ fn verify_inspection_receipt_in(
     let expected = [
         (receipt.workspace_root.as_str(), workspace.to_string_lossy()),
         (receipt.artifact_path.as_str(), artifact.to_string_lossy()),
-        (receipt.product_id.as_str(), request.product_id.clone().into()),
-        (receipt.version.as_str(), request.version.trim().to_string().into()),
+        (
+            receipt.product_id.as_str(),
+            request.product_id.clone().into(),
+        ),
+        (
+            receipt.version.as_str(),
+            request.version.trim().to_string().into(),
+        ),
         (receipt.channel.as_str(), request.channel.clone().into()),
         (receipt.platform.as_str(), request.platform.clone().into()),
         (
@@ -322,8 +328,7 @@ fn now_seconds() -> Result<u64, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_inspection_receipt_in, consume_inspection_receipt,
-        verify_inspection_receipt_in,
+        attach_inspection_receipt_in, consume_inspection_receipt, verify_inspection_receipt_in,
     };
     use crate::api::distribution::SoftwareReleasePublishRequest;
     use crate::capability::types::{InvocationContext, InvocationSource};

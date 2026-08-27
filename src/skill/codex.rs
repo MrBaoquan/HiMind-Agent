@@ -1,3 +1,4 @@
+use crate::skill::clients::manifest_supports_client;
 use crate::skill::manifest::validate_skill_id;
 use crate::skill::resolver::{CapabilityFact, SkillReadiness};
 use crate::skill::store::{SkillStore, SKILL_SYNC_MODE_SYMLINK};
@@ -45,6 +46,11 @@ pub(crate) fn status_json(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
         "client_id": "codex",
+        "client_name": "Codex",
+        "client_detected": target_detected(&target),
+        "skill_standard": "agentskills.io",
+        "support_level": "official",
+        "support_note": "Codex 原生 Agent Skills",
         "target_root": target.root.to_string_lossy().to_string(),
         "target_source": target.source,
         "target_configured": target.configured,
@@ -53,6 +59,10 @@ pub(crate) fn status_json(
         "sync_mode": sync_mode,
         "items": items,
     }))
+}
+
+pub(crate) fn is_detected() -> bool {
+    target_detected(&resolve_target(&SkillStore::new()))
 }
 
 pub(crate) fn sync_record_json(
@@ -135,6 +145,9 @@ pub(crate) fn sync_json(
     let mut skipped = Vec::new();
     let mut blocked = Vec::new();
     for record in records {
+        if !manifest_supports_client(&record.manifest, "codex") {
+            continue;
+        }
         let readiness =
             SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, "codex");
         match readiness.state.as_str() {
@@ -194,6 +207,9 @@ fn skill_status_entry(
     let render_root = target_root.join(&record.manifest.id);
     let current_dir = render_root.join("current");
     let receipt = read_receipt(&current_dir).ok();
+    let managing_profile = receipt
+        .as_ref()
+        .map(|receipt| receipt.agent_profile.clone());
     let modified_files = receipt
         .as_ref()
         .map(|receipt| rendered_drift(&current_dir, receipt))
@@ -207,7 +223,10 @@ fn skill_status_entry(
                 && validate_rendered_skill(&current_dir, receipt).is_ok()
         })
         .unwrap_or(false);
-    let client_state = if readiness.state == "blocked" {
+    let supported = manifest_supports_client(&record.manifest, "codex");
+    let client_state = if !supported {
+        "unsupported"
+    } else if readiness.state == "blocked" {
         "blocked"
     } else if !current_dir.exists() {
         "not_installed"
@@ -237,6 +256,7 @@ fn skill_status_entry(
         "rendered_valid": receipt_ok,
         "client_state": client_state,
         "installed_version": receipt.as_ref().map(|value| value.version.clone()),
+        "managing_profile": managing_profile,
         "available_version": record.manifest.version,
         "last_synced_at": receipt.as_ref().map(|value| value.rendered_at.clone()),
         "managed_files": receipt.as_ref().map(|value| value.files.clone()).unwrap_or_default(),
@@ -253,6 +273,10 @@ fn target_mode(target: &CodexTarget) -> &'static str {
     } else {
         "detected"
     }
+}
+
+fn target_detected(target: &CodexTarget) -> bool {
+    target.configured || target.root.exists() || target.root.parent().is_some_and(Path::exists)
 }
 
 fn render_skill(target_root: &Path, record: &SkillRecord) -> Result<RenderOutcome, Box<dyn Error>> {
@@ -300,6 +324,7 @@ fn render_skill(target_root: &Path, record: &SkillRecord) -> Result<RenderOutcom
         skill_id: record.manifest.id.clone(),
         version: record.manifest.version.clone(),
         client: "codex".to_string(),
+        agent_profile: crate::store::paths::profile_name(),
         source_root: record.version_root.to_string_lossy().to_string(),
         rendered_root: current_dir.to_string_lossy().to_string(),
         rendered_at: unique_stamp(),
@@ -345,13 +370,19 @@ fn uninstall_skill(
             "removed": false,
         }));
     }
-    if current_dir.exists() {
-        let receipt = read_receipt(&current_dir)?;
+    let current_receipt = current_dir
+        .exists()
+        .then(|| read_receipt(&current_dir))
+        .transpose()?;
+    let previous_receipt = previous_dir
+        .exists()
+        .then(|| read_receipt(&previous_dir))
+        .transpose()?;
+    if let Some(receipt) = current_receipt {
         validate_rendered_skill(&current_dir, &receipt)?;
         remove_rendered_tree(&current_dir, &receipt)?;
     }
-    if previous_dir.exists() {
-        let receipt = read_receipt(&previous_dir)?;
+    if let Some(receipt) = previous_receipt {
         let _ = validate_rendered_skill(&previous_dir, &receipt);
         let _ = fs::remove_dir_all(&previous_dir);
     }

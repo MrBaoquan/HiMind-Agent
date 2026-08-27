@@ -7,7 +7,11 @@ use url::Url;
 
 use crate::api::client::load_agent_state;
 use crate::api::oauth::{
-    platform_access_token, BUSINESS_CONTEXT_READ_SCOPE, KNOWLEDGE_SEARCH_SCOPE,
+    platform_access_token, BUSINESS_CONTEXT_READ_SCOPE, BUSINESS_EXHIBIT_READ_SCOPE,
+    BUSINESS_EXHIBIT_WRITE_SCOPE, BUSINESS_PEOPLE_READ_SCOPE, BUSINESS_PEOPLE_WRITE_SCOPE,
+    BUSINESS_PROJECT_READ_SCOPE, BUSINESS_PROJECT_WRITE_SCOPE, BUSINESS_REQUIREMENT_READ_SCOPE,
+    BUSINESS_REQUIREMENT_WRITE_SCOPE, BUSINESS_WORKSPACE_READ_SCOPE,
+    BUSINESS_WORKSPACE_WRITE_SCOPE, KNOWLEDGE_SEARCH_SCOPE,
 };
 use crate::Options;
 
@@ -31,8 +35,9 @@ pub(crate) fn resolve_context(options: &Options, input: Value) -> Result<Value, 
 
 pub(crate) fn project_context(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
     let project_id = required_string(&input, "project_id")?;
-    request(
+    request_with_scope(
         options,
+        BUSINESS_PROJECT_READ_SCOPE,
         Method::GET,
         &[
             "api",
@@ -48,8 +53,9 @@ pub(crate) fn project_context(options: &Options, input: Value) -> Result<Value, 
 
 pub(crate) fn exhibit_context(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
     let exhibit_id = required_string(&input, "exhibit_id")?;
-    request(
+    request_with_scope(
         options,
+        BUSINESS_EXHIBIT_READ_SCOPE,
         Method::GET,
         &[
             "api",
@@ -96,6 +102,433 @@ pub(crate) fn search_knowledge(options: &Options, input: Value) -> Result<Value,
     )
 }
 
+pub(crate) fn project_list(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    business_list(
+        options,
+        BUSINESS_PROJECT_READ_SCOPE,
+        &["api", "integrations", "ai", "business", "projects"],
+        input,
+    )
+}
+
+pub(crate) fn project_create(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    request_with_scope(
+        options,
+        BUSINESS_PROJECT_WRITE_SCOPE,
+        Method::POST,
+        &["api", "integrations", "ai", "business", "projects"],
+        Some(input),
+    )
+}
+
+pub(crate) fn project_update(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let project_id = required_string(&input, "project_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_PROJECT_WRITE_SCOPE,
+        Method::PUT,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "projects",
+            &project_id,
+        ],
+        Some(without_key(input, "project_id")),
+    )
+}
+
+pub(crate) fn project_delete(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let project_id = required_string(&input, "project_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_PROJECT_WRITE_SCOPE,
+        Method::DELETE,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "projects",
+            &project_id,
+        ],
+        None,
+    )
+}
+
+pub(crate) fn exhibit_list(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    business_list(
+        options,
+        BUSINESS_EXHIBIT_READ_SCOPE,
+        &["api", "integrations", "ai", "business", "exhibits"],
+        input,
+    )
+}
+
+pub(crate) fn exhibit_create(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    request_with_scope(
+        options,
+        BUSINESS_EXHIBIT_WRITE_SCOPE,
+        Method::POST,
+        &["api", "integrations", "ai", "business", "exhibits"],
+        Some(input),
+    )
+}
+
+pub(crate) fn exhibit_update(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_EXHIBIT_WRITE_SCOPE,
+        Method::PUT,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+        ],
+        Some(without_key(input, "exhibit_id")),
+    )
+}
+
+pub(crate) fn exhibit_delete(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_EXHIBIT_WRITE_SCOPE,
+        Method::DELETE,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+        ],
+        None,
+    )
+}
+
+pub(crate) fn people_search(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let mut query = Vec::new();
+    for key in ["q", "project_id", "exhibit_id", "page", "page_size"] {
+        if let Some(value) = input.get(key) {
+            if let Some(value) = value.as_str() {
+                if !value.trim().is_empty() {
+                    query.push((key.to_string(), value.to_string()));
+                }
+            } else if value.is_number() {
+                query.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    request_with_scope_query(
+        options,
+        BUSINESS_PEOPLE_READ_SCOPE,
+        Method::GET,
+        &["api", "integrations", "ai", "business", "people", "search"],
+        None,
+        Some(query),
+    )
+}
+
+pub(crate) fn requirement_list(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    let mut query = Vec::new();
+    for key in ["status", "mine", "page", "page_size"] {
+        if let Some(value) = input.get(key) {
+            if let Some(value) = value.as_str() {
+                if !value.trim().is_empty() {
+                    query.push((key.to_string(), value.to_string()));
+                }
+            } else if value.is_number() || value.is_boolean() {
+                query.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    query.push(("exhibit_id".to_string(), exhibit_id));
+    request_with_scope_query(
+        options,
+        BUSINESS_REQUIREMENT_READ_SCOPE,
+        Method::GET,
+        &["api", "integrations", "ai", "business", "requirements"],
+        None,
+        Some(query),
+    )
+}
+
+pub(crate) fn requirement_get(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let requirement_id = required_string(&input, "requirement_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_REQUIREMENT_READ_SCOPE,
+        Method::GET,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "requirements",
+            &requirement_id,
+        ],
+        None,
+    )
+}
+
+pub(crate) fn requirement_create(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_REQUIREMENT_WRITE_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "requirements",
+        ],
+        Some(without_key(input, "exhibit_id")),
+    )
+}
+
+pub(crate) fn requirement_update(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let requirement_id = required_string(&input, "requirement_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_REQUIREMENT_WRITE_SCOPE,
+        Method::PATCH,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "requirements",
+            &requirement_id,
+        ],
+        Some(without_key(input, "requirement_id")),
+    )
+}
+
+pub(crate) fn requirement_assignment_update(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let requirement_id = required_string(&input, "requirement_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_REQUIREMENT_WRITE_SCOPE,
+        Method::PATCH,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "requirements",
+            &requirement_id,
+            "assignment",
+        ],
+        Some(without_key(input, "requirement_id")),
+    )
+}
+
+pub(crate) fn requirement_action(
+    options: &Options,
+    input: Value,
+    action: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let requirement_id = required_string(&input, "requirement_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_REQUIREMENT_WRITE_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "requirements",
+            &requirement_id,
+            action,
+        ],
+        if action == "cancel" {
+            None
+        } else {
+            Some(without_key(input, "requirement_id"))
+        },
+    )
+}
+
+pub(crate) fn project_people_replace(
+    options: &Options,
+    input: Value,
+    role: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let project_id = required_string(&input, "project_id")?;
+    let path_role = match role {
+        "managers" | "owners" => role,
+        _ => return Err("role must be managers or owners".into()),
+    };
+    let body = input
+        .get("user_ids")
+        .cloned()
+        .map(|user_ids| serde_json::json!({"user_ids": user_ids}))
+        .unwrap_or_else(|| serde_json::json!({"user_ids": []}));
+    request_with_scope(
+        options,
+        BUSINESS_PEOPLE_WRITE_SCOPE,
+        Method::PUT,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "projects",
+            &project_id,
+            path_role,
+        ],
+        Some(body),
+    )
+}
+
+pub(crate) fn exhibit_crew_replace(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_PEOPLE_WRITE_SCOPE,
+        Method::PUT,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "crew",
+        ],
+        Some(without_key(input, "exhibit_id")),
+    )
+}
+
+pub(crate) fn project_exhibit_association(
+    options: &Options,
+    input: Value,
+    action: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let project_id = required_string(&input, "project_id")?;
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    if action != "attach" && action != "detach" {
+        return Err("action must be attach or detach".into());
+    }
+    request_with_scope(
+        options,
+        BUSINESS_PROJECT_WRITE_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "projects",
+            &project_id,
+            "exhibits",
+            &exhibit_id,
+            action,
+        ],
+        None,
+    )
+}
+
+pub(crate) fn exhibit_workspace_get(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    let agent_id = required_string(&input, "agent_id")?;
+    request_with_scope_query(
+        options,
+        BUSINESS_WORKSPACE_READ_SCOPE,
+        Method::GET,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "workspace",
+        ],
+        None,
+        Some(vec![("agent_id".to_string(), agent_id)]),
+    )
+}
+
+pub(crate) fn exhibit_workspace_bind(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_WORKSPACE_WRITE_SCOPE,
+        Method::PUT,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "workspace",
+        ],
+        Some(without_key(input, "exhibit_id")),
+    )
+}
+
+fn business_list(
+    options: &Options,
+    scope: &str,
+    path: &[&str],
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let mut query = Vec::new();
+    for key in [
+        "q",
+        "status",
+        "scope",
+        "project",
+        "engine",
+        "page",
+        "page_size",
+    ] {
+        if let Some(value) = input.get(key) {
+            if let Some(value) = value.as_str() {
+                if !value.trim().is_empty() {
+                    query.push((key.to_string(), value.to_string()));
+                }
+            } else if value.is_number() {
+                query.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    request_with_scope_query(options, scope, Method::GET, path, None, Some(query))
+}
+
+fn without_key(mut input: Value, key: &str) -> Value {
+    if let Some(object) = input.as_object_mut() {
+        object.remove(key);
+    }
+    input
+}
+
 fn request(
     options: &Options,
     method: Method,
@@ -112,12 +545,26 @@ fn request_with_scope(
     path: &[&str],
     body: Option<Value>,
 ) -> Result<Value, Box<dyn Error>> {
+    request_with_scope_query(options, required_scope, method, path, body, None)
+}
+
+fn request_with_scope_query(
+    options: &Options,
+    required_scope: &str,
+    method: Method,
+    path: &[&str],
+    body: Option<Value>,
+    query: Option<Vec<(String, String)>>,
+) -> Result<Value, Box<dyn Error>> {
     let delegated = platform_access_token(options, required_scope)?;
     let state = load_agent_state(&options.state_path)?;
     if delegated.agent_id.trim() != state.agent_id.trim() {
         return Err("Dashboard 授权与当前 Agent 实例不匹配，请重新授权".into());
     }
-    let url = api_url(&options.api_base, path)?;
+    let mut url = api_url(&options.api_base, path)?;
+    if let Some(query) = query {
+        url.query_pairs_mut().extend_pairs(query);
+    }
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let mut builder = client
         .request(method, url)

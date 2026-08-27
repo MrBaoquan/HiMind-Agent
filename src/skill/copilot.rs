@@ -1,3 +1,4 @@
+use crate::skill::clients::manifest_supports_client;
 use crate::skill::manifest::validate_skill_id;
 use crate::skill::resolver::{CapabilityFact, SkillReadiness};
 use crate::skill::store::{SkillStore, SKILL_SYNC_MODE_SYMLINK};
@@ -6,6 +7,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -13,11 +15,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+#[cfg(test)]
 const CLIENT_ID: &str = "github-copilot";
 const RECEIPT_NAME: &str = ".himind-render.json";
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct DirectSkillTarget {
+pub(crate) struct DirectSkillTarget {
     pub(super) root: PathBuf,
     pub(super) source: String,
     pub(super) configured: bool,
@@ -33,19 +36,7 @@ struct RenderOutcome {
     files: Vec<String>,
 }
 
-pub(crate) fn status_json(
-    agent_version: &str,
-    capability_facts: &[CapabilityFact],
-) -> Result<serde_json::Value, Box<dyn Error>> {
-    status_for_target(
-        CLIENT_ID,
-        resolve_target(&SkillStore::new()),
-        agent_version,
-        capability_facts,
-    )
-}
-
-pub(super) fn status_for_target(
+pub(crate) fn status_for_target(
     client_id: &str,
     target: DirectSkillTarget,
     agent_version: &str,
@@ -79,20 +70,7 @@ pub(super) fn status_for_target(
     }))
 }
 
-pub(crate) fn sync_json(
-    agent_version: &str,
-    capability_facts: &[CapabilityFact],
-) -> Result<serde_json::Value, Box<dyn Error>> {
-    sync_for_target(
-        CLIENT_ID,
-        "Copilot",
-        resolve_target(&SkillStore::new()),
-        agent_version,
-        capability_facts,
-    )
-}
-
-pub(super) fn sync_for_target(
+pub(crate) fn sync_for_target(
     client_id: &str,
     client_name: &str,
     target: DirectSkillTarget,
@@ -105,6 +83,9 @@ pub(super) fn sync_for_target(
     let mut skipped = Vec::new();
     let mut blocked = Vec::new();
     for record in store.list_records()? {
+        if !manifest_supports_client(&record.manifest, client_id) {
+            continue;
+        }
         let readiness =
             SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, client_id);
         match readiness.state.as_str() {
@@ -141,22 +122,59 @@ pub(super) fn sync_for_target(
     }))
 }
 
-pub(crate) fn sync_record_json(
-    record: &SkillRecord,
+pub(crate) fn repair_for_target(
+    client_id: &str,
+    client_name: &str,
+    target: DirectSkillTarget,
+    skill_id: &str,
+    preserve_modified: bool,
     agent_version: &str,
     capability_facts: &[CapabilityFact],
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    sync_record_for_target(
-        CLIENT_ID,
-        "Copilot",
-        resolve_target(&SkillStore::new()),
-        record,
-        agent_version,
-        capability_facts,
-    )
+    validate_skill_id(skill_id)?;
+    let store = SkillStore::new();
+    store.bootstrap_builtin_skills()?;
+    let record = store
+        .get_record(skill_id)?
+        .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    let readiness =
+        SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, client_id);
+    if readiness.state == "blocked" {
+        return Err(format!("Skill is blocked: {}", readiness.reasons.join(", ")).into());
+    }
+    let rendered_root = target.root.join(skill_slug(&record)?);
+    let backup_root = if rendered_root.exists() {
+        match read_receipt(&rendered_root) {
+            Ok(receipt) if validate_rendered_skill(&rendered_root, &receipt).is_ok() => None,
+            _ if preserve_modified => {
+                let backup = target.root.join(format!(
+                    ".himind-{}-user-backup-{}",
+                    skill_slug(&record)?,
+                    unique_stamp()
+                ));
+                fs::rename(&rendered_root, &backup)?;
+                Some(backup)
+            }
+            _ => {
+                fs::remove_dir_all(&rendered_root)?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let outcome = render_skill(&target.root, &record, client_id, client_name)?;
+    Ok(json!({
+        "client_id": client_id,
+        "target_root": target.root.to_string_lossy().to_string(),
+        "target_source": target.source,
+        "target_configured": target.configured,
+        "rendered": outcome,
+        "backup_root": backup_root.map(|path| path.to_string_lossy().to_string()),
+    }))
 }
 
-pub(super) fn sync_record_for_target(
+pub(crate) fn sync_record_for_target(
     client_id: &str,
     client_name: &str,
     target: DirectSkillTarget,
@@ -179,16 +197,7 @@ pub(super) fn sync_record_for_target(
     }))
 }
 
-pub(crate) fn uninstall_json(skill_id: &str) -> Result<serde_json::Value, Box<dyn Error>> {
-    uninstall_for_target(
-        CLIENT_ID,
-        "Copilot",
-        resolve_target(&SkillStore::new()),
-        skill_id,
-    )
-}
-
-pub(super) fn uninstall_for_target(
+pub(crate) fn uninstall_for_target(
     client_id: &str,
     client_name: &str,
     target: DirectSkillTarget,
@@ -217,6 +226,9 @@ fn skill_status_entry(
         SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, client_id);
     let rendered_root = target_root.join(skill_slug(&record)?);
     let receipt = read_receipt(&rendered_root).ok();
+    let managing_profile = receipt
+        .as_ref()
+        .map(|receipt| receipt.agent_profile.clone());
     let modified_files = receipt
         .as_ref()
         .map(|receipt| rendered_drift(&rendered_root, receipt))
@@ -232,7 +244,10 @@ fn skill_status_entry(
                 && validate_rendered_skill(&rendered_root, receipt).is_ok()
         })
         .unwrap_or(false);
-    let client_state = if readiness.state == "blocked" {
+    let supported = manifest_supports_client(&record.manifest, client_id);
+    let client_state = if !supported {
+        "unsupported"
+    } else if readiness.state == "blocked" {
         "blocked"
     } else if !rendered_root.exists() {
         "not_installed"
@@ -262,6 +277,7 @@ fn skill_status_entry(
         "rendered_valid": receipt_ok,
         "client_state": client_state,
         "installed_version": receipt.as_ref().map(|value| value.version.clone()),
+        "managing_profile": managing_profile,
         "available_version": record.manifest.version,
         "last_synced_at": receipt.as_ref().map(|value| value.rendered_at.clone()),
         "managed_files": receipt.as_ref().map(|value| value.files.clone()).unwrap_or_default(),
@@ -322,6 +338,7 @@ fn render_skill(
         skill_id: record.manifest.id.clone(),
         version: record.manifest.version.clone(),
         client: client_id.to_string(),
+        agent_profile: crate::store::paths::profile_name(),
         source_root: record.version_root.to_string_lossy().to_string(),
         rendered_root: rendered_root.to_string_lossy().to_string(),
         rendered_at: stamp,
@@ -384,42 +401,6 @@ fn uninstall_skill(
     validate_rendered_skill(&rendered_root, &receipt)?;
     fs::remove_dir_all(&rendered_root)?;
     Ok(json!({"skill_id": skill_id, "removed": true}))
-}
-
-fn resolve_target(store: &SkillStore) -> DirectSkillTarget {
-    if let Some(path) = env::var_os("HIMIND_COPILOT_SKILL_DIR") {
-        return DirectSkillTarget {
-            root: PathBuf::from(path),
-            source: "env:HIMIND_COPILOT_SKILL_DIR".to_string(),
-            configured: true,
-        };
-    }
-    if let Some(path) = env::var_os("COPILOT_SKILL_DIR") {
-        return DirectSkillTarget {
-            root: PathBuf::from(path),
-            source: "env:COPILOT_SKILL_DIR".to_string(),
-            configured: true,
-        };
-    }
-    if let Some(userprofile) = env::var_os("USERPROFILE") {
-        return DirectSkillTarget {
-            root: PathBuf::from(userprofile).join(".copilot").join("skills"),
-            source: "userprofile:dot-copilot".to_string(),
-            configured: false,
-        };
-    }
-    if let Some(home) = env::var_os("HOME") {
-        return DirectSkillTarget {
-            root: PathBuf::from(home).join(".copilot").join("skills"),
-            source: "home:dot-copilot".to_string(),
-            configured: false,
-        };
-    }
-    DirectSkillTarget {
-        root: store.rendered_skill_root(CLIENT_ID, ".preview"),
-        source: "preview".to_string(),
-        configured: false,
-    }
 }
 
 fn target_mode(target: &DirectSkillTarget) -> &'static str {

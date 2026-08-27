@@ -346,7 +346,7 @@ pub(crate) fn create(
                 "author": author.trim(),
                 "categories": [category],
                 "release_notes": release_notes,
-                "supported_clients": ["himind-ai", "codex", "github-copilot", "workbuddy"],
+                "supported_clients": ["agent-skills"],
             }),
         )?,
     };

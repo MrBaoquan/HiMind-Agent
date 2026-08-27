@@ -131,7 +131,12 @@ impl SkillStore {
                     fs::remove_dir_all(skill_root)?;
                 }
             }
-            for client in ["codex", "github-copilot", "workbuddy"] {
+            let clients = std::iter::once("codex").chain(
+                crate::skill::clients::DIRECTORY_CLIENTS
+                    .iter()
+                    .map(|definition| definition.id),
+            );
+            for client in clients {
                 let rendered_root = self.root.join("rendered").join(client).join(skill_id);
                 if rendered_root.exists() {
                     fs::remove_dir_all(rendered_root)?;
@@ -198,13 +203,33 @@ impl SkillStore {
         if existed {
             fs::remove_dir_all(&root)?;
         }
-        for client in ["codex", "github-copilot", "workbuddy"] {
+        let clients = std::iter::once("codex").chain(
+            crate::skill::clients::DIRECTORY_CLIENTS
+                .iter()
+                .map(|definition| definition.id),
+        );
+        for client in clients {
             let rendered = self.rendered_skill_root(client, skill_id);
             if rendered.exists() {
                 fs::remove_dir_all(rendered)?;
             }
         }
         Ok(existed)
+    }
+
+    pub(crate) fn remove_installed_skill(&self, skill_id: &str) -> Result<bool, Box<dyn Error>> {
+        let Some(record) = self.get_record(skill_id)? else {
+            return Ok(false);
+        };
+        if record.manifest.scope == SkillScope::Builtin {
+            return Err("系统内置技能不能卸载".into());
+        }
+        let root = self.skill_root_for_scope(&record.manifest.scope, skill_id);
+        if !root.exists() {
+            return Ok(false);
+        }
+        fs::remove_dir_all(root)?;
+        Ok(true)
     }
 
     pub(crate) fn apply_management_policy(
@@ -619,6 +644,40 @@ mod tests {
             .install_organization_package(&package, &manifest.id, &manifest.version)
             .unwrap_err();
         assert!(error.to_string().contains("内容不同"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removes_installed_skill_from_the_agent_store() {
+        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
+        let store = SkillStore::with_root(root.clone());
+        let package = root.join("package");
+        let manifest = SkillManifest {
+            id: "com.himind.skill.remove-test".to_string(),
+            name: "卸载测试".to_string(),
+            author: String::new(),
+            categories: vec![],
+            version: "1.0.0".to_string(),
+            scope: SkillScope::User,
+            description: String::new(),
+            release_notes: String::new(),
+            min_agent_version: String::new(),
+            supported_clients: vec!["himind-ai".to_string()],
+            capabilities: vec![],
+            plugin_dependencies: vec![],
+            risk_summary: String::new(),
+            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
+        };
+        write_skill_package(&package, &manifest, "# Remove test").unwrap();
+        store
+            .install_user_package(&package, &manifest.id, &manifest.version)
+            .unwrap();
+
+        assert!(store.get_record(&manifest.id).unwrap().is_some());
+        assert!(store.remove_installed_skill(&manifest.id).unwrap());
+        assert!(store.get_record(&manifest.id).unwrap().is_none());
+        assert!(!store.remove_installed_skill(&manifest.id).unwrap());
+
         let _ = fs::remove_dir_all(root);
     }
 }

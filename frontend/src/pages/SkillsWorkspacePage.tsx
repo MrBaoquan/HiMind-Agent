@@ -4,26 +4,32 @@ import {
   ArrowLeft,
   BadgeCheck,
   Building2,
+  ChevronDown,
+  Code2,
   CircleAlert,
   FolderOpen,
   Download,
+  Link2Off,
+  PlugZap,
   RefreshCw,
   Files,
   Link2,
   Search,
+  Settings2,
   Sparkles,
   Trash2,
   Wrench,
   X,
 } from 'lucide-react';
 import { EmptyState, PageHeader, Pill, Tags } from '../components/Common';
-import type { CatalogPage, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillInstallPlan, SkillSyncSettings } from '../services/agentApi';
+import type { CatalogPage, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, McpTargetDescriptor, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillInstallPlan, SkillSyncSettings } from '../services/agentApi';
 import { FUNCTIONAL_CATEGORIES, categorySearchText, functionalCategoryLabels, functionalCategoryMatches } from '../data/categoryCatalog';
 import { ManagedCapabilitiesPanel } from './ManagedCapabilitiesPage';
 
 type SkillsWorkspacePageProps = {
   catalog: SkillCatalogResponse | null;
   status: CodexSkillStatusResponse | null;
+  mcpTargets: McpTargetDescriptor[];
   error: string | null;
   marketplace: OrganizationSkillCatalogItem[];
   marketplaceError: string | null;
@@ -46,14 +52,18 @@ type SkillsWorkspacePageProps = {
   onInstallMarketplace: (skillId: string, version: string | undefined, optionalPluginIds: string[]) => void;
   onRepair: (skillId: string) => void;
   onUninstall: (skillId: string) => void;
+  onSyncSkillClient: (skillId: string, clientId: string) => void;
+  onUnregisterClient: (skillId: string, clientId: string) => void;
+  onUnregisterClients: (skillId: string) => void;
   onOpenDirectory: (path: string) => void;
   onImportLocal: () => void;
   onImportGithub: (sourceUrl: string) => Promise<void>;
+  onOpenAiConnections: () => void;
 };
 
 type ViewKey = 'marketplace' | 'installed' | 'system';
 
-export function SkillsWorkspacePage({ catalog, status, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, marketEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onOpenDirectory, onImportLocal, onImportGithub }: SkillsWorkspacePageProps) {
+export function SkillsWorkspacePage({ catalog, status, mcpTargets, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, marketEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onSyncSkillClient, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onUnregisterClient, onUnregisterClients, onOpenDirectory, onImportLocal, onImportGithub, onOpenAiConnections }: SkillsWorkspacePageProps) {
   const [query, setQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [marketplaceItems, setMarketplaceItems] = useState<OrganizationSkillCatalogItem[]>(marketplace);
@@ -78,9 +88,9 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
   const [githubBusy, setGithubBusy] = useState(false);
   const [githubError, setGithubError] = useState('');
   const [planLoading, setPlanLoading] = useState(false);
-  const items = status?.items || [];
-	const installedById = useMemo(() => new Map(items.filter(item => ['installed', 'outdated', 'modified'].includes(item.client_state)).map(item => [item.record.manifest.id, item])), [items]);
-	const localItems = useMemo(() => dashboardEnabled ? items.filter(item => item.client_state !== 'not_installed' && !isManagedSkill(item, desired, marketplace)) : items.filter(item => item.client_state !== 'not_installed'), [dashboardEnabled, desired, items, marketplace]);
+  const items = useMemo(() => aggregateSkillStatusItems(status), [status]);
+	const installedById = useMemo(() => new Map(items.map(item => [item.record.manifest.id, item])), [items]);
+	const localItems = useMemo(() => dashboardEnabled ? items.filter(item => !isManagedSkill(item, desired, marketplace)) : items, [dashboardEnabled, desired, items, marketplace]);
 	const systemSkillCount = useMemo(() => {
 	  const ids = new Set((desired?.items || []).filter(item => item.asset_kind === 'skill' && isManagedPolicy(item)).map(item => item.asset_key));
 	  items.filter(item => item.record.manifest.scope === 'builtin').forEach(item => ids.add(item.record.manifest.id));
@@ -180,17 +190,17 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
         actions={<>
           <button className="btn" title="从 GitHub 导入 Skill" onClick={() => { setGithubError(''); setGithubOpen(true); }}><Link2 size={15} />GitHub 导入</button>
           <button className="btn" title="导入本地 Skill" onClick={onImportLocal}><FolderOpen size={15} />导入本地 Skill</button>
-          {view === 'installed' ? <button className="btn btn-primary" onClick={onSyncAll} disabled={isBusy || !items.length}><RefreshCw className={busyAction === 'sync-all' ? 'spin' : ''} size={16} />{busyAction === 'sync-all' ? '正在更新' : '更新全部'}</button> : null}
+          {view === 'installed' ? <button className="btn btn-primary" title="同步全部已安装技能到可用 AI 工具" onClick={onSyncAll} disabled={isBusy || !items.length}><RefreshCw className={busyAction === 'sync-all' ? 'spin' : ''} size={16} />{busyAction === 'sync-all' ? '同步中' : '全量同步'}</button> : null}
           {view === 'installed' ? <button className="btn btn-icon" title="打开技能目录" aria-label="打开技能目录" onClick={() => status?.target_root && onOpenDirectory(status.target_root)} disabled={!status?.target_root}><FolderOpen size={16} /></button> : null}
           <button className="btn btn-icon" title="刷新状态" aria-label="刷新状态" onClick={onRefresh} disabled={isBusy}><RefreshCw size={16} /></button>
         </>}
       />
 
-      <SkillClientSummary status={status} />
+      <SkillClientSummary status={status} mcpTargets={mcpTargets} onOpenAiConnections={onOpenAiConnections} />
 
       {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>技能状态读取失败</strong><span>{error}</span></div></div> : null}
 
-      {status?.target_mode === 'preview' && view !== 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>未找到 AI 工具的技能目录，当前安装仅在 HiMind Agent 中可用。</span></div> : null}
+      {externalSkillTargetsUnavailable(status) && view !== 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>尚未发现外部 AI 工具的技能目录；已安装技能仍可由 HiMind AI 直接使用。</span></div> : null}
 	  {marketEnabled && marketplaceError && view === 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{marketplaceError}</span></div> : null}
 	  <div className="plugin-toolbar skill-view-toolbar"><div className="plugin-tabs" role="tablist" aria-label="技能视图">
 	    {marketEnabled ? <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button> : null}
@@ -214,13 +224,13 @@ export function SkillsWorkspacePage({ catalog, status, error, marketplace, marke
 
         <main className="skill-detail">
 		  <button className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回技能列表</button>
-		  {view === 'marketplace' ? (selectedMarket ? <MarketSkillDetail item={selectedMarket} installed={installedById.get(selectedMarket.skill_id)} availablePlugins={availablePlugins} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlan={(version) => void openInstallPlan(selectedMarket.skill_id, version)} planLoading={planLoading} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />) : (selected ? <SkillDetail item={selected} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />)}
+          {view === 'marketplace' ? (selectedMarket ? <MarketSkillDetail item={selectedMarket} installed={installedById.get(selectedMarket.skill_id)} availablePlugins={availablePlugins} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlan={(version) => void openInstallPlan(selectedMarket.skill_id, version)} planLoading={planLoading} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />) : (selected ? <SkillDetail item={selected} clientStatus={status} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />)}
         </main>
       </section>}
 
       {pendingUninstall ? <div className="skill-dialog-backdrop" role="presentation"><div className="skill-dialog" role="dialog" aria-modal="true" aria-labelledby="skill-uninstall-title">
         <div className="skill-dialog-head"><strong id="skill-uninstall-title">卸载技能</strong><button className="btn btn-icon" aria-label="关闭" onClick={() => setPendingUninstall(null)}><X size={16} /></button></div>
-        <p>将从 Codex 中移除 <strong>{pendingUninstall.record.manifest.name}</strong>，本地版本会保留。</p>
+        <p>将卸载 <strong>{pendingUninstall.record.manifest.name}</strong>，并清理它在各 AI 工具中的分发副本。</p>
         {pendingUninstall.modified_files.length ? <div className="skill-dialog-warning"><CircleAlert size={16} />检测到用户修改。请先使用“修复并备份”保留当前文件。</div> : null}
         <div className="skill-dialog-actions"><button className="btn" onClick={() => setPendingUninstall(null)}>取消</button><button className="btn btn-danger" disabled={isBusy || pendingUninstall.modified_files.length > 0} onClick={() => { onUninstall(pendingUninstall.record.manifest.id); setPendingUninstall(null); }}><Trash2 size={15} />确认卸载</button></div>
       </div></div> : null}
@@ -238,42 +248,151 @@ function MarketSkillListItem({ item, installed, selected, onSelect }: { item: Or
   return <button className={`skill-browser-item skill-marketplace-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(item.skill_id)}><span className={`skill-card-mark ${tone}`}>{item.name.slice(0, 1).toUpperCase()}</span><span className="skill-browser-item-copy"><strong>{item.name}</strong><small>{item.source === 'organization' ? '组织提供' : '公共技能库'} · {item.description || '暂无用途说明'}</small><small className="catalog-item-author">作者：{item.author_name || '马宝全'}</small></span><span className={`skill-state-label ${tone}`}>{label}</span></button>;
 }
 
-const SKILL_CLIENTS = [
-  { id: 'codex', name: 'Codex', mark: 'C' },
-  { id: 'github-copilot', name: 'GitHub Copilot', mark: 'G' },
-  { id: 'workbuddy', name: 'WorkBuddy', mark: 'W' },
-] as const;
+const DISTRIBUTED_SKILL_STATES: CodexSkillStatusItem['client_state'][] = ['installed', 'outdated', 'modified', 'managed_elsewhere'];
 
-function SkillClientSummary({ status }: { status: CodexSkillStatusResponse | null }) {
-  return <section className="skill-client-summary" aria-label="AI 工具技能状态">
-    <div className="skill-client-summary-intro"><span className="skill-client-mark">AI</span><div><small>AI 工具</small><strong>技能将安装到可用工具</strong></div></div>
-    {SKILL_CLIENTS.map(client => {
-      const clientStatus = statusForClient(status, client.id);
-      const installedCount = clientStatus?.items.filter(item => item.client_state !== 'not_installed').length || 0;
-      const attentionCount = clientStatus?.items.filter(item => ['outdated', 'modified', 'failed'].includes(item.client_state)).length || 0;
-      return <div className="skill-client-card" key={client.id}>
-        <span className="skill-client-mark">{client.mark}</span>
-        <div><small>{client.name}</small><strong><span className={`status-dot ${clientStatusTone(clientStatus)}`} /> {clientStatusLabel(clientStatus)}</strong><span className="skill-client-count">{clientStatus ? `${installedCount} 个技能${attentionCount ? ` · ${attentionCount} 个待处理` : ''}` : '等待检测'}</span></div>
-      </div>;
-    })}
+const SKILL_CLIENT_NAMES: Record<string, string> = {
+  'himind-ai': 'HiMind AI',
+  codex: 'Codex',
+  'github-copilot': 'GitHub Copilot',
+  workbuddy: 'WorkBuddy',
+  claude: 'Claude',
+  cursor: 'Cursor',
+  windsurf: 'Windsurf',
+  cline: 'Cline',
+  trae: 'Trae',
+  codebuddy: 'CodeBuddy',
+  qoder: 'Qoder',
+  zcode: 'ZCode',
+  antigravity: 'Antigravity',
+  'gemini-cli': 'Gemini CLI',
+  opencode: 'OpenCode',
+  'kimi-code': 'Kimi Code',
+  kiro: 'Kiro',
+  'qwen-code': 'Qwen Code',
+};
+
+function skillClientDescriptors(status: CodexSkillStatusResponse | null, mcpTargets: McpTargetDescriptor[]) {
+  const ids = new Set<string>(['himind-ai', 'codex']);
+  Object.keys(status?.clients || {}).forEach(id => ids.add(id));
+  mcpTargets.filter(target => target.supports_skills).forEach(target => ids.add(target.skill_client_id || target.id));
+  const preferred = ['himind-ai', 'github-copilot', 'workbuddy', 'qoder', 'zcode', 'codex', 'claude'];
+  return [...ids].filter(Boolean).sort((left, right) => {
+    const li = preferred.indexOf(left); const ri = preferred.indexOf(right);
+    if (li !== -1 || ri !== -1) return (li === -1 ? 99 : li) - (ri === -1 ? 99 : ri);
+    return (SKILL_CLIENT_NAMES[left] || left).localeCompare(SKILL_CLIENT_NAMES[right] || right);
+  }).map(id => {
+    const clientStatus = statusForClient(status, id);
+    return {
+      id,
+      name: clientStatus?.client_name || SKILL_CLIENT_NAMES[id] || id,
+      detected: Boolean(clientStatus?.client_detected || clientStatus?.target_exists || clientStatus?.target_configured),
+      supportLevel: clientStatus?.support_level || (['himind-ai', 'codex'].includes(id) ? 'official' : 'compatible'),
+      supportNote: clientStatus?.support_note || '',
+    };
+  });
+}
+
+function SkillClientIcon({ clientId, size = 16 }: { clientId: string; size?: number }) {
+  if (clientId === 'himind-ai') return <Sparkles size={size} />;
+  if (clientId === 'codex' || clientId === 'claude') return <Code2 size={size} />;
+  if (clientId.includes('github')) return <span className="skill-client-letter">GH</span>;
+  return <Wrench size={size} />;
+}
+
+function SkillClientSummary({ status, mcpTargets, onOpenAiConnections }: { status: CodexSkillStatusResponse | null; mcpTargets: McpTargetDescriptor[]; onOpenAiConnections: () => void }) {
+  const clients = skillClientDescriptors(status, mcpTargets);
+  const external = clients.filter(client => client.id !== 'himind-ai');
+  const activeExternal = external.filter(client => client.detected || Boolean(targetForSkillClient(mcpTargets, client.id)?.detected));
+  const attention = activeExternal.reduce((count, client) => {
+    const state = statusForClient(status, client.id)?.items.some(item => ['outdated', 'modified', 'blocked', 'failed'].includes(item.client_state));
+    return count + (state ? 1 : 0);
+  }, 0);
+  return <section className="skill-client-summary skill-client-summary-compact" aria-label="AI 工具技能状态">
+    <div className="skill-client-summary-compact-main"><span className="status-dot success" /><div><small>Agent Skills</small><strong>HiMind AI 直接可用</strong><span>{activeExternal.length ? `已连接 ${activeExternal.length} 个外部 AI 工具` : '可按需连接外部 AI 工具'}{attention ? ` · ${attention} 个工具需处理` : ''}</span></div></div>
+    <button type="button" className="btn btn-icon" title="管理 AI 连接" aria-label="管理 AI 连接" onClick={onOpenAiConnections}><Settings2 size={15} /></button>
   </section>;
+}
+
+function skillClientDistributionState(clientId: string, status?: CodexSkillStatusResponse): { label: string; detail: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
+  if (!status) return { label: '正在读取', detail: '技能分发状态', tone: 'neutral' };
+  const items = status.items.filter(item => item.client_state !== 'unsupported');
+  if (!items.length) return { label: '暂无适用技能', detail: '0 个技能', tone: 'neutral' };
+  const distributed = items.filter(item => DISTRIBUTED_SKILL_STATES.includes(item.client_state)).length;
+  const pending = items.filter(item => item.client_state === 'not_installed').length;
+  const repair = items.filter(item => item.client_state === 'outdated' || item.client_state === 'modified').length;
+  const blocked = items.filter(item => item.client_state === 'blocked' || item.client_state === 'failed').length;
+  const foreign = items.filter(item => item.client_state === 'managed_elsewhere');
+  const detail = `${distributed}/${items.length} 个技能`;
+  if (blocked) return { label: `${blocked} 个技能不可用`, detail, tone: 'danger' };
+  if (repair) return { label: `${repair} 个技能需处理`, detail, tone: 'warn' };
+  if (pending) return { label: `${pending} 个技能待同步`, detail, tone: 'warn' };
+  if (foreign.length === items.length) {
+    return { label: '已同步', detail, tone: 'success' };
+  }
+  return { label: clientId === 'himind-ai' ? 'Skill 直接可用' : 'Skill 已同步', detail, tone: 'success' };
+}
+
+function targetForSkillClient(targets: McpTargetDescriptor[], clientId: string) {
+  return targets
+    .filter(target => (target.skill_client_id || target.id) === clientId)
+    .sort((left, right) => Number(right.state === 'configured') - Number(left.state === 'configured') || Number(right.detected) - Number(left.detected))[0];
 }
 
 function statusForClient(status: CodexSkillStatusResponse | null, clientId: string) {
   if (!status) return undefined;
-  return clientId === 'codex' ? status : status.clients?.[clientId];
+  return status.clients?.[clientId] || (clientId === 'codex' ? status : undefined);
 }
 
-function clientStatusLabel(status?: CodexSkillStatusResponse) {
-  if (!status) return '未检测';
-  if (status.target_mode === 'preview') return '未连接';
-  if (status.target_configured || status.target_exists || status.target_mode === 'detected' || status.target_mode === 'configured') return '已就绪';
-  return '未连接';
+function skillClientConnectionState(clientId: string, target?: McpTargetDescriptor): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
+  if (clientId === 'himind-ai') return { label: '内置可用', tone: 'success' };
+  if (!target) return { label: 'MCP 未适配', tone: 'neutral' };
+  if (target.state === 'configured') return { label: 'MCP 已连接', tone: 'success' };
+  if (target.state === 'needs_repair') return { label: '连接需更新', tone: 'warn' };
+  if (target.state === 'invalid_config') return { label: '连接异常', tone: 'danger' };
+  if (target.detected) return { label: '可连接', tone: 'neutral' };
+  return { label: 'MCP 未配置', tone: 'neutral' };
 }
 
-function clientStatusTone(status?: CodexSkillStatusResponse) {
-  if (!status || status.target_mode === 'preview') return 'neutral';
-  return status.target_configured || status.target_exists || status.target_mode === 'detected' || status.target_mode === 'configured' ? 'success' : 'warn';
+function externalSkillTargetsUnavailable(status: CodexSkillStatusResponse | null) {
+  if (!status) return false;
+  return Object.entries(status.clients || {}).filter(([clientId]) => clientId !== 'himind-ai').every(([, client]) => !client.client_detected && !client.target_exists && client.target_mode === 'preview');
+}
+
+function aggregateSkillStatusItems(status: CodexSkillStatusResponse | null): CodexSkillStatusItem[] {
+  if (!status) return [];
+  const clients = status.clients ? Object.values(status.clients) : [status];
+  const records = new Map<string, CodexSkillStatusItem>();
+  clients.forEach(client => client.items.forEach(item => {
+    if (!records.has(item.record.manifest.id)) records.set(item.record.manifest.id, item);
+  }));
+  return [...records.values()].map(base => {
+    const variants = clients
+      .map(client => client.items.find(item => item.record.manifest.id === base.record.manifest.id))
+      .filter((item): item is CodexSkillStatusItem => Boolean(item));
+    const supported = variants.filter(item => item.client_state !== 'unsupported');
+    const state = aggregateClientState(supported.map(item => item.client_state));
+    const representative = supported.find(item => item.client_state === state) || supported[0] || base;
+    const availableActions = new Set(supported.flatMap(item => item.available_actions));
+    if (base.record.manifest.scope === 'builtin') availableActions.delete('uninstall');
+    else availableActions.add('uninstall');
+    return {
+      ...representative,
+      client_state: state,
+      rendered: supported.some(item => item.rendered),
+      rendered_valid: supported.some(item => item.rendered_valid),
+      installed_version: supported.find(item => item.installed_version)?.installed_version || representative.installed_version,
+      modified_files: [...new Set(supported.flatMap(item => item.modified_files))],
+      available_actions: [...availableActions],
+    };
+  });
+}
+
+function aggregateClientState(states: CodexSkillStatusItem['client_state'][]): CodexSkillStatusItem['client_state'] {
+  if (!states.length) return 'unsupported';
+  for (const state of ['failed', 'modified', 'outdated', 'installed', 'managed_elsewhere', 'not_installed', 'blocked'] as const) {
+    if (states.includes(state)) return state;
+  }
+  return 'unsupported';
 }
 
 function MarketSkillDetail({ item, installed, availablePlugins, busyAction, onLoadVersions, onPlan, planLoading }: { item: OrganizationSkillCatalogItem; installed?: CodexSkillStatusItem; availablePlugins: PluginCatalogItem[]; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onPlan: (version?: string) => void; planLoading: boolean }) {
@@ -303,7 +422,7 @@ function MarketSkillDetail({ item, installed, availablePlugins, busyAction, onLo
     {tab === 'versions' ? <SkillVersionList versions={versions} currentVersion={installed?.record.manifest.version} lockedLabel={lockedLabel} loading={versionsLoading} error={versionsError} onSelect={onPlan} /> : <>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>功能</strong></div></div><p className="skill-release-notes">{item.description || '暂无功能说明。'}</p><div className="market-taxonomy"><Tags items={functionalCategoryLabels(item.categories)} /></div></section>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>依赖</strong></div></div><div className="skill-dependency-list">{(item.plugin_dependencies || []).map(dependency => <div key={dependency.plugin_id}><span className="status-dot success" /><PluginDependencyIdentity pluginId={dependency.plugin_id} plugins={availablePlugins} /><span>{dependency.required ? '必需' : '可选'}</span><strong>{dependency.min_version ? `v${dependency.min_version} 及以上` : '不限版本'}</strong></div>)}{!item.plugin_dependencies?.length ? <span className="skill-section-empty">无依赖</span> : null}</div></section>
-      <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="skill-release-grid"><div><small>Skill ID</small><code>{item.skill_id}</code></div><div><small>最低 Agent 版本</small><strong>{item.min_agent_version ? `v${item.min_agent_version}` : '--'}</strong></div><div><small>支持的 AI 客户端</small><strong>{item.supported_clients.join('、') || '--'}</strong></div></div></details>
+      <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="skill-release-grid"><div><small>Skill ID</small><code>{item.skill_id}</code></div><div><small>最低 Agent 版本</small><strong>{item.min_agent_version ? `v${item.min_agent_version}` : '--'}</strong></div><div><small>兼容标准</small><strong>Agent Skills</strong></div></div></details>
     </>}
   </>;
 }
@@ -335,7 +454,7 @@ function SkillListItem({ item, selected, onSelect }: { item: CodexSkillStatusIte
   return <button className={`skill-browser-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(manifest.id)}><span className={`skill-state-rail ${stateTone(item.client_state)}`} /><span className="skill-browser-item-copy"><strong>{manifest.name}</strong><small>作者：{manifest.author || '未知作者'}</small><small>{manifest.description || manifest.id}</small></span><span className={`skill-state-label ${stateTone(item.client_state)}`}>{clientStateLabel(item.client_state)}</span></button>;
 }
 
-function SkillDetail({ item, availablePlugins, catalogPolicy, busyAction, onLoadVersions, onPlanVersion, onSync, onRepair, onUninstall, onOpenDirectory }: { item: CodexSkillStatusItem; availablePlugins: PluginCatalogItem[]; catalogPolicy?: OrganizationSkillCatalogItem; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onPlanVersion: (version: string) => void; onSync: (id: string) => void; onRepair: (id: string) => void; onUninstall: () => void; onOpenDirectory: (path: string) => void }) {
+function SkillDetail({ item, clientStatus, availablePlugins, catalogPolicy, busyAction, onLoadVersions, onPlanVersion, onSync, onRepair, onUninstall, onSyncSkillClient, onUnregisterClient, onUnregisterClients, onOpenDirectory }: { item: CodexSkillStatusItem; clientStatus: CodexSkillStatusResponse | null; availablePlugins: PluginCatalogItem[]; catalogPolicy?: OrganizationSkillCatalogItem; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onPlanVersion: (version: string) => void; onSync: (id: string) => void; onRepair: (id: string) => void; onUninstall: () => void; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void; onOpenDirectory: (path: string) => void }) {
   const manifest = item.record.manifest;
   const actionBusy = Boolean(busyAction?.endsWith(manifest.id));
   const [tab, setTab] = useState<'details' | 'versions'>('details');
@@ -354,7 +473,6 @@ function SkillDetail({ item, availablePlugins, catalogPolicy, busyAction, onLoad
   }, [catalogPolicy, manifest.id, onLoadVersions, tab]);
   return <>
     <header className="skill-detail-header"><div className="skill-detail-title"><span className="skill-detail-mark">{manifest.name.slice(0, 1).toUpperCase()}</span><div><div className="skill-title-line"><h3>{manifest.name}</h3><Pill kind={statePill(item.client_state)}>{clientStateLabel(item.client_state)}</Pill></div><small className="skill-detail-source">作者：{manifest.author || '未知作者'}</small></div></div><div className="skill-detail-actions">
-      {item.available_actions.includes('install') || item.available_actions.includes('update') ? <button className="btn btn-primary" disabled={actionBusy} onClick={() => onSync(manifest.id)}><RefreshCw className={actionBusy ? 'spin' : ''} size={15} />{item.client_state === 'outdated' ? '更新' : '安装'}</button> : null}
       {item.available_actions.includes('repair') ? <button className="btn" disabled={actionBusy} onClick={() => onRepair(manifest.id)}><Wrench size={15} />{item.client_state === 'modified' ? '修复并备份' : '重新同步'}</button> : null}
       {item.available_actions.includes('uninstall') && catalogPolicy?.allow_uninstall !== false ? <button className="btn btn-danger-quiet" disabled={actionBusy} onClick={onUninstall}><Trash2 size={15} />卸载</button> : null}
     </div></header>
@@ -363,10 +481,47 @@ function SkillDetail({ item, availablePlugins, catalogPolicy, busyAction, onLoad
     {item.client_state === 'modified' ? <div className="skill-detail-notice modified"><Wrench size={16} /><div><strong>检测到技能文件已被修改</strong><span>修复前会自动保留一份备份。</span></div></div> : null}
     {tab === 'versions' ? <SkillVersionList versions={versions} currentVersion={item.installed_version || manifest.version} lockedLabel={catalogPolicy?.assignment === 'blocked' ? '不可安装' : managed ? '由组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={catalogPolicy ? onPlanVersion : undefined} /> : <>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>功能</strong></div></div><p className="skill-release-notes">{manifest.description || '暂无功能说明。'}</p></section>
+      <section className="skill-detail-section"><div className="skill-section-title"><div><strong>AI 工具</strong><small>管理技能注册</small></div></div><SkillClientAvailability status={clientStatus} skillId={manifest.id} busyAction={busyAction} canRegisterAll={item.available_actions.includes('install') || item.available_actions.includes('update')} allowUnregister={catalogPolicy?.allow_uninstall !== false} onRegisterAll={onSync} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} /></section>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>依赖</strong></div></div><div className="skill-dependency-list">{(manifest.plugin_dependencies || []).map(dependency => <div key={dependency.plugin_id}><span className="status-dot success" /><PluginDependencyIdentity pluginId={dependency.plugin_id} plugins={availablePlugins} /><span>{dependency.required ? '必需' : '可选'}</span><strong>{dependency.min_version ? `v${dependency.min_version} 及以上` : '不限版本'}</strong></div>)}{!manifest.plugin_dependencies?.length ? <span className="skill-section-empty">无依赖</span> : null}</div></section>
       <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>Skill ID</span><code>{manifest.id}</code></div><div><span>作者</span><strong>{manifest.author || '未知作者'}</strong></div><div><span>来源</span><strong>{scopeLabel(manifest.scope)}</strong></div><div><span>最近同步</span><strong>{formatSyncedAt(item.last_synced_at)}</strong></div><div className="wide"><span>本地目录</span><code>{item.rendered_root || '--'}</code></div></div><div className="skill-file-summary"><span /><button className="text-action" disabled={!item.rendered} onClick={() => onOpenDirectory(item.rendered_root)}><FolderOpen size={14} />打开目录</button></div></details>
     </>}
   </>;
+}
+
+function SkillClientAvailability({ status, skillId, busyAction, canRegisterAll, allowUnregister, onRegisterAll, onSyncSkillClient, onUnregisterClient, onUnregisterClients }: { status: CodexSkillStatusResponse | null; skillId: string; busyAction: string | null; canRegisterAll: boolean; allowUnregister: boolean; onRegisterAll: (skillId: string) => void; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void }) {
+  const clients = skillClientDescriptors(status, []);
+  const relevant = clients.filter(client => client.id === 'himind-ai' || client.detected || DISTRIBUTED_SKILL_STATES.includes(statusForClient(status, client.id)?.items.find(candidate => candidate.record.manifest.id === skillId)?.client_state || 'not_installed'));
+  const external = relevant.filter(client => client.id !== 'himind-ai');
+  const skillItems = new Map(external.map(client => [client.id, statusForClient(status, client.id)?.items.find(candidate => candidate.record.manifest.id === skillId)]));
+  const synced = external.filter(client => ['installed', 'outdated', 'modified', 'managed_elsewhere'].includes(skillItems.get(client.id)?.client_state || '')).length;
+  const pending = external.filter(client => skillItems.get(client.id)?.client_state === 'not_installed').length;
+  const attention = external.filter(client => ['outdated', 'modified', 'blocked', 'failed'].includes(skillItems.get(client.id)?.client_state || '')).length;
+  const registerAllBusy = busyAction === `sync:${skillId}`;
+  const renderClient = (client: (typeof clients)[number]) => {
+    const item = statusForClient(status, client.id)?.items.find(candidate => candidate.record.manifest.id === skillId);
+    const state = skillAvailabilityState(client.id, item);
+    const canUnregister = allowUnregister && client.id !== 'himind-ai' && ['installed', 'outdated'].includes(item?.client_state || '');
+    const unregisterBusy = busyAction === `unregister:${client.id}:${skillId}`;
+    const registerable = client.id !== 'himind-ai' && ['not_installed', 'outdated', 'modified'].includes(item?.client_state || '') && client.detected;
+    const registerBusy = busyAction === `register:${client.id}:${skillId}`;
+    return <div className="skill-client-tool" key={client.id}><span className={`skill-client-mini-icon ${client.id === 'himind-ai' ? 'himind-ai' : ''}`}><SkillClientIcon clientId={client.id} size={14} /></span><span className="skill-client-tool-copy"><strong title={client.name}>{client.name}</strong><small className={state.tone}>{state.label}</small></span>{canUnregister ? <button type="button" className="btn btn-icon btn-danger-quiet skill-client-unregister" title={`取消 ${client.name} 注册`} aria-label={`取消 ${client.name} 注册`} disabled={unregisterBusy} onClick={() => onUnregisterClient(skillId, client.id)}><Link2Off className={unregisterBusy ? 'spin' : ''} size={13} /></button> : registerable ? <button type="button" className="btn btn-icon skill-client-register" title={`注册到 ${client.name}`} aria-label={`注册到 ${client.name}`} disabled={registerBusy} onClick={() => onSyncSkillClient(skillId, client.id)}><PlugZap className={registerBusy ? 'spin' : ''} size={13} /></button> : <span className="skill-client-tool-action-space" />}</div>;
+  };
+  if (!relevant.length) return <div className="skill-client-availability"><span className="skill-section-empty">暂无可用的 AI 工具分发目标</span></div>;
+  const summary = status ? `已注册 ${synced} 个工具${pending ? ` · ${pending} 个待注册` : ''}${attention ? ` · ${attention} 个需处理` : ''}` : '正在读取注册状态';
+  const canUnregisterAll = allowUnregister && external.some(client => ['installed', 'outdated', 'managed_elsewhere'].includes(skillItems.get(client.id)?.client_state || ''));
+  return <div className="skill-client-availability"><div className="skill-client-distribution-summary"><span className="status-dot success" /><span><strong>HiMind AI 直接可用</strong><small>{summary}</small></span><div className="skill-client-summary-actions">{canRegisterAll ? <button type="button" className="btn btn-icon btn-primary" title="注册到全部工具" aria-label="注册到全部工具" disabled={Boolean(busyAction)} onClick={() => onRegisterAll(skillId)}><PlugZap className={registerAllBusy ? 'spin' : ''} size={14} /></button> : null}{canUnregisterAll ? <button type="button" className="btn btn-icon btn-danger-quiet" title="取消全部注册" aria-label="取消全部注册" disabled={Boolean(busyAction)} onClick={() => onUnregisterClients(skillId)}><Link2Off size={14} /></button> : null}</div></div><details className="skill-client-tools"><summary><span><Settings2 size={14} /><strong>按工具管理</strong><small>{relevant.length}</small></span><ChevronDown className="skill-client-tools-chevron" size={15} /></summary><div>{relevant.map(renderClient)}</div></details></div>;
+}
+
+function skillAvailabilityState(clientId: string, item?: CodexSkillStatusItem): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
+  const state = item?.client_state;
+  if (!state || state === 'unsupported') return { label: '不支持', tone: 'neutral' };
+  if (state === 'installed') return { label: clientId === 'himind-ai' ? '直接可用' : '已注册', tone: 'success' };
+  if (state === 'managed_elsewhere') return { label: '其他实例已注册', tone: 'success' };
+  if (state === 'not_installed') return { label: '未注册', tone: 'neutral' };
+  if (state === 'outdated') return { label: '待更新', tone: 'warn' };
+  if (state === 'modified') return { label: '已修改', tone: 'warn' };
+  if (state === 'blocked') return { label: '依赖未满足', tone: 'danger' };
+  return { label: '注册失败', tone: 'danger' };
 }
 
 function isManagedPolicy(item: ExtensionDesiredItem) {
@@ -385,12 +540,12 @@ function isManagedSkill(item: CodexSkillStatusItem, desired: ExtensionDesiredSta
 }
 
 function clientStateLabel(state: CodexSkillStatusItem['client_state']) {
-  const labels: Record<CodexSkillStatusItem['client_state'], string> = { not_installed: '未安装', installed: '已安装', outdated: '有更新', modified: '已修改', blocked: '不可用', unsupported: '不兼容', failed: '失败' };
+  const labels: Record<CodexSkillStatusItem['client_state'], string> = { not_installed: '未安装', installed: '已安装', outdated: '有更新', modified: '已修改', managed_elsewhere: '其他实例已同步', blocked: '不可用', unsupported: '不兼容', failed: '失败' };
   return labels[state] || state;
 }
 
-function stateTone(state: CodexSkillStatusItem['client_state']) { if (state === 'installed') return 'success'; if (state === 'outdated' || state === 'modified') return 'warn'; if (state === 'not_installed') return 'neutral'; return 'danger'; }
-function statePill(state: CodexSkillStatusItem['client_state']): 'success' | 'warn' | 'danger' { if (state === 'installed') return 'success'; if (state === 'outdated' || state === 'modified' || state === 'not_installed') return 'warn'; return 'danger'; }
+function stateTone(state: CodexSkillStatusItem['client_state']) { if (state === 'installed' || state === 'managed_elsewhere') return 'success'; if (state === 'outdated' || state === 'modified') return 'warn'; if (state === 'not_installed') return 'neutral'; return 'danger'; }
+function statePill(state: CodexSkillStatusItem['client_state']): 'success' | 'warn' | 'danger' { if (state === 'installed' || state === 'managed_elsewhere') return 'success'; if (state === 'outdated' || state === 'modified' || state === 'not_installed') return 'warn'; return 'danger'; }
 function scopeLabel(scope: string) { if (scope === 'builtin') return '系统内置'; if (scope === 'organization') return '技能市场'; if (scope === 'user') return '我的技能'; return scope || '--'; }
 function formatSyncedAt(value?: string | null) { if (!value) return '尚未同步'; const milliseconds = Number.parseInt(value.split('-')[0], 10); return Number.isFinite(milliseconds) ? new Date(milliseconds).toLocaleString('zh-CN', { hour12: false }) : value; }
 function formatPublishedAt(value?: string) { if (!value) return '发布时间未知'; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('zh-CN'); }

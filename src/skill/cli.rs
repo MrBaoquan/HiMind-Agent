@@ -2,7 +2,8 @@ use crate::capability::types::{InvocationContext, InvocationSource};
 use crate::skill::resolver::CapabilityFact;
 use crate::skill::{
     catalog_json, client_status_json, client_sync_json, sync_record_to_supported_clients,
-    uninstall_supported_clients_json,
+    sync_skill_client_json, uninstall_supported_clients_json, unregister_skill_client_json,
+    unregister_skill_clients_json,
 };
 use crate::{Options, VERSION};
 use std::error::Error;
@@ -111,9 +112,24 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         Some("uninstall") if arguments.len() == 2 => {
             print_json(uninstall_supported_clients_json(&arguments[1])?)?
         }
+        Some("register") if arguments.len() == 3 => {
+            let capability_facts = capability_facts_for_cli(options)?;
+            print_json(sync_skill_client_json(
+                &arguments[1],
+                &arguments[2],
+                VERSION,
+                &capability_facts,
+            )?)?
+        }
+        Some("unregister") if arguments.len() == 3 => {
+            print_json(unregister_skill_client_json(&arguments[1], &arguments[2])?)?
+        }
+        Some("unregister-all") if arguments.len() == 2 => {
+            print_json(unregister_skill_clients_json(&arguments[1])?)?
+        }
         _ => {
             return Err(
-                "usage: himind-agent skill <catalog|import-local path|import-github github-url [ref] [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
+                "usage: himind-agent skill <catalog|import-local path|import-github github-url [ref] [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|register <skill-id> <client-id>|unregister <skill-id> <client-id>|unregister-all <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
             )
         }
     }

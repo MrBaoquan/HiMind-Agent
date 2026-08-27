@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const AGENT_FILE: &str = "himind-agent.exe";
+pub(crate) const MCP_FILE: &str = "himind-agent-mcp.exe";
 pub(crate) const LAUNCHER_FILE: &str = "himind-agent-launcher.exe";
 pub(crate) const UPDATER_FILE: &str = "himind-agent-updater.exe";
 pub(crate) const ACTIVE_VERSION_FILE: &str = "active-version";
@@ -108,6 +109,42 @@ pub(crate) fn resolve_agent_path(root: &Path) -> Result<PathBuf, Box<dyn Error>>
     Err(format!("installed Agent is missing under {}", root.display()).into())
 }
 
+/// Resolve the console MCP companion that belongs to the active Agent.
+///
+/// The GUI Agent intentionally uses the Windows GUI subsystem in release
+/// builds, so it must never be used as a stdio MCP process. Keeping the
+/// companion next to the versioned Agent makes launcher and self-update
+/// selection deterministic.
+pub(crate) fn resolve_mcp_path(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(version) = read_active_version(root)? {
+        let path = root.join("versions").join(version).join(MCP_FILE);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!("active Agent MCP companion is missing: {}", path.display()).into());
+    }
+    let legacy = root.join("current").join(MCP_FILE);
+    if legacy.is_file() {
+        return Ok(legacy);
+    }
+    let root_level = root.join(MCP_FILE);
+    if root_level.is_file() {
+        return Ok(root_level);
+    }
+    Err(format!(
+        "installed Agent MCP companion is missing under {}",
+        root.display()
+    )
+    .into())
+}
+
+pub(crate) fn companion_mcp_path(agent: &Path) -> PathBuf {
+    agent
+        .parent()
+        .map(|parent| parent.join(MCP_FILE))
+        .unwrap_or_else(|| PathBuf::from(MCP_FILE))
+}
+
 pub(crate) fn write_active_version(root: &Path, version: &str) -> Result<(), Box<dyn Error>> {
     validate_version(version)?;
     fs::create_dir_all(root)?;
@@ -138,6 +175,7 @@ pub(crate) fn prepare_version_directory(
     root: &Path,
     version: &str,
     staged_agent: &Path,
+    staged_mcp: &Path,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let versions = root.join("versions");
     fs::create_dir_all(&versions)?;
@@ -148,6 +186,10 @@ pub(crate) fn prepare_version_directory(
     }
     fs::create_dir(&temporary)?;
     if let Err(error) = fs::copy(staged_agent, temporary.join(AGENT_FILE)) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::copy(staged_mcp, temporary.join(MCP_FILE)) {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error.into());
     }
@@ -232,7 +274,7 @@ fn wide_path(path: &Path) -> Vec<u16> {
 mod tests {
     use super::{
         active_agent_path, installation_root_from_executable, repair_pending_updater,
-        resolve_agent_path, stable_launcher_for_executable, write_active_version,
+        resolve_agent_path, resolve_mcp_path, stable_launcher_for_executable, write_active_version,
     };
     use std::fs;
     use std::path::Path;
@@ -253,6 +295,28 @@ mod tests {
         assert_eq!(
             resolve_agent_path(&root).unwrap(),
             root.join("versions/0.4.0/himind-agent.exe")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_mcp_companion_from_active_version() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-layout-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("versions/0.4.0")).unwrap();
+        fs::write(root.join("versions/0.4.0/himind-agent.exe"), b"agent").unwrap();
+        fs::write(root.join("versions/0.4.0/himind-agent-mcp.exe"), b"mcp").unwrap();
+        write_active_version(&root, "0.4.0").unwrap();
+
+        assert_eq!(
+            resolve_mcp_path(&root).unwrap(),
+            root.join("versions/0.4.0/himind-agent-mcp.exe")
         );
         let _ = fs::remove_dir_all(root);
     }

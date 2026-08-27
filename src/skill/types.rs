@@ -80,6 +80,8 @@ pub(crate) struct SkillReceipt {
     pub skill_id: String,
     pub version: String,
     pub client: String,
+    #[serde(default = "default_agent_profile")]
+    pub agent_profile: String,
     pub source_root: String,
     pub rendered_root: String,
     pub rendered_at: String,
@@ -93,6 +95,10 @@ fn default_render_mode() -> String {
     "copy".to_string()
 }
 
+fn default_agent_profile() -> String {
+    "production".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SkillRecord {
     pub manifest: SkillManifest,
@@ -100,4 +106,20 @@ pub(crate) struct SkillRecord {
     pub version_root: PathBuf,
     pub current: bool,
     pub previous_version: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SkillReceipt;
+
+    #[test]
+    fn legacy_receipts_belong_to_the_production_profile() {
+        let receipt: SkillReceipt = serde_json::from_str(
+            r#"{"skill_id":"com.example.skill","version":"1.0.0","client":"codex","source_root":"source","rendered_root":"target","rendered_at":"now","files":[],"checksums":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.agent_profile, "production");
+        assert_eq!(receipt.render_mode, "copy");
+    }
 }

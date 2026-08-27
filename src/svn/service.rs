@@ -3703,10 +3703,11 @@ pub(crate) fn ensure_project_exhibits_access(
     request: EnsureProjectExhibitsAccessRequest,
 ) -> Result<Value, Box<dyn Error>> {
     let project_id = normalize_repository_name(&request.project_id)?;
+    let repository_access = normalize_repository_access(&request.repository_access);
     let (connection, password) = load_svn_admin_secret()?;
     let token = login_svnadmin(&connection.username, &password)?;
     let mut paths = Vec::new();
-    for (path, access) in PROJECT_REPOSITORY_BROAD_ACL {
+    for (path, access) in project_repository_broad_acl(&repository_access) {
         let action = ensure_authenticated_path_access(&project_id, path, access, &token)?;
         paths.push(json!({ "path": path, "access": access, "action": action }));
     }
@@ -3716,9 +3717,34 @@ pub(crate) fn ensure_project_exhibits_access(
         "principal": "$authenticated",
         "paths": paths,
         "tortoise_log_compatible": true,
-        "exhibit_default_access": "no",
+        "repository_access": repository_access,
+        "exhibit_default_access": if repository_access == "members" { "no" } else { "broad" },
         "verified": true
     }))
+}
+
+fn normalize_repository_access(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "all_read" => "all_read".to_string(),
+        "all_read_write" => "all_read_write".to_string(),
+        _ => "members".to_string(),
+    }
+}
+
+fn project_repository_broad_acl(access: &str) -> Vec<(&'static str, &'static str)> {
+    if access == "members" {
+        return PROJECT_REPOSITORY_BROAD_ACL.to_vec();
+    }
+    let exhibits_access = match access {
+        "all_read" => "r",
+        "all_read_write" => "rw",
+        _ => "no",
+    };
+    vec![
+        ("/", "r"),
+        ("/trunk", "r"),
+        ("/trunk/exhibits", exhibits_access),
+    ]
 }
 
 fn ensure_authenticated_path_access(
@@ -3869,13 +3895,16 @@ pub(crate) fn preview_project_acl(
     let managed_paths = validate_managed_acl_paths(&request.managed_paths)?;
     let desired = validate_desired_acl_entries(&request.desired_entries, &managed_paths)?;
     let current = read_project_acl(&project_id, &managed_paths)?;
-    Ok(acl_plan_result(
+    let mut result = acl_plan_result(
         &request.plan_id,
         &project_id,
         &managed_paths,
         &desired,
         &current,
-    ))
+    );
+    result["repository_access"] =
+        Value::String(normalize_repository_access(&request.repository_access));
+    Ok(result)
 }
 
 pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value, Box<dyn Error>> {
@@ -3890,6 +3919,7 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
     }
     let repository_policy = ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest {
         project_id: project_id.clone(),
+        repository_access: request.repository_access.clone(),
     })?;
     let (connection, password) = load_svn_admin_secret()?;
     let token = login_svnadmin(&connection.username, &password)?;
@@ -3991,6 +4021,12 @@ pub(crate) fn reconcile_project_acl(
     request: ReconcileProjectAclRequest,
 ) -> Result<Value, Box<dyn Error>> {
     let project_id = normalize_repository_name(&request.project_id)?;
+    if request.managed_paths.is_empty() {
+        return ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest {
+            project_id,
+            repository_access: request.repository_access,
+        });
+    }
     let managed_paths = validate_managed_acl_paths(&request.managed_paths)?;
     let desired_entries = validate_desired_acl_entries(&request.desired_entries, &managed_paths)?;
     let current = read_project_acl(&project_id, &managed_paths)?;
@@ -4000,6 +4036,7 @@ pub(crate) fn reconcile_project_acl(
         managed_paths,
         desired_entries,
         expected_current_digest: acl_digest(&current)?,
+        repository_access: request.repository_access,
     })
 }
 
@@ -4402,6 +4439,7 @@ fn is_migration_excluded_name(value: &str) -> bool {
 
 pub(crate) fn update_workspace(request: SvnWorkspaceRequest) -> Result<Value, Box<dyn Error>> {
     let target = validate_working_copy(&request.target_path)?;
+    ensure_clean_working_copy_for_update(&target)?;
     let (connection, password) = load_company_svn_secret()?;
     let output = run_svn_authenticated(
         ["update".to_string(), target.to_string_lossy().to_string()],
@@ -4409,6 +4447,17 @@ pub(crate) fn update_workspace(request: SvnWorkspaceRequest) -> Result<Value, Bo
         &password,
     )?;
     Ok(json!({ "ok": true, "output": output, "workspace": workspace_status_path(&target)? }))
+}
+
+fn ensure_clean_working_copy_for_update(working_copy: &Path) -> Result<(), Box<dyn Error>> {
+    let change_count = svn_status_change_count(working_copy)?;
+    if change_count > 0 {
+        return Err(format!(
+            "SVN update 已阻止：本地工程存在 {change_count} 项未提交变更，请先提交或备份后再更新"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn open_workspace(request: SvnWorkspaceRequest) -> Result<Value, Box<dyn Error>> {
@@ -5273,7 +5322,15 @@ fn reject_sensitive_path(target: &Path) -> Result<(), Box<dyn Error>> {
         r"c:\program files (x86)",
         r"c:\programdata",
     ];
-    if normalized == r"c:\"
+    let is_windows_volume_root =
+        normalized.len() == 3 && normalized.as_bytes()[1] == b':' && normalized.ends_with('\\');
+    let unc_components = normalized
+        .strip_prefix(r"\\")
+        .map(|value| value.split('\\').filter(|part| !part.is_empty()).count())
+        .unwrap_or_default();
+    let is_unc_share_root = normalized.starts_with(r"\\") && unc_components <= 2;
+    if is_windows_volume_root
+        || is_unc_share_root
         || normalized.starts_with(&(windows + "\\"))
         || program_files
             .iter()
@@ -5349,9 +5406,11 @@ fn checkout_repository_url(
     if segments.len() != 5
         || segments[0] != "repo"
         || normalize_repository_name(segments[1]).is_err()
+        || segments[1] != project_id
         || segments[2] != "trunk"
         || segments[3] != "exhibits"
         || normalize_repository_name(segments[4]).is_err()
+        || segments[4] != exhibit_id
     {
         return Err("repository_url must be a HiMind exhibit SVN URL".into());
     }
@@ -5456,17 +5515,23 @@ mod tests {
     fn checkout_prefers_a_registered_himind_exhibit_url() {
         assert_eq!(
             checkout_repository_url(
-                Some("http://svn.andcrane.com/repo/prj_legacy/trunk/exhibits/EX-0088/"),
+                Some("http://svn.andcrane.com/repo/prj_current/trunk/exhibits/EX-0088/"),
                 "prj_current",
                 "EX-0088",
             )
             .unwrap(),
-            "http://svn.andcrane.com/repo/prj_legacy/trunk/exhibits/EX-0088"
+            "http://svn.andcrane.com/repo/prj_current/trunk/exhibits/EX-0088"
         );
         assert_eq!(
             checkout_repository_url(None, "prj_current", "EX-0088").unwrap(),
             "http://svn.andcrane.com/repo/prj_current/trunk/exhibits/EX-0088"
         );
+        assert!(checkout_repository_url(
+            Some("http://svn.andcrane.com/repo/prj_current/trunk/exhibits/EX-0001"),
+            "prj_current",
+            "EX-0088",
+        )
+        .is_err());
     }
 
     #[test]
@@ -5549,6 +5614,8 @@ mod tests {
     fn rejects_relative_and_system_checkout_targets() {
         assert!(absolute_path("relative/path").is_err());
         assert!(reject_sensitive_path(Path::new(r"C:\Windows\Temp\repo")).is_err());
+        assert!(reject_sensitive_path(Path::new(r"D:\")).is_err());
+        assert!(reject_sensitive_path(Path::new(r"\\server\share")).is_err());
         assert!(reject_sensitive_path(Path::new(r"D:\Projects\repo")).is_ok());
     }
 
@@ -5618,6 +5685,14 @@ mod tests {
         assert_eq!(
             PROJECT_REPOSITORY_BROAD_ACL,
             [("/", "r"), ("/trunk", "r"), ("/trunk/exhibits", "no")]
+        );
+        assert_eq!(
+            project_repository_broad_acl("all_read"),
+            [("/", "r"), ("/trunk", "r"), ("/trunk/exhibits", "r")]
+        );
+        assert_eq!(
+            project_repository_broad_acl("all_read_write"),
+            [("/", "r"), ("/trunk", "r"), ("/trunk/exhibits", "rw")]
         );
     }
 
