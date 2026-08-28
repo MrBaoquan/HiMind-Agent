@@ -2421,15 +2421,15 @@ fn validate_mcp_capability_workspace(
         .filter(|value| !value.is_empty())
     else {
         return if software_scoped {
-            Err("软件分发能力必须提供当前 AI 工作区 workspace_root".into())
+            Err("软件分发能力必须提供待分发软件所在目录 workspace_root".into())
         } else {
             Ok(())
         };
     };
-    let current = crate::extension_projects::current_workspace_path()?;
     if software_scoped {
-        validate_software_workspace_root(&current, workspace_root)
+        validate_software_workspace_root(workspace_root)
     } else {
+        let current = crate::extension_projects::current_workspace_path()?;
         validate_extension_workspace_root(&current, workspace_root)
     }
 }
@@ -2477,12 +2477,12 @@ fn validate_extension_workspace_root(
     Ok(())
 }
 
-fn validate_software_workspace_root(current: &Path, requested: &str) -> Result<(), Box<dyn Error>> {
+fn validate_software_workspace_root(requested: &str) -> Result<(), Box<dyn Error>> {
     let requested = Path::new(requested).canonicalize()?;
-    if requested != current {
+    if !requested.is_dir() {
         return Err(serde_json::json!({
-            "code": "software_workspace_mismatch",
-            "message": "workspace_root 必须与 workspace.current 返回的当前 AI 工作区一致"
+            "code": "software_workspace_invalid",
+            "message": "workspace_root 必须是可访问的本机目录；软件分发允许使用当前 AI 工作区之外的目录"
         })
         .to_string()
         .into());
@@ -3107,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn software_distribution_workspace_must_match_the_ai_session_root() {
+    fn software_distribution_workspace_accepts_an_explicit_external_root() {
         let root = std::env::temp_dir().join(format!(
             "himind-software-workspace-boundary-{}-{}",
             std::process::id(),
@@ -3120,14 +3120,34 @@ mod tests {
         let outside = root.join("outside");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        let current = workspace.canonicalize().unwrap();
-
-        validate_software_workspace_root(&current, workspace.to_str().unwrap()).unwrap();
-        let error = validate_software_workspace_root(&current, outside.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("software_workspace_mismatch"));
+        validate_software_workspace_root(workspace.to_str().unwrap()).unwrap();
+        validate_software_workspace_root(outside.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn software_distribution_mcp_validation_does_not_bind_to_session_root() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-software-workspace-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mcp = InvocationContext::new(
+            crate::capability::types::InvocationSource::Mcp,
+            "ai-client:test",
+        );
+        let input = serde_json::json!({ "workspace_root": root });
+        validate_mcp_capability_workspace(
+            &mcp,
+            "software.distribution.artifact.inspect",
+            &input,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(input["workspace_root"].as_str().unwrap());
     }
 
     #[test]
