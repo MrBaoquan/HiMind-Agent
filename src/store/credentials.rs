@@ -90,6 +90,41 @@ pub(crate) fn discovered_unity_editor_path() -> Option<String> {
         .map(|path| path.to_string_lossy().to_string())
 }
 
+pub(crate) fn unity_editor_path_for_version(version: Option<&str>) -> Option<String> {
+    let requested = version.map(str::trim).filter(|value| !value.is_empty());
+    let mut candidates = Vec::new();
+    if let Some(path) = unity_editor_environment_path() {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(settings) = load_local_editor_settings() {
+        if !settings.unity_editor_path.trim().is_empty() {
+            candidates.push(PathBuf::from(settings.unity_editor_path));
+        }
+    }
+    candidates.extend(
+        unity_editor_install_roots()
+            .iter()
+            .flat_map(|root| unity_editor_candidates(root)),
+    );
+    candidates.retain(|path| path.is_file());
+    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .rev()
+        .find(|path| requested.is_none_or(|value| unity_editor_path_matches_version(path, value)))
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn unity_editor_path_matches_version(path: &Path, version: &str) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(version)
+    })
+}
+
 fn find_unity_editor_in_roots(roots: &[PathBuf]) -> Option<PathBuf> {
     roots
         .iter()

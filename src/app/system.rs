@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use crate::app::types::RemoteConnectRequest;
 use crate::store::credentials::{
     configured_unity_editor_path, discovered_unity_editor_path, unity_editor_environment_path,
+    unity_editor_path_for_version,
 };
 use crate::Options;
 
@@ -668,13 +669,13 @@ pub(crate) fn open_folder(path: &str) -> Result<(), Box<dyn Error>> {
 pub(crate) fn inspect_project_workspace(
     path: &str,
     engine_type: Option<&str>,
-    _engine_version: Option<&str>,
+    engine_version: Option<&str>,
 ) -> Result<Value, Box<dyn Error>> {
     let folder = PathBuf::from(path.trim());
     let path_exists = folder.is_dir();
     let engine = normalized_engine_type(engine_type.unwrap_or_default(), &folder);
     let (project_file, launcher) = if path_exists {
-        resolve_project_launcher(&folder, &engine)
+        resolve_project_launcher(&folder, &engine, engine_version)
     } else {
         (None, None)
     };
@@ -816,11 +817,20 @@ fn normalized_engine_type(configured: &str, folder: &Path) -> String {
     String::new()
 }
 
-fn resolve_project_launcher(folder: &Path, engine: &str) -> (Option<String>, Option<String>) {
+fn resolve_project_launcher(
+    folder: &Path,
+    engine: &str,
+    requested_engine_version: Option<&str>,
+) -> (Option<String>, Option<String>) {
     if engine == "unity" {
         let project_file = is_unity_project(folder).then(|| folder.to_string_lossy().to_string());
-        let launcher = unity_editor_environment_path()
-            .filter(|value| Path::new(value).is_file())
+        let project_version = read_unity_project_version(folder);
+        let version = requested_engine_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(project_version.as_deref());
+        let launcher = unity_editor_path_for_version(version)
+            .or_else(|| unity_editor_environment_path().filter(|value| Path::new(value).is_file()))
             .or_else(configured_unity_editor_path)
             .or_else(discovered_unity_editor_path)
             .filter(|value| Path::new(value).is_file());
@@ -836,6 +846,18 @@ fn resolve_project_launcher(folder: &Path, engine: &str) -> (Option<String>, Opt
         return (project_file, launcher);
     }
     (None, None)
+}
+
+fn read_unity_project_version(folder: &Path) -> Option<String> {
+    let contents =
+        std::fs::read_to_string(folder.join("ProjectSettings").join("ProjectVersion.txt")).ok()?;
+    contents.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("m_EditorVersion:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn is_unity_project(folder: &Path) -> bool {

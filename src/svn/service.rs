@@ -3913,6 +3913,16 @@ pub(crate) fn apply_project_acl(request: ApplyProjectAclRequest) -> Result<Value
     let managed_paths = validate_managed_acl_paths(&request.managed_paths)?;
     let desired = validate_desired_acl_entries(&request.desired_entries, &managed_paths)?;
     let before = read_project_acl(&project_id, &managed_paths)?;
+    apply_project_acl_with_current(request, project_id, managed_paths, desired, before)
+}
+
+fn apply_project_acl_with_current(
+    request: ApplyProjectAclRequest,
+    project_id: String,
+    managed_paths: Vec<String>,
+    desired: Vec<ProjectAclEntry>,
+    before: Vec<Value>,
+) -> Result<Value, Box<dyn Error>> {
     let before_digest = acl_digest(&before)?;
     if before_digest != request.expected_current_digest {
         return Err("SVN ACL changed after preview; generate a new plan".into());
@@ -4030,14 +4040,20 @@ pub(crate) fn reconcile_project_acl(
     let managed_paths = validate_managed_acl_paths(&request.managed_paths)?;
     let desired_entries = validate_desired_acl_entries(&request.desired_entries, &managed_paths)?;
     let current = read_project_acl(&project_id, &managed_paths)?;
-    apply_project_acl(ApplyProjectAclRequest {
-        plan_id: "system-reconcile".to_string(),
+    apply_project_acl_with_current(
+        ApplyProjectAclRequest {
+            plan_id: "system-reconcile".to_string(),
+            project_id: project_id.clone(),
+            managed_paths: managed_paths.clone(),
+            desired_entries: desired_entries.clone(),
+            expected_current_digest: acl_digest(&current)?,
+            repository_access: request.repository_access,
+        },
         project_id,
         managed_paths,
         desired_entries,
-        expected_current_digest: acl_digest(&current)?,
-        repository_access: request.repository_access,
-    })
+        current,
+    )
 }
 
 fn validate_plan_id(value: &str) -> Result<(), Box<dyn Error>> {
