@@ -11,6 +11,14 @@ use crate::api::oauth::{
     authorization_snapshot, platform_access_token, BUSINESS_CONTEXT_READ_SCOPE,
 };
 use crate::approval::remote::ApprovalProof;
+use crate::business_integration::{
+    BusinessCapabilityContract, BusinessCatalogSnapshot, BusinessIntegrationProvider,
+    BusinessProviderDescriptor, BUSINESS_CAPABILITY_ID_HEADER, BUSINESS_CAPABILITY_VERSION_HEADER,
+    BUSINESS_INTEGRATION_ACCEPT, BUSINESS_INTEGRATION_PROTOCOL_HEADER,
+    BUSINESS_INTEGRATION_PROTOCOL_ID, BUSINESS_INTEGRATION_PROTOCOL_VERSION,
+    BUSINESS_INTEGRATION_PROVIDER_HEADER, BUSINESS_INTEGRATION_VERSION_HEADER,
+    DASHBOARD_BUSINESS_PROVIDER_ID,
+};
 use crate::Options;
 
 const CATALOG_SCHEMA_VERSION: &str = "1";
@@ -18,50 +26,22 @@ const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CATALOG_STALE_AFTER: Duration = Duration::from_secs(60);
 const CATALOG_CLIENT_ID: &str = "himind-agent-capability-catalog";
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DashboardCapabilityContract {
-    pub id: String,
-    pub version: String,
-    pub name: String,
-    pub description: String,
-    pub risk_level: String,
-    pub http_method: String,
-    pub scope: String,
-    pub dashboard_route: String,
-    pub input_schema: Value,
-    pub execution_mode: String,
-    #[serde(default)]
-    pub supports_progress: bool,
-    #[serde(default)]
-    pub supports_cancel: bool,
-    pub idempotency: String,
-    #[serde(default = "default_retry_policy")]
-    pub retry_policy: String,
-    #[serde(default = "default_concurrency_policy")]
-    pub concurrency: String,
-    #[serde(default)]
-    pub approval_required: bool,
-}
-
-fn default_retry_policy() -> String {
-    "never".to_string()
-}
-
-fn default_concurrency_policy() -> String {
-    "keyed".to_string()
-}
+// Compatibility aliases keep existing internal callers stable while the
+// Dashboard adapter transitions to the provider-neutral protocol names.
+pub(crate) type DashboardCapabilityContract = BusinessCapabilityContract;
+pub(crate) type DashboardCatalogSnapshot = BusinessCatalogSnapshot;
 
 #[derive(Debug, Clone, Deserialize)]
 struct DashboardCatalogResponse {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    protocol_version: String,
+    #[serde(default)]
+    provider: Option<BusinessProviderDescriptor>,
     schema_version: String,
     generation: String,
     items: Vec<DashboardCapabilityContract>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DashboardCatalogSnapshot {
-    pub generation: String,
-    pub items: Vec<DashboardCapabilityContract>,
 }
 
 /// Execute a catalog operation using the same Dashboard OAuth boundary as
@@ -76,7 +56,7 @@ pub(crate) fn invoke_catalog_capability(
     proof: Option<&ApprovalProof>,
 ) -> Result<Value, Box<dyn Error>> {
     let access = platform_access_token(options, &contract.scope)?;
-    let (url, consumed) = catalog_operation_url(options, &contract.dashboard_route, &input)?;
+    let (url, consumed) = catalog_operation_url(options, &contract.route, &input)?;
     let method = Method::from_bytes(contract.http_method.as_bytes())?;
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let mut remaining = input;
@@ -91,6 +71,21 @@ pub(crate) fn invoke_catalog_capability(
         let mut request = client
             .request(method.clone(), url.clone())
             .bearer_auth(&access.token)
+            .header("Accept", BUSINESS_INTEGRATION_ACCEPT)
+            .header(
+                BUSINESS_INTEGRATION_PROTOCOL_HEADER,
+                BUSINESS_INTEGRATION_PROTOCOL_ID,
+            )
+            .header(
+                BUSINESS_INTEGRATION_VERSION_HEADER,
+                BUSINESS_INTEGRATION_PROTOCOL_VERSION,
+            )
+            .header(
+                BUSINESS_INTEGRATION_PROVIDER_HEADER,
+                DASHBOARD_BUSINESS_PROVIDER_ID,
+            )
+            .header(BUSINESS_CAPABILITY_ID_HEADER, &contract.id)
+            .header(BUSINESS_CAPABILITY_VERSION_HEADER, &contract.version)
             .header("X-HiMind-Agent-ID", &access.agent_id)
             .header("X-HiMind-AI-Client", CATALOG_CLIENT_ID)
             .header("X-HiMind-Retry-Policy", &contract.retry_policy)
@@ -353,6 +348,31 @@ impl DashboardCatalogProvider {
     }
 }
 
+impl BusinessIntegrationProvider for DashboardCatalogProvider {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn provider_id(&self) -> &str {
+        DASHBOARD_BUSINESS_PROVIDER_ID
+    }
+
+    fn catalog_snapshot(&self) -> Option<BusinessCatalogSnapshot> {
+        DashboardCatalogProvider::snapshot(self)
+    }
+
+    fn invoke(
+        &self,
+        contract: &BusinessCapabilityContract,
+        input: Value,
+        request_id: &str,
+        proof: Option<&ApprovalProof>,
+    ) -> Result<Value, Box<dyn Error>> {
+        invoke_catalog_capability(&self.options, contract, input, request_id, proof)
+    }
+}
+
 enum FetchResult {
     NotModified,
     Modified {
@@ -368,6 +388,19 @@ fn fetch_catalog(options: &Options, etag: &str) -> Result<FetchResult, Box<dyn E
     let mut request = client
         .get(url)
         .bearer_auth(&access.token)
+        .header("Accept", BUSINESS_INTEGRATION_ACCEPT)
+        .header(
+            BUSINESS_INTEGRATION_PROTOCOL_HEADER,
+            BUSINESS_INTEGRATION_PROTOCOL_ID,
+        )
+        .header(
+            BUSINESS_INTEGRATION_VERSION_HEADER,
+            BUSINESS_INTEGRATION_PROTOCOL_VERSION,
+        )
+        .header(
+            BUSINESS_INTEGRATION_PROVIDER_HEADER,
+            DASHBOARD_BUSINESS_PROVIDER_ID,
+        )
         .header("X-HiMind-Agent-ID", &access.agent_id)
         .header("X-HiMind-AI-Client", CATALOG_CLIENT_ID);
     if !etag.trim().is_empty() {
@@ -392,6 +425,20 @@ fn fetch_catalog(options: &Options, etag: &str) -> Result<FetchResult, Box<dyn E
         .to_string();
     let payload: DashboardCatalogResponse = response.json()?;
     validate_catalog(&payload)?;
+    let provider = payload.provider.unwrap_or(BusinessProviderDescriptor {
+        id: DASHBOARD_BUSINESS_PROVIDER_ID.to_string(),
+        kind: "control_plane".to_string(),
+    });
+    let protocol = if payload.protocol.trim().is_empty() {
+        BUSINESS_INTEGRATION_PROTOCOL_ID.to_string()
+    } else {
+        payload.protocol
+    };
+    let protocol_version = if payload.protocol_version.trim().is_empty() {
+        BUSINESS_INTEGRATION_PROTOCOL_VERSION.to_string()
+    } else {
+        payload.protocol_version
+    };
     Ok(FetchResult::Modified {
         etag: if response_etag.is_empty() {
             payload.generation.clone()
@@ -399,6 +446,9 @@ fn fetch_catalog(options: &Options, etag: &str) -> Result<FetchResult, Box<dyn E
             response_etag
         },
         snapshot: DashboardCatalogSnapshot {
+            provider,
+            protocol,
+            protocol_version,
             generation: payload.generation,
             items: payload.items,
         },
@@ -420,6 +470,27 @@ fn catalog_url(base: &str) -> Result<Url, Box<dyn Error>> {
 }
 
 fn validate_catalog(payload: &DashboardCatalogResponse) -> Result<(), Box<dyn Error>> {
+    if !payload.protocol.trim().is_empty() && payload.protocol != BUSINESS_INTEGRATION_PROTOCOL_ID {
+        return Err(format!(
+            "unsupported business integration protocol: {}",
+            payload.protocol
+        )
+        .into());
+    }
+    if !payload.protocol_version.trim().is_empty()
+        && payload.protocol_version != BUSINESS_INTEGRATION_PROTOCOL_VERSION
+    {
+        return Err(format!(
+            "unsupported business integration protocol version: {}",
+            payload.protocol_version
+        )
+        .into());
+    }
+    if let Some(provider) = &payload.provider {
+        if provider.id != DASHBOARD_BUSINESS_PROVIDER_ID || provider.kind != "control_plane" {
+            return Err("Dashboard catalog advertised an unexpected provider identity".into());
+        }
+    }
     if payload.schema_version != CATALOG_SCHEMA_VERSION {
         return Err(format!(
             "unsupported Dashboard capability catalog schema: {}",
@@ -437,7 +508,7 @@ fn validate_catalog(payload: &DashboardCatalogResponse) -> Result<(), Box<dyn Er
         if !ids.insert(item.id.as_str()) {
             return Err(format!("duplicate Dashboard capability id: {}", item.id).into());
         }
-        let route_key = format!("{} {}", item.http_method, item.dashboard_route);
+        let route_key = format!("{} {}", item.http_method, item.route);
         if let Some(previous) = route_contracts.insert(route_key.clone(), item) {
             if previous.scope != item.scope
                 || previous.risk_level != item.risk_level
@@ -487,10 +558,10 @@ fn validate_contract(item: &DashboardCapabilityContract) -> Result<(), Box<dyn E
             .scope
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-        || !item.dashboard_route.starts_with("/api/integrations/ai/")
-        || item.dashboard_route.contains("..")
-        || item.dashboard_route.contains('?')
-        || item.dashboard_route.contains('#')
+        || !item.route.starts_with("/api/integrations/ai/")
+        || item.route.contains("..")
+        || item.route.contains('?')
+        || item.route.contains('#')
     {
         return Err(format!("unsafe Dashboard capability route: {}", item.id).into());
     }
@@ -609,7 +680,7 @@ fn validate_contract(item: &DashboardCapabilityContract) -> Result<(), Box<dyn E
             .map_err(|error| format!("Dashboard capability field {name} is invalid: {error}"))?;
     }
     let mut placeholders = std::collections::BTreeSet::new();
-    for segment in item.dashboard_route.trim_start_matches('/').split('/') {
+    for segment in item.route.trim_start_matches('/').split('/') {
         let has_brace = segment.contains('{') || segment.contains('}');
         if !has_brace {
             continue;
@@ -705,7 +776,7 @@ mod tests {
             risk_level: "read_only".into(),
             http_method: "GET".into(),
             scope: "business.example.read".into(),
-            dashboard_route: "/api/integrations/ai/business/examples".into(),
+            route: "/api/integrations/ai/business/examples".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
             execution_mode: "sync".into(),
             supports_progress: false,
@@ -720,7 +791,7 @@ mod tests {
     #[test]
     fn rejects_routes_outside_the_ai_integration_boundary() {
         let mut item = contract();
-        item.dashboard_route = "https://example.test/admin".into();
+        item.route = "https://example.test/admin".into();
         assert!(validate_contract(&item).is_err());
     }
 
@@ -761,8 +832,7 @@ mod tests {
         assert!(validate_contract(&invalid_type).is_err());
 
         let mut duplicate_required = contract();
-        duplicate_required.dashboard_route =
-            "/api/integrations/ai/business/examples/{example_id}".into();
+        duplicate_required.route = "/api/integrations/ai/business/examples/{example_id}".into();
         duplicate_required.input_schema = json!({
             "type":"object",
             "properties":{"example_id":{"type":"string"}},
@@ -779,6 +849,9 @@ mod tests {
         second.id = "business.example.alias".into();
         second.scope = "business.example.write".into();
         let payload = DashboardCatalogResponse {
+            protocol: String::new(),
+            protocol_version: String::new(),
+            provider: None,
             schema_version: CATALOG_SCHEMA_VERSION.into(),
             generation: "generation-test".into(),
             items: vec![first, second],
@@ -792,10 +865,7 @@ mod tests {
         options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
         let provider = DashboardCatalogProvider::from_snapshot(
             &options,
-            DashboardCatalogSnapshot {
-                generation: "cached".into(),
-                items: vec![contract()],
-            },
+            DashboardCatalogSnapshot::dashboard("cached".into(), vec![contract()]),
         );
         assert!(provider.snapshot().is_none());
     }
@@ -919,7 +989,16 @@ mod tests {
             assert!(!first_request
                 .to_ascii_lowercase()
                 .contains("if-none-match:"));
+            assert!(first_request
+                .to_ascii_lowercase()
+                .contains("accept: application/vnd.himind.business-integration+json;v=1"));
+            assert!(first_request.to_ascii_lowercase().contains(
+                "x-himind-business-integration-protocol: himind-agent.business-integration"
+            ));
             let body = serde_json::to_vec(&json!({
+                "protocol": "himind-agent.business-integration",
+                "protocol_version": "1",
+                "provider": {"id": "himind.dashboard", "kind": "control_plane"},
                 "schema_version": "1",
                 "generation": "generation-one",
                 "items": [{
@@ -930,6 +1009,7 @@ mod tests {
                     "risk_level": "read_only",
                     "http_method": "GET",
                     "scope": "business.example.read",
+                    "route": "/api/integrations/ai/business/examples",
                     "dashboard_route": "/api/integrations/ai/business/examples",
                     "input_schema": {"type":"object","properties":{},"additionalProperties":false},
                     "execution_mode": "sync",
@@ -964,6 +1044,8 @@ mod tests {
         let etag = match fetch_catalog(&options, "").unwrap() {
             FetchResult::Modified { snapshot, etag } => {
                 assert_eq!(snapshot.generation, "generation-one");
+                assert_eq!(snapshot.provider.id, DASHBOARD_BUSINESS_PROVIDER_ID);
+                assert_eq!(snapshot.protocol, BUSINESS_INTEGRATION_PROTOCOL_ID);
                 assert_eq!(snapshot.items.len(), 1);
                 etag
             }
@@ -988,6 +1070,18 @@ mod tests {
             assert!(request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer test-access-token"));
+            assert!(request.to_ascii_lowercase().contains(
+                "x-himind-business-integration-protocol: himind-agent.business-integration"
+            ));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-himind-business-integration-provider: himind.dashboard"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-himind-business-capability-id: business.example.get"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-himind-business-capability-version: 1.0.0"));
             respond_json(stream);
         });
         let result = invoke_catalog_capability(
@@ -1000,7 +1094,7 @@ mod tests {
                 risk_level: "read_only".into(),
                 http_method: "GET".into(),
                 scope: "business.example.read".into(),
-                dashboard_route: "/api/integrations/ai/business/examples/{example_id}".into(),
+                route: "/api/integrations/ai/business/examples/{example_id}".into(),
                 input_schema: json!({"type":"object","properties":{"example_id":{"type":"string"},"q":{"type":"string"}},"required":["example_id"]}),
                 execution_mode: "sync".into(),
                 supports_progress: false,
@@ -1054,7 +1148,7 @@ mod tests {
                 risk_level: "network_write".into(),
                 http_method: "POST".into(),
                 scope: "business.example.write".into(),
-                dashboard_route: "/api/integrations/ai/business/examples/{example_id}".into(),
+                route: "/api/integrations/ai/business/examples/{example_id}".into(),
                 input_schema: json!({"type":"object","properties":{"example_id":{"type":"string"},"name":{"type":"string"}},"required":["example_id","name"]}),
                 execution_mode: "sync".into(),
                 supports_progress: false,
@@ -1103,7 +1197,7 @@ mod tests {
                 risk_level: "network_write".into(),
                 http_method: "POST".into(),
                 scope: "business.example.write".into(),
-                dashboard_route: "/api/integrations/ai/business/examples".into(),
+                route: "/api/integrations/ai/business/examples".into(),
                 input_schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
                 execution_mode: "sync".into(),
                 supports_progress: false,

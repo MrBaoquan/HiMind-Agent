@@ -649,6 +649,11 @@ fn resolve_credential(
 ) -> Result<AIClientCredential, Box<dyn Error>> {
     let service = service.trim();
     if service.is_empty() || service == "managed" {
+        if !options.mode().dashboard_enabled() {
+            return Err(
+                "HiMind 分发服务需要 Connected 模式；独立模式请从本机自定义 AI 服务导入".into(),
+            );
+        }
         return fetch_client_credential(options, expected_user_id, client_id);
     }
     let custom_id = service
@@ -3381,7 +3386,7 @@ fn bundled_vscode_vsix_candidates(
         candidates.push(directory.join("resources/vscode/himind-ai.vsix"));
     }
     if let Some(root) = repository_root {
-        candidates.push(root.join("official-extensions/vscode-himind-ai/dist/himind-ai.vsix"));
+        candidates.push(root.join("integrations/vscode-himind-ai/dist/himind-ai.vsix"));
     }
     candidates
 }
@@ -4147,7 +4152,7 @@ command = "uvx.exe"
         assert_eq!(
             candidates.last().unwrap(),
             &PathBuf::from(
-                r"F:\workspace\himind\official-extensions\vscode-himind-ai\dist\himind-ai.vsix"
+                r"F:\workspace\himind\integrations\vscode-himind-ai\dist\himind-ai.vsix"
             )
         );
     }

@@ -906,14 +906,6 @@ fn handle_local_http(
             }
         }
         ("POST", "/ai-provider-import") => {
-            if !options.mode().dashboard_enabled() {
-                return write_local_response(
-                    &mut stream,
-                    400,
-                    &crate::app::runtime_mode::control_plane_required_error(),
-                    "application/json",
-                );
-            }
             let payload: AIProviderImportRequest = match serde_json::from_str(body) {
                 Ok(value) => value,
                 Err(error) => {
@@ -929,7 +921,7 @@ fn handle_local_http(
             match gateway.invoke(
                 &context,
                 "ai.client.import",
-                json!({ "target": payload.target.clone() }),
+                json!({ "target": payload.target.clone(), "service": payload.service_source() }),
             ) {
                 Ok(value) => write_local_response(
                     &mut stream,

@@ -1,6 +1,29 @@
 # HiMind Agent
 
-Rust 实现的 Windows Agent 最小原型。
+HiMind Agent 是可独立安装和运行的 Windows 客户端，提供本机 AI、Skill、插件、MCP、工程、远程设备与受控能力网关。Dashboard 是通过标准业务对接协议接入的可选增强 Provider，不是 Agent 的启动依赖。
+
+## 仓库与构建
+
+环境要求：Rust stable、Node.js 22 和 PowerShell 7。构建 Agent、前端与官方客户端适配器：
+
+```powershell
+./scripts/build.ps1
+```
+
+生成便携发布包：
+
+```powershell
+./scripts/package.ps1
+```
+
+安装器需要 NSIS。GitHub 安装器默认 `independent`；Dashboard 分发必须显式选择 `connected`：
+
+```powershell
+./scripts/build-installer.ps1 -ReleaseDirectory ./artifacts/0.3.37
+./scripts/build-installer.ps1 -ReleaseDirectory ./artifacts/0.3.37 -DefaultMode connected
+```
+
+业务协议说明见 [业务对接协议](docs/business-integration-protocol.md)，仓库与分发边界见 [仓库边界](docs/repository-boundaries.md)。
 
 ## 安装与本地应用服务
 
@@ -13,7 +36,7 @@ cargo build --release
 .\target\release\himind-agent.exe --local-app --local-port 18181
 ```
 
-该模式会启动系统托盘图标和 `http://127.0.0.1:18181` 本地服务。默认 `Connected` 模式会额外启动 Dashboard Worker；如需把 Agent 作为独立 AI Harness 使用，可在设置面板选择 `Independent`，重启后保留本机 AI、技能、插件、MCP、工程和远程设备能力，不启动组织控制面 Worker。两种模式共享同一套 Agent 协议、Capability Gateway 和本机实现。
+该模式会启动系统托盘图标和 `http://127.0.0.1:18181` 本地服务。Agent 默认以 `Independent` 模式运行，保留本机 AI、技能、插件、MCP、工程和远程设备能力，不启动组织控制面 Worker；从 Dashboard 分发的安装器会在首次安装时预置 `Connected` 模式。Connected 模式额外启用 Dashboard Worker 和内置 Dashboard Provider。两种模式共享同一套 Agent 协议、Capability Gateway 和本机实现。
 
 运行模式持久化在 Agent 状态目录旁的 `agent-preferences.json`，模式切换必须重启进程，避免同一进程内出现服务边界不一致。Independent 不是离线模式，仍可访问 GitHub、第三方 AI Provider 和原生 DSH 网络服务；组织调度、策略、审计、组织商城和 Dashboard AI 服务属于 Connected 模式的可选控制面能力。
 
@@ -51,14 +74,14 @@ Agent Skills 分发与 MCP 注册是两套独立适配器，共享同一客户�
 
 本地 HTTP 已按 ADR 0022 启用 Origin/Host 信任边界：浏览器默认只能从当前 `--api` 的 Dashboard Origin 调用，响应不再返回通配 CORS；无 Origin 的本机脚本保持兼容。额外可信 Dashboard Origin 通过 `HIMIND_AGENT_ALLOWED_ORIGINS` 配置。自更新下载必须与当前 Dashboard API 同源，并在替换前验证完整 SHA-256。
 
-Agent 的 Dashboard 用户身份使用 OAuth 设备授权和轮换 refresh token，不依赖浏览器持续在线。设备 credential 与 refresh token 通过当前 Windows 用户 DPAPI 保护，access token 只保存在内存；设备 credential 默认每 30 天自动轮换。主窗口会显示当前 Dashboard 代表用户，并提供浏览器设备授权、撤销和在线验证。“AI 接入”页首批支持 Codex、GitHub Copilot 与 WorkBuddy 的 MCP 配置、备份合并和连接自检。已安装 Agent 由稳定 launcher 接收 `--mcp` 并转发到同版本的 `himind-agent-mcp.exe` console companion；开发目录和直接配置则使用同目录 companion，避免把 Windows GUI 子系统的 Agent 当作 stdio 进程。MCP 配置不得写入 Dashboard session、Agent credential 或 OAuth token。完整流程、CLI 和安全边界见 [Agent 身份、OAuth 与外部 AI 接入](../docs/agent-identity-and-oauth.md)。
+Agent 的 Dashboard 用户身份使用 OAuth 设备授权和轮换 refresh token，不依赖浏览器持续在线。设备 credential 与 refresh token 通过当前 Windows 用户 DPAPI 保护，access token 只保存在内存；设备 credential 默认每 30 天自动轮换。主窗口会显示当前 Dashboard 代表用户，并提供浏览器设备授权、撤销和在线验证。“AI 接入”页首批支持 Codex、GitHub Copilot 与 WorkBuddy 的 MCP 配置、备份合并和连接自检。已安装 Agent 由稳定 launcher 接收 `--mcp` 并转发到同版本的 `himind-agent-mcp.exe` console companion；开发目录和直接配置则使用同目录 companion，避免把 Windows GUI 子系统的 Agent 当作 stdio 进程。MCP 配置不得写入 Dashboard session、Agent credential 或 OAuth token。
 
 本机已提供示例插件 `demo-multi-cap`（位于 `%LOCALAPPDATA%/ProjectDashboardAgent/plugins/demo-multi-cap`），声明 `demo.echo`、`demo.time`、`demo.stats` 三项能力，用于验证一个插件对应一组能力、能力合并到 Gateway 和通过 `/capabilities/invoke` 调用的端到端链路。
 
-从仓库根目录可直接执行：
+开发模式可直接执行：
 
 ```powershell
-./scripts/start.ps1
+cargo run -- --local-app --local-port 18181
 ```
 
 ## Worker 调试模式

@@ -2682,6 +2682,7 @@ mod tests {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
         let patch = render_himind_profile_patch(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
@@ -2841,6 +2842,7 @@ mod tests {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = root.join("agent-state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
 
         let profile = render_himind_profile_patch(
             &root,
@@ -2878,6 +2880,7 @@ mod tests {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = root.join("agent-state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
 
         let profile = render_himind_profile_patch(
             &root,
@@ -3045,6 +3048,7 @@ mod tests {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
         let profile = render_himind_profile_patch(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
@@ -3153,6 +3157,7 @@ mod tests {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
         let profile = render_himind_profile_patch_from_base(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,

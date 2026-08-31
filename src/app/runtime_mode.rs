@@ -27,7 +27,10 @@ pub(crate) enum ControlPlaneKind {
 
 impl Default for AgentMode {
     fn default() -> Self {
-        Self::Connected
+        // A standalone or GitHub installation must be useful without a
+        // control plane. Dashboard-distributed installers explicitly seed
+        // Connected as their first-run preference.
+        Self::Independent
     }
 }
 
@@ -118,7 +121,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn defaults_to_connected_and_round_trips_independent_mode() {
+    fn defaults_to_independent_and_round_trips_connected_mode() {
         let root = std::env::temp_dir().join(format!(
             "himind-agent-mode-{}-{}",
             std::process::id(),
@@ -128,9 +131,9 @@ mod tests {
                 .as_nanos()
         ));
         let state_path = root.join("data/agent-state.json");
-        assert_eq!(load(&state_path), AgentMode::Connected);
-        save(&state_path, AgentMode::Independent).unwrap();
         assert_eq!(load(&state_path), AgentMode::Independent);
+        save(&state_path, AgentMode::Connected).unwrap();
+        assert_eq!(load(&state_path), AgentMode::Connected);
         assert!(path_for(&state_path).is_file());
         let _ = fs::remove_dir_all(root);
     }

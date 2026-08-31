@@ -1,0 +1,119 @@
+name: GitHub Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: himind-agent-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            integrations/vscode-himind-ai/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+      - name: Import Windows code-signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_CODE_SIGNING_PFX_B64: ${{ secrets.HIMIND_WINDOWS_CODE_SIGNING_PFX_B64 }}
+          WINDOWS_CODE_SIGNING_PFX_PASSWORD: ${{ secrets.HIMIND_WINDOWS_CODE_SIGNING_PFX_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CODE_SIGNING_PFX_B64 -or -not $env:WINDOWS_CODE_SIGNING_PFX_PASSWORD) {
+            throw 'Official releases require the Windows Authenticode signing secrets.'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'himind-agent-code-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CODE_SIGNING_PFX_B64))
+          $password = ConvertTo-SecureString $env:WINDOWS_CODE_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $imported = @(Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password -Exportable:$false)
+          $certificate = $imported | Where-Object HasPrivateKey | Select-Object -First 1
+          if (-not $certificate) { throw 'Windows code-signing certificate import failed.' }
+          "HIMIND_WINDOWS_CODE_SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+          "HIMIND_WINDOWS_CODE_SIGNING_PFX_PATH=$pfx" >> $env:GITHUB_ENV
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          $cargo = [IO.File]::ReadAllText('Cargo.toml')
+          $version = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $version) { throw 'Cargo package version was not found.' }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build and test
+        shell: pwsh
+        run: ./scripts/build.ps1 -Configuration release
+      - name: Package portable release
+        shell: pwsh
+        run: >-
+          ./scripts/package.ps1
+          -Version '${{ steps.version.outputs.version }}'
+          -SkipBuild
+          -SkipDependencyInstall
+          -WindowsCodeSigningCertificateThumbprint $env:HIMIND_WINDOWS_CODE_SIGNING_CERT_THUMBPRINT
+          -RequireAuthenticode
+      - name: Build Independent installer
+        shell: pwsh
+        run: >-
+          ./scripts/build-installer.ps1
+          -ReleaseDirectory 'artifacts/${{ steps.version.outputs.version }}'
+          -OutputDirectory artifacts
+          -Version '${{ steps.version.outputs.version }}'
+          -DefaultMode independent
+          -VSCodeExtensionPath 'artifacts/${{ steps.version.outputs.version }}/resources/vscode/himind-ai.vsix'
+          -WindowsCodeSigningCertificateThumbprint $env:HIMIND_WINDOWS_CODE_SIGNING_CERT_THUMBPRINT
+          -RequireAuthenticode
+      - name: Prepare public artifacts
+        shell: pwsh
+        run: |
+          Copy-Item 'contracts/business-integration/v1/catalog.schema.json' 'artifacts/himind-business-integration-v1.schema.json'
+          Get-ChildItem artifacts -File | Sort-Object Name | ForEach-Object {
+            "$( (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant() )  $($_.Name)"
+          } | Set-Content artifacts/SHA256SUMS -Encoding ASCII
+      - uses: actions/upload-artifact@v4
+        with:
+          name: himind-agent-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/himind-agent-*-windows-x64.zip
+            artifacts/himind-agent-*-setup.exe
+            artifacts/himind-business-integration-v1.schema.json
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/himind-agent-*-windows-x64.zip
+            artifacts/himind-agent-*-setup.exe
+            artifacts/himind-business-integration-v1.schema.json
+            artifacts/SHA256SUMS
+      - name: Remove Windows code-signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HIMIND_WINDOWS_CODE_SIGNING_CERT_THUMBPRINT) {
+            Remove-Item "Cert:\CurrentUser\My\$env:HIMIND_WINDOWS_CODE_SIGNING_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
+          if ($env:HIMIND_WINDOWS_CODE_SIGNING_PFX_PATH -and (Test-Path -LiteralPath $env:HIMIND_WINDOWS_CODE_SIGNING_PFX_PATH)) {
+            Remove-Item -LiteralPath $env:HIMIND_WINDOWS_CODE_SIGNING_PFX_PATH -Force
+          }

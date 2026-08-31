@@ -28,9 +28,9 @@ export const aiServicePresets: AiServicePreset[] = [
     category: '国内厂商',
     description: 'DeepSeek 官方按量 API',
     base_url: 'https://api.deepseek.com/v1',
-    protocol: 'openai-chat',
-    default_model: 'deepseek-chat',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
+    protocol: 'openai-responses',
+    default_model: 'deepseek-v4-flash',
+    models: ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro'],
   },
   {
     id: 'dashscope',
@@ -39,8 +39,8 @@ export const aiServicePresets: AiServicePreset[] = [
     description: '百炼 OpenAI 兼容按量 API',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     protocol: 'openai-responses',
-    default_model: 'qwen3.7-plus',
-    models: ['qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-plus', 'qwen3.6-flash', 'qwen3.5-plus', 'qwen3-coder-plus'],
+    default_model: 'kimi/kimi-k3',
+    models: ['kimi/kimi-k3', 'MiniMax/MiniMax-M3'],
   },
   {
     id: 'xiaomi',

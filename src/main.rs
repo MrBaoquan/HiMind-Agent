@@ -16,6 +16,7 @@ use std::time::Duration;
 mod api;
 mod app;
 mod approval;
+mod business_integration;
 mod capability;
 mod extension_projects;
 mod extension_workspace;

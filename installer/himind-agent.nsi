@@ -13,6 +13,9 @@ Unicode true
 !ifndef PRODUCT_VERSION
   !define PRODUCT_VERSION "${VERSION}"
 !endif
+!ifndef DEFAULT_MODE
+  !define DEFAULT_MODE "independent"
+!endif
 !ifndef ASSET_DIR
   !define ASSET_DIR "generated"
 !endif
@@ -55,7 +58,7 @@ UninstallIcon "${ASSET_DIR}\himind-agent.ico"
 
 !define MUI_WELCOMEFINISHPAGE_BITMAP "${ASSET_DIR}\installer-welcome.bmp"
 !define MUI_WELCOMEPAGE_TITLE "欢迎安装 HiMind Agent"
-!define MUI_WELCOMEPAGE_TEXT "HiMind Agent 将安装到当前 Windows 用户，用于连接 HiMind 工作台与本机能力。$\r$\n$\r$\n安装无需管理员权限，通常只需几秒。现有版本会被安全替换，本机配置保持不变。"
+!define MUI_WELCOMEPAGE_TEXT "HiMind Agent 将安装到当前 Windows 用户，提供独立本机能力，并可按需连接 HiMind 工作台。$\r$\n$\r$\n安装无需管理员权限，通常只需几秒。现有版本会被安全替换，本机配置保持不变。"
 !insertmacro MUI_PAGE_WELCOME
 
 !define MUI_HEADERIMAGE
@@ -71,7 +74,7 @@ Page custom OptionsPage OptionsPageLeave
 !insertmacro MUI_PAGE_INSTFILES
 
 !define MUI_FINISHPAGE_TITLE "HiMind Agent 已准备就绪"
-!define MUI_FINISHPAGE_TEXT "安装已完成。HiMind Agent 已在后台启动，并会自动连接工作台完成当前账号绑定。"
+!define MUI_FINISHPAGE_TEXT "安装已完成。HiMind Agent 已在后台启动；首次运行模式已按安装来源配置，之后可在设置中切换。"
 !define MUI_FINISHPAGE_NOAUTOCLOSE
 !insertmacro MUI_PAGE_FINISH
 
@@ -168,6 +171,13 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   File /oname=himind-ai.vsix "${VSCODE_EXTENSION_VSIX}"
 
   SetOutPath "$INSTDIR\data"
+  ; Installation source only selects the first-run default. Reinstall and
+  ; update must preserve the user's persisted mode choice.
+  IfFileExists "$INSTDIR\data\agent-preferences.json" mode_preferences_done
+  FileOpen $0 "$INSTDIR\data\agent-preferences.json" w
+  FileWrite $0 "{$\r$\n  $\"mode$\": $\"${DEFAULT_MODE}$\"$\r$\n}$\r$\n"
+  FileClose $0
+  mode_preferences_done:
   SetOutPath "$INSTDIR\previous"
   SetOutPath "$INSTDIR\logs"
   WriteUninstaller "$INSTDIR\uninstall.exe"

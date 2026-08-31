@@ -16,7 +16,12 @@ use crate::app::{mcp_downstream::DownstreamMcpManager, mcp_registry, mcp_targets
 use crate::approval::manager::ApprovalManager;
 use crate::approval::policy;
 use crate::approval::remote::ApprovalProof;
-use crate::capability::dashboard_catalog::{DashboardCapabilityContract, DashboardCatalogProvider};
+#[cfg(test)]
+use crate::business_integration::BusinessCatalogSnapshot;
+use crate::business_integration::{
+    BusinessCapabilityContract, BusinessIntegrationProvider, DASHBOARD_BUSINESS_PROVIDER_ID,
+};
+use crate::capability::dashboard_catalog::DashboardCatalogProvider;
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, invoke_plugin_capability_for_plugin,
     registry_json_for_control_plane, scan_plugins,
@@ -45,7 +50,7 @@ pub(crate) struct CapabilityGateway {
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     approval_manager: Arc<ApprovalManager>,
     downstream_mcp: DownstreamMcpManager,
-    dashboard_catalog: DashboardCatalogProvider,
+    business_provider: Arc<dyn BusinessIntegrationProvider>,
 }
 
 #[derive(Clone)]
@@ -152,7 +157,7 @@ enum CapabilityHandler {
     McpRegistrationRemove,
     McpRegistrationRemoveAll,
     McpConnectionTest,
-    DashboardBusinessDynamic(DashboardCapabilityContract),
+    BusinessIntegrationDynamic(BusinessCapabilityContract),
 }
 
 #[derive(Clone)]
@@ -173,7 +178,7 @@ impl CapabilityGateway {
     ) -> Self {
         Self {
             downstream_mcp: DownstreamMcpManager::new(&options.state_path),
-            dashboard_catalog: DashboardCatalogProvider::new(&options),
+            business_provider: Arc::new(DashboardCatalogProvider::new(&options)),
             options,
             worker_status,
             approval_manager,
@@ -181,11 +186,13 @@ impl CapabilityGateway {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_dashboard_catalog_for_test(
-        &self,
-        snapshot: crate::capability::dashboard_catalog::DashboardCatalogSnapshot,
-    ) {
-        self.dashboard_catalog.replace_snapshot(snapshot);
+    pub(crate) fn replace_business_catalog_for_test(&self, snapshot: BusinessCatalogSnapshot) {
+        let provider = self
+            .business_provider
+            .as_any()
+            .downcast_ref::<DashboardCatalogProvider>()
+            .expect("test Gateway must use the Dashboard business integration provider");
+        provider.replace_snapshot(snapshot);
     }
 
     pub(crate) fn list_capabilities(
@@ -197,7 +204,7 @@ impl CapabilityGateway {
             context.principal.as_str(),
             context.request_id.as_str(),
         );
-        let catalog_ids = self.dashboard_catalog.snapshot().map(|snapshot| {
+        let catalog_ids = self.business_provider.catalog_snapshot().map(|snapshot| {
             snapshot
                 .items
                 .into_iter()
@@ -222,7 +229,7 @@ impl CapabilityGateway {
                 // control-plane providers (media, review, distribution) use
                 // their own contracts and are intentionally unaffected.
                 if let Some(ids) = catalog_ids.as_ref() {
-                    if is_dashboard_catalog_handler(&registration.handler)
+                    if is_business_integration_handler(&registration.handler)
                         && !ids.contains(&registration.descriptor.id)
                     {
                         return false;
@@ -1368,12 +1375,19 @@ impl CapabilityGateway {
                 insert_registration(&mut registry, registration)?;
             }
         }
-        // Dashboard is an optional capability provider. Independent mode
-        // never reads its catalog; Connected mode projects new ordinary
-        // business operations into this same Gateway. Static Agent handlers
-        // win on ID collisions so special semantics remain local and stable.
-        if let Some(snapshot) = self.dashboard_catalog.snapshot() {
+        // Remote business systems are optional providers. Independent mode
+        // never reads their catalog; Connected mode projects ordinary
+        // operations into this same Gateway. Static Agent handlers win on ID
+        // collisions so special semantics remain local and stable.
+        if let Some(snapshot) = self.business_provider.catalog_snapshot() {
+            if snapshot.provider.id != self.business_provider.provider_id()
+                || snapshot.protocol != self.business_provider.protocol_id()
+                || snapshot.protocol_version != self.business_provider.protocol_version()
+            {
+                return Err("business integration provider protocol identity mismatch".into());
+            }
             let contract_generation = snapshot.generation.clone();
+            let contract_source = business_integration_contract_source(&snapshot.provider.id);
             for contract in snapshot.items {
                 let id = contract.id.clone();
                 if let Some(existing) = registry.get_mut(&id) {
@@ -1406,10 +1420,9 @@ impl CapabilityGateway {
                                 || policy::is_destructive_capability(&id);
                         }
                         existing.descriptor.required_scope = Some(contract.scope.clone());
-                        existing.descriptor.dashboard_route =
-                            Some(contract.dashboard_route.clone());
+                        existing.descriptor.dashboard_route = Some(contract.route.clone());
                         existing.descriptor.input_schema = contract.input_schema.clone();
-                        existing.descriptor.contract_source = "dashboard:catalog".to_string();
+                        existing.descriptor.contract_source = contract_source.clone();
                         existing.descriptor.contract_generation = Some(contract_generation.clone());
                     }
                     continue;
@@ -1434,8 +1447,8 @@ impl CapabilityGateway {
                             } else {
                                 contract.risk_level.clone()
                             },
-                            source: "dashboard:catalog".to_string(),
-                            contract_source: "dashboard:catalog".to_string(),
+                            source: contract_source.clone(),
+                            contract_source: contract_source.clone(),
                             contract_generation: Some(contract_generation.clone()),
                             availability: CapabilityAvailability::ControlPlane,
                             execution_mode: contract.execution_mode.clone(),
@@ -1448,10 +1461,10 @@ impl CapabilityGateway {
                                 || policy::is_destructive_capability(&id),
                             dashboard_provider: true,
                             required_scope: Some(contract.scope.clone()),
-                            dashboard_route: Some(contract.dashboard_route.clone()),
+                            dashboard_route: Some(contract.route.clone()),
                             input_schema: contract.input_schema.clone(),
                         },
-                        handler: CapabilityHandler::DashboardBusinessDynamic(contract),
+                        handler: CapabilityHandler::BusinessIntegrationDynamic(contract),
                     },
                 )?;
             }
@@ -1489,8 +1502,8 @@ impl CapabilityGateway {
             .registry()?
             .remove(capability_id)
             .ok_or_else(|| format!("capability not found: {capability_id}"))?;
-        if let Some(snapshot) = self.dashboard_catalog.snapshot() {
-            if is_dashboard_catalog_handler(&registration.handler)
+        if let Some(snapshot) = self.business_provider.catalog_snapshot() {
+            if is_business_integration_handler(&registration.handler)
                 && !snapshot.items.iter().any(|item| item.id == capability_id)
             {
                 return Err(format!(
@@ -1533,7 +1546,9 @@ impl CapabilityGateway {
             let risk_level =
                 policy::effective_risk_level(capability_id, &registration.descriptor.risk_level);
             let target = policy::target_description(capability_id, &input);
-            let remote_approval_id = if self.options.mode().dashboard_enabled() {
+            let remote_approval_id = if self.options.mode().dashboard_enabled()
+                && !policy::is_local_ai_configuration_capability(capability_id)
+            {
                 let agent_id =
                     crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
                 let args_digest = policy::args_digest(&input)?;
@@ -1622,7 +1637,13 @@ impl CapabilityGateway {
             CapabilityHandler::AIClientImport => {
                 let request: crate::app::ai_provider_import::AIProviderImportRequest =
                     serde_json::from_value(input)?;
-                let user_id = self.dashboard_user_id(context)?;
+                // managed 服务源凭据来自 Dashboard，需绑定 Dashboard 用户；
+                // custom 服务源由本机自管，独立模式无 Dashboard 也可用。
+                let user_id = if request.service_source() == "managed" {
+                    self.dashboard_user_id(context)?
+                } else {
+                    self.dashboard_user_id(context).unwrap_or_default()
+                };
                 Ok(serde_json::to_value(
                     crate::app::ai_provider_import::import(&self.options, &user_id, &request)?,
                 )?)
@@ -2099,9 +2120,8 @@ impl CapabilityGateway {
                     &server,
                 ))?)
             }
-            CapabilityHandler::DashboardBusinessDynamic(contract) => {
-                crate::capability::dashboard_catalog::invoke_catalog_capability(
-                    &self.options,
+            CapabilityHandler::BusinessIntegrationDynamic(contract) => {
+                self.business_provider.invoke(
                     &contract,
                     input,
                     &context.request_id,
@@ -2123,6 +2143,12 @@ impl CapabilityGateway {
                 "kind": self.options.mode().control_plane(),
                 "enabled": self.options.mode().control_plane_enabled(),
                 "worker_online": worker["dashboard_worker_online"],
+            }),
+            "business_integration": json!({
+                "provider_id": self.business_provider.provider_id(),
+                "protocol": self.business_provider.protocol_id(),
+                "protocol_version": self.business_provider.protocol_version(),
+                "enabled": self.options.mode().control_plane_enabled(),
             }),
             "native_folder_picker": true,
             "tree_api": true,
@@ -2187,6 +2213,11 @@ impl CapabilityGateway {
         input: &Value,
     ) -> Result<Option<ApprovalProof>, Box<dyn Error>> {
         let destructive_type = policy::destructive_request_type(&descriptor.id);
+        // AI 连接域只读写本机 AI 客户端配置与本机服务状态，由 Agent 自管，
+        // 不依赖 Dashboard Grant 事实源；本机确认由 invoke 审批分支承担。
+        if policy::is_local_ai_configuration_capability(&descriptor.id) {
+            return Ok(None);
+        }
         // Grant validation is part of the Gateway contract for every
         // capability that advertises approval_required, not just deletes.
         // Non-destructive capabilities may still fall back to an explicit
@@ -3050,10 +3081,6 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
                 handler,
                 CapabilityHandler::SoftwareDistributionPublish
                     | CapabilityHandler::ExtensionReviewDecide
-                    | CapabilityHandler::AIClientImport
-                    | CapabilityHandler::AIClientRemove
-                    | CapabilityHandler::AIServiceCustomUpsert
-                    | CapabilityHandler::AIServiceCustomRemove
             );
     descriptor.idempotency = if descriptor.risk_level == "read_only" {
         "safe"
@@ -3140,13 +3167,14 @@ fn is_dashboard_provider_handler(handler: &CapabilityHandler) -> bool {
             | CapabilityHandler::DashboardRequirementReopen
             | CapabilityHandler::DashboardRequirementReview
             | CapabilityHandler::DashboardRequirementComment
+            | CapabilityHandler::BusinessIntegrationDynamic(_)
             | CapabilityHandler::MediaSubmit(_, _)
             | CapabilityHandler::MediaJobGet
             | CapabilityHandler::MediaJobCancel
     )
 }
 
-fn is_dashboard_catalog_handler(handler: &CapabilityHandler) -> bool {
+fn is_business_integration_handler(handler: &CapabilityHandler) -> bool {
     matches!(
         handler,
         CapabilityHandler::DashboardContextResolve
@@ -3184,7 +3212,18 @@ fn is_dashboard_catalog_handler(handler: &CapabilityHandler) -> bool {
             | CapabilityHandler::DashboardRequirementReopen
             | CapabilityHandler::DashboardRequirementReview
             | CapabilityHandler::DashboardRequirementComment
+            | CapabilityHandler::BusinessIntegrationDynamic(_)
     )
+}
+
+fn business_integration_contract_source(provider_id: &str) -> String {
+    if provider_id == DASHBOARD_BUSINESS_PROVIDER_ID {
+        // Preserve the established Dashboard source label for existing MCP
+        // consumers while other providers use the protocol-neutral form.
+        "dashboard:catalog".to_string()
+    } else {
+        format!("business-integration:{provider_id}:catalog")
+    }
 }
 
 fn dashboard_route_for(capability_id: &str) -> Option<String> {
@@ -4512,11 +4551,11 @@ mod tests {
         options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
         let mut gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
-        gateway.dashboard_catalog = DashboardCatalogProvider::from_snapshot(
+        gateway.business_provider = Arc::new(DashboardCatalogProvider::from_snapshot(
             &gateway.options,
-            crate::capability::dashboard_catalog::DashboardCatalogSnapshot {
-                generation: "generation-test".into(),
-                items: vec![DashboardCapabilityContract {
+            BusinessCatalogSnapshot::dashboard(
+                "generation-test".into(),
+                vec![BusinessCapabilityContract {
                     id: "business.catalog.example.list".into(),
                     version: "1.0.0".into(),
                     name: "目录示例".into(),
@@ -4524,7 +4563,7 @@ mod tests {
                     risk_level: "read_only".into(),
                     http_method: "GET".into(),
                     scope: "business.example.read".into(),
-                    dashboard_route: "/api/integrations/ai/business/examples".into(),
+                    route: "/api/integrations/ai/business/examples".into(),
                     input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
                     execution_mode: "sync".into(),
                     supports_progress: false,
@@ -4534,8 +4573,8 @@ mod tests {
                     concurrency: "parallel".into(),
                     approval_required: false,
                 }],
-            },
-        );
+            ),
+        ));
         let visible = gateway
             .list_capabilities(&InvocationContext::local_http())
             .unwrap();

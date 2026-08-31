@@ -86,6 +86,10 @@ fn protocol_registration_command(
     let Some(local_port) = unique_argument_value(arguments, "--local-port")? else {
         return Ok(None);
     };
+    let mode = unique_argument_value(arguments, "--mode")?;
+    if mode.is_some_and(|value| !matches!(value, "connected" | "independent")) {
+        return Err("invalid Agent mode for protocol registration".into());
+    }
     if !arguments.iter().any(|argument| argument == "--local-app") {
         return Ok(None);
     }
@@ -105,10 +109,14 @@ fn protocol_registration_command(
         return Err("invalid local Agent port for protocol registration".into());
     }
     let launcher = root.join("himind-agent-launcher.exe");
+    let mode_argument = mode
+        .map(|value| format!(" --mode {value}"))
+        .unwrap_or_default();
     Ok(Some(format!(
-        "\"{}\" --api \"{}\" --local-app --local-port {} --protocol-url \"%1\"",
+        "\"{}\" --api \"{}\"{} --local-app --local-port {} --protocol-url \"%1\"",
         launcher.display(),
         api_base,
+        mode_argument,
         port
     )))
 }
@@ -262,6 +270,25 @@ mod tests {
                 root.join("himind-agent-launcher.exe").display()
             )
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protocol_registration_preserves_an_explicit_install_mode() {
+        let root = installed_root("mode");
+        let arguments = vec![
+            "--api".into(),
+            "https://himind.example".into(),
+            "--mode".into(),
+            "connected".into(),
+            "--local-app".into(),
+            "--local-port".into(),
+            "18181".into(),
+        ];
+        let command = protocol_registration_command(&root, &arguments)
+            .unwrap()
+            .unwrap();
+        assert!(command.contains("--mode connected --local-app"));
         fs::remove_dir_all(root).unwrap();
     }
 

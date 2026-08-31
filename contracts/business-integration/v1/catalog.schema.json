@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/business-integration/v1/catalog.schema.json",
+  "title": "HiMind Agent Business Integration Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "protocol_version", "provider", "schema_version", "generation", "items"],
+  "properties": {
+    "protocol": { "const": "himind-agent.business-integration" },
+    "protocol_version": { "const": "1" },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "kind": { "enum": ["control_plane", "business_service"] }
+      }
+    },
+    "schema_version": { "const": "1" },
+    "generation": { "type": "string", "minLength": 1 },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "version", "name", "description", "risk_level", "http_method", "scope", "route", "input_schema", "execution_mode", "idempotency"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+          "version": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+          "name": { "type": "string", "minLength": 1 },
+          "description": { "type": "string", "minLength": 1 },
+          "risk_level": { "type": "string" },
+          "http_method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+          "scope": { "type": "string", "minLength": 1 },
+          "route": { "type": "string", "pattern": "^/" },
+          "dashboard_route": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Deprecated Dashboard compatibility alias for route."
+          },
+          "input_schema": { "type": "object" },
+          "execution_mode": { "enum": ["sync", "long_running"] },
+          "supports_progress": { "type": "boolean" },
+          "supports_cancel": { "type": "boolean" },
+          "idempotency": { "enum": ["safe", "conditional", "not_guaranteed"] },
+          "retry_policy": { "enum": ["safe", "idempotency_key", "never"] },
+          "concurrency": { "enum": ["parallel", "keyed", "exclusive"] },
+          "approval_required": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "name": "himind-ai",
+  "displayName": "HiMind AI",
+  "description": "在 VS Code Chat 中使用由组织统一治理的 HiMind 模型。",
+  "version": "0.1.15",
+  "publisher": "himind",
+  "author": "马宝全",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MrBaoquan/HiMind-Agent.git",
+    "directory": "integrations/vscode-himind-ai"
+  },
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "extensionKind": ["ui"],
+  "enabledApiProposals": ["chatProvider"],
+  "categories": ["AI", "Chat"],
+  "keywords": ["himind", "copilot", "language-model", "openai-compatible"],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri",
+    "onLanguageModelChatProvider:himind",
+    "onChatParticipant:himind.chat",
+    "onCommand:himindAi.connect",
+    "onCommand:himindAi.selectModel",
+    "onCommand:himindAi.testConnection",
+    "onCommand:himindAi.disconnect"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "himind.chat",
+        "name": "himind",
+        "fullName": "HiMind",
+        "description": "使用组织分配的 HiMind 模型进行对话",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "model",
+            "description": "选择当前使用的 HiMind 模型"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      { "command": "himindAi.connect", "category": "HiMind AI", "title": "从 HiMind 工作台连接" },
+      { "command": "himindAi.selectModel", "category": "HiMind AI", "title": "选择模型" },
+      { "command": "himindAi.testConnection", "category": "HiMind AI", "title": "测试连接" },
+      { "command": "himindAi.disconnect", "category": "HiMind AI", "title": "断开连接" }
+    ],
+    "languageModelChatProviders": [
+      {
+        "vendor": "himind",
+        "displayName": "HiMind",
+        "managementCommand": "himindAi.connect"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "npm run compile && node --test out/test/enrollmentHandoff.test.js out/test/importStatus.test.js out/test/protocol.test.js",
+    "prepare:provider-dev": "npm run test && node scripts/prepare-provider-dev.mjs dev",
+    "prepare:provider-preview": "npm run test && node scripts/prepare-provider-dev.mjs preview",
+    "dev:provider": "npm run prepare:provider-dev && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-provider-dev.ps1",
+    "package:provider-preview": "npm run prepare:provider-preview && node scripts/package-provider-preview.mjs",
+    "start:provider-preview": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-provider-preview.ps1",
+    "prepackage": "node -e \"require('fs').mkdirSync('dist',{recursive:true})\"",
+    "package": "npm run test && vsce package --no-dependencies -o dist/himind-ai.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.118.0",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.9.0"
+  }
+}

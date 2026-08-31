@@ -495,9 +495,7 @@ mod tests {
         spawn_registry_watcher_with_interval,
     };
     use crate::api::oauth::AgentAccessToken;
-    use crate::capability::dashboard_catalog::{
-        DashboardCapabilityContract, DashboardCatalogSnapshot,
-    };
+    use crate::business_integration::{BusinessCapabilityContract, BusinessCatalogSnapshot};
     use crate::capability::service::CapabilityGateway;
     use crate::store::types::LocalWorkerStatus;
     use crate::Options;
@@ -610,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_catalog_change_updates_mcp_discovery_call_and_notifications() {
+    fn business_integration_catalog_change_updates_mcp_discovery_call_and_notifications() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let mut options = Options::from_env();
         options.api_base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -637,9 +635,9 @@ mod tests {
         let updates =
             spawn_registry_watcher_with_interval(gateway.clone(), Duration::from_millis(10));
 
-        gateway.replace_dashboard_catalog_for_test(DashboardCatalogSnapshot {
-            generation: "dashboard-generation-two".into(),
-            items: vec![DashboardCapabilityContract {
+        gateway.replace_business_catalog_for_test(BusinessCatalogSnapshot::dashboard(
+            "dashboard-generation-two".into(),
+            vec![BusinessCapabilityContract {
                 id: "business.example.lookup".into(),
                 version: "1.1.0".into(),
                 name: "查询示例".into(),
@@ -647,7 +645,7 @@ mod tests {
                 risk_level: "read_only".into(),
                 http_method: "GET".into(),
                 scope: "business.example.read".into(),
-                dashboard_route: "/api/integrations/ai/business/examples/{example_id}".into(),
+                route: "/api/integrations/ai/business/examples/{example_id}".into(),
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -665,7 +663,7 @@ mod tests {
                 concurrency: "parallel".into(),
                 approval_required: false,
             }],
-        });
+        ));
 
         let changed_generation = updates
             .recv_timeout(Duration::from_secs(1))
@@ -837,11 +835,13 @@ mod tests {
             "ai.service.custom.upsert",
             "ai.service.custom.remove",
         ] {
+            // AI 连接域由 Agent 本机自管：写入/移除本机客户端配置与服务状态，
+            // UI 层确认即可，不再进入 capability 审批流、也不创建 Dashboard 审批。
             assert_eq!(
                 tools.iter().find(|tool| tool["name"] == name).unwrap()["annotations"]
                     ["approvalRequired"],
-                true,
-                "{name} must require approval for MCP calls"
+                false,
+                "{name} must not require capability-level approval"
             );
         }
         assert_eq!(
@@ -856,7 +856,7 @@ mod tests {
                 .iter()
                 .find(|tool| tool["name"] == "ai.client.import")
                 .unwrap()["annotations"]["approvalRequired"],
-            true
+            false
         );
         assert_eq!(
             tools

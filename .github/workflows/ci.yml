@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            integrations/vscode-himind-ai/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend
+      - name: Install VS Code integration dependencies
+        run: npm ci
+        working-directory: integrations/vscode-himind-ai
+      - name: Test VS Code integration
+        run: npm test
+        working-directory: integrations/vscode-himind-ai
+      - name: Check Rust formatting
+        run: cargo fmt --check
+      - name: Check Rust
+        run: cargo check --locked
+      - name: Test Rust
+        run: cargo test --locked

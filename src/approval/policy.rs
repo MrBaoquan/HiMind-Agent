@@ -39,11 +39,9 @@ pub(crate) fn destructive_request_type(capability_id: &str) -> Option<RequestTyp
         | "business.exhibit.crew.replace"
         | "business.exhibit.crew.remove"
         | "business.project.exhibit.detach" => Some(RequestType::DestructiveAction),
-        "mcp.server.remove"
-        | "mcp.registration.remove"
-        | "mcp.registration.remove_all"
-        | "ai.client.remove"
-        | "ai.service.custom.remove" => Some(RequestType::DestructiveAction),
+        "mcp.server.remove" | "mcp.registration.remove" | "mcp.registration.remove_all" => {
+            Some(RequestType::DestructiveAction)
+        }
         _ if id.ends_with(".delete") || id.ends_with(".delete_all") => {
             Some(RequestType::DestructiveAction)
         }
@@ -53,6 +51,14 @@ pub(crate) fn destructive_request_type(capability_id: &str) -> Option<RequestTyp
 
 pub(crate) fn is_destructive_capability(capability_id: &str) -> bool {
     destructive_request_type(capability_id).is_some()
+}
+
+/// AI 连接域能力（`ai.client.*` / `ai.service.*`）只读写本机 AI 客户端配置与
+/// 本机 AI 服务状态，不触碰 Dashboard 业务数据，也不依赖控制平面。它们由
+/// Agent 本机自管：审批只在本机确认，不创建 Dashboard 审批记录。
+pub(crate) fn is_local_ai_configuration_capability(capability_id: &str) -> bool {
+    let id = capability_id.trim();
+    id.starts_with("ai.client.") || id.starts_with("ai.service.") || id == "ai.service.list"
 }
 
 /// R3 is the minimum tier for deleting user or business data. The only R4
@@ -210,5 +216,44 @@ mod tests {
             ),
             "skill-1"
         );
+    }
+
+    #[test]
+    fn ai_connection_domain_is_local_owned_configuration() {
+        // AI 连接域只读写本机客户端配置与本机服务状态，不触碰 Dashboard 业务
+        // 数据：识别为本机配置能力、不视为破坏性、保持声明风险等级（R2）。
+        for capability_id in [
+            "ai.client.list",
+            "ai.client.status",
+            "ai.client.import",
+            "ai.client.remove",
+            "ai.client.import.plan",
+            "ai.client.remove.plan",
+            "ai.service.list",
+            "ai.service.custom.upsert",
+            "ai.service.custom.remove",
+            "ai.service.custom.list_models",
+        ] {
+            assert!(
+                is_local_ai_configuration_capability(capability_id),
+                "AI 连接域能力必须识别为本机配置: {capability_id}"
+            );
+            assert!(
+                !is_destructive_capability(capability_id),
+                "AI 连接域不得视为破坏性: {capability_id}"
+            );
+            assert_eq!(
+                effective_risk_level(capability_id, "local_write"),
+                "R2",
+                "AI 连接域应保持声明风险等级: {capability_id}"
+            );
+        }
+        for unrelated in [
+            "business.project.delete",
+            "filesystem.delete",
+            "context.resolve",
+        ] {
+            assert!(!is_local_ai_configuration_capability(unrelated));
+        }
     }
 }
