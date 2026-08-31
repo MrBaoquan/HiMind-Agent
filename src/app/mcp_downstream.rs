@@ -18,6 +18,12 @@ const MAX_CURSOR_LENGTH: usize = 512;
 pub(crate) struct DownstreamMcpManager {
     state_path: PathBuf,
     sessions: Arc<Mutex<HashMap<String, DownstreamSession>>>,
+    capability_cache: Arc<Mutex<HashMap<String, CachedTools>>>,
+}
+
+struct CachedTools {
+    fingerprint: String,
+    tools: Vec<Value>,
 }
 
 struct DownstreamSession {
@@ -44,17 +50,13 @@ impl DownstreamMcpManager {
         Self {
             state_path: state_path.to_path_buf(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            capability_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(crate) fn list_capabilities(
         &self,
     ) -> Result<Vec<(CapabilityDescriptor, String)>, Box<dyn Error>> {
-        // DSH receives user MCP rows through its native configuration overlay.
-        // Do not expose the same rows a second time through the Agent bridge.
-        if is_native_dsh_client() {
-            return Ok(Vec::new());
-        }
         let servers = mcp_registry::list(&self.state_path)?;
         let mut result = Vec::new();
         let mut ids = HashSet::new();
@@ -88,10 +90,25 @@ impl DownstreamMcpManager {
                         description,
                         risk_level: "mcp_downstream".to_string(),
                         source: format!("mcp:{}", server.stable_id),
+                        contract_source: format!("mcp:{}:discovery", server.stable_id),
+                        contract_generation: None,
                         availability: match server.transport {
                             McpTransport::Stdio => CapabilityAvailability::Local,
                             McpTransport::StreamableHttp => CapabilityAvailability::NetworkService,
                         },
+                        execution_mode: "provider_defined".to_string(),
+                        supports_progress: false,
+                        supports_cancel: false,
+                        idempotency: "provider_defined".to_string(),
+                        retry_policy: "provider_defined".to_string(),
+                        concurrency: "provider_defined".to_string(),
+                        // Third-party tools have no trusted HiMind risk
+                        // contract. They remain manual-only until an explicit
+                        // governed descriptor can prove a lower risk tier.
+                        approval_required: true,
+                        dashboard_provider: false,
+                        required_scope: None,
+                        dashboard_route: None,
                         input_schema,
                     },
                     original_name.to_string(),
@@ -106,9 +123,6 @@ impl DownstreamMcpManager {
         capability_id: &str,
         input: Value,
     ) -> Result<Value, Box<dyn Error>> {
-        if is_native_dsh_client() {
-            return Err("下游 MCP 已由 HiMind AI 原生配置管理".into());
-        }
         let servers = mcp_registry::list(&self.state_path)?;
         let mut ids = HashSet::new();
         for server in servers.into_iter().filter(|server| server.enabled) {
@@ -164,6 +178,17 @@ impl DownstreamMcpManager {
 
     fn tools_for(&self, server: &McpServerSpec) -> Result<Vec<Value>, Box<dyn Error>> {
         let fingerprint = format!("{server:?}");
+        {
+            let cache = self
+                .capability_cache
+                .lock()
+                .map_err(|_| "downstream MCP capability cache lock poisoned")?;
+            if let Some(entry) = cache.get(&server.stable_id) {
+                if entry.fingerprint == fingerprint {
+                    return Ok(entry.tools.clone());
+                }
+            }
+        }
         let mut sessions = self
             .sessions
             .lock()
@@ -174,6 +199,7 @@ impl DownstreamMcpManager {
                     Ok(tools) => return Ok(tools),
                     Err(error) => {
                         sessions.remove(&server.stable_id);
+                        self.remove_cached_tools(&server.stable_id)?;
                         return Err(error);
                     }
                 }
@@ -189,6 +215,16 @@ impl DownstreamMcpManager {
             }
         };
         let tools = list_tools(&mut session)?;
+        self.capability_cache
+            .lock()
+            .map_err(|_| "downstream MCP capability cache lock poisoned")?
+            .insert(
+                server.stable_id.clone(),
+                CachedTools {
+                    fingerprint: fingerprint.clone(),
+                    tools: tools.clone(),
+                },
+            );
         sessions.insert(
             server.stable_id.clone(),
             DownstreamSession {
@@ -198,12 +234,14 @@ impl DownstreamMcpManager {
         );
         Ok(tools)
     }
-}
 
-fn is_native_dsh_client() -> bool {
-    std::env::var("HIMIND_AI_CLIENT_ID")
-        .map(|value| value.eq_ignore_ascii_case("himind-ai"))
-        .unwrap_or(false)
+    fn remove_cached_tools(&self, stable_id: &str) -> Result<(), Box<dyn Error>> {
+        self.capability_cache
+            .lock()
+            .map_err(|_| "downstream MCP capability cache lock poisoned")?
+            .remove(stable_id);
+        Ok(())
+    }
 }
 
 fn list_tools(session: &mut DownstreamTransport) -> Result<Vec<Value>, Box<dyn Error>> {

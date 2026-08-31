@@ -35,6 +35,8 @@ pub(crate) const AI_CONVERSATION_SCOPE: &str = "ai.conversation.invoke";
 pub(crate) const MEDIA_SUBMIT_SCOPE: &str = "ai.media.submit";
 pub(crate) const MEDIA_READ_SCOPE: &str = "ai.media.read";
 pub(crate) const MEDIA_CANCEL_SCOPE: &str = "ai.media.cancel";
+pub(crate) const OPERATION_READ_SCOPE: &str = "operation.read";
+pub(crate) const OPERATION_CANCEL_SCOPE: &str = "operation.cancel";
 const CLIENT_ID: &str = "himind-agent";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -204,6 +206,22 @@ pub(crate) fn platform_access_token(
     Ok(access)
 }
 
+/// Read the last persisted Dashboard identity without attempting a token
+/// refresh. Approval outbox records use this when connectivity is temporarily
+/// unavailable so they remain bound to the original user and Agent.
+pub(crate) fn persisted_authorization_identity(state_path: &Path) -> Option<(String, String)> {
+    let stored = read_stored_authorization(state_path).ok()?;
+    if stored.refresh_expires_at <= unix_now() {
+        return None;
+    }
+    let agent_id = stored.agent_id.trim();
+    let user_id = stored.user_id.trim();
+    if agent_id.is_empty() || user_id.is_empty() {
+        return None;
+    }
+    Some((agent_id.to_string(), user_id.to_string()))
+}
+
 pub(crate) fn cache_registration_access(options: &Options, state: &AgentState) {
     if state.access_token.trim().is_empty() {
         return;
@@ -304,6 +322,12 @@ fn clear_authorization_unlocked(state_path: &Path) -> Result<(), Box<dyn Error>>
             fs::remove_file(candidate)?;
         }
     }
+    let grant_cache = state_path.with_file_name("approval-grants.cache");
+    for candidate in [&grant_cache, &atomic_file::backup_path(&grant_cache)] {
+        if candidate.exists() {
+            fs::remove_file(candidate)?;
+        }
+    }
     Ok(())
 }
 
@@ -349,12 +373,11 @@ pub(crate) fn begin_device_authorization(
         )
         .form(&[
             ("client_id", CLIENT_ID),
-            (
-                "scope",
-                &format!(
-                    "{PROFILE_SCOPE} {BUSINESS_CONTEXT_READ_SCOPE} {BUSINESS_PROJECT_READ_SCOPE} {BUSINESS_PROJECT_WRITE_SCOPE} {BUSINESS_EXHIBIT_READ_SCOPE} {BUSINESS_EXHIBIT_WRITE_SCOPE} {BUSINESS_PEOPLE_READ_SCOPE} {BUSINESS_PEOPLE_WRITE_SCOPE} {BUSINESS_REQUIREMENT_READ_SCOPE} {BUSINESS_REQUIREMENT_WRITE_SCOPE} {BUSINESS_WORKSPACE_READ_SCOPE} {BUSINESS_WORKSPACE_WRITE_SCOPE} {KNOWLEDGE_SEARCH_SCOPE} {AI_CONVERSATION_SCOPE} {MEDIA_SUBMIT_SCOPE} {MEDIA_READ_SCOPE} {MEDIA_CANCEL_SCOPE} {CREATIVE_SUBMIT_SCOPE} {RELEASE_MANAGE_SCOPE}"
-                ),
-            ),
+            // An empty scope asks Dashboard to negotiate every capability the
+            // current user may grant. This keeps future catalog scopes a
+            // Dashboard-only change while the verification page remains the
+            // explicit user-consent boundary.
+            ("scope", ""),
             ("agent_id", state.agent_id.as_str()),
             ("device_id", state.device_id.as_str()),
         ])

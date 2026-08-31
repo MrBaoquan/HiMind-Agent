@@ -1725,6 +1725,7 @@ name = "himind-agent"
 version = "0.3.37"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "encoding_rs",
  "fs4",
  "quick-xml",

@@ -138,6 +138,15 @@ pub(crate) fn run_loop(
         );
     }
     flush_report_outbox(&client, &options, &state.agent_id);
+    match crate::approval::remote::flush_approval_decision_outbox(&options) {
+        Ok(count) if count > 0 => {
+            if let Some(logs) = approval_mgr.as_ref() {
+                logs.add_log("info", &format!("已重放 {count} 条本地审批决定"));
+            }
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("approval decision outbox replay failed: {error}"),
+    }
     crate::app::plugin_manager::flush_status_outbox(&options, &state.agent_id);
 
     println!("agent {} connected to {}", state.agent_id, options.api_base);
@@ -266,6 +275,17 @@ pub(crate) fn run_loop(
                         &heartbeat_options,
                         &heartbeat_agent_id,
                     );
+                    match crate::approval::remote::flush_approval_decision_outbox(
+                        &heartbeat_options,
+                    ) {
+                        Ok(count) if count > 0 => {
+                            if let Some(logs) = heartbeat_logs.as_ref() {
+                                logs.add_log("info", &format!("已重放 {count} 条本地审批决定"));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("approval decision outbox replay failed: {error}"),
+                    }
                 }
                 Ok(false) => {
                     if let Some(logs) = heartbeat_logs.as_ref() {

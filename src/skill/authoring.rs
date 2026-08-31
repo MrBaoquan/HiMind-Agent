@@ -9,6 +9,7 @@ use crate::skill::types::{
 use crate::Options;
 use crate::VERSION;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -82,6 +83,8 @@ pub(crate) struct AuthoringDraft {
     pub codex_target: Option<String>,
     #[serde(default)]
     pub client_targets: BTreeMap<String, String>,
+    #[serde(default)]
+    pub test_report: Option<Value>,
     pub updated_at: String,
 }
 
@@ -93,6 +96,7 @@ pub(crate) struct AuthoringTestResult {
     pub plugin_issues: Vec<String>,
     pub codex: serde_json::Value,
     pub clients: BTreeMap<String, serde_json::Value>,
+    pub cleanup: serde_json::Value,
 }
 
 pub(crate) fn list() -> Result<Vec<AuthoringDraft>, Box<dyn Error>> {
@@ -226,6 +230,10 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
             .filter(|_| unchanged)
             .map(|value| value.client_targets.clone())
             .unwrap_or_default(),
+        test_report: previous
+            .as_ref()
+            .filter(|_| unchanged)
+            .and_then(|value| value.test_report.clone()),
         updated_at: now_stamp(),
     };
     persist(&draft)?;
@@ -323,6 +331,10 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
                 .filter(|_| unchanged)
                 .map(|value| value.client_targets.clone())
                 .unwrap_or_default(),
+            test_report: previous
+                .as_ref()
+                .filter(|_| unchanged)
+                .and_then(|value| value.test_report.clone()),
             updated_at: now_stamp(),
         };
         persist(&draft)?;
@@ -373,6 +385,7 @@ pub(crate) fn create_revision(
     draft.confirmed_at = None;
     draft.submitted_at = None;
     draft.dashboard_draft_id = None;
+    draft.test_report = None;
     persist(&draft)?;
     Ok(draft)
 }
@@ -440,12 +453,9 @@ pub(crate) fn test(
         }
         client_readiness.insert(client_id, readiness);
     }
-    let readiness = client_readiness
-        .get("himind-ai")
-        .or_else(|| client_readiness.get("codex"))
-        .or_else(|| client_readiness.values().next())
-        .cloned()
-        .ok_or("Skill 未声明支持的 AI 客户端")?;
+    if client_readiness.is_empty() {
+        return Err("Skill 未声明支持的 AI 客户端".into());
+    }
     let plugin_issues = plugin_dependency_issues(&draft.manifest.plugin_dependencies);
     if !readiness_blockers.is_empty() || !plugin_issues.is_empty() {
         return Err(format!(
@@ -455,47 +465,122 @@ pub(crate) fn test(
         )
         .into());
     }
-    let package_root = draft_version_root(skill_id, version).join("package");
-    let store = SkillStore::new();
-    let record = store.install_organization_package(
-        &package_root,
-        &draft.manifest.id,
-        &draft.manifest.version,
-    )?;
-    store.apply_management_policy(
-        &draft.manifest.id,
-        &SkillManagementPolicy {
-            management: "user_managed".to_string(),
-            source: "authoring_candidate".to_string(),
-            assignment_id: String::new(),
-            reason: "本机候选测试".to_string(),
-            allow_uninstall: true,
-        },
-    )?;
-    let clients =
-        crate::skill::sync_record_to_supported_clients(&record, VERSION, capability_facts)?;
-    let codex = clients
-        .get("codex")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let client_targets = clients
-        .iter()
-        .filter_map(|(client, result)| {
-            result
+    let snapshot = SkillTestSnapshot::capture(&draft.manifest, capability_facts)?;
+    let test_result =
+        (|| -> Result<(AuthoringDraft, BTreeMap<String, Value>, Value), Box<dyn Error>> {
+            let package_root = draft_version_root(skill_id, version).join("package");
+            let store = SkillStore::new();
+            let record = store.install_organization_package(
+                &package_root,
+                &draft.manifest.id,
+                &draft.manifest.version,
+            )?;
+            store.apply_management_policy(
+                &draft.manifest.id,
+                &SkillManagementPolicy {
+                    management: "user_managed".to_string(),
+                    source: "authoring_candidate".to_string(),
+                    assignment_id: String::new(),
+                    reason: "本机候选测试".to_string(),
+                    allow_uninstall: true,
+                },
+            )?;
+            let clients =
+                crate::skill::sync_record_to_supported_clients(&record, VERSION, capability_facts)?;
+            let codex = clients.get("codex").cloned().unwrap_or(Value::Null);
+            let client_targets = clients
+                .iter()
+                .filter_map(|(client, result)| {
+                    result
+                        .get("target_root")
+                        .and_then(Value::as_str)
+                        .map(|target| (client.clone(), target.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            draft.tested_at = Some(now_stamp());
+            draft.confirmed_at = None;
+            draft.submitted_at = None;
+            draft.dashboard_draft_id = None;
+            draft.codex_target = codex
                 .get("target_root")
-                .and_then(|value| value.as_str())
-                .map(|target| (client.clone(), target.to_string()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    draft.tested_at = Some(now_stamp());
-    draft.confirmed_at = None;
-    draft.submitted_at = None;
-    draft.dashboard_draft_id = None;
-    draft.codex_target = codex
-        .get("target_root")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    draft.client_targets = client_targets;
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            draft.client_targets = client_targets;
+            draft.updated_at = now_stamp();
+            persist(&draft)?;
+
+            let mut cleanup_failures = Vec::new();
+            for client_id in crate::skill::uninstall_client_ids_for_record(&record) {
+                if client_id == "himind-ai" {
+                    continue;
+                }
+                if let Err(error) =
+                    crate::skill::unregister_skill_client_json(&record.manifest.id, &client_id)
+                {
+                    cleanup_failures.push(format!("{client_id}: {error}"));
+                }
+            }
+            let store_removed = SkillStore::new()
+                .remove_installed_skill(&record.manifest.id)
+                .unwrap_or(false);
+            let cleanup = serde_json::json!({
+                "store_removed": store_removed,
+                "failures": cleanup_failures,
+                "state": if cleanup_failures.is_empty() && store_removed { "passed" } else { "failed" }
+            });
+            Ok((draft, clients, cleanup))
+        })();
+    let restored = snapshot.restore();
+    let (mut draft, clients, cleanup) = match (test_result, restored) {
+        (Ok(value), Ok(())) => value,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(restore_error)) => {
+            return Err(
+                format!("Skill 候选测试失败且恢复原状态失败: {error}; {restore_error}").into(),
+            )
+        }
+    };
+    if cleanup.get("state").and_then(Value::as_str) != Some("passed") {
+        return Err(format!(
+            "Skill 候选测试清理未通过: {}",
+            cleanup
+                .get("failures")
+                .cloned()
+                .unwrap_or_else(|| json!(["installed Skill 未从本地状态移除"]))
+        )
+        .into());
+    }
+    let codex = clients.get("codex").cloned().unwrap_or(Value::Null);
+    let readiness = client_readiness
+        .get("himind-ai")
+        .or_else(|| client_readiness.get("codex"))
+        .or_else(|| client_readiness.values().next())
+        .cloned()
+        .ok_or("Skill 未声明支持的 AI 客户端")?;
+    let tested_at = draft.tested_at.clone().unwrap_or_else(now_stamp);
+    let test_report = json!({
+        "manifest": "passed",
+        "dependencies": "passed",
+        "package": "passed",
+        "install": "passed",
+        "registry": "passed",
+        "mcp_contract": "passed",
+        "client_registration": "passed",
+        "lifecycle": {
+            "registered": true,
+            "unregistered": true,
+            "state": "passed"
+        },
+        "cleanup": cleanup.clone(),
+        "candidate_sha256": draft.candidate_sha256.clone(),
+        "agent_version": VERSION,
+        "tested_at": tested_at,
+        "built_at": draft.updated_at,
+        "codex_target": draft.codex_target.clone(),
+        "client_targets": draft.client_targets.clone(),
+    });
+    draft.test_report = Some(test_report);
     draft.updated_at = now_stamp();
     persist(&draft)?;
     Ok(AuthoringTestResult {
@@ -505,7 +590,155 @@ pub(crate) fn test(
         plugin_issues,
         codex,
         clients,
+        cleanup: serde_json::json!({
+            "state": cleanup.get("state").cloned().unwrap_or(Value::String("failed".to_string())),
+            "store_removed": cleanup.get("store_removed").cloned().unwrap_or(Value::Bool(false)),
+            "failures": cleanup.get("failures").cloned().unwrap_or_else(|| json!([])),
+            "existing_state_restored": true,
+            "restored": true,
+        }),
     })
+}
+
+struct SkillTestSnapshot {
+    skill_id: String,
+    skill_root: PathBuf,
+    skill_backup: Option<PathBuf>,
+    rendered_backups: Vec<(PathBuf, PathBuf)>,
+    lock_entry: Option<crate::app::extension_lock::ExtensionLockEntry>,
+}
+
+impl SkillTestSnapshot {
+    fn capture(
+        manifest: &SkillManifest,
+        capability_facts: &[CapabilityFact],
+    ) -> Result<Self, Box<dyn Error>> {
+        let store = SkillStore::new();
+        store.bootstrap_builtin_skills()?;
+        let skill_root = store.skill_root_for_scope(&SkillScope::Organization, &manifest.id);
+        let mut rendered_paths = Vec::new();
+        if let Ok(status) = crate::skill::client_status_json(VERSION, capability_facts) {
+            if let Some(clients) = status.as_object() {
+                for (client_id, client_status) in clients {
+                    if client_id == "himind-ai" {
+                        continue;
+                    }
+                    let Some(items) = client_status.get("items").and_then(Value::as_array) else {
+                        continue;
+                    };
+                    if let Some(rendered) = items.iter().find_map(|item| {
+                        let matches = item.pointer("/record/manifest/id").and_then(Value::as_str)
+                            == Some(manifest.id.as_str());
+                        matches
+                            .then(|| item.get("rendered_root").and_then(Value::as_str))
+                            .flatten()
+                    }) {
+                        let rendered = PathBuf::from(rendered);
+                        if rendered.is_dir() && rendered.join(".himind-render.json").is_file() {
+                            rendered_paths.push(rendered);
+                        }
+                    }
+                }
+            }
+        }
+        let skill_backup = if skill_root.exists() {
+            let backup =
+                skill_root.with_file_name(format!(".{}.test-backup-{}", manifest.id, now_stamp()));
+            fs::rename(&skill_root, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+
+        let mut rendered_backups: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for rendered in rendered_paths {
+            let backup =
+                rendered.with_file_name(format!(".{}.test-backup-{}", manifest.id, now_stamp()));
+            if let Err(error) = fs::rename(&rendered, &backup) {
+                for (original, previous) in rendered_backups.into_iter().rev() {
+                    if previous.exists() {
+                        let _ = fs::rename(previous, original);
+                    }
+                }
+                if let Some(previous) = &skill_backup {
+                    if previous.exists() {
+                        let _ = fs::rename(previous, &skill_root);
+                    }
+                }
+                return Err(error.into());
+            }
+            rendered_backups.push((rendered, backup));
+        }
+
+        Ok(Self {
+            skill_id: manifest.id.clone(),
+            skill_root,
+            skill_backup,
+            rendered_backups,
+            lock_entry: crate::app::extension_lock::read("skill", &manifest.id)?,
+        })
+    }
+
+    fn restore(self) -> Result<(), Box<dyn Error>> {
+        remove_candidate_rendered_copies(&self.skill_id)?;
+        if self.skill_root.exists() {
+            fs::remove_dir_all(&self.skill_root)?;
+        }
+        if let Some(backup) = self.skill_backup {
+            if backup.exists() {
+                fs::rename(backup, &self.skill_root)?;
+            }
+        }
+        for (rendered, backup) in self.rendered_backups {
+            if rendered.exists() {
+                fs::remove_dir_all(&rendered)?;
+            }
+            if backup.exists() {
+                fs::rename(backup, rendered)?;
+            }
+        }
+        crate::app::extension_lock::restore("skill", &self.skill_id, self.lock_entry)?;
+        Ok(())
+    }
+}
+
+fn remove_candidate_rendered_copies(skill_id: &str) -> Result<(), Box<dyn Error>> {
+    let rendered_root = SkillStore::new().root().join("rendered");
+    if !rendered_root.is_dir() {
+        return Ok(());
+    }
+    for client_entry in fs::read_dir(rendered_root)?.flatten() {
+        let client_root = client_entry.path();
+        if !client_root.is_dir() {
+            continue;
+        }
+        for skill_entry in fs::read_dir(client_root)?.flatten() {
+            let candidate = skill_entry.path();
+            if !candidate.is_dir()
+                || candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            let receipt_path = candidate.join(".himind-render.json");
+            let matches = fs::read_to_string(receipt_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                .and_then(|value| {
+                    value
+                        .get("skill_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|value| value == skill_id);
+            if matches {
+                fs::remove_dir_all(candidate)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn confirm(skill_id: &str, version: &str) -> Result<AuthoringDraft, Box<dyn Error>> {
@@ -549,12 +782,14 @@ pub(crate) fn submit(
         options,
         crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
     )?;
-    let report = serde_json::json!({
-        "candidate_sha256": draft.candidate_sha256,
-        "agent_version": VERSION,
-        "built_at": draft.updated_at,
-        "codex_target": draft.codex_target,
-        "client_targets": draft.client_targets,
+    let report = draft.test_report.clone().unwrap_or_else(|| {
+        serde_json::json!({
+            "candidate_sha256": draft.candidate_sha256,
+            "agent_version": VERSION,
+            "built_at": draft.updated_at,
+            "codex_target": draft.codex_target,
+            "client_targets": draft.client_targets,
+        })
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))

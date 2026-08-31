@@ -46,7 +46,6 @@ const HIMIND_HEADLESS_PROFILE: &str = "himind-headless";
 const HIMIND_MCP_SERVER_NAME: &str = "himind-agent";
 const HIMIND_MCP_ROW_ID: &str = "himind-agent-mcp";
 const HIMIND_SKILL_ROW_ID: &str = "himind-agent-skill-filesystem";
-const HIMIND_PERSONAL_MCP_ROW_PREFIX: &str = "himind-agent-personal-mcp-";
 const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
 const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
@@ -1563,7 +1562,7 @@ fn strip_managed_patch_row(row: &YamlValue) -> Option<YamlValue> {
     ) || id == HIMIND_MCP_ROW_ID
         || id == HIMIND_SKILL_ROW_ID
         || id.starts_with("personal-mcp-")
-        || id.starts_with(HIMIND_PERSONAL_MCP_ROW_PREFIX)
+        || id.starts_with("himind-agent-personal-mcp-")
     {
         return None;
     }
@@ -1793,9 +1792,6 @@ fn render_himind_profile_patch_from_base(
     patch.push_str(
         "        failOnStartupError: false\n        reconnect:\n          enabled: true\n          initialDelayMs: 500\n          maxDelayMs: 30000\n          maxAttempts: 5\n",
     );
-    for server in crate::app::mcp_registry::list(&options.state_path)? {
-        append_personal_mcp_row(&mut patch, &server);
-    }
     patch.push_str(&format!(
         "\n    - id: {HIMIND_SKILL_ROW_ID}\n      name: '@deepseek-ai/dsh-skill-filesystem'\n      config:\n        providerName: himind-managed\n        includeDefaultRoots: true\n        customSkillDirs:\n          - {}\n        watch: false\n",
         yaml_scalar(&home.join(HIMIND_SKILL_ADAPTER_DIR).to_string_lossy()),
@@ -1905,67 +1901,6 @@ fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
     // rewrite the selected model, provider overrides, or UI preferences.
     fs::write(marker, b"3\n")?;
     Ok(())
-}
-
-fn append_personal_mcp_row(patch: &mut String, server: &crate::app::mcp_registry::McpServerSpec) {
-    patch.push_str(&format!(
-        "\n    - id: {HIMIND_PERSONAL_MCP_ROW_PREFIX}{}\n      name: '@deepseek-ai/dsh-mcp-client'\n",
-        server.stable_id
-    ));
-    if !server.enabled {
-        patch.push_str("      disabled: true\n");
-    }
-    patch.push_str(&format!(
-        "      config:\n        transport: {}\n        serverName: {}\n",
-        yaml_scalar(server.transport.as_str()),
-        yaml_scalar(&server.stable_id),
-    ));
-    if matches!(
-        server.transport,
-        crate::app::mcp_registry::McpTransport::Stdio
-    ) {
-        patch.push_str(&format!(
-            "        command: {}\n",
-            yaml_scalar(&server.command)
-        ));
-        if !server.args.is_empty() {
-            patch.push_str("        args:\n");
-            for argument in &server.args {
-                patch.push_str(&format!("          - {}\n", yaml_scalar(argument)));
-            }
-        }
-        if !server.env.is_empty() {
-            patch.push_str("        env:\n");
-            for (key, value) in &server.env {
-                patch.push_str(&format!(
-                    "          {}: {}\n",
-                    yaml_scalar(key),
-                    yaml_scalar(value)
-                ));
-            }
-        }
-        if !server.cwd.is_empty() {
-            patch.push_str(&format!("        cwd: {}\n", yaml_scalar(&server.cwd)));
-        }
-    } else {
-        patch.push_str(&format!("        url: {}\n", yaml_scalar(&server.url)));
-        if !server.headers.is_empty() {
-            patch.push_str("        headers:\n");
-            for (key, value) in &server.headers {
-                patch.push_str(&format!(
-                    "          {}: {}\n",
-                    yaml_scalar(key),
-                    yaml_scalar(value)
-                ));
-            }
-        }
-    }
-    patch.push_str(&format!(
-        "        toolCallTimeoutMs: {}\n        failOnStartupError: {}\n        reconnect:\n          enabled: {}\n",
-        server.tool_call_timeout_ms,
-        server.fail_on_startup_error,
-        server.reconnect,
-    ));
 }
 
 fn himind_mcp_arguments(options: &Options) -> Vec<String> {
@@ -2960,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_profile_adds_personal_mcp_connections() {
+    fn managed_profile_routes_personal_mcp_through_agent_gateway() {
         let root = std::env::temp_dir().join(format!(
             "himind-profile-mcp-{}-{}",
             std::process::id(),
@@ -2999,12 +2934,9 @@ mod tests {
         )
         .unwrap();
         assert!(patch.contains("id: himind-agent-mcp"));
-        assert!(patch.contains("id: himind-agent-personal-mcp-project-tools"));
-        assert!(patch.contains("serverName: \"project-tools\""));
-        assert!(patch.contains("command: \"node\""));
-        assert!(patch.contains("\"API_KEY\": \"local-secret\""));
-        assert!(patch.contains("toolCallTimeoutMs: 45000"));
-        assert!(patch.contains("disabled: true"));
+        assert!(!patch.contains("id: himind-agent-personal-mcp-project-tools"));
+        assert!(!patch.contains("serverName: \"project-tools\""));
+        assert!(!patch.contains("\"API_KEY\": \"local-secret\""));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3100,6 +3032,7 @@ mod tests {
             base_url: "https://example.test".to_string(),
             model: "fast".to_string(),
             models: vec!["fast".to_string(), "deep".to_string()],
+            protocol: "openai-responses".to_string(),
         };
         assert_eq!(
             managed_model_catalog(&credential).unwrap(),

@@ -11,8 +11,10 @@ use crate::api::oauth::{
     BUSINESS_EXHIBIT_WRITE_SCOPE, BUSINESS_PEOPLE_READ_SCOPE, BUSINESS_PEOPLE_WRITE_SCOPE,
     BUSINESS_PROJECT_READ_SCOPE, BUSINESS_PROJECT_WRITE_SCOPE, BUSINESS_REQUIREMENT_READ_SCOPE,
     BUSINESS_REQUIREMENT_WRITE_SCOPE, BUSINESS_WORKSPACE_READ_SCOPE,
-    BUSINESS_WORKSPACE_WRITE_SCOPE, KNOWLEDGE_SEARCH_SCOPE,
+    BUSINESS_WORKSPACE_WRITE_SCOPE, KNOWLEDGE_SEARCH_SCOPE, OPERATION_CANCEL_SCOPE,
+    OPERATION_READ_SCOPE,
 };
+use crate::approval::remote::ApprovalProof;
 use crate::Options;
 
 const BUSINESS_CLIENT_ID: &str = "himind-agent-business";
@@ -139,9 +141,13 @@ pub(crate) fn project_update(options: &Options, input: Value) -> Result<Value, B
     )
 }
 
-pub(crate) fn project_delete(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn project_delete(
+    options: &Options,
+    input: Value,
+    proof: Option<&ApprovalProof>,
+) -> Result<Value, Box<dyn Error>> {
     let project_id = required_string(&input, "project_id")?;
-    request_with_scope(
+    request_with_scope_proof(
         options,
         BUSINESS_PROJECT_WRITE_SCOPE,
         Method::DELETE,
@@ -154,6 +160,7 @@ pub(crate) fn project_delete(options: &Options, input: Value) -> Result<Value, B
             &project_id,
         ],
         None,
+        proof,
     )
 }
 
@@ -194,9 +201,13 @@ pub(crate) fn exhibit_update(options: &Options, input: Value) -> Result<Value, B
     )
 }
 
-pub(crate) fn exhibit_delete(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn exhibit_delete(
+    options: &Options,
+    input: Value,
+    proof: Option<&ApprovalProof>,
+) -> Result<Value, Box<dyn Error>> {
     let exhibit_id = required_string(&input, "exhibit_id")?;
-    request_with_scope(
+    request_with_scope_proof(
         options,
         BUSINESS_EXHIBIT_WRITE_SCOPE,
         Method::DELETE,
@@ -209,6 +220,7 @@ pub(crate) fn exhibit_delete(options: &Options, input: Value) -> Result<Value, B
             &exhibit_id,
         ],
         None,
+        proof,
     )
 }
 
@@ -368,18 +380,24 @@ pub(crate) fn project_people_replace(
     options: &Options,
     input: Value,
     role: &str,
+    proof: Option<&ApprovalProof>,
 ) -> Result<Value, Box<dyn Error>> {
     let project_id = required_string(&input, "project_id")?;
     let path_role = match role {
         "managers" | "owners" => role,
         _ => return Err("role must be managers or owners".into()),
     };
-    let body = input
+    let mut body = input
         .get("user_ids")
         .cloned()
         .map(|user_ids| serde_json::json!({"user_ids": user_ids}))
         .unwrap_or_else(|| serde_json::json!({"user_ids": []}));
-    request_with_scope(
+    if let Some(expected) = input.get("expected_user_ids") {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("expected_user_ids".to_string(), expected.clone());
+        }
+    }
+    request_with_scope_proof(
         options,
         BUSINESS_PEOPLE_WRITE_SCOPE,
         Method::PUT,
@@ -393,15 +411,17 @@ pub(crate) fn project_people_replace(
             path_role,
         ],
         Some(body),
+        proof,
     )
 }
 
 pub(crate) fn exhibit_crew_replace(
     options: &Options,
     input: Value,
+    proof: Option<&ApprovalProof>,
 ) -> Result<Value, Box<dyn Error>> {
     let exhibit_id = required_string(&input, "exhibit_id")?;
-    request_with_scope(
+    request_with_scope_proof(
         options,
         BUSINESS_PEOPLE_WRITE_SCOPE,
         Method::PUT,
@@ -415,6 +435,55 @@ pub(crate) fn exhibit_crew_replace(
             "crew",
         ],
         Some(without_key(input, "exhibit_id")),
+        proof,
+    )
+}
+
+pub(crate) fn exhibit_crew_append(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_PEOPLE_WRITE_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "crew",
+            "append",
+        ],
+        Some(without_key(input, "exhibit_id")),
+    )
+}
+
+pub(crate) fn exhibit_crew_remove(
+    options: &Options,
+    input: Value,
+    proof: Option<&ApprovalProof>,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope_proof(
+        options,
+        BUSINESS_PEOPLE_WRITE_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "crew",
+            "remove",
+        ],
+        Some(without_key(input, "exhibit_id")),
+        proof,
     )
 }
 
@@ -422,13 +491,14 @@ pub(crate) fn project_exhibit_association(
     options: &Options,
     input: Value,
     action: &str,
+    proof: Option<&ApprovalProof>,
 ) -> Result<Value, Box<dyn Error>> {
     let project_id = required_string(&input, "project_id")?;
     let exhibit_id = required_string(&input, "exhibit_id")?;
     if action != "attach" && action != "detach" {
         return Err("action must be attach or detach".into());
     }
-    request_with_scope(
+    request_with_scope_proof(
         options,
         BUSINESS_PROJECT_WRITE_SCOPE,
         Method::POST,
@@ -444,6 +514,7 @@ pub(crate) fn project_exhibit_association(
             action,
         ],
         None,
+        proof,
     )
 }
 
@@ -490,6 +561,59 @@ pub(crate) fn exhibit_workspace_bind(
             "workspace",
         ],
         Some(without_key(input, "exhibit_id")),
+    )
+}
+
+pub(crate) fn exhibit_workspace_checkout(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    request_with_scope(
+        options,
+        BUSINESS_WORKSPACE_WRITE_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "business",
+            "exhibits",
+            &exhibit_id,
+            "workspace",
+            "checkout",
+        ],
+        Some(without_key(input, "exhibit_id")),
+    )
+}
+
+pub(crate) fn operation_get(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let operation_id = required_string(&input, "operation_id")?;
+    let path = [
+        "api",
+        "integrations",
+        "ai",
+        "operations",
+        operation_id.as_str(),
+    ];
+    request_with_scope(options, OPERATION_READ_SCOPE, Method::GET, &path, None)
+}
+
+pub(crate) fn operation_cancel(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
+    let operation_id = required_string(&input, "operation_id")?;
+    request_with_scope(
+        options,
+        OPERATION_CANCEL_SCOPE,
+        Method::POST,
+        &[
+            "api",
+            "integrations",
+            "ai",
+            "operations",
+            operation_id.as_str(),
+            "cancel",
+        ],
+        None,
     )
 }
 
@@ -545,7 +669,18 @@ fn request_with_scope(
     path: &[&str],
     body: Option<Value>,
 ) -> Result<Value, Box<dyn Error>> {
-    request_with_scope_query(options, required_scope, method, path, body, None)
+    request_with_scope_proof(options, required_scope, method, path, body, None)
+}
+
+fn request_with_scope_proof(
+    options: &Options,
+    required_scope: &str,
+    method: Method,
+    path: &[&str],
+    body: Option<Value>,
+    proof: Option<&ApprovalProof>,
+) -> Result<Value, Box<dyn Error>> {
+    request_with_scope_query_proof(options, required_scope, method, path, body, None, proof)
 }
 
 fn request_with_scope_query(
@@ -555,6 +690,18 @@ fn request_with_scope_query(
     path: &[&str],
     body: Option<Value>,
     query: Option<Vec<(String, String)>>,
+) -> Result<Value, Box<dyn Error>> {
+    request_with_scope_query_proof(options, required_scope, method, path, body, query, None)
+}
+
+fn request_with_scope_query_proof(
+    options: &Options,
+    required_scope: &str,
+    method: Method,
+    path: &[&str],
+    body: Option<Value>,
+    query: Option<Vec<(String, String)>>,
+    proof: Option<&ApprovalProof>,
 ) -> Result<Value, Box<dyn Error>> {
     let delegated = platform_access_token(options, required_scope)?;
     let state = load_agent_state(&options.state_path)?;
@@ -571,6 +718,16 @@ fn request_with_scope_query(
         .bearer_auth(&delegated.token)
         .header("X-HiMind-Agent-ID", &delegated.agent_id)
         .header("X-HiMind-AI-Client", BUSINESS_CLIENT_ID);
+    if let Some(proof) = proof {
+        match proof {
+            ApprovalProof::Approval(id) => {
+                builder = builder.header("X-HiMind-Approval-ID", id);
+            }
+            ApprovalProof::Grant(id) => {
+                builder = builder.header("X-HiMind-Grant-ID", id);
+            }
+        }
+    }
     if let Some(value) = body {
         builder = builder.json(&value);
     }

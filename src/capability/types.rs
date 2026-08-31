@@ -10,8 +10,28 @@ pub(crate) struct CapabilityDescriptor {
     pub name: String,
     pub description: String,
     pub risk_level: String,
+    /// Runtime implementation owner. This remains stable when a remote
+    /// provider overlays a newer public contract onto a compiled handler.
     pub source: String,
+    /// Machine-readable source of the public schema, scope and execution
+    /// contract exposed through MCP and the local capability API.
+    pub contract_source: String,
+    /// Provider generation that supplied the current public contract. Local
+    /// and fallback contracts do not carry a provider generation.
+    pub contract_generation: Option<String>,
     pub availability: CapabilityAvailability,
+    /// Execution contract consumed by MCP clients and the local UI.  This is
+    /// intentionally descriptive: the Gateway remains the only executor.
+    pub execution_mode: String,
+    pub supports_progress: bool,
+    pub supports_cancel: bool,
+    pub idempotency: String,
+    pub retry_policy: String,
+    pub concurrency: String,
+    pub approval_required: bool,
+    pub dashboard_provider: bool,
+    pub required_scope: Option<String>,
+    pub dashboard_route: Option<String>,
     pub input_schema: Value,
 }
 

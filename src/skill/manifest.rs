@@ -1,4 +1,5 @@
 use crate::skill::types::{SkillManifest, SkillScope};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -65,8 +66,12 @@ pub(crate) fn validate_skill_manifest(manifest: &SkillManifest) -> Result<(), Bo
             .into());
         }
     }
+    let mut capability_ids = HashSet::new();
     for dependency in &manifest.capabilities {
         validate_skill_id(&dependency.id)?;
+        if !capability_ids.insert(dependency.id.as_str()) {
+            return Err(format!("duplicate capability dependency: {}", dependency.id).into());
+        }
         if let Some(value) = dependency.min_version.as_deref() {
             validate_skill_version(value)?;
         }
@@ -79,8 +84,12 @@ pub(crate) fn validate_skill_manifest(manifest: &SkillManifest) -> Result<(), Bo
             }
         }
     }
+    let mut plugin_ids = HashSet::new();
     for dependency in &manifest.plugin_dependencies {
         validate_skill_id(&dependency.plugin_id)?;
+        if !plugin_ids.insert(dependency.plugin_id.as_str()) {
+            return Err(format!("duplicate plugin dependency: {}", dependency.plugin_id).into());
+        }
         if let Some(value) = dependency.min_version.as_deref() {
             validate_skill_version(value)?;
         }

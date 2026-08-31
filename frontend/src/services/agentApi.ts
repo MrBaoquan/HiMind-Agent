@@ -87,6 +87,19 @@ export type ApprovalItem = {
     created_at?: string;
 };
 
+export type ApprovalFact = {
+    schema_version: number;
+    id: string;
+    request_type: string;
+    title: string;
+    description: string;
+    status: 'pending' | 'approved' | 'rejected' | 'expired' | 'interrupted';
+    created_at_unix: number;
+    expires_at_unix: number;
+    resolved_at_unix?: number;
+    resolution_reason?: string;
+};
+
 export type UnityEditorSettings = {
     unity_editor_path: string;
     workflow_default_path: string;
@@ -96,10 +109,22 @@ export type UnityEditorSettings = {
 };
 
 export type ApprovalSettings = {
-    timeout_seconds: number;
-    auto_start: boolean;
-    rules?: Record<string, string>;
-    editors?: UnityEditorSettings;
+  timeout_seconds: number;
+  auto_start: boolean;
+  rules?: Record<string, string>;
+  profile?: 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'silent_deny' | 'focus' | string;
+  notification_mode?: 'popup' | 'tray' | 'inbox' | string;
+  owner_user_id?: string;
+  agent_id?: string;
+  binding_updated_at?: number;
+  risk_acknowledged_at?: number;
+  risk_acknowledged?: boolean;
+  effective_modes?: {
+    read: 'manual' | 'auto_approve' | 'auto_deny';
+    write: 'manual' | 'auto_approve' | 'auto_deny';
+    high_risk: 'manual' | 'auto_approve' | 'auto_deny';
+  };
+  editors?: UnityEditorSettings;
 };
 
 export type RemoteExecutionSettings = {
@@ -405,18 +430,18 @@ export type PluginCatalogItem = {
     min_agent_version: string;
     file_size: number;
     sha256: string;
-	 source?: 'marketplace' | 'organization' | 'system' | string;
-	 assignment?: 'optional' | 'recommended' | 'required' | 'blocked' | string;
-	 management?: 'user_managed' | 'organization_managed' | 'builtin' | string;
-	 install_mode?: 'prompt' | 'silent' | string;
-	 organization_reason?: string;
-	 managed?: boolean;
-	 allow_disable?: boolean;
-	 allow_uninstall?: boolean;
-	 capability_ids?: string[];
-	 permissions?: string[];
-	 view_count?: number;
-	 plugin_dependencies?: SkillPluginDependency[];
+    source?: 'marketplace' | 'organization' | 'system' | string;
+    assignment?: 'optional' | 'recommended' | 'required' | 'blocked' | string;
+    management?: 'user_managed' | 'organization_managed' | 'builtin' | string;
+    install_mode?: 'prompt' | 'silent' | string;
+    organization_reason?: string;
+    managed?: boolean;
+    allow_disable?: boolean;
+    allow_uninstall?: boolean;
+    capability_ids?: string[];
+    permissions?: string[];
+    view_count?: number;
+    plugin_dependencies?: SkillPluginDependency[];
 };
 
 export type DashboardIdentityStatus = {
@@ -635,14 +660,14 @@ export type OrganizationSkillCatalogItem = {
     signature_key_id: string;
     signature_algorithm: string;
     download_url: string;
-	 source?: 'marketplace' | 'organization' | 'system' | string;
-	 assignment?: 'optional' | 'recommended' | 'required' | 'blocked' | string;
-	 management?: 'user_managed' | 'organization_managed' | 'builtin' | string;
-	 install_mode?: 'prompt' | 'silent' | string;
-	 organization_reason?: string;
-	 managed?: boolean;
-	 allow_disable?: boolean;
-	 allow_uninstall?: boolean;
+    source?: 'marketplace' | 'organization' | 'system' | string;
+    assignment?: 'optional' | 'recommended' | 'required' | 'blocked' | string;
+    management?: 'user_managed' | 'organization_managed' | 'builtin' | string;
+    install_mode?: 'prompt' | 'silent' | string;
+    organization_reason?: string;
+    managed?: boolean;
+    allow_disable?: boolean;
+    allow_uninstall?: boolean;
 };
 
 export type OrganizationSkillInstallResponse = {
@@ -788,10 +813,7 @@ export type ExtensionWorkspaceSettings = {
     error: string;
 };
 
-export type BuiltinAiWorkspaceTarget =
-  | { kind: 'project'; projectId: string; name: string; path: string }
-  | { kind: 'extension-workspace'; name: string; path: string }
-  | null;
+export type BuiltinAiWorkspaceTarget = { kind: 'project'; projectId: string; name: string; path: string } | { kind: 'extension-workspace'; name: string; path: string } | null;
 
 export type ExtensionProject = {
     id: string;
@@ -841,9 +863,7 @@ export type CreateExtensionProjectInput = {
     template?: 'readonly-tool' | 'job-worker' | 'ui-tool';
 };
 
-export type ExtensionCandidate =
-    | { kind: 'plugin'; draft: AuthoringPluginDraft }
-    | { kind: 'skill'; draft: AuthoringSkillDraft };
+export type ExtensionCandidate = { kind: 'plugin'; draft: AuthoringPluginDraft } | { kind: 'skill'; draft: AuthoringSkillDraft };
 
 export type ExtensionCollaborationRole = 'owner' | 'contributor';
 
@@ -931,14 +951,14 @@ export type CodexSkillStatusResponse = {
     target_source: string;
     target_configured: boolean;
     target_exists: boolean;
-  target_mode: 'builtin' | 'configured' | 'detected' | 'preview';
-  sync_mode?: 'copy' | 'symlink';
+    target_mode: 'builtin' | 'configured' | 'detected' | 'preview';
+    sync_mode?: 'copy' | 'symlink';
     items: CodexSkillStatusItem[];
     clients?: Record<string, CodexSkillStatusResponse>;
 };
 
 export type SkillSyncSettings = {
-  mode: 'copy' | 'symlink';
+    mode: 'copy' | 'symlink';
 };
 
 export type CodexSkillSyncRendered = {
@@ -1019,6 +1039,53 @@ export type CodexSkillActionResponse = {
     clients?: Record<string, CodexSkillActionResponse>;
 };
 
+export type CustomAIService = {
+    id: string;
+    display_name: string;
+    base_url: string;
+    protocol: 'openai-chat' | 'openai-responses';
+    model: string;
+    models: string[];
+    created_at: string;
+    updated_at: string;
+};
+
+export type AIProviderImportStatus = {
+    target: string;
+    state: string;
+    client_detected: boolean;
+    detail: string;
+    config_path?: string;
+    models?: string[];
+    synced_at?: string;
+};
+
+export type AIProviderImportOverview = {
+    targets: AIProviderImportStatus[];
+};
+
+export type ManagedAIServiceSummary = {
+    available: boolean;
+    reason?: string;
+    active_source?: string;
+    active_entitlement_id?: string;
+    active_personal_connection_id?: string;
+    base_url?: string;
+    model?: string;
+    models?: string[];
+    status?: string;
+};
+
+export type AIServiceListResult = {
+    custom: { services: CustomAIService[] };
+    managed: ManagedAIServiceSummary;
+    clients: AIProviderImportOverview;
+};
+
+export type AIServiceModelListResult = {
+    models: string[];
+};
+
 export function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
     return tauriInvoke<T>(command, args);
 }
@@ -1052,6 +1119,7 @@ export const agentApi = {
     removeAllMcpRegistrations: (detectedOnly = true) => invoke<McpTargetBatchResult>('remove_all_mcp_registrations', { detectedOnly }),
     testMcpServer: (serverId: string) => invoke<McpProbeResult>('test_mcp_server', { serverId }),
     approvals: () => invoke<ApprovalItem[]>('get_pending_approvals'),
+    approvalHistory: () => invoke<ApprovalFact[]>('get_approval_history'),
     settings: () => invoke<ApprovalSettings>('get_approval_settings'),
     remoteExecutionSettings: () => invoke<RemoteExecutionSettings>('get_remote_execution_settings'),
     saveRemoteExecutionSettings: (settings: RemoteExecutionSettings, fullAccessConfirmed = false) => invoke<RemoteExecutionSettings>('save_remote_execution_settings', { settings, fullAccessConfirmed }),
@@ -1080,8 +1148,10 @@ export const agentApi = {
     importGithubPlugin: (sourceUrl: string) => invoke<PluginRegistry>('import_github_plugin_url', { sourceUrl }),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),
     extensionSources: () => invoke<ExtensionSourceSettings>('get_extension_sources'),
-    addExtensionSource: (name: string, repository: string, reference: string, catalogPath?: string, verification: ExtensionSourceConfig['verification'] = 'required') => invoke<ExtensionSourceSettings>('add_extension_source', { name, repository, reference, catalogPath, verification }),
-    updateExtensionSource: (sourceId: string, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => invoke<ExtensionSourceSettings>('update_extension_source', { sourceId, enabled, autoUpdate, verification }),
+    addExtensionSource: (name: string, repository: string, reference: string, catalogPath?: string, verification: ExtensionSourceConfig['verification'] = 'required') =>
+        invoke<ExtensionSourceSettings>('add_extension_source', { name, repository, reference, catalogPath, verification }),
+    updateExtensionSource: (sourceId: string, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) =>
+        invoke<ExtensionSourceSettings>('update_extension_source', { sourceId, enabled, autoUpdate, verification }),
     removeExtensionSource: (sourceId: string) => invoke<ExtensionSourceSettings>('remove_extension_source', { sourceId }),
     extensionSourceSnapshot: () => invoke<ExtensionSourceSnapshot>('get_extension_source_snapshot'),
     extensionProvenance: () => invoke<ExtensionProvenance[]>('get_extension_provenance'),
@@ -1094,7 +1164,17 @@ export const agentApi = {
     selectExtensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('select_extension_workspace'),
     extensionCollaborationProjects: () => invoke<ExtensionRemoteProject[]>('list_extension_collaboration_projects'),
     openExtensionProjects: () => invoke<ExtensionProject[]>('open_extension_projects'),
-    associateExtensionProject: (project: ExtensionRemoteProject) => invoke<ExtensionProject>('associate_extension_project', { input: { kind: project.product_type === 'agent_plugin' ? 'plugin' : 'skill', extension_id: project.product_key, source_repository: project.source_repository, source_default_branch: project.source_default_branch, source_subdirectory: project.source_subdirectory, source_commit: '' } }),
+    associateExtensionProject: (project: ExtensionRemoteProject) =>
+        invoke<ExtensionProject>('associate_extension_project', {
+            input: {
+                kind: project.product_type === 'agent_plugin' ? 'plugin' : 'skill',
+                extension_id: project.product_key,
+                source_repository: project.source_repository,
+                source_default_branch: project.source_default_branch,
+                source_subdirectory: project.source_subdirectory,
+                source_commit: '',
+            },
+        }),
     createExtensionProject: (input: CreateExtensionProjectInput) => invoke<ExtensionProject>('create_extension_project', { input }),
     buildExtensionProject: (projectId: string) => invoke<ExtensionCandidate>('build_extension_project', { projectId }),
     prepareExtensionAuthoring: () => invoke<void>('prepare_extension_authoring'),
@@ -1145,8 +1225,26 @@ export const agentApi = {
     rollbackPlugin: (pluginId: string) => invoke('rollback_plugin', { pluginId }),
     setPluginEnabled: (pluginId: string, enabled: boolean) => invoke('set_plugin_enabled', { pluginId, enabled }),
     capabilities: () => invoke<CapabilityItem[]>('get_agent_capabilities'),
+    fetchAIServiceModels: (input: { base_url: string; api_key: string }) => invoke<AIServiceModelListResult>('fetch_ai_service_models', { baseUrl: input.base_url, apiKey: input.api_key }),
+    fetchSavedAIServiceModels: (id: string, baseUrl: string) => invoke<AIServiceModelListResult>('fetch_saved_ai_service_models', { id, baseUrl }),
+    listAIServices: () => invoke<AIServiceListResult>('list_ai_services'),
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: 'openai-chat' | 'openai-responses'; model: string; models: string[]; api_key: string }) =>
+        invoke<CustomAIService>('save_ai_service', {
+            id: input.id,
+            displayName: input.display_name,
+            baseUrl: input.base_url,
+            protocol: input.protocol,
+            model: input.model,
+            models: input.models,
+            apiKey: input.api_key,
+        }),
+    removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
+    importAIClient: (target: string, service?: string) => invoke<Record<string, unknown>>('import_ai_client', { target, service }),
+    removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),
+    setApprovalProfile: (profile: string, confirmed = false) => invoke<{ profile: string; notification_mode: string }>('set_approval_profile', { profile, confirmed }),
+    setApprovalNotificationMode: (mode: string) => invoke<{ profile: string; notification_mode: string }>('set_approval_notification_mode', { mode }),
     setTimeout: (seconds: number) => invoke('set_approval_timeout', { seconds }),
     setAutoStart: (enabled: boolean) => invoke<{ auto_start: boolean }>('set_auto_start', { enabled }),
     pickUnityEditor: () => invoke<{ path?: string }>('pick_unity_editor'),

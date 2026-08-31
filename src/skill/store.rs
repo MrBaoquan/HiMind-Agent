@@ -61,15 +61,24 @@ struct SkillSeed {
 #[derive(Debug, Clone)]
 pub(crate) struct SkillStore {
     root: PathBuf,
+    extension_state_root: PathBuf,
 }
 
 impl SkillStore {
     pub(crate) fn new() -> Self {
-        Self::with_root(skill_store_root())
+        let agent_home = crate::store::paths::agent_home();
+        Self {
+            root: agent_home.join("skills"),
+            extension_state_root: agent_home.join("data"),
+        }
     }
 
     pub(crate) fn with_root(root: PathBuf) -> Self {
-        Self { root }
+        let extension_state_root = root.join(".extension-state");
+        Self {
+            root,
+            extension_state_root,
+        }
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -203,6 +212,11 @@ impl SkillStore {
         if existed {
             fs::remove_dir_all(&root)?;
         }
+        let _ = crate::app::extension_lock::remove_at(
+            &crate::app::extension_lock::path_for_state_root(&self.extension_state_root),
+            "skill",
+            skill_id,
+        );
         let clients = std::iter::once("codex").chain(
             crate::skill::clients::DIRECTORY_CLIENTS
                 .iter()
@@ -229,6 +243,11 @@ impl SkillStore {
             return Ok(false);
         }
         fs::remove_dir_all(root)?;
+        let _ = crate::app::extension_lock::remove_at(
+            &crate::app::extension_lock::path_for_state_root(&self.extension_state_root),
+            "skill",
+            skill_id,
+        );
         Ok(true)
     }
 
@@ -327,8 +346,16 @@ impl SkillStore {
         let skill_root = self.skill_root_for_scope(&manifest.scope, expected_id);
         let versions_root = skill_root.join("versions");
         fs::create_dir_all(&versions_root)?;
+        let mut transaction = crate::app::extension_lock::InstallGuard::begin_at(
+            &self.extension_state_root.join("extension-transactions"),
+            "skill",
+            expected_id,
+            expected_version,
+            &skill_root,
+        )?;
         let staging = skill_root.join(format!("staging-{}", now_stamp()));
         copy_package_tree(package_root, &staging)?;
+        transaction.stage("staged")?;
         let version_root = versions_root.join(expected_version);
         if version_root.exists() {
             let existing = fs::read(version_root.join("checksums.sha256"))?;
@@ -354,8 +381,18 @@ impl SkillStore {
             }
         }
         fs::write(&current_path, serde_json::to_vec_pretty(&current_pointer)?)?;
-        self.read_skill_record(&skill_root)?
-            .ok_or_else(|| "Skill 安装后无法从 Store 读取".into())
+        transaction.stage("installed")?;
+        let record: SkillRecord = self
+            .read_skill_record(&skill_root)?
+            .ok_or_else(|| -> Box<dyn Error> { "Skill 安装后无法从 Store 读取".into() })?;
+        crate::app::extension_lock::record_local_skill_at(
+            &crate::app::extension_lock::path_for_state_root(&self.extension_state_root),
+            &record.manifest,
+            "agent_store",
+        )?;
+        transaction.stage("lock_committed")?;
+        transaction.commit()?;
+        Ok(record)
     }
 
     fn scope_root(&self, scope: &SkillScope) -> PathBuf {
@@ -452,10 +489,6 @@ fn copy_package_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn skill_store_root() -> PathBuf {
-    crate::store::paths::agent_home().join("skills")
-}
-
 fn read_pointer(path: &Path) -> Result<Option<SkillPointer>, Box<dyn Error>> {
     if !path.exists() {
         return Ok(None);
@@ -517,10 +550,18 @@ pub(crate) fn retired_skill_ids() -> &'static [&'static str] {
 mod tests {
     use super::*;
 
+    fn test_store_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "himind-skill-store-test-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ))
+    }
+
     #[test]
     fn retires_removed_builtin_skill_seed() {
-        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
-        let store = SkillStore { root: root.clone() };
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
         let retired_builtin = root
             .join("builtin")
             .join("com.himind.skill.environment-doctor");
@@ -541,8 +582,8 @@ mod tests {
 
     #[test]
     fn sync_mode_defaults_to_copy_and_persists_supported_values() {
-        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
-        let store = SkillStore { root: root.clone() };
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
         assert_eq!(store.sync_mode().unwrap(), SKILL_SYNC_MODE_COPY);
         assert_eq!(
             store.set_sync_mode(SKILL_SYNC_MODE_SYMLINK).unwrap().mode,
@@ -555,8 +596,8 @@ mod tests {
 
     #[test]
     fn prefers_current_pointer_over_latest_version() {
-        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
-        let store = SkillStore { root: root.clone() };
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
         let skill_root = store.skill_root_for_scope(&SkillScope::Builtin, "demo.skill");
         let current_version = "2.0.0";
         let previous_version = "1.0.0";
@@ -610,8 +651,8 @@ mod tests {
 
     #[test]
     fn rejects_different_content_for_existing_organization_version() {
-        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
-        let store = SkillStore { root: root.clone() };
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
         let package = root.join("package");
         let manifest = SkillManifest {
             id: "com.himind.skill.immutable-test".to_string(),
@@ -649,7 +690,7 @@ mod tests {
 
     #[test]
     fn removes_installed_skill_from_the_agent_store() {
-        let root = std::env::temp_dir().join(format!("himind-skill-store-test-{}", now_stamp()));
+        let root = test_store_root();
         let store = SkillStore::with_root(root.clone());
         let package = root.join("package");
         let manifest = SkillManifest {

@@ -65,6 +65,20 @@ impl SkillReadiness {
             dependencies.push(resolution);
         }
 
+        // Plugin dependencies are part of the Skill runtime contract as well
+        // as a candidate-time check. Resolve them here so every client
+        // adapter reports the same readiness state before rendering a Skill.
+        for dependency in &manifest.plugin_dependencies {
+            let resolution = resolve_plugin_dependency(dependency);
+            if resolution.required && resolution.state == "blocked" {
+                state = "blocked".to_string();
+                reasons.push(format!("missing required plugin: {}", resolution.id));
+            } else if resolution.required && resolution.state == "degraded" && state == "ready" {
+                state = "degraded".to_string();
+            }
+            dependencies.push(resolution);
+        }
+
         if !reasons.is_empty() && state == "ready" {
             state = "degraded".to_string();
         }
@@ -76,14 +90,107 @@ impl SkillReadiness {
     }
 }
 
+fn resolve_plugin_dependency(
+    dependency: &crate::skill::types::SkillPluginDependency,
+) -> SkillDependencyResolution {
+    let found = crate::capability::plugin::find_plugin(&dependency.plugin_id);
+    let plugin = match found {
+        Ok(Some(plugin)) => plugin,
+        Ok(None) => {
+            return SkillDependencyResolution {
+                id: dependency.plugin_id.clone(),
+                required: dependency.required,
+                state: if dependency.required {
+                    "blocked".to_string()
+                } else {
+                    "degraded".to_string()
+                },
+                reason: Some("plugin not found".to_string()),
+                capability_version: None,
+                provider: Some("plugin".to_string()),
+            }
+        }
+        Err(error) => {
+            return SkillDependencyResolution {
+                id: dependency.plugin_id.clone(),
+                required: dependency.required,
+                state: if dependency.required {
+                    "blocked".to_string()
+                } else {
+                    "degraded".to_string()
+                },
+                reason: Some(format!("plugin lookup failed: {error}")),
+                capability_version: None,
+                provider: Some("plugin".to_string()),
+            }
+        }
+    };
+    if !plugin.enabled || plugin.error.is_some() {
+        return SkillDependencyResolution {
+            id: dependency.plugin_id.clone(),
+            required: dependency.required,
+            state: if dependency.required {
+                "blocked".to_string()
+            } else {
+                "degraded".to_string()
+            },
+            reason: Some("plugin unavailable".to_string()),
+            capability_version: Some(plugin.version),
+            provider: Some("plugin".to_string()),
+        };
+    }
+    if let Some(min_version) = dependency.min_version.as_deref() {
+        if compare_versions(&plugin.version, min_version) == Ordering::Less {
+            return SkillDependencyResolution {
+                id: dependency.plugin_id.clone(),
+                required: dependency.required,
+                state: if dependency.required {
+                    "blocked".to_string()
+                } else {
+                    "degraded".to_string()
+                },
+                reason: Some(format!(
+                    "plugin version {} is below minimum {}",
+                    plugin.version, min_version
+                )),
+                capability_version: Some(plugin.version),
+                provider: Some("plugin".to_string()),
+            };
+        }
+    }
+    SkillDependencyResolution {
+        id: dependency.plugin_id.clone(),
+        required: dependency.required,
+        state: "ready".to_string(),
+        reason: None,
+        capability_version: Some(plugin.version),
+        provider: Some("plugin".to_string()),
+    }
+}
+
 fn resolve_dependency(
     dependency: &SkillCapabilityDependency,
     capability_facts: &[CapabilityFact],
 ) -> SkillDependencyResolution {
-    let Some(capability) = capability_facts
+    let matching_id = capability_facts
         .iter()
-        .find(|item| item.id == dependency.id)
-    else {
+        .find(|item| item.id == dependency.id);
+    let Some(capability) = matching_id.filter(|item| {
+        dependency
+            .provider
+            .as_deref()
+            .map(|provider| provider_matches(provider, &item.source))
+            .unwrap_or(true)
+    }) else {
+        let reason =
+            if let (Some(provider), Some(actual)) = (dependency.provider.as_deref(), matching_id) {
+                format!(
+                    "capability provider {} does not satisfy {}",
+                    actual.source, provider
+                )
+            } else {
+                "capability not found".to_string()
+            };
         return SkillDependencyResolution {
             id: dependency.id.clone(),
             required: dependency.required,
@@ -92,7 +199,7 @@ fn resolve_dependency(
             } else {
                 "degraded".to_string()
             },
-            reason: Some("capability not found".to_string()),
+            reason: Some(reason),
             capability_version: None,
             provider: dependency.provider.clone(),
         };
@@ -103,7 +210,11 @@ fn resolve_dependency(
             return SkillDependencyResolution {
                 id: dependency.id.clone(),
                 required: dependency.required,
-                state: "blocked".to_string(),
+                state: if dependency.required {
+                    "blocked".to_string()
+                } else {
+                    "degraded".to_string()
+                },
                 reason: Some(format!(
                     "capability version {} is below minimum {}",
                     capability.version, min_version
@@ -118,7 +229,11 @@ fn resolve_dependency(
             return SkillDependencyResolution {
                 id: dependency.id.clone(),
                 required: dependency.required,
-                state: "blocked".to_string(),
+                state: if dependency.required {
+                    "blocked".to_string()
+                } else {
+                    "degraded".to_string()
+                },
                 reason: Some(format!(
                     "capability version {} exceeds maximum {}",
                     capability.version, max_version
@@ -137,6 +252,15 @@ fn resolve_dependency(
         capability_version: Some(capability.version.clone()),
         provider: dependency.provider.clone(),
     }
+}
+
+fn provider_matches(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim();
+    expected.is_empty()
+        || expected == actual
+        || (matches!(expected, "agent" | "builtin")
+            && (actual == "builtin" || actual.starts_with("builtin:")))
+        || actual == format!("plugin:{expected}")
 }
 
 pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
@@ -166,7 +290,9 @@ pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skill::types::{SkillCapabilityDependency, SkillManifest, SkillScope};
+    use crate::skill::types::{
+        SkillCapabilityDependency, SkillManifest, SkillPluginDependency, SkillScope,
+    };
 
     fn manifest(capabilities: Vec<SkillCapabilityDependency>) -> SkillManifest {
         SkillManifest {
@@ -227,5 +353,109 @@ mod tests {
             vec!["missing required capability: extension.plugin.build"]
         );
         assert_eq!(readiness.dependencies[0].state, "blocked");
+    }
+
+    #[test]
+    fn missing_required_plugin_blocks_skill_readiness() {
+        let mut skill = manifest(Vec::new());
+        skill.plugin_dependencies = vec![SkillPluginDependency {
+            plugin_id: "com.example.missing".to_string(),
+            required: true,
+            min_version: Some("1.0.0".to_string()),
+        }];
+        let readiness = SkillReadiness::resolve(&skill, &[], "0.3.32", "codex");
+
+        assert_eq!(readiness.state, "blocked");
+        assert!(readiness
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("com.example.missing")));
+        assert_eq!(
+            readiness.dependencies[0].provider.as_deref(),
+            Some("plugin")
+        );
+    }
+
+    #[test]
+    fn missing_optional_plugin_does_not_block_skill_readiness() {
+        let mut skill = manifest(Vec::new());
+        skill.plugin_dependencies = vec![SkillPluginDependency {
+            plugin_id: "com.example.optional".to_string(),
+            required: false,
+            min_version: None,
+        }];
+        let readiness = SkillReadiness::resolve(&skill, &[], "0.3.32", "codex");
+
+        assert_eq!(readiness.state, "ready");
+        assert_eq!(readiness.dependencies[0].state, "degraded");
+    }
+
+    #[test]
+    fn optional_dependency_version_mismatch_degrades_without_blocking() {
+        let mut skill = manifest(vec![SkillCapabilityDependency {
+            id: "example.inspect".to_string(),
+            required: false,
+            min_version: Some("2.0.0".to_string()),
+            max_version: None,
+            provider: Some("agent".to_string()),
+        }]);
+        skill.plugin_dependencies = vec![SkillPluginDependency {
+            plugin_id: "com.example.optional".to_string(),
+            required: false,
+            min_version: Some("2.0.0".to_string()),
+        }];
+
+        let readiness = SkillReadiness::resolve(
+            &skill,
+            &[CapabilityFact {
+                id: "example.inspect".to_string(),
+                version: "1.0.0".to_string(),
+                source: "builtin".to_string(),
+            }],
+            "0.3.32",
+            "codex",
+        );
+
+        assert_eq!(readiness.state, "ready");
+        assert!(readiness
+            .dependencies
+            .iter()
+            .all(|dependency| dependency.state != "blocked"));
+        assert!(readiness
+            .dependencies
+            .iter()
+            .all(|dependency| dependency.state == "degraded"));
+    }
+
+    #[test]
+    fn capability_provider_is_part_of_the_dependency_contract() {
+        let skill = manifest(vec![dependency("example.inspect", true)]);
+        let wrong = SkillReadiness::resolve(
+            &skill,
+            &[CapabilityFact {
+                id: "example.inspect".to_string(),
+                version: "1.0.0".to_string(),
+                source: "plugin:com.example.other".to_string(),
+            }],
+            "0.3.32",
+            "codex",
+        );
+        assert_eq!(wrong.state, "blocked");
+        assert!(wrong.dependencies[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("does not satisfy")));
+
+        let ready = SkillReadiness::resolve(
+            &skill,
+            &[CapabilityFact {
+                id: "example.inspect".to_string(),
+                version: "1.0.0".to_string(),
+                source: "builtin".to_string(),
+            }],
+            "0.3.32",
+            "codex",
+        );
+        assert_eq!(ready.state, "ready");
     }
 }

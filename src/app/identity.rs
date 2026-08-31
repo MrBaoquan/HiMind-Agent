@@ -313,6 +313,8 @@ pub(crate) fn start_authorization(
             Ok(access) => {
                 let info = oauth::fetch_user_info(&options).ok();
                 let svn_result = info.as_ref().map(ensure_svn_credentials_for_identity);
+                let access_user_id = access.user_id.clone();
+                let access_agent_id = access.agent_id.clone();
                 let Ok(mut state) = flow_for_thread.lock() else {
                     return;
                 };
@@ -325,10 +327,16 @@ pub(crate) fn start_authorization(
                         .as_ref()
                         .map(|value| value.name.clone())
                         .unwrap_or_default(),
-                    user_id: access.user_id,
+                    user_id: access_user_id.clone(),
                     ..state.progress.clone()
                 };
                 drop(state);
+                if let Err(error) = logs.bind_identity(&access_user_id, &access_agent_id) {
+                    logs.add_log(
+                        "error",
+                        &format!("审批身份绑定失败，已保持 fail-closed: {error}"),
+                    );
+                }
                 logs.add_log("info", "Dashboard 账号授权成功");
                 match svn_result {
                     Some(Ok(true)) => logs.add_log("info", "已按 HiMind 姓名配置 SVN 账号"),

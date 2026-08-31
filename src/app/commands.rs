@@ -150,12 +150,22 @@ pub(crate) async fn get_dashboard_identity_status(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardIdentityStatus, String> {
     if !state.options.mode().dashboard_enabled() {
+        state.approval_manager.clear_identity()?;
         return Ok(crate::app::identity::independent_status(&state.options));
     }
     let options = state.options.clone();
-    tauri::async_runtime::spawn_blocking(move || crate::app::identity::identity_status(&options))
-        .await
-        .map_err(|error| error.to_string())
+    let manager = Arc::clone(&state.approval_manager);
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = crate::app::identity::identity_status(&options);
+        if !status.user_id.trim().is_empty() && !status.agent_id.trim().is_empty() {
+            manager.bind_identity(&status.user_id, &status.agent_id)?;
+        } else {
+            manager.clear_identity()?;
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -236,6 +246,7 @@ pub(crate) async fn revoke_dashboard_authorization(
     state
         .approval_manager
         .add_log("info", "已退出 Dashboard 账号授权");
+    state.approval_manager.clear_identity()?;
     Ok(())
 }
 
@@ -593,6 +604,13 @@ pub(crate) fn get_pending_approvals(
 }
 
 #[tauri::command]
+pub(crate) fn get_approval_history(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::approval::types::ApprovalFact>, String> {
+    Ok(state.approval_manager.list_recent_facts())
+}
+
+#[tauri::command]
 pub(crate) fn respond_approval(
     state: State<'_, AgentState>,
     id: String,
@@ -605,15 +623,68 @@ pub(crate) fn respond_approval(
 pub(crate) fn get_approval_settings(
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
+    match crate::api::oauth::persisted_authorization_identity(&state.state_path) {
+        Some((agent_id, user_id)) => state.approval_manager.bind_identity(&user_id, &agent_id)?,
+        None => state.approval_manager.clear_identity()?,
+    };
     let settings = state.approval_manager.get_settings();
+    let effective_r1 = state.approval_manager.effective_mode_for_risk("R1");
+    let effective_r2 = state.approval_manager.effective_mode_for_risk("R2");
+    let effective_r3 = state.approval_manager.effective_mode_for_risk("R3");
     let auto_start =
         is_agent_auto_start_enabled(&state.dashboard_base, state.port, &state.state_path)
             .unwrap_or(false);
     Ok(json!({
         "rules": settings.rules,
         "timeout_seconds": settings.timeout_seconds,
+        "profile": settings.profile,
+        "notification_mode": settings.notification_mode,
+        "owner_user_id": settings.owner_user_id,
+        "agent_id": settings.agent_id,
+        "binding_updated_at": settings.binding_updated_at,
+        "risk_acknowledged_at": settings.risk_acknowledged_at,
+        "risk_acknowledged": settings.risk_acknowledged_at > 0,
+        "effective_modes": {
+            "read": effective_r1,
+            "write": effective_r2,
+            "high_risk": effective_r3,
+        },
         "auto_start": auto_start,
         "editors": local_unity_editor_settings().map_err(|error| error.to_string())?,
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn set_approval_profile(
+    state: State<'_, AgentState>,
+    profile: String,
+    confirmed: bool,
+) -> Result<serde_json::Value, String> {
+    state.approval_manager.update_profile(&profile, confirmed)?;
+    state
+        .approval_manager
+        .add_log("warn", &format!("审批档位已调整为: {}", profile.trim()));
+    Ok(serde_json::json!({
+        "profile": state.approval_manager.get_settings().profile,
+        "notification_mode": state.approval_manager.get_settings().notification_mode,
+        "owner_user_id": state.approval_manager.get_settings().owner_user_id,
+        "agent_id": state.approval_manager.get_settings().agent_id,
+        "risk_acknowledged": state.approval_manager.get_settings().risk_acknowledged_at > 0,
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn set_approval_notification_mode(
+    state: State<'_, AgentState>,
+    mode: String,
+) -> Result<serde_json::Value, String> {
+    state.approval_manager.update_notification_mode(&mode)?;
+    state
+        .approval_manager
+        .add_log("info", &format!("审批提醒方式已调整为: {}", mode.trim()));
+    Ok(serde_json::json!({
+        "profile": state.approval_manager.get_settings().profile,
+        "notification_mode": state.approval_manager.get_settings().notification_mode,
     }))
 }
 
@@ -1458,6 +1529,12 @@ pub(crate) fn get_extension_provenance(
 }
 
 #[tauri::command]
+pub(crate) fn get_extension_lock() -> Result<crate::app::extension_lock::ExtensionLockFile, String>
+{
+    crate::app::extension_lock::load().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn import_local_plugin(
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
@@ -1563,6 +1640,131 @@ pub(crate) fn get_agent_capabilities(
     gateway
         .list_capabilities(&InvocationContext::tauri())
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_ai_services(state: State<'_, AgentState>) -> Result<serde_json::Value, String> {
+    let custom = crate::store::ai_services::public_snapshot().map_err(|e| e.to_string())?;
+    let clients = crate::app::ai_provider_import::status(&state.options);
+    let managed = if state.options.mode().dashboard_enabled() {
+        // 使用当前本机绑定用户做摘要一致性校验；未授权时返回 available:false。
+        let user_id = crate::app::identity::identity_status(&state.options).user_id;
+        crate::api::ai::managed_ai_service_summary(&state.options, &user_id)
+    } else {
+        serde_json::json!({ "available": false, "reason": "independent" })
+    };
+    Ok(json!({
+        "custom": custom,
+        "managed": managed,
+        "clients": serde_json::to_value(clients).map_err(|e| e.to_string())?,
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn save_ai_service(
+    state: State<'_, AgentState>,
+    id: String,
+    display_name: String,
+    base_url: String,
+    protocol: String,
+    model: String,
+    models: Vec<String>,
+    api_key: String,
+) -> Result<serde_json::Value, String> {
+    let protocol = match protocol.as_str() {
+        "openai-chat" => crate::store::ai_services::AIServiceProtocol::OpenaiChat,
+        "openai-responses" => crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+        _ => return Err("protocol 只支持 openai-chat 或 openai-responses".to_string()),
+    };
+    let service =
+        crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+            id,
+            display_name,
+            base_url,
+            protocol,
+            model,
+            models,
+            api_key,
+        })
+        .map_err(|e| e.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!("已保存自定义 AI 服务: {}", service.display_name),
+    );
+    Ok(service.public_json())
+}
+
+#[tauri::command]
+pub(crate) fn remove_ai_service(state: State<'_, AgentState>, id: String) -> Result<bool, String> {
+    crate::app::ai_provider_import::ensure_no_imported_clients(&state.options)
+        .map_err(|error| error.to_string())?;
+    let removed = crate::store::ai_services::remove(&id).map_err(|e| e.to_string())?;
+    if removed {
+        state
+            .approval_manager
+            .add_log("info", &format!("已删除自定义 AI 服务: {id}"));
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub(crate) fn fetch_ai_service_models(
+    base_url: String,
+    api_key: String,
+) -> Result<serde_json::Value, String> {
+    let models =
+        crate::store::ai_services::fetch_models(&base_url, &api_key).map_err(|e| e.to_string())?;
+    Ok(json!({ "models": models }))
+}
+
+#[tauri::command]
+pub(crate) fn fetch_saved_ai_service_models(
+    id: String,
+    base_url: String,
+) -> Result<serde_json::Value, String> {
+    let (_, api_key) = crate::store::ai_services::load_secret(&id).map_err(|e| e.to_string())?;
+    let models =
+        crate::store::ai_services::fetch_models(&base_url, &api_key).map_err(|e| e.to_string())?;
+    Ok(json!({ "models": models }))
+}
+
+#[tauri::command]
+pub(crate) fn import_ai_client(
+    state: State<'_, AgentState>,
+    target: String,
+    service: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let gateway = CapabilityGateway::new(state.options.clone(), Arc::clone(&state.worker_status));
+    let request = serde_json::json!({
+        "target": target,
+        "service": service.unwrap_or_else(|| "managed".to_string()),
+    });
+    let result = gateway
+        .invoke(&InvocationContext::tauri(), "ai.client.import", request)
+        .map_err(|e| e.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", &format!("已导入 AI 客户端: {target}"));
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn remove_ai_client(
+    state: State<'_, AgentState>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    let gateway = CapabilityGateway::new(state.options.clone(), Arc::clone(&state.worker_status));
+    let result = gateway
+        .invoke(
+            &InvocationContext::tauri(),
+            "ai.client.remove",
+            serde_json::json!({ "target": target }),
+        )
+        .map_err(|e| e.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", "已移除 AI 客户端接入");
+    Ok(result)
 }
 
 fn skill_capability_facts(

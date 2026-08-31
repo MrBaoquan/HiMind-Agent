@@ -924,24 +924,23 @@ pub fn extension_review_decide(
     artifact_id: &str,
     action: &str,
     note: &str,
+    approval_proof: Option<&crate::approval::remote::ApprovalProof>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    review_json(
-        client
-            .post(format!(
-                "{api_base}/api/distribution/reviews/{}/{}/decision",
-                encode_path_segment(kind),
-                encode_path_segment(review_id)
-            ))
-            .bearer_auth(access_token)
-            .header("X-HiMind-Agent-ID", agent_id)
-            .header("X-HiMind-AI-Client", ai_client_id())
-            .json(&json!({
-                "action": action,
-                "note": note,
-                "artifact_id": artifact_id,
-            }))
-            .send()?,
-    )
+    let request = client
+        .post(format!(
+            "{api_base}/api/distribution/reviews/{}/{}/decision",
+            encode_path_segment(kind),
+            encode_path_segment(review_id)
+        ))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .json(&json!({
+            "action": action,
+            "note": note,
+            "artifact_id": artifact_id,
+        }));
+    review_json(with_approval_proof(request, approval_proof).send()?)
 }
 
 pub fn extension_collaboration(
@@ -1211,6 +1210,7 @@ pub fn publish_software_release(
         artifact_file,
         artifact_size,
         file_name,
+        None,
     )
 }
 
@@ -1223,6 +1223,7 @@ pub fn publish_software_release_with_artifact(
     artifact_file: File,
     artifact_size: u64,
     file_name: String,
+    approval_proof: Option<&crate::approval::remote::ApprovalProof>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let products = collaboration_json::<serde_json::Value>(
         client
@@ -1342,15 +1343,15 @@ pub fn publish_software_release_with_artifact(
         .as_str()
         .ok_or("Dashboard release response is missing id")?;
 
+    let publish_request = client
+        .post(format!(
+            "{api_base}/api/distribution/releases/{release_id}/publish"
+        ))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id());
     let published = collaboration_json::<serde_json::Value>(
-        client
-            .post(format!(
-                "{api_base}/api/distribution/releases/{release_id}/publish"
-            ))
-            .bearer_auth(access_token)
-            .header("X-HiMind-Agent-ID", agent_id)
-            .header("X-HiMind-AI-Client", ai_client_id())
-            .send()?,
+        with_approval_proof(publish_request, approval_proof).send()?,
     )?;
     Ok(json!({
         "product_id": request.product_id,
@@ -1358,6 +1359,23 @@ pub fn publish_software_release_with_artifact(
         "release": published,
         "status": "published"
     }))
+}
+
+fn with_approval_proof(
+    mut request: reqwest::blocking::RequestBuilder,
+    proof: Option<&crate::approval::remote::ApprovalProof>,
+) -> reqwest::blocking::RequestBuilder {
+    if let Some(proof) = proof {
+        request = match proof {
+            crate::approval::remote::ApprovalProof::Approval(id) => {
+                request.header("X-HiMind-Approval-ID", id)
+            }
+            crate::approval::remote::ApprovalProof::Grant(id) => {
+                request.header("X-HiMind-Grant-ID", id)
+            }
+        };
+    }
+    request
 }
 
 fn ai_client_id() -> String {
@@ -1589,9 +1607,10 @@ pub fn report_update_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        distribution_state_path, publish_software_release, DistributionState,
+        distribution_state_path, publish_software_release, with_approval_proof, DistributionState,
         SoftwareReleasePublishRequest,
     };
+    use crate::approval::remote::ApprovalProof;
     use reqwest::blocking::Client;
     use std::fs;
     use std::io::{Read, Write};
@@ -1600,6 +1619,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn governed_distribution_requests_carry_exactly_one_approval_proof() {
+        let client = Client::new();
+        let approval = with_approval_proof(
+            client.post("http://127.0.0.1/publish"),
+            Some(&ApprovalProof::Approval("approval-1".into())),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(approval.headers()["X-HiMind-Approval-ID"], "approval-1");
+        assert!(!approval.headers().contains_key("X-HiMind-Grant-ID"));
+
+        let grant = with_approval_proof(
+            client.post("http://127.0.0.1/publish"),
+            Some(&ApprovalProof::Grant("grant-1".into())),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(grant.headers()["X-HiMind-Grant-ID"], "grant-1");
+        assert!(!grant.headers().contains_key("X-HiMind-Approval-ID"));
+    }
 
     #[test]
     fn distribution_state_uses_a_separate_file() {

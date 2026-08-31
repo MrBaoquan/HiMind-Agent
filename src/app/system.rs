@@ -1692,6 +1692,15 @@ if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground bef
 Start-Sleep -Milliseconds 100
 Paste-WithContextMenu 0.34 0.50 $code
 if (-not [string]::IsNullOrWhiteSpace($password)) {
+    # The verification code keeps its stale value between requests; clear it
+    # the same way as the device code. A small sweep across the field's right
+    # edge tolerates the clear glyph drifting with window resizing, without
+    # reaching the connect button.
+    if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground before clearing password' }
+    foreach ($clearX in @(0.66, 0.69, 0.72)) {
+        [HimindSunloginInput]::LeftClick((Point-X $clearX), (Point-Y 0.50))
+        Start-Sleep -Milliseconds 80
+    }
     Paste-WithContextMenu 0.575 0.50 $password
 }
 if (-not (Ensure-Foreground)) { Abort-Input 'sunlogin window lost foreground before submit' }

@@ -2,22 +2,27 @@ use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, SyncSender, TrySendError},
+    mpsc::{self, Sender},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use crate::app::builtin_ai_gateway::{RuntimeCapabilities, RuntimeCapabilitiesState};
 use crate::app::builtin_ai_proxy::EventObserver;
 use crate::runtime::builtin::{self, BuiltinAIRuntimeEvent};
 use crate::Options;
 
-const EVENT_QUEUE_CAPACITY: usize = 256;
 const EVENT_UPLOAD_ATTEMPTS: usize = 4;
 const RUNTIME_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const EVENT_OUTBOX_REPLAY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeHeartbeatTarget {
@@ -47,11 +52,16 @@ impl BuiltinAiEventSync {
                 Arc::new(|_| {}),
             );
         }
-        let (sender, receiver) = mpsc::sync_channel::<BuiltinAIRuntimeEvent>(EVENT_QUEUE_CAPACITY);
+        let outbox_path = event_outbox_path();
+        if let Err(error) = fs::create_dir_all(&outbox_path) {
+            eprintln!("HiMind AI 会话事件 outbox 初始化失败：{error}");
+        }
+        let (sender, receiver) = mpsc::channel::<BuiltinAIRuntimeEvent>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let capabilities = Arc::new(Mutex::new(initial_capabilities));
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_capabilities = Arc::clone(&capabilities);
+        let worker_outbox_path = outbox_path.clone();
         let worker = thread::spawn(move || {
             let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
                 Ok(client) => client,
@@ -61,6 +71,7 @@ impl BuiltinAiEventSync {
                 }
             };
             let mut last_heartbeat = Instant::now();
+            let mut last_outbox_replay = Instant::now();
             let mut heartbeat_target: Option<RuntimeHeartbeatTarget> = None;
             while !worker_shutdown.load(Ordering::Acquire) {
                 if !options.mode().dashboard_enabled() {
@@ -68,18 +79,39 @@ impl BuiltinAiEventSync {
                 }
                 match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(event) => {
-                        if let Some(target) = upload_with_retry(
+                        if let Ok(target) = upload_with_retry(
                             &client,
                             &options,
                             &worker_shutdown,
                             &worker_capabilities,
                             &event,
                         ) {
-                            heartbeat_target = Some(target);
-                            last_heartbeat = Instant::now();
+                            remove_persisted_event(&worker_outbox_path, &event);
+                            if let Some(target) = target {
+                                heartbeat_target = Some(target);
+                                last_heartbeat = Instant::now();
+                            }
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if last_outbox_replay.elapsed() >= EVENT_OUTBOX_REPLAY_INTERVAL {
+                            if let Some(event) = next_persisted_event(&worker_outbox_path) {
+                                if let Ok(target) = upload_with_retry(
+                                    &client,
+                                    &options,
+                                    &worker_shutdown,
+                                    &worker_capabilities,
+                                    &event,
+                                ) {
+                                    remove_persisted_event(&worker_outbox_path, &event);
+                                    if let Some(target) = target {
+                                        heartbeat_target = Some(target);
+                                        last_heartbeat = Instant::now();
+                                    }
+                                }
+                            }
+                            last_outbox_replay = Instant::now();
+                        }
                         if last_heartbeat.elapsed() >= RUNTIME_HEARTBEAT_INTERVAL {
                             if let Some(target) = heartbeat_target.as_ref() {
                                 if let Ok(access) = crate::api::oauth::platform_access_token(
@@ -110,7 +142,7 @@ impl BuiltinAiEventSync {
                 .ok()
                 .and_then(|mut projector| projector.project(&raw));
             if let Some(event) = event {
-                enqueue_event(&sender, event);
+                enqueue_event(&sender, &outbox_path, event);
             }
         });
         (
@@ -147,15 +179,79 @@ impl Drop for BuiltinAiEventSync {
     }
 }
 
-fn enqueue_event(sender: &SyncSender<BuiltinAIRuntimeEvent>, event: BuiltinAIRuntimeEvent) {
-    match sender.try_send(event) {
-        Ok(()) => {}
-        Err(TrySendError::Full(event)) => eprintln!(
-            "HiMind AI 会话同步队列已满，事件稍后可由会话恢复补齐：{}",
-            event.event_id
-        ),
-        Err(TrySendError::Disconnected(_)) => {}
+fn enqueue_event(
+    sender: &Sender<BuiltinAIRuntimeEvent>,
+    outbox: &Path,
+    event: BuiltinAIRuntimeEvent,
+) {
+    if let Err(error) = persist_event(outbox, &event) {
+        eprintln!(
+            "HiMind AI 会话事件无法写入 outbox（event={}）：{}",
+            event.event_id, error
+        );
     }
+    if sender.send(event).is_err() {
+        eprintln!("HiMind AI 会话同步 worker 已退出，事件将由 outbox 重放");
+    }
+}
+
+fn event_outbox_path() -> PathBuf {
+    crate::store::paths::agent_home()
+        .join("outbox")
+        .join("builtin-ai-events")
+}
+
+fn persisted_event_path(outbox: &Path, event: &BuiltinAIRuntimeEvent) -> PathBuf {
+    let safe_id = if !event.event_id.is_empty()
+        && event
+            .event_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_' | b'.'))
+    {
+        event.event_id.clone()
+    } else {
+        let mut digest = Sha256::new();
+        digest.update(event.event_id.as_bytes());
+        format!("{:x}", digest.finalize())
+    };
+    outbox.join(format!(
+        "{:020}-{:020}-{safe_id}.json",
+        event.occurred_at_ms.max(0),
+        event.sequence.max(0)
+    ))
+}
+
+fn persist_event(outbox: &Path, event: &BuiltinAIRuntimeEvent) -> Result<(), String> {
+    fs::create_dir_all(outbox).map_err(|error| error.to_string())?;
+    let content = serde_json::to_vec(event).map_err(|error| error.to_string())?;
+    crate::store::atomic_file::atomic_write(&persisted_event_path(outbox, event), &content)
+        .map_err(|error| error.to_string())
+}
+
+fn remove_persisted_event(outbox: &Path, event: &BuiltinAIRuntimeEvent) {
+    let _ = fs::remove_file(persisted_event_path(outbox, event));
+}
+
+fn next_persisted_event(outbox: &Path) -> Option<BuiltinAIRuntimeEvent> {
+    let mut paths = fs::read_dir(outbox)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let Ok(content) = fs::read(&path) else {
+            continue;
+        };
+        match serde_json::from_slice::<BuiltinAIRuntimeEvent>(&content) {
+            Ok(event) => return Some(event),
+            Err(error) => eprintln!(
+                "HiMind AI 会话事件 outbox 文件损坏（{}）：{error}",
+                path.display()
+            ),
+        }
+    }
+    None
 }
 
 fn upload_with_retry(
@@ -164,13 +260,16 @@ fn upload_with_retry(
     shutdown: &AtomicBool,
     capabilities: &Arc<Mutex<RuntimeCapabilities>>,
     event: &BuiltinAIRuntimeEvent,
-) -> Option<RuntimeHeartbeatTarget> {
+) -> Result<Option<RuntimeHeartbeatTarget>, UploadError> {
     for attempt in 0..EVENT_UPLOAD_ATTEMPTS {
         if shutdown.load(Ordering::Acquire) {
-            return None;
+            return Err(UploadError {
+                message: "会话同步 worker 正在关闭".to_string(),
+                transient: true,
+            });
         }
         match upload_event(client, options, capabilities, event) {
-            Ok(target) => return target,
+            Ok(target) => return Ok(target),
             Err(error) if error.transient && attempt + 1 < EVENT_UPLOAD_ATTEMPTS => {
                 thread::sleep(retry_delay(attempt));
             }
@@ -179,11 +278,11 @@ fn upload_with_retry(
                     "HiMind AI 会话事件同步失败（event={}）：{}",
                     event.event_id, error.message
                 );
-                return None;
+                return Err(error);
             }
         }
     }
-    None
+    unreachable!("event upload retry loop must return from a match arm")
 }
 
 struct UploadError {
@@ -381,6 +480,7 @@ fn retry_delay(attempt: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn only_transient_http_statuses_are_retried() {
@@ -389,5 +489,44 @@ mod tests {
         assert!(transient_status(StatusCode::BAD_GATEWAY));
         assert!(!transient_status(StatusCode::BAD_REQUEST));
         assert!(!transient_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn persisted_events_can_be_replayed_and_removed() {
+        let outbox = std::env::temp_dir().join(format!(
+            "himind-ai-event-outbox-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let event = BuiltinAIRuntimeEvent {
+            schema_version: 1,
+            session_id: "session-test".to_string(),
+            event_id: "event-test".to_string(),
+            sequence: 1,
+            turn_id: String::new(),
+            event_type: "approval.requested".to_string(),
+            content: String::new(),
+            label: "允许测试".to_string(),
+            outcome: String::new(),
+            request_rpc_id: "rpc-test".to_string(),
+            approval_id: "approval-test".to_string(),
+            question_payload: None,
+            occurred_at_ms: 1,
+        };
+        let mut later = event.clone();
+        later.event_id = "event-later".to_string();
+        later.sequence = 2;
+        later.occurred_at_ms = 2;
+        persist_event(&outbox, &later).expect("persist later event");
+        persist_event(&outbox, &event).expect("persist event");
+        assert_eq!(next_persisted_event(&outbox), Some(event.clone()));
+        remove_persisted_event(&outbox, &event);
+        assert_eq!(next_persisted_event(&outbox), Some(later.clone()));
+        remove_persisted_event(&outbox, &later);
+        assert_eq!(next_persisted_event(&outbox), None);
+        let _ = fs::remove_dir_all(outbox);
     }
 }

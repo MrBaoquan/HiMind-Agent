@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -239,7 +240,192 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
         items.push(read_plugin_item(PathBuf::from(entry.path), true));
     }
     items.sort_by(|a, b| a.id.cmp(&b.id));
+    for (plugin_id, issue) in plugin_dependency_cycle_issues(&items) {
+        if let Some(item) = items
+            .iter_mut()
+            .find(|candidate| candidate.id == plugin_id && candidate.error.is_none())
+        {
+            item.status = "blocked".to_string();
+            item.enabled = false;
+            item.error = Some(issue);
+        }
+    }
+    // Resolve plugin dependencies after all sources have been discovered. A
+    // plugin with an unsatisfied required dependency remains visible for
+    // diagnostics, but is blocked from the Capability Registry and MCP.
+    loop {
+        let snapshot = items.clone();
+        let mut changed = false;
+        for item in &mut items {
+            let issues = plugin_dependency_issues(item, &snapshot);
+            if !issues.is_empty() && item.error.is_none() {
+                item.status = "blocked".to_string();
+                item.enabled = false;
+                item.error = Some(issues.join("; "));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     Ok(items)
+}
+
+fn plugin_dependency_cycle_issues(installed: &[PluginRegistryItem]) -> HashMap<String, String> {
+    fn visit(
+        plugin_id: &str,
+        installed: &[PluginRegistryItem],
+        index: &HashMap<String, usize>,
+        visited: &mut HashSet<String>,
+        active: &mut HashMap<String, usize>,
+        stack: &mut Vec<String>,
+        issues: &mut HashMap<String, String>,
+    ) {
+        if let Some(start) = active.get(plugin_id).copied() {
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(plugin_id.to_string());
+            let message = format!("插件依赖存在循环: {}", cycle.join(" -> "));
+            for member in &stack[start..] {
+                issues
+                    .entry(member.clone())
+                    .or_insert_with(|| message.clone());
+            }
+            return;
+        }
+        if visited.contains(plugin_id) {
+            return;
+        }
+        let Some(item) = index
+            .get(plugin_id)
+            .and_then(|position| installed.get(*position))
+        else {
+            return;
+        };
+        active.insert(plugin_id.to_string(), stack.len());
+        stack.push(plugin_id.to_string());
+        for dependency in item
+            .plugin_dependencies
+            .iter()
+            .filter(|dependency| dependency.required)
+        {
+            if index.contains_key(&dependency.plugin_id) {
+                visit(
+                    &dependency.plugin_id,
+                    installed,
+                    index,
+                    visited,
+                    active,
+                    stack,
+                    issues,
+                );
+            }
+        }
+        stack.pop();
+        active.remove(plugin_id);
+        visited.insert(plugin_id.to_string());
+    }
+
+    let index = installed
+        .iter()
+        .enumerate()
+        .map(|(position, item)| (item.id.clone(), position))
+        .collect::<HashMap<_, _>>();
+    let mut visited = HashSet::new();
+    let mut active = HashMap::new();
+    let mut stack = Vec::new();
+    let mut issues = HashMap::new();
+    for item in installed {
+        visit(
+            &item.id,
+            installed,
+            &index,
+            &mut visited,
+            &mut active,
+            &mut stack,
+            &mut issues,
+        );
+    }
+    issues
+}
+
+/// Returns required dependency failures for an installed plugin. Optional
+/// dependencies are intentionally omitted: their absence must not prevent a
+/// plugin from being used, but can be surfaced by management UIs later.
+pub(crate) fn plugin_dependency_issues(
+    plugin: &PluginRegistryItem,
+    installed: &[PluginRegistryItem],
+) -> Vec<String> {
+    plugin
+        .plugin_dependencies
+        .iter()
+        .filter(|dependency| dependency.required)
+        .filter_map(|dependency| {
+            let Some(provider) = installed
+                .iter()
+                .find(|item| item.id == dependency.plugin_id)
+            else {
+                return Some(format!("缺少必需插件 {}", dependency.plugin_id));
+            };
+            if !provider.enabled || provider.error.is_some() {
+                return Some(format!("必需插件 {} 当前不可用", dependency.plugin_id));
+            }
+            if !dependency.min_version.trim().is_empty()
+                && crate::skill::resolver::compare_versions(
+                    &provider.version,
+                    &dependency.min_version,
+                ) == std::cmp::Ordering::Less
+            {
+                return Some(format!(
+                    "插件 {} 版本低于 {}",
+                    dependency.plugin_id, dependency.min_version
+                ));
+            }
+            None
+        })
+        .collect()
+}
+
+/// Resolves dependencies for a manifest before it is installed as a
+/// development candidate. This keeps candidate tests aligned with the same
+/// runtime gate used by the live registry.
+pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Vec<String> {
+    match scan_plugins() {
+        Ok(installed) => {
+            let candidate = PluginRegistryItem {
+                id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                author_name: manifest.author.clone(),
+                description: manifest.description.clone(),
+                release_notes: manifest.release_notes.clone(),
+                version: manifest.version.clone(),
+                runtime: manifest.runtime.clone(),
+                min_agent_version: manifest.min_agent_version.clone(),
+                governance: manifest.governance.clone(),
+                availability: "local".to_string(),
+                source: "candidate".to_string(),
+                status: "installed".to_string(),
+                enabled: true,
+                path: String::new(),
+                development: true,
+                entry: manifest.entry.clone(),
+                entry_modified_at: None,
+                entry_size: None,
+                previous_version: None,
+                rollback_available: false,
+                capabilities: manifest.capabilities.clone(),
+                permissions: manifest.permissions.clone(),
+                plugin_dependencies: manifest.plugin_dependencies.clone(),
+                views: manifest.contributes.views.clone(),
+                commands: manifest.contributes.commands.clone(),
+                error: None,
+                failure_count: 0,
+                circuit_open: false,
+            };
+            plugin_dependency_issues(&candidate, &installed)
+        }
+        Err(error) => vec![format!("读取插件依赖失败: {error}")],
+    }
 }
 
 fn is_plugin_install_directory(path: &std::path::Path) -> bool {
@@ -1046,6 +1232,27 @@ pub(crate) fn validate_manifest_contributions(
     if !is_safe_resource_segment(&manifest.id) {
         return Err(format!("invalid plugin id: {}", manifest.id).into());
     }
+    let mut dependency_ids = std::collections::HashSet::new();
+    for dependency in &manifest.plugin_dependencies {
+        if !is_safe_resource_segment(&dependency.plugin_id) {
+            return Err(format!("invalid plugin dependency id: {}", dependency.plugin_id).into());
+        }
+        if dependency.plugin_id == manifest.id {
+            return Err("plugin cannot depend on itself".into());
+        }
+        if !dependency_ids.insert(dependency.plugin_id.as_str()) {
+            return Err(format!("duplicate plugin dependency: {}", dependency.plugin_id).into());
+        }
+        if !dependency.min_version.trim().is_empty()
+            && semver::Version::parse(&dependency.min_version).is_err()
+        {
+            return Err(format!(
+                "invalid plugin dependency version: {}",
+                dependency.min_version
+            )
+            .into());
+        }
+    }
     let mut view_ids = std::collections::HashSet::new();
     for view in &manifest.contributes.views {
         if !is_safe_resource_segment(&view.id) || view.title.trim().is_empty() {
@@ -1190,6 +1397,73 @@ mod tests {
         assert_eq!(item.version, "1.2.3");
         assert_eq!(item.release_notes, "新增本机详情更新说明。");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn required_plugin_dependency_blocks_missing_or_old_provider() {
+        let dependent = builtin_plugin("com.example.dependent", "依赖测试", "依赖测试", &[], &[]);
+        let mut dependent = dependent;
+        dependent.plugin_dependencies = vec![PluginDependencyManifest {
+            plugin_id: "com.example.provider".to_string(),
+            required: true,
+            min_version: "2.0.0".to_string(),
+        }];
+
+        let missing = plugin_dependency_issues(&dependent, &[]);
+        assert_eq!(missing, vec!["缺少必需插件 com.example.provider"]);
+
+        let mut old = builtin_plugin("com.example.provider", "能力提供者", "能力提供者", &[], &[]);
+        old.version = "1.0.0".to_string();
+        let outdated = plugin_dependency_issues(&dependent, &[old]);
+        assert_eq!(outdated, vec!["插件 com.example.provider 版本低于 2.0.0"]);
+    }
+
+    #[test]
+    fn optional_plugin_dependency_does_not_block_runtime() {
+        let mut dependent = builtin_plugin(
+            "com.example.dependent",
+            "可选依赖测试",
+            "可选依赖测试",
+            &[],
+            &[],
+        );
+        dependent.plugin_dependencies = vec![PluginDependencyManifest {
+            plugin_id: "com.example.optional".to_string(),
+            required: false,
+            min_version: "1.0.0".to_string(),
+        }];
+
+        assert!(plugin_dependency_issues(&dependent, &[]).is_empty());
+    }
+
+    #[test]
+    fn required_plugin_dependency_cycle_blocks_every_cycle_member() {
+        let mut first = builtin_plugin("com.example.first", "第一个插件", "测试", &[], &[]);
+        first.plugin_dependencies = vec![PluginDependencyManifest {
+            plugin_id: "com.example.second".to_string(),
+            required: true,
+            min_version: "1.0.0".to_string(),
+        }];
+        let mut second = builtin_plugin("com.example.second", "第二个插件", "测试", &[], &[]);
+        second.plugin_dependencies = vec![PluginDependencyManifest {
+            plugin_id: "com.example.first".to_string(),
+            required: true,
+            min_version: "1.0.0".to_string(),
+        }];
+        let mut upstream = builtin_plugin("com.example.upstream", "上游插件", "测试", &[], &[]);
+        upstream.plugin_dependencies = vec![PluginDependencyManifest {
+            plugin_id: "com.example.first".to_string(),
+            required: true,
+            min_version: "1.0.0".to_string(),
+        }];
+
+        let issues = plugin_dependency_cycle_issues(&[first, second, upstream]);
+        assert_eq!(issues.len(), 2);
+        assert!(issues.contains_key("com.example.first"));
+        assert!(issues.contains_key("com.example.second"));
+        assert!(!issues.contains_key("com.example.upstream"));
+        assert!(issues["com.example.first"]
+            .contains("com.example.first -> com.example.second -> com.example.first"));
     }
 
     #[test]

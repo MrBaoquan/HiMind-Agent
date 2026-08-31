@@ -72,7 +72,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         distribution_update_signature_key_id: String::new(),
         distribution_update_signature_algorithm: String::new(),
     }));
-    let approval_manager = Arc::new(ApprovalManager::new());
+    let approval_manager = ApprovalManager::global();
     let service_options = options.clone();
     let service_worker_status = Arc::clone(&worker_status);
     let service_approval_manager = Arc::clone(&approval_manager);
@@ -171,6 +171,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_all_mcp_registrations,
             super::commands::test_mcp_server,
             super::commands::get_pending_approvals,
+            super::commands::get_approval_history,
             super::commands::respond_approval,
             super::commands::get_approval_settings,
             super::commands::get_remote_execution_settings,
@@ -193,6 +194,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::start_builtin_ai_session,
             super::commands::sync_builtin_ai_models,
             super::commands::set_approval_rule,
+            super::commands::set_approval_profile,
+            super::commands::set_approval_notification_mode,
             super::commands::set_approval_timeout,
             super::commands::get_local_login_status,
             super::commands::save_local_login,
@@ -222,6 +225,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_extension_source,
             super::commands::get_extension_source_snapshot,
             super::commands::get_extension_provenance,
+            super::commands::get_extension_lock,
             super::commands::import_local_plugin,
             super::commands::import_github_plugin,
             super::commands::import_github_plugin_url,
@@ -236,6 +240,13 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::rollback_plugin,
             super::commands::set_plugin_enabled,
             super::commands::get_agent_capabilities,
+            super::commands::list_ai_services,
+            super::commands::save_ai_service,
+            super::commands::remove_ai_service,
+            super::commands::import_ai_client,
+            super::commands::remove_ai_client,
+            super::commands::fetch_ai_service_models,
+            super::commands::fetch_saved_ai_service_models,
             super::commands::get_skill_catalog,
             super::commands::import_local_skill,
             super::commands::import_github_skill,
@@ -370,6 +381,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
         false,
         None::<&str>,
     )?;
+    let approval_item = MenuItem::with_id(handle, "approvals", "待审批：0", true, None::<&str>)?;
     let check_update_item =
         MenuItem::with_id(handle, "check-update", "检查更新", true, None::<&str>)?;
     let update_status = handle
@@ -396,6 +408,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
         &[
             &open_item,
             &status_item,
+            &approval_item,
             &check_update_item,
             &install_update_item,
             &quit_item,
@@ -404,6 +417,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
 
     let icon = make_tray_icon()?;
     start_update_tray_watcher(handle.clone(), install_update_item.clone());
+    start_approval_tray_watcher(handle.clone(), approval_item.clone());
 
     let _tray = TrayIconBuilder::new()
         .icon(icon)
@@ -412,6 +426,15 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => {
                 show_main_window(app);
+            }
+            "approvals" => {
+                if let Some(window) = app.get_webview_window("approval-popup") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                } else {
+                    show_main_window(app);
+                }
             }
             "quit" => {
                 stop_builtin_ai_process();
@@ -490,6 +513,28 @@ fn start_update_tray_watcher(app: tauri::AppHandle, install_item: MenuItem<tauri
     });
 }
 
+fn start_approval_tray_watcher(app: tauri::AppHandle, approval_item: MenuItem<tauri::Wry>) {
+    thread::spawn(move || {
+        let mut previous = usize::MAX;
+        loop {
+            let Some(state) = app.try_state::<AgentState>() else {
+                return;
+            };
+            let count = state.approval_manager.list_pending().len();
+            if count != previous {
+                let text = if count == 0 {
+                    "待审批：0".to_string()
+                } else {
+                    format!("待审批：{count}")
+                };
+                let _ = approval_item.set_text(text);
+                previous = count;
+            }
+            thread::sleep(Duration::from_millis(700));
+        }
+    });
+}
+
 fn setup_approval_popup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
     if handle.get_webview_window("approval-popup").is_some() {
@@ -525,7 +570,7 @@ fn start_approval_popup_watcher(app: tauri::AppHandle, approval_manager: Arc<App
                 break;
             };
 
-            if pending.is_empty() {
+            if pending.is_empty() || !approval_manager.should_show_popup() {
                 if popup_visible {
                     let _ = window.hide();
                     popup_visible = false;

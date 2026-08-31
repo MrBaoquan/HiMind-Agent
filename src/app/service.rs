@@ -1,5 +1,6 @@
 use reqwest::blocking::Client;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,8 +20,7 @@ use std::num::NonZeroIsize;
 
 use crate::api::client::{verify_local_agent_ticket, LocalAgentTicketPrincipal};
 use crate::app::ai_provider_import::{
-    cancel as cancel_ai_provider_import, consume_vscode_enrollment, import as import_ai_provider,
-    reconcile_vscode_import, status as ai_provider_import_status, AIProviderImportRequest,
+    consume_vscode_enrollment, reconcile_vscode_import, AIProviderImportRequest,
 };
 use crate::app::http::{
     local_tree_json, query_param, set_response_origin, split_target, write_local_response,
@@ -126,6 +126,29 @@ pub(crate) fn start_background_services(
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
                 reconcile_vscode_import(&reconcile_options);
+            });
+        // 已登录且 DSH 会话已启动时，周期对账 Dashboard 分发的 AI 服务：
+        // 模型目录变更 live 更新；凭据/路由变更自动重启 DSH 会话使用新环境。
+        // 会话未启动属预期（用户尚未打开 HiMind AI），静默跳过，不刷错误日志。
+        let sync_options = options.clone();
+        let _ = thread::Builder::new()
+            .name("himind-builtin-ai-sync-loop".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(120));
+                match crate::app::ui::sync_builtin_ai_models(&sync_options) {
+                    Ok(result) => {
+                        if result.status == "restarted" {
+                            eprintln!(
+                                "builtin AI model sync restarted DSH session with new credential"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if !error.contains("尚未启动") {
+                            eprintln!("builtin AI model sync failed: {error}");
+                        }
+                    }
+                }
             });
     }
     let listener = match TcpListener::bind(("127.0.0.1", options.local_port)) {
@@ -386,7 +409,10 @@ fn handle_local_http(
             Ok(items) => write_local_response(
                 &mut stream,
                 200,
-                &json!({ "items": items }).to_string(),
+                &json!({
+                    "items": items,
+                    "generation": format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&items)?))
+                }).to_string(),
                 "application/json",
             ),
             Err(error) => write_local_response(
@@ -899,15 +925,16 @@ fn handle_local_http(
                     )
                 }
             };
-            let expected_user_id = local_principal
-                .as_ref()
-                .map(|principal| principal.user_id.as_str())
-                .unwrap_or_default();
-            match import_ai_provider(&options, expected_user_id, &payload) {
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(
+                &context,
+                "ai.client.import",
+                json!({ "target": payload.target.clone() }),
+            ) {
                 Ok(value) => write_local_response(
                     &mut stream,
                     200,
-                    &serde_json::to_string(&value)?,
+                    &value.to_string(),
                     "application/json",
                 ),
                 Err(error) => write_local_response(
@@ -918,12 +945,18 @@ fn handle_local_http(
                 ),
             }
         }
-        ("GET", "/ai-provider-import/status") => write_local_response(
-            &mut stream,
-            200,
-            &serde_json::to_string(&ai_provider_import_status(&options))?,
-            "application/json",
-        ),
+        ("GET", "/ai-provider-import/status") => {
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(&context, "ai.client.status", serde_json::json!({})) {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
         ("POST", "/ai-provider-import/cancel") => {
             let payload: AIProviderImportRequest = match serde_json::from_str(body) {
                 Ok(value) => value,
@@ -936,11 +969,16 @@ fn handle_local_http(
                     )
                 }
             };
-            match cancel_ai_provider_import(&options, &payload.target) {
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(
+                &context,
+                "ai.client.remove",
+                json!({ "target": payload.target.clone() }),
+            ) {
                 Ok(value) => write_local_response(
                     &mut stream,
                     200,
-                    &serde_json::to_string(&value)?,
+                    &value.to_string(),
                     "application/json",
                 ),
                 Err(error) => write_local_response(

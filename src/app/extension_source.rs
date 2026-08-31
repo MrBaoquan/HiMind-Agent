@@ -467,21 +467,52 @@ pub(crate) fn install_plugin(
         &mut order,
     )?;
     let mut changes = Vec::new();
+    let mut reference_changes = Vec::new();
+    let mut provenance_changes = Vec::new();
+    let mut lock_changes = Vec::new();
     for item in &order {
         let before = crate::app::plugin_manager::local_status(&item.plugin_id);
+        let previous_lock = crate::app::extension_lock::read("plugin", &item.plugin_id)?;
         if before.current_version == item.version && before.enabled {
             continue;
         }
-        let source = source_for_catalog_item(&snapshot, &item.source)?;
+        let source = match source_for_catalog_item(&snapshot, &item.source) {
+            Ok(source) => source,
+            Err(error) => {
+                restore_plugin_install_state(&reference_changes);
+                restore_provenance_changes(&provenance_changes);
+                restore_lock_changes(&lock_changes);
+                compensate_plugin_changes(&changes);
+                return Err(error);
+            }
+        };
+        lock_changes.push(("plugin".to_string(), item.plugin_id.clone(), previous_lock));
         if let Err(error) = crate::app::plugin_manager::install_public_catalog_item(
             item,
             source.verification.requires_signature(),
         ) {
+            restore_plugin_install_state(&reference_changes);
+            restore_provenance_changes(&provenance_changes);
+            restore_lock_changes(&lock_changes);
             compensate_plugin_changes(&changes);
             return Err(error);
         }
         changes.push((item.plugin_id.clone(), before));
-        save_provenance(
+        let previous_provenance = match read_provenance("plugin", &item.plugin_id) {
+            Ok(value) => value,
+            Err(error) => {
+                restore_plugin_install_state(&reference_changes);
+                compensate_plugin_changes(&changes);
+                restore_lock_changes(&lock_changes);
+                return Err(error);
+            }
+        };
+        provenance_changes.push((
+            "plugin".to_string(),
+            item.plugin_id.clone(),
+            previous_provenance,
+        ));
+        if let Err(error) = save_provenance(
             source,
             "plugin",
             &item.plugin_id,
@@ -489,22 +520,88 @@ pub(crate) fn install_plugin(
             &item.download_url,
             &item.sha256,
             &item.signature_key_id,
-        )?;
+        ) {
+            restore_plugin_install_state(&reference_changes);
+            restore_provenance_changes(&provenance_changes);
+            restore_lock_changes(&lock_changes);
+            compensate_plugin_changes(&changes);
+            return Err(error);
+        }
         let direct_dependencies = item
             .plugin_dependencies
             .iter()
             .filter(|dependency| dependency.required)
             .map(|dependency| dependency.plugin_id.clone())
             .collect::<Vec<_>>();
-        crate::app::plugin_manager::set_owner_references(
-            &format!("plugin:{}", item.plugin_id),
-            &direct_dependencies,
-        )?;
+        let owner = format!("plugin:{}", item.plugin_id);
+        let previous_references = crate::app::plugin_manager::owner_dependency_ids(&owner);
+        if let Err(error) =
+            crate::app::plugin_manager::set_owner_references(&owner, &direct_dependencies)
+        {
+            restore_plugin_install_state(&reference_changes);
+            restore_provenance_changes(&provenance_changes);
+            restore_lock_changes(&lock_changes);
+            compensate_plugin_changes(&changes);
+            return Err(error);
+        }
+        reference_changes.push((owner, previous_references));
+        if let Err(error) = crate::app::extension_lock::record_source_plugin(source, item) {
+            restore_plugin_install_state(&reference_changes);
+            restore_provenance_changes(&provenance_changes);
+            restore_lock_changes(&lock_changes);
+            compensate_plugin_changes(&changes);
+            return Err(error);
+        }
     }
     order
         .into_iter()
         .find(|item| item.plugin_id == plugin_id)
         .ok_or_else(|| "扩展源中未找到插件".into())
+}
+
+fn restore_plugin_install_state(reference_changes: &[(String, Vec<String>)]) {
+    for (owner, previous) in reference_changes.iter().rev() {
+        let _ = crate::app::plugin_manager::set_owner_references(owner, previous);
+    }
+}
+
+fn read_provenance(kind: &str, key: &str) -> Result<Option<ExtensionProvenance>, Box<dyn Error>> {
+    let path = provenance_path(kind, key)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+fn restore_provenance_changes(changes: &[(String, String, Option<ExtensionProvenance>)]) {
+    for (kind, key, previous) in changes.iter().rev() {
+        let Ok(path) = provenance_path(kind, key) else {
+            continue;
+        };
+        match previous {
+            Some(record) => {
+                let _ = atomic_file::atomic_write(
+                    &path,
+                    &serde_json::to_vec_pretty(record).unwrap_or_default(),
+                );
+            }
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn restore_lock_changes(
+    changes: &[(
+        String,
+        String,
+        Option<crate::app::extension_lock::ExtensionLockEntry>,
+    )],
+) {
+    for (kind, key, previous) in changes.iter().rev() {
+        let _ = crate::app::extension_lock::restore(kind, key, previous.clone());
+    }
 }
 
 pub(crate) fn plan_plugin(
@@ -578,7 +675,13 @@ pub(crate) fn install_skill(
         })
         .cloned()
         .ok_or_else(|| format!("扩展源中未找到 Skill: {skill_id}"))?;
+    // Resolve the source before mutating any local dependency state so a
+    // malformed catalog cannot leave a partially installed dependency set.
+    let source = source_for_catalog_item(&snapshot, &item.source)?;
+    let previous_provenance = read_provenance("skill", &item.skill_id)?;
     let mut plugin_changes = Vec::new();
+    let mut plugin_provenance_changes = Vec::new();
+    let mut lock_changes = Vec::new();
     let previous_references =
         crate::app::plugin_manager::owner_dependency_ids(&format!("skill:{skill_id}"));
     for dependency in item
@@ -587,6 +690,16 @@ pub(crate) fn install_skill(
         .filter(|dependency| dependency.required)
     {
         let before = crate::app::plugin_manager::local_status(&dependency.plugin_id);
+        let previous_lock = crate::app::extension_lock::read("plugin", &dependency.plugin_id)?;
+        let previous_plugin_provenance = match read_provenance("plugin", &dependency.plugin_id) {
+            Ok(value) => value,
+            Err(error) => {
+                restore_provenance_changes(&plugin_provenance_changes);
+                restore_lock_changes(&lock_changes);
+                compensate_plugin_changes(&plugin_changes);
+                return Err(error);
+            }
+        };
         let satisfied = !before.current_version.is_empty()
             && (dependency.min_version.is_empty()
                 || crate::skill::resolver::compare_versions(
@@ -596,8 +709,23 @@ pub(crate) fn install_skill(
         if satisfied {
             continue;
         }
-        install_plugin(&dependency.plugin_id, None)?;
+        if let Err(error) = install_plugin(&dependency.plugin_id, None) {
+            restore_provenance_changes(&plugin_provenance_changes);
+            restore_lock_changes(&lock_changes);
+            compensate_plugin_changes(&plugin_changes);
+            return Err(format!("安装 Skill 依赖 {} 失败: {error}", dependency.plugin_id).into());
+        }
         plugin_changes.push((dependency.plugin_id.clone(), before));
+        plugin_provenance_changes.push((
+            "plugin".to_string(),
+            dependency.plugin_id.clone(),
+            previous_plugin_provenance,
+        ));
+        lock_changes.push((
+            "plugin".to_string(),
+            dependency.plugin_id.clone(),
+            previous_lock,
+        ));
     }
     let dependency_ids = item
         .plugin_dependencies
@@ -607,10 +735,10 @@ pub(crate) fn install_skill(
         .collect::<Vec<_>>();
     let owner = format!("skill:{skill_id}");
     if let Err(error) = crate::app::plugin_manager::set_owner_references(&owner, &dependency_ids) {
+        restore_provenance_changes(&plugin_provenance_changes);
         compensate_plugin_changes(&plugin_changes);
         return Err(format!("记录 Skill 插件依赖失败: {error}").into());
     }
-    let source = source_for_catalog_item(&snapshot, &item.source)?;
     let record = match crate::app::skill_manager::install_public_catalog_item(
         &item,
         source.verification.requires_signature(),
@@ -618,11 +746,13 @@ pub(crate) fn install_skill(
         Ok(record) => record,
         Err(error) => {
             let _ = crate::app::plugin_manager::set_owner_references(&owner, &previous_references);
+            restore_provenance_changes(&plugin_provenance_changes);
+            restore_lock_changes(&lock_changes);
             compensate_plugin_changes(&plugin_changes);
             return Err(error);
         }
     };
-    save_provenance(
+    if let Err(error) = save_provenance(
         source,
         "skill",
         &item.skill_id,
@@ -630,7 +760,32 @@ pub(crate) fn install_skill(
         &item.download_url,
         &item.sha256,
         &item.signature_key_id,
-    )?;
+    ) {
+        let _ = crate::app::plugin_manager::set_owner_references(&owner, &previous_references);
+        restore_provenance_changes(&[(
+            "skill".to_string(),
+            item.skill_id.clone(),
+            previous_provenance,
+        )]);
+        restore_provenance_changes(&plugin_provenance_changes);
+        restore_lock_changes(&lock_changes);
+        compensate_plugin_changes(&plugin_changes);
+        return Err(error);
+    }
+    let previous_lock = crate::app::extension_lock::read("skill", &item.skill_id)?;
+    lock_changes.push(("skill".to_string(), item.skill_id.clone(), previous_lock));
+    if let Err(error) = crate::app::extension_lock::record_source_skill(source, &item) {
+        let _ = crate::app::plugin_manager::set_owner_references(&owner, &previous_references);
+        restore_provenance_changes(&[(
+            "skill".to_string(),
+            item.skill_id.clone(),
+            previous_provenance,
+        )]);
+        restore_provenance_changes(&plugin_provenance_changes);
+        restore_lock_changes(&lock_changes);
+        compensate_plugin_changes(&plugin_changes);
+        return Err(error);
+    }
     Ok((item, record))
 }
 

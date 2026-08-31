@@ -4,7 +4,8 @@ use crate::api::distribution::{
 };
 use crate::app::system::verify_extension_artifact_signature;
 use crate::capability::plugin::{
-    is_builtin_plugin, parse_plugin_manifest, plugin_registry_dir, PluginManifest,
+    is_builtin_plugin, parse_plugin_manifest, plugin_registry_dir, validate_manifest_contributions,
+    PluginManifest,
 };
 use crate::skill::resolver::compare_versions;
 use crate::store::plugin_outbox::{
@@ -396,7 +397,7 @@ fn validate_local_dependency(
     if !visiting.insert(plugin_id.to_string()) {
         return Err(format!("插件依赖存在循环：{plugin_id}").into());
     }
-    let result = (|| {
+    let result: Result<(), Box<dyn Error>> = (|| {
         if !item.enabled {
             if required {
                 return Err(format!("必需插件依赖不可用：{plugin_id}").into());
@@ -932,6 +933,14 @@ pub(crate) fn rollback(plugin_id: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn rollback_root(root: &Path, plugin_id: &str) -> Result<(), Box<dyn Error>> {
+    rollback_root_with_lock(root, plugin_id, &crate::app::extension_lock::path())
+}
+
+fn rollback_root_with_lock(
+    root: &Path,
+    plugin_id: &str,
+    lock_path: &Path,
+) -> Result<(), Box<dyn Error>> {
     let current = root.join("current");
     let previous = root.join("previous");
     if !current.exists() || !previous.exists() {
@@ -947,7 +956,13 @@ fn rollback_root(root: &Path, plugin_id: &str) -> Result<(), Box<dyn Error>> {
         return Err("插件 current/previous 身份不一致".into());
     }
     ensure_agent_version_supported(&previous_manifest.min_agent_version)?;
-    swap_current_previous(&root)
+    swap_current_previous(&root)?;
+    crate::app::extension_lock::record_local_plugin_at(
+        lock_path,
+        &previous_manifest,
+        "local_rollback",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
@@ -964,6 +979,7 @@ pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
         fs::remove_dir_all(root)?;
     }
     remove_owner_references(&format!("plugin:{plugin_id}"));
+    let _ = crate::app::extension_lock::remove("plugin", plugin_id);
     Ok(())
 }
 
@@ -977,6 +993,7 @@ pub(crate) fn remove_for_policy(plugin_id: &str) -> Result<(), Box<dyn Error>> {
         fs::remove_dir_all(root)?;
     }
     remove_owner_references(&format!("plugin:{plugin_id}"));
+    let _ = crate::app::extension_lock::remove("plugin", plugin_id);
     Ok(())
 }
 
@@ -1188,11 +1205,24 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
     if fs::metadata(archive_path)?.len() > MAX_PLUGIN_ARCHIVE_BYTES {
         return Err("插件制品超过 512 MiB 限制".into());
     }
+    let candidate_manifest = read_plugin_manifest_from_archive(archive_path)?;
+    if candidate_manifest.id != item.plugin_id || candidate_manifest.version != item.version {
+        return Err("插件 Manifest ID 或版本与发布记录不一致".into());
+    }
+    ensure_agent_version_supported(&candidate_manifest.min_agent_version)?;
+    validate_local_dependencies(&candidate_manifest)?;
     let root = plugin_root(&item.plugin_id)?;
     fs::create_dir_all(root.join("versions"))?;
+    let mut transaction = crate::app::extension_lock::InstallGuard::begin(
+        "plugin",
+        &item.plugin_id,
+        &item.version,
+        &root,
+    )?;
     let staging = root.join(format!("staging-{}", unique_suffix()));
     fs::create_dir_all(&staging)?;
-    let result = (|| {
+    transaction.stage("staged")?;
+    let result: Result<(), Box<dyn Error>> = (|| {
         let mut archive = ZipArchive::new(File::open(archive_path)?)?;
         if archive.len() > MAX_PLUGIN_ARCHIVE_ENTRIES {
             return Err("插件 ZIP 文件数量超过 100000 个限制".into());
@@ -1228,6 +1258,7 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
         if manifest.id != item.plugin_id || manifest.version != item.version {
             return Err("插件 Manifest ID 或版本与发布记录不一致".into());
         }
+        validate_manifest_contributions(&staging, &manifest)?;
         let version_dir = root.join("versions").join(&item.version);
         if version_dir.exists() {
             let existing = fs::read(version_dir.join("checksums.sha256"))?;
@@ -1269,6 +1300,7 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
             }
             return Err(error.into());
         }
+        transaction.stage("installed")?;
         let marker = root.join("disabled");
         if marker.exists() {
             fs::remove_file(marker)?;
@@ -1278,7 +1310,11 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
     if staging.exists() {
         let _ = fs::remove_dir_all(staging);
     }
-    result
+    result?;
+    crate::app::extension_lock::record_plugin(item)?;
+    transaction.stage("lock_committed")?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn swap_current_previous(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -1426,7 +1462,8 @@ mod tests {
         add_dependency_reference_at, build_install_plan, build_install_plan_for_item,
         compare_versions, dependency_references_at, ensure_plugin_not_referenced,
         flush_status_outbox, owner_dependency_ids_in, remove_owner_references_from, report_status,
-        rollback_root, set_enabled, set_owner_references_in, uninstall, verify_plugin_checksums,
+        rollback_root_with_lock, set_enabled, set_owner_references_in, uninstall,
+        verify_plugin_checksums,
     };
     use crate::api::distribution::{PluginCatalogItem, SkillPluginDependency};
     use crate::app::system::verify_extension_artifact_signature;
@@ -1800,7 +1837,12 @@ mod tests {
         fs::write(root.join("current/plugin.json"), manifest("2.0.0")).unwrap();
         fs::write(root.join("previous/plugin.json"), manifest("1.0.0")).unwrap();
 
-        rollback_root(&root, "com.himind.rollback").unwrap();
+        rollback_root_with_lock(
+            &root,
+            "com.himind.rollback",
+            &root.join("extension.lock.json"),
+        )
+        .unwrap();
 
         let current = fs::read_to_string(root.join("current/plugin.json")).unwrap();
         let previous = fs::read_to_string(root.join("previous/plugin.json")).unwrap();

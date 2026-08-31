@@ -6,6 +6,7 @@ pub(crate) mod builtin_ai_proxy;
 pub(crate) mod builtin_ai_sync;
 pub(crate) mod commands;
 pub(crate) mod diagnostics;
+pub(crate) mod extension_lock;
 pub(crate) mod extension_orchestrator;
 pub(crate) mod extension_reconciler;
 pub(crate) mod extension_source;

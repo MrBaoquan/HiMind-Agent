@@ -84,7 +84,7 @@ pub(crate) fn install_local_package_from_source(
         extract_archive(&source, &staging)?;
         staging.clone()
     };
-    let result = (|| {
+    let result: Result<SkillRecord, Box<dyn Error>> = (|| {
         validate_package_size(&package_root)?;
         verify_checksums(&package_root)?;
         verify_declared_contents(&package_root)?;
@@ -123,7 +123,9 @@ pub(crate) fn install_local_package_from_source(
     if staging.exists() {
         let _ = fs::remove_dir_all(staging);
     }
-    result
+    let record = result?;
+    crate::app::extension_lock::record_local_skill(&record.manifest, source_kind)?;
+    Ok(record)
 }
 
 /// Installs a Skill release from a configured public extension source.
@@ -142,7 +144,7 @@ pub(crate) fn install_public_catalog_item(
         .build()?;
     let archive = download_public(&client, item, require_signature)?;
     let staging = env::temp_dir().join(format!("himind-public-skill-{}", unique_suffix()));
-    let result = (|| {
+    let result: Result<SkillRecord, Box<dyn Error>> = (|| {
         extract_archive(&archive, &staging)?;
         validate_package_size(&staging)?;
         verify_checksums(&staging)?;
@@ -182,7 +184,9 @@ pub(crate) fn install_public_catalog_item(
     })();
     let _ = fs::remove_file(archive);
     let _ = fs::remove_dir_all(staging);
-    result
+    let record = result?;
+    crate::app::extension_lock::record_skill(item)?;
+    Ok(record)
 }
 
 pub(crate) fn plan_install(
@@ -260,7 +264,7 @@ pub(crate) fn install_with_dependencies(
         compensate_plugin_changes(&plugin_changes);
         return Err(format!("记录 Skill 插件依赖失败：{error}").into());
     }
-    let result = (|| {
+    let result: Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> = (|| {
         extract_archive(&archive, &staging)?;
         verify_checksums(&staging)?;
         verify_declared_contents(&staging)?;
@@ -284,7 +288,9 @@ pub(crate) fn install_with_dependencies(
         let _ = plugin_manager::set_owner_references(&owner, &previous_references);
         compensate_plugin_changes(&plugin_changes);
     }
-    result
+    let result = result?;
+    crate::app::extension_lock::record_skill(&result.0)?;
+    Ok(result)
 }
 
 fn compensate_plugin_changes(changes: &[(String, plugin_manager::LocalPluginStatus)]) {

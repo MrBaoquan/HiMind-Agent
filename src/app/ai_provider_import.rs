@@ -29,6 +29,17 @@ const MANAGED_VENDOR: &str = "HiMind";
 const CC_SWITCH_PROVIDER_ID: &str = "himind-codex";
 const CODEX_HIMIND_MODELS_FILE: &str = "himind-models.json";
 const CODEX_PROVIDER_ID: &str = "himind";
+const KIMI_CODE_PROVIDER_ID: &str = "himind";
+const KIMI_CODE_HIMIND_PREFIX: &str = "himind/";
+const KIMI_CODE_DEFAULT_CONTEXT: u64 = 1_048_576;
+const QWEN_CODE_PROVIDER_ID: &str = "himind";
+const QWEN_CODE_ENV_KEY: &str = "HIMIND_API_KEY";
+// Claude Code / Claude Desktop 通过 settings env 块注入 Anthropic 协议端点。
+// Anthropic SDK 会在 base_url 后追加 /v1/messages，故 base_url 需剥掉网关路径末尾的 /v1。
+const CLAUDE_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+const CLAUDE_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+const CLAUDE_MODEL_ENV: &str = "ANTHROPIC_MODEL";
+const CLAUDE_CUSTOM_MODEL_OPTION: &str = "ANTHROPIC_CUSTOM_MODEL_OPTION";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
 const VSCODE_CHAT_PROVIDER_PROPOSAL: &str = "chatProvider";
 // Keep the handoff short-lived, but long enough for a cold VS Code process,
@@ -66,6 +77,290 @@ static VSCODE_EXTENSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[derive(Debug, Deserialize)]
 pub(crate) struct AIProviderImportRequest {
     pub target: String,
+    /// 服务源：`managed`（默认，HiMind Dashboard 分发）或 `custom:<id>`（本机自定义服务）。
+    #[serde(default)]
+    pub service: String,
+}
+
+impl AIProviderImportRequest {
+    pub(crate) fn service_source(&self) -> &str {
+        if self.service.trim().is_empty() {
+            "managed"
+        } else {
+            self.service.trim()
+        }
+    }
+}
+
+/// 每种 AI 客户端的独立 Adapter 契约。
+///
+/// 各实现负责该客户端的检测、状态、接入计划、写配置、备份与移除；
+/// 不允许把客户端特定逻辑复制到 HTTP、Tauri 或 MCP 适配层。
+pub(crate) trait AIClientAdapter {
+    fn id(&self) -> &'static str;
+    fn display_name(&self) -> &'static str;
+    fn status(&self, options: &Options) -> AIProviderImportStatus;
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan;
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>>;
+    fn cancel(&self, options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>>;
+}
+
+pub(crate) struct VSCodeAdapter;
+pub(crate) struct CCSwitchAdapter;
+pub(crate) struct CodexAdapter;
+pub(crate) struct WorkBuddyAdapter;
+
+impl AIClientAdapter for VSCodeAdapter {
+    fn id(&self) -> &'static str {
+        "vscode"
+    }
+    fn display_name(&self) -> &'static str {
+        "VS Code"
+    }
+    fn status(&self, options: &Options) -> AIProviderImportStatus {
+        vscode_import_status(options)
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("vscode", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_vscode(options, user_id, service)
+    }
+    fn cancel(&self, options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_vscode(options)
+    }
+}
+
+impl AIClientAdapter for CCSwitchAdapter {
+    fn id(&self) -> &'static str {
+        "cc-switch"
+    }
+    fn display_name(&self) -> &'static str {
+        "CC Switch"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        cc_switch_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("cc-switch", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_cc_switch(options, user_id, service)
+    }
+    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_cc_switch()
+    }
+}
+
+impl AIClientAdapter for CodexAdapter {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+    fn status(&self, options: &Options) -> AIProviderImportStatus {
+        codex_import_status(options)
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("codex", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_codex(options, user_id, service)
+    }
+    fn cancel(&self, options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_codex(options)
+    }
+}
+
+impl AIClientAdapter for WorkBuddyAdapter {
+    fn id(&self) -> &'static str {
+        "workbuddy"
+    }
+    fn display_name(&self) -> &'static str {
+        "WorkBuddy"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        workbuddy_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("workbuddy", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_workbuddy(options, user_id, service)
+    }
+    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_workbuddy()
+    }
+}
+
+pub(crate) struct KimiCodeAdapter;
+pub(crate) struct QwenCodeAdapter;
+
+impl AIClientAdapter for KimiCodeAdapter {
+    fn id(&self) -> &'static str {
+        "kimi-code"
+    }
+    fn display_name(&self) -> &'static str {
+        "Kimi Code"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        kimi_code_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("kimi-code", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_kimi_code(options, user_id, service)
+    }
+    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_kimi_code()
+    }
+}
+
+impl AIClientAdapter for QwenCodeAdapter {
+    fn id(&self) -> &'static str {
+        "qwen-code"
+    }
+    fn display_name(&self) -> &'static str {
+        "Qwen Code"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        qwen_code_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("qwen-code", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_qwen_code(options, user_id, service)
+    }
+    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_qwen_code()
+    }
+}
+
+pub(crate) struct ClaudeCodeAdapter;
+pub(crate) struct ClaudeDesktopAdapter;
+
+impl AIClientAdapter for ClaudeCodeAdapter {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        claude_code_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("claude-code", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_claude_code(options, user_id, service)
+    }
+    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_claude_code()
+    }
+}
+
+impl AIClientAdapter for ClaudeDesktopAdapter {
+    fn id(&self) -> &'static str {
+        "claude-desktop"
+    }
+    fn display_name(&self) -> &'static str {
+        "Claude Desktop"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        claude_desktop_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("claude-desktop", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_claude_desktop(options, user_id, service)
+    }
+    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_claude_desktop()
+    }
+}
+
+pub(crate) fn adapter_for(target: &str) -> Option<&'static dyn AIClientAdapter> {
+    match target.trim() {
+        "vscode" => Some(&VSCodeAdapter),
+        "cc-switch" => Some(&CCSwitchAdapter),
+        "codex" => Some(&CodexAdapter),
+        "workbuddy" => Some(&WorkBuddyAdapter),
+        "kimi-code" => Some(&KimiCodeAdapter),
+        "qwen-code" => Some(&QwenCodeAdapter),
+        "claude-code" => Some(&ClaudeCodeAdapter),
+        "claude-desktop" => Some(&ClaudeDesktopAdapter),
+        _ => None,
+    }
+}
+
+pub(crate) fn known_adapters() -> Vec<&'static dyn AIClientAdapter> {
+    vec![
+        &VSCodeAdapter,
+        &CCSwitchAdapter,
+        &CodexAdapter,
+        &WorkBuddyAdapter,
+        &KimiCodeAdapter,
+        &QwenCodeAdapter,
+        &ClaudeCodeAdapter,
+        &ClaudeDesktopAdapter,
+    ]
+}
+
+pub(crate) fn known_adapter_ids() -> Vec<&'static str> {
+    known_adapters()
+        .into_iter()
+        .map(AIClientAdapter::id)
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -122,50 +417,263 @@ pub(crate) struct AIProviderImportCancelResult {
     pub backup_path: String,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct AIProviderImportPlan {
+    pub target: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service: String,
+    pub client_detected: bool,
+    pub already_imported: bool,
+    pub will_write: Vec<String>,
+    pub will_backup: Vec<String>,
+    pub detail: String,
+}
+
+pub(crate) fn plan(
+    options: &Options,
+    target: &str,
+    action: &str,
+) -> Result<AIProviderImportPlan, Box<dyn Error>> {
+    plan_with_service(options, target, action, "")
+}
+
+pub(crate) fn plan_with_service(
+    options: &Options,
+    target: &str,
+    action: &str,
+    service: &str,
+) -> Result<AIProviderImportPlan, Box<dyn Error>> {
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let status = status(options)
+        .targets
+        .into_iter()
+        .find(|item| item.target == target.trim())
+        .ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let mut result = adapter.plan(action, &status);
+    result.service = service.trim().to_string();
+    if action == "import" && service.trim().starts_with("custom:") && result.already_imported {
+        result.detail = format!(
+            "{}；切换到自定义服务前请先移除客户端当前接入",
+            result.detail
+        );
+    }
+    Ok(result)
+}
+
+fn plan_for(target: &str, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+    let (will_write, will_backup) = match action {
+        "import" => plan_import(target, status),
+        "remove" => plan_remove(target, status),
+        _ => (Vec::new(), Vec::new()),
+    };
+    AIProviderImportPlan {
+        target: target.to_string(),
+        action: action.to_string(),
+        service: String::new(),
+        client_detected: status.client_detected,
+        already_imported: status.state == "imported",
+        will_write,
+        will_backup,
+        detail: status.detail.clone(),
+    }
+}
+
+fn plan_import(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, Vec<String>) {
+    let mut will_write = Vec::new();
+    let mut will_backup = Vec::new();
+    if !status.config_path.is_empty() {
+        will_backup.push(status.config_path.clone());
+        will_write.push(status.config_path.clone());
+    }
+    match target {
+        "codex" => {
+            will_write
+                .push("写入 Codex config.toml 的 [model_providers.himind] 与模型目录".to_string());
+        }
+        "cc-switch" => {
+            will_write.push("向 CC Switch 数据库写入 HiMind 供应商配置".to_string());
+        }
+        "workbuddy" => {
+            will_write.push("向 WorkBuddy models 配置写入 HiMind 模型".to_string());
+        }
+        "vscode" => {
+            will_write.push("安装/更新 HiMind VS Code 扩展并打开授权页".to_string());
+        }
+        "kimi-code" => {
+            will_write.push(
+                "写入 Kimi Code config.toml 的 [providers.himind] 与 [models] 配置".to_string(),
+            );
+        }
+        "qwen-code" => {
+            will_write.push("写入 Qwen Code settings.json 的 modelProviders 与 env".to_string());
+        }
+        "claude-code" => {
+            will_write.push(
+                "写入 Claude Code settings.json env 的 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL"
+                    .to_string(),
+            );
+        }
+        "claude-desktop" => {
+            will_write.push(
+                "写入 Claude Desktop claude_desktop_config.json env 的 ANTHROPIC_* 配置"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    (will_write, will_backup)
+}
+
+fn plan_remove(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, Vec<String>) {
+    let mut will_write = Vec::new();
+    let mut will_backup = Vec::new();
+    if !status.config_path.is_empty() {
+        will_backup.push(status.config_path.clone());
+        will_write.push(status.config_path.clone());
+    }
+    match target {
+        "codex" => {
+            will_write.push(
+                "移除 Codex config.toml 的 [model_providers.himind] 配置与模型目录".to_string(),
+            );
+        }
+        "cc-switch" => {
+            will_write.push("移除 CC Switch 数据库中的 HiMind 供应商配置".to_string());
+        }
+        "workbuddy" => {
+            will_write.push("移除 WorkBuddy models 配置中的 HiMind 模型".to_string());
+        }
+        "vscode" => {
+            will_write.push("移除 HiMind VS Code 扩展中的 HiMind 服务配置".to_string());
+        }
+        "kimi-code" => {
+            will_write
+                .push("移除 Kimi Code config.toml 中的 HiMind provider 与相关模型配置".to_string());
+        }
+        "qwen-code" => {
+            will_write.push(
+                "移除 Qwen Code settings.json 中的 HiMind modelProviders 条目与 env key"
+                    .to_string(),
+            );
+        }
+        "claude-code" => {
+            will_write.push(
+                "移除 Claude Code settings.json env 中的 HiMind ANTHROPIC_* 配置".to_string(),
+            );
+        }
+        "claude-desktop" => {
+            will_write.push(
+                "移除 Claude Desktop claude_desktop_config.json env 中的 HiMind ANTHROPIC_* 配置"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    (will_write, will_backup)
+}
+
 pub(crate) fn import(
     options: &Options,
     expected_user_id: &str,
     request: &AIProviderImportRequest,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
-    match request.target.trim() {
-        "cc-switch" => import_cc_switch(options, expected_user_id),
-        "codex" => import_codex(options, expected_user_id),
-        "workbuddy" => import_workbuddy(options, expected_user_id),
-        "vscode" => import_vscode(options, expected_user_id),
-        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch、Codex 或 WorkBuddy".into()),
+    let adapter = adapter_for(&request.target)
+        .ok_or_else(|| format!("不支持的 AI 客户端：{}", request.target))?;
+    // 冲突防护：目标客户端已接入时，切换/覆盖到自定义服务需先显式移除，避免无声明双写。
+    let service_source = request.service_source();
+    if service_source.starts_with("custom:") {
+        let client_state = status(options)
+            .targets
+            .into_iter()
+            .find(|item| item.target == request.target.trim())
+            .map(|item| item.state)
+            .unwrap_or_default();
+        if client_state == "imported" {
+            return Err(format!(
+                "客户端 {} 已接入其他服务；如需切换到自定义服务，请先移除现有接入再重新导入",
+                request.target
+            )
+            .into());
+        }
     }
+    adapter.import(options, expected_user_id, service_source)
 }
 
 pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
     AIProviderImportStatusOverview {
-        targets: vec![
-            vscode_import_status(options),
-            cc_switch_import_status(),
-            codex_import_status(options),
-            workbuddy_import_status(),
-        ],
+        targets: known_adapters()
+            .into_iter()
+            .map(|adapter| adapter.status(options))
+            .collect(),
     }
+}
+
+/// 删除自定义服务前必须先撤销客户端接入，避免 API Key 继续留在外部客户端配置中。
+/// 当前客户端配置格式不携带可靠的服务源 ID，因此采用保守阻断策略；
+/// UI 会提供逐个移除入口，完成后再允许删除服务。
+pub(crate) fn ensure_no_imported_clients(options: &Options) -> Result<(), Box<dyn Error>> {
+    let imported = status(options)
+        .targets
+        .into_iter()
+        .filter(|item| item.state == "imported")
+        .map(|item| item.target)
+        .collect::<Vec<_>>();
+    if imported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "请先移除已接入客户端（{}），再删除 AI 服务；这样可以避免客户端继续保留旧凭据",
+        imported.join("、")
+    )
+    .into())
 }
 
 pub(crate) fn cancel(
     options: &Options,
     target: &str,
 ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-    match target.trim() {
-        "vscode" => cancel_vscode(options),
-        "cc-switch" => cancel_cc_switch(),
-        "codex" => cancel_codex(options),
-        "workbuddy" => cancel_workbuddy(),
-        _ => Err("不支持的 AI 客户端，请选择 VS Code、CC Switch、Codex 或 WorkBuddy".into()),
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    adapter.cancel(options)
+}
+
+/// 解析服务源对应的 AI 凭据。
+///
+/// `service` 为 `managed`（默认）时走 HiMind Dashboard 分发；
+/// 为 `custom:<id>` 时从本机自定义服务读取（API Key 经 DPAPI 解密）。
+fn resolve_credential(
+    options: &Options,
+    expected_user_id: &str,
+    client_id: &str,
+    service: &str,
+) -> Result<AIClientCredential, Box<dyn Error>> {
+    let service = service.trim();
+    if service.is_empty() || service == "managed" {
+        return fetch_client_credential(options, expected_user_id, client_id);
     }
+    let custom_id = service
+        .strip_prefix("custom:")
+        .ok_or_else(|| format!("不支持的服务源：{service}，应为 managed 或 custom:<id>"))?;
+    let (custom, api_key) = crate::store::ai_services::load_secret(custom_id)?;
+    let access = crate::api::ai::AIUserCredential {
+        active_entitlement_id: String::new(),
+        active_personal_connection_id: String::new(),
+        status: "active".to_string(),
+        base_url: custom.base_url,
+        model: custom.model,
+        models: custom.models,
+        protocol: custom.protocol.as_str().to_string(),
+    };
+    Ok(AIClientCredential { access, api_key })
 }
 
 fn import_vscode(
     options: &Options,
     expected_user_id: &str,
+    service: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let vscode_cli = ensure_vscode_extension()?;
-    let credential = fetch_client_credential(options, expected_user_id, "vscode-import")?;
+    let credential = resolve_credential(options, expected_user_id, "vscode-import", service)?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let code = create_vscode_enrollment(
@@ -280,6 +788,7 @@ fn build_vscode_enrollment_url(port: u16, code: &str) -> Result<String, Box<dyn 
 fn import_cc_switch(
     options: &Options,
     expected_user_id: &str,
+    service: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let path = cc_switch_database_path();
     let client_detected =
@@ -291,7 +800,7 @@ fn import_cc_switch(
             "未检测到 CC Switch，请先安装并启动一次 CC Switch".into()
         });
     }
-    let credential = fetch_client_credential(options, expected_user_id, "cc-switch-import")?;
+    let credential = resolve_credential(options, expected_user_id, "cc-switch-import", service)?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let existing = read_cc_switch_managed_settings(&path)?;
@@ -334,12 +843,13 @@ fn codex_himind_models_path() -> PathBuf {
 fn import_codex(
     options: &Options,
     expected_user_id: &str,
+    service: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let config_path = codex_config_path();
     let models_path = codex_himind_models_path();
     let client_detected = config_path.join("config.toml").is_file()
         || config_path.join(CODEX_HIMIND_MODELS_FILE).is_file();
-    let credential = fetch_client_credential(options, expected_user_id, "codex-import")?;
+    let credential = resolve_credential(options, expected_user_id, "codex-import", service)?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let catalog = build_codex_models_json(&models)?;
@@ -459,7 +969,7 @@ fn build_codex_config_toml(
         .ok_or("既有 config.toml 的 model_providers.himind 不是表")?;
     provider["name"] = value(MANAGED_VENDOR);
     provider["base_url"] = value(endpoint.as_str());
-    provider["wire_api"] = value("responses");
+    provider["wire_api"] = value(openai_wire_api(credential));
     provider["experimental_bearer_token"] = value(credential.api_key.as_str());
     Ok(document.to_string())
 }
@@ -620,8 +1130,9 @@ fn strip_codex_himind(config: &str, models_path: &Path) -> Result<(String, bool)
 fn import_workbuddy(
     options: &Options,
     expected_user_id: &str,
+    service: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
-    let credential = fetch_client_credential(options, expected_user_id, "workbuddy-import")?;
+    let credential = resolve_credential(options, expected_user_id, "workbuddy-import", service)?;
     let path = workbuddy_models_path();
     let original = if path.exists() {
         fs::read_to_string(&path)?
@@ -888,6 +1399,795 @@ fn preferred_model(credential: &AIClientCredential) -> Result<String, Box<dyn Er
         .ok_or_else(|| "当前 AI 接入没有可导入的模型".into())
 }
 
+// ---- Kimi Code ----
+// Kimi Code CLI 使用 ~/.kimi-code/config.toml（KIMI_CODE_HOME 可重定位）。Provider
+// type 支持 openai / openai_responses，与 HiMind 网关的 OpenAI Chat/Responses 协议
+// 对齐；模型以 [models."himind/<model>"] 别名表形式暴露，default_model 指向首选别名。
+// 采用保留式合并：只接管 providers.himind、himind/* 模型别名与 default_model，
+// hooks、permission、services 等用户配置原样保留。
+fn kimi_code_config_path() -> PathBuf {
+    if let Some(path) = env::var_os("KIMI_CODE_HOME") {
+        return PathBuf::from(path).join("config.toml");
+    }
+    user_home().join(".kimi-code").join("config.toml")
+}
+
+fn kimi_code_himind_alias(model: &str) -> String {
+    format!("{KIMI_CODE_HIMIND_PREFIX}{model}")
+}
+
+fn import_kimi_code(
+    options: &Options,
+    expected_user_id: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let path = kimi_code_config_path();
+    let client_detected = path.is_file()
+        || user_home().join(".kimi-code").is_dir()
+        || env::var_os("KIMI_CODE_HOME").is_some();
+    let credential = resolve_credential(options, expected_user_id, "kimi-code-import", service)?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let updated = build_kimi_code_config(&original, &credential, &models, &preferred)?;
+    let backup = backup_and_write(&path, updated.as_bytes())?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: "kimi-code".to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: path.to_string_lossy().to_string(),
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        client_detected,
+    })
+}
+
+fn build_kimi_code_config(
+    original: &str,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let endpoint = normalized_base_url(&credential.access.base_url)?;
+    let mut document = original
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("Kimi Code config.toml 格式无效：{error}"))?;
+    let providers = document
+        .as_table_mut()
+        .entry("providers")
+        .or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        })
+        .as_table_mut()
+        .ok_or("既有 config.toml 的 providers 不是表")?;
+    let provider = providers
+        .entry(KIMI_CODE_PROVIDER_ID)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or("既有 config.toml 的 providers.himind 不是表")?;
+    provider["type"] = value(openai_provider_type(credential));
+    provider["api_key"] = value(credential.api_key.as_str());
+    provider["base_url"] = value(endpoint.as_str());
+    let models_table = document
+        .as_table_mut()
+        .entry("models")
+        .or_insert_with(|| {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            Item::Table(table)
+        })
+        .as_table_mut()
+        .ok_or("既有 config.toml 的 models 不是表")?;
+    for model in models {
+        let alias = kimi_code_himind_alias(model);
+        let entry = models_table
+            .entry(&alias)
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or("既有 config.toml 的 models 条目不是表")?;
+        entry["provider"] = value(KIMI_CODE_PROVIDER_ID);
+        entry["model"] = value(model.as_str());
+        entry["max_context_size"] = value(KIMI_CODE_DEFAULT_CONTEXT as i64);
+        let mut capabilities = toml_edit::Array::new();
+        capabilities.push("tool_use");
+        entry["capabilities"] = toml_edit::Item::Value(toml_edit::Value::Array(capabilities));
+    }
+    document["default_model"] = value(kimi_code_himind_alias(preferred).as_str());
+    Ok(document.to_string())
+}
+
+fn kimi_code_import_status() -> AIProviderImportStatus {
+    let path = kimi_code_config_path();
+    let client_detected = path.is_file()
+        || user_home().join(".kimi-code").is_dir()
+        || env::var_os("KIMI_CODE_HOME").is_some();
+    let models = read_kimi_code_himind_models(&path).unwrap_or_default();
+    let imported = !models.is_empty() || kimi_code_himind_provider_present(&path);
+    AIProviderImportStatus {
+        target: "kimi-code".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported && models.is_empty() {
+            "检测到 Kimi Code 已配置 HiMind 供应商，但缺少模型别名，请重新导入".to_string()
+        } else if imported {
+            format!(
+                "已写入 {} 个 HiMind 模型；重启 Kimi Code 后可在模型选择器中使用",
+                models.len()
+            )
+        } else if client_detected {
+            "已检测到 Kimi Code，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 Kimi Code 配置目录，请先运行一次 kimi".to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+    }
+}
+
+fn kimi_code_himind_provider_present(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<DocumentMut>().ok())
+        .is_some_and(|document| {
+            document
+                .get("providers")
+                .and_then(|item| item.as_table())
+                .is_some_and(|table| table.contains_key(KIMI_CODE_PROVIDER_ID))
+        })
+}
+
+fn read_kimi_code_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let content = fs::read_to_string(path)?;
+    let document = content.parse::<DocumentMut>()?;
+    let Some(models) = document.get("models").and_then(|item| item.as_table()) else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for (alias, item) in models.iter() {
+        let Some(model) = alias.strip_prefix(KIMI_CODE_HIMIND_PREFIX) else {
+            continue;
+        };
+        let provider = item
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if provider == KIMI_CODE_PROVIDER_ID && !model.trim().is_empty() {
+            result.push(model.to_string());
+        }
+    }
+    Ok(result)
+}
+
+fn cancel_kimi_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let path = kimi_code_config_path();
+    let client_detected = path.is_file();
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let (updated, removed) = strip_kimi_code_himind(&original)?;
+    let backup = if removed {
+        backup_and_write(&path, updated.as_bytes())?
+    } else {
+        None
+    };
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "kimi-code".to_string(),
+        status: if removed { "cancelled" } else { "not_imported" }.to_string(),
+        changed: removed,
+        client_detected,
+        detail: if removed {
+            "已从 Kimi Code 移除 HiMind 供应商与模型别名".to_string()
+        } else {
+            "Kimi Code 当前没有 HiMind 导入记录".to_string()
+        },
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+// 只移除 HiMind 明确写入的字段（providers.himind、himind/* 别名、default_model），
+// 用户其他配置原样保留；无法判定归属的字段不动。
+fn strip_kimi_code_himind(original: &str) -> Result<(String, bool), Box<dyn Error>> {
+    let mut document = original.parse::<DocumentMut>()?;
+    let mut changed = false;
+    if let Some(providers) = document
+        .get_mut("providers")
+        .and_then(|item| item.as_table_mut())
+    {
+        if providers.remove(KIMI_CODE_PROVIDER_ID).is_some() {
+            changed = true;
+        }
+        if providers.is_empty() {
+            document.remove("providers");
+        }
+    }
+    if let Some(models) = document
+        .get_mut("models")
+        .and_then(|item| item.as_table_mut())
+    {
+        let himind_aliases: Vec<String> = models
+            .iter()
+            .filter_map(|(alias, _)| {
+                alias
+                    .strip_prefix(KIMI_CODE_HIMIND_PREFIX)
+                    .map(|_| alias.to_string())
+            })
+            .collect();
+        for alias in himind_aliases {
+            models.remove(&alias);
+            changed = true;
+        }
+        if models.is_empty() {
+            document.remove("models");
+        }
+    }
+    if document
+        .get("default_model")
+        .and_then(|item| item.as_str())
+        .is_some_and(|value| value.starts_with(KIMI_CODE_HIMIND_PREFIX))
+    {
+        document.remove("default_model");
+        changed = true;
+    }
+    Ok((document.to_string(), changed))
+}
+
+// ---- Qwen Code ----
+// Qwen Code 使用 ~/.qwen/settings.json；凭据经顶层 env 存放（envKey 引用），
+// modelProviders 声明模型目录，自定义 provider id 经 providerProtocol 映射到
+// openai 协议，与 HiMind 网关 OpenAI Chat/Responses 协议对齐。采用保留式合并：
+// 只接管 env.HIMIND_API_KEY、modelProviders.himind、providerProtocol.himind 与
+// model.name；mcpServers、ui 等用户配置原样保留。
+fn qwen_code_settings_path() -> PathBuf {
+    if let Some(path) = env::var_os("QWEN_CODE_HOME") {
+        return PathBuf::from(path).join("settings.json");
+    }
+    user_home().join(".qwen").join("settings.json")
+}
+
+fn import_qwen_code(
+    options: &Options,
+    expected_user_id: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let path = qwen_code_settings_path();
+    let client_detected = path.is_file()
+        || user_home().join(".qwen").is_dir()
+        || env::var_os("QWEN_CODE_HOME").is_some();
+    let credential = resolve_credential(options, expected_user_id, "qwen-code-import", service)?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let updated = build_qwen_code_settings(&original, &credential, &models, &preferred)?;
+    let backup = backup_and_write(&path, updated.as_bytes())?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: "qwen-code".to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: path.to_string_lossy().to_string(),
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        client_detected,
+    })
+}
+
+fn build_qwen_code_settings(
+    original: &str,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let endpoint = normalized_base_url(&credential.access.base_url)?;
+    let mut root = if original.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str::<Value>(original)
+            .map_err(|error| format!("Qwen Code settings.json 格式无效：{error}"))?
+            .as_object()
+            .cloned()
+            .ok_or("Qwen Code settings.json 顶层必须是 JSON 对象")?
+    };
+    let env = root
+        .entry("env")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Qwen Code settings.json 的 env 必须是对象")?
+        .clone();
+    let mut env = env;
+    env.insert(QWEN_CODE_ENV_KEY.to_string(), json!(credential.api_key));
+    root.insert("env".to_string(), Value::Object(env));
+    let provider_models = models
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model,
+                "name": model,
+                "envKey": QWEN_CODE_ENV_KEY,
+                "baseUrl": endpoint,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut providers = root
+        .entry("modelProviders")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Qwen Code settings.json 的 modelProviders 必须是对象")?
+        .clone();
+    providers.insert(QWEN_CODE_PROVIDER_ID.to_string(), json!(provider_models));
+    root.insert("modelProviders".to_string(), Value::Object(providers));
+    let mut protocols = root
+        .entry("providerProtocol")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Qwen Code settings.json 的 providerProtocol 必须是对象")?
+        .clone();
+    // Qwen Code currently exposes the OpenAI Chat provider name only. Its
+    // `providerProtocol` value is a client capability, not the wire protocol
+    // selector used by other adapters.
+    protocols.insert(QWEN_CODE_PROVIDER_ID.to_string(), json!("openai"));
+    root.insert("providerProtocol".to_string(), Value::Object(protocols));
+    root.insert("model".to_string(), json!({ "name": preferred }));
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(root))?
+    ))
+}
+
+fn qwen_code_import_status() -> AIProviderImportStatus {
+    let path = qwen_code_settings_path();
+    let client_detected = path.is_file()
+        || user_home().join(".qwen").is_dir()
+        || env::var_os("QWEN_CODE_HOME").is_some();
+    let models = read_qwen_code_himind_models(&path).unwrap_or_default();
+    let imported = !models.is_empty() || qwen_code_himind_provider_present(&path);
+    AIProviderImportStatus {
+        target: "qwen-code".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported && models.is_empty() {
+            "检测到 Qwen Code 已配置 HiMind 供应商，但缺少模型条目，请重新导入".to_string()
+        } else if imported {
+            format!(
+                "已写入 {} 个 HiMind 模型；重启 Qwen Code 后可在 /model 选择",
+                models.len()
+            )
+        } else if client_detected {
+            "已检测到 Qwen Code，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 Qwen Code 配置目录，请先运行一次 qwen".to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+    }
+}
+
+fn qwen_code_himind_provider_present(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .is_some_and(|root| {
+            root.get("modelProviders")
+                .and_then(|value| value.get(QWEN_CODE_PROVIDER_ID))
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        })
+}
+
+fn read_qwen_code_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let content = fs::read_to_string(path)?;
+    let root: Value = serde_json::from_str(&content)?;
+    Ok(root
+        .get("modelProviders")
+        .and_then(|value| value.get(QWEN_CODE_PROVIDER_ID))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn cancel_qwen_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let path = qwen_code_settings_path();
+    let client_detected = path.is_file();
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let (updated, removed) = strip_qwen_code_himind(&original)?;
+    let backup = if removed {
+        backup_and_write(&path, updated.as_bytes())?
+    } else {
+        None
+    };
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "qwen-code".to_string(),
+        status: if removed { "cancelled" } else { "not_imported" }.to_string(),
+        changed: removed,
+        client_detected,
+        detail: if removed {
+            "已从 Qwen Code 移除 HiMind 模型供应商与凭据".to_string()
+        } else {
+            "Qwen Code 当前没有 HiMind 导入记录".to_string()
+        },
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+// 只移除 HiMind 明确写入的字段（env.HIMIND_API_KEY、modelProviders.himind、
+// providerProtocol.himind、model.name 若指向 HiMind 模型），用户其他配置原样保留。
+fn strip_qwen_code_himind(original: &str) -> Result<(String, bool), Box<dyn Error>> {
+    if original.trim().is_empty() {
+        return Ok((String::new(), false));
+    }
+    let mut root = serde_json::from_str::<Value>(original)
+        .map_err(|_| "Qwen Code settings.json 格式无效，已停止取消导入且未覆盖原文件")?;
+    let object = root
+        .as_object_mut()
+        .ok_or("Qwen Code settings.json 顶层必须是 JSON 对象")?;
+    let mut changed = false;
+    if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+        if env.remove(QWEN_CODE_ENV_KEY).is_some() {
+            changed = true;
+        }
+    }
+    if let Some(providers) = object
+        .get_mut("modelProviders")
+        .and_then(Value::as_object_mut)
+    {
+        if providers.remove(QWEN_CODE_PROVIDER_ID).is_some() {
+            changed = true;
+        }
+    }
+    if let Some(protocols) = object
+        .get_mut("providerProtocol")
+        .and_then(Value::as_object_mut)
+    {
+        if protocols.remove(QWEN_CODE_PROVIDER_ID).is_some() {
+            changed = true;
+        }
+    }
+    let model_points_at_himind = object
+        .get("model")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            object
+                .get("modelProviders")
+                .and_then(|value| value.get(QWEN_CODE_PROVIDER_ID))
+                .and_then(Value::as_array)
+                .is_none()
+                && name.starts_with(QWEN_CODE_PROVIDER_ID)
+        });
+    if model_points_at_himind {
+        object.remove("model");
+        changed = true;
+    }
+    Ok((
+        format!("{}\n", serde_json::to_string_pretty(&root)?),
+        changed,
+    ))
+}
+
+// ---- Claude Code / Claude Desktop ----
+// 两者共用 Anthropic 协议 env 注入：settings.json 的 env 块写入
+// ANTHROPIC_BASE_URL（网关 base，SDK 自动追加 /v1/messages）、
+// ANTHROPIC_AUTH_TOKEN（网关 Bearer 认证）、ANTHROPIC_MODEL 与
+// ANTHROPIC_CUSTOM_MODEL_OPTION。Anthropic SDK 会在 base_url 后追加
+// /v1/messages，因此这里把网关 URL 末尾的 /v1 剥掉再写入。
+// 采用保留式合并，取消时只剥离 HiMind 写入的 ANTHROPIC_* 键。
+fn anthropic_base_url(value: &str) -> Result<String, Box<dyn Error>> {
+    let base = normalized_base_url(value)?;
+    let stripped = base.strip_suffix("/v1").map(str::to_string).unwrap_or(base);
+    Ok(stripped)
+}
+
+fn claude_code_settings_path() -> PathBuf {
+    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR") {
+        return PathBuf::from(dir).join("settings.json");
+    }
+    user_home().join(".claude").join("settings.json")
+}
+
+fn claude_desktop_config_path() -> PathBuf {
+    let app_data = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home().join("AppData").join("Roaming"));
+    app_data.join("Claude").join("claude_desktop_config.json")
+}
+
+fn claude_env_keys() -> [&'static str; 4] {
+    [
+        CLAUDE_BASE_URL_ENV,
+        CLAUDE_AUTH_TOKEN_ENV,
+        CLAUDE_MODEL_ENV,
+        CLAUDE_CUSTOM_MODEL_OPTION,
+    ]
+}
+
+fn import_claude_code(
+    options: &Options,
+    expected_user_id: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let path = claude_code_settings_path();
+    let client_detected = path.is_file() || user_home().join(".claude").is_dir();
+    let credential = resolve_credential(options, expected_user_id, "claude-code-import", service)?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let updated =
+        build_claude_settings(&original, &credential, &models, &preferred, "Claude Code")?;
+    let backup = backup_and_write(&path, updated.as_bytes())?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: "claude-code".to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: path.to_string_lossy().to_string(),
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        client_detected,
+    })
+}
+
+fn import_claude_desktop(
+    options: &Options,
+    expected_user_id: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let path = claude_desktop_config_path();
+    let client_detected = path.is_file()
+        || env::var_os("APPDATA")
+            .map(|dir| PathBuf::from(dir).join("Claude").is_dir())
+            .unwrap_or(false);
+    let credential =
+        resolve_credential(options, expected_user_id, "claude-desktop-import", service)?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let updated = build_claude_settings(
+        &original,
+        &credential,
+        &models,
+        &preferred,
+        "Claude Desktop",
+    )?;
+    let backup = backup_and_write(&path, updated.as_bytes())?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: "claude-desktop".to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: path.to_string_lossy().to_string(),
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        client_detected,
+    })
+}
+
+fn build_claude_settings(
+    original: &str,
+    credential: &AIClientCredential,
+    _models: &[String],
+    preferred: &str,
+    client_name: &str,
+) -> Result<String, Box<dyn Error>> {
+    let base = anthropic_base_url(&credential.access.base_url)?;
+    let mut root = if original.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str::<Value>(original)
+            .map_err(|error| format!("{client_name} settings.json 格式无效：{error}"))?
+            .as_object()
+            .cloned()
+            .ok_or(format!("{client_name} settings.json 顶层必须是 JSON 对象"))?
+    };
+    let mut env = root
+        .entry("env")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(format!("{client_name} settings.json 的 env 必须是对象"))?
+        .clone();
+    env.insert(CLAUDE_BASE_URL_ENV.to_string(), json!(base));
+    env.insert(CLAUDE_AUTH_TOKEN_ENV.to_string(), json!(credential.api_key));
+    env.insert(CLAUDE_MODEL_ENV.to_string(), json!(preferred));
+    env.insert(CLAUDE_CUSTOM_MODEL_OPTION.to_string(), json!(preferred));
+    root.insert("env".to_string(), Value::Object(env));
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(root))?
+    ))
+}
+
+fn claude_import_status(path: &Path, target: &str, client_name: &str) -> AIProviderImportStatus {
+    let client_detected = path.is_file();
+    let models = read_claude_himind_models(path, target).unwrap_or_default();
+    let imported = claude_himind_env_present(path);
+    AIProviderImportStatus {
+        target: target.to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported && models.is_empty() {
+            format!("检测到 {client_name} 已配置 HiMind 网关，但缺少模型声明，请重新导入")
+        } else if imported {
+            format!(
+                "已写入 HiMind 网关端点与模型；重启 {client_name} 后生效（模型：{}）",
+                models.join(", ")
+            )
+        } else if client_detected {
+            format!("已检测到 {client_name}，尚未导入 HiMind AI")
+        } else {
+            format!("未检测到 {client_name} 配置，请先安装并启动一次")
+        },
+        config_path: path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+    }
+}
+
+fn claude_code_import_status() -> AIProviderImportStatus {
+    claude_import_status(&claude_code_settings_path(), "claude-code", "Claude Code")
+}
+
+fn claude_desktop_import_status() -> AIProviderImportStatus {
+    claude_import_status(
+        &claude_desktop_config_path(),
+        "claude-desktop",
+        "Claude Desktop",
+    )
+}
+
+fn claude_himind_env_present(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .is_some_and(|root| {
+            root.get("env")
+                .and_then(|value| value.get(CLAUDE_BASE_URL_ENV))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                && root
+                    .get("env")
+                    .and_then(|value| value.get(CLAUDE_AUTH_TOKEN_ENV))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
+fn read_claude_himind_models(path: &Path, _target: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let content = fs::read_to_string(path)?;
+    let root: Value = serde_json::from_str(&content)?;
+    let mut models = Vec::new();
+    if let Some(model) = root
+        .get("env")
+        .and_then(|value| value.get(CLAUDE_MODEL_ENV))
+        .and_then(Value::as_str)
+    {
+        if !model.trim().is_empty() {
+            models.push(model.trim().to_string());
+        }
+    }
+    Ok(models)
+}
+
+fn cancel_claude_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    cancel_claude_settings(&claude_code_settings_path(), "claude-code", "Claude Code")
+}
+
+fn cancel_claude_desktop() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    cancel_claude_settings(
+        &claude_desktop_config_path(),
+        "claude-desktop",
+        "Claude Desktop",
+    )
+}
+
+fn cancel_claude_settings(
+    path: &Path,
+    target: &str,
+    client_name: &str,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let client_detected = path.is_file();
+    let original = if path.is_file() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let (updated, removed) = strip_claude_himind(&original, client_name)?;
+    let backup = if removed {
+        backup_and_write(path, updated.as_bytes())?
+    } else {
+        None
+    };
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: target.to_string(),
+        status: if removed { "cancelled" } else { "not_imported" }.to_string(),
+        changed: removed,
+        client_detected,
+        detail: if removed {
+            format!("已从 {client_name} 移除 HiMind 网关端点与凭据")
+        } else {
+            format!("{client_name} 当前没有 HiMind 导入记录")
+        },
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+// 只移除 HiMind 写入的 ANTHROPIC_* 键，用户其他配置原样保留。
+fn strip_claude_himind(
+    original: &str,
+    client_name: &str,
+) -> Result<(String, bool), Box<dyn Error>> {
+    if original.trim().is_empty() {
+        return Ok((String::new(), false));
+    }
+    let mut root = serde_json::from_str::<Value>(original).map_err(|_| {
+        format!("{client_name} settings.json 格式无效，已停止取消导入且未覆盖原文件")
+    })?;
+    let object = root
+        .as_object_mut()
+        .ok_or(format!("{client_name} settings.json 顶层必须是 JSON 对象"))?;
+    let mut changed = false;
+    if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+        for key in claude_env_keys() {
+            if env.remove(key).is_some() {
+                changed = true;
+            }
+        }
+        if env.is_empty() {
+            object.remove("env");
+        }
+    }
+    Ok((
+        format!("{}\n", serde_json::to_string_pretty(&root)?),
+        changed,
+    ))
+}
+
 // cc-switch v3.16+ 以供应商 settings_config.modelCatalog 为模型列表唯一事实源：
 // 启用供应商时生成 ~/.codex/cc-switch-model-catalog.json 并注入 model_catalog_json，
 // Codex 重启后 /model 才能列出第三方模型；官方 deep link 协议无法携带该字段。
@@ -932,7 +2232,7 @@ fn build_cc_switch_provider_settings(
         .ok_or("CC Switch 既有 config 的 model_providers.custom 不是表")?;
     provider["name"] = value(MANAGED_VENDOR);
     provider["base_url"] = value(endpoint.as_str());
-    provider["wire_api"] = value("responses");
+    provider["wire_api"] = value(openai_wire_api(credential));
     provider["requires_openai_auth"] = value(true);
 
     let previous_entries = existing
@@ -1095,6 +2395,8 @@ fn merge_workbuddy_models(
     models.retain(|item| !is_managed_workbuddy_model(item));
 
     let aliases = available_models(credential)?;
+    // WorkBuddy's models.json contract is fixed to Chat Completions; retain
+    // that client-specific capability even when the service supports Responses.
     let endpoint = chat_completions_url(&credential.access.base_url)?;
     let mut generated_id_set = HashSet::new();
     let mut generated_ids = Vec::new();
@@ -1288,7 +2590,7 @@ fn unix_now_millis() -> u128 {
         .as_millis()
 }
 
-fn unix_now_seconds() -> u64 {
+pub(crate) fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1313,6 +2615,26 @@ fn chat_completions_url(value: &str) -> Result<String, Box<dyn Error>> {
         Ok(base)
     } else {
         Ok(format!("{base}/chat/completions"))
+    }
+}
+
+fn openai_protocol_is_chat(credential: &AIClientCredential) -> bool {
+    credential.access.protocol.trim() == "openai-chat"
+}
+
+fn openai_wire_api(credential: &AIClientCredential) -> &'static str {
+    if openai_protocol_is_chat(credential) {
+        "chat"
+    } else {
+        "responses"
+    }
+}
+
+fn openai_provider_type(credential: &AIClientCredential) -> &'static str {
+    if openai_protocol_is_chat(credential) {
+        "openai"
+    } else {
+        "openai_responses"
     }
 }
 
@@ -2221,16 +3543,19 @@ fn cc_switch_protocol_registered() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_cc_switch_provider_settings, build_codex_config_toml, build_codex_models_json,
-        build_vscode_enrollment_url, bundled_vscode_vsix_candidates, chat_completions_url,
-        compare_extension_versions, consume_vscode_enrollment, create_vscode_enrollment,
-        ensure_vscode_chat_provider_allowlist, find_vscode_extension_version,
-        legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
-        migrate_workbuddy_sessions, parse_vscode_cli_version, parse_vscode_extension_version,
-        parse_vscode_import_status, push_vscode_registry_value, read_cc_switch_managed_models,
-        read_cc_switch_managed_settings, read_codex_model_catalog, remove_workbuddy_models,
-        strip_codex_himind, vscode_extension_install_required, workbuddy_model_id,
-        workbuddy_models_path_in, write_cc_switch_provider, AIClientCredential,
+        adapter_for, anthropic_base_url, build_cc_switch_provider_settings, build_claude_settings,
+        build_codex_config_toml, build_codex_models_json, build_kimi_code_config,
+        build_qwen_code_settings, build_vscode_enrollment_url, bundled_vscode_vsix_candidates,
+        chat_completions_url, compare_extension_versions, consume_vscode_enrollment,
+        create_vscode_enrollment, ensure_vscode_chat_provider_allowlist,
+        find_vscode_extension_version, known_adapters, legacy_workbuddy_model_id,
+        managed_workbuddy_model_ids, merge_workbuddy_models, migrate_workbuddy_sessions,
+        parse_vscode_cli_version, parse_vscode_extension_version, parse_vscode_import_status,
+        push_vscode_registry_value, read_cc_switch_managed_models, read_cc_switch_managed_settings,
+        read_codex_model_catalog, remove_workbuddy_models, strip_claude_himind, strip_codex_himind,
+        strip_kimi_code_himind, strip_qwen_code_himind, vscode_extension_install_required,
+        workbuddy_model_id, workbuddy_models_path_in, write_cc_switch_provider, AIClientCredential,
+        AIProviderImportRequest, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION,
         VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
@@ -2238,6 +3563,49 @@ mod tests {
     use serde_json::{json, Value};
     use std::cmp::Ordering;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn adapters_register_unique_ids_with_display_names() {
+        let adapters = known_adapters();
+        let mut ids = std::collections::HashSet::new();
+        for adapter in &adapters {
+            let id = adapter.id();
+            assert!(!id.trim().is_empty());
+            assert!(ids.insert(id), "duplicate adapter id: {id}");
+            assert!(!adapter.display_name().trim().is_empty());
+        }
+        assert_eq!(adapters.len(), 8);
+        for target in [
+            "vscode",
+            "cc-switch",
+            "codex",
+            "workbuddy",
+            "kimi-code",
+            "qwen-code",
+            "claude-code",
+            "claude-desktop",
+        ] {
+            assert!(adapter_for(target).is_some(), "missing adapter: {target}");
+        }
+        assert!(adapter_for("gemini-cli").is_none());
+    }
+
+    #[test]
+    fn plan_returns_read_only_preview_without_writing() {
+        for adapter in known_adapters() {
+            let status = adapter.status(&crate::Options::from_env());
+            for action in ["import", "remove"] {
+                let plan = adapter.plan(action, &status);
+                assert_eq!(plan.target, adapter.id());
+                assert_eq!(plan.action, action);
+                assert!(
+                    !plan.will_write.is_empty() || !plan.will_backup.is_empty(),
+                    "plan for {} ({action}) must describe at least one change",
+                    adapter.id()
+                );
+            }
+        }
+    }
 
     fn credential(models: &[&str]) -> AIClientCredential {
         AIClientCredential {
@@ -2248,6 +3616,7 @@ mod tests {
                 base_url: "https://ai.example.com/v1/".to_string(),
                 model: models.first().copied().unwrap_or("default").to_string(),
                 models: models.iter().map(|value| value.to_string()).collect(),
+                protocol: "openai-responses".to_string(),
             },
             api_key: "test-secret-key".to_string(),
         }
@@ -2340,6 +3709,29 @@ wire_api = "responses"
         )
         .unwrap_err();
         assert!(error.to_string().contains("Codex config.toml 格式无效"));
+    }
+
+    #[test]
+    fn chat_protocol_is_forwarded_to_openai_compatible_adapters() {
+        let mut chat = credential(&["model-a"]);
+        chat.access.protocol = "openai-chat".to_string();
+        let codex = build_codex_config_toml(
+            "",
+            &chat,
+            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            "model-a",
+        )
+        .unwrap();
+        assert!(codex.contains("wire_api = \"chat\""));
+        let kimi = build_kimi_code_config("", &chat, &["model-a".to_string()], "model-a").unwrap();
+        assert!(kimi.contains("type = \"openai\""));
+        let cc_switch =
+            build_cc_switch_provider_settings(&chat, &["model-a".to_string()], "model-a", None)
+                .unwrap();
+        let cc_switch_config: Value = serde_json::from_str(&cc_switch).unwrap();
+        assert!(cc_switch_config["config"]
+            .as_str()
+            .is_some_and(|value| value.contains("wire_api = \"chat\"")));
     }
 
     #[test]
@@ -2921,5 +4313,180 @@ command = "uvx.exe"
             .unwrap_err()
             .to_string();
         assert!(error.contains("未覆盖原文件"));
+    }
+
+    #[test]
+    fn resolves_service_source_from_import_request() {
+        let managed = AIProviderImportRequest {
+            target: "codex".to_string(),
+            service: String::new(),
+        };
+        assert_eq!(managed.service_source(), "managed");
+
+        let explicit_managed = AIProviderImportRequest {
+            target: "codex".to_string(),
+            service: "managed".to_string(),
+        };
+        assert_eq!(explicit_managed.service_source(), "managed");
+
+        let custom = AIProviderImportRequest {
+            target: "codex".to_string(),
+            service: "custom:my-gateway".to_string(),
+        };
+        assert_eq!(custom.service_source(), "custom:my-gateway");
+    }
+
+    #[test]
+    fn builds_kimi_code_config_with_himind_provider_and_models() {
+        let credential = credential(&["kimi-k3", "kimi-for-coding"]);
+        let models = ["kimi-k3".to_string(), "kimi-for-coding".to_string()];
+        let updated = build_kimi_code_config("", &credential, &models, "kimi-k3").unwrap();
+        assert!(updated.contains("[providers.himind]"));
+        assert!(updated.contains("type = \"openai_responses\""));
+        assert!(updated.contains("api_key = \"test-secret-key\""));
+        assert!(updated.contains("base_url = \"https://ai.example.com/v1\""));
+        assert!(updated.contains("[models.\"himind/kimi-k3\"]"));
+        assert!(updated.contains("[models.\"himind/kimi-for-coding\"]"));
+        assert!(updated.contains("default_model = \"himind/kimi-k3\""));
+    }
+
+    #[test]
+    fn kimi_code_config_merge_preserves_existing_tables() {
+        let original = "default_model = \"existing/model\"\n[hooks]\nenabled = true\n";
+        let models = ["kimi-k3".to_string()];
+        let updated =
+            build_kimi_code_config(original, &credential(&["kimi-k3"]), &models, "kimi-k3")
+                .unwrap();
+        assert!(updated.contains("[hooks]"));
+        assert!(updated.contains("enabled = true"));
+        assert!(updated.contains("[providers.himind]"));
+        assert!(updated.contains("[models.\"himind/kimi-k3\"]"));
+        assert!(updated.contains("default_model = \"himind/kimi-k3\""));
+    }
+
+    #[test]
+    fn strip_kimi_code_only_removes_himind_fields() {
+        let original = "default_model = \"himind/kimi-k3\"\n[providers.himind]\ntype = \"openai_responses\"\n[providers.other]\ntype = \"openai\"\n[models.\"himind/kimi-k3\"]\nprovider = \"himind\"\n[models.\"local/m1\"]\nprovider = \"other\"\n";
+        let (updated, changed) = strip_kimi_code_himind(original).unwrap();
+        assert!(changed);
+        assert!(!updated.contains("himind"));
+        assert!(updated.contains("[providers.other]"));
+        assert!(updated.contains("[models.\"local/m1\"]"));
+        assert!(!updated.contains("default_model"));
+    }
+
+    #[test]
+    fn builds_qwen_code_settings_with_provider_catalog_and_env() {
+        let credential = credential(&["qwen3-coder-plus"]);
+        let models = ["qwen3-coder-plus".to_string()];
+        let updated =
+            build_qwen_code_settings("", &credential, &models, "qwen3-coder-plus").unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(root["env"]["HIMIND_API_KEY"], "test-secret-key");
+        assert_eq!(root["providerProtocol"]["himind"], "openai");
+        assert_eq!(
+            root["modelProviders"]["himind"][0]["id"],
+            "qwen3-coder-plus"
+        );
+        assert_eq!(
+            root["modelProviders"]["himind"][0]["envKey"],
+            "HIMIND_API_KEY"
+        );
+        assert_eq!(root["model"]["name"], "qwen3-coder-plus");
+    }
+
+    #[test]
+    fn qwen_code_settings_merge_preserves_existing_keys() {
+        let original = r#"{"mcpServers":{"github":{"command":"npx"}},"ui":{"theme":"dark"}}"#;
+        let models = ["qwen3-coder-plus".to_string()];
+        let updated = build_qwen_code_settings(
+            original,
+            &credential(&["qwen3-coder-plus"]),
+            &models,
+            "qwen3-coder-plus",
+        )
+        .unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(root["mcpServers"]["github"]["command"], "npx");
+        assert_eq!(root["ui"]["theme"], "dark");
+        assert!(root["modelProviders"]["himind"].is_array());
+        assert!(root["providerProtocol"]["himind"].is_string());
+    }
+
+    #[test]
+    fn strip_qwen_code_only_removes_himind_fields() {
+        let original = r#"{"env":{"HIMIND_API_KEY":"sk-1","OTHER":"v"},"modelProviders":{"himind":[{"id":"qwen3-coder-plus"}],"local":[{"id":"m1"}]},"providerProtocol":{"himind":"openai","local":"openai"},"mcpServers":{"s":{"command":"x"}}}"#;
+        let (updated, changed) = strip_qwen_code_himind(original).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["env"].get("HIMIND_API_KEY").is_none());
+        assert_eq!(root["env"]["OTHER"], "v");
+        assert!(root["modelProviders"].get("himind").is_none());
+        assert!(root["modelProviders"]["local"].is_array());
+        assert!(root["providerProtocol"].get("himind").is_none());
+        assert_eq!(root["providerProtocol"]["local"], "openai");
+        assert!(root["mcpServers"]["s"].is_object());
+    }
+
+    #[test]
+    fn strips_gateway_v1_suffix_for_anthropic_base_url() {
+        assert_eq!(
+            anthropic_base_url("https://himind.example.com/gateway/v1").unwrap(),
+            "https://himind.example.com/gateway"
+        );
+        assert_eq!(
+            anthropic_base_url("https://himind.example.com/gateway").unwrap(),
+            "https://himind.example.com/gateway"
+        );
+        assert_eq!(
+            anthropic_base_url("http://127.0.0.1:18090/gateway/v1/").unwrap(),
+            "http://127.0.0.1:18090/gateway"
+        );
+    }
+
+    #[test]
+    fn builds_claude_settings_env_with_anthropic_gateway() {
+        let credential = credential(&["claude-sonnet-5"]);
+        let models = ["claude-sonnet-5".to_string()];
+        let updated =
+            build_claude_settings("", &credential, &models, "claude-sonnet-5", "Claude Code")
+                .unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        // credential(helpers) 使用 base_url "https://ai.example.com/v1/"；anthropic 剥掉 /v1
+        assert_eq!(root["env"][CLAUDE_BASE_URL_ENV], "https://ai.example.com");
+        assert_eq!(root["env"][CLAUDE_CUSTOM_MODEL_OPTION], "claude-sonnet-5");
+    }
+
+    #[test]
+    fn claude_settings_merge_preserves_existing_keys() {
+        let original =
+            r#"{"env":{"OTHER_VAR":"keep"},"permissions":{"allow":["Bash(npm test *)"]}}"#;
+        let credential = credential(&["claude-sonnet-5"]);
+        let models = ["claude-sonnet-5".to_string()];
+        let updated = build_claude_settings(
+            original,
+            &credential,
+            &models,
+            "claude-sonnet-5",
+            "Claude Code",
+        )
+        .unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(root["env"]["OTHER_VAR"], "keep");
+        assert_eq!(root["permissions"]["allow"][0], "Bash(npm test *)");
+        assert!(root["env"][CLAUDE_BASE_URL_ENV].is_string());
+    }
+
+    #[test]
+    fn strip_claude_only_removes_himind_env_keys() {
+        let original = r#"{"env":{"ANTHROPIC_BASE_URL":"https://himind.example.com/gateway","ANTHROPIC_AUTH_TOKEN":"sk-1","ANTHROPIC_MODEL":"claude-sonnet-5","OTHER":"v"},"permissions":{"allow":["Bash(npm test *)"]}}"#;
+        let (updated, changed) = strip_claude_himind(original, "Claude Code").unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["env"].get(CLAUDE_BASE_URL_ENV).is_none());
+        assert!(root["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert!(root["env"].get("ANTHROPIC_MODEL").is_none());
+        assert_eq!(root["env"]["OTHER"], "v");
+        assert_eq!(root["permissions"]["allow"][0], "Bash(npm test *)");
     }
 }

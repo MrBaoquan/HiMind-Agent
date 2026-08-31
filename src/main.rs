@@ -41,15 +41,17 @@ use store::outbox::{
     list_reports, remove_report, remove_reports_for_execution, store_report, TaskReportRecord,
 };
 use svn::service::{
-    apply_project_acl, clone_exhibit_repository, create_exhibit_repository_path,
-    create_repository_with_post_commit_hook, ensure_project_exhibits_access,
-    import_local_exhibit_with_cancel_and_progress, initialize_exhibit_repository_with_cancel,
-    preview_project_acl, reconcile_project_acl, task_failure_result, SvnDiagnosticContextGuard,
+    apply_project_acl, checkout_workspace, clone_exhibit_repository,
+    create_exhibit_repository_path, create_repository_with_post_commit_hook,
+    ensure_project_exhibits_access, import_local_exhibit_with_cancel_and_progress,
+    initialize_exhibit_repository_with_cancel, preview_project_acl, reconcile_project_acl,
+    task_failure_result, SvnDiagnosticContextGuard,
 };
 use svn::types::{
     ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
     CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
     InitializeExhibitRepositoryRequest, PreviewProjectAclRequest, ReconcileProjectAclRequest,
+    SvnCheckoutRequest,
 };
 use upload::smb::execute_smb_upload;
 use upload::tasks::{execute_upload_code, execute_upload_placeholder};
@@ -88,7 +90,11 @@ fn protocol_open_requested(args: &[String]) -> bool {
 
 fn main() {
     let options = Options::from_env();
-    let mcp_mode = cfg!(feature = "mcp-console") || env::args().any(|argument| argument == "--mcp");
+    let arguments = env::args().collect::<Vec<_>>();
+    let mcp_mode = should_run_mcp(env!("CARGO_BIN_NAME"), &arguments);
+    if let Err(error) = app::extension_lock::recover() {
+        eprintln!("extension transaction recovery failed: {error}");
+    }
     if !mcp_mode {
         let svn_credentials_from_environment = match svn::service::bootstrap_svn_credentials() {
             Ok(configured) => configured,
@@ -152,6 +158,11 @@ fn main() {
         eprintln!("agent failed: {error}");
         std::process::exit(1);
     }
+}
+
+fn should_run_mcp(binary_name: &str, arguments: &[String]) -> bool {
+    binary_name.eq_ignore_ascii_case("himind-agent-mcp")
+        || arguments.iter().any(|argument| argument == "--mcp")
 }
 
 fn auth_cli_arguments() -> Option<Vec<String>> {
@@ -679,7 +690,22 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_plugin_view_launch, protocol_open_requested, PluginViewLaunch};
+    use super::{
+        parse_plugin_view_launch, protocol_open_requested, should_run_mcp, PluginViewLaunch,
+    };
+
+    #[test]
+    fn selects_mcp_mode_by_binary_target_or_explicit_argument() {
+        assert!(should_run_mcp("himind-agent-mcp", &[]));
+        assert!(should_run_mcp(
+            "himind-agent",
+            &["himind-agent.exe".to_string(), "--mcp".to_string()]
+        ));
+        assert!(!should_run_mcp(
+            "himind-agent",
+            &["himind-agent.exe".to_string(), "--local-app".to_string()]
+        ));
+    }
 
     #[test]
     fn parses_plugin_view_shortcut_arguments() {
@@ -1102,6 +1128,58 @@ fn execute_task(
                 &mut check_cancel,
                 &mut report_progress,
             )
+        }
+        "exhibit_workspace_checkout" => {
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                30,
+                "正在准备检出工作区",
+                None,
+                None,
+            )?;
+            let request = serde_json::from_value::<SvnCheckoutRequest>(
+                task.payload.clone().unwrap_or_else(|| json!({})),
+            )?;
+            let mut cancel_guard = TaskCancelGuard::new();
+            cancel_guard.check(client, options, agent_id, &task.id)?;
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                45,
+                "正在检出 SVN 工作区",
+                None,
+                None,
+            )?;
+            let mut result = checkout_workspace(request)?;
+            cancel_guard.check(client, options, agent_id, &task.id)?;
+            report_task(
+                client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                85,
+                "正在同步工作区外部依赖",
+                None,
+                None,
+            )?;
+            if result.get("target_path").is_none() {
+                if let Some(target_path) = task
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("target_path"))
+                {
+                    result["target_path"] = target_path.clone();
+                }
+            }
+            Ok(result)
         }
         "agent_run" => runtime::execute(client, options, agent_id, &task),
         "project_acl_preview" => {

@@ -56,6 +56,144 @@ pub(crate) fn catalog_json(
     }))
 }
 
+/// Project ready portable Skills into the MCP Prompt surface.  Skills remain
+/// orchestration documents; their referenced capabilities are still invoked
+/// through the normal Gateway tools.
+pub(crate) fn mcp_prompts_json(
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Value, Box<dyn Error>> {
+    let records = ready_mcp_records(agent_version, capability_facts)?;
+    let prompts = records
+        .into_iter()
+        .map(|record| {
+            json!({
+                "name": record.manifest.id,
+                "title": record.manifest.name,
+                "description": record.manifest.description,
+                "arguments": [],
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "prompts": prompts }))
+}
+
+pub(crate) fn mcp_prompt_get(
+    name: &str,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Value, Box<dyn Error>> {
+    let record = ready_mcp_records(agent_version, capability_facts)?
+        .into_iter()
+        .find(|record| record.manifest.id == name.trim())
+        .ok_or_else(|| format!("MCP Prompt not found or unavailable: {name}"))?;
+    let readme = std::fs::read_to_string(record.version_root.join("SKILL.md"))?;
+    Ok(json!({
+        "description": record.manifest.description,
+        "messages": [{
+            "role": "user",
+            "content": { "type": "text", "text": readme }
+        }]
+    }))
+}
+
+pub(crate) fn mcp_resources_json(
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Value, Box<dyn Error>> {
+    let mut resources = Vec::new();
+    for record in ready_mcp_records(agent_version, capability_facts)? {
+        for content in &record.manifest.contents {
+            if content.eq_ignore_ascii_case("skill.json")
+                || content.eq_ignore_ascii_case("SKILL.md")
+            {
+                continue;
+            }
+            resources.push(json!({
+                "uri": format!("himind://skill/{}/{}", record.manifest.id, content.replace('\\', "/")),
+                "name": format!("{} / {}", record.manifest.name, content),
+                "description": record.manifest.description,
+                "mimeType": mcp_mime_type(content),
+            }));
+        }
+    }
+    Ok(json!({ "resources": resources }))
+}
+
+pub(crate) fn mcp_resource_read(
+    uri: &str,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Value, Box<dyn Error>> {
+    let value = uri
+        .strip_prefix("himind://skill/")
+        .ok_or("不支持的 HiMind Skill Resource URI")?;
+    let (skill_id, relative) = value.split_once('/').ok_or("Skill Resource URI 缺少路径")?;
+    crate::skill::manifest::validate_relative_package_path(relative)?;
+    let record = ready_mcp_records(agent_version, capability_facts)?
+        .into_iter()
+        .find(|record| record.manifest.id == skill_id)
+        .ok_or_else(|| format!("MCP Resource not found or unavailable: {uri}"))?;
+    if !record
+        .manifest
+        .contents
+        .iter()
+        .any(|item| item.replace('\\', "/") == relative)
+    {
+        return Err("Skill Resource 未在 Manifest contents 中声明".into());
+    }
+    let path = record.version_root.join(relative);
+    if !path.is_file() {
+        return Err("Skill Resource 文件不存在".into());
+    }
+    Ok(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": mcp_mime_type(relative),
+            "text": std::fs::read_to_string(path)?
+        }]
+    }))
+}
+
+fn ready_mcp_records(
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Vec<SkillRecord>, Box<dyn Error>> {
+    retire_removed_client_skills();
+    let store = SkillStore::new();
+    store.bootstrap_builtin_skills()?;
+    Ok(store
+        .list_records()?
+        .into_iter()
+        .filter(|record| declares_portable_skill(&record.manifest))
+        .filter(|record| {
+            SkillReadiness::resolve(
+                &record.manifest,
+                capability_facts,
+                agent_version,
+                "himind-ai",
+            )
+            .state
+                != "blocked"
+        })
+        .collect())
+}
+
+fn mcp_mime_type(path: &str) -> &'static str {
+    let extension = path.rsplit('.').next().unwrap_or_default();
+    if extension.eq_ignore_ascii_case("json") {
+        "application/json"
+    } else if extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml") {
+        "application/yaml"
+    } else if extension.eq_ignore_ascii_case("md") {
+        "text/markdown"
+    } else if extension.eq_ignore_ascii_case("txt") {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 pub(crate) fn client_status_json(
     agent_version: &str,
     capability_facts: &[CapabilityFact],
@@ -580,6 +718,10 @@ fn uninstall_client_ids(record: &SkillRecord) -> Vec<String> {
     clients.sort();
     clients.dedup();
     clients
+}
+
+pub(crate) fn uninstall_client_ids_for_record(record: &SkillRecord) -> Vec<String> {
+    uninstall_client_ids(record)
 }
 
 pub(crate) fn capability_facts_from_gateway(

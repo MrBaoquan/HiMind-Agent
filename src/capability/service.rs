@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -12,13 +13,16 @@ use crate::app::system::{
 };
 use crate::app::types::{ProjectWorkspaceRequest, RemoteConnectRequest};
 use crate::app::{mcp_downstream::DownstreamMcpManager, mcp_registry, mcp_targets};
+use crate::approval::manager::ApprovalManager;
+use crate::approval::policy;
+use crate::approval::remote::ApprovalProof;
+use crate::capability::dashboard_catalog::{DashboardCapabilityContract, DashboardCatalogProvider};
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, invoke_plugin_capability_for_plugin,
     registry_json_for_control_plane, scan_plugins,
 };
 use crate::capability::software_distribution::{
     attach_inspection_receipt, consume_inspection_receipt, verify_inspection_receipt,
-    VerifiedSoftwareArtifact,
 };
 use crate::capability::types::{CapabilityAvailability, CapabilityDescriptor, InvocationContext};
 use crate::store::credentials::{local_login_status_json, local_login_status_value};
@@ -35,19 +39,34 @@ use crate::svn::types::{
 };
 use crate::{Options, VERSION};
 
+#[derive(Clone)]
 pub(crate) struct CapabilityGateway {
     options: Options,
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
+    approval_manager: Arc<ApprovalManager>,
     downstream_mcp: DownstreamMcpManager,
+    dashboard_catalog: DashboardCatalogProvider,
 }
 
 #[derive(Clone)]
 enum CapabilityHandler {
     SystemHealth,
+    AIClientList,
+    AIClientStatus,
+    AIClientImport,
+    AIClientRemove,
+    AIClientImportPlan,
+    AIClientRemovePlan,
+    AIServiceList,
+    AIServiceCustomUpsert,
+    AIServiceCustomRemove,
+    AIServiceCustomListModels,
     AuthoringIdentity,
     ExtensionWorkspaceCurrent,
+    ExtensionLock,
     InnerAdminLoginStatus,
     SystemOpenFolder,
+    FilesystemDelete,
     WorkspaceBuild,
     WorkspaceStatus,
     WorkspaceOpen,
@@ -68,6 +87,7 @@ enum CapabilityHandler {
     PluginInvoke,
     SkillCandidateSave,
     SkillCandidateTest,
+    ExtensionTest,
     SkillClientRegister,
     SkillClientUnregister,
     SkillClientsUnregister,
@@ -97,11 +117,15 @@ enum CapabilityHandler {
     DashboardProjectManagersReplace,
     DashboardProjectOwnersReplace,
     DashboardExhibitCrewReplace,
+    DashboardExhibitCrewAppend,
+    DashboardExhibitCrewRemove,
     DashboardProjectExhibitAttach,
     DashboardProjectExhibitDetach,
     DashboardExhibitWorkspaceGet,
     DashboardExhibitWorkspaceBind,
     DashboardExhibitWorkspaceCheckout,
+    OperationGet,
+    OperationCancel,
     DashboardPeopleSearch,
     DashboardRequirementList,
     DashboardRequirementGet,
@@ -128,6 +152,7 @@ enum CapabilityHandler {
     McpRegistrationRemove,
     McpRegistrationRemoveAll,
     McpConnectionTest,
+    DashboardBusinessDynamic(DashboardCapabilityContract),
 }
 
 #[derive(Clone)]
@@ -138,11 +163,29 @@ struct CapabilityRegistration {
 
 impl CapabilityGateway {
     pub(crate) fn new(options: Options, worker_status: Arc<Mutex<LocalWorkerStatus>>) -> Self {
+        Self::new_with_approval_manager(options, worker_status, ApprovalManager::global())
+    }
+
+    pub(crate) fn new_with_approval_manager(
+        options: Options,
+        worker_status: Arc<Mutex<LocalWorkerStatus>>,
+        approval_manager: Arc<ApprovalManager>,
+    ) -> Self {
         Self {
             downstream_mcp: DownstreamMcpManager::new(&options.state_path),
+            dashboard_catalog: DashboardCatalogProvider::new(&options),
             options,
             worker_status,
+            approval_manager,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_dashboard_catalog_for_test(
+        &self,
+        snapshot: crate::capability::dashboard_catalog::DashboardCatalogSnapshot,
+    ) {
+        self.dashboard_catalog.replace_snapshot(snapshot);
     }
 
     pub(crate) fn list_capabilities(
@@ -154,15 +197,38 @@ impl CapabilityGateway {
             context.principal.as_str(),
             context.request_id.as_str(),
         );
+        let catalog_ids = self.dashboard_catalog.snapshot().map(|snapshot| {
+            snapshot
+                .items
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<std::collections::BTreeSet<_>>()
+        });
         Ok(self
             .registry()?
             .into_values()
             .filter(|registration| {
-                self.options.mode().control_plane_enabled()
+                let visible_for_mode = self.options.mode().control_plane_enabled()
                     || registration
                         .descriptor
                         .availability
-                        .available_without_control_plane()
+                        .available_without_control_plane();
+                if !visible_for_mode {
+                    return false;
+                }
+                // Once a fresh catalog is available, catalog-owned business
+                // capabilities absent from it have been removed by Dashboard
+                // and must no longer be projected through MCP. Other
+                // control-plane providers (media, review, distribution) use
+                // their own contracts and are intentionally unaffected.
+                if let Some(ids) = catalog_ids.as_ref() {
+                    if is_dashboard_catalog_handler(&registration.handler)
+                        && !ids.contains(&registration.descriptor.id)
+                    {
+                        return false;
+                    }
+                }
+                true
             })
             .map(|registration| registration.descriptor)
             .collect())
@@ -170,6 +236,7 @@ impl CapabilityGateway {
 
     fn registry(&self) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
         let mut registry = BTreeMap::new();
+        let ai_client_targets = crate::app::ai_provider_import::known_adapter_ids();
         let builtins = [
             registration(
                 "mcp.server.list",
@@ -178,6 +245,144 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::McpServerList,
+            ),
+            registration(
+                "ai.client.list",
+                "AI 客户端列表",
+                "检测本机支持的 AI 客户端，不读取配置中的密钥或敏感值。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::AIClientList,
+            ),
+            registration(
+                "ai.client.status",
+                "AI 客户端接入状态",
+                "读取本机 AI 客户端的 HiMind 接入状态和模型摘要。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::AIClientStatus,
+            ),
+            registration(
+                "ai.client.import",
+                "接入 AI 客户端",
+                "为指定 AI 客户端配置指定 AI 服务；执行前应确认目标客户端、服务源和本机配置变更。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() },
+                        "service": {
+                            "type": "string",
+                            "default": "managed",
+                            "pattern": "^(managed|custom:[A-Za-z0-9_-]{1,64})$"
+                        }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIClientImport,
+            ),
+            registration(
+                "ai.client.remove",
+                "移除 AI 客户端接入",
+                "移除指定 AI 客户端中的 HiMind AI 配置并保留原配置备份。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIClientRemove,
+            ),
+            registration(
+                "ai.client.import.plan",
+                "生成 AI 客户端接入计划",
+                "只读预览指定 AI 客户端接入 HiMind 将写入和备份的配置，不修改任何本机文件。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() },
+                        "service": { "type": "string", "description": "managed 或 custom:<id>；仅用于预览切换冲突" }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIClientImportPlan,
+            ),
+            registration(
+                "ai.client.remove.plan",
+                "生成 AI 客户端移除计划",
+                "只读预览从指定 AI 客户端移除 HiMind 将写入和备份的配置，不修改任何本机文件。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": ai_client_targets.clone() },
+                        "service": { "type": "string", "description": "可选服务源，便于客户端统一调用契约" }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIClientRemovePlan,
+            ),
+            registration(
+                "ai.service.list",
+                "AI 服务列表",
+                "读取本机可用的 AI 服务：HiMind 分发服务摘要与用户自定义服务；不返回 API Key。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::AIServiceList,
+            ),
+            registration(
+                "ai.service.custom.upsert",
+                "保存自定义 AI 服务",
+                "新增或更新本机自定义 AI 供应商服务；API Key 加密保存，不落明文。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+                        "display_name": { "type": "string" },
+                        "base_url": { "type": "string" },
+                        "protocol": { "type": "string", "enum": ["openai-chat", "openai-responses"] },
+                        "model": { "type": "string" },
+                        "models": { "type": "array", "items": { "type": "string" } },
+                        "api_key": { "type": "string" }
+                    },
+                    "required": ["id", "display_name", "base_url", "protocol", "model"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIServiceCustomUpsert,
+            ),
+            registration(
+                "ai.service.custom.remove",
+                "删除自定义 AI 服务",
+                "删除本机自定义 AI 供应商服务及其加密存储的 API Key。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIServiceCustomRemove,
+            ),
+            registration(
+                "ai.service.custom.list_models",
+                "拉取自定义 AI 服务模型",
+                "读取指定自定义 AI 服务的 /models 接口，返回可用模型 ID 列表；不修改任何配置。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIServiceCustomListModels,
             ),
             registration(
                 "mcp.server.inspect",
@@ -342,6 +547,14 @@ impl CapabilityGateway {
                 CapabilityHandler::ExtensionWorkspaceCurrent,
             ),
             registration(
+                "extension.lock",
+                "扩展锁定快照",
+                "读取当前 Agent 已安装扩展的来源、版本、摘要和依赖闭包。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::ExtensionLock,
+            ),
+            registration(
                 "workspace.current",
                 "当前 AI 工作区",
                 "返回 AI 会话当前工作目录，以及检测到的 HiMind 项目身份。",
@@ -377,6 +590,23 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SystemOpenFolder,
+            ),
+            registration(
+                "filesystem.delete",
+                "删除本机文件或目录",
+                "高风险删除能力。默认只生成删除预览；必须显式 permanent=true，并通过桌面审批后才会执行。系统目录、Agent 数据目录和根目录永远拒绝。",
+                "R3",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                        "recursive": { "type": "boolean" },
+                        "permanent": { "type": "boolean" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::FilesystemDelete,
             ),
             registration(
                 "exhibit.workspace.build",
@@ -672,6 +902,23 @@ impl CapabilityGateway {
                 CapabilityHandler::SkillCandidateTest,
             ),
             registration(
+                "extension.test",
+                "测试扩展候选",
+                "按插件或 Skill 类型执行完整的候选测试闭环并返回结构化报告。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill"] },
+                        "id": { "type": "string" },
+                        "version": { "type": "string" }
+                    },
+                    "required": ["kind", "id", "version"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionTest,
+            ),
+            registration(
                 "extension.skill.client.register",
                 "注册 Skill 客户端",
                 "将指定 Skill 同步到一个 AI 工具；不影响其他客户端和 Agent Skill Store。",
@@ -922,11 +1169,11 @@ impl CapabilityGateway {
                 json!({"type":"object","properties":{"project_name":{"type":"string"},"scope_type":{"type":"string","enum":["organization","personal"]},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"project_manager_user_ids":{"type":"array","items":{"type":"string"}},"project_owner_user_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string","enum":["members","all_read","all_read_write"]},"initial_engineering_name":{"type":"string"},"initial_engine_type":{"type":"string"},"agent_id":{"type":"string"}},"required":["project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectCreate,
             ),
             dashboard_business_registration(
-                "business.project.update", "更新项目", "更新项目资料、责任人和协作中心。", "network_write",
-                json!({"type":"object","properties":{"project_id":{"type":"string"},"project_name":{"type":"string"},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"project_manager_user_ids":{"type":"array","items":{"type":"string"}},"project_owner_user_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string","enum":["members","all_read","all_read_write"]}},"required":["project_id","project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectUpdate,
+                "business.project.update", "更新项目", "更新项目资料和协作中心；项目经理/负责人必须通过专用人员能力调整。", "network_write",
+                json!({"type":"object","properties":{"project_id":{"type":"string"},"project_name":{"type":"string"},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string","enum":["members","all_read","all_read_write"]}},"required":["project_id","project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectUpdate,
             ),
             dashboard_business_registration(
-                "business.project.delete", "删除项目", "删除项目及其展项、工作区和项目关系。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectDelete,
+                "business.project.delete", "删除项目", "删除项目及其展项、工作区和项目关系。该操作为 R3 高风险能力，必须经过审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectDelete,
             ),
             dashboard_business_registration(
                 "business.exhibit.list", "展项列表", "读取当前用户可见的展项列表。", "read_only", json!({"type":"object","properties":{"q":{"type":"string"},"project":{"type":"string"},"engine":{"type":"string"},"page":{"type":"integer"},"page_size":{"type":"integer"}},"additionalProperties":false}), CapabilityHandler::DashboardExhibitList,
@@ -935,25 +1182,31 @@ impl CapabilityGateway {
                 "business.exhibit.create", "创建展项", "在项目下创建展项。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"resolution":{"type":"string"},"hall_id":{"type":"string"},"hall":{"type":"string"},"workload":{"type":"number"},"engineering_id":{"type":"string"},"developer_source":{"type":"string"},"edit_url":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"source_path":{"type":"string"},"release_path":{"type":"string"},"config_params":{"type":"array","items":{"type":"string"}},"code_uploads":{"type":"array","items":{"type":"string"}},"engine_type":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"note":{"type":"string"}},"required":["project_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCreate,
             ),
             dashboard_business_registration(
-                "business.exhibit.update", "更新展项", "更新展项资料和项目归属。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"hall_id":{"type":"string"},"hall":{"type":"string"},"engine_type":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"note":{"type":"string"}},"required":["exhibit_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitUpdate,
+                "business.exhibit.update", "更新展项", "更新展项资料和项目归属；制作人员必须通过 crew 专用能力调整。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"hall_id":{"type":"string"},"hall":{"type":"string"},"engine_type":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"note":{"type":"string"}},"required":["exhibit_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitUpdate,
             ),
             dashboard_business_registration(
-                "business.exhibit.delete", "删除展项", "删除展项及其工作区、设备和关联关系。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitDelete,
+                "business.exhibit.delete", "删除展项", "删除展项及其工作区、设备和关联关系。该操作为 R3 高风险能力，必须经过审批。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitDelete,
             ),
             dashboard_business_registration(
-                "business.project.managers.replace", "配置项目经理", "全量替换项目经理。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectManagersReplace,
+                "business.project.managers.replace", "替换项目经理", "全量替换项目经理；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}},"expected_user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectManagersReplace,
             ),
             dashboard_business_registration(
-                "business.project.owners.replace", "配置项目负责人", "全量替换项目负责人。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectOwnersReplace,
+                "business.project.owners.replace", "替换项目负责人", "全量替换项目负责人；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}},"expected_user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectOwnersReplace,
             ),
             dashboard_business_registration(
-                "business.exhibit.crew.replace", "配置展项人员", "全量或部分替换展项制作人员和现场调试人员。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewReplace,
+                "business.exhibit.crew.replace", "替换展项人员", "全量替换展项制作人员和现场调试人员；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewReplace,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.crew.append", "追加展项制作人员", "只向展项追加制作人员，不会删除或替换已有制作人员。重复人员会被忽略。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"add_developer_user_ids":{"type":"array","items":{"type":"string"},"maxItems":100},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id","add_developer_user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewAppend,
+            ),
+            dashboard_business_registration(
+                "business.exhibit.crew.remove", "移出展项制作人员", "从展项移出制作人员，不影响现场调试人员、需求历史或用户账户；重复移出幂等。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"remove_developer_user_ids":{"type":"array","items":{"type":"string"},"maxItems":100},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}},"reason":{"type":"string","maxLength":500}},"required":["exhibit_id","remove_developer_user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewRemove,
             ),
             dashboard_business_registration(
                 "business.project.exhibit.attach", "关联展项", "将展项关联到指定项目。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitAttach,
             ),
             dashboard_business_registration(
-                "business.project.exhibit.detach", "解除展项关联", "解除展项与项目的关联。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitDetach,
+                "business.project.exhibit.detach", "解除展项关联", "解除展项与项目的既有关联。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitDetach,
             ),
             dashboard_business_registration(
                 "business.exhibit.workspace.get", "查看展项工作区", "读取展项在指定 Agent 上的本地工作区绑定。", "read_only", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"}},"required":["exhibit_id","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceGet,
@@ -963,6 +1216,32 @@ impl CapabilityGateway {
             ),
             dashboard_business_registration(
                 "business.exhibit.workspace.checkout", "检出展项工作区", "检出展项 SVN 工作区并自动保存到 Dashboard 的工作区绑定。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"repository_url":{"type":"string"},"target_path":{"type":"string"},"agent_id":{"type":"string"},"engine_version":{"type":"string"}},"required":["project_id","exhibit_id","target_path","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceCheckout,
+            ),
+            dashboard_business_registration(
+                "operation.get",
+                "查看异步操作",
+                "读取由 Dashboard AI 能力创建的异步操作状态、进度和结果。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "operation_id": { "type": "string" } },
+                    "required": ["operation_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::OperationGet,
+            ),
+            dashboard_business_registration(
+                "operation.cancel",
+                "取消异步操作",
+                "请求取消仍在排队或执行中的 Dashboard AI 异步操作。",
+                "network_write",
+                json!({
+                    "type": "object",
+                    "properties": { "operation_id": { "type": "string" } },
+                    "required": ["operation_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::OperationCancel,
             ),
             dashboard_business_registration(
                 "business.people.search", "查询人员", "按姓名、用户 ID 或部门查询可用于项目和展项配置的人员。", "read_only",
@@ -1030,6 +1309,7 @@ impl CapabilityGateway {
 
         for mut item in builtins {
             item.descriptor.availability = availability_for_handler(&item.handler);
+            apply_registry_metadata(&mut item.descriptor, &item.handler);
             insert_registration(&mut registry, item)?;
         }
 
@@ -1041,22 +1321,33 @@ impl CapabilityGateway {
                 for capability in &plugin.capabilities {
                     let availability = plugin_capability_availability(&plugin, &capability);
                     let capability_id = capability.id.clone();
-                    insert_registration(
-                        &mut registry,
-                        CapabilityRegistration {
-                            descriptor: CapabilityDescriptor {
-                                id: capability_id.clone(),
-                                version: plugin.version.clone(),
-                                name: capability.description.clone(),
-                                description: capability.description.clone(),
-                                risk_level: capability.risk_level.clone(),
-                                source: format!("plugin:{}", plugin.id),
-                                availability,
-                                input_schema: capability.input_schema.clone(),
-                            },
-                            handler: CapabilityHandler::PluginCapability(capability_id),
+                    let mut registration = CapabilityRegistration {
+                        descriptor: CapabilityDescriptor {
+                            id: capability_id.clone(),
+                            version: plugin.version.clone(),
+                            name: capability.description.clone(),
+                            description: capability.description.clone(),
+                            risk_level: capability.risk_level.clone(),
+                            source: format!("plugin:{}", plugin.id),
+                            contract_source: format!("plugin:{}:manifest", plugin.id),
+                            contract_generation: None,
+                            availability,
+                            execution_mode: "provider_defined".to_string(),
+                            supports_progress: false,
+                            supports_cancel: false,
+                            idempotency: "provider_defined".to_string(),
+                            retry_policy: "provider_defined".to_string(),
+                            concurrency: "provider_defined".to_string(),
+                            approval_required: false,
+                            dashboard_provider: false,
+                            required_scope: None,
+                            dashboard_route: None,
+                            input_schema: capability.input_schema.clone(),
                         },
-                    )?;
+                        handler: CapabilityHandler::PluginCapability(capability_id),
+                    };
+                    apply_registry_metadata(&mut registration.descriptor, &registration.handler);
+                    insert_registration(&mut registry, registration)?;
                 }
             }
         }
@@ -1069,16 +1360,123 @@ impl CapabilityGateway {
                 if registry.contains_key(&capability_id) {
                     continue;
                 }
+                let mut registration = CapabilityRegistration {
+                    descriptor,
+                    handler: CapabilityHandler::DownstreamMcp(capability_id),
+                };
+                apply_registry_metadata(&mut registration.descriptor, &registration.handler);
+                insert_registration(&mut registry, registration)?;
+            }
+        }
+        // Dashboard is an optional capability provider. Independent mode
+        // never reads its catalog; Connected mode projects new ordinary
+        // business operations into this same Gateway. Static Agent handlers
+        // win on ID collisions so special semantics remain local and stable.
+        if let Some(snapshot) = self.dashboard_catalog.snapshot() {
+            let contract_generation = snapshot.generation.clone();
+            for contract in snapshot.items {
+                let id = contract.id.clone();
+                if let Some(existing) = registry.get_mut(&id) {
+                    // Keep the compiled handler for special semantics, while
+                    // accepting Dashboard as the source of truth for its
+                    // public contract and authorization metadata.
+                    if existing.descriptor.dashboard_provider {
+                        existing.descriptor.version = contract.version.clone();
+                        existing.descriptor.name = contract.name.clone();
+                        existing.descriptor.description = contract.description.clone();
+                        existing.descriptor.risk_level = if policy::is_destructive_capability(&id) {
+                            "R3".to_string()
+                        } else {
+                            contract.risk_level.clone()
+                        };
+                        let preserves_agent_execution = matches!(
+                            existing.handler,
+                            CapabilityHandler::DashboardExhibitWorkspaceCheckout
+                                | CapabilityHandler::SoftwareDistributionPublish
+                                | CapabilityHandler::MediaSubmit(_, _)
+                                | CapabilityHandler::MediaJobGet
+                                | CapabilityHandler::MediaJobCancel
+                        );
+                        if !preserves_agent_execution {
+                            existing.descriptor.execution_mode = contract.execution_mode.clone();
+                            existing.descriptor.supports_progress = contract.supports_progress;
+                            existing.descriptor.supports_cancel = contract.supports_cancel;
+                            existing.descriptor.idempotency = contract.idempotency.clone();
+                            existing.descriptor.approval_required = contract.approval_required
+                                || policy::is_destructive_capability(&id);
+                        }
+                        existing.descriptor.required_scope = Some(contract.scope.clone());
+                        existing.descriptor.dashboard_route =
+                            Some(contract.dashboard_route.clone());
+                        existing.descriptor.input_schema = contract.input_schema.clone();
+                        existing.descriptor.contract_source = "dashboard:catalog".to_string();
+                        existing.descriptor.contract_generation = Some(contract_generation.clone());
+                    }
+                    continue;
+                }
+                // A generic HTTP proxy cannot provide Agent-side progress or
+                // cancellation semantics. Long-running Dashboard operations
+                // must first receive a dedicated static handler; only
+                // ordinary synchronous routes are auto-discovered.
+                if contract.execution_mode != "sync" {
+                    continue;
+                }
                 insert_registration(
                     &mut registry,
                     CapabilityRegistration {
-                        descriptor,
-                        handler: CapabilityHandler::DownstreamMcp(capability_id),
+                        descriptor: CapabilityDescriptor {
+                            id: id.clone(),
+                            version: contract.version.clone(),
+                            name: contract.name.clone(),
+                            description: contract.description.clone(),
+                            risk_level: if policy::is_destructive_capability(&id) {
+                                "R3".to_string()
+                            } else {
+                                contract.risk_level.clone()
+                            },
+                            source: "dashboard:catalog".to_string(),
+                            contract_source: "dashboard:catalog".to_string(),
+                            contract_generation: Some(contract_generation.clone()),
+                            availability: CapabilityAvailability::ControlPlane,
+                            execution_mode: contract.execution_mode.clone(),
+                            supports_progress: contract.supports_progress,
+                            supports_cancel: contract.supports_cancel,
+                            idempotency: contract.idempotency.clone(),
+                            retry_policy: contract.retry_policy.clone(),
+                            concurrency: contract.concurrency.clone(),
+                            approval_required: contract.approval_required
+                                || policy::is_destructive_capability(&id),
+                            dashboard_provider: true,
+                            required_scope: Some(contract.scope.clone()),
+                            dashboard_route: Some(contract.dashboard_route.clone()),
+                            input_schema: contract.input_schema.clone(),
+                        },
+                        handler: CapabilityHandler::DashboardBusinessDynamic(contract),
                     },
                 )?;
             }
         }
         Ok(registry)
+    }
+
+    fn dashboard_user_id(&self, context: &InvocationContext) -> Result<String, Box<dyn Error>> {
+        if let Some(user_id) = context
+            .principal
+            .strip_prefix("dashboard-user:")
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(user_id.trim().to_string());
+        }
+        if context.source == crate::capability::types::InvocationSource::Mcp {
+            if let Some(snapshot) =
+                crate::api::oauth::authorization_snapshot(&self.options.state_path)?
+            {
+                if !snapshot.user_id.trim().is_empty() {
+                    return Ok(snapshot.user_id.trim().to_string());
+                }
+            }
+        }
+        Err("AI 客户端配置需要已绑定的 Dashboard 用户身份".into())
     }
 
     pub(crate) fn invoke(
@@ -1091,6 +1489,16 @@ impl CapabilityGateway {
             .registry()?
             .remove(capability_id)
             .ok_or_else(|| format!("capability not found: {capability_id}"))?;
+        if let Some(snapshot) = self.dashboard_catalog.snapshot() {
+            if is_dashboard_catalog_handler(&registration.handler)
+                && !snapshot.items.iter().any(|item| item.id == capability_id)
+            {
+                return Err(format!(
+                    "capability not available in Dashboard catalog: {capability_id}"
+                )
+                .into());
+            }
+        }
         if matches!(
             registration.descriptor.availability,
             CapabilityAvailability::ControlPlane
@@ -1105,6 +1513,88 @@ impl CapabilityGateway {
             .into());
         }
         validate_capability_input_schema(&registration.descriptor.input_schema, &input)?;
+        let mut approval_proof =
+            self.enforce_high_risk_approval(context, &registration.descriptor, &input)?;
+        if (registration.descriptor.approval_required
+            || policy::risk_rank(policy::effective_risk_level(
+                capability_id,
+                &registration.descriptor.risk_level,
+            )) >= policy::risk_rank("R3"))
+            && policy::destructive_request_type(capability_id).is_none()
+            && approval_proof.is_none()
+            && matches!(
+                context.source,
+                crate::capability::types::InvocationSource::Mcp
+                    | crate::capability::types::InvocationSource::LocalHttp
+                    | crate::capability::types::InvocationSource::Tauri
+                    | crate::capability::types::InvocationSource::Cli
+            )
+        {
+            let risk_level =
+                policy::effective_risk_level(capability_id, &registration.descriptor.risk_level);
+            let target = policy::target_description(capability_id, &input);
+            let remote_approval_id = if self.options.mode().dashboard_enabled() {
+                let agent_id =
+                    crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
+                let args_digest = policy::args_digest(&input)?;
+                let generation = policy::approval_generation(
+                    registration.descriptor.contract_generation.as_deref(),
+                );
+                Some(crate::approval::remote::create_approval(
+                    &self.options,
+                    &agent_id,
+                    &context.request_id,
+                    capability_id,
+                    &registration.descriptor.version,
+                    &registration.descriptor.source,
+                    risk_level,
+                    &input,
+                    &format!("{}：{}", registration.descriptor.name, target),
+                    &args_digest,
+                    generation,
+                    120,
+                )?)
+            } else {
+                None
+            };
+            let approved = self
+                .approval_manager
+                .request_capability_approval(
+                    capability_id,
+                    risk_level,
+                    format!("受控操作审批：{}", registration.descriptor.name),
+                    format!(
+                        "能力：{}\n风险等级：{}\n目标：{}\n来源：{}\n\n拒绝、超时或 Agent 中断都会阻止实际执行。",
+                        capability_id,
+                        risk_level,
+                        target,
+                        context.source.as_str()
+                    ),
+                )
+                .map_err(|error| format!("审批请求失败：{error}"))?;
+            if let Some(approval_id) = remote_approval_id.as_deref() {
+                match crate::approval::remote::decide_approval(
+                    &self.options,
+                    approval_id,
+                    approved,
+                    &context.request_id,
+                )? {
+                    crate::approval::remote::DecisionSync::Synced => {}
+                    crate::approval::remote::DecisionSync::Queued => {
+                        self.approval_manager.add_log(
+                            "warn",
+                            &format!(
+                                "审批结果已写入本地 outbox，等待 Dashboard 重放: {approval_id}"
+                            ),
+                        );
+                    }
+                }
+            }
+            if !approved {
+                return Err(format!("受控能力 {capability_id} 未获批准，未执行实际副作用").into());
+            }
+            approval_proof = remote_approval_id.map(ApprovalProof::Approval);
+        }
         if is_svn_admin_capability(capability_id)
             && context.source != crate::capability::types::InvocationSource::DashboardWorker
         {
@@ -1123,12 +1613,94 @@ impl CapabilityGateway {
         );
         match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
+            CapabilityHandler::AIClientList => Ok(serde_json::to_value(
+                crate::app::ai_provider_import::status(&self.options),
+            )?),
+            CapabilityHandler::AIClientStatus => Ok(serde_json::to_value(
+                crate::app::ai_provider_import::status(&self.options),
+            )?),
+            CapabilityHandler::AIClientImport => {
+                let request: crate::app::ai_provider_import::AIProviderImportRequest =
+                    serde_json::from_value(input)?;
+                let user_id = self.dashboard_user_id(context)?;
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::import(&self.options, &user_id, &request)?,
+                )?)
+            }
+            CapabilityHandler::AIClientRemove => {
+                let request: crate::app::ai_provider_import::AIProviderImportRequest =
+                    serde_json::from_value(input)?;
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::cancel(&self.options, &request.target)?,
+                )?)
+            }
+            CapabilityHandler::AIClientImportPlan => {
+                let request: crate::app::ai_provider_import::AIProviderImportRequest =
+                    serde_json::from_value(input)?;
+                Ok(serde_json::to_value(
+                    crate::app::ai_provider_import::plan_with_service(
+                        &self.options,
+                        &request.target,
+                        "import",
+                        request.service_source(),
+                    )?,
+                )?)
+            }
+            CapabilityHandler::AIClientRemovePlan => {
+                let request: crate::app::ai_provider_import::AIProviderImportRequest =
+                    serde_json::from_value(input)?;
+                Ok(serde_json::to_value(crate::app::ai_provider_import::plan(
+                    &self.options,
+                    &request.target,
+                    "remove",
+                )?)?)
+            }
+            CapabilityHandler::AIServiceList => {
+                let custom = crate::store::ai_services::public_snapshot()?;
+                let clients = crate::app::ai_provider_import::status(&self.options);
+                let user_id = self.dashboard_user_id(context).unwrap_or_default();
+                let managed = crate::api::ai::managed_ai_service_summary(&self.options, &user_id);
+                let services = custom
+                    .get("services")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]));
+                Ok(serde_json::json!({
+                    "custom": { "services": services },
+                    "managed": managed,
+                    "clients": clients,
+                }))
+            }
+            CapabilityHandler::AIServiceCustomUpsert => Ok(serde_json::to_value(
+                crate::store::ai_services::upsert(serde_json::from_value(input)?)?.public_json(),
+            )?),
+            CapabilityHandler::AIServiceCustomRemove => {
+                let id = input
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("id is required")?;
+                crate::app::ai_provider_import::ensure_no_imported_clients(&self.options)?;
+                Ok(serde_json::to_value(crate::store::ai_services::remove(
+                    id,
+                )?)?)
+            }
+            CapabilityHandler::AIServiceCustomListModels => {
+                let id = input
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("id is required")?;
+                let models = crate::store::ai_services::list_models(id)?;
+                Ok(serde_json::json!({ "service_id": id, "models": models }))
+            }
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
             CapabilityHandler::ExtensionWorkspaceCurrent => {
                 crate::extension_projects::current_workspace()
             }
+            CapabilityHandler::ExtensionLock => {
+                Ok(serde_json::to_value(crate::app::extension_lock::load()?)?)
+            }
             CapabilityHandler::InnerAdminLoginStatus => Ok(local_login_status_json()),
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
+            CapabilityHandler::FilesystemDelete => self.filesystem_delete(input),
             CapabilityHandler::WorkspaceBuild => self.build_workspace(input),
             CapabilityHandler::WorkspaceStatus => self.workspace_status(input),
             CapabilityHandler::WorkspaceOpen => self.workspace_open(input),
@@ -1180,6 +1752,7 @@ impl CapabilityGateway {
                 self.save_skill_candidate(input)
             }
             CapabilityHandler::SkillCandidateTest => self.test_skill_candidate(input),
+            CapabilityHandler::ExtensionTest => self.test_extension_candidate(input),
             CapabilityHandler::SkillClientRegister => {
                 let skill_id = input
                     .get("skill_id")
@@ -1232,9 +1805,11 @@ impl CapabilityGateway {
             CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
             CapabilityHandler::ExtensionReviewQueue => self.extension_review_queue(input),
             CapabilityHandler::ExtensionReviewGet => self.extension_review_get(input),
-            CapabilityHandler::ExtensionReviewDecide => self.extension_review_decide(input),
+            CapabilityHandler::ExtensionReviewDecide => {
+                self.extension_review_decide(input, approval_proof.as_ref())
+            }
             CapabilityHandler::SoftwareDistributionPublish => {
-                self.publish_software_release(context, input)
+                self.publish_software_release(context, input, approval_proof.as_ref())
             }
             CapabilityHandler::DashboardContextResolve => {
                 crate::api::dashboard_business::resolve_context(&self.options, input)
@@ -1261,7 +1836,11 @@ impl CapabilityGateway {
                 crate::api::dashboard_business::project_update(&self.options, input)
             }
             CapabilityHandler::DashboardProjectDelete => {
-                crate::api::dashboard_business::project_delete(&self.options, input)
+                crate::api::dashboard_business::project_delete(
+                    &self.options,
+                    input,
+                    approval_proof.as_ref(),
+                )
             }
             CapabilityHandler::DashboardExhibitList => {
                 crate::api::dashboard_business::exhibit_list(&self.options, input)
@@ -1273,13 +1852,18 @@ impl CapabilityGateway {
                 crate::api::dashboard_business::exhibit_update(&self.options, input)
             }
             CapabilityHandler::DashboardExhibitDelete => {
-                crate::api::dashboard_business::exhibit_delete(&self.options, input)
+                crate::api::dashboard_business::exhibit_delete(
+                    &self.options,
+                    input,
+                    approval_proof.as_ref(),
+                )
             }
             CapabilityHandler::DashboardProjectManagersReplace => {
                 crate::api::dashboard_business::project_people_replace(
                     &self.options,
                     input,
                     "managers",
+                    approval_proof.as_ref(),
                 )
             }
             CapabilityHandler::DashboardProjectOwnersReplace => {
@@ -1287,16 +1871,32 @@ impl CapabilityGateway {
                     &self.options,
                     input,
                     "owners",
+                    approval_proof.as_ref(),
                 )
             }
             CapabilityHandler::DashboardExhibitCrewReplace => {
-                crate::api::dashboard_business::exhibit_crew_replace(&self.options, input)
+                crate::api::dashboard_business::exhibit_crew_replace(
+                    &self.options,
+                    input,
+                    approval_proof.as_ref(),
+                )
+            }
+            CapabilityHandler::DashboardExhibitCrewAppend => {
+                crate::api::dashboard_business::exhibit_crew_append(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitCrewRemove => {
+                crate::api::dashboard_business::exhibit_crew_remove(
+                    &self.options,
+                    input,
+                    approval_proof.as_ref(),
+                )
             }
             CapabilityHandler::DashboardProjectExhibitAttach => {
                 crate::api::dashboard_business::project_exhibit_association(
                     &self.options,
                     input,
                     "attach",
+                    approval_proof.as_ref(),
                 )
             }
             CapabilityHandler::DashboardProjectExhibitDetach => {
@@ -1304,6 +1904,7 @@ impl CapabilityGateway {
                     &self.options,
                     input,
                     "detach",
+                    approval_proof.as_ref(),
                 )
             }
             CapabilityHandler::DashboardExhibitWorkspaceGet => {
@@ -1313,34 +1914,13 @@ impl CapabilityGateway {
                 crate::api::dashboard_business::exhibit_workspace_bind(&self.options, input)
             }
             CapabilityHandler::DashboardExhibitWorkspaceCheckout => {
-                let checkout_request: SvnCheckoutRequest = serde_json::from_value(input.clone())?;
-                let checkout = checkout_workspace(checkout_request)?;
-                let exhibit_id = input
-                    .get("exhibit_id")
-                    .and_then(Value::as_str)
-                    .ok_or("exhibit_id is required")?;
-                let agent_id = input
-                    .get("agent_id")
-                    .and_then(Value::as_str)
-                    .ok_or("agent_id is required")?;
-                let local_path = checkout
-                    .get("target_path")
-                    .cloned()
-                    .or_else(|| input.get("target_path").cloned())
-                    .ok_or("checkout did not return target_path")?;
-                let mut bind_input = json!({
-                    "exhibit_id": exhibit_id,
-                    "agent_id": agent_id,
-                    "local_path": local_path,
-                });
-                if let Some(engine_version) = input.get("engine_version") {
-                    bind_input["engine_version"] = engine_version.clone();
-                }
-                let binding = crate::api::dashboard_business::exhibit_workspace_bind(
-                    &self.options,
-                    bind_input,
-                )?;
-                Ok(json!({"checkout": checkout, "binding": binding}))
+                crate::api::dashboard_business::exhibit_workspace_checkout(&self.options, input)
+            }
+            CapabilityHandler::OperationGet => {
+                crate::api::dashboard_business::operation_get(&self.options, input)
+            }
+            CapabilityHandler::OperationCancel => {
+                crate::api::dashboard_business::operation_cancel(&self.options, input)
             }
             CapabilityHandler::DashboardPeopleSearch => {
                 crate::api::dashboard_business::people_search(&self.options, input)
@@ -1519,6 +2099,15 @@ impl CapabilityGateway {
                     &server,
                 ))?)
             }
+            CapabilityHandler::DashboardBusinessDynamic(contract) => {
+                crate::capability::dashboard_catalog::invoke_catalog_capability(
+                    &self.options,
+                    &contract,
+                    input,
+                    &context.request_id,
+                    approval_proof.as_ref(),
+                )
+            }
         }
     }
 
@@ -1589,6 +2178,216 @@ impl CapabilityGateway {
         }
         open_folder(&folder_path)?;
         Ok(json!({ "ok": true, "path": folder_path }))
+    }
+
+    fn enforce_high_risk_approval(
+        &self,
+        context: &InvocationContext,
+        descriptor: &CapabilityDescriptor,
+        input: &Value,
+    ) -> Result<Option<ApprovalProof>, Box<dyn Error>> {
+        let destructive_type = policy::destructive_request_type(&descriptor.id);
+        // Grant validation is part of the Gateway contract for every
+        // capability that advertises approval_required, not just deletes.
+        // Non-destructive capabilities may still fall back to an explicit
+        // desktop confirmation, while background Worker execution must have a
+        // server-issued Grant because no local user is present.
+        if destructive_type.is_none()
+            && !descriptor.approval_required
+            && policy::risk_rank(policy::effective_risk_level(
+                &descriptor.id,
+                &descriptor.risk_level,
+            )) < policy::risk_rank("R3")
+        {
+            return Ok(None);
+        }
+        // A non-permanent filesystem call is a read-only deletion preview.
+        if descriptor.id == "filesystem.delete"
+            && !input
+                .get("permanent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        if self.options.mode().dashboard_enabled() {
+            let args_digest = policy::args_digest(input)?;
+            let generation = policy::approval_generation(descriptor.contract_generation.as_deref());
+            match crate::approval::remote::active_grant(
+                &self.options,
+                &descriptor.id,
+                &descriptor.version,
+                &descriptor.source,
+                policy::effective_risk_level(&descriptor.id, &descriptor.risk_level),
+                generation,
+                &args_digest,
+                input,
+            ) {
+                Ok(Some(grant_id)) => {
+                    self.approval_manager.add_log(
+                        "info",
+                        &format!("已使用 Dashboard Grant 放行高风险能力: {}", descriptor.id),
+                    );
+                    return Ok(Some(ApprovalProof::Grant(grant_id)));
+                }
+                Ok(None) => {}
+                Err(error)
+                    if context.source
+                        == crate::capability::types::InvocationSource::DashboardWorker =>
+                {
+                    return Err(format!(
+                        "无法验证审批授权，已阻止执行 {}：{}",
+                        descriptor.id, error
+                    )
+                    .into())
+                }
+                Err(error) => {
+                    self.approval_manager.add_log(
+                        "warn",
+                        &format!(
+                            "Dashboard Grant 暂不可用，将等待本机确认: {} ({})",
+                            descriptor.id, error
+                        ),
+                    );
+                }
+            }
+        }
+        if destructive_type.is_none() {
+            if context.source == crate::capability::types::InvocationSource::DashboardWorker {
+                return Err(json!({
+                    "code": "approval_required",
+                    "capability_id": descriptor.id,
+                    "risk_level": policy::effective_risk_level(&descriptor.id, &descriptor.risk_level),
+                    "message": "后台 Agent 任务执行需要已批准的 Dashboard Grant；当前调用未执行实际副作用"
+                })
+                .to_string()
+                .into());
+            }
+            return Ok(None);
+        }
+        let request_type = destructive_type.expect("destructive type checked above");
+        // Background work has no trustworthy local user interaction channel.
+        // It must be resumed with a server-issued approval/grant in a later
+        // phase; silently treating the worker as the approver is forbidden.
+        if context.source == crate::capability::types::InvocationSource::DashboardWorker {
+            return Err(json!({
+                "code": "approval_required",
+                "capability_id": descriptor.id,
+                "risk_level": policy::effective_risk_level(&descriptor.id, &descriptor.risk_level),
+                "message": "后台 Agent 任务执行删除类能力前必须携带已批准的 Dashboard 授权；当前调用未执行任何删除"
+            })
+            .to_string()
+            .into());
+        }
+        let target = policy::target_description(&descriptor.id, input);
+        let title = format!("高风险操作审批：{}", descriptor.name);
+        let description = format!(
+            "能力：{}\n风险等级：R3\n目标：{}\n来源：{}\n\n拒绝、超时或关闭审批窗口都会阻止实际执行。",
+            descriptor.id,
+            target,
+            context.source.as_str()
+        );
+        let remote_approval_id = if self.options.mode().dashboard_enabled() {
+            let agent_id = crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
+            let args_digest = policy::args_digest(input)?;
+            let generation = policy::approval_generation(descriptor.contract_generation.as_deref());
+            Some(crate::approval::remote::create_approval(
+                &self.options,
+                &agent_id,
+                &context.request_id,
+                &descriptor.id,
+                &descriptor.version,
+                &descriptor.source,
+                policy::effective_risk_level(&descriptor.id, &descriptor.risk_level),
+                input,
+                &description,
+                &args_digest,
+                generation,
+                120,
+            )?)
+        } else {
+            None
+        };
+        let approved = self
+            .approval_manager
+            .request_approval(request_type, title, description)
+            .map_err(|error| format!("审批请求失败：{error}"))?;
+        if let Some(approval_id) = remote_approval_id.as_deref() {
+            match crate::approval::remote::decide_approval(
+                &self.options,
+                approval_id,
+                approved,
+                &context.request_id,
+            )? {
+                crate::approval::remote::DecisionSync::Synced => {}
+                crate::approval::remote::DecisionSync::Queued => self.approval_manager.add_log(
+                    "warn",
+                    &format!(
+                        "审批结果已写入本地 outbox，等待 Dashboard 重放: {}",
+                        approval_id
+                    ),
+                ),
+            }
+        }
+        if approved {
+            Ok(remote_approval_id.map(ApprovalProof::Approval))
+        } else {
+            Err(format!("高风险能力 {} 未获批准，未执行任何删除", descriptor.id).into())
+        }
+    }
+
+    fn filesystem_delete(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let raw_path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if raw_path.is_empty() {
+            return Err("path is required".into());
+        }
+        let target =
+            fs::canonicalize(raw_path).map_err(|error| format!("无法解析删除目标：{error}"))?;
+        validate_delete_target(&target)?;
+        let metadata = fs::metadata(&target)?;
+        let recursive = input
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (items, bytes) = delete_target_stats(&target, metadata.is_dir())?;
+        if metadata.is_dir() && !recursive {
+            return Err("目标是目录；必须显式 recursive=true 才能删除目录".into());
+        }
+        if items > 10_000 {
+            return Err("为避免误删，单次删除最多允许 10000 个文件系统项".into());
+        }
+        if !input
+            .get("permanent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(json!({
+                "ok": false,
+                "preview": true,
+                "requires_permanent_confirmation": true,
+                "path": target.to_string_lossy(),
+                "is_directory": metadata.is_dir(),
+                "items": items,
+                "bytes": bytes,
+                "message": "这是删除预览；再次调用时需传 permanent=true，并重新经过审批"
+            }));
+        }
+        if metadata.is_dir() {
+            fs::remove_dir_all(&target)?;
+        } else {
+            fs::remove_file(&target)?;
+        }
+        Ok(json!({
+            "ok": true,
+            "deleted": true,
+            "path": target.to_string_lossy(),
+            "items": items,
+            "bytes": bytes
+        }))
     }
 
     fn build_workspace(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -1715,6 +2514,7 @@ impl CapabilityGateway {
         &self,
         context: &InvocationContext,
         input: Value,
+        approval_proof: Option<&ApprovalProof>,
     ) -> Result<Value, Box<dyn Error>> {
         let mut request = serde_json::from_value::<
             crate::api::distribution::SoftwareReleasePublishRequest,
@@ -1735,11 +2535,6 @@ impl CapabilityGateway {
             &serde_json::json!({ "workspace_root": request.workspace_root.clone() }),
         )?;
         let verified = verify_inspection_receipt(context, &request)?;
-        if requires_native_software_confirmation(context)
-            && !confirm_software_publish(&request, &verified)
-        {
-            return Err("用户取消了软件版本发布".into());
-        }
         consume_inspection_receipt(&verified)?;
         request.artifact_path = verified.artifact_path.to_string_lossy().to_string();
         let access = crate::api::oauth::platform_access_token(
@@ -1759,6 +2554,7 @@ impl CapabilityGateway {
             verified.file,
             verified.size,
             verified.file_name,
+            approval_proof,
         )
     }
 
@@ -1777,6 +2573,80 @@ impl CapabilityGateway {
             &version,
             &capability_facts,
         )?)?)
+    }
+
+    fn test_extension_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let (id, version) = authoring_identity(&input)?;
+        match kind {
+            "skill" => {
+                let capability_facts = crate::skill::capability_facts_from_gateway(
+                    &self.options,
+                    Arc::clone(&self.worker_status),
+                    &InvocationContext::new(
+                        crate::capability::types::InvocationSource::Mcp,
+                        "authoring-test",
+                    ),
+                )?;
+                let result = crate::skill::authoring::test(&id, &version, &capability_facts)?;
+                let cleanup_state = result
+                    .cleanup
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed");
+                if cleanup_state != "passed" {
+                    return Err(format!("Skill 候选测试清理未通过: {cleanup_state}").into());
+                }
+                Ok(json!({
+                    "kind": "skill",
+                    "id": id,
+                    "version": version,
+                    "state": "passed",
+                    "checks": {
+                        "manifest": "passed",
+                        "dependencies": "passed",
+                        "package": "passed",
+                        "client_registration": "passed",
+                        "cleanup": cleanup_state
+                    },
+                    "result": result
+                }))
+            }
+            "plugin" => {
+                let result = crate::plugin_authoring::test(&id, &version)?;
+                let report = result.test_report.clone().unwrap_or_else(|| {
+                    json!({
+                        "manifest": "passed",
+                        "dependencies": "passed",
+                        "package": "passed",
+                        "runtime": { "state": "skipped" },
+                        "lifecycle": { "state": "passed" }
+                    })
+                });
+                Ok(json!({
+                    "kind": "plugin",
+                    "id": id,
+                    "version": version,
+                    "state": "passed",
+                    "checks": {
+                        "manifest": "passed",
+                        "dependencies": "passed",
+                        "package": "passed",
+                        "development_registration": "passed",
+                        "runtime": report.get("runtime").cloned().unwrap_or(Value::Null),
+                        "lifecycle": report.get("lifecycle").cloned().unwrap_or(Value::Null),
+                        "cleanup": report.get("cleanup").cloned().unwrap_or(Value::Null)
+                    },
+                    "result": result,
+                    "report": report
+                }))
+            }
+            _ => Err("kind must be plugin or skill".into()),
+        }
     }
 
     fn submit_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -1892,7 +2762,11 @@ impl CapabilityGateway {
         )
     }
 
-    fn extension_review_decide(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+    fn extension_review_decide(
+        &self,
+        input: Value,
+        approval_proof: Option<&ApprovalProof>,
+    ) -> Result<Value, Box<dyn Error>> {
         let (kind, id) = extension_review_identity(&input)?;
         let artifact_id = input
             .get("artifact_id")
@@ -1939,6 +2813,7 @@ impl CapabilityGateway {
             artifact_id,
             action,
             note,
+            approval_proof,
         )
     }
 
@@ -1960,6 +2835,62 @@ fn is_svn_admin_capability(capability_id: &str) -> bool {
             | "exhibit.repository_path.create"
             | "exhibit.repository.initialize_template"
     )
+}
+
+fn validate_delete_target(target: &Path) -> Result<(), Box<dyn Error>> {
+    if target.parent().is_none() || target == target.parent().unwrap_or(target) {
+        return Err("禁止删除磁盘根目录".into());
+    }
+    let target_key = target.to_string_lossy().to_ascii_lowercase();
+    let mut protected = vec![crate::store::paths::agent_home()];
+    for variable in [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramData",
+        "ProgramFiles(x86)",
+    ] {
+        if let Ok(value) = std::env::var(variable) {
+            if !value.trim().is_empty() {
+                protected.push(std::path::PathBuf::from(value));
+            }
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            protected.push(parent.to_path_buf());
+        }
+    }
+    if protected.into_iter().any(|root| {
+        let root_key = root
+            .canonicalize()
+            .unwrap_or(root)
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        target_key == root_key
+            || target_key.starts_with(&(root_key + std::path::MAIN_SEPARATOR.to_string().as_str()))
+    }) {
+        return Err("禁止删除系统目录、Agent 数据目录或 Agent 安装目录".into());
+    }
+    Ok(())
+}
+
+fn delete_target_stats(target: &Path, is_directory: bool) -> Result<(usize, u64), Box<dyn Error>> {
+    if !is_directory {
+        return Ok((1, fs::metadata(target)?.len()));
+    }
+    let mut items = 0usize;
+    let mut bytes = 0u64;
+    for entry in walkdir::WalkDir::new(target).follow_links(false) {
+        let entry = entry?;
+        items = items.saturating_add(1);
+        if items > 10_000 {
+            break;
+        }
+        if entry.file_type().is_file() {
+            bytes = bytes.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok((items, bytes))
 }
 
 fn authoring_identity_schema() -> Value {
@@ -2012,39 +2943,6 @@ fn extension_review_identity(input: &Value) -> Result<(String, String), Box<dyn 
     Ok((kind, id))
 }
 
-fn requires_native_software_confirmation(context: &InvocationContext) -> bool {
-    context.source == crate::capability::types::InvocationSource::Mcp
-}
-
-fn confirm_software_publish(
-    request: &crate::api::distribution::SoftwareReleasePublishRequest,
-    artifact: &VerifiedSoftwareArtifact,
-) -> bool {
-    matches!(
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("确认发布软件版本")
-            .set_description(format!(
-                "产品：{} ({})\n版本：{}\n渠道：{}\n目标：{}/{}/{}\n文件：{}\n大小：{} 字节\nSHA-256：{}\n强制更新：{}\n灰度比例：{}%\n\n该操作会创建不可变制品并发布到组织分发服务，是否继续？",
-                request.product_name,
-                request.product_id,
-                request.version,
-                request.channel,
-                request.platform,
-                request.architecture,
-                request.package_type,
-                artifact.file_name,
-                artifact.size,
-                artifact.sha256,
-                if request.mandatory { "是" } else { "否" },
-                request.rollout_percent,
-            ))
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show(),
-        rfd::MessageDialogResult::Yes
-    )
-}
-
 fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
     match capability_id {
         "extension.skill.submission.submit"
@@ -2074,7 +2972,9 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         }
         "business.project.managers.replace"
         | "business.project.owners.replace"
-        | "business.exhibit.crew.replace" => Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE),
+        | "business.exhibit.crew.replace"
+        | "business.exhibit.crew.append"
+        | "business.exhibit.crew.remove" => Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE),
         "business.people.search" => Some(crate::api::oauth::BUSINESS_PEOPLE_READ_SCOPE),
         "business.requirement.list" | "business.requirement.get" => {
             Some(crate::api::oauth::BUSINESS_REQUIREMENT_READ_SCOPE)
@@ -2095,6 +2995,8 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         "business.exhibit.workspace.bind" | "business.exhibit.workspace.checkout" => {
             Some(crate::api::oauth::BUSINESS_WORKSPACE_WRITE_SCOPE)
         }
+        "operation.get" => Some(crate::api::oauth::OPERATION_READ_SCOPE),
+        "operation.cancel" => Some(crate::api::oauth::OPERATION_CANCEL_SCOPE),
         "knowledge.search.v1" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
         "media.image.generate"
         | "media.image.edit"
@@ -2105,6 +3007,251 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         "media.job.cancel" => Some(crate::api::oauth::MEDIA_CANCEL_SCOPE),
         _ => None,
     }
+}
+
+/// Populate the contract fields that are shared by HTTP, Tauri, Dashboard
+/// Worker and MCP consumers.  Keeping this derivation next to the Gateway
+/// registry prevents each adapter from inventing its own notion of a long
+/// task, retry safety or Dashboard route.
+fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &CapabilityHandler) {
+    let id = descriptor.id.as_str();
+    descriptor.required_scope = required_platform_scope(id).map(str::to_string);
+    descriptor.dashboard_route = dashboard_route_for(id);
+    descriptor.dashboard_provider = is_dashboard_provider_handler(handler);
+
+    let long_running = matches!(
+        handler,
+        CapabilityHandler::SvnWorkspaceCheckout
+            | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+            | CapabilityHandler::SoftwareDistributionPublish
+            | CapabilityHandler::MediaSubmit(_, _)
+            | CapabilityHandler::MediaJobCancel
+    );
+    descriptor.execution_mode = if long_running { "long_running" } else { "sync" }.to_string();
+    descriptor.supports_progress = long_running;
+    descriptor.supports_cancel = matches!(
+        handler,
+        CapabilityHandler::SvnWorkspaceCheckout
+            | CapabilityHandler::MediaSubmit(_, _)
+            | CapabilityHandler::MediaJobCancel
+            | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+    );
+    descriptor.approval_required =
+        policy::risk_rank(policy::effective_risk_level(id, &descriptor.risk_level))
+            >= policy::risk_rank("R3")
+            || policy::is_destructive_capability(id)
+            || matches!(handler, CapabilityHandler::DownstreamMcp(_))
+            || (matches!(handler, CapabilityHandler::PluginCapability(_))
+                && !matches!(
+                    descriptor.risk_level.trim().to_ascii_uppercase().as_str(),
+                    "READ_ONLY" | "R1"
+                ))
+            || matches!(
+                handler,
+                CapabilityHandler::SoftwareDistributionPublish
+                    | CapabilityHandler::ExtensionReviewDecide
+                    | CapabilityHandler::AIClientImport
+                    | CapabilityHandler::AIClientRemove
+                    | CapabilityHandler::AIServiceCustomUpsert
+                    | CapabilityHandler::AIServiceCustomRemove
+            );
+    descriptor.idempotency = if descriptor.risk_level == "read_only" {
+        "safe"
+    } else if matches!(handler, CapabilityHandler::DashboardExhibitCrewAppend) {
+        "safe"
+    } else if matches!(
+        handler,
+        CapabilityHandler::DashboardProjectManagersReplace
+            | CapabilityHandler::DashboardProjectOwnersReplace
+            | CapabilityHandler::DashboardExhibitCrewReplace
+            | CapabilityHandler::DashboardExhibitCrewRemove
+    ) {
+        "conditional"
+    } else if matches!(
+        handler,
+        CapabilityHandler::DashboardProjectExhibitAttach
+            | CapabilityHandler::DashboardProjectExhibitDetach
+            | CapabilityHandler::MediaJobCancel
+    ) {
+        "conditional"
+    } else {
+        "not_guaranteed"
+    }
+    .to_string();
+    descriptor.retry_policy = if descriptor.idempotency == "safe" {
+        "safe"
+    } else if descriptor.idempotency == "conditional" {
+        "idempotency_key"
+    } else {
+        "never"
+    }
+    .to_string();
+    descriptor.concurrency = if descriptor.risk_level == "read_only" {
+        "parallel"
+    } else {
+        "keyed"
+    }
+    .to_string();
+}
+
+fn is_dashboard_provider_handler(handler: &CapabilityHandler) -> bool {
+    matches!(
+        handler,
+        CapabilityHandler::SkillSubmissionSubmit
+            | CapabilityHandler::SkillSubmissionStatus
+            | CapabilityHandler::PluginSubmissionSubmit
+            | CapabilityHandler::PluginSubmissionStatus
+            | CapabilityHandler::ExtensionReviewQueue
+            | CapabilityHandler::ExtensionReviewGet
+            | CapabilityHandler::ExtensionReviewDecide
+            | CapabilityHandler::SoftwareDistributionPublish
+            | CapabilityHandler::DashboardContextResolve
+            | CapabilityHandler::DashboardProjectContext
+            | CapabilityHandler::DashboardExhibitContext
+            | CapabilityHandler::DashboardMyWorkSummary
+            | CapabilityHandler::DashboardKnowledgeSearch
+            | CapabilityHandler::DashboardProjectList
+            | CapabilityHandler::DashboardProjectCreate
+            | CapabilityHandler::DashboardProjectUpdate
+            | CapabilityHandler::DashboardProjectDelete
+            | CapabilityHandler::DashboardExhibitList
+            | CapabilityHandler::DashboardExhibitCreate
+            | CapabilityHandler::DashboardExhibitUpdate
+            | CapabilityHandler::DashboardExhibitDelete
+            | CapabilityHandler::DashboardProjectManagersReplace
+            | CapabilityHandler::DashboardProjectOwnersReplace
+            | CapabilityHandler::DashboardExhibitCrewReplace
+            | CapabilityHandler::DashboardExhibitCrewAppend
+            | CapabilityHandler::DashboardExhibitCrewRemove
+            | CapabilityHandler::DashboardProjectExhibitAttach
+            | CapabilityHandler::DashboardProjectExhibitDetach
+            | CapabilityHandler::DashboardExhibitWorkspaceGet
+            | CapabilityHandler::DashboardExhibitWorkspaceBind
+            | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+            | CapabilityHandler::OperationGet
+            | CapabilityHandler::OperationCancel
+            | CapabilityHandler::DashboardPeopleSearch
+            | CapabilityHandler::DashboardRequirementList
+            | CapabilityHandler::DashboardRequirementGet
+            | CapabilityHandler::DashboardRequirementCreate
+            | CapabilityHandler::DashboardRequirementUpdate
+            | CapabilityHandler::DashboardRequirementAssignmentUpdate
+            | CapabilityHandler::DashboardRequirementCancel
+            | CapabilityHandler::DashboardRequirementReopen
+            | CapabilityHandler::DashboardRequirementReview
+            | CapabilityHandler::DashboardRequirementComment
+            | CapabilityHandler::MediaSubmit(_, _)
+            | CapabilityHandler::MediaJobGet
+            | CapabilityHandler::MediaJobCancel
+    )
+}
+
+fn is_dashboard_catalog_handler(handler: &CapabilityHandler) -> bool {
+    matches!(
+        handler,
+        CapabilityHandler::DashboardContextResolve
+            | CapabilityHandler::DashboardProjectContext
+            | CapabilityHandler::DashboardExhibitContext
+            | CapabilityHandler::DashboardMyWorkSummary
+            | CapabilityHandler::DashboardKnowledgeSearch
+            | CapabilityHandler::DashboardProjectList
+            | CapabilityHandler::DashboardProjectCreate
+            | CapabilityHandler::DashboardProjectUpdate
+            | CapabilityHandler::DashboardProjectDelete
+            | CapabilityHandler::DashboardExhibitList
+            | CapabilityHandler::DashboardExhibitCreate
+            | CapabilityHandler::DashboardExhibitUpdate
+            | CapabilityHandler::DashboardExhibitDelete
+            | CapabilityHandler::DashboardProjectManagersReplace
+            | CapabilityHandler::DashboardProjectOwnersReplace
+            | CapabilityHandler::DashboardExhibitCrewReplace
+            | CapabilityHandler::DashboardExhibitCrewAppend
+            | CapabilityHandler::DashboardExhibitCrewRemove
+            | CapabilityHandler::DashboardProjectExhibitAttach
+            | CapabilityHandler::DashboardProjectExhibitDetach
+            | CapabilityHandler::DashboardExhibitWorkspaceGet
+            | CapabilityHandler::DashboardExhibitWorkspaceBind
+            | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+            | CapabilityHandler::OperationGet
+            | CapabilityHandler::OperationCancel
+            | CapabilityHandler::DashboardPeopleSearch
+            | CapabilityHandler::DashboardRequirementList
+            | CapabilityHandler::DashboardRequirementGet
+            | CapabilityHandler::DashboardRequirementCreate
+            | CapabilityHandler::DashboardRequirementUpdate
+            | CapabilityHandler::DashboardRequirementAssignmentUpdate
+            | CapabilityHandler::DashboardRequirementCancel
+            | CapabilityHandler::DashboardRequirementReopen
+            | CapabilityHandler::DashboardRequirementReview
+            | CapabilityHandler::DashboardRequirementComment
+    )
+}
+
+fn dashboard_route_for(capability_id: &str) -> Option<String> {
+    let route = match capability_id {
+        "context.resolve" => "/api/integrations/ai/business/context/resolve",
+        "project.context.get" | "business.project.get" => {
+            "/api/integrations/ai/business/projects/{project_id}"
+        }
+        "exhibit.context.get" | "business.exhibit.get" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}"
+        }
+        "work.my_summary" => "/api/integrations/ai/business/my-work/summary",
+        "business.project.list" => "/api/integrations/ai/business/projects",
+        "business.project.create" => "/api/integrations/ai/business/projects",
+        "business.project.update" | "business.project.delete" => {
+            "/api/integrations/ai/business/projects/{project_id}"
+        }
+        "business.project.managers.replace" => {
+            "/api/integrations/ai/business/projects/{project_id}/managers"
+        }
+        "business.project.owners.replace" => {
+            "/api/integrations/ai/business/projects/{project_id}/owners"
+        }
+        "business.exhibit.list" | "business.exhibit.create" => {
+            "/api/integrations/ai/business/exhibits"
+        }
+        "business.exhibit.update" | "business.exhibit.delete" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}"
+        }
+        "business.exhibit.crew.replace" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}/crew"
+        }
+        "business.exhibit.crew.append" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}/crew/append"
+        }
+        "business.exhibit.crew.remove" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}/crew/remove"
+        }
+        "business.project.exhibit.attach" => {
+            "/api/integrations/ai/business/projects/{project_id}/exhibits/{exhibit_id}/attach"
+        }
+        "business.project.exhibit.detach" => {
+            "/api/integrations/ai/business/projects/{project_id}/exhibits/{exhibit_id}/detach"
+        }
+        "business.people.search" => "/api/integrations/ai/business/people/search",
+        "business.requirement.list" => "/api/integrations/ai/business/requirements",
+        "business.requirement.get" => "/api/integrations/ai/business/requirements/{requirement_id}",
+        "business.requirement.create" => "/api/integrations/ai/business/requirements",
+        "business.requirement.update"
+        | "business.requirement.cancel"
+        | "business.requirement.reopen"
+        | "business.requirement.review"
+        | "business.requirement.comment" => {
+            "/api/integrations/ai/business/requirements/{requirement_id}"
+        }
+        "business.requirement.assignment.update" => {
+            "/api/integrations/ai/business/requirements/{requirement_id}/assignment"
+        }
+        "knowledge.search.v1" => "/api/integrations/ai/business/knowledge/search",
+        "business.exhibit.workspace.checkout" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}/workspace/checkout"
+        }
+        "operation.get" => "/api/integrations/ai/operations/{operation_id}",
+        "operation.cancel" => "/api/integrations/ai/operations/{operation_id}/cancel",
+        _ => return None,
+    };
+    Some(route.to_string())
 }
 
 // Validate every Gateway invocation, including built-ins and downstream MCP
@@ -2300,6 +3447,8 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
     match handler {
         CapabilityHandler::AuthoringIdentity
         | CapabilityHandler::ExtensionWorkspaceCurrent
+        | CapabilityHandler::ExtensionLock
+        | CapabilityHandler::ExtensionTest
         | CapabilityHandler::SkillCandidateSave
         | CapabilityHandler::SkillCandidateTest
         | CapabilityHandler::SkillClientRegister
@@ -2331,11 +3480,15 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::DashboardProjectManagersReplace
         | CapabilityHandler::DashboardProjectOwnersReplace
         | CapabilityHandler::DashboardExhibitCrewReplace
+        | CapabilityHandler::DashboardExhibitCrewAppend
+        | CapabilityHandler::DashboardExhibitCrewRemove
         | CapabilityHandler::DashboardProjectExhibitAttach
         | CapabilityHandler::DashboardProjectExhibitDetach
         | CapabilityHandler::DashboardExhibitWorkspaceGet
         | CapabilityHandler::DashboardExhibitWorkspaceBind
         | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+        | CapabilityHandler::OperationGet
+        | CapabilityHandler::OperationCancel
         | CapabilityHandler::DashboardPeopleSearch
         | CapabilityHandler::DashboardRequirementList
         | CapabilityHandler::DashboardRequirementGet
@@ -2658,17 +3811,31 @@ fn registration_versioned(
     input_schema: Value,
     handler: CapabilityHandler,
 ) -> CapabilityRegistration {
+    let mut descriptor = CapabilityDescriptor {
+        id: id.to_string(),
+        version: version.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        risk_level: risk_level.to_string(),
+        source: "builtin".to_string(),
+        contract_source: "builtin".to_string(),
+        contract_generation: None,
+        availability: availability_for_handler(&handler),
+        execution_mode: "sync".to_string(),
+        supports_progress: false,
+        supports_cancel: false,
+        idempotency: "unknown".to_string(),
+        retry_policy: "unknown".to_string(),
+        concurrency: "unknown".to_string(),
+        approval_required: false,
+        dashboard_provider: false,
+        required_scope: None,
+        dashboard_route: None,
+        input_schema,
+    };
+    apply_registry_metadata(&mut descriptor, &handler);
     CapabilityRegistration {
-        descriptor: CapabilityDescriptor {
-            id: id.to_string(),
-            version: version.to_string(),
-            name: name.to_string(),
-            description: description.to_string(),
-            risk_level: risk_level.to_string(),
-            source: "builtin".to_string(),
-            availability: CapabilityAvailability::Local,
-            input_schema,
-        },
+        descriptor,
         handler,
     }
 }
@@ -2683,6 +3850,7 @@ fn dashboard_business_registration(
 ) -> CapabilityRegistration {
     let mut item = registration(id, name, description, risk_level, input_schema, handler);
     item.descriptor.source = "plugin:com.himind.dashboard-business".to_string();
+    item.descriptor.contract_source = "agent:dashboard-fallback".to_string();
     item.descriptor.availability = CapabilityAvailability::ControlPlane;
     item
 }
@@ -2697,6 +3865,7 @@ fn dashboard_knowledge_registration(
 ) -> CapabilityRegistration {
     let mut item = registration(id, name, description, risk_level, input_schema, handler);
     item.descriptor.source = "plugin:com.himind.knowledge".to_string();
+    item.descriptor.contract_source = "agent:dashboard-fallback".to_string();
     item.descriptor.availability = CapabilityAvailability::ControlPlane;
     item
 }
@@ -2774,16 +3943,52 @@ fn media_job_schema() -> Value {
 
 fn insert_registration(
     registry: &mut BTreeMap<String, CapabilityRegistration>,
-    registration: CapabilityRegistration,
+    mut registration: CapabilityRegistration,
 ) -> Result<(), Box<dyn Error>> {
-    let id = registration.descriptor.id.trim();
+    let id = registration.descriptor.id.trim().to_string();
     if id.is_empty() {
         return Err("capability id is required".into());
     }
-    if registry.contains_key(id) {
+    if registration.descriptor.version.trim().is_empty() {
+        return Err(format!("capability version is required: {id}").into());
+    }
+    if !matches!(
+        registration.descriptor.execution_mode.as_str(),
+        "sync" | "long_running" | "provider_defined"
+    ) {
+        return Err(format!("invalid execution mode for capability: {id}").into());
+    }
+    if !matches!(
+        registration.descriptor.idempotency.as_str(),
+        "safe" | "conditional" | "not_guaranteed" | "provider_defined" | "unknown"
+    ) {
+        return Err(format!("invalid idempotency contract for capability: {id}").into());
+    }
+    if !matches!(
+        registration.descriptor.retry_policy.as_str(),
+        "safe" | "idempotency_key" | "never" | "provider_defined" | "unknown"
+    ) {
+        return Err(format!("invalid retry policy for capability: {id}").into());
+    }
+    if !matches!(
+        registration.descriptor.concurrency.as_str(),
+        "parallel" | "keyed" | "exclusive" | "provider_defined" | "unknown"
+    ) {
+        return Err(format!("invalid concurrency policy for capability: {id}").into());
+    }
+    // Every Dashboard-owned capability must declare the OAuth scope that the
+    // Gateway will resolve before invoking it. This catches accidental drift
+    // between the business registry and the authorization table at startup.
+    if registration.descriptor.dashboard_provider
+        && registration.descriptor.required_scope.is_none()
+    {
+        return Err(format!("Dashboard capability is missing required scope: {id}").into());
+    }
+    if registry.contains_key(&id) {
         return Err(format!("duplicate capability id: {id}").into());
     }
-    registry.insert(id.to_string(), registration);
+    registration.descriptor.id = id.clone();
+    registry.insert(id, registration);
     Ok(())
 }
 
@@ -2834,6 +4039,95 @@ mod tests {
         let error = insert_registration(&mut registry, item).unwrap_err();
 
         assert_eq!(error.to_string(), "capability id is required");
+    }
+
+    #[test]
+    fn third_party_write_and_unknown_mcp_capabilities_require_approval() {
+        let plugin_write = registration(
+            "third.party.write",
+            "Third-party write",
+            "Writes through an installed plugin",
+            "network_write",
+            json!({}),
+            CapabilityHandler::PluginCapability("third.party.write".into()),
+        );
+        let plugin_read = registration(
+            "third.party.read",
+            "Third-party read",
+            "Reads through an installed plugin",
+            "read_only",
+            json!({}),
+            CapabilityHandler::PluginCapability("third.party.read".into()),
+        );
+        let downstream = registration(
+            "mcp.database.drop_table",
+            "Drop table",
+            "Unknown downstream MCP operation",
+            "mcp_downstream",
+            json!({}),
+            CapabilityHandler::DownstreamMcp("mcp.database.drop_table".into()),
+        );
+
+        assert!(plugin_write.descriptor.approval_required);
+        assert!(!plugin_read.descriptor.approval_required);
+        assert!(downstream.descriptor.approval_required);
+        assert_eq!(
+            policy::effective_risk_level(
+                &downstream.descriptor.id,
+                &downstream.descriptor.risk_level
+            ),
+            "R3"
+        );
+    }
+
+    #[test]
+    fn filesystem_delete_defaults_to_preview_without_side_effect() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-delete-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("important.txt");
+        std::fs::write(&file, b"keep").unwrap();
+        let mut options = crate::Options::from_env();
+        options.state_path = root.join("state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let result = gateway
+            .filesystem_delete(json!({"path": file, "permanent": false}))
+            .unwrap();
+        assert_eq!(result["preview"], true);
+        assert_eq!(result["requires_permanent_confirmation"], true);
+        assert!(file.exists(), "preview must not delete the target");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filesystem_delete_requires_recursive_for_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-delete-directory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let mut options = crate::Options::from_env();
+        options.state_path = root.join("state.json");
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let error = gateway
+            .filesystem_delete(json!({"path": root.join("nested"), "permanent": true}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recursive=true"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2968,6 +4262,52 @@ mod tests {
             item.descriptor.source,
             "plugin:com.himind.dashboard-business"
         );
+        assert!(item.descriptor.dashboard_provider);
+        assert_eq!(item.descriptor.execution_mode, "sync");
+        assert_eq!(
+            item.descriptor.required_scope.as_deref(),
+            Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE)
+        );
+        assert_eq!(
+            item.descriptor.dashboard_route.as_deref(),
+            Some("/api/integrations/ai/business/exhibits/{exhibit_id}")
+        );
+        assert_eq!(item.descriptor.idempotency, "safe");
+    }
+
+    #[test]
+    fn registry_rejects_dashboard_capability_without_scope() {
+        let mut registry = BTreeMap::new();
+        let mut item = registration(
+            "business.test",
+            "Test",
+            "Test",
+            "read_only",
+            json!({}),
+            CapabilityHandler::SystemHealth,
+        );
+        item.descriptor.source = "builtin:test-provider".to_string();
+        item.descriptor.dashboard_provider = true;
+        item.descriptor.required_scope = None;
+        let error = insert_registration(&mut registry, item).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Dashboard capability is missing required scope"));
+    }
+
+    #[test]
+    fn svn_checkout_reports_long_running_contract() {
+        let item = registration(
+            "exhibit.workspace.checkout",
+            "检出展项工作区",
+            "检出 SVN 工作区",
+            "network_write",
+            json!({}),
+            CapabilityHandler::SvnWorkspaceCheckout,
+        );
+        assert_eq!(item.descriptor.execution_mode, "long_running");
+        assert!(item.descriptor.supports_progress);
+        assert!(item.descriptor.supports_cancel);
     }
 
     #[test]
@@ -3079,6 +4419,141 @@ mod tests {
         assert!(visible.iter().any(|item| item.id == "system.health"));
         assert!(visible.iter().any(|item| item.id == "context.resolve"));
         assert!(visible.iter().any(|item| item.id == "media.image.generate"));
+        for capability_id in [
+            "ai.client.list",
+            "ai.client.status",
+            "ai.client.import",
+            "ai.client.remove",
+            "ai.client.import.plan",
+            "ai.client.remove.plan",
+        ] {
+            assert!(
+                visible.iter().any(|item| item.id == capability_id),
+                "missing AI client capability: {capability_id}"
+            );
+        }
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.import")
+            .is_some_and(|item| item.risk_level == "local_write"));
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.remove")
+            .is_some_and(|item| item.risk_level == "local_write"));
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.import.plan")
+            .is_some_and(|item| item.risk_level == "read_only"));
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.client.remove.plan")
+            .is_some_and(|item| item.risk_level == "read_only"));
+        for capability_id in [
+            "ai.service.list",
+            "ai.service.custom.upsert",
+            "ai.service.custom.remove",
+            "ai.service.custom.list_models",
+        ] {
+            assert!(
+                visible.iter().any(|item| item.id == capability_id),
+                "missing AI service capability: {capability_id}"
+            );
+        }
+        assert!(visible
+            .iter()
+            .find(|item| item.id == "ai.service.custom.upsert")
+            .is_some_and(|item| item.risk_level == "local_write"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ai_client_capability_schemas_follow_the_adapter_registry() {
+        let mut options = crate::Options::from_env();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry = gateway.registry().unwrap();
+        let expected = crate::app::ai_provider_import::known_adapter_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        for capability_id in [
+            "ai.client.import",
+            "ai.client.remove",
+            "ai.client.import.plan",
+            "ai.client.remove.plan",
+        ] {
+            let actual = registry[capability_id]
+                .descriptor
+                .input_schema
+                .pointer("/properties/target/enum")
+                .and_then(Value::as_array)
+                .expect("AI client target enum must be present")
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "target enum drifted for {capability_id}");
+        }
+    }
+
+    #[test]
+    fn connected_gateway_projects_new_dashboard_catalog_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-capability-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut options = crate::Options::from_env();
+        options.state_path = root.join("agent-state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let mut gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        gateway.dashboard_catalog = DashboardCatalogProvider::from_snapshot(
+            &gateway.options,
+            crate::capability::dashboard_catalog::DashboardCatalogSnapshot {
+                generation: "generation-test".into(),
+                items: vec![DashboardCapabilityContract {
+                    id: "business.catalog.example.list".into(),
+                    version: "1.0.0".into(),
+                    name: "目录示例".into(),
+                    description: "读取目录示例。".into(),
+                    risk_level: "read_only".into(),
+                    http_method: "GET".into(),
+                    scope: "business.example.read".into(),
+                    dashboard_route: "/api/integrations/ai/business/examples".into(),
+                    input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+                    execution_mode: "sync".into(),
+                    supports_progress: false,
+                    supports_cancel: false,
+                    idempotency: "safe".into(),
+                    retry_policy: "safe".into(),
+                    concurrency: "parallel".into(),
+                    approval_required: false,
+                }],
+            },
+        );
+        let visible = gateway
+            .list_capabilities(&InvocationContext::local_http())
+            .unwrap();
+        let dynamic = visible
+            .iter()
+            .find(|item| item.id == "business.catalog.example.list")
+            .expect("catalog capability must be projected");
+        assert_eq!(dynamic.source, "dashboard:catalog");
+        assert_eq!(
+            dynamic.required_scope.as_deref(),
+            Some("business.example.read")
+        );
+        assert_eq!(
+            dynamic.dashboard_route.as_deref(),
+            Some("/api/integrations/ai/business/examples")
+        );
+        assert!(!visible.iter().any(|item| item.id == "context.resolve"));
+        assert!(!visible.iter().any(|item| item.id == "operation.get"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3141,24 +4616,8 @@ mod tests {
             "ai-client:test",
         );
         let input = serde_json::json!({ "workspace_root": root });
-        validate_mcp_capability_workspace(
-            &mcp,
-            "software.distribution.artifact.inspect",
-            &input,
-        )
-        .unwrap();
+        validate_mcp_capability_workspace(&mcp, "software.distribution.artifact.inspect", &input)
+            .unwrap();
         let _ = std::fs::remove_dir_all(input["workspace_root"].as_str().unwrap());
-    }
-
-    #[test]
-    fn only_mcp_software_publish_requires_native_confirmation() {
-        let mcp = InvocationContext::new(
-            crate::capability::types::InvocationSource::Mcp,
-            "ai-client:test",
-        );
-        let cli =
-            InvocationContext::new(crate::capability::types::InvocationSource::Cli, "local-cli");
-        assert!(requires_native_software_confirmation(&mcp));
-        assert!(!requires_native_software_confirmation(&cli));
     }
 }

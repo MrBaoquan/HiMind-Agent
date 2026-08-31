@@ -5,6 +5,7 @@ use crate::capability::plugin::{
 };
 use crate::{Options, VERSION};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
@@ -43,6 +44,8 @@ pub(crate) struct PluginDraft {
     pub confirmed_at: Option<String>,
     pub submitted_at: Option<String>,
     pub dashboard_submission_id: Option<String>,
+    #[serde(default)]
+    pub test_report: Option<Value>,
     pub updated_at: String,
 }
 
@@ -123,6 +126,10 @@ pub(crate) fn save(input: PluginDraftInput) -> Result<PluginDraft, Box<dyn Error
             .as_ref()
             .filter(|_| unchanged)
             .and_then(|value| value.dashboard_submission_id.clone()),
+        test_report: previous
+            .as_ref()
+            .filter(|_| unchanged)
+            .and_then(|value| value.test_report.clone()),
         updated_at: now_stamp(),
     };
     persist(&draft)?;
@@ -184,6 +191,7 @@ pub(crate) fn create_revision(
         confirmed_at: None,
         submitted_at: None,
         dashboard_submission_id: None,
+        test_report: None,
         updated_at: now_stamp(),
     };
     persist(&draft)?;
@@ -268,20 +276,266 @@ fn archive_directory(root: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
 pub(crate) fn test(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dyn Error>> {
     let mut draft = read(plugin_id, version)?;
     ensure_candidate_unchanged(&draft)?;
+    let dependency_issues =
+        crate::capability::plugin::plugin_manifest_dependency_issues(&draft.manifest);
+    if !dependency_issues.is_empty() {
+        return Err(format!("插件候选包依赖预检未通过: {}", dependency_issues.join("; ")).into());
+    }
     let root = draft_version_root(plugin_id, version).join("test-package");
     if root.exists() {
         fs::remove_dir_all(&root)?;
     }
     extract_and_validate(&draft.candidate_path, &root, &draft.manifest)?;
+    let mut registry_snapshot = DevelopmentRegistrySnapshot::capture()?;
     crate::capability::plugin::register_development_plugin(&root)?;
+    // Candidate tests use an isolated development registration only for the
+    // duration of validation.  Do not leave a stale registry entry after the
+    // report has been persisted.
+    let runtime = run_runtime_contract_test(&draft.manifest)?;
+    let registered_before_cleanup = development_registry_contains(&draft.manifest.id);
+    let registration_cleanup =
+        crate::capability::plugin::unregister_development_plugin(&draft.manifest.id);
+    let absent_after_cleanup = !development_registry_contains(&draft.manifest.id);
+    let re_registration = crate::capability::plugin::register_development_plugin(&root).map(|_| ());
+    let present_after_restore = development_registry_contains(&draft.manifest.id);
+    let final_cleanup =
+        crate::capability::plugin::unregister_development_plugin(&draft.manifest.id);
+    let cleanup_errors = [registration_cleanup, re_registration, final_cleanup]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !registered_before_cleanup || !absent_after_cleanup || !present_after_restore {
+        return Err("插件候选测试注册生命周期未通过".into());
+    }
+    if !cleanup_errors.is_empty() {
+        return Err(format!("插件候选测试注册清理失败: {}", cleanup_errors.join("; ")).into());
+    }
+    if runtime.get("state").and_then(Value::as_str) == Some("failed") {
+        return Err(format!(
+            "插件候选测试运行时契约未通过: {}",
+            runtime
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown runtime contract failure")
+        )
+        .into());
+    }
+    registry_snapshot.restore()?;
     draft.development_path = Some(root);
     draft.tested_at = Some(now_stamp());
     draft.confirmed_at = None;
     draft.submitted_at = None;
     draft.dashboard_submission_id = None;
+    draft.test_report = Some(json!({
+        "manifest": "passed",
+        "dependencies": "passed",
+        "package": "passed",
+        "runtime": runtime,
+        "lifecycle": {
+            "registered": registered_before_cleanup,
+            "unregistered": absent_after_cleanup,
+            "re_registered": present_after_restore,
+            "state": "passed"
+        },
+        "cleanup": { "development_registry": "passed" }
+    }));
     draft.updated_at = now_stamp();
     persist(&draft)?;
     Ok(draft)
+}
+
+fn development_registry_contains(plugin_id: &str) -> bool {
+    let path = development_registry_path_for_test();
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Vec<Value>>(&content).ok())
+        .map(|items| {
+            items
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(plugin_id))
+        })
+        .unwrap_or(false)
+}
+
+fn development_registry_path_for_test() -> PathBuf {
+    env::var_os("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::capability::plugin::plugin_registry_dir()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("plugin-development.json")
+        })
+}
+
+struct DevelopmentRegistrySnapshot {
+    path: PathBuf,
+    content: Option<Vec<u8>>,
+    armed: bool,
+}
+
+impl DevelopmentRegistrySnapshot {
+    fn capture() -> Result<Self, Box<dyn Error>> {
+        let path = development_registry_path_for_test();
+        Ok(Self {
+            content: fs::read(&path).ok(),
+            path,
+            armed: true,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), Box<dyn Error>> {
+        self.restore_inner()?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn restore_inner(&self) -> Result<(), Box<dyn Error>> {
+        match self.content.as_deref() {
+            Some(content) => {
+                if let Some(parent) = self.path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&self.path, content)?;
+            }
+            None => {
+                if self.path.exists() {
+                    fs::remove_file(&self.path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DevelopmentRegistrySnapshot {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.restore_inner();
+        }
+    }
+}
+
+fn run_runtime_contract_test(manifest: &PluginManifest) -> Result<Value, Box<dyn Error>> {
+    let Some(capability) = manifest
+        .capabilities
+        .iter()
+        .find(|capability| capability.risk_level.eq_ignore_ascii_case("read_only"))
+        .or_else(|| manifest.capabilities.first())
+    else {
+        return Ok(json!({ "state": "skipped", "reason": "插件未声明 Capability" }));
+    };
+    if !capability.risk_level.eq_ignore_ascii_case("read_only") {
+        return Ok(json!({
+            "state": "skipped",
+            "capability_id": capability.id,
+            "reason": "候选测试不会自动执行有副作用的 Capability"
+        }));
+    }
+    let input = sample_input(&capability.input_schema);
+    match crate::capability::plugin::invoke_plugin_capability_for_plugin(
+        &manifest.id,
+        &capability.id,
+        input.clone(),
+        None,
+    ) {
+        Ok(output) => Ok(json!({
+            "state": "passed",
+            "capability_id": capability.id,
+            "input": input,
+            "output": output
+        })),
+        Err(error) if is_runtime_transport_failure(&error.to_string()) => Ok(json!({
+            "state": "failed",
+            "capability_id": capability.id,
+            "input": input,
+            "error": error.to_string()
+        })),
+        Err(error) => Ok(json!({
+            "state": "passed",
+            "capability_id": capability.id,
+            "input": input,
+            "outcome": "error_response",
+            "error": error.to_string()
+        })),
+    }
+}
+
+fn is_runtime_transport_failure(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    [
+        "failed to start plugin",
+        "plugin timed out",
+        "plugin output channel closed",
+        "plugin returned empty response",
+        "plugin exited with status",
+        "invalid json",
+        "plugin input",
+        "plugin capability not found",
+        "plugin not found or unavailable",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn sample_input(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return json!({});
+    };
+    if object.get("type").and_then(Value::as_str) != Some("object") {
+        return json!({});
+    }
+    let properties = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut input = serde_json::Map::new();
+    for name in required {
+        if let Some(property) = properties.get(name) {
+            input.insert(name.to_string(), sample_value(name, property));
+        }
+    }
+    Value::Object(input)
+}
+
+fn sample_value(name: &str, schema: &Value) -> Value {
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        if let Some(value) = values.first() {
+            return value.clone();
+        }
+    }
+    match schema
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string")
+    {
+        "string" => {
+            if name.ends_with("path") || name.ends_with("_root") {
+                if name.ends_with("path") {
+                    let path =
+                        env::temp_dir().join(format!("himind-plugin-contract-{}.txt", now_stamp()));
+                    let _ = fs::write(&path, "HiMind plugin contract sample\n");
+                    Value::String(path.to_string_lossy().to_string())
+                } else {
+                    Value::String(env::temp_dir().to_string_lossy().to_string())
+                }
+            } else {
+                Value::String("sample".to_string())
+            }
+        }
+        "integer" | "number" => schema.get("minimum").cloned().unwrap_or_else(|| json!(1)),
+        "boolean" => json!(false),
+        "array" => json!([]),
+        "object" => json!({}),
+        _ => Value::Null,
+    }
 }
 
 pub(crate) fn confirm(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dyn Error>> {
@@ -311,11 +565,11 @@ pub(crate) fn submit(
         options,
         crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
     )?;
-    let report = serde_json::json!({
-        "candidate_sha256": draft.candidate_sha256,
-        "agent_version": VERSION,
-        "built_at": draft.updated_at,
-    });
+    let mut report = draft.test_report.clone().unwrap_or_else(|| json!({}));
+    report["candidate_sha256"] = json!(draft.candidate_sha256);
+    report["agent_version"] = json!(VERSION);
+    report["tested_at"] = json!(draft.tested_at);
+    report["built_at"] = json!(draft.updated_at);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
@@ -396,6 +650,15 @@ fn validate_identity(manifest: &PluginManifest) -> Result<(), Box<dyn Error>> {
     }
     if manifest.release_notes.trim().is_empty() {
         return Err("请在 plugin.json 中填写本版本更新说明 release_notes".into());
+    }
+    for dependency in &manifest.plugin_dependencies {
+        validate_identifier(&dependency.plugin_id)?;
+        if dependency.plugin_id == manifest.id {
+            return Err("插件不能依赖自身".into());
+        }
+        if !dependency.min_version.trim().is_empty() {
+            validate_version(&dependency.min_version)?;
+        }
     }
     Ok(())
 }

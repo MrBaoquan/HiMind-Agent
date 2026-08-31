@@ -1,5 +1,5 @@
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -65,26 +65,26 @@ fn active_adapter() -> &'static dyn AIRuntimeAdapter {
     &ACTIVE_RUNTIME_ADAPTER
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BuiltinAIRuntimeEvent {
     pub schema_version: u32,
     pub session_id: String,
     pub event_id: String,
     pub sequence: i64,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub turn_id: String,
     pub event_type: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub outcome: String,
     /// The original DSH server-request correlation. It is only present for
     /// approval/question waits and is echoed verbatim by a later response.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub request_rpc_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub approval_id: String,
     /// Sanitized question metadata (question text/options only; no tool
     /// arguments or internal runtime payloads).
