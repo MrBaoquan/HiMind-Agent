@@ -467,6 +467,7 @@ pub(crate) fn run_supervisor(
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     approval_mgr: Option<Arc<ApprovalManager>>,
 ) {
+    let mut retry_delay = Duration::from_secs(2);
     loop {
         match run_loop(
             options.clone(),
@@ -497,7 +498,8 @@ pub(crate) fn run_supervisor(
                 }
                 set_status(&Some(Arc::clone(&worker_status)), false, "", &message);
                 eprintln!("agent worker stopped: {}", message);
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(60));
             }
         }
     }

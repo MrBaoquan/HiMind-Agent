@@ -57,9 +57,10 @@ export function AiServicesPanel({
   const [selectedPreset, setSelectedPreset] = useState<string>('');
 
   const customServices = aiServices?.custom?.services ?? [];
+  const managed = aiServices?.managed ?? { available: false };
   const clientStatuses = aiServices?.clients?.targets ?? [];
   const importedClientCount = clientStatuses.filter((client) => client.state === 'imported').length;
-  const importedClients = clientStatuses.filter((client) => client.state === 'imported');
+  const serviceCount = customServices.length + 1;
   const editing = editingServiceId !== null;
 
   function applyPreset(presetId: string) {
@@ -174,8 +175,8 @@ export function AiServicesPanel({
     <div className="ai-services-view">
       <section className="ai-services-summary">
         <div className="ai-services-summary-stats">
-          <div><span>自定义服务</span><strong>{customServices.length}</strong></div>
-          <div><span>已接入客户端</span><strong>{importedClientCount}</strong></div>
+          <div><span>AI 服务</span><strong>{serviceCount}</strong></div>
+          <div><span>已注册客户端</span><strong>{importedClientCount}</strong></div>
         </div>
         <div className="ai-services-summary-actions">
           <button className="btn btn-primary" onClick={openNewService}>
@@ -184,20 +185,13 @@ export function AiServicesPanel({
         </div>
       </section>
 
-      <ManagedServiceCard managed={aiServices?.managed ?? { available: false }} onOpenAccount={onOpenAccount} onRefresh={onRefresh} />
-
-      {importedClients.length ? <section className="ai-service-client-access">
-        <div className="ai-section-heading"><div><h3>客户端接入</h3><span>当前客户端已存在 HiMind 接入；切换服务或删除服务前请先撤销。</span></div><Pill kind="warn">{importedClients.length}</Pill></div>
-        <div className="ai-service-imported-clients standalone">{importedClients.map((client) => <span className="ai-service-client-chip" key={client.target}>{clientLabels[client.target] ?? client.target}<button type="button" title={`移除 ${clientLabels[client.target] ?? client.target} 接入`} aria-label={`移除 ${clientLabels[client.target] ?? client.target} 接入`} disabled={removingClient !== null} onClick={() => { if (window.confirm(`确认移除 ${clientLabels[client.target] ?? client.target} 中的 HiMind 接入？`)) void removeFromClient(client.target); }}><Unplug size={11} /></button></span>)}</div>
-      </section> : null}
-
       {formOpen ? (
         <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setFormOpen(false); }}>
-          <section className="modal ai-service-modal" role="dialog" aria-modal="true" aria-label={editing ? '编辑自定义 AI 服务' : '新增自定义 AI 服务'}>
+          <section className="modal ai-service-modal" role="dialog" aria-modal="true" aria-label={editing ? '编辑 AI 服务' : '新增 AI 服务'}>
             <div className="modal-header">
               <div>
-                <h3>{editing ? '编辑自定义 AI 服务' : '新增自定义 AI 服务'}</h3>
-                <p>{editing ? '更新连接参数；API Key 留空表示继续使用已保存凭据。' : 'HiMind 分发服务之外的模型供应商；API Key 加密保存于本机。'}</p>
+                <h3>{editing ? '编辑 AI 服务' : '新增 AI 服务'}</h3>
+                <p>{editing ? '更新连接参数；API Key 留空表示继续使用已保存凭据。' : '添加一个模型供应商服务；API Key 加密保存于本机。'}</p>
               </div>
               <button className="btn btn-icon" title="关闭" aria-label="关闭" disabled={saving} onClick={() => setFormOpen(false)}><X size={16} /></button>
             </div>
@@ -207,7 +201,7 @@ export function AiServicesPanel({
                 <div className="ai-service-group-label">快捷方式</div>
                 <div className="ai-service-preset-tabs">
                   <button type="button" className={`ai-service-preset-tab${!selectedPreset ? ' active' : ''}`} onClick={() => { setSelectedPreset(''); setDraft(emptyDraft); }}>
-                    <Pencil size={13} />自定义
+                    <Pencil size={13} />手动配置
                   </button>
                   {presetGroups.map((group) => (
                     <button key={group.name} type="button" className={`ai-service-preset-tab${selectedPreset && group.items.some((item) => item.id === selectedPreset) ? ' active' : ''}`} onClick={() => applyPreset(group.items[0].id)}>
@@ -270,18 +264,19 @@ export function AiServicesPanel({
 
       <section className="ai-services-section">
         <div className="ai-section-heading ai-services-heading">
-          <div><h3>自定义服务</h3><span>将服务作为模型 Provider 导入到各 AI 客户端。</span></div>
-          <Pill kind="neutral">{customServices.length}</Pill>
+          <div><h3>AI 服务</h3><span>选择服务并注册到相关 AI 客户端；Dashboard 分发服务和本机服务统一展示。</span></div>
+          <Pill kind="neutral">{serviceCount}</Pill>
         </div>
 
-        {customServices.length ? (
+        {serviceCount ? (
           <div className="ai-client-list">
+            <ManagedServiceCard managed={managed} clientStatuses={clientStatuses} importing={importingClient} removing={removingClient} onImport={async (target) => { setImportingClient(target); try { await onImportAIClient(target, 'managed'); } finally { setImportingClient(null); await onRefresh(); } }} onRemove={removeFromClient} onOpenAccount={onOpenAccount} onRefresh={onRefresh} />
             {customServices.map((service) => (
               <AiServiceRow key={service.id} service={service} clientStatuses={clientStatuses} importing={importingClient} removing={removingClient} importSelection={importService[service.id] ?? ''} onImportSelectionChange={(targetId) => setImportService((current) => ({ ...current, [service.id]: targetId }))} onImport={importToClient} onEdit={openEditService} onRemove={(id) => void onRemoveAIService(id).then(onRefresh)} />
             ))}
           </div>
         ) : (
-          <div className="ai-empty-row"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>还没有自定义 AI 服务，点击「新增服务」添加。</span></div>
+          <div className="ai-empty-row"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>暂无可用 AI 服务，点击「新增服务」添加本机服务，或先配置 Dashboard 分发服务。</span></div>
         )}
       </section>
     </div>
@@ -301,7 +296,7 @@ const clientLabels: Record<string, string> = {
 
 function AiServiceRow({ service, clientStatuses, importing, removing, importSelection, onImportSelectionChange, onImport, onEdit, onRemove }: {
   service: CustomAIService;
-  clientStatuses: { target: string; state: string; client_detected: boolean; detail: string }[];
+  clientStatuses: { target: string; state: string; client_detected: boolean; detail: string; service?: string }[];
   importing: string | null;
   removing: string | null;
   importSelection: string;
@@ -310,37 +305,41 @@ function AiServiceRow({ service, clientStatuses, importing, removing, importSele
   onEdit: (service: CustomAIService) => void;
   onRemove: (id: string) => void;
 }) {
-  const availableClients = clientStatuses.filter((client) => client.client_detected && client.state !== 'imported');
-  const hasImportedClients = clientStatuses.some((client) => client.state === 'imported');
+  const source = `custom:${service.id}`;
+  const boundClients = clientStatuses.filter((client) => client.state === 'imported' && client.service === source);
+  const unknownImported = clientStatuses.some((client) => client.state === 'imported' && !client.service);
+  const selectableClients = clientStatuses.filter((client) => client.state !== 'imported' || client.service === source);
+  const selectedClient = clientStatuses.find((client) => client.target === importSelection);
+  const canDelete = boundClients.length === 0 && !unknownImported;
   return (
     <article className="ai-client-row">
       <div className="ai-client-icon target"><PlugZap size={18} /></div>
       <div className="ai-client-copy">
         <strong>{service.display_name}</strong>
-        <span>{service.base_url} · {service.protocol === 'openai-responses' ? 'Responses' : 'Chat'} · 模型 {service.model}{service.models.length > 1 ? ` 等 ${service.models.length} 个` : ''}</span>
+        <span>{service.base_url} · {service.protocol === 'openai-responses' ? 'Responses' : 'Chat'} · 模型 {service.model}{service.models.length > 1 ? ` 等 ${service.models.length} 个` : ''}{boundClients.length ? ` · 已注册 ${boundClients.length} 个客户端，修改后请同步` : ''}</span>
       </div>
       <Pill kind="neutral">{service.models.length ? `${service.models.length} 模型` : '未配置模型'}</Pill>
       <div className="ai-client-registration-actions">
         <select
-          aria-label={`选择导入 ${service.display_name} 的客户端`}
+          aria-label={`选择注册 ${service.display_name} 的客户端`}
           value={importSelection}
-          disabled={!availableClients.length || importing !== null || removing !== null}
+          disabled={!selectableClients.length || importing !== null || removing !== null}
           onChange={(event) => onImportSelectionChange(event.target.value)}
         >
-          <option value="">{availableClients.length ? '选择客户端' : '暂无可接入客户端'}</option>
-          {availableClients.map((client) => <option key={client.target} value={client.target}>{clientLabels[client.target] ?? client.target}</option>)}
+          <option value="">{selectableClients.length ? '选择客户端' : '暂无可用客户端'}</option>
+          {clientStatuses.map((client) => <option key={client.target} value={client.target} disabled={client.state === 'imported' && client.service !== source}>{clientLabels[client.target] ?? client.target}{client.state === 'imported' ? (client.service === source ? ' · 已注册，可同步' : ' · 已注册其他服务') : ''}</option>)}
         </select>
         <button
           className="btn btn-icon btn-primary"
-          title={`将 ${service.display_name} 注册到客户端`}
-          aria-label={`将 ${service.display_name} 注册到客户端`}
+          title={selectedClient?.service === source ? `同步 ${service.display_name} 到客户端` : `将 ${service.display_name} 注册到客户端`}
+          aria-label={selectedClient?.service === source ? `同步 ${service.display_name} 到客户端` : `将 ${service.display_name} 注册到客户端`}
           disabled={importing !== null || !importSelection}
           onClick={() => onImport(importSelection, service.id)}
         >
-          <PlugZap size={15} />
+          {selectedClient?.service === source ? <RefreshCw size={15} /> : <PlugZap size={15} />}
         </button>
         <button className="btn btn-icon" title={`编辑 ${service.display_name}`} aria-label={`编辑 ${service.display_name}`} onClick={() => onEdit(service)}><Pencil size={15} /></button>
-        <button className="btn btn-icon ai-row-remove" title={hasImportedClients ? '请先移除已接入客户端' : `删除 ${service.display_name}`} aria-label={hasImportedClients ? '请先移除已接入客户端' : `删除 ${service.display_name}`} disabled={hasImportedClients || removing !== null} onClick={() => { if (window.confirm(`确认删除自定义服务“${service.display_name}”？`)) onRemove(service.id); }}><Unplug size={15} /></button>
+        <button className="btn btn-icon ai-row-remove" title={!canDelete ? '请先取消注册此服务关联的客户端' : `删除 ${service.display_name}`} aria-label={!canDelete ? '请先取消注册此服务关联的客户端' : `删除 ${service.display_name}`} disabled={!canDelete || removing !== null} onClick={() => { if (window.confirm(`确认删除 AI 服务“${service.display_name}”？`)) onRemove(service.id); }}><Unplug size={15} /></button>
       </div>
     </article>
   );
@@ -362,17 +361,30 @@ function formatAIServiceError(error: unknown, fallback: string) {
   return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
 }
 
-function ManagedServiceCard({ managed, onOpenAccount, onRefresh }: { managed: ManagedAIServiceSummary; onOpenAccount: () => void; onRefresh: () => void }) {
+function ManagedServiceCard({ managed, clientStatuses, importing, removing, onImport, onRemove, onOpenAccount, onRefresh }: { managed: ManagedAIServiceSummary; clientStatuses: { target: string; state: string; service?: string }[]; importing: string | null; removing: string | null; onImport: (target: string) => Promise<void>; onRemove: (target: string) => Promise<void>; onOpenAccount: () => void; onRefresh: () => void }) {
+  const [selection, setSelection] = useState('');
   if (managed.available) {
     const models = managed.models?.length ? `${managed.models.length} 个模型` : '未返回模型列表';
+    const source = 'managed';
+    const boundClients = clientStatuses.filter((client) => client.state === 'imported' && client.service === source);
+    const selectableClients = clientStatuses.filter((client) => client.state !== 'imported' || client.service === source);
+    const selected = clientStatuses.find((client) => client.target === selection);
     return (
       <section className="ai-managed-strip ready">
         <div className="ai-managed-icon"><ShieldCheck size={18} /></div>
         <div className="ai-managed-copy">
           <strong>Dashboard 分发服务已就绪</strong>
-          <span>{managed.model} · {models} · {managed.base_url}</span>
+          <span>{managed.model} · {models} · {managed.base_url}{boundClients.length ? ` · 已注册 ${boundClients.length} 个客户端` : ''}</span>
         </div>
         <Pill kind="success">已接入</Pill>
+        <div className="ai-managed-actions">
+          <select aria-label="选择注册 Dashboard 分发服务的客户端" value={selection} disabled={!selectableClients.length || importing !== null || removing !== null} onChange={(event) => setSelection(event.target.value)}>
+            <option value="">{selectableClients.length ? '选择客户端' : '暂无可用客户端'}</option>
+            {clientStatuses.map((client) => <option key={client.target} value={client.target} disabled={client.state === 'imported' && client.service !== source}>{clientLabels[client.target] ?? client.target}{client.state === 'imported' ? (client.service === source ? ' · 已注册，可同步' : ' · 已注册其他服务') : ''}</option>)}
+          </select>
+          <button className="btn btn-icon btn-primary" title={selected?.service === source ? '同步 Dashboard 分发服务' : '注册 Dashboard 分发服务'} aria-label={selected?.service === source ? '同步 Dashboard 分发服务' : '注册 Dashboard 分发服务'} disabled={!selection || importing !== null} onClick={() => void onImport(selection)}>{selected?.service === source ? <RefreshCw size={14} /> : <PlugZap size={14} />}</button>
+          {boundClients.length ? <button className="btn btn-icon ai-row-remove" title="取消 Dashboard 分发服务注册" aria-label="取消 Dashboard 分发服务注册" disabled={removing !== null} onClick={() => { const target = selection || boundClients[0].target; if (window.confirm(`确认取消 ${target} 的 Dashboard 分发服务注册？`)) void onRemove(target); }}><Unplug size={14} /></button> : null}
+        </div>
       </section>
     );
   }
@@ -385,13 +397,14 @@ function ManagedServiceCard({ managed, onOpenAccount, onRefresh }: { managed: Ma
     not_ready: '当前 AI 凭证未处于可用状态，请先在 Dashboard 选择有效渠道',
     network_error: '无法连接 Dashboard，稍后自动重试',
     dashboard_error: 'Dashboard 读取 AI 接入失败，请稍后重试',
+    parse_error: 'Dashboard AI 服务信息暂时无法读取，请刷新后重试',
   };
   return (
     <section className="ai-managed-strip">
       <div className="ai-managed-icon muted">{reason === 'not_authorized' ? <CircleDashed size={18} /> : <CircleX size={18} />}</div>
       <div className="ai-managed-copy">
         <strong>Dashboard 分发服务未就绪</strong>
-        <span>{reasonText[reason] ?? `未接入 Dashboard 的 AI 服务（${reason}）`}</span>
+        <span>{reasonText[reason] ?? 'Dashboard 暂未提供可用的 AI 服务'}</span>
       </div>
       <div className="ai-managed-actions">
         {reason === 'not_authorized' || reason === 'user_mismatch' ? <button className="btn" onClick={onOpenAccount}><ExternalLink size={13} />连接账号</button> : null}

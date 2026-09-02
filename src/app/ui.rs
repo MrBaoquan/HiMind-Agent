@@ -1029,9 +1029,16 @@ fn sanitize_window_label(value: &str) -> String {
 }
 
 fn plugin_ui_response(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    const MAX_PLUGIN_UI_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
     let result = (|| -> Result<Response<Vec<u8>>, Box<dyn std::error::Error>> {
         let url = url::Url::parse(&request.uri().to_string())?;
         let (path, content_type) = crate::capability::plugin::resolve_plugin_ui_resource(&url)?;
+        let size = std::fs::metadata(&path)?.len();
+        if size > MAX_PLUGIN_UI_RESOURCE_BYTES {
+            return Err(
+                format!("plugin UI resource exceeds {MAX_PLUGIN_UI_RESOURCE_BYTES} bytes").into(),
+            );
+        }
         let body = std::fs::read(path)?;
         Ok(Response::builder()
             .status(StatusCode::OK)
@@ -1041,8 +1048,13 @@ fn plugin_ui_response(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
             .body(body)?)
     })();
     result.unwrap_or_else(|error| {
+        let status = if error.to_string().contains("exceeds") {
+            StatusCode::from_u16(413).unwrap_or(StatusCode::NOT_FOUND)
+        } else {
+            StatusCode::NOT_FOUND
+        };
         Response::builder()
-            .status(StatusCode::NOT_FOUND)
+            .status(status)
             .header("Content-Type", "text/html; charset=utf-8")
             .header("X-Content-Type-Options", "nosniff")
             .body(format!(

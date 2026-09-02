@@ -1058,6 +1058,7 @@ export type AIProviderImportStatus = {
     config_path?: string;
     models?: string[];
     synced_at?: string;
+    service?: string;
 };
 
 export type AIProviderImportOverview = {

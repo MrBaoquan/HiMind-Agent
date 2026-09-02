@@ -9,29 +9,86 @@ use crate::Options;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AIUserCredential {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub active_entitlement_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub active_personal_connection_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub status: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub base_url: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub models: Vec<String>,
     /// OpenAI 兼容协议：`openai-chat` 或 `openai-responses`。
     /// Dashboard 旧版本未返回该字段时保持 Responses 兼容行为。
-    #[serde(default = "default_protocol")]
+    #[serde(default = "default_protocol", deserialize_with = "deserialize_nullable_string_or_protocol")]
     pub protocol: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub created_at: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub updated_at: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub rotated_at: String,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_string_or_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(default_protocol))
 }
 
 fn default_protocol() -> String {
     "openai-responses".to_string()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::AIUserAccess;
+
+    #[test]
+    fn accepts_dashboard_optional_null_fields() {
+        let access: AIUserAccess = serde_json::from_value(serde_json::json!({
+            "active_source": "organization",
+            "credential": {
+                "active_entitlement_id": "entitlement-1",
+                "active_personal_connection_id": null,
+                "status": "active",
+                "base_url": "https://gateway.example/v1",
+                "model": "model-1",
+                "models": ["model-1"],
+                "protocol": null,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "rotated_at": null
+            }
+        })).expect("Dashboard access payload should accept nullable optional fields");
+        let credential = access.credential.expect("credential");
+        assert_eq!(credential.active_personal_connection_id, "");
+        assert_eq!(credential.rotated_at, "");
+        assert_eq!(credential.protocol, "openai-responses");
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AIUserAccess {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     active_source: String,
     credential: Option<AIUserCredential>,
 }
@@ -142,9 +199,19 @@ pub(crate) fn managed_ai_service_summary(
     if !access_response.status().is_success() {
         return unavailable("dashboard_error");
     }
-    let access = match access_response.json::<AIUserAccess>() {
+    let access_body = match access_response.text() {
         Ok(value) => value,
-        Err(_) => return unavailable("parse_error"),
+        Err(_) => return unavailable("response_error"),
+    };
+    let access = match serde_json::from_str::<AIUserAccess>(&access_body) {
+        Ok(value) => value,
+        Err(error) => {
+            // Never include the response body or serde details because the
+            // payload may contain credential metadata. The UI maps this to a
+            // user-facing retry message.
+            let _ = error;
+            return unavailable("parse_error");
+        }
     };
     let Some(credential) = access.credential else {
         return unavailable("no_credential");

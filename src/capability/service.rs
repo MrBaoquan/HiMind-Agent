@@ -1480,7 +1480,16 @@ impl CapabilityGateway {
         {
             return Ok(user_id.trim().to_string());
         }
-        if context.source == crate::capability::types::InvocationSource::Mcp {
+        // Local entry points share the Agent's persisted Dashboard OAuth
+        // identity. Tauri used to be excluded here, which made the desktop
+        // "register AI service" action fail even though the Agent was logged
+        // in; the MCP path already relied on this same snapshot.
+        if matches!(
+            context.source,
+            crate::capability::types::InvocationSource::Mcp
+                | crate::capability::types::InvocationSource::Tauri
+                | crate::capability::types::InvocationSource::Cli
+        ) {
             if let Some(snapshot) =
                 crate::api::oauth::authorization_snapshot(&self.options.state_path)?
             {
@@ -1546,32 +1555,6 @@ impl CapabilityGateway {
             let risk_level =
                 policy::effective_risk_level(capability_id, &registration.descriptor.risk_level);
             let target = policy::target_description(capability_id, &input);
-            let remote_approval_id = if self.options.mode().dashboard_enabled()
-                && !policy::is_local_ai_configuration_capability(capability_id)
-            {
-                let agent_id =
-                    crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
-                let args_digest = policy::args_digest(&input)?;
-                let generation = policy::approval_generation(
-                    registration.descriptor.contract_generation.as_deref(),
-                );
-                Some(crate::approval::remote::create_approval(
-                    &self.options,
-                    &agent_id,
-                    &context.request_id,
-                    capability_id,
-                    &registration.descriptor.version,
-                    &registration.descriptor.source,
-                    risk_level,
-                    &input,
-                    &format!("{}：{}", registration.descriptor.name, target),
-                    &args_digest,
-                    generation,
-                    120,
-                )?)
-            } else {
-                None
-            };
             let approved = self
                 .approval_manager
                 .request_capability_approval(
@@ -1587,6 +1570,38 @@ impl CapabilityGateway {
                     ),
                 )
                 .map_err(|error| format!("审批请求失败：{error}"))?;
+            // The Agent is the only interactive decision surface for an
+            // agent_local request. Create the Dashboard fact only after the
+            // local decision so Dashboard never exposes a second pending
+            // approval while the Agent is waiting for the user.
+            let remote_approval_id = if approved
+                && self.options.mode().dashboard_enabled()
+                && !policy::is_local_ai_configuration_capability(capability_id)
+            {
+                let agent_id =
+                    crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
+                let args_digest = policy::args_digest(&input)?;
+                let generation = policy::approval_generation(
+                    registration.descriptor.contract_generation.as_deref(),
+                );
+                let approval_id = crate::approval::remote::create_approval(
+                    &self.options,
+                    &agent_id,
+                    &context.request_id,
+                    capability_id,
+                    &registration.descriptor.version,
+                    &registration.descriptor.source,
+                    risk_level,
+                    &input,
+                    &format!("{}：{}", registration.descriptor.name, target),
+                    &args_digest,
+                    generation,
+                    120,
+                )?;
+                Some(approval_id)
+            } else {
+                None
+            };
             if let Some(approval_id) = remote_approval_id.as_deref() {
                 match crate::approval::remote::decide_approval(
                     &self.options,
@@ -1699,7 +1714,7 @@ impl CapabilityGateway {
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or("id is required")?;
-                crate::app::ai_provider_import::ensure_no_imported_clients(&self.options)?;
+                crate::app::ai_provider_import::ensure_service_not_in_use(&self.options, id)?;
                 Ok(serde_json::to_value(crate::store::ai_services::remove(
                     id,
                 )?)?)
@@ -2318,7 +2333,14 @@ impl CapabilityGateway {
             target,
             context.source.as_str()
         );
-        let remote_approval_id = if self.options.mode().dashboard_enabled() {
+        let approved = self
+            .approval_manager
+            .request_approval(request_type, title, description.clone())
+            .map_err(|error| format!("审批请求失败：{error}"))?;
+        // Keep agent_local as the sole interactive approval surface. The
+        // durable Dashboard request is created only after local approval and
+        // is immediately resolved with the same decision.
+        let remote_approval_id = if approved && self.options.mode().dashboard_enabled() {
             let agent_id = crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
             let args_digest = policy::args_digest(input)?;
             let generation = policy::approval_generation(descriptor.contract_generation.as_deref());
@@ -2339,10 +2361,6 @@ impl CapabilityGateway {
         } else {
             None
         };
-        let approved = self
-            .approval_manager
-            .request_approval(request_type, title, description)
-            .map_err(|error| format!("审批请求失败：{error}"))?;
         if let Some(approval_id) = remote_approval_id.as_deref() {
             match crate::approval::remote::decide_approval(
                 &self.options,

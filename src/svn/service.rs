@@ -227,10 +227,12 @@ pub(crate) fn ensure_default_svn_credentials(username: &str) -> Result<bool, Box
         .lock()
         .map_err(|_| "SVN credential synchronization lock is poisoned")?;
     let username = default_svn_username(username)?;
+    // 已配置的公司 SVN 凭据以用户手动设置为准：无论当前是 configured
+    // （用户刚保存、未验证）还是 ready（已通过连接验证），只要用户名和
+    // 密码非空就不被自动同步覆盖；仅当完全缺失时才按 Dashboard 身份播种。
     if list_local_svn_connections()?.into_iter().any(|item| {
         item.id == SVN_CONNECTION_ID
-            && item.status == "ready"
-            && item.username == username
+            && !item.username.trim().is_empty()
             && !item.encrypted_password.is_empty()
     }) {
         return Ok(false);

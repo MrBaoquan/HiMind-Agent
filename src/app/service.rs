@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -217,16 +218,49 @@ fn run_local_http_service(
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     options: Options,
 ) -> Result<(), Box<dyn Error>> {
+    const MAX_HTTP_CONNECTIONS: usize = 64;
+    const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+    const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).is_err()
+                    || stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT)).is_err()
+                {
+                    continue;
+                }
+                if active_connections
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        (current < MAX_HTTP_CONNECTIONS).then_some(current + 1)
+                    })
+                    .is_err()
+                {
+                    let mut stream = stream;
+                    let _ = write_local_response(
+                        &mut stream,
+                        503,
+                        &json!({ "error": "local Agent is busy; retry shortly" }).to_string(),
+                        "application/json",
+                    );
+                    continue;
+                }
                 let worker_status = Arc::clone(&worker_status);
                 let options = options.clone();
-                thread::spawn(|| {
-                    if let Err(error) = handle_local_http(stream, worker_status, options) {
-                        eprintln!("local agent request failed: {error}");
-                    }
-                });
+                let active_connections = Arc::clone(&active_connections);
+                let active_connections_for_thread = Arc::clone(&active_connections);
+                let spawn_result = thread::Builder::new()
+                    .name("himind-local-http-request".to_string())
+                    .spawn(move || {
+                        if let Err(error) = handle_local_http(stream, worker_status, options) {
+                            eprintln!("local agent request failed: {error}");
+                        }
+                        active_connections_for_thread.fetch_sub(1, Ordering::AcqRel);
+                    });
+                if let Err(error) = spawn_result {
+                    active_connections.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("local agent request thread creation failed: {error}");
+                }
             }
             Err(error) => eprintln!("local agent accept failed: {error}"),
         }
@@ -239,7 +273,25 @@ fn handle_local_http(
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     options: Options,
 ) -> Result<(), Box<dyn Error>> {
-    let request_bytes = read_http_request(&mut stream)?;
+    let request_bytes = match read_http_request(&mut stream) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("too large") {
+                413
+            } else {
+                400
+            };
+            set_response_origin(None);
+            let _ = write_local_response(
+                &mut stream,
+                status,
+                &json!({ "error": message }).to_string(),
+                "application/json",
+            );
+            return Ok(());
+        }
+    };
     let request = String::from_utf8_lossy(&request_bytes);
     let security = LocalRequestSecurity::new(&options.api_base, options.local_port);
     let response_origin = match security.validate(&request) {
@@ -949,6 +1001,33 @@ fn handle_local_http(
                 ),
             }
         }
+        ("POST", "/ai-provider-import/plan") => {
+            let payload: AIProviderImportRequest = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "error": format!("invalid AI provider plan payload: {error}") }).to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            let context = local_http_invocation_context(local_principal.as_ref());
+            match gateway.invoke(
+                &context,
+                "ai.client.import.plan",
+                json!({ "target": payload.target, "service": payload.service_source() }),
+            ) {
+                Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
+                Err(error) => write_local_response(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "error": error.to_string() }).to_string(),
+                    "application/json",
+                ),
+            }
+        }
         ("POST", "/ai-provider-import/cancel") => {
             let payload: AIProviderImportRequest = match serde_json::from_str(body) {
                 Ok(value) => value,
@@ -1624,6 +1703,7 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
         ("POST", "/remote-clients/configure") => Some("local.remote.clients.configure"),
         ("POST", "/ai-provider-import") => Some("local.ai.provider_import"),
         ("GET", "/ai-provider-import/status") => Some("local.ai.provider_import_status"),
+        ("POST", "/ai-provider-import/plan") => Some("local.ai.provider_import_plan"),
         ("POST", "/ai-provider-import/cancel") => Some("local.ai.provider_import_cancel"),
         ("GET", "/login-status") => Some("local.inner_admin.login_status"),
         ("GET", "/engineering-projects") => Some("local.inner_admin.projects"),
@@ -1716,6 +1796,10 @@ mod local_operation_tests {
         assert_eq!(
             local_operation("GET", "/ai-provider-import/status"),
             Some("local.ai.provider_import_status")
+        );
+        assert_eq!(
+            local_operation("POST", "/ai-provider-import/plan"),
+            Some("local.ai.provider_import_plan")
         );
         assert_eq!(
             local_operation("POST", "/ai-provider-import/cancel"),
@@ -1953,6 +2037,7 @@ mod local_operation_tests {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn Error>> {
+    const MAX_LOCAL_HTTP_REQUEST_BYTES: usize = 1_048_576;
     let mut request = Vec::with_capacity(8192);
     let mut buffer = [0_u8; 4096];
     let mut expected_size = None;
@@ -1966,16 +2051,45 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn Error>> 
             if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&request[..header_end + 4]);
                 let content_length = crate::app::security::header_value(&headers, "content-length")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(0);
-                expected_size = Some(header_end + 4 + content_length);
+                    .map(|value| {
+                        value.parse::<usize>().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid Content-Length",
+                            )
+                        })
+                    })
+                    .transpose()?;
+                let header_size = header_end.checked_add(4).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "local request header size overflow",
+                    )
+                })?;
+                let expected = header_size
+                    .checked_add(content_length.unwrap_or(0))
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "local request size overflow",
+                        )
+                    })?;
+                if expected > MAX_LOCAL_HTTP_REQUEST_BYTES {
+                    return Err("local request is too large".into());
+                }
+                expected_size = Some(expected);
             }
         }
         if expected_size.is_some_and(|value| request.len() >= value) {
             break;
         }
-        if request.len() > 1_048_576 {
+        if request.len() > MAX_LOCAL_HTTP_REQUEST_BYTES {
             return Err("local request is too large".into());
+        }
+    }
+    if let Some(expected) = expected_size {
+        if request.len() < expected {
+            return Err("local request ended before Content-Length".into());
         }
     }
     Ok(request)

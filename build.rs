@@ -43,7 +43,7 @@ fn generate_ico() -> Vec<u8> {
     let h: u32 = 32;
     let pixel_bytes = (w * h * 4) as usize;
     let bmp_header_size: usize = 40;
-    let and_mask_row = ((w + 31) / 32 * 4) as usize;
+    let and_mask_row = (w.div_ceil(32) * 4) as usize;
     let and_mask_size = and_mask_row * h as usize;
     let image_data_size = bmp_header_size + pixel_bytes + and_mask_size;
     let data_offset: u32 = 6 + 16;

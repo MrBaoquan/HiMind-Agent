@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -15,6 +15,8 @@ use crate::runtime::process::configure_hidden_process;
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const MAX_MCP_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MCP_STDIO_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct McpProbeResult {
@@ -435,9 +437,35 @@ fn post_http(
             ))
         })
         .collect::<BTreeMap<_, _>>();
-    let body = response.text()?;
+    let body = read_limited_response(response, MAX_MCP_HTTP_RESPONSE_BYTES)?;
     let value = serde_json::from_str::<Value>(&body).or_else(|_| parse_sse_json(&body))?;
     Ok((value, headers))
+}
+
+fn read_limited_response(
+    response: reqwest::blocking::Response,
+    limit: usize,
+) -> Result<String, Box<dyn Error>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(format!("MCP response exceeds {limit} bytes").into());
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .map(|length| length as usize)
+            .unwrap_or(8192)
+            .min(limit),
+    );
+    response
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(format!("MCP response exceeds {limit} bytes").into());
+    }
+    String::from_utf8(bytes).map_err(|error| format!("MCP response is not UTF-8: {error}").into())
 }
 
 fn post_http_notification(
@@ -549,18 +577,20 @@ fn write_notification(
 fn spawn_json_reader(
     stdout: impl std::io::Read + Send + 'static,
 ) -> Receiver<Result<Value, String>> {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(256);
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            match line {
-                Ok(line) if !line.trim().is_empty() => {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_line(&mut reader, MAX_MCP_STDIO_LINE_BYTES) {
+                Ok(Some(line)) if !line.trim().is_empty() => {
                     let value = serde_json::from_str::<Value>(&line)
                         .map_err(|error| format!("invalid_handshake: {error}"));
                     if sender.send(value).is_err() {
                         break;
                     }
                 }
-                Ok(_) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => break,
                 Err(error) => {
                     let _ = sender.send(Err(format!("process_exit: {error}")));
                     break;
@@ -569,6 +599,40 @@ fn spawn_json_reader(
         }
     });
     receiver
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(8192.min(limit));
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            };
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(buffer.len());
+        if bytes.len().saturating_add(take) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MCP stdio message exceeds {limit} bytes"),
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if take > 0 && bytes.last() == Some(&b'\n') {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    }
 }
 
 fn wait_for_response(

@@ -48,6 +48,7 @@ const VSCODE_ENROLLMENT_TTL_SECONDS: u64 = 180;
 const MIN_SUPPORTED_VSCODE_VERSION: &str = "1.120.0";
 const VSCODE_ENROLLMENT_HANDOFF_FILE: &str = "vscode-enrollment-v2.json";
 const VSCODE_IMPORT_STATUS_FILE: &str = "vscode-import-status.json";
+const IMPORT_BINDINGS_FILE: &str = "ai-provider-import-bindings.json";
 
 #[derive(Debug, Serialize)]
 pub(crate) struct VSCodeEnrollmentCredential {
@@ -378,6 +379,17 @@ pub(crate) struct AIProviderImportResult {
     pub client_detected: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AIProviderImportBinding {
+    service: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AIProviderImportBindings {
+    #[serde(default)]
+    clients: HashMap<String, AIProviderImportBinding>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct AIProviderImportStatus {
     pub target: String,
@@ -390,6 +402,8 @@ pub(crate) struct AIProviderImportStatus {
     pub models: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub synced_at: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -580,31 +594,122 @@ pub(crate) fn import(
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let adapter = adapter_for(&request.target)
         .ok_or_else(|| format!("不支持的 AI 客户端：{}", request.target))?;
-    // 冲突防护：目标客户端已接入时，切换/覆盖到自定义服务需先显式移除，避免无声明双写。
+    // 一个客户端只能绑定一个来源。相同来源再次执行即为同步，切换来源必须先取消注册。
     let service_source = request.service_source();
-    if service_source.starts_with("custom:") {
-        let client_state = status(options)
-            .targets
-            .into_iter()
-            .find(|item| item.target == request.target.trim())
-            .map(|item| item.state)
-            .unwrap_or_default();
-        if client_state == "imported" {
-            return Err(format!(
-                "客户端 {} 已接入其他服务；如需切换到自定义服务，请先移除现有接入再重新导入",
-                request.target
-            )
-            .into());
+    let current = status(options)
+        .targets
+        .into_iter()
+        .find(|item| item.target == request.target.trim());
+    if current
+        .as_ref()
+        .is_some_and(|item| item.state == "imported")
+    {
+        let bindings = load_import_bindings(options);
+        match bindings.clients.get(request.target.trim()) {
+            Some(binding) if binding.service == service_source => {}
+            Some(_) => {
+                return Err(format!(
+                    "客户端 {} 已注册其他 AI 服务，请先取消注册后再切换",
+                    request.target
+                )
+                .into())
+            }
+            None => {
+                return Err(format!(
+                    "客户端 {} 的注册来源未知，请先取消注册后再重新注册",
+                    request.target
+                )
+                .into())
+            }
         }
     }
-    adapter.import(options, expected_user_id, service_source)
+    let result = adapter.import(options, expected_user_id, service_source)?;
+    let mut bindings = load_import_bindings(options);
+    bindings.clients.insert(
+        request.target.trim().to_string(),
+        AIProviderImportBinding {
+            service: service_source.to_string(),
+        },
+    );
+    save_import_bindings(options, &bindings)?;
+    Ok(result)
+}
+
+fn import_bindings_path(options: &Options) -> PathBuf {
+    options
+        .state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(IMPORT_BINDINGS_FILE)
+}
+
+fn load_import_bindings(options: &Options) -> AIProviderImportBindings {
+    fs::read(import_bindings_path(options))
+        .ok()
+        .and_then(|content| serde_json::from_slice(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_import_bindings(
+    options: &Options,
+    bindings: &AIProviderImportBindings,
+) -> Result<(), Box<dyn Error>> {
+    let path = import_bindings_path(options);
+    let _lock = crate::store::atomic_file::lock(&path)?;
+    crate::store::atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(bindings)?)?;
+    Ok(())
+}
+
+pub(crate) fn ensure_service_not_in_use(
+    options: &Options,
+    service_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let source = format!("custom:{}", service_id.trim());
+    let bindings = load_import_bindings(options);
+    let clients = bindings
+        .clients
+        .iter()
+        .filter(|(_, binding)| binding.service == source)
+        .map(|(target, _)| target.clone())
+        .collect::<Vec<_>>();
+    let unknown_imported = status(options)
+        .targets
+        .into_iter()
+        .filter(|item| item.state == "imported")
+        .filter(|item| !bindings.clients.contains_key(&item.target))
+        .map(|item| item.target)
+        .collect::<Vec<_>>();
+    if !unknown_imported.is_empty() {
+        return Err(format!(
+            "检测到来源未知的客户端注册（{}），请先取消注册后再删除 AI 服务",
+            unknown_imported.join("、")
+        )
+        .into());
+    }
+    if clients.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "请先取消客户端注册（{}），再删除此 AI 服务",
+        clients.join("、")
+    )
+    .into())
 }
 
 pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
+    let bindings = load_import_bindings(options);
     AIProviderImportStatusOverview {
         targets: known_adapters()
             .into_iter()
-            .map(|adapter| adapter.status(options))
+            .map(|adapter| {
+                let mut status = adapter.status(options);
+                if status.state == "imported" {
+                    if let Some(binding) = bindings.clients.get(status.target.as_str()) {
+                        status.service = binding.service.clone();
+                    }
+                }
+                status
+            })
             .collect(),
     }
 }
@@ -634,7 +739,11 @@ pub(crate) fn cancel(
     target: &str,
 ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
-    adapter.cancel(options)
+    let result = adapter.cancel(options)?;
+    let mut bindings = load_import_bindings(options);
+    bindings.clients.remove(target.trim());
+    save_import_bindings(options, &bindings)?;
+    Ok(result)
 }
 
 /// 解析服务源对应的 AI 凭据。
@@ -664,6 +773,9 @@ fn resolve_credential(
         active_entitlement_id: String::new(),
         active_personal_connection_id: String::new(),
         status: "active".to_string(),
+        created_at: custom.created_at,
+        updated_at: custom.updated_at,
+        rotated_at: String::new(),
         base_url: custom.base_url,
         model: custom.model,
         models: custom.models,
@@ -1007,6 +1119,7 @@ fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
         config_path: config_file.to_string_lossy().to_string(),
         models,
         synced_at: String::new(),
+        service: String::new(),
     }
 }
 
@@ -1197,6 +1310,7 @@ fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
         config_path: path.to_string_lossy().to_string(),
         models: status.models,
         synced_at: status.synced_at,
+        service: String::new(),
     }
 }
 
@@ -1232,6 +1346,7 @@ fn cc_switch_import_status() -> AIProviderImportStatus {
         config_path: path.to_string_lossy().to_string(),
         models,
         synced_at: String::new(),
+        service: String::new(),
     }
 }
 
@@ -1258,6 +1373,7 @@ fn workbuddy_import_status() -> AIProviderImportStatus {
         config_path: path.to_string_lossy().to_string(),
         models,
         synced_at: String::new(),
+        service: String::new(),
     }
 }
 
@@ -1536,6 +1652,7 @@ fn kimi_code_import_status() -> AIProviderImportStatus {
         config_path: path.to_string_lossy().to_string(),
         models,
         synced_at: String::new(),
+        service: String::new(),
     }
 }
 
@@ -1785,6 +1902,7 @@ fn qwen_code_import_status() -> AIProviderImportStatus {
         config_path: path.to_string_lossy().to_string(),
         models,
         synced_at: String::new(),
+        service: String::new(),
     }
 }
 
@@ -2068,6 +2186,7 @@ fn claude_import_status(path: &Path, target: &str, client_name: &str) -> AIProvi
         config_path: path.to_string_lossy().to_string(),
         models,
         synced_at: String::new(),
+        service: String::new(),
     }
 }
 
@@ -3386,6 +3505,9 @@ fn bundled_vscode_vsix_candidates(
         candidates.push(directory.join("resources/vscode/himind-ai.vsix"));
     }
     if let Some(root) = repository_root {
+        // The monorepo keeps the extension under official-extensions; the
+        // standalone Agent repository keeps the legacy integrations path.
+        candidates.push(root.join("official-extensions/vscode-himind-ai/dist/himind-ai.vsix"));
         candidates.push(root.join("integrations/vscode-himind-ai/dist/himind-ai.vsix"));
     }
     candidates
@@ -3618,6 +3740,9 @@ mod tests {
                 active_entitlement_id: "ent-1".to_string(),
                 active_personal_connection_id: String::new(),
                 status: "active".to_string(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                rotated_at: String::new(),
                 base_url: "https://ai.example.com/v1/".to_string(),
                 model: models.first().copied().unwrap_or("default").to_string(),
                 models: models.iter().map(|value| value.to_string()).collect(),

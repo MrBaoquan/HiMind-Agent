@@ -30,6 +30,7 @@ pub(crate) fn write_local_response(
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",

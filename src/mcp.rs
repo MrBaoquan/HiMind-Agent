@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,9 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const TOOL_PAGE_SIZE: usize = 128;
 const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MCP_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const MCP_INPUT_QUEUE_CAPACITY: usize = 128;
 
 pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
@@ -34,11 +37,24 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
         distribution_update_signature_algorithm: String::new(),
     }));
     let gateway = CapabilityGateway::new(options, worker_status);
-    let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
+    let (line_tx, line_rx) = mpsc::sync_channel::<io::Result<String>>(MCP_INPUT_QUEUE_CAPACITY);
     thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if line_tx.send(line).is_err() {
-                break;
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        loop {
+            match read_bounded_line(&mut reader, MAX_MCP_REQUEST_BYTES) {
+                Ok(Some(line)) => {
+                    if line_tx.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = line_tx.send(Err(error));
+                    if discard_until_newline(&mut reader).is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -54,7 +70,18 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
             }
         }
         let line = match line_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(line) => line?,
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => {
+                write_message(
+                    &mut stdout,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": { "code": -32600, "message": error.to_string() }
+                    }),
+                )?;
+                continue;
+            }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
@@ -358,11 +385,71 @@ fn mcp_tool_call_result(result: Value) -> Result<Value, Box<dyn Error>> {
         .get("structuredContent")
         .cloned()
         .unwrap_or_else(|| result.clone());
+    let projected = json!({
+        "content": &content,
+        "structuredContent": &structured,
+        "isError": is_error
+    });
+    if serde_json::to_vec(&projected)
+        .map(|bytes| bytes.len() > MAX_MCP_TOOL_RESULT_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(format!("MCP tool result exceeds {MAX_MCP_TOOL_RESULT_BYTES} bytes").into());
+    }
     Ok(json!({
         "content": content,
         "structuredContent": structured,
         "isError": is_error
     }))
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(8192.min(limit));
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            };
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(buffer.len());
+        if bytes.len().saturating_add(take) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("MCP request exceeds {limit} bytes"),
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if bytes.last() == Some(&b'\n') {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+    }
+}
+
+fn discard_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            return Ok(());
+        }
+        let length = buffer.len();
+        reader.consume(length);
+    }
 }
 
 fn mcp_capability_facts(

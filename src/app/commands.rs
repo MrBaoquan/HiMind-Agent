@@ -1696,7 +1696,7 @@ pub(crate) fn save_ai_service(
 
 #[tauri::command]
 pub(crate) fn remove_ai_service(state: State<'_, AgentState>, id: String) -> Result<bool, String> {
-    crate::app::ai_provider_import::ensure_no_imported_clients(&state.options)
+    crate::app::ai_provider_import::ensure_service_not_in_use(&state.options, &id)
         .map_err(|error| error.to_string())?;
     let removed = crate::store::ai_services::remove(&id).map_err(|e| e.to_string())?;
     if removed {
@@ -1744,7 +1744,7 @@ pub(crate) fn import_ai_client(
         .map_err(|e| e.to_string())?;
     state
         .approval_manager
-        .add_log("info", &format!("已导入 AI 客户端: {target}"));
+        .add_log("info", &format!("已注册 AI 客户端: {target}"));
     Ok(result)
 }
 
@@ -1763,7 +1763,7 @@ pub(crate) fn remove_ai_client(
         .map_err(|e| e.to_string())?;
     state
         .approval_manager
-        .add_log("info", "已移除 AI 客户端接入");
+        .add_log("info", "已取消 AI 客户端注册");
     Ok(result)
 }
 

@@ -9,6 +9,8 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
+const MAX_SUBMISSION_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionState {
     pub client_id: String,
@@ -725,7 +727,14 @@ pub fn submit_skill(
         .and_then(|value| value.to_str())
         .unwrap_or("skill.hmskill")
         .to_string();
-    let package = Part::bytes(fs::read(package_path)?)
+    let package_size = fs::metadata(package_path)?.len();
+    if package_size == 0 || package_size > MAX_SUBMISSION_PACKAGE_BYTES {
+        return Err(format!(
+            "Skill submission package must be between 1 byte and {MAX_SUBMISSION_PACKAGE_BYTES} bytes"
+        )
+        .into());
+    }
+    let package = Part::file(package_path)?
         .file_name(file_name)
         .mime_str("application/vnd.himind.skill+zip")?;
     let source_type = if source.source_repository.trim().is_empty() {
@@ -786,7 +795,14 @@ pub fn submit_plugin(
         .and_then(|value| value.to_str())
         .unwrap_or("plugin.hmpkg")
         .to_string();
-    let package = Part::bytes(fs::read(package_path)?)
+    let package_size = fs::metadata(package_path)?.len();
+    if package_size == 0 || package_size > MAX_SUBMISSION_PACKAGE_BYTES {
+        return Err(format!(
+            "Plugin submission package must be between 1 byte and {MAX_SUBMISSION_PACKAGE_BYTES} bytes"
+        )
+        .into());
+    }
+    let package = Part::file(package_path)?
         .file_name(file_name)
         .mime_str("application/vnd.himind.plugin+zip")?;
     let source_type = if source.source_repository.trim().is_empty() {

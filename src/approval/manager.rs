@@ -8,6 +8,10 @@ use std::{fs, io::Write, path::PathBuf};
 
 use super::types::*;
 
+const MAX_PENDING_APPROVALS: usize = 256;
+const APPROVAL_FACT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_APPROVAL_TEXT_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub time: String,
@@ -126,6 +130,14 @@ impl ApprovalManager {
         title: String,
         description: String,
     ) -> Result<bool, String> {
+        if title.len() > 512 {
+            return Err("审批标题长度不能超过 512 字节".to_string());
+        }
+        if description.len() > MAX_APPROVAL_TEXT_BYTES {
+            return Err(format!(
+                "审批说明长度不能超过 {MAX_APPROVAL_TEXT_BYTES} 字节"
+            ));
+        }
         let mode = self.get_mode_for_key(request_key, default_mode, manual_only, risk_level);
 
         match mode {
@@ -183,9 +195,23 @@ impl ApprovalManager {
             timeout_seconds: timeout,
         };
 
-        if let Ok(mut list) = self.pending.lock() {
-            list.push(pending);
+        let mut list = self
+            .pending
+            .lock()
+            .map_err(|_| "审批队列锁已损坏".to_string())?;
+        list.retain(|item| item.created.elapsed().as_secs() < item.timeout_seconds);
+        if list.len() >= MAX_PENDING_APPROVALS {
+            drop(list);
+            let _ = self.resolve_fact(
+                &request.id,
+                ApprovalFactStatus::Rejected,
+                "approval_queue_full",
+            );
+            self.add_log("warn", "审批队列已满，新的请求已拒绝");
+            return Err("审批队列已满，请稍后重试".to_string());
         }
+        list.push(pending);
+        drop(list);
 
         self.add_log("info", &format!("等待审批: {title} (超时 {timeout}s)"));
 
@@ -716,6 +742,7 @@ impl ApprovalManager {
         rx: mpsc::Receiver<bool>,
     ) -> Result<bool, String> {
         let started = Instant::now();
+        let mut last_fact_poll = Instant::now();
         loop {
             let elapsed = started.elapsed().as_secs();
             if elapsed >= timeout {
@@ -750,6 +777,10 @@ impl ApprovalManager {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+            if last_fact_poll.elapsed() < APPROVAL_FACT_POLL_INTERVAL {
+                continue;
+            }
+            last_fact_poll = Instant::now();
             if let Some(fact) = self
                 .load_latest_facts()
                 .into_iter()

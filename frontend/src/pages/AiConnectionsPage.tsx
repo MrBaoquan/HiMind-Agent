@@ -111,8 +111,8 @@ export function AiConnectionsPage({
   const attentionCount = groups.actionable.length + groups.manual.length;
   const headline = attentionCount ? `${attentionCount} 个 MCP 注册待处理` : 'AI 工具已就绪';
   const headlineDescription = attentionCount
-    ? '完成注册后，已发现的 AI 工具即可使用 Agent 的统一能力。'
-    : '本机已发现的 AI 工具都可以使用 Agent 的统一能力。';
+    ? '完成注册后，AI 工具即可使用 Agent 的统一能力。'
+    : '本机已注册的 AI 工具都可以使用 Agent 的统一能力。';
 
   async function copyConfiguration(target: McpTargetDescriptor) {
     const content = target.config_preview || target.manual_snippet;
@@ -163,7 +163,7 @@ export function AiConnectionsPage({
             <div className="ai-overview-stats" aria-label="MCP 注册统计">
               <div><span>已就绪</span><strong>{readyCount}</strong></div>
               <div><span>待处理</span><strong className={attentionCount ? 'warning-text' : ''}>{attentionCount}</strong></div>
-              <div><span>已发现</span><strong>{discoveredCount}</strong></div>
+              <div><span>可管理</span><strong>{discoveredCount}</strong></div>
             </div>
             <div className="ai-overview-actions">
               <button className="btn btn-primary" disabled={Boolean(busyAction) || !groups.actionable.length} onClick={onApplyAll}>
@@ -201,9 +201,9 @@ export function AiConnectionsPage({
             {!groups.connected.length ? <EmptyConnectionRow text="还没有注册 MCP 的外部 AI 工具" /> : null}
           </ConnectionSection>
 
-          <ConnectionSection title="待注册" description="已在本机发现，可一键写入 MCP 配置。" count={groups.actionable.length} tone={groups.actionable.length ? 'attention' : 'default'}>
+          <ConnectionSection title="待注册" description="可一键写入 MCP 配置。" count={groups.actionable.length} tone={groups.actionable.length ? 'attention' : 'default'}>
             {groups.actionable.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
-            {!groups.actionable.length ? <EmptyConnectionRow text="已发现的 AI 工具均已注册" success /> : null}
+            {!groups.actionable.length ? <EmptyConnectionRow text="可管理的 AI 工具均已注册" success /> : null}
           </ConnectionSection>
 
           {groups.manual.length ? <ConnectionSection title="手动注册" description="客户端配置格式需要保留，请在客户端设置中粘贴配置。" count={groups.manual.length} tone="attention">
@@ -211,7 +211,7 @@ export function AiConnectionsPage({
           </ConnectionSection> : null}
 
           {groups.unavailable.length ? <details className="ai-unavailable">
-            <summary><div><CircleDashed size={16} /><span><strong>未发现的客户端</strong><small>未安装或暂未被本机识别，不影响其他工具</small></span></div><Pill kind="neutral">{groups.unavailable.length}</Pill></summary>
+            <summary><div><CircleDashed size={16} /><span><strong>暂不可用的客户端</strong><small>未安装或暂不可用，不影响其他工具</small></span></div><Pill kind="neutral">{groups.unavailable.length}</Pill></summary>
             <div className="ai-client-list">
               {groups.unavailable.map(target => <ConnectionRow key={target.id} target={target} unavailable busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
             </div>
@@ -260,9 +260,9 @@ function ConnectionRow({ target, unavailable = false, busyAction, onApplyTarget,
   return <article className={`ai-client-row${builtin ? ' builtin' : ''}${unavailable ? ' unavailable' : ''}`}>
     <div className={`ai-client-icon ${builtin ? 'himind-ai' : targetIconClass(target.id)}`}><TargetIcon target={target} /></div>
     <div className="ai-client-copy"><strong>{target.name}</strong><span>{targetDescription(target)}</span></div>
-    <Pill kind={state.kind}>{unavailable ? '未发现' : state.label}</Pill>
+    <Pill kind={state.kind}>{unavailable ? '暂不可用' : state.label}</Pill>
     <div className="ai-client-registration-actions">
-      {builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 内置</span> : unavailable ? <span className="ai-target-unavailable">未发现</span> : !target.supports_auto_configure ? <><button className="btn btn-icon" title={`复制 ${target.name} MCP 配置`} aria-label={`复制 ${target.name} MCP 配置`} onClick={() => onCopyTarget(target)}><Copy size={15} /></button>{target.config_directory ? <button className="btn btn-icon" title={`打开 ${target.name} 配置目录`} aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} /></button> : null}</> : target.state === 'configured' ? <button className="btn btn-icon ai-row-remove" title={`取消 ${target.name} 注册`} aria-label={`取消 ${target.name} 注册`} disabled={pending} onClick={() => onRemoveTarget(target.id)}><Unplug size={15} /></button> : <button className="btn btn-icon btn-primary" title={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '注册 MCP'} ${target.name}`} aria-label={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '注册 MCP'} ${target.name}`} disabled={pending} onClick={() => onApplyTarget(target.id, target.state === 'invalid_config')}><PlugZap size={15} /></button>}
+      {builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 内置</span> : unavailable ? <span className="ai-target-unavailable">暂不可用</span> : !target.supports_auto_configure ? <><button className="btn btn-icon" title={`复制 ${target.name} MCP 配置`} aria-label={`复制 ${target.name} MCP 配置`} onClick={() => onCopyTarget(target)}><Copy size={15} /></button>{target.config_directory ? <button className="btn btn-icon" title={`打开 ${target.name} 配置目录`} aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} /></button> : null}</> : target.state === 'configured' ? <button className="btn btn-icon ai-row-remove" title={`取消 ${target.name} 注册`} aria-label={`取消 ${target.name} 注册`} disabled={pending} onClick={() => onRemoveTarget(target.id)}><Unplug size={15} /></button> : <button className="btn btn-icon btn-primary" title={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '注册 MCP'} ${target.name}`} aria-label={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '注册 MCP'} ${target.name}`} disabled={pending} onClick={() => onApplyTarget(target.id, target.state === 'invalid_config')}><PlugZap size={15} /></button>}
     </div>
   </article>;
 }
@@ -287,8 +287,8 @@ function targetState(target: McpTargetDescriptor): { label: string; kind: 'succe
   if (target.state === 'configured') return { label: '已注册', kind: 'success' };
   if (target.state === 'needs_repair') return { label: '需要更新', kind: 'warn' };
   if (target.state === 'invalid_config') return { label: '配置异常', kind: 'danger' };
-  if (!target.detected && target.state === 'not_configured') return { label: '未发现', kind: 'neutral' };
-  return { label: target.detected ? '可注册' : '未发现', kind: 'neutral' };
+  if (!target.detected && target.state === 'not_configured') return { label: '暂不可用', kind: 'neutral' };
+  return { label: target.detected ? '可注册' : '暂不可用', kind: 'neutral' };
 }
 
 function targetDescription(target: McpTargetDescriptor) {

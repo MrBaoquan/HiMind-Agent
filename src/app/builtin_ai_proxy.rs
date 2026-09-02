@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -16,6 +16,7 @@ use std::time::Duration;
 const HEADER_LIMIT: usize = 64 * 1024;
 const HTML_RESPONSE_LIMIT: usize = 1024 * 1024;
 const OBSERVED_FRAME_LIMIT: u64 = 4 * 1024 * 1024;
+const MAX_PROXY_CONNECTIONS: usize = 64;
 const SESSION_QUERY: &str = "himind_session";
 const SESSION_COOKIE: &str = "himind_ai_session";
 // WebView2 treats Secure cookies on the `localhost` HTTP origin as a secure
@@ -122,41 +123,66 @@ impl BuiltinAiProxy {
         let token = random_token();
         let url = format!("http://{BROWSER_HOST}:{port}/?{SESSION_QUERY}={token}");
         let shutdown = Arc::new(AtomicBool::new(false));
+        let active_connections = Arc::new(AtomicUsize::new(0));
         let listener_shutdown = Arc::clone(&shutdown);
         let listener_token = token.clone();
-        let listener_thread = thread::spawn(move || {
-            while !listener_shutdown.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let connection_shutdown = Arc::clone(&listener_shutdown);
-                        let connection_token = listener_token.clone();
-                        let connection_observer = observer.clone();
-                        thread::spawn(move || {
-                            if let Err(error) = handle_connection(
-                                stream,
-                                upstream,
-                                &connection_token,
-                                connection_shutdown,
-                                connection_observer,
-                            ) {
-                                if error.kind() != io::ErrorKind::ConnectionReset
-                                    && error.kind() != io::ErrorKind::BrokenPipe
-                                {
-                                    eprintln!("HiMind AI 本机入口连接已关闭：{error}");
-                                }
+        let listener_active_connections = Arc::clone(&active_connections);
+        let listener_thread = thread::Builder::new()
+            .name("himind-ai-proxy-listener".to_string())
+            .spawn(move || {
+                while !listener_shutdown.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if listener_active_connections
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                    (current < MAX_PROXY_CONNECTIONS).then_some(current + 1)
+                                })
+                                .is_err()
+                            {
+                                let mut stream = stream;
+                                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                                let _ = write_proxy_busy(&mut stream);
+                                continue;
                             }
-                        });
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(25));
-                    }
-                    Err(error) => {
-                        eprintln!("HiMind AI 本机入口已停止：{error}");
-                        break;
+                            let connection_shutdown = Arc::clone(&listener_shutdown);
+                            let connection_token = listener_token.clone();
+                            let connection_observer = observer.clone();
+                            let connection_active_connections =
+                                Arc::clone(&listener_active_connections);
+                            let spawn_result = thread::Builder::new()
+                                .name("himind-ai-proxy-connection".to_string())
+                                .spawn(move || {
+                                    if let Err(error) = handle_connection(
+                                        stream,
+                                        upstream,
+                                        &connection_token,
+                                        connection_shutdown,
+                                        connection_observer,
+                                    ) {
+                                        if error.kind() != io::ErrorKind::ConnectionReset
+                                            && error.kind() != io::ErrorKind::BrokenPipe
+                                        {
+                                            eprintln!("HiMind AI 本机入口连接已关闭：{error}");
+                                        }
+                                    }
+                                    connection_active_connections.fetch_sub(1, Ordering::AcqRel);
+                                });
+                            if let Err(error) = spawn_result {
+                                listener_active_connections.fetch_sub(1, Ordering::AcqRel);
+                                eprintln!("HiMind AI 本机入口连接线程创建失败：{error}");
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(error) => {
+                            eprintln!("HiMind AI 本机入口已停止：{error}");
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .map_err(|error| format!("无法创建 HiMind AI 本机入口线程：{error}"))?;
         Ok(Self {
             url,
             shutdown,
@@ -541,14 +567,19 @@ fn handle_connection(
     let mut client_reader = client.try_clone()?;
     let mut server_writer = server.try_clone()?;
     let upload_shutdown = Arc::clone(&shutdown);
-    let upload = thread::spawn(move || {
-        copy_until_shutdown(
-            &mut client_reader,
-            &mut server_writer,
-            &upload_shutdown,
-            None,
-        )
-    });
+    let upload = thread::Builder::new()
+        .name("himind-ai-proxy-upload".to_string())
+        .spawn(move || {
+            copy_until_shutdown(
+                &mut client_reader,
+                &mut server_writer,
+                &upload_shutdown,
+                None,
+            )
+        })
+        .map_err(|error| {
+            io::Error::other(format!("proxy upload thread creation failed: {error}"))
+        })?;
 
     let mut websocket_observer = websocket.then(|| WebSocketObserver::new(observer));
     let download = copy_until_shutdown(
@@ -915,6 +946,12 @@ fn browser_session_response(token: &str) -> String {
 fn write_forbidden(stream: &mut TcpStream) -> io::Result<()> {
     stream.write_all(
         b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden",
+    )
+}
+
+fn write_proxy_busy(stream: &mut TcpStream) -> io::Result<()> {
+    stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy",
     )
 }
 
