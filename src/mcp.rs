@@ -351,14 +351,29 @@ fn handle_request(
             let context = mcp_invocation_context();
             match gateway.invoke(&context, name, arguments) {
                 Ok(result) => Ok(mcp_tool_call_result(result)?),
-                Err(error) => Ok(json!({
-                    "content": [{ "type": "text", "text": error.to_string() }],
-                    "isError": true
-                })),
+                Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
             }
         }
         _ => Err(format!("unsupported MCP method: {method}").into()),
     }
+}
+
+fn mcp_tool_call_error(error: &dyn Error) -> Value {
+    let text = error.to_string();
+    // Authoring operations expose a JSON diagnostic envelope so external AI
+    // clients can branch on stable blocker codes. Legacy errors remain plain
+    // text while still using the standard MCP error shape.
+    if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+        return json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": payload,
+            "isError": true
+        });
+    }
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true
+    })
 }
 
 fn mcp_tool_call_result(result: Value) -> Result<Value, Box<dyn Error>> {
@@ -578,7 +593,7 @@ fn write_notification(
 mod tests {
     use super::{
         emit_registry_notifications, handle_request, mcp_error_code, mcp_registry_generation,
-        mcp_tool_call_result, negotiate_protocol_version, parse_tool_cursor,
+        mcp_tool_call_error, mcp_tool_call_result, negotiate_protocol_version, parse_tool_cursor,
         spawn_registry_watcher_with_interval,
     };
     use crate::api::oauth::AgentAccessToken;
@@ -862,6 +877,29 @@ mod tests {
     }
 
     #[test]
+    fn structured_authoring_errors_survive_mcp_tool_projection() {
+        let error = crate::extension_authoring::blocked_error(
+            "plugin",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_unbound",
+                "workspace",
+                "当前 AI 工作区仍是 Agent 主目录",
+                "调用 extension.workspace.bind",
+                true,
+            )],
+            Vec::new(),
+            vec!["调用 extension.workspace.bind 后重试".to_string()],
+        );
+        let response = mcp_tool_call_error(error.as_ref());
+        assert_eq!(response["isError"], true);
+        assert_eq!(response["structuredContent"]["state"], "blocked");
+        assert_eq!(
+            response["structuredContent"]["blockers"][0]["code"],
+            "extension_workspace_unbound"
+        );
+    }
+
+    #[test]
     fn tools_list_exposes_the_builtin_knowledge_search_capability() {
         let result = handle_request(&test_gateway(), "tools/list", json!({})).unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -1030,6 +1068,18 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "extension.workspace.current"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "workspace.current"));
+        for name in [
+            "extension.authoring.preflight",
+            "extension.workspace.bind",
+            "extension.workspace.clear",
+            "extension.revision.create",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == name),
+                "missing local authoring capability: {name}"
+            );
+        }
         assert!(tools.iter().any(|tool| tool["name"] == "plugin.list"));
         assert!(tools.iter().any(|tool| tool["name"] == "mcp.server.list"));
         assert!(tools.iter().any(|tool| tool["name"] == "mcp.server.upsert"));

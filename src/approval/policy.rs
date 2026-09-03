@@ -73,6 +73,13 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
         )
     {
         "R3"
+    } else if capability_id == "extension.plugin.build"
+        && declared.trim().eq_ignore_ascii_case("process")
+    {
+        // Older extension-development-tools manifests used `process` for a
+        // fixed Go test/build command. Keep that known capability at the
+        // local R2 tier while unknown process vocabularies still fail closed.
+        "R2"
     } else {
         match declared.trim().to_ascii_uppercase().as_str() {
             "READ_ONLY" => "R1",
@@ -178,6 +185,15 @@ mod tests {
     #[test]
     fn unknown_risk_vocabulary_fails_closed_at_r3() {
         assert_eq!(effective_risk_level("third.party.write", "mystery"), "R3");
+    }
+
+    #[test]
+    fn fixed_extension_build_process_alias_is_local_r2() {
+        assert_eq!(
+            effective_risk_level("extension.plugin.build", "process"),
+            "R2"
+        );
+        assert_eq!(effective_risk_level("third.party.process", "process"), "R3");
     }
 
     #[test]

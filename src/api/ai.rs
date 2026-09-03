@@ -23,7 +23,10 @@ pub(crate) struct AIUserCredential {
     pub models: Vec<String>,
     /// OpenAI 兼容协议：`openai-chat` 或 `openai-responses`。
     /// Dashboard 旧版本未返回该字段时保持 Responses 兼容行为。
-    #[serde(default = "default_protocol", deserialize_with = "deserialize_nullable_string_or_protocol")]
+    #[serde(
+        default = "default_protocol",
+        deserialize_with = "deserialize_nullable_string_or_protocol"
+    )]
     pub protocol: String,
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub created_at: String,
@@ -78,7 +81,8 @@ mod tests {
                 "updated_at": "2026-01-01T00:00:00Z",
                 "rotated_at": null
             }
-        })).expect("Dashboard access payload should accept nullable optional fields");
+        }))
+        .expect("Dashboard access payload should accept nullable optional fields");
         let credential = access.credential.expect("credential");
         assert_eq!(credential.active_personal_connection_id, "");
         assert_eq!(credential.rotated_at, "");

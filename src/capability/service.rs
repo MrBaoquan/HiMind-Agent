@@ -67,7 +67,11 @@ enum CapabilityHandler {
     AIServiceCustomRemove,
     AIServiceCustomListModels,
     AuthoringIdentity,
+    AuthoringPreflight,
     ExtensionWorkspaceCurrent,
+    ExtensionWorkspaceBind,
+    ExtensionWorkspaceClear,
+    ExtensionRevisionCreate,
     ExtensionLock,
     InnerAdminLoginStatus,
     SystemOpenFolder,
@@ -546,12 +550,66 @@ impl CapabilityGateway {
                 CapabilityHandler::AuthoringIdentity,
             ),
             registration(
+                "extension.authoring.preflight",
+                "扩展创作预检",
+                "检查当前工作区、三件套、Agent 能力和运行模式，返回可机器处理的受阻点。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill"] },
+                        "workspace_root": { "type": "string" }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AuthoringPreflight,
+            ),
+            registration(
                 "extension.workspace.current",
                 "当前扩展工作区",
-                "返回 AI 会话当前工作目录，以及检测到的 HiMind 插件或 Skill 项目身份。",
+                "返回当前扩展工作区、绑定来源，以及检测到的插件或 Skill 项目身份。",
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::ExtensionWorkspaceCurrent,
+            ),
+            registration(
+                "extension.workspace.bind",
+                "绑定扩展工作区",
+                "将外部 AI 会话绑定到聚合仓库、插件或 Skill 目录；不打开文件夹，不依赖 Dashboard。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": { "workspace_root": { "type": "string", "minLength": 1 } },
+                    "required": ["workspace_root"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionWorkspaceBind,
+            ),
+            registration(
+                "extension.workspace.clear",
+                "清除扩展工作区绑定",
+                "清除 Agent 保存的外部 AI 扩展工作区绑定，恢复会话或进程目录。",
+                "local_write",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::ExtensionWorkspaceClear,
+            ),
+            registration(
+                "extension.revision.create",
+                "创建扩展修订",
+                "基于已有插件或 Skill 候选创建下一个补丁版本，并清除旧测试、确认和提审状态。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill"] },
+                        "id": { "type": "string" },
+                        "version": { "type": "string" }
+                    },
+                    "required": ["kind", "id", "version"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionRevisionCreate,
             ),
             registration(
                 "extension.lock",
@@ -560,14 +618,6 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::ExtensionLock,
-            ),
-            registration(
-                "workspace.current",
-                "当前 AI 工作区",
-                "返回 AI 会话当前工作目录，以及检测到的 HiMind 项目身份。",
-                "read_only",
-                json!({ "type": "object", "additionalProperties": false }),
-                CapabilityHandler::ExtensionWorkspaceCurrent,
             ),
             registration(
                 "system.health",
@@ -1728,9 +1778,13 @@ impl CapabilityGateway {
                 Ok(serde_json::json!({ "service_id": id, "models": models }))
             }
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
+            CapabilityHandler::AuthoringPreflight => self.authoring_preflight(input),
             CapabilityHandler::ExtensionWorkspaceCurrent => {
                 crate::extension_projects::current_workspace()
             }
+            CapabilityHandler::ExtensionWorkspaceBind => self.bind_extension_workspace(input),
+            CapabilityHandler::ExtensionWorkspaceClear => self.clear_extension_workspace(),
+            CapabilityHandler::ExtensionRevisionCreate => self.create_extension_revision(input),
             CapabilityHandler::ExtensionLock => {
                 Ok(serde_json::to_value(crate::app::extension_lock::load()?)?)
             }
@@ -2201,6 +2255,440 @@ impl CapabilityGateway {
         }))
     }
 
+    fn bind_extension_workspace(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let workspace_root = input
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                crate::extension_authoring::blocked_error(
+                    "workspace",
+                    vec![crate::extension_authoring::blocker(
+                        "extension_workspace_required",
+                        "workspace",
+                        "workspace_root 不能为空",
+                        "传入聚合仓库、插件、Skill 或空白扩展目录的绝对路径",
+                        false,
+                    )],
+                    Vec::new(),
+                    vec!["修正 workspace_root 后重新调用 extension.workspace.bind".to_string()],
+                )
+            })?;
+        let path =
+            crate::extension_workspace::bind(Path::new(workspace_root)).map_err(|error| {
+                crate::extension_authoring::blocked_error(
+                    "workspace",
+                    vec![crate::extension_authoring::blocker(
+                        "extension_workspace_bind_failed",
+                        "workspace",
+                        error.to_string(),
+                        "传入存在且可访问的扩展工程目录；不要使用 Agent 安装目录或数据目录",
+                        true,
+                    )],
+                    Vec::new(),
+                    vec![
+                        "修正目录后重新调用 extension.workspace.bind".to_string(),
+                        "绑定成功后重新调用 extension.workspace.current".to_string(),
+                    ],
+                )
+            })?;
+        let current = crate::extension_projects::current_workspace()?;
+        Ok(json!({
+            "state": "ready",
+            "bound": true,
+            "workspace_root": crate::extension_workspace::display_path(&path),
+            "workspace": current,
+            "next_steps": [
+                "重新调用 extension.workspace.current 确认绑定",
+                "调用 extension.authoring.preflight 并传入 kind"
+            ]
+        }))
+    }
+
+    fn clear_extension_workspace(&self) -> Result<Value, Box<dyn Error>> {
+        let previous = crate::extension_workspace::bound_root()
+            .map(|path| crate::extension_workspace::display_path(&path));
+        crate::extension_workspace::clear_binding().map_err(|error| {
+            crate::extension_authoring::blocked_error(
+                "workspace",
+                vec![crate::extension_authoring::blocker(
+                    "extension_workspace_clear_failed",
+                    "workspace",
+                    error.to_string(),
+                    "检查 Agent 用户目录权限后重试",
+                    true,
+                )],
+                Vec::new(),
+                vec!["重新调用 extension.workspace.clear".to_string()],
+            )
+        })?;
+        let current = crate::extension_projects::current_workspace()?;
+        Ok(json!({
+            "state": "ready",
+            "bound": false,
+            "previous_workspace_root": previous,
+            "workspace": current,
+            "next_steps": ["重新调用 extension.workspace.current 确认当前会话目录"]
+        }))
+    }
+
+    fn authoring_preflight(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(kind.as_str(), "plugin" | "skill") {
+            return Err(crate::extension_authoring::blocked_error(
+                "unknown",
+                vec![crate::extension_authoring::blocker(
+                    "invalid_extension_kind",
+                    "preflight",
+                    "kind 必须是 plugin 或 skill",
+                    "使用 kind=plugin 或 kind=skill 重新调用",
+                    false,
+                )],
+                Vec::new(),
+                vec!["修正 kind 后重新调用 extension.authoring.preflight".to_string()],
+            ));
+        }
+
+        let mut blockers = Vec::new();
+        let workspace_state = match crate::extension_workspace::current_root() {
+            Ok((path, source, bound)) if path.is_dir() => Some((path, source, bound)),
+            Ok((path, _, _)) => {
+                blockers.push(crate::extension_authoring::blocker(
+                    "extension_workspace_invalid",
+                    "workspace",
+                    format!("当前 AI 工作区不是目录: {}", path.display()),
+                    "在外部 AI 工具中打开一个真实的扩展工作区后重试",
+                    true,
+                ));
+                None
+            }
+            Err(error) => {
+                blockers.push(crate::extension_authoring::blocker(
+                    "extension_workspace_unavailable",
+                    "workspace",
+                    error.to_string(),
+                    "确认 AI 会话工作区仍然存在并重新调用 extension.workspace.current",
+                    true,
+                ));
+                None
+            }
+        };
+        let current = workspace_state.as_ref().map(|(path, _, _)| path.clone());
+        if let Some((current, source, _bound)) = workspace_state.as_ref() {
+            if *source == "process_current_dir" {
+                blockers.push(crate::extension_authoring::blocker(
+                    "extension_workspace_unbound",
+                    "workspace",
+                    "当前 AI 工作区来自进程目录，尚未绑定扩展工程目录",
+                    "调用 extension.workspace.bind，并传入扩展聚合仓库、插件或 Skill 目录",
+                    true,
+                ));
+            }
+            if crate::extension_workspace::is_agent_managed_path(current) {
+                blockers.push(crate::extension_authoring::blocker(
+                    "extension_workspace_unbound",
+                    "workspace",
+                    "当前 AI 工作区仍是 Agent 主目录，未绑定扩展工程目录",
+                    "调用 extension.workspace.bind，并传入扩展聚合仓库或单个扩展项目目录",
+                    true,
+                ));
+            }
+        }
+        // A session workspace supplied by HiMind AI is already explicit and
+        // valid; only an implicit process directory must be rebound by MCP.
+        if let Some(requested) = input
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(current) = current.as_ref() {
+                match Path::new(requested).canonicalize() {
+                    Ok(path) if path == *current || path.starts_with(current) => {}
+                    Ok(path) => blockers.push(crate::extension_authoring::blocker(
+                        "extension_workspace_mismatch",
+                        "workspace",
+                        format!(
+                            "请求工作区 {} 与当前 AI 工作区 {} 不一致",
+                            path.display(),
+                            current.display()
+                        ),
+                        "切换 AI 会话工作区，或使用 extension.workspace.current 返回的 workspace_root",
+                        false,
+                    )),
+                    Err(error) => blockers.push(crate::extension_authoring::blocker(
+                        "extension_workspace_invalid",
+                        "workspace",
+                        format!("无法访问请求工作区: {error}"),
+                        "传入存在且可访问的 workspace_root",
+                        true,
+                    )),
+                }
+            }
+        }
+
+        let required_tools = match kind.as_str() {
+            "plugin" => vec![
+                "extension.environment.preflight",
+                "extension.plugin.scaffold",
+                "extension.plugin.validate",
+                "extension.plugin.build",
+                "extension.plugin.package",
+            ],
+            _ => vec![
+                "extension.environment.preflight",
+                "extension.skill.scaffold",
+                "extension.skill.validate",
+                "extension.skill.package",
+            ],
+        };
+        let visible_capabilities = self.list_capabilities(&InvocationContext::local_http())?;
+        let visible_ids = visible_capabilities
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let capability_facts = visible_capabilities
+            .iter()
+            .map(|item| crate::skill::resolver::CapabilityFact {
+                id: item.id.clone(),
+                version: item.version.clone(),
+                source: item.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        for required in required_tools {
+            if !visible_ids.contains(required) {
+                blockers.push(crate::extension_authoring::blocker(
+                    "extension_tool_missing",
+                    "toolchain",
+                    format!("三件套未提供必需能力: {required}"),
+                    "启用并重新安装 AI 扩展开发工具插件，然后重启 Agent",
+                    true,
+                ));
+            }
+        }
+        match crate::capability::plugin::find_plugin("com.himind.extension-development-tools") {
+            Ok(Some(plugin)) if plugin.enabled && plugin.error.is_none() => {
+                let minimum = "1.3.1";
+                if crate::skill::resolver::compare_versions(&plugin.version, minimum)
+                    == std::cmp::Ordering::Less
+                {
+                    blockers.push(crate::extension_authoring::blocker(
+                        "extension_tools_plugin_outdated",
+                        "toolchain",
+                        format!(
+                            "AI 扩展开发工具版本 {} 低于最低要求 {}",
+                            plugin.version, minimum
+                        ),
+                        "安装最新 AI 扩展开发工具插件后重新执行预检",
+                        true,
+                    ));
+                }
+            }
+            Ok(Some(plugin)) => blockers.push(crate::extension_authoring::blocker(
+                "extension_tools_plugin_unavailable",
+                "toolchain",
+                format!(
+                    "AI 扩展开发工具插件不可用{}",
+                    plugin
+                        .error
+                        .as_deref()
+                        .map(|value| format!(": {value}"))
+                        .unwrap_or_default()
+                ),
+                "在本机启用 AI 扩展开发工具插件并重新执行预检",
+                true,
+            )),
+            Ok(None) => blockers.push(crate::extension_authoring::blocker(
+                "extension_tools_plugin_missing",
+                "toolchain",
+                "未安装 AI 扩展开发工具插件",
+                "安装三件套中的 AI 扩展开发工具插件后重新执行预检",
+                true,
+            )),
+            Err(error) => blockers.push(crate::extension_authoring::blocker(
+                "extension_tools_plugin_lookup_failed",
+                "toolchain",
+                error.to_string(),
+                "修复本机插件注册表后重新执行预检",
+                true,
+            )),
+        }
+
+        let required_skill = match kind.as_str() {
+            "plugin" => (
+                "com.himind.skill.develop-himind-plugins",
+                "1.7.0",
+                "extension.plugin.scaffold",
+            ),
+            _ => (
+                "com.himind.skill.develop-himind-skills",
+                "1.8.0",
+                "extension.skill.scaffold",
+            ),
+        };
+        match crate::skill::store::SkillStore::new().list_records() {
+            Ok(records) => {
+                let (skill_id, minimum, required_capability) = required_skill;
+                match records.iter().find(|record| record.manifest.id == skill_id) {
+                    Some(record)
+                        if crate::skill::resolver::compare_versions(
+                            &record.manifest.version,
+                            minimum,
+                        ) != std::cmp::Ordering::Less =>
+                    {
+                        let readiness = crate::skill::resolver::SkillReadiness::resolve(
+                            &record.manifest,
+                            &capability_facts,
+                            VERSION,
+                            "himind-ai",
+                        );
+                        if readiness.state == "blocked"
+                            || !visible_ids.contains(required_capability)
+                        {
+                            blockers.push(crate::extension_authoring::blocker(
+                                "authoring_skill_contract_mismatch",
+                                "toolchain",
+                                format!(
+                                    "{} 的 MCP 依赖契约未满足: {}",
+                                    record.manifest.name,
+                                    if readiness.reasons.is_empty() {
+                                        format!("缺少 {required_capability}")
+                                    } else {
+                                        readiness.reasons.join("、")
+                                    }
+                                ),
+                                "更新 Agent 能力或重新安装与当前 Agent 契约匹配的三件套 Skill",
+                                true,
+                            ));
+                        }
+                    }
+                    Some(record) => blockers.push(crate::extension_authoring::blocker(
+                        "authoring_skill_outdated",
+                        "toolchain",
+                        format!(
+                            "{} 版本 {} 低于最低要求 {}",
+                            record.manifest.name, record.manifest.version, minimum
+                        ),
+                        "从聚合扩展仓库安装最新三件套 Skill 后重试",
+                        true,
+                    )),
+                    None => blockers.push(crate::extension_authoring::blocker(
+                        "authoring_skill_missing",
+                        "toolchain",
+                        format!("未安装 {skill_id}"),
+                        "安装对应的插件开发助手或技能开发助手后重试",
+                        true,
+                    )),
+                }
+            }
+            Err(error) => blockers.push(crate::extension_authoring::blocker(
+                "authoring_skill_lookup_failed",
+                "toolchain",
+                format!("读取三件套 Skill 失败: {error}"),
+                "修复 Agent Skill Store 后重新执行预检",
+                true,
+            )),
+        }
+
+        let mut warnings = Vec::new();
+        if !self.options.mode().dashboard_enabled() {
+            warnings.push(crate::extension_authoring::warning(
+                "Independent 模式可完成本地创作、候选测试和客户端注册；提审与组织分发需在 Connected 模式执行。",
+            ));
+        } else if crate::api::client::load_agent_state(&self.options.state_path)
+            .ok()
+            .is_none_or(|state| state.agent_id.trim().is_empty())
+        {
+            warnings.push(crate::extension_authoring::warning(
+                "当前为 Connected 模式，但 Agent 尚未完成 Dashboard 配对；本地创作不受影响，提审前需完成配对。",
+            ));
+        }
+        let next_steps = vec![
+            "调用 extension.authoring.identity 获取作者资料".to_string(),
+            format!("调用 extension.{kind}.scaffold 创建或更新工程"),
+            format!("调用 extension.{kind}.validate、构建/打包能力生成候选制品"),
+            "调用 extension.test 完成依赖、注册、运行时和清理闭环".to_string(),
+        ];
+        if blockers.is_empty() {
+            Ok(crate::extension_authoring::success(
+                &kind,
+                json!({
+                    "workspace": current.map(|path| json!({
+                        "root": crate::extension_workspace::display_path(&path),
+                        "available": true,
+                        "source": workspace_state.as_ref().map(|(_, source, _)| *source).unwrap_or("unknown"),
+                        "bound": workspace_state.as_ref().map(|(_, _, bound)| *bound).unwrap_or(false),
+                    })).unwrap_or_else(|| json!({"available": false, "bound": false})),
+                    "mode": self.options.mode().as_str(),
+                    "toolchain": "ready",
+                    "submission": if self.options.mode().dashboard_enabled() { "available" } else { "connected_mode_required" },
+                    "warnings": warnings,
+                    "next_steps": next_steps,
+                }),
+            ))
+        } else {
+            Err(crate::extension_authoring::blocked_error(
+                &kind, blockers, warnings, next_steps,
+            ))
+        }
+    }
+
+    fn create_extension_revision(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let (id, version) = authoring_identity(&input)?;
+        let result = match kind.as_str() {
+            "plugin" => {
+                serde_json::to_value(crate::plugin_authoring::create_revision(&id, &version)?)?
+            }
+            "skill" => {
+                serde_json::to_value(crate::skill::authoring::create_revision(&id, &version)?)?
+            }
+            _ => {
+                return Err(crate::extension_authoring::blocked_error(
+                    "unknown",
+                    vec![crate::extension_authoring::blocker(
+                        "invalid_extension_kind",
+                        "revision",
+                        "kind 必须是 plugin 或 skill",
+                        "使用 kind=plugin 或 kind=skill 重新调用",
+                        false,
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        };
+        let next_version = result
+            .get("manifest")
+            .and_then(|manifest| manifest.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(crate::extension_authoring::success(
+            &kind,
+            json!({
+                "id": id,
+                "previous_version": version,
+                "version": next_version,
+                "draft": result,
+                "next_steps": [
+                    "在修订工作区完成修改",
+                    "重新校验、构建/打包并调用 extension.test",
+                ],
+            }),
+        ))
+    }
+
     fn save_skill_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
         Ok(serde_json::to_value(
             crate::skill::authoring::import_package(serde_json::from_value(input)?)?,
@@ -2617,11 +3105,13 @@ impl CapabilityGateway {
                 "authoring-test",
             ),
         )?;
-        Ok(serde_json::to_value(crate::skill::authoring::test(
-            &id,
-            &version,
-            &capability_facts,
-        )?)?)
+        match crate::skill::authoring::test(&id, &version, &capability_facts) {
+            Ok(result) => Ok(crate::extension_authoring::success(
+                "skill",
+                serde_json::to_value(result)?,
+            )),
+            Err(error) => Err(authoring_operation_error("skill", "test", error)),
+        }
     }
 
     fn test_extension_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -2641,14 +3131,19 @@ impl CapabilityGateway {
                         "authoring-test",
                     ),
                 )?;
-                let result = crate::skill::authoring::test(&id, &version, &capability_facts)?;
+                let result = crate::skill::authoring::test(&id, &version, &capability_facts)
+                    .map_err(|error| authoring_operation_error("skill", "test", error))?;
                 let cleanup_state = result
                     .cleanup
                     .get("state")
                     .and_then(Value::as_str)
                     .unwrap_or("failed");
                 if cleanup_state != "passed" {
-                    return Err(format!("Skill 候选测试清理未通过: {cleanup_state}").into());
+                    return Err(authoring_operation_error(
+                        "skill",
+                        "cleanup",
+                        format!("Skill 候选测试清理未通过: {cleanup_state}"),
+                    ));
                 }
                 Ok(json!({
                     "kind": "skill",
@@ -2666,7 +3161,8 @@ impl CapabilityGateway {
                 }))
             }
             "plugin" => {
-                let result = crate::plugin_authoring::test(&id, &version)?;
+                let result = crate::plugin_authoring::test(&id, &version)
+                    .map_err(|error| authoring_operation_error("plugin", "test", error))?;
                 let report = result.test_report.clone().unwrap_or_else(|| {
                     json!({
                         "manifest": "passed",
@@ -2694,7 +3190,18 @@ impl CapabilityGateway {
                     "report": report
                 }))
             }
-            _ => Err("kind must be plugin or skill".into()),
+            _ => Err(crate::extension_authoring::blocked_error(
+                "unknown",
+                vec![crate::extension_authoring::blocker(
+                    "invalid_extension_kind",
+                    "test",
+                    "kind must be plugin or skill",
+                    "使用 kind=plugin 或 kind=skill 重新调用 extension.test",
+                    false,
+                )],
+                Vec::new(),
+                Vec::new(),
+            )),
         }
     }
 
@@ -2734,9 +3241,13 @@ impl CapabilityGateway {
 
     fn test_plugin_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
         let (id, version) = authoring_identity(&input)?;
-        Ok(serde_json::to_value(crate::plugin_authoring::test(
-            &id, &version,
-        )?)?)
+        match crate::plugin_authoring::test(&id, &version) {
+            Ok(result) => Ok(crate::extension_authoring::success(
+                "plugin",
+                serde_json::to_value(result)?,
+            )),
+            Err(error) => Err(authoring_operation_error("plugin", "test", error)),
+        }
     }
 
     fn submit_plugin_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -2884,6 +3395,45 @@ fn is_svn_admin_capability(capability_id: &str) -> bool {
             | "exhibit.repository_path.create"
             | "exhibit.repository.initialize_template"
     )
+}
+
+fn authoring_operation_error(
+    kind: &str,
+    stage: &str,
+    error: impl std::fmt::Display,
+) -> Box<dyn Error> {
+    let message = error.to_string();
+    let normalized = message.to_ascii_lowercase();
+    let (code, remediation) = if normalized.contains("依赖")
+        || normalized.contains("missing required")
+        || normalized.contains("not found")
+    {
+        (
+            "extension_dependency_missing",
+            "补齐 Manifest 声明的必需 Capability/插件依赖，或调整为可选依赖后重试",
+        )
+    } else if normalized.contains("清理") || normalized.contains("恢复") {
+        (
+            "extension_cleanup_failed",
+            "检查客户端注册目录、Agent Store 和插件注册表的写权限，清理残留后重试",
+        )
+    } else if normalized.contains("运行时") || normalized.contains("runtime") {
+        (
+            "extension_runtime_contract_failed",
+            "修复插件 JSON-RPC/stdio 入口或测试输入后重新构建候选包",
+        )
+    } else if normalized.contains("候选") || normalized.contains("draft") {
+        (
+            "extension_candidate_invalid",
+            "重新执行校验和打包，并确认候选包路径、Manifest 与 SHA-256 一致",
+        )
+    } else {
+        (
+            "extension_operation_failed",
+            "根据 blockers.message 修复对应阶段后重新调用 extension.test",
+        )
+    };
+    crate::extension_authoring::operation_error_with_code(kind, stage, code, message, remediation)
 }
 
 fn validate_delete_target(target: &Path) -> Result<(), Box<dyn Error>> {
@@ -3064,6 +3614,7 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
 /// task, retry safety or Dashboard route.
 fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &CapabilityHandler) {
     let id = descriptor.id.as_str();
+    let trusted_local_authoring = is_trusted_local_authoring_capability(descriptor, handler);
     descriptor.required_scope = required_platform_scope(id).map(str::to_string);
     descriptor.dashboard_route = dashboard_route_for(id);
     descriptor.dashboard_provider = is_dashboard_provider_handler(handler);
@@ -3094,7 +3645,8 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
                 && !matches!(
                     descriptor.risk_level.trim().to_ascii_uppercase().as_str(),
                     "READ_ONLY" | "R1"
-                ))
+                )
+                && !trusted_local_authoring)
             || matches!(
                 handler,
                 CapabilityHandler::SoftwareDistributionPublish
@@ -3137,6 +3689,35 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
         "keyed"
     }
     .to_string();
+}
+
+const EXTENSION_DEVELOPMENT_TOOLS_PLUGIN_ID: &str = "com.himind.extension-development-tools";
+
+/// These are deterministic local authoring operations supplied by the
+/// first-party development-tools plugin. They are intentionally a small
+/// allow-list: a future plugin capability must opt into the normal approval
+/// path until its workspace and risk contract are reviewed.
+fn is_extension_tool_capability(capability_id: &str) -> bool {
+    matches!(
+        capability_id,
+        "extension.plugin.scaffold"
+            | "extension.plugin.validate"
+            | "extension.plugin.build"
+            | "extension.plugin.package"
+            | "extension.skill.scaffold"
+            | "extension.skill.validate"
+            | "extension.skill.package"
+    )
+}
+
+fn is_trusted_local_authoring_capability(
+    descriptor: &CapabilityDescriptor,
+    handler: &CapabilityHandler,
+) -> bool {
+    matches!(handler, CapabilityHandler::PluginCapability(_))
+        && descriptor.source == format!("plugin:{EXTENSION_DEVELOPMENT_TOOLS_PLUGIN_ID}")
+        && descriptor.availability == CapabilityAvailability::Local
+        && is_extension_tool_capability(&descriptor.id)
 }
 
 fn is_dashboard_provider_handler(handler: &CapabilityHandler) -> bool {
@@ -3503,7 +4084,11 @@ fn matches_capability_pattern(pattern: &str, value: &str) -> bool {
 fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailability {
     match handler {
         CapabilityHandler::AuthoringIdentity
+        | CapabilityHandler::AuthoringPreflight
         | CapabilityHandler::ExtensionWorkspaceCurrent
+        | CapabilityHandler::ExtensionWorkspaceBind
+        | CapabilityHandler::ExtensionWorkspaceClear
+        | CapabilityHandler::ExtensionRevisionCreate
         | CapabilityHandler::ExtensionLock
         | CapabilityHandler::ExtensionTest
         | CapabilityHandler::SkillCandidateSave
@@ -3611,6 +4196,13 @@ fn validate_mcp_capability_workspace(
     capability_id: &str,
     input: &Value,
 ) -> Result<(), Box<dyn Error>> {
+    // First-party authoring tools are local capabilities, but their file
+    // boundary must be enforced for every invocation adapter (MCP, CLI,
+    // local HTTP and Tauri). Otherwise a caller could bypass the workspace
+    // guard simply by choosing a different adapter than MCP.
+    if is_extension_tool_capability(capability_id) {
+        return validate_extension_tool_workspace(input);
+    }
     if context.source != crate::capability::types::InvocationSource::Mcp {
         return Ok(());
     }
@@ -3644,6 +4236,111 @@ fn validate_mcp_capability_workspace(
     }
 }
 
+fn validate_extension_tool_workspace(input: &Value) -> Result<(), Box<dyn Error>> {
+    let workspace_root = input
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            crate::extension_authoring::blocked_error(
+                "unknown",
+                vec![crate::extension_authoring::blocker(
+                    "extension_workspace_required",
+                    "workspace",
+                    "扩展开发能力必须提供 workspace_root",
+                    "传入已绑定的聚合仓库、插件或 Skill 项目目录",
+                    false,
+                )],
+                Vec::new(),
+                vec!["调用 extension.workspace.current 确认工作区".to_string()],
+            )
+        })?;
+
+    let (current, source, _bound) =
+        crate::extension_workspace::current_root().map_err(|error| {
+            crate::extension_authoring::blocked_error(
+                "unknown",
+                vec![crate::extension_authoring::blocker(
+                    "extension_workspace_unavailable",
+                    "workspace",
+                    error.to_string(),
+                    "调用 extension.workspace.bind 绑定扩展工程目录",
+                    true,
+                )],
+                Vec::new(),
+                vec!["调用 extension.workspace.current 确认工作区".to_string()],
+            )
+        })?;
+    if source == "process_current_dir"
+        || crate::extension_workspace::is_agent_managed_path(&current)
+    {
+        return Err(crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_unbound",
+                "workspace",
+                "当前 AI 工作区尚未绑定扩展工程目录",
+                "调用 extension.workspace.bind，并传入扩展聚合仓库、插件或 Skill 目录",
+                true,
+            )],
+            Vec::new(),
+            vec![
+                "调用 extension.workspace.bind 绑定扩展工作区".to_string(),
+                "重新调用 extension.workspace.current 确认绑定".to_string(),
+            ],
+        ));
+    }
+
+    let requested = Path::new(workspace_root).canonicalize().map_err(|error| {
+        crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_invalid",
+                "workspace",
+                format!("无法访问请求工作区: {error}"),
+                "传入存在且可访问的 workspace_root",
+                true,
+            )],
+            Vec::new(),
+            vec!["修正 workspace_root 后重新调用扩展开发能力".to_string()],
+        )
+    })?;
+    if !requested.is_dir() {
+        return Err(crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_invalid",
+                "workspace",
+                "workspace_root 必须是目录",
+                "传入存在且可访问的扩展工作区目录",
+                false,
+            )],
+            Vec::new(),
+            vec!["修正 workspace_root 后重新调用扩展开发能力".to_string()],
+        ));
+    }
+    if !requested.starts_with(&current) {
+        return Err(crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_mismatch",
+                "workspace",
+                format!(
+                    "请求工作区 {} 与当前扩展工作区 {} 不一致",
+                    requested.display(),
+                    current.display()
+                ),
+                "切换 AI 会话工作区，或使用 extension.workspace.current 返回的 workspace_root",
+                false,
+            )],
+            Vec::new(),
+            vec!["将 workspace_root 改为当前扩展工作区或其子目录".to_string()],
+        ));
+    }
+    Ok(())
+}
+
 fn validate_mcp_candidate_package(
     context: &InvocationContext,
     capability_id: &str,
@@ -3662,11 +4359,68 @@ fn validate_mcp_candidate_package(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("package_path is required")?;
-    let current = crate::extension_projects::current_workspace_path()?;
-    let package = Path::new(package_path).canonicalize()?;
+        .ok_or_else(|| {
+            crate::extension_authoring::blocked_error(
+                "unknown",
+                vec![crate::extension_authoring::blocker(
+                    "extension_package_required",
+                    "package",
+                    "package_path is required",
+                    "传入工作区内已生成并校验的 .hmpkg 或 .hmskill 文件",
+                    false,
+                )],
+                Vec::new(),
+                vec!["重新调用候选保存能力并传入 package_path".to_string()],
+            )
+        })?;
+    let current = crate::extension_projects::current_workspace_path().map_err(|error| {
+        crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_unavailable",
+                "workspace",
+                error.to_string(),
+                "先调用 extension.workspace.bind 绑定扩展工程目录",
+                true,
+            )],
+            Vec::new(),
+            vec!["调用 extension.workspace.current 确认工作区".to_string()],
+        )
+    })?;
+    let package = Path::new(package_path).canonicalize().map_err(|error| {
+        crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_package_invalid",
+                "package",
+                format!("无法访问候选包: {error}"),
+                "传入存在且可访问的 .hmpkg 或 .hmskill 文件",
+                true,
+            )],
+            Vec::new(),
+            vec!["重新构建并打包扩展后重试".to_string()],
+        )
+    })?;
     if !package.is_file() || !package.starts_with(&current) {
-        return Err("候选包必须位于当前 AI 扩展工作区内".into());
+        return Err(crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_workspace_unbound",
+                "workspace",
+                format!(
+                    "候选包必须位于当前 AI 扩展工作区内: {}",
+                    crate::extension_workspace::display_path(&current)
+                ),
+                "调用 extension.workspace.bind 绑定候选包所在的聚合仓库或扩展项目目录",
+                true,
+            )],
+            Vec::new(),
+            vec![
+                "调用 extension.workspace.bind，并传入候选包所在目录".to_string(),
+                "重新调用 extension.workspace.current 确认绑定".to_string(),
+                "再调用 extension.*.candidate.save 保存候选包".to_string(),
+            ],
+        ));
     }
     Ok(())
 }
@@ -3676,10 +4430,10 @@ fn validate_extension_workspace_root(
     requested: &str,
 ) -> Result<(), Box<dyn Error>> {
     let requested = Path::new(requested).canonicalize()?;
-    if requested != current {
+    if !requested.starts_with(current) {
         return Err(serde_json::json!({
             "code": "extension_workspace_mismatch",
-            "message": "workspace_root 必须与 extension.workspace.current 返回的当前 AI 工作区一致"
+            "message": "workspace_root 必须与当前 AI 扩展工作区一致，或位于该工作区内"
         })
         .to_string()
         .into());
@@ -4134,6 +4888,44 @@ mod tests {
                 &downstream.descriptor.risk_level
             ),
             "R3"
+        );
+    }
+
+    #[test]
+    fn first_party_authoring_tools_are_local_without_interactive_approval() {
+        let mut item = registration(
+            "extension.plugin.build",
+            "构建插件",
+            "在扩展工作区运行固定构建流程",
+            "local_action",
+            json!({
+                "type": "object",
+                "properties": {"workspace_root": {"type": "string"}},
+                "required": ["workspace_root"]
+            }),
+            CapabilityHandler::PluginCapability("extension.plugin.build".into()),
+        );
+        item.descriptor.source = "plugin:com.himind.extension-development-tools".to_string();
+        item.descriptor.availability = CapabilityAvailability::Local;
+        apply_registry_metadata(&mut item.descriptor, &item.handler);
+
+        assert!(is_trusted_local_authoring_capability(
+            &item.descriptor,
+            &item.handler
+        ));
+        assert!(!item.descriptor.approval_required);
+    }
+
+    #[test]
+    fn authoring_tool_workspace_guard_rejects_missing_binding() {
+        let error = validate_extension_tool_workspace(&json!({
+            "workspace_root": "C:\\definitely-not-the-agent-workspace"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("extension_workspace_unbound")
+                || error.contains("extension_workspace_mismatch")
         );
     }
 

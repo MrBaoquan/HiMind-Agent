@@ -212,27 +212,25 @@ pub(crate) fn get(project_id: &str) -> Result<ExtensionProject, Box<dyn Error>> 
 }
 
 pub(crate) fn current_workspace() -> Result<Value, Box<dyn Error>> {
-    let workspace = current_workspace_path()?;
+    let (workspace, source, bound) = crate::extension_workspace::current_root()?;
     let project = project_record_from_path(&workspace, "ai_workspace")
         .ok()
         .map(ExtensionProject::from);
     let kind = project
         .as_ref()
         .map(|item| item.kind.as_str())
-        .unwrap_or("directory");
+        .unwrap_or_else(|| crate::extension_workspace::classify_path(&workspace));
     Ok(json!({
         "workspace_root": crate::extension_workspace::display_path(&workspace),
+        "source": source,
+        "bound": bound,
         "kind": kind,
         "project": project,
     }))
 }
 
 pub(crate) fn current_workspace_path() -> Result<PathBuf, Box<dyn Error>> {
-    Ok(env::var_os("HIMIND_AI_WORKSPACE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?)
-        .canonicalize()?)
+    Ok(crate::extension_workspace::current_root()?.0)
 }
 
 pub(crate) fn register(path: &Path) -> Result<ExtensionProject, Box<dyn Error>> {

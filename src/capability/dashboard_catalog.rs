@@ -544,7 +544,13 @@ fn validate_contract(item: &DashboardCapabilityContract) -> Result<(), Box<dyn E
     {
         return Err("Dashboard capability identity is incomplete".into());
     }
-    if !matches!(item.risk_level.as_str(), "read_only" | "network_write") {
+    // Dashboard business contracts use the legacy semantic labels for
+    // ordinary reads/writes and the unified R1-R4 tiers for capabilities that
+    // require explicit risk handling (notably destructive R3 operations).
+    if !matches!(
+        item.risk_level.as_str(),
+        "read_only" | "network_write" | "R1" | "R2" | "R3" | "R4"
+    ) {
         return Err(format!("invalid Dashboard capability risk level: {}", item.id).into());
     }
     if !matches!(

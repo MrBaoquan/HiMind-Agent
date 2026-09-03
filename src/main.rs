@@ -18,6 +18,7 @@ mod app;
 mod approval;
 mod business_integration;
 mod capability;
+mod extension_authoring;
 mod extension_projects;
 mod extension_workspace;
 mod install_layout;
