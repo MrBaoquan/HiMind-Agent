@@ -42,6 +42,7 @@ if (Test-Path -LiteralPath $ReleaseDirectory) {
     throw "Release output already exists: $ReleaseDirectory"
 }
 New-Item -ItemType Directory -Path $ReleaseDirectory | Out-Null
+Set-Content -LiteralPath (Join-Path $ReleaseDirectory "himind-agent.version") -Value $Version -Encoding ASCII
 
 $BinaryRoot = Join-Path $Root "target\$Configuration"
 foreach ($Name in @("himind-agent.exe", "himind-agent-launcher.exe", "himind-agent-updater.exe", "himind-agent-mcp.exe")) {
@@ -100,9 +101,46 @@ $ArchivePath = Join-Path $OutputRoot "himind-agent-$Version-windows-x64.zip"
 if (Test-Path -LiteralPath $ArchivePath) { throw "Release archive already exists: $ArchivePath" }
 Compress-Archive -Path (Join-Path $ReleaseDirectory "*") -DestinationPath $ArchivePath -CompressionLevel Optimal
 
+# The self-update contract is intentionally stricter than the portable
+# package: every entry is a file at the archive root so the updater can
+# validate and atomically replace only runtime files.
+$UpdateArchivePath = Join-Path $OutputRoot "himind-agent-update.zip"
+if (Test-Path -LiteralPath $UpdateArchivePath) { throw "Self-update archive already exists: $UpdateArchivePath" }
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$UpdateArchive = [System.IO.Compression.ZipFile]::Open($UpdateArchivePath, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    $UpdateFiles = @(
+        @{ Source = (Join-Path $ReleaseDirectory "himind-agent.exe"); Entry = "himind-agent.exe" },
+        @{ Source = (Join-Path $ReleaseDirectory "himind-agent-mcp.exe"); Entry = "himind-agent-mcp.exe" },
+        @{ Source = (Join-Path $ReleaseDirectory "himind-agent-updater.exe"); Entry = "himind-agent-updater.exe" },
+        @{ Source = (Join-Path $ReleaseDirectory "himind-agent-launcher.exe"); Entry = "himind-agent-launcher.exe" }
+    )
+    $VSCodeSource = Join-Path $ReleaseDirectory "resources\vscode\himind-ai.vsix"
+    if (Test-Path -LiteralPath $VSCodeSource -PathType Leaf) {
+        $UpdateFiles += @{ Source = $VSCodeSource; Entry = "himind-ai.vsix" }
+    }
+    foreach ($File in $UpdateFiles) {
+        if (-not (Test-Path -LiteralPath $File.Source -PathType Leaf)) {
+            throw "Self-update input is missing: $($File.Source)"
+        }
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+            $UpdateArchive,
+            $File.Source,
+            $File.Entry,
+            [System.IO.Compression.CompressionLevel]::Optimal
+        ) | Out-Null
+    }
+}
+finally {
+    $UpdateArchive.Dispose()
+}
+
 [pscustomobject]@{
     version = $Version
     release_directory = $ReleaseDirectory
     archive = $ArchivePath
     sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $ArchivePath).Hash.ToLowerInvariant()
+    update_archive = $UpdateArchivePath
+    update_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $UpdateArchivePath).Hash.ToLowerInvariant()
 } | ConvertTo-Json

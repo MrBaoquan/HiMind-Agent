@@ -18,8 +18,14 @@ pub(crate) fn import_plugin(
     let root = download_source(&source.repository, &source.reference)?;
     let result = (|| {
         let package = package_root(&root, &source.subpath, "plugin.json")?;
+        let identity = package_identity(&package, "plugin.json")?;
+        let binding = bind_extension_source(&root, &source, "plugin", &identity.0, &identity.1)?;
         crate::app::plugin_manager::validate_local_plugin_package_dependencies(&package)?;
         crate::app::plugin_manager::install_local_package_from_source(&package, "github")?;
+        if let Some((config, catalog)) = binding {
+            crate::app::extension_source::upsert_source(config.clone())?;
+            save_import_provenance(&config, &catalog, "plugin", &identity.0, &identity.1)?;
+        }
         crate::capability::plugin::registry_json().map_err(Into::into)
     })();
     cleanup_source_root(&root);
@@ -35,8 +41,20 @@ pub(crate) fn import_skill(
     let root = download_source(&source.repository, &source.reference)?;
     let result = (|| {
         let package = package_root(&root, &source.subpath, "skill.json")?;
+        let identity = package_identity(&package, "skill.json")?;
+        let binding = bind_extension_source(&root, &source, "skill", &identity.0, &identity.1)?;
         let record =
             crate::app::skill_manager::install_local_package_from_source(&package, "github")?;
+        if let Some((config, catalog)) = binding {
+            crate::app::extension_source::upsert_source(config.clone())?;
+            save_import_provenance(
+                &config,
+                &catalog,
+                "skill",
+                &record.manifest.id,
+                &record.manifest.version,
+            )?;
+        }
         serde_json::to_value(record).map_err(Into::into)
     })();
     cleanup_source_root(&root);
@@ -234,13 +252,169 @@ fn package_root(root: &Path, subpath: &str, marker: &str) -> Result<PathBuf, Box
             .ok_or_else(|| Box::<dyn Error>::from(format!("GitHub 仓库中未找到 {marker}")))?
     } else {
         validate_subpath(&relative)?;
-        let candidate = root.join(&relative);
+        let candidate = archive_relative_path(root, &relative)?;
         if !candidate.join(marker).is_file() {
             return Err(format!("GitHub 子目录缺少 {marker}: {relative}").into());
         }
         candidate
     };
     Ok(package)
+}
+
+fn archive_relative_path(root: &Path, relative: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let direct = root.join(relative);
+    if direct.exists() {
+        return Ok(direct);
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let candidate = entry.path().join(relative);
+        if candidate.exists() {
+            candidates.push(candidate);
+        }
+    }
+    match candidates.len() {
+        0 => Ok(direct),
+        1 => Ok(candidates.remove(0)),
+        _ => Err(format!("GitHub 压缩包包含多个可匹配的顶层目录，无法确定路径: {relative}").into()),
+    }
+}
+
+fn package_identity(package: &Path, marker: &str) -> Result<(String, String), Box<dyn Error>> {
+    let content = fs::read_to_string(package.join(marker))?;
+    let value = serde_json::from_str::<serde_json::Value>(content.trim_start_matches('\u{feff}'))?;
+    let id = value
+        .get("id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{marker} 缺少 id"))?;
+    let version = value
+        .get("version")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("{marker} 缺少 version"))?;
+    Ok((id.to_string(), version.to_string()))
+}
+
+fn bind_extension_source(
+    root: &Path,
+    source: &GithubSourceSpec,
+    kind: &str,
+    key: &str,
+    version: &str,
+) -> Result<
+    Option<(
+        crate::app::extension_source::ExtensionSourceConfig,
+        crate::app::extension_source::ExtensionSourceCatalog,
+    )>,
+    Box<dyn Error>,
+> {
+    let candidates = [
+        if source.subpath.is_empty() {
+            String::new()
+        } else {
+            format!("{}/.himind/catalog.json", source.subpath)
+        },
+        ".himind/catalog.json".to_string(),
+    ];
+    for catalog_path in candidates {
+        if catalog_path.is_empty() {
+            continue;
+        }
+        let path = archive_relative_path(root, &catalog_path)?;
+        if !path.is_file() {
+            continue;
+        }
+        let catalog = serde_json::from_slice::<crate::app::extension_source::ExtensionSourceCatalog>(
+            &fs::read(&path)?,
+        )?;
+        let config = crate::app::extension_source::github_source_config(
+            &format!("GitHub: {}", source.repository),
+            &source.repository,
+            &source.reference,
+            Some(&catalog_path),
+            None,
+        )?;
+        crate::app::extension_source::validate_catalog(&catalog, &config)?;
+        let listed = match kind {
+            "plugin" => catalog
+                .plugins
+                .iter()
+                .any(|item| item.plugin_id == key && item.version == version),
+            "skill" => catalog
+                .skills
+                .iter()
+                .any(|item| item.skill_id == key && item.version == version),
+            _ => return Err("扩展类型无效".into()),
+        };
+        if !listed {
+            return Err(format!(
+                "GitHub 扩展目录未声明 {kind} {key} v{version}，无法建立自动更新来源"
+            )
+            .into());
+        }
+        return Ok(Some((config, catalog)));
+    }
+    Ok(None)
+}
+
+fn save_import_provenance(
+    source: &crate::app::extension_source::ExtensionSourceConfig,
+    catalog: &crate::app::extension_source::ExtensionSourceCatalog,
+    kind: &str,
+    key: &str,
+    version: &str,
+) -> Result<(), Box<dyn Error>> {
+    if kind == "plugin" {
+        if let Some(item) = catalog
+            .plugins
+            .iter()
+            .find(|item| item.plugin_id == key && item.version == version)
+        {
+            crate::app::extension_source::save_provenance(
+                source,
+                kind,
+                key,
+                version,
+                &item.download_url,
+                &item.sha256,
+                &item.signature_key_id,
+            )?;
+        } else {
+            return Err(format!(
+                "GitHub 扩展目录未声明插件 {} v{}，无法记录更新来源",
+                key, version
+            )
+            .into());
+        }
+    } else if kind == "skill" {
+        if let Some(item) = catalog
+            .skills
+            .iter()
+            .find(|item| item.skill_id == key && item.version == version)
+        {
+            crate::app::extension_source::save_provenance(
+                source,
+                kind,
+                key,
+                version,
+                &item.download_url,
+                &item.sha256,
+                &item.signature_key_id,
+            )?;
+        } else {
+            return Err(format!(
+                "GitHub 扩展目录未声明技能 {} v{}，无法记录更新来源",
+                key, version
+            )
+            .into());
+        }
+    } else {
+        return Err("扩展类型无效".into());
+    }
+    Ok(())
 }
 
 fn find_marker(root: &Path, marker: &str) -> Result<Option<PathBuf>, Box<dyn Error>> {
@@ -328,7 +502,12 @@ fn is_github_segment_byte(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_repository, parse_source_url, validate_reference, validate_subpath};
+    use super::{
+        archive_relative_path, parse_repository, parse_source_url, validate_reference,
+        validate_subpath,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn accepts_repository_forms_and_rejects_cross_host_urls() {
@@ -374,5 +553,40 @@ mod tests {
         assert!(validate_reference("../main").is_err());
         assert!(validate_subpath("skills/example").is_ok());
         assert!(validate_subpath("../outside").is_err());
+    }
+
+    #[test]
+    fn archive_paths_support_github_top_level_directory_without_guessing() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-github-path-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("repo-main").join("skills/demo")).unwrap();
+        assert_eq!(
+            archive_relative_path(&root, "skills/demo").unwrap(),
+            root.join("repo-main/skills/demo")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn archive_paths_reject_multiple_matching_top_level_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-github-ambiguous-path-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for directory in ["repo-main", "repo-extra"] {
+            fs::create_dir_all(root.join(directory).join("skills/demo")).unwrap();
+        }
+        assert!(archive_relative_path(&root, "skills/demo").is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

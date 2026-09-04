@@ -577,7 +577,7 @@ export function SettingsPage({
             <section className="card settings-section">
               <div className="card-header"><span>运行模式</span><Pill kind={agentMode?.mode === 'independent' ? 'success' : 'neutral'}>{agentMode?.mode === 'independent' ? 'Independent' : 'Connected'}</Pill></div>
               <div className="card-body setting-list">
-                <SettingRow title="Agent 运行模式" description="默认连接 Dashboard；独立模式保留本机 AI、技能、插件、MCP 和工程能力。">
+                <SettingRow title="Agent 运行模式" description="Independent 适合个人本机使用；Connected 适合接入组织控制面。">
                   <div className="mode-options" role="radiogroup" aria-label="Agent 运行模式">
                     <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>Connected</span></label>
                     <label className={agentMode?.mode === 'independent' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'independent'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('independent')} /><span>Independent</span></label>

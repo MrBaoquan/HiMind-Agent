@@ -30,16 +30,39 @@ pub(crate) fn validate_update_download_url(
     api_base: &str,
     download_url: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let api = Url::parse(api_base).map_err(|_| "Dashboard API 地址无效")?;
+    validate_update_download_url_for_source(api_base, download_url, "dashboard")
+}
+
+pub(crate) fn validate_update_download_url_for_source(
+    api_base: &str,
+    download_url: &str,
+    source: &str,
+) -> Result<(), Box<dyn Error>> {
     let download = Url::parse(download_url).map_err(|_| "Agent 更新包下载地址无效")?;
-    if !matches!(download.scheme(), "http" | "https") {
-        return Err("Agent 更新包只允许使用 HTTP 或 HTTPS 下载".into());
+    if download.scheme() != "https" && !(download.scheme() == "http" && source == "dashboard") {
+        return Err("Agent 更新包只允许使用 HTTPS 下载".into());
     }
-    if api.scheme() != download.scheme()
-        || api.host_str() != download.host_str()
-        || api.port_or_known_default() != download.port_or_known_default()
-    {
-        return Err("Agent 更新包下载地址必须与当前 Dashboard API 同源".into());
+    match source {
+        "github" => {
+            if download.host_str() != Some("github.com")
+                || !download.path().contains("/releases/download/")
+                || download.username() != ""
+                || download.password().is_some()
+                || download.port().is_some()
+            {
+                return Err("独立模式更新包必须来自 GitHub Release".into());
+            }
+        }
+        "dashboard" => {
+            let api = Url::parse(api_base).map_err(|_| "Dashboard API 地址无效")?;
+            if api.scheme() != download.scheme()
+                || api.host_str() != download.host_str()
+                || api.port_or_known_default() != download.port_or_known_default()
+            {
+                return Err("Agent 更新包下载地址必须与当前 Dashboard API 同源".into());
+            }
+        }
+        _ => return Err("Agent 更新来源无效".into()),
     }
     Ok(())
 }
@@ -1860,6 +1883,28 @@ mod tests {
         assert!(validate_update_download_url(
             "http://localhost:18081",
             "file:///C:/Temp/agent.exe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_only_github_release_urls_for_independent_updates() {
+        assert!(validate_update_download_url_for_source(
+            "",
+            "https://github.com/MrBaoquan/HiMind-Agent/releases/download/v0.3.40/himind-agent-update.zip",
+            "github"
+        )
+        .is_ok());
+        assert!(validate_update_download_url_for_source(
+            "https://himind.andcrane.com",
+            "https://raw.githubusercontent.com/MrBaoquan/HiMind-Agent/main/himind-agent-update.zip",
+            "github"
+        )
+        .is_err());
+        assert!(validate_update_download_url_for_source(
+            "https://himind.andcrane.com",
+            "https://github.com/MrBaoquan/HiMind-Agent/releases/download/v0.3.40/himind-agent-update.zip",
+            "unknown"
         )
         .is_err());
     }

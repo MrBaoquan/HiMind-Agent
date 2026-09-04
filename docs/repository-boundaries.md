@@ -24,10 +24,12 @@ client validation, trusted provider adapter, local gateway, UI, runtime,
 installer, and GitHub release pipeline.
 
 Dashboard release automation may call this repository's public scripts, but it
-must explicitly pass `-DefaultMode connected`. GitHub release automation does
-not pass that option and therefore produces `independent` installers.
+must explicitly pass `-DefaultMode connected`. Independent GitHub releases use
+`./scripts/publish-github-release.ps1`, which always produces an `independent`
+installer and does not depend on GitHub Actions.
 
-Official release workflows require `HIMIND_WINDOWS_CODE_SIGNING_PFX_B64` and
-`HIMIND_WINDOWS_CODE_SIGNING_PFX_PASSWORD`. The workflow signs all four
-portable binaries and the NSIS installer, and fails instead of publishing an
-unsigned fallback when signing material is unavailable.
+The local publisher requires the update signing private key, public key and key
+ID by default. The public key is embedded in the Agent and installed into the
+trusted key directory; the private key is used only by the local signing step.
+Windows Authenticode can be enabled independently through the existing
+certificate parameters and environment variables.

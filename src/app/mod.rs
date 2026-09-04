@@ -32,3 +32,4 @@ pub mod tray;
 pub mod types;
 pub(crate) mod ui;
 pub(crate) mod update_manager;
+pub(crate) mod update_source;

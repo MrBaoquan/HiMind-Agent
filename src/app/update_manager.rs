@@ -46,6 +46,8 @@ pub(crate) struct AgentUpdateStatus {
     pub current_version: String,
     #[serde(default = "default_channel")]
     pub channel: String,
+    #[serde(default = "default_update_source")]
+    pub source: String,
     #[serde(default)]
     pub available_version: String,
     #[serde(default)]
@@ -104,6 +106,7 @@ impl Default for AgentUpdateStatus {
             status: default_idle(),
             current_version: crate::VERSION.to_string(),
             channel: default_channel(),
+            source: default_update_source(),
             available_version: String::new(),
             release_id: String::new(),
             file_name: String::new(),
@@ -139,6 +142,18 @@ fn default_idle() -> String {
 
 fn default_channel() -> String {
     std::env::var("HIMIND_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "stable".to_string())
+}
+
+fn default_update_source() -> String {
+    "dashboard".to_string()
+}
+
+fn update_source_for_mode(options: &Options) -> &'static str {
+    if options.mode().dashboard_enabled() {
+        "dashboard"
+    } else {
+        "github"
+    }
 }
 
 fn default_package_type() -> String {
@@ -252,10 +267,15 @@ pub(crate) fn check_now(options: &Options) -> Result<AgentUpdateStatus, Box<dyn 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let distribution_state =
-        distribution::load_state(&distribution::distribution_state_path(&options.state_path))?
-            .ok_or("软件更新服务尚未完成设备注册")?;
-    check_with_state(&client, options, &distribution_state, true)
+    let distribution_state = if options.mode().dashboard_enabled() {
+        Some(
+            distribution::load_state(&distribution::distribution_state_path(&options.state_path))?
+                .ok_or("软件更新服务尚未完成设备注册")?,
+        )
+    } else {
+        None
+    };
+    check_with_state(&client, options, distribution_state.as_ref(), true)
 }
 
 pub(crate) fn background_check(
@@ -268,21 +288,38 @@ pub(crate) fn background_check(
     if !current.auto_check || !background_check_due(&current, options) {
         return Ok(current);
     }
-    check_with_state(client, options, distribution_state, false)
+    check_with_state(client, options, Some(distribution_state), false)
+}
+
+pub(crate) fn background_check_independent(
+    client: &reqwest::blocking::Client,
+    options: &Options,
+) -> Result<AgentUpdateStatus, Box<dyn Error>> {
+    let _guard = operation_lock()?;
+    let current = load(&options.state_path)?;
+    if !current.auto_check || !background_check_due(&current, options) {
+        return Ok(current);
+    }
+    check_with_state(client, options, None, false)
 }
 
 fn check_with_state(
     client: &reqwest::blocking::Client,
     options: &Options,
-    distribution_state: &DistributionState,
+    distribution_state: Option<&DistributionState>,
     manual: bool,
 ) -> Result<AgentUpdateStatus, Box<dyn Error>> {
     let mut status = load(&options.state_path)?;
+    status.source = update_source_for_mode(options).to_string();
     status.status = "checking".to_string();
     status.last_error.clear();
     save(&options.state_path, &status)?;
 
-    let update = match distribution::check_update(client, &options.api_base, distribution_state) {
+    let update = match if let Some(state) = distribution_state {
+        distribution::check_update(client, &options.api_base, state)
+    } else {
+        crate::app::update_source::check_github(client, options)
+    } {
         Ok(update) => update,
         Err(error) => {
             status.status = "failed".to_string();
@@ -308,19 +345,21 @@ fn check_with_state(
     save(&options.state_path, &status)?;
 
     if update.has_update && !was_same_release {
-        let _ = distribution::report_update_result(
-            client,
-            &options.api_base,
-            distribution_state,
-            "update_available",
-            crate::VERSION,
-            &update.version,
-            if manual {
-                "update discovered by manual check"
-            } else {
-                "update discovered by automatic check"
-            },
-        );
+        if let Some(state) = distribution_state {
+            let _ = distribution::report_update_result(
+                client,
+                &options.api_base,
+                state,
+                "update_available",
+                crate::VERSION,
+                &update.version,
+                if manual {
+                    "update discovered by manual check"
+                } else {
+                    "update discovered by automatic check"
+                },
+            );
+        }
     }
     if update.has_update && status.auto_download && status.status != "ready" {
         return download_locked(options, distribution_state, status);
@@ -378,22 +417,35 @@ fn apply_update_check(
 
 pub(crate) fn download(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Error>> {
     let _guard = operation_lock()?;
-    let distribution_state =
-        distribution::load_state(&distribution::distribution_state_path(&options.state_path))?
-            .ok_or("软件更新服务尚未完成设备注册")?;
+    let distribution_state = if options.mode().dashboard_enabled() {
+        Some(
+            distribution::load_state(&distribution::distribution_state_path(&options.state_path))?
+                .ok_or("软件更新服务尚未完成设备注册")?,
+        )
+    } else {
+        None
+    };
     let status = load(&options.state_path)?;
-    download_locked(options, &distribution_state, status)
+    let expected_source = update_source_for_mode(options);
+    if !status.available_version.trim().is_empty() && status.source != expected_source {
+        return Err("当前更新信息来自其他更新源，请先重新检查更新".into());
+    }
+    download_locked(options, distribution_state.as_ref(), status)
 }
 
 fn download_locked(
     options: &Options,
-    distribution_state: &DistributionState,
+    distribution_state: Option<&DistributionState>,
     mut status: AgentUpdateStatus,
 ) -> Result<AgentUpdateStatus, Box<dyn Error>> {
     if status.available_version.trim().is_empty() || status.download_url.trim().is_empty() {
         return Err("当前没有可下载的软件更新".into());
     }
-    crate::app::system::validate_update_download_url(&options.api_base, &status.download_url)?;
+    crate::app::system::validate_update_download_url_for_source(
+        &options.api_base,
+        &status.download_url,
+        &status.source,
+    )?;
     DOWNLOAD_CANCELED.store(false, Ordering::Relaxed);
     status.status = "downloading".to_string();
     status.downloaded_bytes = 0;
@@ -404,15 +456,17 @@ fn download_locked(
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()?;
-    let _ = distribution::report_update_result(
-        &client,
-        &options.api_base,
-        distribution_state,
-        "download_started",
-        crate::VERSION,
-        &status.available_version,
-        "",
-    );
+    if let Some(state) = distribution_state {
+        let _ = distribution::report_update_result(
+            &client,
+            &options.api_base,
+            state,
+            "download_started",
+            crate::VERSION,
+            &status.available_version,
+            "",
+        );
+    }
     let result = download_to_staging(&client, options, distribution_state, &mut status);
     if let Err(error) = result {
         status.status = if DOWNLOAD_CANCELED.load(Ordering::Relaxed) {
@@ -422,19 +476,21 @@ fn download_locked(
         };
         status.last_error = error.to_string();
         save(&options.state_path, &status)?;
-        let _ = distribution::report_update_result(
-            &client,
-            &options.api_base,
-            distribution_state,
-            if DOWNLOAD_CANCELED.load(Ordering::Relaxed) {
-                "download_canceled"
-            } else {
-                "update_failed"
-            },
-            crate::VERSION,
-            &status.available_version,
-            &status.last_error,
-        );
+        if let Some(state) = distribution_state {
+            let _ = distribution::report_update_result(
+                &client,
+                &options.api_base,
+                state,
+                if DOWNLOAD_CANCELED.load(Ordering::Relaxed) {
+                    "download_canceled"
+                } else {
+                    "update_failed"
+                },
+                crate::VERSION,
+                &status.available_version,
+                &status.last_error,
+            );
+        }
         return Err(error);
     }
     status.status = "ready".to_string();
@@ -442,28 +498,31 @@ fn download_locked(
     status.progress_percent = 100;
     status.last_error.clear();
     save(&options.state_path, &status)?;
-    let _ = distribution::report_update_result(
-        &client,
-        &options.api_base,
-        distribution_state,
-        "download_ready",
-        crate::VERSION,
-        &status.available_version,
-        "artifact verified and ready to install",
-    );
+    if let Some(state) = distribution_state {
+        let _ = distribution::report_update_result(
+            &client,
+            &options.api_base,
+            state,
+            "download_ready",
+            crate::VERSION,
+            &status.available_version,
+            "artifact verified and ready to install",
+        );
+    }
     Ok(status)
 }
 
 fn download_to_staging(
     client: &reqwest::blocking::Client,
     options: &Options,
-    distribution_state: &DistributionState,
+    distribution_state: Option<&DistributionState>,
     status: &mut AgentUpdateStatus,
 ) -> Result<(), Box<dyn Error>> {
-    let mut response = client
-        .get(&status.download_url)
-        .bearer_auth(&distribution_state.token)
-        .send()?;
+    let mut request = client.get(&status.download_url);
+    if let Some(state) = distribution_state {
+        request = request.bearer_auth(&state.token);
+    }
+    let mut response = request.send()?;
     response.error_for_status_ref()?;
     let staging = staging_directory()?;
     fs::create_dir_all(&staging)?;

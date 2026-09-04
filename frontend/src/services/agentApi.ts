@@ -61,6 +61,7 @@ export type AgentUpdateStatus = {
     status: 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'installing' | 'failed' | 'rolled_back' | string;
     current_version: string;
     channel: string;
+    source: 'dashboard' | 'github' | string;
     available_version: string;
     release_id: string;
     file_name: string;

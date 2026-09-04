@@ -144,6 +144,21 @@ pub(crate) fn add_github_source(
     catalog_path: Option<&str>,
     verification: Option<&str>,
 ) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
+    let source = github_source_config(name, repository, reference, catalog_path, verification)?;
+    upsert_source(source)
+}
+
+/// Build a validated GitHub source without persisting it.
+///
+/// Importers use this before writing settings so a malformed catalog cannot
+/// leave an unusable source behind when a one-click import fails.
+pub(crate) fn github_source_config(
+    name: &str,
+    repository: &str,
+    reference: &str,
+    catalog_path: Option<&str>,
+    verification: Option<&str>,
+) -> Result<ExtensionSourceConfig, Box<dyn Error>> {
     let parsed = crate::app::github_source::parse_source_url(repository)?;
     let repository = parsed.repository;
     let reference = if !parsed.reference.is_empty() {
@@ -165,8 +180,7 @@ pub(crate) fn add_github_source(
         };
     let verification = source_verification(&repository, verification)?;
     let id = source_id(&repository, &reference, &catalog_path);
-    let mut current = settings()?;
-    let source = ExtensionSourceConfig {
+    Ok(ExtensionSourceConfig {
         id: id.clone(),
         name: if name.trim().is_empty() {
             repository.clone()
@@ -179,7 +193,14 @@ pub(crate) fn add_github_source(
         enabled: true,
         auto_update: false,
         verification,
-    };
+    })
+}
+
+pub(crate) fn upsert_source(
+    source: ExtensionSourceConfig,
+) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
+    let mut current = settings()?;
+    let id = source.id.clone();
     if let Some(existing) = current.sources.iter_mut().find(|item| item.id == id) {
         *existing = source;
     } else {
@@ -1060,7 +1081,7 @@ fn fetch_catalog(source: &ExtensionSourceConfig) -> Result<ExtensionSourceCatalo
     Ok(catalog)
 }
 
-fn validate_catalog(
+pub(crate) fn validate_catalog(
     catalog: &ExtensionSourceCatalog,
     source: &ExtensionSourceConfig,
 ) -> Result<(), Box<dyn Error>> {

@@ -180,6 +180,35 @@ pub(crate) fn start_background_services(
             state.dashboard_worker_error.clear();
         }
         let independent_options = options.clone();
+        let _ =
+            thread::Builder::new()
+                .name("himind-independent-update-loop".to_string())
+                .spawn({
+                    let update_options = options.clone();
+                    move || {
+                        let client = match reqwest::blocking::Client::builder()
+                            .timeout(Duration::from_secs(30))
+                            .build()
+                        {
+                            Ok(client) => client,
+                            Err(error) => {
+                                eprintln!("independent Agent update client unavailable: {error}");
+                                return;
+                            }
+                        };
+                        loop {
+                            if let Err(error) =
+                                crate::app::update_manager::background_check_independent(
+                                    &client,
+                                    &update_options,
+                                )
+                            {
+                                eprintln!("independent Agent update check failed: {error}");
+                            }
+                            thread::sleep(Duration::from_secs(60));
+                        }
+                    }
+                });
         let _ = thread::Builder::new()
             .name("himind-extension-reconcile-loop".to_string())
             .spawn(move || {
