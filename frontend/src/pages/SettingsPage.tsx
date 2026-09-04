@@ -19,6 +19,10 @@ const BUILTIN_APPROVAL_RULES = new Set(['remote_connect', 'upload_code', 'upload
 type ApprovalProfile = 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'silent_deny';
 type ApprovalRuleMode = 'inherit' | 'manual' | 'auto_approve' | 'auto_deny';
 
+function agentModeLabel(mode?: string) {
+  return mode === 'independent' ? '独立模式' : '组织模式';
+}
+
 const APPROVAL_PROFILE_OPTIONS = [
   { value: 'strict', label: '更安全', description: '除单独授权外，受控操作都先确认', icon: ShieldAlert },
   { value: 'balanced', label: '推荐', description: '查询预览自动执行，修改操作先确认', icon: ShieldCheck },
@@ -273,10 +277,10 @@ export function SettingsPage({
 
   async function changeAgentMode(mode: 'connected' | 'independent') {
     if (!agentMode || agentMode.mode === mode || agentModeBusy) return;
-    const title = mode === 'independent' ? '开启独立模式？' : '切回 Connected 模式？';
+    const title = mode === 'independent' ? '切换到独立模式？' : '切换到组织模式？';
     const message = mode === 'independent'
-      ? '独立模式不会启动 Dashboard Worker，但仍可使用 DSH 原生 AI、技能、插件、MCP 和本机能力。保存后需重启 Agent。'
-      : 'Connected 模式会重新启用 Dashboard Worker。保存后需重启 Agent。';
+      ? '保留本机 AI、技能、插件、MCP 和工程能力，不参与组织调度。保存后需重启 Agent。'
+      : '接入 HiMind 工作台，启用组织调度、共享服务和审计。保存后需重启 Agent。';
     if (!window.confirm(`${title}\n\n${message}`)) return;
     setAgentModeBusy(true);
     setAgentModeFeedback('');
@@ -575,17 +579,17 @@ export function SettingsPage({
 
           {section === 'general' ? <>
             <section className="card settings-section">
-              <div className="card-header"><span>运行模式</span><Pill kind={agentMode?.mode === 'independent' ? 'success' : 'neutral'}>{agentMode?.mode === 'independent' ? 'Independent' : 'Connected'}</Pill></div>
+              <div className="card-header"><span>运行模式</span><Pill kind={agentMode?.mode === 'independent' ? 'success' : 'neutral'}>{agentModeLabel(agentMode?.mode)}</Pill></div>
               <div className="card-body setting-list">
-                <SettingRow title="Agent 运行模式" description="Independent 适合个人本机使用；Connected 适合接入组织控制面。">
+                <SettingRow title="Agent 运行模式" description="独立模式适合个人使用；组织模式适合接入 HiMind 工作台。">
                   <div className="mode-options" role="radiogroup" aria-label="Agent 运行模式">
-                    <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>Connected</span></label>
-                    <label className={agentMode?.mode === 'independent' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'independent'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('independent')} /><span>Independent</span></label>
+                    <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>组织模式</span></label>
+                    <label className={agentMode?.mode === 'independent' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'independent'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('independent')} /><span>独立模式</span></label>
                   </div>
                 </SettingRow>
                 {agentMode ? <div className="mode-state-summary" role="status">
-                  <span>当前生效：{agentMode.effective_mode === 'independent' ? 'Independent' : 'Connected'}</span>
-                  <span>重启后：{agentMode.pending_mode === 'independent' ? 'Independent' : 'Connected'}</span>
+                  <span>当前生效：{agentModeLabel(agentMode.effective_mode)}</span>
+                  <span>重启后：{agentModeLabel(agentMode.pending_mode)}</span>
                   {agentMode.requires_restart ? <strong>重启 Agent 后切换</strong> : null}
                 </div> : null}
                 {agentModeFeedback ? <div className="inline-feedback visible" role="status">{agentModeFeedback}</div> : null}

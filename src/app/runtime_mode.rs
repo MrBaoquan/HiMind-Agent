@@ -72,7 +72,7 @@ impl AgentMode {
 pub(crate) fn control_plane_required_error() -> String {
     serde_json::json!({
         "code": "control_plane_required",
-        "message": "当前运行模式不支持此功能；如需使用，请在设置中切换 Connected 模式并重启 Agent"
+        "message": "当前运行模式不支持此功能；如需使用，请在设置中切换到组织模式并重启 Agent"
     })
     .to_string()
 }

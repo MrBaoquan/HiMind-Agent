@@ -1579,7 +1579,7 @@ impl CapabilityGateway {
             return Err(serde_json::json!({
                 "code": "control_plane_required",
                 "capability_id": capability_id,
-                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换 Connected 模式并重启 Agent"
+                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换到组织模式并重启 Agent"
             })
             .to_string()
             .into());
@@ -2599,14 +2599,14 @@ impl CapabilityGateway {
         let mut warnings = Vec::new();
         if !self.options.mode().dashboard_enabled() {
             warnings.push(crate::extension_authoring::warning(
-                "Independent 模式可完成本地创作、候选测试和客户端注册；提审与组织分发需在 Connected 模式执行。",
+                "独立模式可完成本地创作、候选测试和客户端注册；提审与组织分发需在组织模式执行。",
             ));
         } else if crate::api::client::load_agent_state(&self.options.state_path)
             .ok()
             .is_none_or(|state| state.agent_id.trim().is_empty())
         {
             warnings.push(crate::extension_authoring::warning(
-                "当前为 Connected 模式，但 Agent 尚未完成 Dashboard 配对；本地创作不受影响，提审前需完成配对。",
+                "当前为组织模式，但 Agent 尚未完成工作台配对；本地创作不受影响，提审前需完成配对。",
             ));
         }
         let next_steps = vec![
@@ -3024,7 +3024,7 @@ impl CapabilityGateway {
             return Err(serde_json::json!({
                 "code": "control_plane_required",
                 "capability_id": capability_id,
-                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换 Connected 模式并重启 Agent"
+                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换到组织模式并重启 Agent"
             })
             .to_string()
             .into());

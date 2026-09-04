@@ -759,9 +759,7 @@ fn resolve_credential(
     let service = service.trim();
     if service.is_empty() || service == "managed" {
         if !options.mode().dashboard_enabled() {
-            return Err(
-                "HiMind 分发服务需要 Connected 模式；独立模式请从本机自定义 AI 服务导入".into(),
-            );
+            return Err("HiMind 分发服务需要组织模式；独立模式请从本机自定义 AI 服务导入".into());
         }
         return fetch_client_credential(options, expected_user_id, client_id);
     }
