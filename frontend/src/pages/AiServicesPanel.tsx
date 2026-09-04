@@ -58,9 +58,10 @@ export function AiServicesPanel({
 
   const customServices = aiServices?.custom?.services ?? [];
   const managed = aiServices?.managed ?? { available: false };
+  const independentMode = managed.reason === 'independent';
   const clientStatuses = aiServices?.clients?.targets ?? [];
   const importedClientCount = clientStatuses.filter((client) => client.state === 'imported').length;
-  const serviceCount = customServices.length + 1;
+  const serviceCount = customServices.length + (independentMode ? 0 : 1);
   const editing = editingServiceId !== null;
 
   function applyPreset(presetId: string) {
@@ -270,13 +271,13 @@ export function AiServicesPanel({
 
         {serviceCount ? (
           <div className="ai-client-list">
-            <ManagedServiceCard managed={managed} clientStatuses={clientStatuses} importing={importingClient} removing={removingClient} onImport={async (target) => { setImportingClient(target); try { await onImportAIClient(target, 'managed'); } finally { setImportingClient(null); await onRefresh(); } }} onRemove={removeFromClient} onOpenAccount={onOpenAccount} onRefresh={onRefresh} />
+            {!independentMode ? <ManagedServiceCard managed={managed} clientStatuses={clientStatuses} importing={importingClient} removing={removingClient} onImport={async (target) => { setImportingClient(target); try { await onImportAIClient(target, 'managed'); } finally { setImportingClient(null); await onRefresh(); } }} onRemove={removeFromClient} onOpenAccount={onOpenAccount} onRefresh={onRefresh} /> : null}
             {customServices.map((service) => (
               <AiServiceRow key={service.id} service={service} clientStatuses={clientStatuses} importing={importingClient} removing={removingClient} importSelection={importService[service.id] ?? ''} onImportSelectionChange={(targetId) => setImportService((current) => ({ ...current, [service.id]: targetId }))} onImport={importToClient} onEdit={openEditService} onRemove={(id) => void onRemoveAIService(id).then(onRefresh)} />
             ))}
           </div>
         ) : (
-          <div className="ai-empty-row"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>暂无可用 AI 服务，点击「新增服务」添加本机服务，或先配置 Dashboard 分发服务。</span></div>
+          <div className="ai-empty-row"><span className="ai-empty-icon"><CircleDashed size={14} /></span><span>{independentMode ? '暂无 AI 服务，点击「新增服务」添加本机服务。' : '暂无可用 AI 服务，点击「新增服务」添加本机服务，或先配置工作台服务。'}</span></div>
         )}
       </section>
     </div>

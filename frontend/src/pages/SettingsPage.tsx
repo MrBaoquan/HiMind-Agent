@@ -20,7 +20,9 @@ type ApprovalProfile = 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'silent_d
 type ApprovalRuleMode = 'inherit' | 'manual' | 'auto_approve' | 'auto_deny';
 
 function agentModeLabel(mode?: string) {
-  return mode === 'independent' ? '独立模式' : '组织模式';
+  if (mode === 'independent') return '独立模式';
+  if (mode === 'connected') return '组织模式';
+  return '未确定';
 }
 
 const APPROVAL_PROFILE_OPTIONS = [
