@@ -4918,11 +4918,21 @@ mod tests {
 
     #[test]
     fn authoring_tool_workspace_guard_rejects_missing_binding() {
+        let requested = std::env::temp_dir().join(format!(
+            "himind-authoring-workspace-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&requested).unwrap();
         let error = validate_extension_tool_workspace(&json!({
-            "workspace_root": "C:\\definitely-not-the-agent-workspace"
+            "workspace_root": requested.to_string_lossy()
         }))
         .unwrap_err()
         .to_string();
+        let _ = std::fs::remove_dir_all(&requested);
         assert!(
             error.contains("extension_workspace_unbound")
                 || error.contains("extension_workspace_mismatch")
