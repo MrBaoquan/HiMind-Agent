@@ -6,8 +6,11 @@ param(
     [string]$PrivateKeyPath,
     [string]$PublicKeyPath,
     [string]$SigningKeyId,
+    [string]$WindowsCodeSigningCertificateThumbprint,
+    [string]$WindowsTimestampUrl = "http://timestamp.sectigo.com",
     [string]$ReleaseNotes = "",
     [switch]$AllowUnsigned,
+    [switch]$SkipWindowsTimestamp,
     [switch]$SkipBuild,
     [switch]$SkipTests,
     [switch]$SkipGhRelease,
@@ -79,6 +82,11 @@ try {
         [Environment]::SetEnvironmentVariable("HIMIND_SIGNING_KEY_ID", $SigningKeyId, "Process")
     }
     $packageArgs = @{ Version = $Version; OutputDirectory = $OutputRoot; Configuration = "release" }
+    if ($WindowsCodeSigningCertificateThumbprint) {
+        $packageArgs.WindowsCodeSigningCertificateThumbprint = $WindowsCodeSigningCertificateThumbprint
+    }
+    if ($WindowsTimestampUrl) { $packageArgs.WindowsTimestampUrl = $WindowsTimestampUrl }
+    if ($SkipWindowsTimestamp) { $packageArgs.SkipWindowsTimestamp = $true }
     if ($SkipBuild) { $packageArgs.SkipBuild = $true }
     if ($SkipTests) { $packageArgs.SkipTests = $true }
     & (Join-Path $PSScriptRoot "package.ps1") @packageArgs | Out-Host
@@ -105,6 +113,11 @@ $installerArgs = @{
     DefaultMode = "independent"
     VSCodeExtensionPath = (Join-Path $ReleaseDirectory "resources\vscode\himind-ai.vsix")
 }
+if ($WindowsCodeSigningCertificateThumbprint) {
+    $installerArgs.WindowsCodeSigningCertificateThumbprint = $WindowsCodeSigningCertificateThumbprint
+}
+if ($WindowsTimestampUrl) { $installerArgs.WindowsTimestampUrl = $WindowsTimestampUrl }
+if ($SkipWindowsTimestamp) { $installerArgs.SkipWindowsTimestamp = $true }
 if ($hasSigning) {
     $installerArgs.PublicKeyPath = $PublicKeyPath
     $installerArgs.SigningKeyId = $SigningKeyId
