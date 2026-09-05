@@ -49,7 +49,8 @@ export function DashboardPage({
   }
 
   const independentMode = status.mode === 'independent' || status.dashboard_enabled === false;
-  const workerOnline = status.dashboard_worker_online;
+  const workerExpected = status.dashboard_worker_expected ?? status.dashboard_enabled !== false;
+  const workerOnline = !workerExpected || status.dashboard_worker_online;
   if (independentMode) {
     return (
       <div className="dashboard-page">
@@ -79,7 +80,7 @@ export function DashboardPage({
       </div>
     );
   }
-  const workerIssue = describeWorkerIssue(status.dashboard_worker_error);
+  const workerIssue = describeWorkerIssue(status.dashboard_worker_error, status.dashboard_worker_reason_code);
   const aiReadyCount = mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected && target.state === 'configured').length;
   const aiInstalledCount = mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected).length;
   return (
@@ -90,7 +91,7 @@ export function DashboardPage({
         actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
-      {!workerOnline ? <div className="blocker"><CircleAlert size={18} /><div><strong>{workerIssue.title}</strong><span>{workerIssue.description}</span></div></div> : null}
+      {workerExpected && !workerOnline ? <div className="blocker"><CircleAlert size={18} /><div><strong>{workerIssue.title}</strong><span>{workerIssue.description}</span></div></div> : null}
       <DashboardIdentityPanel
         identity={identity}
         authorization={authorization}
@@ -164,9 +165,25 @@ function updateBannerMessage(status: AgentUpdateStatus) {
   return status.release_notes || '可以先下载，准备完成后再选择何时重启。';
 }
 
-function describeWorkerIssue(error?: string) {
+function describeWorkerIssue(error?: string, reasonCode?: string) {
   const value = error?.trim() || '';
   const normalized = value.toLowerCase();
+  if (reasonCode === 'connected_agent_app_starting') {
+    return {
+      title: '正在连接工作台',
+      description: 'Agent 正在建立任务连接，请稍候刷新状态。',
+      healthDescription: '本机服务正在建立工作台任务连接。',
+      requiresEnrollment: false,
+    };
+  }
+  if (reasonCode === 'connected_agent_app_worker_error' && !value) {
+    return {
+      title: '工作台连接需要处理',
+      description: '请刷新状态；若问题持续，请从工作台重新连接 Agent。',
+      healthDescription: '本机服务仍在运行，但工作台任务连接尚未就绪。',
+      requiresEnrollment: false,
+    };
+  }
   if (
     normalized.includes('credential is no longer valid')
     || normalized.includes('authorize a new enrollment')

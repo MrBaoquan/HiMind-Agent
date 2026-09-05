@@ -29,7 +29,9 @@ use crate::capability::plugin::{
 use crate::capability::software_distribution::{
     attach_inspection_receipt, consume_inspection_receipt, verify_inspection_receipt,
 };
-use crate::capability::types::{CapabilityAvailability, CapabilityDescriptor, InvocationContext};
+use crate::capability::types::{
+    CapabilityAvailability, CapabilityDescriptor, InvocationContext, InvocationTransport,
+};
 use crate::store::credentials::{local_login_status_json, local_login_status_value};
 use crate::store::types::LocalWorkerStatus;
 use crate::svn::service::{
@@ -241,7 +243,11 @@ impl CapabilityGateway {
                 }
                 true
             })
-            .map(|registration| registration.descriptor)
+            .map(|registration| {
+                let mut descriptor = registration.descriptor;
+                annotate_business_exhibit_id_contract(&mut descriptor);
+                descriptor
+            })
             .collect())
     }
 
@@ -622,7 +628,7 @@ impl CapabilityGateway {
             registration(
                 "system.health",
                 "Agent 健康状态",
-                "读取本机 Agent 版本、Worker 状态、本地服务能力和登录状态。",
+                "读取本机 Agent 版本、能力网关、控制面和登录状态。stdio companion 下 dashboard_worker_state=not_applicable 属于正常状态；判断 Worker 是否异常请看 dashboard_worker_expected 和 dashboard_worker_state。",
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::SystemHealth,
@@ -1585,6 +1591,10 @@ impl CapabilityGateway {
             .into());
         }
         validate_capability_input_schema(&registration.descriptor.input_schema, &input)?;
+        // The pid/display-number rule belongs to Dashboard business
+        // capabilities only. A local plugin is allowed to define its own
+        // `exhibit_id` argument with unrelated semantics.
+        validate_exhibit_route_id_input(&registration.descriptor, &input)?;
         let mut approval_proof =
             self.enforce_high_risk_approval(context, &registration.descriptor, &input)?;
         if (registration.descriptor.approval_required
@@ -2202,9 +2212,54 @@ impl CapabilityGateway {
 
     pub(crate) fn health(&self, context: &InvocationContext) -> Value {
         let worker = local_worker_snapshot(&self.worker_status);
+        let mcp_stdio = context.transport == InvocationTransport::Stdio;
+        let worker_state = if mcp_stdio {
+            "not_applicable"
+        } else {
+            worker["dashboard_worker_state"]
+                .as_str()
+                .unwrap_or("unknown")
+        };
+        let worker_expected = if mcp_stdio {
+            false
+        } else {
+            worker["dashboard_worker_expected"]
+                .as_bool()
+                .unwrap_or(false)
+        };
+        let mcp_transport = if mcp_stdio {
+            InvocationTransport::Stdio.as_str()
+        } else {
+            worker["mcp_transport"]
+                .as_str()
+                .unwrap_or(InvocationTransport::LocalHttp.as_str())
+        };
+        let worker_error = if mcp_stdio || worker_state == "not_applicable" {
+            Value::Null
+        } else {
+            worker["dashboard_worker_error"].clone()
+        };
+        let local_service_expected = !mcp_stdio;
+        let worker_reason_code = if mcp_stdio {
+            "stdio_companion_gateway_only"
+        } else if worker_state == "not_applicable" && !self.options.mode().control_plane_enabled() {
+            "independent_mode_no_control_plane"
+        } else {
+            worker["dashboard_worker_reason_code"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(match worker_state {
+                    "online" => "connected_agent_app_worker",
+                    "connecting" => "connected_agent_app_starting",
+                    "offline" => "connected_agent_app_worker_error",
+                    _ => "worker_status_unknown",
+                })
+        };
         let executable = local_agent_executable_metadata();
         json!({
             "status": "online",
+            "runtime_schema_version": 1,
+            "dashboard_worker_online_semantics": "legacy_boolean_use_expected_state",
             "version": VERSION,
             "mode": self.options.mode().as_str(),
             "dashboard_enabled": self.options.mode().dashboard_enabled(),
@@ -2212,6 +2267,10 @@ impl CapabilityGateway {
                 "kind": self.options.mode().control_plane(),
                 "enabled": self.options.mode().control_plane_enabled(),
                 "worker_online": worker["dashboard_worker_online"],
+                "worker_state": worker_state,
+                "worker_expected": worker_expected,
+                "worker_reason_code": worker_reason_code,
+                "available": self.options.mode().control_plane_enabled(),
             }),
             "business_integration": json!({
                 "provider_id": self.business_provider.provider_id(),
@@ -2232,7 +2291,12 @@ impl CapabilityGateway {
             "login_status": local_login_status_value(),
             "dashboard_worker_online": worker["dashboard_worker_online"],
             "dashboard_agent_id": worker["dashboard_agent_id"],
-            "dashboard_worker_error": worker["dashboard_worker_error"],
+            "dashboard_worker_error": worker_error,
+            "dashboard_worker_state": worker_state,
+            "dashboard_worker_expected": worker_expected,
+            "dashboard_worker_reason_code": worker_reason_code,
+            "mcp_transport": mcp_transport,
+            "local_service_expected": local_service_expected,
             "svn_admin_ready": crate::svn::service::svn_admin_ready(),
             "svn_admin_status": crate::svn::service::svn_admin_status(),
             "local_service_online": worker["local_service_online"],
@@ -2241,6 +2305,27 @@ impl CapabilityGateway {
             "capabilities": self.list_capabilities(context).map(|items| items.len()).unwrap_or_default(),
             "local_port": self.options.local_port,
             "profile": crate::store::paths::profile_name(),
+        })
+    }
+
+    /// Runtime facts used by MCP `initialize`. This is deliberately
+    /// structured so clients can branch on mode/control-plane availability
+    /// without making a second health call or parsing prose.
+    pub(crate) fn mcp_runtime_metadata(&self) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "transport": InvocationTransport::Stdio.as_str(),
+            "mode": self.options.mode().as_str(),
+            "dashboardEnabled": self.options.mode().dashboard_enabled(),
+            "dashboardWorkerState": "not_applicable",
+            "dashboardWorkerExpected": false,
+            "dashboardWorkerReasonCode": "stdio_companion_gateway_only",
+            "localServiceExpected": false,
+            "controlPlane": {
+                "kind": self.options.mode().control_plane(),
+                "enabled": self.options.mode().control_plane_enabled(),
+                "available": self.options.mode().control_plane_enabled(),
+            }
         })
     }
 
@@ -3913,6 +3998,44 @@ fn validate_capability_input_schema(schema: &Value, input: &Value) -> Result<(),
     validate_capability_value("capability input", schema, input)
 }
 
+fn validate_exhibit_route_id_input(
+    descriptor: &CapabilityDescriptor,
+    input: &Value,
+) -> Result<(), Box<dyn Error>> {
+    if !descriptor.dashboard_provider {
+        return Ok(());
+    }
+    let Some(value) = input.get("exhibit_id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let normalized = value.trim();
+    let is_display_number = normalized
+        .get(..3)
+        .map(|prefix| {
+            prefix.eq_ignore_ascii_case("ex-")
+                && normalized
+                    .get(3..)
+                    .map(|suffix| {
+                        !suffix.is_empty()
+                            && suffix.chars().all(|character| character.is_ascii_digit())
+                    })
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if is_display_number {
+        return Err(serde_json::json!({
+            "code": "EXHIBIT_ROUTE_ID_REQUIRED",
+            "field": "exhibit_id",
+            "display_id": normalized,
+            "message": format!("展项参数使用了展示编号 {normalized}。请先调用 business.exhibit.list 或 context.resolve，并使用返回项的 pid 作为 exhibit_id。"),
+            "hint": "EX-xxxx 仅用于展示；后续展项读取、人员、需求和工作区操作必须传入 list 返回的 pid。"
+        })
+        .to_string()
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_capability_value(
     name: &str,
     schema: &Value,
@@ -4079,6 +4202,40 @@ fn matches_capability_pattern(pattern: &str, value: &str) -> bool {
         return value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     }
     true
+}
+
+const EXHIBIT_ROUTE_ID_DESCRIPTION: &str =
+    "使用 business.exhibit.list 或 context.resolve 返回的 pid（展项路由 ID）；exhibit_id（如 EX-0021）只是展示编号，不能直接使用。";
+
+/// Add the stable exhibit identifier rule to every projected business
+/// capability. Dashboard catalogs are allowed to update schemas at runtime,
+/// so this normalization belongs at the final Gateway projection boundary
+/// instead of being duplicated in each provider contract.
+fn annotate_business_exhibit_id_contract(descriptor: &mut CapabilityDescriptor) {
+    if descriptor.id == "business.exhibit.list" {
+        let suffix =
+            " 返回项中的 pid 才能作为后续 exhibit_id；exhibit_id（如 EX-0021）只是展示编号。";
+        if !descriptor.description.contains("pid") {
+            descriptor.description.push_str(suffix);
+        }
+    }
+    let Some(properties) = descriptor
+        .input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(exhibit_id) = properties.get_mut("exhibit_id") else {
+        return;
+    };
+    let Some(schema) = exhibit_id.as_object_mut() else {
+        return;
+    };
+    schema.insert(
+        "description".to_string(),
+        Value::String(EXHIBIT_ROUTE_ID_DESCRIPTION.to_string()),
+    );
 }
 
 fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailability {
@@ -4806,6 +4963,7 @@ fn insert_registration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::types::{InvocationSource, InvocationTransport};
 
     #[test]
     fn svn_admin_capabilities_are_worker_only() {
@@ -4850,6 +5008,49 @@ mod tests {
         let error = insert_registration(&mut registry, item).unwrap_err();
 
         assert_eq!(error.to_string(), "capability id is required");
+    }
+
+    #[test]
+    fn health_distinguishes_mcp_stdio_from_mcp_over_local_http() {
+        let mut options = crate::Options::from_env();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let gateway = CapabilityGateway::new(
+            options,
+            Arc::new(Mutex::new(LocalWorkerStatus {
+                dashboard_worker_state: "offline".to_string(),
+                dashboard_worker_reason_code: "connected_agent_app_worker_error".to_string(),
+                worker_transport: "local_http".to_string(),
+                dashboard_worker_error: "connection failed".to_string(),
+                ..LocalWorkerStatus::default()
+            })),
+        );
+
+        let stdio = gateway.health(&InvocationContext::with_transport(
+            InvocationSource::Mcp,
+            InvocationTransport::Stdio,
+            "stdio-client",
+        ));
+        assert_eq!(stdio["runtime_schema_version"], 1);
+        assert_eq!(
+            stdio["dashboard_worker_online_semantics"],
+            "legacy_boolean_use_expected_state"
+        );
+        assert_eq!(stdio["mcp_transport"], "stdio");
+        assert_eq!(stdio["dashboard_worker_expected"], false);
+        assert_eq!(stdio["dashboard_worker_state"], "not_applicable");
+
+        let http = gateway.health(&InvocationContext::with_transport(
+            InvocationSource::Mcp,
+            InvocationTransport::LocalHttp,
+            "http-client",
+        ));
+        assert_eq!(http["mcp_transport"], "local_http");
+        assert_eq!(http["dashboard_worker_expected"], true);
+        assert_eq!(http["dashboard_worker_state"], "offline");
+        assert_eq!(
+            http["dashboard_worker_reason_code"],
+            "connected_agent_app_worker_error"
+        );
     }
 
     #[test]
@@ -4914,6 +5115,46 @@ mod tests {
             &item.handler
         ));
         assert!(!item.descriptor.approval_required);
+    }
+
+    #[test]
+    fn exhibit_route_id_guard_does_not_redefine_plugin_arguments() {
+        let plugin = registration(
+            "plugin.exhibit.lookup",
+            "插件展项查询",
+            "插件自定义展项参数",
+            "read_only",
+            json!({
+                "type": "object",
+                "properties": {"exhibit_id": {"type": "string"}},
+                "required": ["exhibit_id"]
+            }),
+            CapabilityHandler::PluginCapability("plugin.exhibit.lookup".into()),
+        );
+        assert!(validate_exhibit_route_id_input(
+            &plugin.descriptor,
+            &json!({"exhibit_id": "EX-0021"})
+        )
+        .is_ok());
+
+        let dashboard = dashboard_business_registration(
+            "business.exhibit.get",
+            "读取展项",
+            "读取展项",
+            "read_only",
+            json!({
+                "type": "object",
+                "properties": {"exhibit_id": {"type": "string"}},
+                "required": ["exhibit_id"]
+            }),
+            CapabilityHandler::DashboardExhibitContext,
+        );
+        let error = validate_exhibit_route_id_input(
+            &dashboard.descriptor,
+            &json!({"exhibit_id": "EX-0021"}),
+        )
+        .expect_err("Dashboard exhibit display id must be rejected");
+        assert!(error.to_string().contains("EXHIBIT_ROUTE_ID_REQUIRED"));
     }
 
     #[test]

@@ -68,6 +68,8 @@ Agent 主窗口前端采用 React + TypeScript + Vite：`frontend/src/` 按 Shel
 
 MCP 接入由统一 Registry、目标适配和真实探测组成。Registry 继续读取 `himind-ai-mcp.json`，但 DSH、Agent MCP、CLI 和 Tauri 都通过同一模型访问；环境变量、请求头和疑似密钥参数不会出现在公开快照中。除 Codex、GitHub Copilot、WorkBuddy 外，面板和 CLI 还可注册 Claude、VS Code、Cursor、Windsurf、Qoder、ZCode、Gemini CLI、OpenCode、Kimi Code、Kiro、Qwen Code、Trae 等客户端。目标配置写入前保留备份，损坏配置必须显式选择重建；需要保留客户端专有配置格式的目标只提供手动配置片段，不参与批量写入。可用命令为 `himind-agent mcp list|targets|inspect|plan|apply|apply-all|remove|remove-all|test`，批量操作默认只处理已检测且支持自动配置的客户端，并逐目标返回成功、失败和跳过明细。
 
+外部 AI 通过 stdio companion 调用时，companion 只启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。`system.health` 的 `local_service_expected=false`、`dashboard_worker_state=not_applicable`、`dashboard_worker_expected=false`、`dashboard_worker_reason_code=stdio_companion_gateway_only` 是正常状态；外部工具必须先看 `dashboard_worker_expected` 和 `local_service_expected`，不要把对应的 `*_online=false` 当成 MCP 故障。调用项目/展项业务能力时先使用 `business.exhibit.list` 或 `context.resolve`，后续 `exhibit_id` 必须传返回项的 `pid`，`EX-xxxx` 只是展示编号；误用会得到 `EXHIBIT_ROUTE_ID_REQUIRED` 结构化提示。完整流程见 [MCP 业务调用指南](docs/mcp-business-calling-guide.md)。
+
 Agent Skills 分发与 MCP 注册是两套独立适配器，共享同一客户端注册表。新建 Skill 使用 `agent-skills` 可移植能力标识，历史上声明 Codex、GitHub Copilot 或 WorkBuddy 的标准 `SKILL.md` 也按 Agent Skills 兼容包处理；仅声明 `himind-ai` 的内部 Skill 不会外部分发。Agent 只向本机已检测到的目录型客户端同步，当前覆盖 HiMind AI、Codex、GitHub Copilot、WorkBuddy、Claude、Qoder、ZCode、Cursor、Windsurf、Trae、CodeBuddy、Antigravity、Gemini CLI、OpenCode、Kimi Code、Kiro 与 Qwen Code。客户端路径、支持级别和 MCP 入口均由注册表集中维护，新增客户端不需要复制同步流程。
 
 启用的个人 MCP 会话会在 Agent MCP 中以 `mcp.<server>.<tool>` 聚合暴露，stdio 服务在 Agent 生命周期内复用并在配置变化或故障后重连；HTTP 服务沿用 Streamable HTTP 和会话请求头。DSH 已通过原生配置层接收个人 MCP，因此不会在 Agent 桥接中重复展示。单个下游服务失败不会影响 Agent 自有能力。

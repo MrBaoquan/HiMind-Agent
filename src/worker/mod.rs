@@ -61,7 +61,7 @@ pub(crate) fn run_loop(
     approval_mgr: Option<Arc<ApprovalManager>>,
 ) -> Result<(), Box<dyn Error>> {
     if !options.mode().dashboard_enabled() {
-        set_status(&worker_status, false, "", "");
+        set_status(&worker_status, "not_applicable", false, "", "");
         return Ok(());
     }
     let connect_started = Instant::now();
@@ -69,7 +69,13 @@ pub(crate) fn run_loop(
         logs.add_log("info", "Dashboard Worker 开始连接");
     }
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-    set_status(&worker_status, false, "", "正在连接 Dashboard 任务 Worker");
+    set_status(
+        &worker_status,
+        "connecting",
+        false,
+        "",
+        "正在连接 Dashboard 任务 Worker",
+    );
     let mut state = if options.reenroll {
         register_agent(
             &client,
@@ -126,7 +132,7 @@ pub(crate) fn run_loop(
             }
         };
     crate::api::oauth::cache_registration_access(&options, &state);
-    set_status(&worker_status, true, &state.agent_id, "");
+    set_status(&worker_status, "online", true, &state.agent_id, "");
     if let Some(logs) = approval_mgr.as_ref() {
         logs.add_log(
             "info",
@@ -168,7 +174,7 @@ pub(crate) fn run_loop(
         let mut last_heartbeat_error = String::new();
         while !heartbeat_stop_for_thread.load(Ordering::Relaxed) {
             if !heartbeat_options.mode().dashboard_enabled() {
-                set_status(&heartbeat_status, false, "", "");
+                set_status(&heartbeat_status, "not_applicable", false, "", "");
                 break;
             }
             if heartbeat_options.identity_generation() != identity_generation {
@@ -202,6 +208,7 @@ pub(crate) fn run_loop(
                                 }
                                 set_status(
                                     &heartbeat_status,
+                                    "offline",
                                     false,
                                     &heartbeat_agent_id,
                                     &format!("Dashboard Agent 凭据轮换恢复失败：{recovery_error}"),
@@ -247,7 +254,7 @@ pub(crate) fn run_loop(
                         }
                         last_heartbeat_error.clear();
                     }
-                    set_status(&heartbeat_status, true, &heartbeat_agent_id, "");
+                    set_status(&heartbeat_status, "online", true, &heartbeat_agent_id, "");
                     match crate::app::identity::sync_svn_credentials(&heartbeat_options) {
                         Ok(_) => {
                             if !last_identity_error.is_empty() {
@@ -293,6 +300,7 @@ pub(crate) fn run_loop(
                     }
                     set_status(
                         &heartbeat_status,
+                        "offline",
                         false,
                         "",
                         "Dashboard Agent 凭据已失效，需要管理员重新授权配对",
@@ -310,6 +318,7 @@ pub(crate) fn run_loop(
                     }
                     set_status(
                         &heartbeat_status,
+                        "offline",
                         false,
                         &heartbeat_agent_id,
                         &format!("Dashboard Agent 心跳失败：{message}"),
@@ -478,6 +487,11 @@ pub(crate) fn run_supervisor(
                 let independent = !options.mode().dashboard_enabled();
                 set_status(
                     &Some(Arc::clone(&worker_status)),
+                    if independent {
+                        "not_applicable"
+                    } else {
+                        "offline"
+                    },
                     false,
                     "",
                     if independent {
@@ -496,7 +510,13 @@ pub(crate) fn run_supervisor(
                         &format!("Dashboard Worker 已停止并准备重连: {message}"),
                     );
                 }
-                set_status(&Some(Arc::clone(&worker_status)), false, "", &message);
+                set_status(
+                    &Some(Arc::clone(&worker_status)),
+                    "offline",
+                    false,
+                    "",
+                    &message,
+                );
                 eprintln!("agent worker stopped: {}", message);
                 thread::sleep(retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(60));
@@ -507,6 +527,7 @@ pub(crate) fn run_supervisor(
 
 fn set_status(
     status: &Option<Arc<Mutex<LocalWorkerStatus>>>,
+    worker_state: &str,
     online: bool,
     agent_id: &str,
     error: &str,
@@ -516,6 +537,18 @@ fn set_status(
             state.dashboard_worker_online = online;
             state.dashboard_agent_id = agent_id.to_string();
             state.dashboard_worker_error = error.to_string();
+            state.dashboard_worker_state = worker_state.to_string();
+            state.dashboard_worker_reason_code = match worker_state {
+                "online" => "connected_agent_app_worker",
+                "connecting" => "connected_agent_app_starting",
+                "offline" => "connected_agent_app_worker_error",
+                "not_applicable" if state.worker_transport == "stdio" => {
+                    "stdio_companion_gateway_only"
+                }
+                "not_applicable" => "independent_mode_no_control_plane",
+                _ => "worker_status_unknown",
+            }
+            .to_string();
         }
     }
 }

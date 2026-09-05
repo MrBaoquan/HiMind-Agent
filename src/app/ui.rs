@@ -62,6 +62,17 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         } else {
             String::new()
         },
+        dashboard_worker_state: if options.mode().dashboard_enabled() {
+            "connecting".to_string()
+        } else {
+            "not_applicable".to_string()
+        },
+        dashboard_worker_reason_code: if options.mode().dashboard_enabled() {
+            "connected_agent_app_starting".to_string()
+        } else {
+            "independent_mode_no_control_plane".to_string()
+        },
+        worker_transport: "local_http".to_string(),
         local_service_online: false,
         local_service_error: String::new(),
         distribution_update_available: false,

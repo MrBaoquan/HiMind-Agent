@@ -5,6 +5,12 @@ pub struct LocalWorkerStatus {
     pub dashboard_worker_online: bool,
     pub dashboard_agent_id: String,
     pub dashboard_worker_error: String,
+    /// Explicit runtime metadata. These fields are intentionally separate
+    /// from the legacy error/online booleans so clients never need to infer
+    /// topology from a localized message.
+    pub dashboard_worker_state: String,
+    pub dashboard_worker_reason_code: String,
+    pub worker_transport: String,
     pub local_service_online: bool,
     pub local_service_error: String,
     pub distribution_update_available: bool,

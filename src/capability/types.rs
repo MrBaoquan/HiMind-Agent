@@ -52,13 +52,37 @@ impl CapabilityAvailability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvocationSource {
     LocalHttp,
     Tauri,
     DashboardWorker,
     Cli,
     Mcp,
+}
+
+/// The protocol/client that reached the Gateway is independent from the
+/// transport used to carry it.  Keeping this dimension explicit prevents a
+/// future HTTP MCP endpoint from being reported as a stdio companion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvocationTransport {
+    LocalHttp,
+    Stdio,
+    Tauri,
+    Cli,
+    Internal,
+}
+
+impl InvocationTransport {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalHttp => "local_http",
+            Self::Stdio => "stdio",
+            Self::Tauri => "tauri",
+            Self::Cli => "cli",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 impl InvocationSource {
@@ -76,6 +100,7 @@ impl InvocationSource {
 #[derive(Debug, Clone)]
 pub(crate) struct InvocationContext {
     pub source: InvocationSource,
+    pub transport: InvocationTransport,
     pub principal: String,
     pub session_id_hash: String,
     pub request_id: String,
@@ -83,8 +108,24 @@ pub(crate) struct InvocationContext {
 
 impl InvocationContext {
     pub(crate) fn new(source: InvocationSource, principal: impl Into<String>) -> Self {
+        let transport = match source {
+            InvocationSource::LocalHttp => InvocationTransport::LocalHttp,
+            InvocationSource::Tauri => InvocationTransport::Tauri,
+            InvocationSource::DashboardWorker => InvocationTransport::Internal,
+            InvocationSource::Cli => InvocationTransport::Cli,
+            InvocationSource::Mcp => InvocationTransport::Stdio,
+        };
+        Self::with_transport(source, transport, principal)
+    }
+
+    pub(crate) fn with_transport(
+        source: InvocationSource,
+        transport: InvocationTransport,
+        principal: impl Into<String>,
+    ) -> Self {
         Self {
             source,
+            transport,
             principal: principal.into(),
             session_id_hash: String::new(),
             request_id: next_request_id(),
@@ -92,8 +133,9 @@ impl InvocationContext {
     }
 
     pub(crate) fn dashboard_user(user_id: &str, session_id_hash: &str) -> Self {
-        let mut context = Self::new(
+        let mut context = Self::with_transport(
             InvocationSource::LocalHttp,
+            InvocationTransport::LocalHttp,
             format!("dashboard-user:{}", user_id.trim()),
         );
         context.session_id_hash = session_id_hash.trim().to_string();
@@ -147,8 +189,29 @@ mod tests {
         let context = InvocationContext::dashboard_user("usr_123", "session_hash");
 
         assert_eq!(context.source, InvocationSource::LocalHttp);
+        assert_eq!(context.transport, InvocationTransport::LocalHttp);
         assert_eq!(context.principal, "dashboard-user:usr_123");
         assert_eq!(context.session_id_hash, "session_hash");
+    }
+
+    #[test]
+    fn mcp_context_defaults_to_stdio_transport() {
+        let context = InvocationContext::new(InvocationSource::Mcp, "test-client");
+
+        assert_eq!(context.source, InvocationSource::Mcp);
+        assert_eq!(context.transport, InvocationTransport::Stdio);
+    }
+
+    #[test]
+    fn mcp_source_can_be_reused_over_another_transport() {
+        let context = InvocationContext::with_transport(
+            InvocationSource::Mcp,
+            InvocationTransport::LocalHttp,
+            "test-client",
+        );
+
+        assert_eq!(context.source, InvocationSource::Mcp);
+        assert_eq!(context.transport, InvocationTransport::LocalHttp);
     }
 
     #[test]

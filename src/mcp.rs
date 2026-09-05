@@ -20,12 +20,16 @@ const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MCP_INPUT_QUEUE_CAPACITY: usize = 128;
+const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve；后续 exhibit_id 必须使用返回项的 pid（路由 ID），EX-xxxx 只是展示编号，不能直接传入。人员配置先用 business.people.search 获取稳定用户 ID，再调用 crew 能力。遇到 EXHIBIT_ROUTE_ID_REQUIRED 时按上述步骤重试。";
 
 pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
         dashboard_agent_id: String::new(),
         dashboard_worker_error: "MCP stdio mode".to_string(),
+        dashboard_worker_state: "not_applicable".to_string(),
+        dashboard_worker_reason_code: "stdio_companion_gateway_only".to_string(),
+        worker_transport: "stdio".to_string(),
         local_service_online: false,
         local_service_error: String::new(),
         distribution_update_available: false,
@@ -258,13 +262,17 @@ fn handle_request(
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": negotiate_protocol_version(&params),
+            "instructions": MCP_INSTRUCTIONS,
             "capabilities": {
                 "tools": { "listChanged": true },
                 "prompts": { "listChanged": true },
                 "resources": { "listChanged": true }
             },
             "serverInfo": { "name": "himind-agent", "version": VERSION },
-            "_meta": { "himind": { "registryGeneration": mcp_registry_generation(gateway)? } }
+            "_meta": { "himind": {
+                "registryGeneration": mcp_registry_generation(gateway)?,
+                "runtime": gateway.mcp_runtime_metadata()
+            } }
         })),
         "ping" => Ok(json!({})),
         "shutdown" => Ok(Value::Null),
@@ -635,6 +643,9 @@ mod tests {
                 dashboard_worker_online: false,
                 dashboard_agent_id: String::new(),
                 dashboard_worker_error: String::new(),
+                dashboard_worker_state: "not_applicable".to_string(),
+                dashboard_worker_reason_code: "stdio_companion_gateway_only".to_string(),
+                worker_transport: "stdio".to_string(),
                 local_service_online: false,
                 local_service_error: String::new(),
                 distribution_update_available: false,
@@ -662,6 +673,51 @@ mod tests {
             negotiate_protocol_version(&json!({ "protocolVersion": "future-version" })),
             "2025-11-25"
         );
+    }
+
+    #[test]
+    fn initialize_explains_stdio_worker_boundary_and_exhibit_id_rule() {
+        let result = handle_request(
+            &test_gateway(),
+            "initialize",
+            json!({ "protocolVersion": "2025-11-25" }),
+        )
+        .unwrap();
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("dashboard_worker_state=not_applicable"));
+        assert!(instructions.contains("business.exhibit.list"));
+        assert!(instructions.contains("pid"));
+        assert!(instructions.contains("EX-xxxx"));
+        assert_eq!(result["_meta"]["himind"]["runtime"]["schemaVersion"], 1);
+        assert_eq!(result["_meta"]["himind"]["runtime"]["transport"], "stdio");
+        assert_eq!(
+            result["_meta"]["himind"]["runtime"]["dashboardWorkerExpected"],
+            false
+        );
+        assert_eq!(
+            result["_meta"]["himind"]["runtime"]["dashboardWorkerReasonCode"],
+            "stdio_companion_gateway_only"
+        );
+        assert_eq!(result["_meta"]["himind"]["runtime"]["mode"], "connected");
+        assert_eq!(
+            result["_meta"]["himind"]["runtime"]["controlPlane"]["enabled"],
+            true
+        );
+    }
+
+    #[test]
+    fn initialize_reports_independent_mode_control_plane_state() {
+        let result = handle_request(
+            &test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Independent),
+            "initialize",
+            json!({ "protocolVersion": "2025-11-25" }),
+        )
+        .unwrap();
+        let runtime = &result["_meta"]["himind"]["runtime"];
+        assert_eq!(runtime["mode"], "independent");
+        assert_eq!(runtime["dashboardEnabled"], false);
+        assert_eq!(runtime["controlPlane"]["enabled"], false);
+        assert_eq!(runtime["dashboardWorkerExpected"], false);
     }
 
     #[test]
@@ -912,6 +968,49 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("不调用 HiMind 模型"));
+    }
+
+    #[test]
+    fn tools_list_exposes_exhibit_route_id_contract() {
+        let result = handle_request(&test_gateway(), "tools/list", json!({})).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        let list = tools
+            .iter()
+            .find(|tool| tool["name"] == "business.exhibit.list")
+            .expect("business.exhibit.list must be discoverable");
+        assert!(list["description"].as_str().unwrap().contains("pid"));
+        let get = tools
+            .iter()
+            .find(|tool| tool["name"] == "business.exhibit.get")
+            .expect("business.exhibit.get must be discoverable");
+        assert!(
+            get["inputSchema"]["properties"]["exhibit_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("EX-0021")
+        );
+    }
+
+    #[test]
+    fn exhibit_display_number_is_rejected_before_dashboard_authentication() {
+        let result = handle_request(
+            &test_gateway(),
+            "tools/call",
+            json!({
+                "name": "business.exhibit.get",
+                "arguments": { "exhibit_id": "EX-0021" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["code"],
+            "EXHIBIT_ROUTE_ID_REQUIRED"
+        );
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("pid"));
     }
 
     #[test]

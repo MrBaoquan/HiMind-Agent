@@ -230,6 +230,9 @@ pub(crate) fn people_search(options: &Options, input: Value) -> Result<Value, Bo
         if let Some(value) = input.get(key) {
             if let Some(value) = value.as_str() {
                 if !value.trim().is_empty() {
+                    if key == "exhibit_id" && is_exhibit_display_id(value) {
+                        return Err(exhibit_route_id_error(value).into());
+                    }
                     query.push((key.to_string(), value.to_string()));
                 }
             } else if value.is_number() {
@@ -773,12 +776,44 @@ fn required_string(input: &Value, name: &str) -> Result<String, Box<dyn Error>> 
     if value.is_empty() {
         return Err(format!("{name} is required").into());
     }
+    if name == "exhibit_id" && is_exhibit_display_id(value) {
+        return Err(exhibit_route_id_error(value).into());
+    }
     Ok(value.to_string())
+}
+
+fn is_exhibit_display_id(value: &str) -> bool {
+    let normalized = value.trim();
+    normalized
+        .get(..3)
+        .map(|prefix| {
+            prefix.eq_ignore_ascii_case("ex-")
+                && normalized
+                    .get(3..)
+                    .map(|suffix| {
+                        !suffix.is_empty()
+                            && suffix.chars().all(|character| character.is_ascii_digit())
+                    })
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+fn exhibit_route_id_error(display_id: &str) -> String {
+    serde_json::json!({
+        "code": "EXHIBIT_ROUTE_ID_REQUIRED",
+        "field": "exhibit_id",
+        "display_id": display_id.trim(),
+        "message": format!("展项参数使用了展示编号 {}。请先调用 business.exhibit.list 或 context.resolve，并使用返回项的 pid 作为 exhibit_id。", display_id.trim()),
+        "hint": "EX-xxxx 仅用于展示；后续展项读取、人员、需求和工作区操作必须传入 list 返回的 pid。"
+    })
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::api_url;
+    use super::{api_url, required_string};
+    use serde_json::json;
 
     #[test]
     fn api_url_preserves_base_path_and_escapes_identifiers() {
@@ -798,5 +833,21 @@ mod tests {
             url.as_str(),
             "https://example.test/root/api/integrations/ai/business/exhibits/%E5%B1%95%E9%A1%B9%2F1"
         );
+    }
+
+    #[test]
+    fn display_exhibit_number_returns_machine_readable_route_id_hint() {
+        let error = required_string(&json!({ "exhibit_id": "EX-0021" }), "exhibit_id")
+            .expect_err("display number must not be sent to the route");
+        let payload: serde_json::Value = serde_json::from_str(&error.to_string()).unwrap();
+        assert_eq!(payload["code"], "EXHIBIT_ROUTE_ID_REQUIRED");
+        assert_eq!(payload["display_id"], "EX-0021");
+        assert!(payload["message"].as_str().unwrap().contains("pid"));
+    }
+
+    #[test]
+    fn non_ascii_exhibit_values_do_not_panic_identifier_validation() {
+        let error = required_string(&json!({ "exhibit_id": "展项-1" }), "exhibit_id");
+        assert_eq!(error.unwrap(), "展项-1");
     }
 }

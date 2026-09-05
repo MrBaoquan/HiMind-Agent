@@ -6,6 +6,11 @@ export type AgentStatus = {
     dashboard_worker_online: boolean;
     dashboard_worker_error?: string;
     dashboard_agent_id?: string;
+    dashboard_worker_state?: 'online' | 'connecting' | 'offline' | 'not_applicable' | 'unknown' | string;
+    dashboard_worker_expected?: boolean;
+    dashboard_worker_reason_code?: string;
+    mcp_transport?: 'local_http' | 'stdio' | 'tauri' | 'cli' | 'internal' | 'unknown' | string;
+    local_service_expected?: boolean;
     local_port?: number;
     mode?: string;
     effective_mode?: string;
@@ -15,6 +20,10 @@ export type AgentStatus = {
     control_plane?: {
         kind: 'none' | 'dashboard' | string;
         enabled: boolean;
+        available?: boolean;
+        worker_state?: string;
+        worker_expected?: boolean;
+        worker_reason_code?: string;
     };
     login_account?: string;
     login_label?: string;
