@@ -131,7 +131,7 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
             if let Err(error) = install_vscode_extension(&root, extension) {
                 let _ = terminate_process_for_path(&target);
                 let _ = fs::remove_dir_all(&target_dir);
-                let _ = launch_and_confirm(args, &current, &args.from_version);
+                let _ = launch_for_recovery(args, &current, &args.from_version);
                 return Err(format!("更新 VS Code 扩展失败，已回滚 Agent：{error}").into());
             }
         }
@@ -143,14 +143,14 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
             ) {
                 let _ = terminate_process_for_path(&target);
                 let _ = fs::remove_dir_all(&target_dir);
-                let _ = launch_and_confirm(args, &current, &args.from_version);
+                let _ = launch_for_recovery(args, &current, &args.from_version);
                 return Err(format!("首次迁移无法更新稳定 launcher：{error}").into());
             }
         }
         if let Err(error) = install_layout::write_active_version(&root, &args.target_version) {
             let _ = terminate_process_for_path(&target);
             let _ = fs::remove_dir_all(&target_dir);
-            let _ = launch_and_confirm(args, &current, &args.from_version);
+            let _ = launch_for_recovery(args, &current, &args.from_version);
             return Err(format!("写入 Agent 活动版本指针失败：{error}").into());
         }
         let _ = fs::remove_file(&staged_launcher);
@@ -169,7 +169,7 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
         "新 Agent 健康检查失败，开始保留当前版本并恢复旧 Agent",
     );
     let _ = fs::remove_dir_all(&target_dir);
-    let _ = launch_and_confirm(args, &current, &args.from_version);
+    let _ = launch_for_recovery(args, &current, &args.from_version);
     let _ = report_update_result(
         args,
         "rolled_back",
@@ -249,6 +249,22 @@ fn read_json_value(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
 }
 
 fn launch_and_confirm(args: &UpdateArgs, executable: &Path, expected_version: &str) -> bool {
+    launch_and_confirm_with_policy(args, executable, expected_version, true)
+}
+
+// Recovery must be conservative: a failed health probe does not prove that
+// the previous Agent process is unusable. Keep that process alive so a
+// transient probe failure cannot leave the installation without an Agent.
+fn launch_for_recovery(args: &UpdateArgs, executable: &Path, expected_version: &str) -> bool {
+    launch_and_confirm_with_policy(args, executable, expected_version, false)
+}
+
+fn launch_and_confirm_with_policy(
+    args: &UpdateArgs,
+    executable: &Path,
+    expected_version: &str,
+    terminate_on_failure: bool,
+) -> bool {
     let root = install_layout::installation_root_from_executable(executable);
     let trusted_keys = root.join("trusted-keys");
     let mut command = Command::new(executable);
@@ -288,7 +304,18 @@ fn launch_and_confirm(args: &UpdateArgs, executable: &Path, expected_version: &s
             child.id()
         ),
     );
-    let _ = terminate_single(child.id());
+    if terminate_on_failure {
+        let _ = terminate_single(child.id());
+    } else {
+        log_update(
+            args,
+            &format!(
+                "回退 Agent 探活未确认，保留进程继续运行：path={}，pid={}",
+                executable.display(),
+                child.id()
+            ),
+        );
+    }
     false
 }
 
@@ -536,7 +563,14 @@ fn wait_for_health(
     executable: &Path,
     pid: u32,
 ) -> bool {
-    let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
+    // /health is served by the local Agent itself. It must never be routed
+    // through an HTTP proxy, which can turn a healthy local response into a
+    // proxy-generated 502 and make both upgrade and rollback look failed.
+    let client = match Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
         Ok(value) => value,
         Err(_) => return false,
     };
@@ -741,11 +775,14 @@ mod tests {
     };
     use super::{
         canonical_staged_helper, health_matches_update, plain_path, read_json_value,
-        replace_helper, staged_path_allowed,
+        replace_helper, staged_path_allowed, wait_for_health,
     };
     use serde_json::json;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -869,6 +906,63 @@ mod tests {
             &state
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_health_probe_ignores_http_proxy_environment() {
+        // Keep environment mutation isolated from other tests in this binary.
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-health-proxy-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("himind-agent.exe");
+        let state = root.join("agent-state.json");
+        fs::write(&executable, b"agent").unwrap();
+        fs::write(&state, b"{}").unwrap();
+        let body = json!({
+            "status": "online",
+            "version": "0.3.0",
+            "executable_path": executable,
+        })
+        .to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for key in keys {
+            std::env::set_var(key, "http://127.0.0.1:9");
+        }
+        let healthy = wait_for_health(port, "", &state, "0.3.0", &executable, 0);
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+        assert!(healthy);
     }
 
     #[test]
