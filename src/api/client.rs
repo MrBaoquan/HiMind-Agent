@@ -461,7 +461,12 @@ pub fn poll_tasks(
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
         .error_for_status()?
-        .json::<Vec<Task>>()?;
+        // Older Dashboard responses could encode an empty task list as null.
+        // Treat that legacy representation as an empty queue so one malformed
+        // poll response cannot stop the Worker and make the Agent appear
+        // disconnected.
+        .json::<Option<Vec<Task>>>()?
+        .unwrap_or_default();
     Ok(tasks)
 }
 
@@ -478,7 +483,8 @@ pub fn list_task_history(
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
         .error_for_status()?
-        .json::<Vec<AgentTaskHistoryItem>>()?;
+        .json::<Option<Vec<AgentTaskHistoryItem>>>()?
+        .unwrap_or_default();
     Ok(tasks)
 }
 

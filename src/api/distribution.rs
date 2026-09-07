@@ -2,7 +2,7 @@ use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use std::env;
 use std::error::Error;
@@ -10,6 +10,14 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 const MAX_SUBMISSION_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionState {
@@ -166,7 +174,7 @@ pub struct PluginCatalogItem {
     pub description: String,
     #[serde(default)]
     pub author_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub categories: Vec<String>,
     #[serde(default)]
     pub review_status: String,
@@ -204,13 +212,13 @@ pub struct PluginCatalogItem {
     pub allow_disable: bool,
     #[serde(default = "default_true")]
     pub allow_uninstall: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub capability_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub permissions: Vec<String>,
     #[serde(default)]
     pub view_count: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub plugin_dependencies: Vec<SkillPluginDependency>,
 }
 
@@ -220,16 +228,18 @@ pub struct SkillCatalogItem {
     pub name: String,
     pub description: String,
     pub author_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub categories: Vec<String>,
     pub version: String,
     pub release_notes: String,
     #[serde(default)]
     pub published_at: String,
     pub min_agent_version: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub supported_clients: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub capability_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub plugin_dependencies: Vec<SkillPluginDependency>,
     pub risk_summary: String,
     pub channel: String,
@@ -280,7 +290,7 @@ pub struct ExtensionDesiredState {
     pub generation: String,
     #[serde(default = "default_reconcile_interval")]
     pub reconcile_interval_seconds: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub items: Vec<ExtensionDesiredItem>,
 }
 
@@ -358,11 +368,14 @@ pub struct PluginStatusReport<'a> {
 
 #[derive(Debug, Deserialize)]
 struct PluginCatalogResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<PluginCatalogItem>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub struct CatalogPage<T> {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub items: Vec<T>,
     pub total: usize,
     pub page: usize,
@@ -374,6 +387,7 @@ pub type SkillCatalogPage = CatalogPage<SkillCatalogItem>;
 
 #[derive(Debug, Deserialize)]
 struct SkillCatalogResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<SkillCatalogItem>,
 }
 
@@ -456,11 +470,13 @@ pub struct PluginSubmissionStatus {
 
 #[derive(Debug, Deserialize)]
 struct SkillSubmissionResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<SkillSubmissionStatus>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PluginSubmissionResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<PluginSubmissionStatus>,
 }
 
@@ -501,7 +517,7 @@ pub struct ExtensionCollaboration {
     pub source_default_branch: String,
     #[serde(default)]
     pub source_subdirectory: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub members: Vec<ExtensionCollaborationMember>,
 }
 
@@ -530,7 +546,7 @@ pub struct AgentExtensionProject {
 pub struct ExtensionCollaboratorOption {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub department_names: Vec<String>,
 }
 
@@ -553,16 +569,19 @@ pub struct ExtensionCollaborationInvitation {
 
 #[derive(Debug, Deserialize)]
 struct ExtensionCollaboratorOptionsResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<ExtensionCollaboratorOption>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExtensionCollaborationInvitationsResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<ExtensionCollaborationInvitation>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AgentExtensionProjectsResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<AgentExtensionProject>,
 }
 
@@ -1676,6 +1695,22 @@ mod tests {
         let serialized = serde_json::to_string(&state).unwrap();
         assert!(!serialized.contains("plaintext-secret"));
         assert!(serialized.contains("protected-value"));
+    }
+
+    #[test]
+    fn distribution_api_accepts_null_array_fields_as_empty() {
+        let desired: super::ExtensionDesiredState = serde_json::from_value(serde_json::json!({
+            "generation": "g1",
+            "items": null,
+        }))
+        .unwrap();
+        assert!(desired.items.is_empty());
+
+        let page: super::CatalogPage<serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"items": null, "total": 0, "page": 1, "page_size": 20}),
+        )
+        .unwrap();
+        assert!(page.items.is_empty());
     }
 
     #[test]

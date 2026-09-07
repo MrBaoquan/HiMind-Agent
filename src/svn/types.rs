@@ -1,4 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
+
+fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SvnConnectionSummary {
@@ -116,7 +124,9 @@ pub(crate) struct ProjectAclEntry {
 pub(crate) struct PreviewProjectAclRequest {
     pub plan_id: String,
     pub project_id: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub managed_paths: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub desired_entries: Vec<ProjectAclEntry>,
     #[serde(default)]
     pub repository_access: String,
@@ -126,7 +136,9 @@ pub(crate) struct PreviewProjectAclRequest {
 pub(crate) struct ApplyProjectAclRequest {
     pub plan_id: String,
     pub project_id: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub managed_paths: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub desired_entries: Vec<ProjectAclEntry>,
     pub expected_current_digest: String,
     #[serde(default)]
@@ -136,8 +148,48 @@ pub(crate) struct ApplyProjectAclRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReconcileProjectAclRequest {
     pub project_id: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub managed_paths: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub desired_entries: Vec<ProjectAclEntry>,
     #[serde(default)]
     pub repository_access: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplyProjectAclRequest, PreviewProjectAclRequest, ReconcileProjectAclRequest};
+
+    #[test]
+    fn project_acl_requests_accept_null_arrays_as_empty() {
+        let preview: PreviewProjectAclRequest = serde_json::from_value(serde_json::json!({
+            "plan_id": "plan-1",
+            "project_id": "project-1",
+            "managed_paths": null,
+            "desired_entries": null,
+        }))
+        .unwrap();
+        assert!(preview.managed_paths.is_empty());
+        assert!(preview.desired_entries.is_empty());
+
+        let apply: ApplyProjectAclRequest = serde_json::from_value(serde_json::json!({
+            "plan_id": "plan-1",
+            "project_id": "project-1",
+            "managed_paths": null,
+            "desired_entries": null,
+            "expected_current_digest": "digest",
+        }))
+        .unwrap();
+        assert!(apply.managed_paths.is_empty());
+        assert!(apply.desired_entries.is_empty());
+
+        let reconcile: ReconcileProjectAclRequest = serde_json::from_value(serde_json::json!({
+            "project_id": "project-1",
+            "managed_paths": null,
+            "desired_entries": null,
+        }))
+        .unwrap();
+        assert!(reconcile.managed_paths.is_empty());
+        assert!(reconcile.desired_entries.is_empty());
+    }
 }
