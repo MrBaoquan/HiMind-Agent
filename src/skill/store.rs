@@ -67,6 +67,19 @@ pub(crate) struct SkillStore {
 impl SkillStore {
     pub(crate) fn new() -> Self {
         let agent_home = crate::store::paths::agent_home();
+        // Tests run in parallel inside one process. Point the default store
+        // at a per-process temp root so parallel skill mutations never leak
+        // into the user's real Agent data directory (which otherwise makes
+        // registry-generation hashes unstable under `cargo test`). Explicit
+        // isolation tests that set HIMIND_AGENT_HOME still win.
+        #[cfg(test)]
+        let agent_home = match std::env::var_os("HIMIND_AGENT_HOME") {
+            Some(value) if !value.is_empty() => agent_home,
+            _ => std::env::temp_dir().join(format!(
+                "himind-agent-test-home-{}",
+                std::process::id()
+            )),
+        };
         Self {
             root: agent_home.join("skills"),
             extension_state_root: agent_home.join("data"),
