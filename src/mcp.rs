@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::mpsc::Receiver;
@@ -20,7 +21,88 @@ const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_MCP_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MCP_INPUT_QUEUE_CAPACITY: usize = 128;
-const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve；后续 exhibit_id 必须使用返回项的 pid（路由 ID），EX-xxxx 只是展示编号，不能直接传入。人员配置先用 business.people.search 获取稳定用户 ID，再调用 crew 能力。遇到 EXHIBIT_ROUTE_ID_REQUIRED 时按上述步骤重试。";
+const MAX_ACTIVATED_CAPABILITIES: usize = 128;
+const MAX_ACTIVATED_SCHEMA_BYTES: usize = 512 * 1024;
+const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 capability.catalog.search 搜索目录，再用 capability.catalog.describe 获取具体 Schema，最后调用 capability.catalog.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 capability.catalog.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
+
+const BOOTSTRAP_TOOL_IDS: &[&str] = &[
+    "capability.catalog.search",
+    "capability.catalog.describe",
+    "capability.catalog.activate",
+    "capability.catalog.invoke",
+    "system.health",
+];
+
+#[derive(Default)]
+struct McpSessionState {
+    activated_capabilities: BTreeSet<String>,
+    /// Capability IDs pre-activated at MCP startup (from
+    /// HIMIND_MCP_DEFAULT_ACTIVATE). Unlike dynamic activations they survive
+    /// registry generation changes, so clients that cannot reliably call
+    /// capability.catalog.activate (e.g. some VS Code Copilot sessions) still
+    /// see the configured business tools on the first tools/list projection.
+    default_activated: BTreeSet<String>,
+    activation_generation: Option<String>,
+    projection_changed: bool,
+    /// Internal callers historically received the complete tool list. Keep
+    /// that behavior in the direct helper while stdio uses the bounded view.
+    legacy_compatibility: bool,
+}
+
+impl McpSessionState {
+    fn is_exposed(&self, capability_id: &str) -> bool {
+        self.legacy_compatibility
+            || BOOTSTRAP_TOOL_IDS.contains(&capability_id)
+            || self.activated_capabilities.contains(capability_id)
+            || self.default_activated.contains(capability_id)
+    }
+
+    fn take_projection_changed(&mut self) -> bool {
+        std::mem::take(&mut self.projection_changed)
+    }
+
+    fn synchronize_generation(&mut self, generation: &str) {
+        if self.legacy_compatibility {
+            return;
+        }
+        if self
+            .activation_generation
+            .as_deref()
+            .is_some_and(|bound| bound != generation)
+        {
+            self.activated_capabilities.clear();
+            self.projection_changed = true;
+        }
+        self.activation_generation = Some(generation.to_string());
+    }
+}
+
+/// Parse the `HIMIND_MCP_DEFAULT_ACTIVATE` environment variable into a set of
+/// capability IDs to project from the very first `tools/list`. Values may be
+/// comma, semicolon or whitespace separated; unknown IDs are ignored so a
+/// stale config never breaks MCP startup.
+fn default_activation_ids(gateway: &CapabilityGateway) -> BTreeSet<String> {
+    let Ok(raw) = std::env::var("HIMIND_MCP_DEFAULT_ACTIVATE") else {
+        return BTreeSet::new();
+    };
+    let known = gateway
+        .list_capabilities(&mcp_invocation_context())
+        .map(|caps| caps.into_iter().map(|cap| cap.id).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    parse_default_activation_ids(&raw, &known)
+}
+
+fn parse_default_activation_ids(raw: &str, known: &BTreeSet<String>) -> BTreeSet<String> {
+    if raw.trim().is_empty() {
+        return BTreeSet::new();
+    }
+    raw.split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| known.contains(*id))
+        .map(str::to_string)
+        .collect()
+}
 
 pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
@@ -66,6 +148,10 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let mut initialized = false;
     let mut last_generation = None::<String>;
     let mut registry_updates = None::<Receiver<String>>;
+    let mut session = McpSessionState {
+        default_activated: default_activation_ids(&gateway),
+        ..McpSessionState::default()
+    };
 
     loop {
         if initialized {
@@ -156,7 +242,7 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
             .filter(|value| !value.is_null())
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let response = match handle_request(&gateway, method, params) {
+        let response = match handle_request_with_session(&gateway, method, params, &mut session) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(error) => {
                 let message = error.to_string();
@@ -171,6 +257,13 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
             }
         };
         write_message(&mut stdout, &response)?;
+        if session.take_projection_changed() {
+            write_notification(
+                &mut stdout,
+                "notifications/tools/list_changed",
+                json!({ "registryGeneration": mcp_registry_generation(&gateway)? }),
+            )?;
+        }
         if method == "initialize" && response.get("error").is_none() {
             last_generation = response
                 .pointer("/result/_meta/himind/registryGeneration")
@@ -259,6 +352,28 @@ fn handle_request(
     method: &str,
     params: Value,
 ) -> Result<Value, Box<dyn Error>> {
+    // Preserve the old in-process helper contract for HTTP/Tauri and tests.
+    // The real stdio loop uses a session-scoped projection below.
+    let mut session = McpSessionState {
+        activated_capabilities: gateway
+            .list_capabilities(&mcp_invocation_context())?
+            .into_iter()
+            .map(|capability| capability.id)
+            .collect(),
+        default_activated: BTreeSet::new(),
+        activation_generation: None,
+        projection_changed: false,
+        legacy_compatibility: true,
+    };
+    handle_request_with_session(gateway, method, params, &mut session)
+}
+
+fn handle_request_with_session(
+    gateway: &CapabilityGateway,
+    method: &str,
+    params: Value,
+    session: &mut McpSessionState,
+) -> Result<Value, Box<dyn Error>> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": negotiate_protocol_version(&params),
@@ -320,9 +435,12 @@ fn handle_request(
         }
         "tools/list" => {
             let context = mcp_invocation_context();
-            let all_tools = gateway
+            let generation = mcp_registry_generation(gateway)?;
+            session.synchronize_generation(&generation);
+            let mut all_tools = gateway
                 .list_capabilities(&context)?
                 .into_iter()
+                .filter(|capability| session.is_exposed(&capability.id))
                 .map(|capability| {
                     json!({
                         "name": capability.id,
@@ -333,21 +451,49 @@ fn handle_request(
                     })
                 })
                 .collect::<Vec<_>>();
+            // This is a session tool rather than a Gateway capability. It
+            // keeps old MCP clients usable after activation without requiring
+            // them to understand listChanged notifications.
+            if !all_tools
+                .iter()
+                .any(|tool| tool["name"] == "capability.catalog.invoke")
+            {
+                all_tools.insert(2.min(all_tools.len()), catalog_invoke_tool());
+            }
+            if !all_tools
+                .iter()
+                .any(|tool| tool["name"] == "capability.catalog.activate")
+            {
+                all_tools.insert(1.min(all_tools.len()), catalog_activation_tool());
+            }
             let offset = parse_tool_cursor(&params)?;
+            let offset = validate_tool_cursor(&params, &generation, offset)?;
             if offset > all_tools.len() {
                 return Err("invalid tools/list cursor".into());
             }
-            let end = offset.saturating_add(TOOL_PAGE_SIZE).min(all_tools.len());
+            let page_size = if session.legacy_compatibility {
+                all_tools.len().max(TOOL_PAGE_SIZE)
+            } else {
+                TOOL_PAGE_SIZE
+            };
+            let end = offset.saturating_add(page_size).min(all_tools.len());
             let mut result = json!({
                 "tools": all_tools[offset..end].to_vec(),
-                "_meta": { "himind": { "registryGeneration": mcp_registry_generation(gateway)? } }
+                "_meta": { "himind": { "registryGeneration": generation } }
             });
             if end < all_tools.len() {
-                result["nextCursor"] = json!(format!("offset:{end}"));
+                result["nextCursor"] = json!(format_tool_cursor(
+                    result["_meta"]["himind"]["registryGeneration"]
+                        .as_str()
+                        .unwrap_or_default(),
+                    end
+                ));
             }
             Ok(result)
         }
         "tools/call" => {
+            let generation = mcp_registry_generation(gateway)?;
+            session.synchronize_generation(&generation);
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
@@ -356,6 +502,24 @@ fn handle_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            if name == "capability.catalog.activate" {
+                return match activate_capabilities(gateway, arguments, session) {
+                    Ok(result) => mcp_tool_call_result(result),
+                    Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
+                };
+            }
+            if name == "capability.catalog.invoke" {
+                return match invoke_activated_capability(gateway, arguments, session) {
+                    Ok(result) => mcp_tool_call_result(result),
+                    Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
+                };
+            }
+            if !session.is_exposed(name) {
+                return Ok(mcp_tool_call_error(&io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("capability is not active in this MCP session: {name}"),
+                )));
+            }
             let context = mcp_invocation_context();
             match gateway.invoke(&context, name, arguments) {
                 Ok(result) => Ok(mcp_tool_call_result(result)?),
@@ -364,6 +528,235 @@ fn handle_request(
         }
         _ => Err(format!("unsupported MCP method: {method}").into()),
     }
+}
+
+fn activate_capabilities(
+    gateway: &CapabilityGateway,
+    params: Value,
+    session: &mut McpSessionState,
+) -> Result<Value, Box<dyn Error>> {
+    let has_selector = params.get("ids").is_some()
+        || params.get("group").is_some()
+        || params.get("surface").is_some()
+        || params.get("query").is_some();
+    if !has_selector {
+        return Err("capability activation requires ids, group, surface, or query".into());
+    }
+    let ids = params
+        .get("ids")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let group = params
+        .get("group")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let surface = params
+        .get("surface")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let query = params
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let replace = params
+        .get("replace")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let available = gateway.list_capabilities(&mcp_invocation_context())?;
+    let generation = mcp_registry_generation(gateway)?;
+    session.synchronize_generation(&generation);
+    let mut matched = available
+        .iter()
+        .filter(|capability| !BOOTSTRAP_TOOL_IDS.contains(&capability.id.as_str()))
+        .filter(|capability| ids.is_empty() || ids.contains(&capability.id))
+        .filter(|capability| {
+            group
+                .as_deref()
+                .map_or(true, |value| capability.discovery_group() == value)
+        })
+        .filter(|capability| {
+            surface
+                .as_deref()
+                .map_or(true, |value| capability.discovery_surface() == value)
+        })
+        .filter(|capability| {
+            query.as_deref().map_or(true, |value| {
+                [
+                    capability.id.as_str(),
+                    capability.name.as_str(),
+                    capability.description.as_str(),
+                ]
+                .iter()
+                .any(|field| field.to_ascii_lowercase().contains(value))
+            })
+        })
+        .map(|capability| capability.id.clone())
+        .collect::<Vec<_>>();
+    matched.sort();
+    matched.dedup();
+    if matched.is_empty() {
+        return Err("capability activation matched no visible capabilities".into());
+    }
+
+    let visible_ids = available
+        .iter()
+        .map(|capability| capability.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let previous = session.activated_capabilities.clone();
+    let mut next = if replace {
+        BTreeSet::new()
+    } else {
+        previous
+            .iter()
+            .filter(|capability_id| visible_ids.contains(capability_id.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+    next.extend(matched.iter().cloned());
+    if next.len() > MAX_ACTIVATED_CAPABILITIES {
+        return Err(format!(
+            "capability activation exceeds the session limit of {MAX_ACTIVATED_CAPABILITIES}"
+        )
+        .into());
+    }
+    let activated_schema_bytes = next.iter().try_fold(0usize, |total, capability_id| {
+        let capability = available
+            .iter()
+            .find(|candidate| candidate.id == *capability_id)
+            .ok_or_else(|| format!("capability is no longer visible: {capability_id}"))?;
+        let schema_bytes = serde_json::to_vec(&capability.input_schema)
+            .map_err(|error| error.to_string())?
+            .len();
+        total
+            .checked_add(schema_bytes)
+            .ok_or_else(|| "capability activation schema budget overflow".to_string())
+    })?;
+    if activated_schema_bytes > MAX_ACTIVATED_SCHEMA_BYTES {
+        return Err(format!(
+            "capability activation exceeds the schema budget of {MAX_ACTIVATED_SCHEMA_BYTES} bytes"
+        )
+        .into());
+    }
+
+    session.activated_capabilities = next;
+    session.projection_changed |= previous != session.activated_capabilities;
+    Ok(json!({
+        "activated": matched,
+        "activatedCount": session.activated_capabilities.len(),
+        "limit": MAX_ACTIVATED_CAPABILITIES,
+        "activatedSchemaBytes": activated_schema_bytes,
+        "schemaByteLimit": MAX_ACTIVATED_SCHEMA_BYTES,
+        "registryGeneration": mcp_registry_generation(gateway)?
+    }))
+}
+
+fn catalog_activation_tool() -> Value {
+    json!({
+        "name": "capability.catalog.activate",
+        "title": "激活能力",
+        "description": "按能力 ID、分组、surface 或关键字将能力加入当前 MCP 会话的工具列表。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": MAX_ACTIVATED_CAPABILITIES
+                },
+                "group": { "type": "string" },
+                "surface": { "type": "string" },
+                "query": { "type": "string" },
+                "replace": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        },
+        "annotations": {
+            "title": "激活能力",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "availability": "local",
+            "riskLevel": "read_only",
+            "source": "mcp-session",
+            "executionMode": "sync",
+            "approvalRequired": false,
+            "discoveryGroup": "core",
+            "discoverySurface": "primary",
+            "discoveryRank": 1
+        }
+    })
+}
+
+fn catalog_invoke_tool() -> Value {
+    json!({
+        "name": "capability.catalog.invoke",
+        "title": "调用已激活能力",
+        "description": "调用当前 MCP 会话已经激活的能力；适用于不支持动态工具列表刷新的客户端。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "arguments": {}
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        },
+        "annotations": {
+            "title": "调用已激活能力",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": true,
+            "availability": "local",
+            "riskLevel": "provider_defined",
+            "source": "mcp-session",
+            "executionMode": "provider_defined",
+            "approvalRequired": true,
+            "discoveryGroup": "core",
+            "discoverySurface": "primary",
+            "discoveryRank": 2
+        }
+    })
+}
+
+fn invoke_activated_capability(
+    gateway: &CapabilityGateway,
+    params: Value,
+    session: &McpSessionState,
+) -> Result<Value, Box<dyn Error>> {
+    let capability_id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("capability.catalog.invoke requires a non-empty id")?;
+    if !session.is_exposed(capability_id) {
+        return Err(
+            format!("capability is not active in this MCP session: {capability_id}").into(),
+        );
+    }
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    gateway.invoke(&mcp_invocation_context(), capability_id, arguments)
 }
 
 fn mcp_tool_call_error(error: &dyn Error) -> Value {
@@ -492,6 +885,50 @@ fn mcp_capability_facts(
 fn mcp_registry_generation(gateway: &CapabilityGateway) -> Result<String, Box<dyn Error>> {
     let context = mcp_invocation_context();
     let capabilities = gateway.list_capabilities(&context)?;
+    let mut hasher = Sha256::new();
+    for capability in &capabilities {
+        // Hash the contract fields individually. This preserves changes to
+        // a Schema while avoiding construction of one large registry JSON
+        // value on every watcher tick.
+        let schema = serde_json::to_vec(&capability.input_schema)?;
+        for field in [
+            capability.id.as_bytes(),
+            capability.version.as_bytes(),
+            capability.name.as_bytes(),
+            capability.description.as_bytes(),
+            capability.risk_level.as_bytes(),
+            capability.source.as_bytes(),
+            capability.contract_source.as_bytes(),
+            capability
+                .contract_generation
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            capability.execution_mode.as_bytes(),
+            capability.idempotency.as_bytes(),
+            capability.retry_policy.as_bytes(),
+            capability.concurrency.as_bytes(),
+            capability
+                .required_scope
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            capability
+                .dashboard_route
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            schema.as_slice(),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        hasher.update([capability.supports_progress as u8]);
+        hasher.update([capability.supports_cancel as u8]);
+        hasher.update([capability.approval_required as u8]);
+        hasher.update([capability.dashboard_provider as u8]);
+        hasher.update(capability.availability.as_str().as_bytes());
+    }
     let facts = capabilities
         .iter()
         .map(|descriptor| crate::skill::resolver::CapabilityFact {
@@ -500,15 +937,11 @@ fn mcp_registry_generation(gateway: &CapabilityGateway) -> Result<String, Box<dy
             source: descriptor.source.clone(),
         })
         .collect::<Vec<_>>();
-    let snapshot = json!({
-        "capabilities": capabilities,
-        "prompts": crate::skill::mcp_prompts_json(VERSION, &facts)?,
-        "resources": crate::skill::mcp_resources_json(VERSION, &facts)?,
-    });
-    Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&snapshot)?)
-    ))
+    let prompts = crate::skill::mcp_prompts_json(VERSION, &facts)?;
+    let resources = crate::skill::mcp_resources_json(VERSION, &facts)?;
+    hasher.update(serde_json::to_vec(&prompts)?);
+    hasher.update(serde_json::to_vec(&resources)?);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn parse_tool_cursor(params: &Value) -> Result<usize, Box<dyn Error>> {
@@ -520,10 +953,44 @@ fn parse_tool_cursor(params: &Value) -> Result<usize, Box<dyn Error>> {
         .ok_or("tools/list cursor must be a string")?;
     let offset = cursor
         .strip_prefix("offset:")
+        .map(str::to_string)
+        .or_else(|| {
+            cursor
+                .strip_prefix("generation:")
+                .and_then(|value| value.rsplit_once("|offset:"))
+                .map(|(_, offset)| offset.to_string())
+        })
         .ok_or("invalid tools/list cursor")?
         .parse::<usize>()
         .map_err(|_| "invalid tools/list cursor")?;
     Ok(offset)
+}
+
+fn format_tool_cursor(generation: &str, offset: usize) -> String {
+    format!("generation:{generation}|offset:{offset}")
+}
+
+fn validate_tool_cursor(
+    params: &Value,
+    generation: &str,
+    legacy_offset: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let Some(cursor) = params.get("cursor").and_then(Value::as_str) else {
+        return Ok(legacy_offset);
+    };
+    if let Some((cursor_generation, offset)) = cursor
+        .strip_prefix("generation:")
+        .and_then(|value| value.rsplit_once("|offset:"))
+    {
+        if cursor_generation != generation {
+            return Err("tools/list cursor is stale; request the first page again".into());
+        }
+        return offset
+            .parse::<usize>()
+            .map_err(|_| "invalid tools/list cursor".into());
+    }
+    // Accept old offset cursors for one compatibility cycle.
+    Ok(legacy_offset)
 }
 
 fn mcp_annotations(capability: &crate::capability::types::CapabilityDescriptor) -> Value {
@@ -600,9 +1067,10 @@ fn write_notification(
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_registry_notifications, handle_request, mcp_error_code, mcp_registry_generation,
-        mcp_tool_call_error, mcp_tool_call_result, negotiate_protocol_version, parse_tool_cursor,
-        spawn_registry_watcher_with_interval,
+        emit_registry_notifications, handle_request, handle_request_with_session, mcp_error_code,
+        mcp_registry_generation, mcp_tool_call_error, mcp_tool_call_result,
+        negotiate_protocol_version, parse_default_activation_ids, parse_tool_cursor,
+        spawn_registry_watcher_with_interval, McpSessionState, MCP_INSTRUCTIONS,
     };
     use crate::api::oauth::AgentAccessToken;
     use crate::business_integration::{BusinessCapabilityContract, BusinessCatalogSnapshot};
@@ -610,6 +1078,7 @@ mod tests {
     use crate::store::types::LocalWorkerStatus;
     use crate::Options;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -673,6 +1142,264 @@ mod tests {
             negotiate_protocol_version(&json!({ "protocolVersion": "future-version" })),
             "2025-11-25"
         );
+    }
+
+    #[test]
+    fn initialize_instructions_identify_short_video_as_independent_local_workflow() {
+        assert!(MCP_INSTRUCTIONS.contains("short.video.*"));
+        assert!(MCP_INSTRUCTIONS.contains("Independent 模式完整可用"));
+        assert!(MCP_INSTRUCTIONS.contains("不依赖 Dashboard"));
+        assert!(MCP_INSTRUCTIONS.contains("Agent 本机审批策略"));
+    }
+
+    #[test]
+    fn session_projection_keeps_bootstrap_small_and_requires_activation() {
+        let gateway = test_gateway();
+        let mut session = McpSessionState::default();
+        let listed =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        let tools = listed["tools"].as_array().unwrap();
+        assert!(
+            tools.len() <= 6,
+            "bootstrap projection grew unexpectedly: {tools:?}"
+        );
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "capability.catalog.search"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "capability.catalog.describe"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "capability.catalog.activate"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "capability.catalog.invoke"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "business.project.list"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ai.client.import"));
+
+        let blocked = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({ "name": "ai.client.import", "arguments": {} }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(blocked["isError"], true);
+        assert!(blocked["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not active"));
+
+        let activated = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "capability.catalog.activate",
+                "arguments": { "ids": ["ai.client.list"] }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(activated["isError"], false);
+        assert_eq!(
+            activated["structuredContent"]["activated"],
+            json!(["ai.client.list"])
+        );
+
+        let listed =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        assert!(listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "ai.client.list"));
+
+        let called = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "capability.catalog.invoke",
+                "arguments": { "id": "ai.client.list", "arguments": {} }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(
+            called["isError"], false,
+            "dynamic capability call failed: {called}"
+        );
+    }
+
+    #[test]
+    fn default_projection_exposes_preactivated_abilities() {
+        let gateway = test_gateway();
+        let mut session = McpSessionState {
+            default_activated: ["ai.client.list".to_string()].into_iter().collect(),
+            ..McpSessionState::default()
+        };
+        let listed =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        let names = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"ai.client.list"),
+            "preactivated capability must be projected: {names:?}"
+        );
+        assert!(
+            !names.contains(&"business.project.list"),
+            "unlisted capabilities must stay hidden: {names:?}"
+        );
+    }
+
+    #[test]
+    fn default_activation_survives_registry_generation_change() {
+        let gateway = test_gateway();
+        let mut session = McpSessionState {
+            default_activated: ["ai.client.list".to_string()].into_iter().collect(),
+            ..McpSessionState::default()
+        };
+        session.synchronize_generation("sha256:one");
+        gateway.replace_business_catalog_for_test(BusinessCatalogSnapshot::dashboard(
+            "session-generation-two".into(),
+            Vec::new(),
+        ));
+        session.synchronize_generation(&mcp_registry_generation(&gateway).unwrap());
+        assert!(session.default_activated.contains("ai.client.list"));
+        assert!(session.activated_capabilities.is_empty());
+        let listed =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        assert!(listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "ai.client.list"));
+    }
+
+    #[test]
+    fn parse_default_activation_filters_unknown_ids() {
+        let known = ["ai.client.list", "business.project.list"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let parsed = parse_default_activation_ids(
+            "business.project.list, ai.client.list , no.such.capability",
+            &known,
+        );
+        assert_eq!(
+            parsed,
+            ["ai.client.list", "business.project.list"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(parse_default_activation_ids("   ", &known).is_empty());
+        assert!(parse_default_activation_ids("nothing.known,also.missing", &known).is_empty());
+    }
+
+    #[test]
+    fn catalog_search_is_lightweight_and_describe_returns_schema() {
+        let gateway = test_gateway();
+        let mut session = McpSessionState::default();
+        let search = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "capability.catalog.search",
+                "arguments": { "query": "ai.client", "limit": 5 }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(search["isError"], false);
+        let item = &search["structuredContent"]["items"][0];
+        assert!(item["schemaBytes"].as_u64().unwrap() > 0);
+        assert!(item.get("inputSchema").is_none());
+
+        let described = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "capability.catalog.describe",
+                "arguments": { "id": "ai.client.import" }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(described["isError"], false);
+        assert!(described["structuredContent"]["inputSchema"]["properties"]["target"].is_object());
+    }
+
+    #[test]
+    fn registry_change_invalidates_old_session_activation_before_invoke() {
+        let gateway = test_gateway();
+        let mut session = McpSessionState::default();
+        let listed =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        let generation = listed["_meta"]["himind"]["registryGeneration"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let activated = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "capability.catalog.activate",
+                "arguments": { "ids": ["ai.client.list"] }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(activated["isError"], false);
+        assert!(session.activated_capabilities.contains("ai.client.list"));
+
+        gateway.replace_business_catalog_for_test(BusinessCatalogSnapshot::dashboard(
+            "session-generation-two".into(),
+            Vec::new(),
+        ));
+        let changed = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "capability.catalog.invoke",
+                "arguments": { "id": "ai.client.list", "arguments": {} }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_ne!(
+            mcp_registry_generation(&gateway).unwrap(),
+            generation,
+            "the provider catalog change must produce a new MCP generation"
+        );
+        assert_eq!(changed["isError"], true);
+        assert!(changed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not active"));
+        assert!(session.activated_capabilities.is_empty());
+    }
+
+    #[test]
+    fn session_activation_is_invalidated_when_registry_generation_changes() {
+        let mut session = McpSessionState {
+            activated_capabilities: ["plugin.example.run".to_string()].into_iter().collect(),
+            default_activated: ["business.exhibit.list".to_string()].into_iter().collect(),
+            activation_generation: Some("sha256:one".to_string()),
+            projection_changed: false,
+            legacy_compatibility: false,
+        };
+        session.synchronize_generation("sha256:two");
+        assert!(session.activated_capabilities.is_empty());
+        assert!(session.default_activated.contains("business.exhibit.list"));
+        assert!(session.take_projection_changed());
+        assert_eq!(session.activation_generation.as_deref(), Some("sha256:two"));
     }
 
     #[test]
@@ -884,7 +1611,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(called["isError"], false);
+        assert_eq!(
+            called["isError"], false,
+            "dynamic capability call failed: {called}"
+        );
         assert_eq!(called["structuredContent"]["item"]["id"], "one");
         server.join().unwrap();
 

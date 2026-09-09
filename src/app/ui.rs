@@ -84,6 +84,12 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         distribution_update_signature_algorithm: String::new(),
     }));
     let approval_manager = ApprovalManager::global();
+    let capability_gateway =
+        crate::capability::service::CapabilityGateway::new_with_approval_manager(
+            options.clone(),
+            Arc::clone(&worker_status),
+            Arc::clone(&approval_manager),
+        );
     let service_options = options.clone();
     let service_worker_status = Arc::clone(&worker_status);
     let service_approval_manager = Arc::clone(&approval_manager);
@@ -91,6 +97,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     let state = AgentState {
         worker_status,
         approval_manager,
+        capability_gateway,
         port,
         dashboard_base: options.api_base.clone(),
         state_path: options.state_path.clone(),
@@ -107,22 +114,30 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     } else {
         builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(launch) = crate::parse_plugin_view_launch(&args) {
-                let result = open_plugin_view(app, &launch.plugin_id, &launch.view_id);
-                if let Some(state) = app.try_state::<AgentState>() {
-                    match result {
-                        Ok(()) => state.approval_manager.add_log(
-                            "info",
-                            &format!("已打开插件窗口: {}/{}", launch.plugin_id, launch.view_id),
-                        ),
-                        Err(error) => state.approval_manager.add_log(
-                            "error",
-                            &format!(
-                                "打开插件窗口失败: {}/{}: {error}",
-                                launch.plugin_id, launch.view_id
-                            ),
-                        ),
-                    }
-                }
+                let app = app.clone();
+                let _ = thread::Builder::new()
+                    .name("himind-plugin-view-open".to_string())
+                    .spawn(move || {
+                        let result = open_plugin_view(&app, &launch.plugin_id, &launch.view_id);
+                        if let Some(state) = app.try_state::<AgentState>() {
+                            match result {
+                                Ok(()) => state.approval_manager.add_log(
+                                    "info",
+                                    &format!(
+                                        "已打开插件窗口: {}/{}",
+                                        launch.plugin_id, launch.view_id
+                                    ),
+                                ),
+                                Err(error) => state.approval_manager.add_log(
+                                    "error",
+                                    &format!(
+                                        "打开插件窗口失败: {}/{}: {error}",
+                                        launch.plugin_id, launch.view_id
+                                    ),
+                                ),
+                            }
+                        }
+                    });
             } else if crate::protocol_open_requested(&args)
                 || !args.iter().any(|argument| argument == "--protocol-url")
             {
@@ -215,10 +230,6 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_inner_admin_page,
             super::commands::open_agent_directory,
             super::commands::show_main_window,
-            super::commands::window_start_dragging,
-            super::commands::window_minimize,
-            super::commands::window_toggle_maximize,
-            super::commands::window_close,
             super::commands::quit_agent,
             super::commands::set_auto_start,
             super::commands::pick_unity_editor,
@@ -318,6 +329,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_plugin_view,
             super::commands::create_plugin_view_shortcut,
             super::commands::close_plugin_view,
+            super::commands::get_plugin_view_context,
+            super::commands::pick_workspace_directory,
             super::commands::invoke_plugin_view_capability,
         ])
         .setup(move |app| {
@@ -325,16 +338,22 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                 &service_options,
                 service_worker_status,
                 Some(Arc::clone(&service_approval_manager)),
+                app.state::<AgentState>().capability_gateway.clone(),
             )?;
-            match super::ai_clients::migrate_legacy_agent_commands() {
-                Ok(count) if count > 0 => service_approval_manager.add_log(
-                    "info",
-                    &format!("已将 {count} 个 AI 客户端连接迁移到稳定 Agent 入口"),
-                ),
-                Ok(_) => {}
-                Err(error) => service_approval_manager
-                    .add_log("warn", &format!("AI 客户端连接迁移未完成：{error}")),
-            }
+            let migration_approval_manager = Arc::clone(&service_approval_manager);
+            let _ = thread::Builder::new()
+                .name("himind-ai-client-migration".to_string())
+                .spawn(
+                    move || match super::ai_clients::migrate_legacy_agent_commands() {
+                        Ok(count) if count > 0 => migration_approval_manager.add_log(
+                            "info",
+                            &format!("已将 {count} 个 AI 客户端连接迁移到稳定 Agent 入口"),
+                        ),
+                        Ok(_) => {}
+                        Err(error) => migration_approval_manager
+                            .add_log("warn", &format!("AI 客户端连接迁移未完成：{error}")),
+                    },
+                );
             start_pending_updater_repair(Arc::clone(&service_approval_manager));
             service_approval_manager
                 .add_log("info", &format!("Agent 已启动，本地服务: 127.0.0.1:{port}"));
@@ -718,6 +737,7 @@ pub(crate) fn open_plugin_view(
         "plugin-ui://localhost/{}/{}/{}",
         plugin.id, view.id, relative_entry
     );
+    let plugin_log_name = format!("{}/{}", plugin.id, view.id);
     WebviewWindowBuilder::new(
         app,
         &label,
@@ -727,6 +747,18 @@ pub(crate) fn open_plugin_view(
     .inner_size(1100.0, 760.0)
     .resizable(true)
     .on_navigation(crate::capability::plugin::is_plugin_ui_navigation)
+    .on_page_load(move |window, payload| {
+        if let Some(state) = window.app_handle().try_state::<AgentState>() {
+            state.approval_manager.add_log(
+                "info",
+                &format!(
+                    "插件窗口页面 {:?}: {} ({plugin_log_name})",
+                    payload.event(),
+                    payload.url()
+                ),
+            );
+        }
+    })
     .build()
     .map(|_| ())
     .map_err(|error| error.to_string())

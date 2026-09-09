@@ -4,13 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const ACCESS_MODE_EXHIBIT_LINKED: &str = "exhibit_linked";
-pub(crate) const ACCESS_MODE_FULL_ACCESS: &str = "full_access";
+/// Persisted as `full_access` for compatibility. This is the remote runtime's
+/// machine-unrestricted mode, not the ApprovalManager profile of the same
+/// serialized name.
+pub(crate) const ACCESS_MODE_MACHINE_UNRESTRICTED: &str = "full_access";
 pub(crate) const PROVIDER_AUTO: &str = "auto";
 const LEGACY_PROVIDER_OPENHANDS: &str = "himind.openhands";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RemoteExecutionSettings {
     pub enabled: bool,
+    /// `full_access` is the legacy serialized value for a machine-unrestricted
+    /// remote runtime. It is independent from `approval.profile=full_access`.
     pub access_mode: String,
     pub default_provider: String,
 }
@@ -29,9 +34,9 @@ impl RemoteExecutionSettings {
     pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
         if !matches!(
             self.access_mode.as_str(),
-            ACCESS_MODE_EXHIBIT_LINKED | ACCESS_MODE_FULL_ACCESS
+            ACCESS_MODE_EXHIBIT_LINKED | ACCESS_MODE_MACHINE_UNRESTRICTED
         ) {
-            return Err("访问模式必须是仅展项关联目录或完全访问此电脑".into());
+            return Err("访问模式必须是仅展项关联目录或允许远程运行时使用本机资源".into());
         }
         if !matches!(
             self.default_provider.as_str(),
@@ -93,7 +98,9 @@ pub(crate) fn save(
 
 #[cfg(test)]
 mod tests {
-    use super::{load, save, settings_path, RemoteExecutionSettings, ACCESS_MODE_FULL_ACCESS};
+    use super::{
+        load, save, settings_path, RemoteExecutionSettings, ACCESS_MODE_MACHINE_UNRESTRICTED,
+    };
     use std::fs;
 
     #[test]
@@ -118,7 +125,7 @@ mod tests {
         let state_path = root.join("agent-state.json");
         let settings = RemoteExecutionSettings {
             enabled: true,
-            access_mode: ACCESS_MODE_FULL_ACCESS.to_string(),
+            access_mode: ACCESS_MODE_MACHINE_UNRESTRICTED.to_string(),
             default_provider: crate::runtime::PROVIDER_CODEX.to_string(),
         };
         save(&state_path, &settings).unwrap();

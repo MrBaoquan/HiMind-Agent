@@ -50,7 +50,7 @@ type DevelopmentPageProps = {
   onUpdateSourceConfig: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
   onRemoveSource: (sourceId: string) => Promise<void>;
   onSelectWorkspace: () => Promise<void>;
-  onCreate: (input: CreateExtensionProjectInput) => Promise<void>;
+  onCreate: (input: CreateExtensionProjectInput) => Promise<ExtensionProject>;
   onOpenProject: () => Promise<void>;
   onAssociateProject: (project: ExtensionRemoteProject) => Promise<void>;
   onBuild: (projectId: string, onProgress?: (stage: ExtensionBuildStage) => void) => Promise<void>;
@@ -118,7 +118,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
         {selected ? <ProjectDetail key={selected.key} project={selected} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={props.onSubmit} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个项目" text={props.dashboardEnabled ? '查看本地工程、构建和发布进度。' : '查看本地工程、构建和版本。'} />}
       </main>
     </section>
-    {createOpen ? <CreateProjectDialog busy={Boolean(props.busyAction)} onClose={() => setCreateOpen(false)} onCreate={async input => { try { await props.onCreate(input); setCreateOpen(false); } catch { /* The parent keeps the dialog open and shows the error. */ } }} /> : null}
+    {createOpen ? <CreateProjectDialog busy={Boolean(props.busyAction)} onClose={() => setCreateOpen(false)} onCreate={async input => { try { const project = await props.onCreate(input); setQuery(''); setKindFilter('all'); setSelectedKey(`${project.kind}:${project.extension_id}`); setDetailOpen(true); setCreateOpen(false); return project; } catch (error) { /* The parent keeps the dialog open and shows the error. */ throw error; } }} /> : null}
     {removeProject ? <ConfirmRemoveDialog project={removeProject} dashboardEnabled={props.dashboardEnabled} busy={Boolean(props.busyAction)} onClose={() => setRemoveProject(null)} onConfirm={async () => { await props.onRemove(removeProject.id); setRemoveProject(null); }} /> : null}
     <ExtensionSourcesDialog open={sourcesOpen} workspace={props.workspace} settings={props.extensionSources} snapshot={props.extensionSourceSnapshot} loading={props.extensionSourcesLoading || Boolean(props.busyAction)} error={props.extensionSourcesError} onClose={() => setSourcesOpen(false)} onSelectWorkspace={props.onSelectWorkspace} onDevelopWorkspace={props.onDevelopWorkspace} onRefresh={props.onRefreshSources} onAdd={props.onAddSource} onUpdate={props.onUpdateSourceConfig} onRemove={props.onRemoveSource} />
   </div>;
@@ -360,7 +360,7 @@ function SettingsPanel({ project, dashboardEnabled, busy, onOpenFolder, onReques
   </>;
 }
 
-function CreateProjectDialog({ busy, onClose, onCreate }: { busy: boolean; onClose: () => void; onCreate: (input: CreateExtensionProjectInput) => Promise<void> }) {
+function CreateProjectDialog({ busy, onClose, onCreate }: { busy: boolean; onClose: () => void; onCreate: (input: CreateExtensionProjectInput) => Promise<ExtensionProject> }) {
   const [input, setInput] = useState<CreateExtensionProjectInput>({ kind: 'skill', slug: '', extension_id: '', name: '', description: '', category: 'software-engineering', template: 'readonly-tool' });
   const valid = input.name.trim() && input.slug.trim() && input.description.trim() && input.category;
   const change = <K extends keyof CreateExtensionProjectInput>(key: K, value: CreateExtensionProjectInput[K]) => setInput(current => ({ ...current, [key]: value }));
@@ -373,7 +373,7 @@ function CreateProjectDialog({ busy, onClose, onCreate }: { busy: boolean; onClo
       <label><span>功能分类</span><select value={input.category} onChange={event => change('category', event.target.value)}>{FUNCTIONAL_CATEGORIES.map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></label>
       {input.kind === 'plugin' ? <label><span>项目模板</span><select value={input.template} onChange={event => change('template', event.target.value as CreateExtensionProjectInput['template'])}><option value="readonly-tool">AI 工具</option><option value="job-worker">后台任务</option><option value="ui-tool">桌面工具</option></select></label> : null}
     </div>
-    <div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" disabled={!valid || busy} onClick={() => void onCreate(input)}><Plus size={15} />创建项目</button></div>
+    <div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" disabled={!valid || busy} onClick={() => { void onCreate(input).catch(() => undefined); }}><Plus size={15} />创建项目</button></div>
   </div></div>;
 }
 

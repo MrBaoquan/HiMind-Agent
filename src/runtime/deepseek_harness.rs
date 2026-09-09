@@ -1385,7 +1385,7 @@ fn build_invocation(
     let home = dsh_run_home(&runtime_version, &claim.run.id)?;
     let permission_mode = match effective_access_mode(claim)? {
         crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED => "workspace-write",
-        crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS => "danger-full-access",
+        crate::app::remote_execution::ACCESS_MODE_MACHINE_UNRESTRICTED => "danger-full-access",
         _ => unreachable!(),
     };
     Ok(Invocation {
@@ -1420,7 +1420,7 @@ fn effective_access_mode(claim: &AgentRunClaim) -> Result<&str, Box<dyn Error>> 
     };
     match value {
         crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED
-        | crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS => Ok(value),
+        | crate::app::remote_execution::ACCESS_MODE_MACHINE_UNRESTRICTED => Ok(value),
         _ => Err("Dashboard returned an unsupported Agent Run access mode".into()),
     }
 }
@@ -1904,13 +1904,17 @@ fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn himind_mcp_arguments(options: &Options) -> Vec<String> {
-    vec![
-        "--mcp".to_string(),
-        "--api".to_string(),
-        options.api_base.clone(),
+    let mut arguments = vec!["--mcp".to_string()];
+    if options.mode().dashboard_enabled() {
+        arguments.extend(["--api".to_string(), options.api_base.clone()]);
+    }
+    arguments.extend([
+        "--mode".to_string(),
+        options.mode().as_str().to_string(),
         "--state".to_string(),
         options.state_path.to_string_lossy().to_string(),
-    ]
+    ]);
+    arguments
 }
 
 fn himind_mcp_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
@@ -2281,6 +2285,12 @@ fn native_dsh_home(version: &str) -> Result<PathBuf, String> {
     dsh_home(version)
 }
 
+pub(crate) fn interactive_home_path() -> Result<PathBuf, String> {
+    let executable = resolve_executable().map_err(|error| error.to_string())?;
+    let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
+    native_dsh_home(&version)
+}
+
 fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
     let root = env::var_os(DSH_HOME_ROOT_ENV)
         .filter(|value| !value.is_empty())
@@ -2470,7 +2480,7 @@ mod tests {
         dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
         managed_model_catalog, merge_profile_package, migrate_legacy_managed_settings,
         native_dsh_provider_config, parse_native_dsh_provider_config, parse_runtime_version,
-        remove_managed_runtime, render_himind_agent_overlay, render_himind_profile_patch,
+        himind_mcp_arguments, remove_managed_runtime, render_himind_agent_overlay, render_himind_profile_patch,
         render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
         skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter, versioned_home,
         InteractiveEventProjector,
@@ -2818,9 +2828,25 @@ mod tests {
         )
         .unwrap();
         assert!(!profile.contains("provider: himind-proxy"));
+        assert!(!profile.contains("https://dashboard.example"));
         assert!(profile.contains("id: himind-agent-mcp"));
         assert!(profile.contains("Independent Mode"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dsh_mcp_launch_uses_the_active_mode_and_omits_dashboard_api_when_independent() {
+        let mut options = crate::Options::from_env();
+        options.api_base = "https://dashboard.example".to_string();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        let arguments = himind_mcp_arguments(&options);
+        assert!(arguments.windows(2).any(|pair| pair == ["--mode", "independent"]));
+        assert!(!arguments.iter().any(|argument| argument == "--api"));
+
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let connected_arguments = himind_mcp_arguments(&options);
+        assert!(connected_arguments.windows(2).any(|pair| pair == ["--mode", "connected"]));
+        assert!(connected_arguments.iter().any(|argument| argument == "--api"));
     }
 
     #[test]

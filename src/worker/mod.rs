@@ -28,7 +28,7 @@ struct UpdateCheckLoop {
     handle: Option<thread::JoinHandle<()>>,
 }
 
-impl Drop for ExtensionReconcileLoop {
+impl Drop for HeartbeatLoop {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -37,7 +37,7 @@ impl Drop for ExtensionReconcileLoop {
     }
 }
 
-impl Drop for HeartbeatLoop {
+impl Drop for ExtensionReconcileLoop {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -386,6 +386,9 @@ pub(crate) fn run_loop(
         handle: Some(update_thread),
     };
 
+    // Dashboard policy reconciliation stays on the Dashboard Worker. Local
+    // GitHub source and DSH preset reconciliation runs in the Agent service so
+    // a Worker credential outage cannot block it.
     let reconcile_stop = Arc::new(AtomicBool::new(false));
     let reconcile_stop_for_thread = Arc::clone(&reconcile_stop);
     let reconcile_options = options.clone();
@@ -401,7 +404,7 @@ pub(crate) fn run_loop(
                 &reconcile_agent_id,
                 &mut generation,
             ) {
-                eprintln!("extension reconcile failed: {error}");
+                eprintln!("extension policy reconcile failed: {error}");
             }
             for _ in 0..30 {
                 if reconcile_stop_for_thread.load(Ordering::Relaxed) {

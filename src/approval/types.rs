@@ -139,9 +139,33 @@ pub struct ApprovalSettings {
     pub agent_id: String,
     #[serde(default)]
     pub binding_updated_at: u64,
-    /// Unix timestamp of the last explicit R3 self-risk acknowledgement.
+    /// Unix timestamp of the last explicit elevated-approval risk acknowledgement.
     #[serde(default)]
     pub risk_acknowledged_at: u64,
+    /// Seconds the risk acknowledgement stays valid from risk_acknowledged_at.
+    /// Zero keeps the acknowledgement valid until the user revokes it.
+    #[serde(default = "default_risk_acknowledged_duration_seconds")]
+    pub risk_acknowledged_duration_seconds: u64,
+}
+
+fn default_risk_acknowledged_duration_seconds() -> u64 {
+    3600
+}
+
+impl ApprovalSettings {
+    /// An elevated approval acknowledgement is valid only inside its chosen duration.
+    /// Duration zero means permanent until the user revokes it; an expired
+    /// acknowledgement invalidates the trusted posture so the UI can re-ask.
+    pub fn risk_acknowledgement_valid(&self, now_unix: u64) -> bool {
+        if self.risk_acknowledged_at == 0 {
+            return false;
+        }
+        self.risk_acknowledged_duration_seconds == 0
+            || now_unix
+                < self
+                    .risk_acknowledged_at
+                    .saturating_add(self.risk_acknowledged_duration_seconds)
+    }
 }
 
 pub fn default_approval_profile() -> String {
@@ -181,6 +205,7 @@ impl Default for ApprovalSettings {
             agent_id: String::new(),
             binding_updated_at: 0,
             risk_acknowledged_at: 0,
+            risk_acknowledged_duration_seconds: default_risk_acknowledged_duration_seconds(),
         }
     }
 }

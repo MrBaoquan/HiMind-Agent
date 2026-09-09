@@ -578,13 +578,20 @@ fn remove_json_config(content: &str) -> Result<String, Box<dyn Error>> {
 }
 
 fn mcp_arguments(options: &Options) -> Vec<String> {
-    vec![
-        "--mcp".to_string(),
-        "--api".to_string(),
-        options.api_base.clone(),
+    let mut arguments = vec!["--mcp".to_string()];
+    if options.mode().dashboard_enabled() {
+        arguments.extend(["--api".to_string(), options.api_base.clone()]);
+    }
+    // The development launcher can use a process-local mode override.
+    // Carry it into the stdio companion so external AI clients cannot
+    // accidentally start against a stale persisted Connected preference.
+    arguments.extend([
+        "--mode".to_string(),
+        options.mode().as_str().to_string(),
         "--state".to_string(),
         options.state_path.to_string_lossy().to_string(),
-    ]
+    ]);
+    arguments
 }
 
 fn stable_launcher_executable() -> Result<PathBuf, Box<dyn Error>> {
@@ -903,9 +910,9 @@ fn unix_now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_output_indicates_client, default_workbuddy_mcp_config_path, merge_client_config,
-        merge_codex_config, merge_json_config, remove_codex_config, remove_json_config, ConfigKind,
-        SERVER_ID,
+        command_output_indicates_client, default_workbuddy_mcp_config_path, mcp_arguments,
+        merge_client_config, merge_codex_config, merge_json_config, remove_codex_config,
+        remove_json_config, ConfigKind, SERVER_ID,
     };
     use serde_json::Value;
     use std::env;
@@ -1028,5 +1035,22 @@ mod tests {
             "cannot find github copilot cli"
         ));
         assert!(command_output_indicates_client("github copilot 1.2.3"));
+    }
+
+    #[test]
+    fn mcp_launch_carries_the_active_agent_mode() {
+        let mut options = crate::Options::from_env();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        let arguments = mcp_arguments(&options);
+        let mode = arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--mode")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(mode, Some("independent"));
+        assert!(!arguments.iter().any(|argument| argument == "--api"));
+
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let connected_arguments = mcp_arguments(&options);
+        assert!(connected_arguments.iter().any(|argument| argument == "--api"));
     }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { agentApi, type AgentModeSettings, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
-import { Bell, BellOff, Bot, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Globe2, Inbox, KeyRound, LoaderCircle, LockKeyhole, Monitor, MoreHorizontal, PencilLine, Power, RefreshCw, RotateCcw, Save, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, Wrench, X } from 'lucide-react';
+import { Bell, BellOff, Bot, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Globe2, Inbox, KeyRound, LoaderCircle, LockKeyhole, Monitor, MoreHorizontal, PencilLine, Power, RefreshCw, RotateCcw, Save, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
 type SettingsSection = 'remote' | 'approval' | 'remote-tools' | 'accounts' | 'tools' | 'general';
@@ -16,7 +16,7 @@ const SETTINGS_SECTIONS = [
 
 const BUILTIN_APPROVAL_RULES = new Set(['remote_connect', 'upload_code', 'upload_placeholder', 'controlled_operation', '*', 'risk:R1', 'risk:R2', 'risk:R3', 'risk:R4']);
 
-type ApprovalProfile = 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'silent_deny';
+type ApprovalProfile = 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'full_access' | 'silent_deny';
 type ApprovalRuleMode = 'inherit' | 'manual' | 'auto_approve' | 'auto_deny';
 
 function agentModeLabel(mode?: string) {
@@ -29,7 +29,8 @@ const APPROVAL_PROFILE_OPTIONS = [
   { value: 'strict', label: '更安全', description: '除单独授权外，受控操作都先确认', icon: ShieldAlert },
   { value: 'balanced', label: '推荐', description: '查询预览自动执行，修改操作先确认', icon: ShieldCheck },
   { value: 'relaxed', label: '少打扰', description: '查询和普通修改自动执行', icon: BellOff },
-  { value: 'trusted', label: '完全信任', description: '删除、发布等高风险操作也自动执行', icon: KeyRound },
+  { value: 'trusted', label: '完全信任', description: '常规及高风险操作自动执行，最高风险仍确认', icon: KeyRound },
+  { value: 'full_access', label: '完全放行', description: '跳过 Agent 审批弹窗，含最高风险操作', icon: UnlockKeyhole },
   { value: 'silent_deny', label: '只执行已授权项', description: '其他受控请求直接拒绝，不弹审批', icon: ShieldX },
 ] satisfies ChoiceOption[];
 
@@ -108,7 +109,7 @@ export function SettingsPage({
   onRemoteExecutionChange: (settings: RemoteExecutionSettings, fullAccessConfirmed?: boolean) => void;
   onRemoteClientsChange: (overview: RemoteClientOverview) => void;
   onRuleChange: (requestType: string, mode: string) => void;
-  onApprovalProfileChange: (profile: string, confirmed?: boolean) => void;
+  onApprovalProfileChange: (profile: string, confirmed?: boolean, durationSeconds?: number) => void;
   onApprovalNotificationModeChange: (mode: string) => void;
   onTimeoutChange: (seconds: number) => void;
   onAutoStartChange: (enabled: boolean) => void;
@@ -152,17 +153,6 @@ export function SettingsPage({
         if (disposed) return;
         setBuiltinAIRuntimeInstallation(installation);
         setBuiltinAIRuntimeStatus(installation.runtime);
-        if (installation.runtime.status === 'ready') {
-          try {
-            const checked = await agentApi.checkBuiltinAiRuntimeUpdate();
-            if (!disposed) {
-              setBuiltinAIRuntimeInstallation(checked);
-              setBuiltinAIRuntimeStatus(checked.runtime);
-            }
-          } catch {
-            // A status page should remain usable when Dashboard is offline.
-          }
-        }
       } catch {
         if (!disposed) setBuiltinAIRuntimeStatus(null);
       }
@@ -239,8 +229,8 @@ export function SettingsPage({
   const [unityEditorSettings, setUnityEditorSettings] = useState<UnityEditorSettings | null>(null);
   const [editorFeedback, setEditorFeedback] = useState('');
   const [editorSaving, setEditorSaving] = useState(false);
-  const [pendingFullAccess, setPendingFullAccess] = useState<RemoteExecutionSettings | null>(null);
-  const [pendingApprovalTrust, setPendingApprovalTrust] = useState(false);
+  const [pendingRemoteRuntimeUnrestricted, setPendingRemoteRuntimeUnrestricted] = useState<RemoteExecutionSettings | null>(null);
+  const [pendingApprovalProfile, setPendingApprovalProfile] = useState<'trusted' | 'full_access' | null>(null);
   const [agentMode, setAgentMode] = useState<AgentModeSettings | null>(null);
   const [agentModeBusy, setAgentModeBusy] = useState(false);
   const [agentModeFeedback, setAgentModeFeedback] = useState('');
@@ -375,16 +365,16 @@ export function SettingsPage({
     const next = { ...remoteExecutionSettings, ...patch };
     const enteringFullAccess = next.access_mode === 'full_access'
       && (remoteExecutionSettings.access_mode !== 'full_access' || (!remoteExecutionSettings.enabled && next.enabled));
-    if (enteringFullAccess) setPendingFullAccess(next);
+    if (enteringFullAccess) setPendingRemoteRuntimeUnrestricted(next);
     else onRemoteExecutionChange(next);
   };
   const approvalProfile = (settings.profile === 'focus' ? 'balanced' : settings.profile || 'balanced') as ApprovalProfile;
   const profileOption = APPROVAL_PROFILE_OPTIONS.find(option => option.value === approvalProfile) || APPROVAL_PROFILE_OPTIONS[1];
   const exactRuleCount = exactApprovalRules.length;
-  const effectiveModes = settings.effective_modes || fallbackEffectiveModes(approvalProfile, settings.rules || {});
+  const effectiveModes = { ...fallbackEffectiveModes(approvalProfile, settings.rules || {}), ...(settings.effective_modes || {}) };
   const changeApprovalProfile = (next: string) => {
-    if (next === 'trusted') {
-      setPendingApprovalTrust(true);
+    if (next === 'trusted' || next === 'full_access') {
+      setPendingApprovalProfile(next);
       return;
     }
     onApprovalProfileChange(next, next === 'trusted');
@@ -413,10 +403,10 @@ export function SettingsPage({
               <div className="card-header"><span>远程任务</span><Pill kind={remoteExecutionSettings.enabled ? 'success' : 'neutral'}>{remoteExecutionSettings.enabled ? '已启用' : '已关闭'}</Pill></div>
               <div className="card-body setting-list">
                 <SettingRow title="接受远程任务" description="只接收当前工作台账号发给本机 Agent 的任务"><label className="toggle"><input type="checkbox" checked={remoteExecutionSettings.enabled} onChange={event => updateRemoteExecution({ enabled: event.target.checked })} /><span className="slider"></span></label></SettingRow>
-                <SettingRow title="访问范围" description={remoteExecutionSettings.enabled ? '控制远程任务可操作的本机目录' : '启用远程任务后生效'}>
+                <SettingRow title="远程运行时范围" description={remoteExecutionSettings.enabled ? '决定远程 AI 是否受展项目录工作区限制；不改变操作审批策略' : '启用远程任务后生效'}>
                   <select aria-label="远程任务访问范围" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.access_mode} onChange={event => updateRemoteExecution({ access_mode: event.target.value as RemoteExecutionSettings['access_mode'] })}>
                     <option value="exhibit_linked">仅限展项关联目录（推荐）</option>
-                    <option value="full_access">允许访问此电脑（高风险）</option>
+                    <option value="full_access">解除工作区限制，使用本机资源（高风险）</option>
                   </select>
                 </SettingRow>
                 <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '自动模式会选择本机可用的 AI 工具' : '启用远程任务后生效'}>
@@ -470,17 +460,23 @@ export function SettingsPage({
           </> : null}
 
           {section === 'approval' ? <section className="card settings-section approval-settings-card">
-              <div className="card-header"><span>操作审批</span><Pill kind={approvalProfile === 'trusted' ? 'warn' : approvalProfile === 'silent_deny' ? 'neutral' : 'success'}>{profileOption.label}</Pill></div>
+              <div className="card-header"><span>操作审批</span><Pill kind={approvalProfile === 'trusted' || approvalProfile === 'full_access' ? 'warn' : approvalProfile === 'silent_deny' ? 'neutral' : 'success'}>{profileOption.label}</Pill></div>
               <div className="approval-settings-body">
                 <div className="approval-identity-row">
                   <div><strong>授权归属</strong><span>{independentMode ? '独立模式：策略保存在本机，仅约束经过 HiMind Agent 能力层的调用' : settings.owner_user_id ? '宽松授权与当前 Dashboard 账号和本机 Agent 绑定' : '当前审批设置仅保存在本机'}</span></div>
                   <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '独立模式' : settings.owner_user_id ? `已绑定 ${settings.owner_user_id}` : '本机模式'}</Pill>
                 </div>
                 {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>独立模式下 Dashboard Worker 不参与审批；本机审批队列、审批历史和右下角提醒仍可用。DSH 或外部 AI 工具直接执行且未经过 HiMind Agent 能力层的操作不受此策略拦截。</span></div> : null}
+                <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>完全放行只跳过经 HiMind Agent 能力层的审批弹窗，不会让远程 AI 运行时解除工作区限制。</span></div>
 
                 <div className="approval-settings-group">
                   <div className="approval-group-heading"><strong>什么时候需要我确认</strong><span>单项例外会优先于整体设置</span></div>
                   <ChoiceGroup className="approval-profile-grid" label="操作审批确认程度" value={approvalProfile} options={APPROVAL_PROFILE_OPTIONS} onChange={changeApprovalProfile} />
+                  {(approvalProfile === 'trusted' || approvalProfile === 'full_access') && (settings.risk_acknowledged ? (
+                    <div className="approval-trust-expired"><ShieldAlert size={14} />{approvalProfile === 'full_access' ? '完全放行授权' : '完全信任授权'}生效中{settings.risk_acknowledged_duration_seconds ? `，剩余约 ${formatTrustRemaining(settings.risk_acknowledged_remaining_seconds)}` : '（永久，直到撤销）'}</div>
+                  ) : (
+                    <div className="approval-trust-expired"><ShieldAlert size={14} />{approvalProfile === 'full_access' ? '完全放行授权' : '完全信任授权'}已过期或未确认，请重新确认授权时长</div>
+                  ))}
                 </div>
 
                 <div className="approval-settings-group">
@@ -494,7 +490,7 @@ export function SettingsPage({
                     <ApprovalEffectiveItem icon={Search} label="查询与预览" mode={effectiveModes.read} />
                     <ApprovalEffectiveItem icon={PencilLine} label="新增与普通修改" mode={effectiveModes.write} />
                     <ApprovalEffectiveItem icon={Trash2} label="删除、发布与权限变更" mode={effectiveModes.high_risk} />
-                    <ApprovalEffectiveItem icon={ShieldX} label="系统保护目标" mode="blocked" />
+                    <ApprovalEffectiveItem icon={ShieldX} label="最高风险操作" mode={effectiveModes.system} />
                   </div>
                 </div>
 
@@ -505,10 +501,12 @@ export function SettingsPage({
                     <SettingRow title="文件上传" description="代码、清单表和制品上传到本机"><ApprovalRuleChoice label="文件上传" value={approvalRuleValue(settings, 'upload_code')} onChange={mode => onRuleChange('upload_code', mode)} /></SettingRow>
                     <SettingRow title="查询与预览" description="只读取信息，不修改文件或业务数据"><ApprovalRuleChoice label="查询与预览" value={approvalRuleValue(settings, 'risk:R1')} onChange={mode => onRuleChange('risk:R1', mode)} /></SettingRow>
                     <SettingRow title="新增与普通修改" description="新增人员、更新展项或写入普通文件"><ApprovalRuleChoice label="新增与普通修改" value={approvalRuleValue(settings, 'risk:R2')} onChange={mode => onRuleChange('risk:R2', mode)} /></SettingRow>
-                    <SettingRow title="删除、发布与权限变更" description="高风险操作；自动允许仅在完全信任下可用"><ApprovalRuleChoice label="删除、发布与权限变更" value={approvalRuleValue(settings, 'risk:R3')} autoApproveDisabled={approvalProfile !== 'trusted'} onChange={mode => onRuleChange('risk:R3', mode)} /></SettingRow>
+                    <SettingRow title="删除、发布与权限变更" description="高风险操作；自动允许仅在完全信任或完全放行下可用"><ApprovalRuleChoice label="删除、发布与权限变更" value={approvalRuleValue(settings, 'risk:R3')} autoApproveDisabled={!['trusted', 'full_access'].includes(approvalProfile)} onChange={mode => onRuleChange('risk:R3', mode)} /></SettingRow>
+                    <SettingRow title="最高风险受控操作" description="可执行的 R4 能力；自动允许仅在完全放行下可用"><ApprovalRuleChoice label="最高风险受控操作" value={approvalRuleValue(settings, 'risk:R4')} autoApproveDisabled={approvalProfile !== 'full_access'} onChange={mode => onRuleChange('risk:R4', mode)} /></SettingRow>
+                    <SettingRow title="系统保护边界" description="系统目录、Agent 数据和安装目录、磁盘根、越界路径及超限批量操作"><Pill kind="danger">始终阻止</Pill></SettingRow>
                     <SettingRow title="其他受控操作" description="没有单独分类、但能力声明需要审批的操作"><ApprovalRuleChoice label="其他受控操作" value={approvalRuleValue(settings, 'controlled_operation')} onChange={mode => onRuleChange('controlled_operation', mode)} /></SettingRow>
                     <SettingRow title="未分类普通操作" description="兼容尚未声明操作类别的非高风险能力"><ApprovalRuleChoice label="未分类普通操作" value={approvalRuleValue(settings, '*')} onChange={mode => onRuleChange('*', mode)} /></SettingRow>
-                    {exactApprovalRules.map(([requestType, mode]) => <SettingRow key={requestType} title={requestType} description="Capability 单项例外"><ApprovalRuleChoice label={requestType} value={mode as ApprovalRuleMode} autoApproveDisabled={requestType === 'risk:R4' || (isHighRiskRuleKey(requestType) && approvalProfile !== 'trusted')} onChange={next => onRuleChange(requestType, next)} /></SettingRow>)}
+                    {exactApprovalRules.map(([requestType, mode]) => <SettingRow key={requestType} title={requestType} description="Capability 单项例外"><ApprovalRuleChoice label={requestType} value={mode as ApprovalRuleMode} autoApproveDisabled={(requestType === 'risk:R4' && approvalProfile !== 'full_access') || (isHighRiskRuleKey(requestType) && !['trusted', 'full_access'].includes(approvalProfile))} onChange={next => onRuleChange(requestType, next)} /></SettingRow>)}
                     <SettingRow title="新增 Capability 例外" description="仅供插件或集成能力的精确授权">
                       <div className="approval-rule-editor">
                         <input aria-label="Capability ID" placeholder="例如 ai.client.import" value={approvalCapabilityId} onChange={event => setApprovalCapabilityId(event.target.value)} />
@@ -632,8 +630,8 @@ export function SettingsPage({
       </div>
       {loginModalOpen ? <LoginModal configured={configured} username={loginUsername} password={loginPassword} onClose={onCloseLoginModal} onUsernameChange={onUsernameChange} onPasswordChange={onPasswordChange} onSave={onSaveLogin} onLogout={onLogoutLogin} onOpenInnerAdmin={onOpenInnerAdmin} /> : null}
       {svnModalOpen ? <SvnConnectionModal draft={svnDraft} exists={svnConnections.length > 0} onClose={onCloseSvnModal} onChange={onSvnDraftChange} onSave={onSaveSvnConnection} /> : null}
-      {pendingApprovalTrust ? <ApprovalTrustConfirmation onClose={() => setPendingApprovalTrust(false)} onConfirm={() => { onApprovalProfileChange('trusted', true); setPendingApprovalTrust(false); }} /> : null}
-      {pendingFullAccess ? <FullAccessConfirmation onClose={() => setPendingFullAccess(null)} onConfirm={() => { onRemoteExecutionChange(pendingFullAccess, true); setPendingFullAccess(null); }} /> : null}
+      {pendingApprovalProfile ? <ApprovalTrustConfirmation profile={pendingApprovalProfile} onClose={() => setPendingApprovalProfile(null)} onConfirm={(durationSeconds) => { onApprovalProfileChange(pendingApprovalProfile, true, durationSeconds); setPendingApprovalProfile(null); }} /> : null}
+      {pendingRemoteRuntimeUnrestricted ? <RemoteRuntimeUnrestrictedConfirmation onClose={() => setPendingRemoteRuntimeUnrestricted(null)} onConfirm={() => { onRemoteExecutionChange(pendingRemoteRuntimeUnrestricted, true); setPendingRemoteRuntimeUnrestricted(null); }} /> : null}
       {pendingRuntimeUninstall ? <RuntimeUninstallConfirmation onClose={() => setPendingRuntimeUninstall(false)} onConfirm={() => { setPendingRuntimeUninstall(false); void startBuiltinAIRuntimeOperation('uninstall'); }} /> : null}
     </>
   );
@@ -690,13 +688,13 @@ function RuntimeUninstallConfirmation({ onClose, onConfirm }: { onClose: () => v
   );
 }
 
-function FullAccessConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+function RemoteRuntimeUnrestrictedConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="full-access-title" onClick={event => event.stopPropagation()}>
-        <div className="modal-header"><div><h3 id="full-access-title">允许访问此电脑？</h3><p>仅在远程任务确实需要时开启。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="remote-runtime-unrestricted-title" onClick={event => event.stopPropagation()}>
+        <div className="modal-header"><div><h3 id="remote-runtime-unrestricted-title">解除远程 AI 的工作区限制？</h3><p>仅在远程任务确实需要展项目录以外的本机资源时开启。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程任务可以访问你有权限使用的文件和文件夹</strong><span>任务可能读取、创建或修改展项目录以外的内容。只对可信任务开启此权限。</span></div></div>
+          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程 AI 运行时会在当前 Windows 账户允许范围内使用本机资源</strong><span>这会解除工作区沙箱，任务可能访问展项目录以外的文件、工具或网络资源。运行时直接执行的动作不会逐条进入操作审批；经 HiMind Agent 能力层的调用仍按审批策略处理，且不会突破 Windows 权限。</span></div></div>
           <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Bot size={15} />确认启用</button></div></div>
         </div>
       </div>
@@ -704,24 +702,53 @@ function FullAccessConfirmation({ onClose, onConfirm }: { onClose: () => void; o
   );
 }
 
-function ApprovalTrustConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+const TRUST_DURATION_OPTIONS: { value: number; label: string }[] = [
+  { value: 3600, label: '1 小时' },
+  { value: 10800, label: '3 小时' },
+  { value: 86400, label: '1 天' },
+  { value: 0, label: '永久（直到撤销）' },
+];
+
+function formatTrustRemaining(seconds?: number): string {
+  if (!seconds || seconds <= 0) {
+    return '0 分钟';
+  }
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.ceil((seconds % 3600) / 60);
+  if (hours > 0) {
+    return minutes > 0 ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+  }
+  return `${minutes} 分钟`;
+}
+
+function ApprovalTrustConfirmation({ profile, onClose, onConfirm }: { profile: 'trusted' | 'full_access'; onClose: () => void; onConfirm: (durationSeconds: number) => void }) {
+  const [durationSeconds, setDurationSeconds] = useState(3600);
+  const durationLabel = TRUST_DURATION_OPTIONS.find(option => option.value === durationSeconds)?.label ?? '1 小时';
+  const fullAccess = profile === 'full_access';
+  const strategyLabel = fullAccess ? '完全放行' : '完全信任';
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div className="modal approval-trust-modal" role="dialog" aria-modal="true" aria-labelledby="approval-trust-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header approval-trust-header">
-          <div className="approval-trust-heading"><div className="approval-trust-icon"><ShieldAlert size={20} /></div><div><h3 id="approval-trust-title">启用完全信任</h3><p>未来 1 小时内，R3 高风险操作可以自动执行。</p></div></div>
+          <div className="approval-trust-heading"><div className="approval-trust-icon"><ShieldAlert size={20} /></div><div><h3 id="approval-trust-title">启用{strategyLabel}</h3><p>未来 {durationLabel} 内，{fullAccess ? '所有可执行受控操作' : '查询、修改和高风险操作'}可以自动执行。</p></div></div>
           <IconButton icon={X} label="关闭" onClick={onClose} />
         </div>
         <div className="modal-body approval-trust-body">
-          <div className="approval-trust-intro"><strong>你将把审批交给当前 Agent 自主判断</strong><span>风险由当前用户自行承担；授权仅作用于当前 Agent，可随时在审批中心或设置中恢复严格审批。</span></div>
+          <div className="approval-trust-intro"><strong>{fullAccess ? '你将跳过 Agent 对所有可执行受控操作的审批弹窗' : '你将把高风险审批交给当前 Agent 自主判断'}</strong><span>风险由当前用户自行承担；授权仅作用于当前 Agent，可随时在审批中心或设置中恢复严格审批。</span></div>
           <div className="approval-trust-scope">
             <div className="approval-trust-scope-item"><FolderOpen size={17} /><div><strong>本地文件</strong><span>删除、批量清理或覆盖工作区文件。</span></div></div>
             <div className="approval-trust-scope-item"><Database size={17} /><div><strong>Dashboard 业务数据</strong><span>删除项目/展项、解除关联、替换人员、发布变更。</span></div></div>
-            <div className="approval-trust-scope-item"><Globe2 size={17} /><div><strong>第三方与 MCP</strong><span>符合 R3 契约的外部写操作和集成调用。</span></div></div>
+            <div className="approval-trust-scope-item"><Globe2 size={17} /><div><strong>第三方与 MCP</strong><span>{fullAccess ? '所有经 Agent 能力层的受控集成调用。' : '符合 R3 契约的外部写操作和集成调用。'}</span></div></div>
           </div>
-          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>仍然不会放行</strong><span>R4 操作、系统保护目录、Agent 数据目录、Dashboard ACL 和服务端硬拒绝。</span></div></div>
-          <div className="approval-trust-meta"><span><Clock3 size={14} />有效期 1 小时</span><span><CheckCircle2 size={14} />可随时撤销</span></div>
-          <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>暂不启用</button><button className="btn btn-danger" onClick={onConfirm}><KeyRound size={15} />确认授权 1 小时</button></div></div>
+          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '完全放行只跳过 Agent 审批弹窗；已设置的单项“每次确认”或“自动拒绝”、系统保护目录、Dashboard ACL 和服务端硬拒绝仍然有效，也不会让远程 AI 运行时解除工作区限制。' : '完全信任自动放行查询、修改和高风险操作，最高风险操作仍会请求确认。'}</span></div></div>
+          <div className="field-group approval-trust-duration">
+            <label className="field-label" htmlFor="approval-trust-duration">授权有效期</label>
+            <select id="approval-trust-duration" value={durationSeconds} onChange={event => setDurationSeconds(Number(event.target.value))}>
+              {TRUST_DURATION_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </div>
+          <div className="approval-trust-meta"><span><Clock3 size={14} />有效期 {durationLabel}</span><span><CheckCircle2 size={14} />可随时撤销</span></div>
+          <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>暂不启用</button><button className="btn btn-danger" onClick={() => onConfirm(durationSeconds)}><KeyRound size={15} />确认{strategyLabel} {durationLabel}</button></div></div>
         </div>
       </div>
     </div>
@@ -808,21 +835,22 @@ function approvalRuleValue(settings: ApprovalSettings, key: string): ApprovalRul
 }
 
 function fallbackEffectiveModes(profile: ApprovalProfile, rules: Record<string, string>) {
-  const resolve = (risk: 'R1' | 'R2' | 'R3'): 'manual' | 'auto_approve' | 'auto_deny' => {
+  const resolve = (risk: 'R1' | 'R2' | 'R3' | 'R4'): 'manual' | 'auto_approve' | 'auto_deny' => {
     const rank = Number(risk.slice(1));
     for (const key of [`risk:${risk}`, 'controlled_operation', '*']) {
       const mode = rules[key];
       if (mode === 'auto_deny') return 'auto_deny';
       if (mode === 'manual') return 'manual';
-      if (mode === 'auto_approve' && (rank < 3 || profile === 'trusted')) return 'auto_approve';
+      if (mode === 'auto_approve' && (rank < 3 || (rank === 3 && ['trusted', 'full_access'].includes(profile)) || (rank === 4 && profile === 'full_access'))) return 'auto_approve';
     }
     if (profile === 'silent_deny') return 'auto_deny';
+    if (profile === 'full_access' && rank <= 4) return 'auto_approve';
     if (profile === 'trusted' && rank <= 3) return 'auto_approve';
     if (profile === 'relaxed' && rank <= 2) return 'auto_approve';
     if (profile === 'balanced' && rank <= 1) return 'auto_approve';
     return 'manual';
   };
-  return { read: resolve('R1'), write: resolve('R2'), high_risk: resolve('R3') };
+  return { read: resolve('R1'), write: resolve('R2'), high_risk: resolve('R3'), system: resolve('R4') };
 }
 
 function isHighRiskRuleKey(key: string) {

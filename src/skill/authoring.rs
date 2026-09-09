@@ -470,11 +470,25 @@ pub(crate) fn test(
         (|| -> Result<(AuthoringDraft, BTreeMap<String, Value>, Value), Box<dyn Error>> {
             let package_root = draft_version_root(skill_id, version).join("package");
             let store = SkillStore::new();
-            let record = store.install_organization_package(
-                &package_root,
-                &draft.manifest.id,
-                &draft.manifest.version,
-            )?;
+            // Candidate tests must exercise the same installation scope that
+            // the package declares. Organization-scoped skills come from the
+            // marketplace, while user-scoped packages are the independent
+            // mode/local-source distribution path.
+            let record = match draft.manifest.scope {
+                SkillScope::Organization => store.install_organization_package(
+                    &package_root,
+                    &draft.manifest.id,
+                    &draft.manifest.version,
+                )?,
+                SkillScope::User => store.install_user_package(
+                    &package_root,
+                    &draft.manifest.id,
+                    &draft.manifest.version,
+                )?,
+                SkillScope::Builtin => {
+                    return Err("候选 Skill 不能使用 builtin scope".into());
+                }
+            };
             store.apply_management_policy(
                 &draft.manifest.id,
                 &SkillManagementPolicy {
@@ -615,7 +629,7 @@ impl SkillTestSnapshot {
     ) -> Result<Self, Box<dyn Error>> {
         let store = SkillStore::new();
         store.bootstrap_builtin_skills()?;
-        let skill_root = store.skill_root_for_scope(&SkillScope::Organization, &manifest.id);
+        let skill_root = store.skill_root_for_scope(&manifest.scope, &manifest.id);
         let mut rendered_paths = Vec::new();
         if let Ok(status) = crate::skill::client_status_json(VERSION, capability_facts) {
             if let Some(clients) = status.as_object() {

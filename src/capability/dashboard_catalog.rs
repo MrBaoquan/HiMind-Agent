@@ -23,7 +23,6 @@ use crate::Options;
 
 const CATALOG_SCHEMA_VERSION: &str = "1";
 const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const CATALOG_STALE_AFTER: Duration = Duration::from_secs(60);
 const CATALOG_CLIENT_ID: &str = "himind-agent-capability-catalog";
 
 // Compatibility aliases keep existing internal callers stable while the
@@ -58,7 +57,14 @@ pub(crate) fn invoke_catalog_capability(
     let access = platform_access_token(options, &contract.scope)?;
     let (url, consumed) = catalog_operation_url(options, &contract.route, &input)?;
     let method = Method::from_bytes(contract.http_method.as_bytes())?;
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let mut client_builder = Client::builder().timeout(Duration::from_secs(30));
+    // The local Agent API must not be routed through a machine-wide HTTP
+    // proxy. Remote Dashboard endpoints continue to use the default proxy
+    // configuration so enterprise network policy remains effective.
+    if is_loopback_api_base(options) {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build()?;
     let mut remaining = input;
     let (body, query) = catalog_request_payload(&method, &mut remaining, &consumed)?;
     let idempotency_key = if method != Method::GET && method != Method::HEAD {
@@ -129,6 +135,16 @@ pub(crate) fn invoke_catalog_capability(
             .unwrap_or("Dashboard 业务能力调用失败");
         return Err(format!("{message}（HTTP {}）", status.as_u16()).into());
     }
+}
+
+fn is_loopback_api_base(options: &Options) -> bool {
+    let Ok(url) = Url::parse(&options.api_base) else {
+        return false;
+    };
+    matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+    )
 }
 
 fn retryable_status(status: StatusCode) -> bool {
@@ -227,6 +243,7 @@ fn catalog_operation_url(
 struct CatalogState {
     last_attempt: Option<Instant>,
     updated_at: Option<Instant>,
+    refresh_in_flight: bool,
     etag: String,
     snapshot: Option<DashboardCatalogSnapshot>,
 }
@@ -251,23 +268,24 @@ impl DashboardCatalogProvider {
         if !self.options.mode().control_plane_enabled() {
             return None;
         }
-        let refresh = self
+        let should_refresh = self
             .state
             .lock()
             .ok()
             .map(|state| {
-                state
-                    .last_attempt
-                    .map(|attempt| attempt.elapsed() >= CATALOG_REFRESH_INTERVAL)
-                    .unwrap_or(true)
+                !state.refresh_in_flight
+                    && state
+                        .last_attempt
+                        .map(|attempt| attempt.elapsed() >= CATALOG_REFRESH_INTERVAL)
+                        .unwrap_or(true)
             })
             .unwrap_or(false);
-        if refresh {
-            // Avoid a network/refresh-token round trip for a fresh Connected
-            // Agent that has never been authorized. Static capabilities stay
-            // immediately available in that state.
+        if should_refresh {
+            // Authorization is a local file check. The network request and
+            // token refresh run in the background so tools/list, health and
+            // the desktop window never wait for Dashboard availability.
             match authorization_snapshot(&self.options.state_path) {
-                Ok(Some(_)) => self.refresh(),
+                Ok(Some(_)) => self.start_background_refresh(),
                 Ok(None) => {
                     if let Ok(mut state) = self.state.lock() {
                         state.last_attempt = Some(Instant::now());
@@ -283,44 +301,53 @@ impl DashboardCatalogProvider {
                 }
             }
         }
-        self.state.lock().ok().and_then(|state| {
-            let fresh = state
-                .updated_at
-                .map(|updated| updated.elapsed() <= CATALOG_STALE_AFTER)
-                .unwrap_or(false);
-            fresh.then(|| state.snapshot.clone()).flatten()
-        })
+        // A previously validated catalog remains useful while Dashboard is
+        // temporarily offline. Every invocation still crosses Dashboard ACL,
+        // so retaining this discovery snapshot does not bypass authorization.
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.snapshot.clone())
     }
 
-    fn refresh(&self) {
+    fn start_background_refresh(&self) {
         let etag = {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
-            if state
-                .last_attempt
-                .map(|attempt| attempt.elapsed() < CATALOG_REFRESH_INTERVAL)
-                .unwrap_or(false)
-            {
+            if state.refresh_in_flight {
                 return;
             }
             state.last_attempt = Some(Instant::now());
+            state.refresh_in_flight = true;
             state.etag.clone()
         };
-        let Ok(result) = fetch_catalog(&self.options, &etag) else {
-            return;
-        };
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        match result {
-            FetchResult::NotModified => {
-                state.updated_at = Some(Instant::now());
-            }
-            FetchResult::Modified { snapshot, etag } => {
-                state.etag = etag;
-                state.snapshot = Some(snapshot);
-                state.updated_at = Some(Instant::now());
+        let provider = self.clone();
+        let refresh_state = Arc::clone(&self.state);
+        if std::thread::Builder::new()
+            .name("himind-dashboard-catalog-refresh".to_string())
+            .spawn(move || {
+                let result = fetch_catalog(&provider.options, &etag);
+                let Ok(mut state) = provider.state.lock() else {
+                    return;
+                };
+                state.refresh_in_flight = false;
+                match result {
+                    Ok(FetchResult::NotModified) => {
+                        state.updated_at = Some(Instant::now());
+                    }
+                    Ok(FetchResult::Modified { snapshot, etag }) => {
+                        state.etag = etag;
+                        state.snapshot = Some(snapshot);
+                        state.updated_at = Some(Instant::now());
+                    }
+                    Err(_) => {}
+                }
+            })
+            .is_err()
+        {
+            if let Ok(mut state) = refresh_state.lock() {
+                state.refresh_in_flight = false;
             }
         }
     }
@@ -332,6 +359,7 @@ impl DashboardCatalogProvider {
             state: Arc::new(Mutex::new(CatalogState {
                 last_attempt: Some(Instant::now()),
                 updated_at: Some(Instant::now()),
+                refresh_in_flight: false,
                 etag: snapshot.generation.clone(),
                 snapshot: Some(snapshot),
             })),
@@ -343,6 +371,7 @@ impl DashboardCatalogProvider {
         let mut state = self.state.lock().expect("catalog test state lock");
         state.last_attempt = Some(Instant::now());
         state.updated_at = Some(Instant::now());
+        state.refresh_in_flight = false;
         state.etag = snapshot.generation.clone();
         state.snapshot = Some(snapshot);
     }

@@ -122,23 +122,30 @@ export type ApprovalSettings = {
   timeout_seconds: number;
   auto_start: boolean;
   rules?: Record<string, string>;
-  profile?: 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'silent_deny' | 'focus' | string;
+  profile?: 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'full_access' | 'silent_deny' | 'focus' | string;
   notification_mode?: 'popup' | 'tray' | 'inbox' | string;
   owner_user_id?: string;
   agent_id?: string;
   binding_updated_at?: number;
   risk_acknowledged_at?: number;
   risk_acknowledged?: boolean;
+  risk_acknowledged_duration_seconds?: number;
+  risk_acknowledged_remaining_seconds?: number;
   effective_modes?: {
     read: 'manual' | 'auto_approve' | 'auto_deny';
     write: 'manual' | 'auto_approve' | 'auto_deny';
     high_risk: 'manual' | 'auto_approve' | 'auto_deny';
+    system: 'manual' | 'auto_approve' | 'auto_deny';
   };
   editors?: UnityEditorSettings;
 };
 
 export type RemoteExecutionSettings = {
     enabled: boolean;
+    /**
+     * `full_access` is the persisted compatibility value for an unrestricted
+     * remote runtime, not the Agent approval-profile setting of the same name.
+     */
     access_mode: 'exhibit_linked' | 'full_access';
     default_provider: 'himind.builtin' | 'auto' | 'personal.codex' | 'personal.github-copilot';
 };
@@ -550,8 +557,27 @@ export type McpProbeResult = McpConnectionTestResult & {
 export type PluginViewContribution = {
     id: string;
     title: string;
+    /** Compact label used by the Agent quick-tools surface. */
+    short_title?: string;
+    /** Semantic icon key resolved by the Agent host. */
+    icon?: string;
+    /** Whether this view should be exposed as a quick launch entry. */
+    quick_access?: boolean;
+    /** Stable ordering hint within the quick-tools surface. */
+    order?: number;
     location?: string;
     entry: string;
+};
+
+/** A host-owned projection of an installed plugin view for quick launch. */
+export type PluginQuickAccessView = {
+    plugin_id: string;
+    plugin_name: string;
+    view_id: string;
+    title: string;
+    short_title: string;
+    icon: string;
+    order: number;
 };
 
 export type CapabilityItem = {
@@ -1254,7 +1280,7 @@ export const agentApi = {
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),
-    setApprovalProfile: (profile: string, confirmed = false) => invoke<{ profile: string; notification_mode: string }>('set_approval_profile', { profile, confirmed }),
+    setApprovalProfile: (profile: string, confirmed = false, durationSeconds?: number) => invoke<{ profile: string; notification_mode: string }>('set_approval_profile', { profile, confirmed, ...(durationSeconds !== undefined ? { durationSeconds } : {}) }),
     setApprovalNotificationMode: (mode: string) => invoke<{ profile: string; notification_mode: string }>('set_approval_notification_mode', { mode }),
     setTimeout: (seconds: number) => invoke('set_approval_timeout', { seconds }),
     setAutoStart: (enabled: boolean) => invoke<{ auto_start: boolean }>('set_auto_start', { enabled }),

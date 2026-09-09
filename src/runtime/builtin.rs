@@ -211,6 +211,10 @@ pub(crate) fn interactive_tool_context_summary(
     active_adapter().interactive_tool_context_summary(options)
 }
 
+pub(crate) fn interactive_home_path() -> Result<PathBuf, String> {
+    deepseek_harness::interactive_home_path()
+}
+
 pub(crate) fn interactive_event_projector() -> BuiltinAIEventProjector {
     active_adapter().interactive_event_projector()
 }

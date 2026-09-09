@@ -35,6 +35,72 @@ pub(crate) struct CapabilityDescriptor {
     pub input_schema: Value,
 }
 
+impl CapabilityDescriptor {
+    pub(crate) fn discovery_group(&self) -> &'static str {
+        if self.source.starts_with("mcp:") {
+            return "integration";
+        }
+        if self.source.starts_with("plugin:") && !self.dashboard_provider {
+            return "plugin";
+        }
+        let id = self.id.as_str();
+        if id.starts_with("capability.") || id.starts_with("context.") {
+            "core"
+        } else if id.starts_with("business.")
+            || id.starts_with("project.")
+            || id.starts_with("exhibit.")
+            || id.starts_with("crew.")
+            || id.starts_with("operation.")
+        {
+            "business"
+        } else if id.starts_with("ai.") || id.starts_with("mcp.") {
+            "platform"
+        } else if id.starts_with("knowledge.") {
+            "knowledge"
+        } else if id.starts_with("media.") {
+            "media"
+        } else if id.starts_with("extension.") {
+            "authoring"
+        } else {
+            "other"
+        }
+    }
+
+    pub(crate) fn discovery_surface(&self) -> &'static str {
+        if self.source.starts_with("mcp:") {
+            return "integration";
+        }
+        if self.source.starts_with("plugin:") && !self.dashboard_provider {
+            return if self.execution_mode != "sync"
+                || self.supports_progress
+                || self.supports_cancel
+            {
+                "workflow"
+            } else {
+                "plugin"
+            };
+        }
+        if matches!(
+            self.id.as_str(),
+            "context.resolve"
+                | "business.project.list"
+                | "business.exhibit.list"
+                | "business.people.search"
+                | "knowledge.search.v1"
+        ) {
+            "primary"
+        } else if self.execution_mode != "sync" || self.supports_progress || self.supports_cancel {
+            "workflow"
+        } else if self.approval_required
+            || self.availability == CapabilityAvailability::ControlPlane
+        {
+            "admin"
+        } else {
+            "secondary"
+        }
+    }
+}
+
 /// Describes which runtime boundary a capability needs. A capability can be
 /// network-backed without being owned by the organization control plane; only
 /// `ControlPlane` is hidden when the Agent is running as an individual tool.
@@ -49,6 +115,14 @@ pub(crate) enum CapabilityAvailability {
 impl CapabilityAvailability {
     pub(crate) fn available_without_control_plane(self) -> bool {
         !matches!(self, Self::ControlPlane)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::NetworkService => "network_service",
+            Self::ControlPlane => "control_plane",
+        }
     }
 }
 

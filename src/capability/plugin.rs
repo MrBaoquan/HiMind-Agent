@@ -93,6 +93,18 @@ pub(crate) struct PluginContributions {
 pub(crate) struct PluginViewContribution {
     pub id: String,
     pub title: String,
+    /// Compact label for host quick-launch surfaces. Full title remains used
+    /// for the plugin window title and accessibility text.
+    #[serde(default)]
+    pub short_title: String,
+    /// Semantic icon key resolved by the host. Unknown keys use app-window.
+    #[serde(default = "default_view_icon")]
+    pub icon: String,
+    /// Whether this view is shown in the Agent quick-tools surface.
+    #[serde(default = "default_true")]
+    pub quick_access: bool,
+    #[serde(default)]
+    pub order: i32,
     #[serde(default = "default_view_location")]
     pub location: String,
     pub entry: String,
@@ -637,7 +649,8 @@ pub(crate) fn resolve_plugin_ui_resource(
 
 pub(crate) fn is_plugin_ui_origin(url: &url::Url) -> bool {
     (url.scheme() == "plugin-ui" && url.host_str() == Some("localhost"))
-        || (url.scheme() == "http" && url.host_str() == Some("plugin-ui.localhost"))
+        || (matches!(url.scheme(), "http" | "https")
+            && url.host_str() == Some("plugin-ui.localhost"))
 }
 
 pub(crate) fn is_plugin_ui_navigation(url: &url::Url) -> bool {
@@ -1028,10 +1041,16 @@ fn invoke_plugin_process(
         .spawn()
         .map_err(|error| format!("failed to start plugin {}: {error}", plugin.id))?;
 
+    // The Agent launches one short-lived plugin process per capability call.
+    // Close the request pipe after the single JSON-RPC message so a normal
+    // stdio server can observe EOF and exit after writing its response. If we
+    // leave `ChildStdin` attached to the child, the response is readable but
+    // `child.wait()` blocks until the plugin timeout because the server keeps
+    // waiting for another request.
     {
-        let stdin = child
+        let mut stdin = child
             .stdin
-            .as_mut()
+            .take()
             .ok_or_else(|| format!("plugin stdin unavailable: {}", plugin.id))?;
         writeln!(stdin, "{}", request)?;
     }
@@ -1232,6 +1251,7 @@ pub(crate) fn validate_manifest_contributions(
     if !is_safe_resource_segment(&manifest.id) {
         return Err(format!("invalid plugin id: {}", manifest.id).into());
     }
+    validate_independent_capability_contract(manifest)?;
     let mut dependency_ids = std::collections::HashSet::new();
     for dependency in &manifest.plugin_dependencies {
         if !is_safe_resource_segment(&dependency.plugin_id) {
@@ -1276,6 +1296,45 @@ pub(crate) fn validate_manifest_contributions(
         }
         if !command_ids.insert(command.id.as_str()) {
             return Err(format!("duplicate plugin command id: {}", command.id).into());
+        }
+    }
+    Ok(())
+}
+
+/// Short-video creation is a local production workflow. Keep that boundary
+/// enforced by the Agent as well as by the extension repository so a future
+/// manifest edit cannot accidentally turn it into a Dashboard capability.
+fn validate_independent_capability_contract(
+    manifest: &PluginManifest,
+) -> Result<(), Box<dyn Error>> {
+    if !manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.id.starts_with("short.video."))
+    {
+        return Ok(());
+    }
+    if manifest
+        .permissions
+        .iter()
+        .any(|permission| permission == "network.dashboard.public")
+    {
+        return Err(
+            "short.video.* capabilities cannot request network.dashboard.public; the workflow must remain independent"
+                .into(),
+        );
+    }
+    for capability in manifest
+        .capabilities
+        .iter()
+        .filter(|capability| capability.id.starts_with("short.video."))
+    {
+        if capability.availability.trim().to_ascii_lowercase() != "local" {
+            return Err(format!(
+                "short.video.* capability {} must declare availability=local",
+                capability.id
+            )
+            .into());
         }
     }
     Ok(())
@@ -1360,6 +1419,10 @@ fn default_plugin_author() -> String {
 
 fn default_view_location() -> String {
     "plugin_navigation".to_string()
+}
+
+fn default_view_icon() -> String {
+    "app-window".to_string()
 }
 
 #[cfg(test)]
@@ -1485,6 +1548,43 @@ mod tests {
     }
 
     #[test]
+    fn short_video_manifest_is_required_to_be_local_only() {
+        let local = parse_plugin_manifest(
+            r#"{
+            "id":"com.himind.short-video-test",
+            "name":"短视频测试",
+            "version":"1.0.0",
+            "capabilities":[{"id":"short.video.project.create","availability":"local"}]
+        }"#,
+        )
+        .unwrap();
+        assert!(validate_independent_capability_contract(&local).is_ok());
+
+        let dashboard = parse_plugin_manifest(
+            r#"{
+            "id":"com.himind.short-video-dashboard-test",
+            "name":"短视频测试",
+            "version":"1.0.0",
+            "capabilities":[{"id":"short.video.project.create","availability":"control_plane"}]
+        }"#,
+        )
+        .unwrap();
+        assert!(validate_independent_capability_contract(&dashboard).is_err());
+
+        let permission = parse_plugin_manifest(
+            r#"{
+            "id":"com.himind.short-video-permission-test",
+            "name":"短视频测试",
+            "version":"1.0.0",
+            "permissions":["network.dashboard.public"],
+            "capabilities":[{"id":"short.video.project.create","availability":"local"}]
+        }"#,
+        )
+        .unwrap();
+        assert!(validate_independent_capability_contract(&permission).is_err());
+    }
+
+    #[test]
     fn dashboard_only_plugin_is_control_plane() {
         let manifest = parse_plugin_manifest(
             r#"{
@@ -1588,6 +1688,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plugin_view_defaults_to_quick_access_metadata() {
+        let manifest = parse_plugin_manifest(
+            r#"{
+                "id":"com.himind.legacy-view",
+                "name":"旧版视图插件",
+                "version":"1.0.0",
+                "contributes": {
+                    "views": [{
+                        "id":"legacy.main",
+                        "title":"旧版工具",
+                        "entry":"ui/index.html"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let view = manifest.contributes.views.first().unwrap();
+        assert_eq!(view.short_title, "");
+        assert_eq!(view.icon, "app-window");
+        assert!(view.quick_access);
+        assert_eq!(view.order, 0);
+        assert_eq!(view.location, "plugin_navigation");
+    }
+
+    #[test]
+    fn plugin_view_can_opt_out_of_quick_access() {
+        let manifest = parse_plugin_manifest(
+            r#"{
+                "id":"com.himind.hidden-view",
+                "name":"隐藏快捷入口插件",
+                "version":"1.0.0",
+                "contributes": {
+                    "views": [{
+                        "id":"hidden.main",
+                        "title":"隐藏工具",
+                        "short_title":"隐藏",
+                        "icon":"video",
+                        "quick_access":false,
+                        "order":42,
+                        "location":"host_panel",
+                        "entry":"ui/index.html"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let view = manifest.contributes.views.first().unwrap();
+        assert_eq!(view.short_title, "隐藏");
+        assert_eq!(view.icon, "video");
+        assert!(!view.quick_access);
+        assert_eq!(view.order, 42);
+        assert_eq!(view.location, "host_panel");
+    }
+
+    #[test]
     fn accepts_html_view_inside_plugin_root() {
         let root =
             std::env::temp_dir().join(format!("agent-plugin-view-test-{}", next_request_id()));
@@ -1611,6 +1768,10 @@ mod tests {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
                     title: "Demo".to_string(),
+                    short_title: String::new(),
+                    icon: default_view_icon(),
+                    quick_access: true,
+                    order: 0,
                     location: "plugin_navigation".to_string(),
                     entry: "ui/index.html".to_string(),
                 }],
@@ -1646,6 +1807,10 @@ mod tests {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
                     title: "Demo".to_string(),
+                    short_title: String::new(),
+                    icon: default_view_icon(),
+                    quick_access: true,
+                    order: 0,
                     location: "plugin_navigation".to_string(),
                     entry: "ui/index.js".to_string(),
                 }],
@@ -1685,6 +1850,10 @@ mod tests {
                 views: vec![PluginViewContribution {
                     id: "demo.view.main".to_string(),
                     title: "Demo".to_string(),
+                    short_title: String::new(),
+                    icon: default_view_icon(),
+                    quick_access: true,
+                    order: 0,
                     location: "plugin_navigation".to_string(),
                     entry: format!("../{}", outside.file_name().unwrap().to_string_lossy()),
                 }],
@@ -1699,11 +1868,13 @@ mod tests {
 
     #[test]
     fn accepts_windows_plugin_ui_origin() {
-        let url = url::Url::parse(
-            "http://plugin-ui.localhost/demo.multi-cap/demo.multi-cap.overview/ui/index.html",
-        )
-        .unwrap();
-        assert!(is_plugin_ui_origin(&url));
+        for scheme in ["http", "https"] {
+            let url = url::Url::parse(&format!(
+                "{scheme}://plugin-ui.localhost/demo.multi-cap/demo.multi-cap.overview/ui/index.html"
+            ))
+            .unwrap();
+            assert!(is_plugin_ui_origin(&url));
+        }
     }
 
     #[test]

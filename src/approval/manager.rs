@@ -138,18 +138,29 @@ impl ApprovalManager {
                 "审批说明长度不能超过 {MAX_APPROVAL_TEXT_BYTES} 字节"
             ));
         }
-        let mode = self.get_mode_for_key(request_key, default_mode, manual_only, risk_level);
+        let (mode, full_access_profile_auto_approved) =
+            self.get_mode_for_key_with_source(request_key, default_mode, manual_only, risk_level);
 
         match mode {
             ApprovalMode::AutoApprove => {
+                let resolution_reason = if full_access_profile_auto_approved {
+                    "full_access_profile_auto_approved"
+                } else {
+                    "local_rule_auto_approved"
+                };
                 self.record_immediate_fact(
                     request_key,
                     &title,
                     &description,
                     ApprovalFactStatus::Approved,
-                    "local_rule_auto_approved",
+                    resolution_reason,
                 )?;
-                self.add_log("info", &format!("自动批准: {title}"));
+                let log_message = if full_access_profile_auto_approved {
+                    format!("完全放行自动批准: {title}")
+                } else {
+                    format!("自动批准: {title}")
+                };
+                self.add_log("info", &log_message);
                 return Ok(true);
             }
             ApprovalMode::AutoDeny => {
@@ -361,8 +372,12 @@ impl ApprovalManager {
         settings.agent_id = agent_id.to_string();
         settings.binding_updated_at = unix_now();
         settings.risk_acknowledged_at = 0;
+        settings.risk_acknowledged_duration_seconds = 0;
         reset_identity_sensitive_rules(&mut settings);
-        if matches!(previous_profile.as_str(), "relaxed" | "trusted" | "focus") {
+        if matches!(
+            previous_profile.as_str(),
+            "relaxed" | "trusted" | "full_access" | "focus"
+        ) {
             settings.profile = "balanced".to_string();
             if previous_profile == "focus" {
                 settings.notification_mode = "popup".to_string();
@@ -394,8 +409,12 @@ impl ApprovalManager {
         settings.agent_id.clear();
         settings.binding_updated_at = unix_now();
         settings.risk_acknowledged_at = 0;
+        settings.risk_acknowledged_duration_seconds = 0;
         reset_identity_sensitive_rules(&mut settings);
-        if matches!(settings.profile.as_str(), "relaxed" | "trusted" | "focus") {
+        if matches!(
+            settings.profile.as_str(),
+            "relaxed" | "trusted" | "full_access" | "focus"
+        ) {
             settings.profile = "balanced".to_string();
         }
         if let Err(error) = persist_settings(&self.settings_path, &settings) {
@@ -415,24 +434,46 @@ impl ApprovalManager {
     }
 
     pub fn update_profile(&self, profile: &str, confirmed: bool) -> Result<(), String> {
+        self.update_profile_with_duration(profile, confirmed, None)
+    }
+
+    pub fn update_profile_with_duration(
+        &self,
+        profile: &str,
+        confirmed: bool,
+        duration_seconds: Option<u64>,
+    ) -> Result<(), String> {
         let profile = profile.trim();
         if !matches!(
             profile,
-            "strict" | "balanced" | "relaxed" | "trusted" | "silent_deny" | "focus"
+            "strict" | "balanced" | "relaxed" | "trusted" | "full_access" | "silent_deny" | "focus"
         ) {
             return Err(format!("不支持的审批档位: {profile}"));
         }
-        if profile == "trusted" && !confirmed {
-            return Err("启用完全信任档位必须明确确认自担风险".to_string());
+        if matches!(profile, "trusted" | "full_access") && !confirmed {
+            return Err("启用宽松审批档位必须明确确认自担风险".to_string());
+        }
+        let duration = duration_seconds.unwrap_or(3600);
+        if matches!(profile, "trusted" | "full_access")
+            && !matches!(duration, 0 | 3_600 | 10_800 | 86_400)
+        {
+            return Err("风险授权有效期仅支持 1 小时、3 小时、1 天或永久".to_string());
         }
         let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
         let previous = settings.clone();
         settings.profile = profile.to_string();
-        settings.risk_acknowledged_at = if profile == "trusted" && confirmed {
+        settings.risk_acknowledged_at = if matches!(profile, "trusted" | "full_access") && confirmed
+        {
             unix_now()
         } else {
             0
         };
+        settings.risk_acknowledged_duration_seconds =
+            if matches!(profile, "trusted" | "full_access") && confirmed {
+                duration
+            } else {
+                0
+            };
         // Focus is specifically the no-popup workflow. Keep an explicit
         // notification choice for other profiles so users can switch back.
         if profile == "focus" {
@@ -479,11 +520,14 @@ impl ApprovalManager {
                 request_type,
                 "software.distribution.release.publish" | "extension.review.decide"
             );
-        if mode == "auto_approve" && (is_r4 || (is_r3 && settings.profile != "trusted")) {
+        if mode == "auto_approve"
+            && ((is_r4 && settings.profile != "full_access")
+                || (is_r3 && !matches!(settings.profile.as_str(), "trusted" | "full_access")))
+        {
             return Err(if is_r4 {
-                "R4 和系统硬拒绝目标不能配置为自动批准".to_string()
+                "R4 仅可在完全放行档位下配置为自动批准".to_string()
             } else {
-                "R3 仅可在完全信任档位下自动批准；请先明确启用该档位".to_string()
+                "R3 仅可在完全信任或完全放行档位下自动批准；请先明确启用对应档位".to_string()
             });
         }
         let previous = settings.clone();
@@ -545,6 +589,20 @@ impl ApprovalManager {
         manual_only: bool,
         risk_level: Option<&str>,
     ) -> ApprovalMode {
+        self.get_mode_for_key_with_source(request_key, default_mode, manual_only, risk_level)
+            .0
+    }
+
+    /// Returns the resolved mode and whether the automatic approval came from
+    /// the global full-access profile itself. This keeps audit facts accurate
+    /// when an explicit rule is also present while full access is enabled.
+    fn get_mode_for_key_with_source(
+        &self,
+        request_key: &str,
+        default_mode: ApprovalMode,
+        manual_only: bool,
+        risk_level: Option<&str>,
+    ) -> (ApprovalMode, bool) {
         if let Ok(settings) = self.settings.lock() {
             // A Dashboard-bound profile must never survive an account switch
             // or logout. The persisted OAuth identity is read on every
@@ -558,56 +616,73 @@ impl ApprovalManager {
                         })
                         .unwrap_or(false);
                 if !identity_matches {
-                    return ApprovalMode::Manual;
+                    return (ApprovalMode::Manual, false);
                 }
             }
             let profile = settings.profile.as_str();
-            let trusted_r3 = profile == "trusted"
-                && settings.risk_acknowledged_at > 0
+            let elevated_approval = matches!(profile, "trusted" | "full_access")
+                && settings.risk_acknowledgement_valid(unix_now())
                 && risk_level
                     .map(|risk| super::policy::risk_rank(risk) <= super::policy::risk_rank("R3"))
                     .unwrap_or(false);
+            let full_access =
+                profile == "full_access" && settings.risk_acknowledgement_valid(unix_now());
             let silent_deny = profile == "silent_deny";
             let risk_key = risk_level.map(|risk| format!("risk:{risk}"));
-            let keys = [
+            // Resolve rules from most-specific to least-specific. A rule at a
+            // more specific level must win over broader rules in either
+            // direction: an exact `manual`/`auto_deny` remains a guard even
+            // under full_access, while an exact permitted `auto_approve` must
+            // not be shadowed by a broader `manual` rule.
+            for key in [
                 Some(request_key),
                 risk_key.as_deref(),
                 Some("controlled_operation"),
                 Some("*"),
-            ];
-            for key in keys.into_iter().flatten() {
+            ]
+            .into_iter()
+            .flatten()
+            {
                 match settings.rules.get(key).map(String::as_str) {
-                    Some("auto_approve") if !manual_only || trusted_r3 => {
-                        return ApprovalMode::AutoApprove
+                    Some("auto_deny") => return (ApprovalMode::AutoDeny, false),
+                    Some("manual") => return (ApprovalMode::Manual, false),
+                    Some("auto_approve") if !manual_only || elevated_approval || full_access => {
+                        return (ApprovalMode::AutoApprove, false)
                     }
-                    Some("auto_deny") => return ApprovalMode::AutoDeny,
-                    Some("manual") => return ApprovalMode::Manual,
                     _ => {}
                 }
             }
+            // Full access is a single, explicit global choice: skip Agent
+            // confirmation for every risk tier. It does not bypass OS ACLs,
+            // Dashboard authorization, or capability-level hard rejection.
+            if full_access {
+                return (ApprovalMode::AutoApprove, true);
+            }
             if silent_deny {
-                return ApprovalMode::AutoDeny;
+                return (ApprovalMode::AutoDeny, false);
             }
             if profile == "strict" {
-                return ApprovalMode::Manual;
+                return (ApprovalMode::Manual, false);
             }
             if risk_level
                 .map(|risk| {
                     let rank = super::policy::risk_rank(risk);
                     (matches!(profile, "balanced" | "focus") && rank <= 1)
                         || (profile == "relaxed" && rank <= 2)
-                        || (profile == "trusted" && settings.risk_acknowledged_at > 0 && rank <= 3)
+                        || (matches!(profile, "trusted" | "full_access")
+                            && settings.risk_acknowledgement_valid(unix_now())
+                            && rank <= if profile == "full_access" { 4 } else { 3 })
                 })
                 .unwrap_or(false)
             {
-                return ApprovalMode::AutoApprove;
+                return (ApprovalMode::AutoApprove, false);
             }
-            if manual_only && !trusted_r3 {
-                return ApprovalMode::Manual;
+            if manual_only && !elevated_approval && !full_access {
+                return (ApprovalMode::Manual, false);
             }
-            default_mode
+            (default_mode, false)
         } else {
-            default_mode
+            (default_mode, false)
         }
     }
 
@@ -1021,7 +1096,7 @@ fn format_unix_time(secs: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1184,6 +1259,92 @@ mod destructive_tests {
             "local_rule_auto_approved"
         );
         drop(std::fs::remove_dir_all(home));
+    }
+
+    #[test]
+    fn full_access_profile_allows_r4_after_explicit_acknowledgement() {
+        let home = test_home("full-access-profile");
+        let manager = ApprovalManager::new_in(home.clone());
+        manager.update_profile("full_access", true).unwrap();
+        assert!(matches!(
+            manager.get_mode_for_key(
+                "unsafe.system.delete",
+                ApprovalMode::Manual,
+                true,
+                Some("R4")
+            ),
+            ApprovalMode::AutoApprove
+        ));
+        assert!(manager
+            .request_capability_approval(
+                "unsafe.system.delete",
+                "R4",
+                "系统边界测试".to_string(),
+                "target=test-system-path".to_string(),
+            )
+            .unwrap());
+        assert_eq!(
+            manager.list_recent_facts()[0].resolution_reason,
+            "full_access_profile_auto_approved"
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn explicit_auto_approve_is_not_misattributed_to_full_access() {
+        let home = test_home("full-access-explicit-auto-approve");
+        let manager = ApprovalManager::new_in(home.clone());
+        manager.update_profile("full_access", true).unwrap();
+        manager.update_rule("risk:R4", "auto_approve").unwrap();
+        assert!(manager
+            .request_capability_approval(
+                "unsafe.system.delete",
+                "R4",
+                "规则优先级测试".to_string(),
+                "target=test-system-path".to_string(),
+            )
+            .unwrap());
+        assert_eq!(
+            manager.list_recent_facts()[0].resolution_reason,
+            "local_rule_auto_approved"
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn elevated_profiles_reject_unsupported_acknowledgement_duration() {
+        let home = test_home("invalid-risk-duration");
+        let manager = ApprovalManager::new_in(home.clone());
+        let error = manager
+            .update_profile_with_duration("full_access", true, Some(86_401))
+            .expect_err("unsupported duration must be rejected");
+        assert!(error.contains("风险授权有效期"));
+        assert_eq!(manager.get_settings().profile, "balanced");
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn explicit_manual_rule_overrides_full_access_profile() {
+        let home = test_home("full-access-manual-exception");
+        let manager = ApprovalManager::new_in(home.clone());
+        manager.update_profile("full_access", true).unwrap();
+        manager
+            .update_rule("unsafe.system.delete", "manual")
+            .unwrap();
+        assert!(matches!(
+            manager.get_mode_for_key(
+                "unsafe.system.delete",
+                ApprovalMode::Manual,
+                true,
+                Some("R4")
+            ),
+            ApprovalMode::Manual
+        ));
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1361,6 +1522,23 @@ mod destructive_tests {
         let request_id = request_id.expect("exact manual rule must enter the approval queue");
         manager.respond(&request_id, false).unwrap();
         assert!(!worker.join().expect("approval worker panicked").unwrap());
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn exact_auto_approve_rule_overrides_broader_manual_rule() {
+        let home = test_home("exact-auto-priority");
+        let manager = ApprovalManager::new_in(home.clone());
+        manager.update_rule("*", "manual").unwrap();
+        manager
+            .update_rule("ai.client.import", "auto_approve")
+            .unwrap();
+
+        assert!(matches!(
+            manager.get_mode_for_key("ai.client.import", ApprovalMode::Manual, false, Some("R2")),
+            ApprovalMode::AutoApprove
+        ));
         drop(manager);
         let _ = fs::remove_dir_all(home);
     }

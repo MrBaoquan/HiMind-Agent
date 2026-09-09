@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
-import { Blocks, BookOpen, Cable, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, ClipboardCheck, Clock3, ExternalLink, FileText, FolderOpen, Hammer, Info, LayoutDashboard, ListChecks, LoaderCircle, LogOut, MessageCircle, Minus, PanelLeftClose, PanelLeftOpen, RefreshCw, Settings, Square, X } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { AppWindow, Blocks, BookOpen, Cable, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, ClipboardCheck, Clapperboard, Clock3, Database, ExternalLink, FileCode2, FileText, FolderOpen, Hammer, Info, LayoutDashboard, LayoutGrid, ListChecks, LoaderCircle, LogOut, MessageCircle, MonitorPlay, Music, Package, PanelLeftClose, PanelLeftOpen, Puzzle, RefreshCw, Settings, Sparkles, Terminal, Video, Workflow, Wrench, X, type LucideIcon } from 'lucide-react';
 import type { PageKey } from '../types';
-import type { AgentTaskHistoryItem, CurrentTaskStatus, DashboardIdentityStatus } from '../services/agentApi';
+import type { AgentTaskHistoryItem, CurrentTaskStatus, DashboardIdentityStatus, PluginQuickAccessView } from '../services/agentApi';
 
 type ShellProps = {
   currentPage: PageKey;
@@ -12,8 +11,10 @@ type ShellProps = {
   agentVersion: string;
   updateBusy: boolean;
   currentTask: CurrentTaskStatus | null;
+  quickPluginViews: PluginQuickAccessView[];
   onLoadTaskHistory: () => Promise<AgentTaskHistoryItem[]>;
   onNavigate: (page: PageKey) => void;
+  onOpenPluginView: (pluginId: string, viewId: string) => void;
   onOpenDashboard: () => void;
   onOpenBuiltinAi: () => void;
   onCheckUpdate: () => void;
@@ -51,6 +52,57 @@ const developerNavItems = [
   { key: 'logs', icon: FileText, label: '日志' },
 ] satisfies { key: PageKey; icon: typeof LayoutDashboard; label: string }[];
 
+const quickViewIconMap: Record<string, LucideIcon> = {
+  'app-window': AppWindow,
+  appwindow: AppWindow,
+  app: AppWindow,
+  window: AppWindow,
+  blocks: Blocks,
+  book: BookOpen,
+  'book-open': BookOpen,
+  cable: Cable,
+  clapperboard: Clapperboard,
+  code: FileCode2,
+  database: Database,
+  file: FileText,
+  'file-code': FileCode2,
+  'file-code-2': FileCode2,
+  folder: FolderOpen,
+  'folder-open': FolderOpen,
+  grid: LayoutGrid,
+  'layout-grid': LayoutGrid,
+  dashboard: LayoutDashboard,
+  chart: LayoutGrid,
+  table: LayoutGrid,
+  extension: Puzzle,
+  plugin: Puzzle,
+  film: Clapperboard,
+  media: Video,
+  music: Music,
+  monitor: MonitorPlay,
+  'monitor-play': MonitorPlay,
+  package: Package,
+  puzzle: Puzzle,
+  settings: Settings,
+  sparkles: Sparkles,
+  terminal: Terminal,
+  video: Video,
+  play: MonitorPlay,
+  flow: Workflow,
+  workflow: Workflow,
+  wrench: Wrench,
+};
+
+function quickViewIcon(icon: string | undefined) {
+  const key = (icon || '').trim().toLowerCase().replace(/[ _]+/g, '-');
+  return quickViewIconMap[key] || AppWindow;
+}
+
+function quickViewLabel(view: PluginQuickAccessView) {
+  const label = view.short_title?.trim() || view.plugin_name?.trim() || view.title.trim();
+  return label || '工具';
+}
+
 type MenuKey = 'agent' | 'view' | 'tools' | 'help';
 
 function AppMenuBar({ currentPage, agentVersion, updateBusy, dashboardEnabled, onNavigate, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onOpenTasks, onQuit }: Pick<ShellProps, 'currentPage' | 'agentVersion' | 'updateBusy' | 'dashboardEnabled' | 'onNavigate' | 'onOpenDashboard' | 'onOpenBuiltinAi' | 'onCheckUpdate' | 'onOpenAgentDirectory' | 'onQuit'> & { onOpenTasks: () => void }) {
@@ -81,21 +133,9 @@ function AppMenuBar({ currentPage, agentVersion, updateBusy, dashboardEnabled, o
     setOpenMenu(null);
     action();
   };
-  const handleTitleBarMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    const target = event.target;
-    if (target instanceof Element && target.closest('button, a, input, select, [role="menu"]')) return;
-    void invoke('window_start_dragging').catch(error => console.error('窗口拖拽失败', error));
-  };
-  const handleTitleBarDoubleClick = (event: ReactMouseEvent<HTMLDivElement>) => {
-    const target = event.target;
-    if (target instanceof Element && target.closest('button, a, input, select, [role="menu"]')) return;
-    void invoke('window_toggle_maximize').catch(error => console.error('窗口最大化失败', error));
-  };
-
   return (
     <>
-      <div className="app-menu-bar" ref={menuBarRef} aria-label="应用菜单" data-tauri-drag-region onMouseDown={handleTitleBarMouseDown} onDoubleClick={handleTitleBarDoubleClick}>
+      <div className="app-menu-bar" ref={menuBarRef} aria-label="应用菜单">
         <div className="app-menu-brand" aria-label="HiMind Agent">
           <span className="app-menu-brand-mark"><span /></span>
           <strong>HiMind Agent</strong>
@@ -155,11 +195,7 @@ function AppMenuBar({ currentPage, agentVersion, updateBusy, dashboardEnabled, o
             </div>
           ) : null}
         </div>
-        <div className="app-window-controls" aria-label="窗口控制">
-          <button type="button" className="app-window-control" title="最小化" aria-label="最小化" onClick={() => { void invoke('window_minimize').catch(error => console.error('窗口最小化失败', error)); }}><Minus size={14} /></button>
-          <button type="button" className="app-window-control" title="最大化" aria-label="最大化" onClick={() => { void invoke('window_toggle_maximize').catch(error => console.error('窗口最大化失败', error)); }}><Square size={11} /></button>
-          <button type="button" className="app-window-control close" title="关闭" aria-label="关闭" onClick={() => { void invoke('window_close').catch(error => console.error('窗口关闭失败', error)); }}><X size={14} /></button>
-        </div>
+        <div className="app-menu-drag-space" aria-hidden="true" />
       </div>
 
       {aboutOpen ? (
@@ -182,7 +218,7 @@ function pageLabel(page: PageKey) {
   return ({ dashboard: '概览', 'builtin-ai': 'HiMind AI', approvals: '审批', ai: 'AI 连接', skills: '技能', plugins: '插件', development: '扩展', settings: '设置', logs: '日志' } as Record<PageKey, string>)[page];
 }
 
-export function Shell({ currentPage, approvalCount, identity, dashboardEnabled, agentVersion, updateBusy, currentTask, onLoadTaskHistory, onNavigate, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
+export function Shell({ currentPage, approvalCount, identity, dashboardEnabled, agentVersion, updateBusy, currentTask, quickPluginViews, onLoadTaskHistory, onNavigate, onOpenPluginView, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return window.localStorage.getItem('himind.sidebar.collapsed') === '1';
@@ -304,8 +340,35 @@ export function Shell({ currentPage, approvalCount, identity, dashboardEnabled, 
         </div>}
         </aside>
         <main className={`main${currentPage === 'builtin-ai' ? ' builtin-ai-main' : ''}`}>
-          {dashboardEnabled && currentTask && currentPage !== 'builtin-ai' ? <button type="button" className="current-task-strip" onClick={() => setTaskDrawerOpen(true)} title="查看当前任务"><LoaderCircle size={15} className="spin" /><span><strong>正在执行 {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></span><code>{currentTask.execution_id || '本机执行'}</code><span className="current-task-open-label">任务记录</span></button> : null}
-          {children}
+          {quickPluginViews.length ? (
+            <div className="quick-access-bar" aria-label="快捷入口">
+              <span className="quick-access-caption">快捷工具</span>
+              <div className="quick-access-items" role="toolbar" aria-label="插件快捷入口">
+                {quickPluginViews.map(view => {
+                  const Icon = quickViewIcon(view.icon);
+                  const label = quickViewLabel(view);
+                  const accessibleLabel = `${view.plugin_name} · ${view.title}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`${view.plugin_id}:${view.view_id}`}
+                      className="quick-access-button"
+                      onClick={() => onOpenPluginView(view.plugin_id, view.view_id)}
+                      aria-label={accessibleLabel}
+                      title={accessibleLabel}
+                    >
+                      <Icon size={17} strokeWidth={1.8} aria-hidden="true" />
+                      <span className="quick-access-button-label">{label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+          <div className="main-content">
+            {dashboardEnabled && currentTask && currentPage !== 'builtin-ai' ? <button type="button" className="current-task-strip" onClick={() => setTaskDrawerOpen(true)} title="查看当前任务"><LoaderCircle size={15} className="spin" /><span><strong>正在执行 {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></span><code>{currentTask.execution_id || '本机执行'}</code><span className="current-task-open-label">任务记录</span></button> : null}
+            {children}
+          </div>
         </main>
       </div>
       {taskDrawerOpen ? <TaskHistoryDrawer currentTask={currentTask} items={taskHistory} loading={taskHistoryLoading} error={taskHistoryError} onRefresh={() => void loadTaskHistory()} onClose={() => setTaskDrawerOpen(false)} /> : null}

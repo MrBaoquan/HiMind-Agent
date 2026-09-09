@@ -87,13 +87,20 @@ pub(crate) fn overview(agent_state_path: &Path) -> Result<Value, Box<dyn Error>>
     let _guard = settings_lock()
         .lock()
         .map_err(|_| "远控客户端配置锁不可用")?;
-    let mut settings = load_unlocked(agent_state_path)?;
+    let settings = load_unlocked(agent_state_path)?;
     let mut items = Vec::new();
     for vendor in ["sunlogin", "todesk"] {
-        let before = config_for(&settings, vendor)?.clone();
-        let resolved = resolve_unlocked(vendor, agent_state_path, &mut settings)?;
         let configured = config_for(&settings, vendor)?.clone();
-        let configured_valid = configured_path(vendor, &configured).is_some();
+        let resolved = configured_path(vendor, &configured).map(|path| ResolvedRemoteClient {
+            path,
+            source: if configured.configured_by.trim().is_empty() {
+                CONFIGURED_BY_MANUAL.to_string()
+            } else {
+                configured.configured_by.clone()
+            },
+            auto_configured: false,
+        });
+        let configured_valid = resolved.is_some();
         items.push(json!({
             "vendor": vendor,
             "name": vendor_label(vendor),
@@ -103,14 +110,27 @@ pub(crate) fn overview(agent_state_path: &Path) -> Result<Value, Box<dyn Error>>
             "configured_valid": configured_valid,
             "resolved_path": resolved.as_ref().map(|item| item.path.to_string_lossy().to_string()),
             "source": resolved.as_ref().map(|item| item.source.as_str()).unwrap_or("missing"),
-            "auto_configured": resolved.as_ref().is_some_and(|item| item.auto_configured)
-                || (before.path.is_empty() && !configured.path.is_empty()),
+            "auto_configured": false,
         }));
     }
     Ok(json!({
         "items": items,
         "settings_file": settings_path(agent_state_path).to_string_lossy(),
     }))
+}
+
+/// Explicitly perform the potentially expensive registry and Start Menu scan.
+/// Passive settings reads intentionally use `overview` and never discover.
+pub(crate) fn detect(agent_state_path: &Path) -> Result<Value, Box<dyn Error>> {
+    let _guard = settings_lock()
+        .lock()
+        .map_err(|_| "远控客户端配置锁不可用")?;
+    let mut settings = load_unlocked(agent_state_path)?;
+    for vendor in ["sunlogin", "todesk"] {
+        let _ = resolve_unlocked(vendor, agent_state_path, &mut settings)?;
+    }
+    drop(_guard);
+    overview(agent_state_path)
 }
 
 pub(crate) fn configure(
@@ -646,6 +666,20 @@ mod tests {
         assert_eq!(settings.todesk.configured_by, CONFIGURED_BY_MANUAL);
         assert_eq!(settings.todesk.path, executable.to_string_lossy());
         assert!(configure("sunlogin", &executable.to_string_lossy(), &state_path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn passive_overview_does_not_scan_or_persist_machine_defaults() {
+        let root = test_root("passive-overview");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+
+        let value = overview(&state_path).unwrap();
+        let items = value["items"].as_array().expect("overview items");
+        assert!(items.iter().all(|item| item["available"] == false));
+        assert!(!settings_path(&state_path).exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 

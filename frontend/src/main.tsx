@@ -13,7 +13,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -94,12 +94,33 @@ function App() {
   const [svnModalOpen, setSvnModalOpen] = useState(false);
   const [svnDraft, setSvnDraft] = useState<SvnConnectionInput>({ username: '', password: '' });
   const [svnTesting, setSvnTesting] = useState(false);
+  const refreshInFlight = useRef(new Map<string, Promise<unknown>>());
+
+  function singleFlight<T>(key: string, operation: () => Promise<T>, options?: { force?: boolean }): Promise<T> {
+    const existing = refreshInFlight.current.get(key) as Promise<T> | undefined;
+    if (existing && !options?.force) return existing;
+    const current = (async () => {
+      // Mutations can finish while a page refresh is still in flight. A forced
+      // refresh waits for that stale read before fetching the authoritative
+      // state, so the mutation cannot be overwritten by an older response.
+      if (existing && options?.force) {
+        try { await existing; } catch { /* The new read is still authoritative. */ }
+      }
+      return operation();
+    })().finally(() => {
+      if (refreshInFlight.current.get(key) === current) refreshInFlight.current.delete(key);
+    });
+    refreshInFlight.current.set(key, current);
+    return current;
+  }
 
   async function refreshStatus() {
-    const next = await agentApi.status();
-    statusRef.current = next;
-    setStatus(next);
-    return next;
+    return singleFlight('status', async () => {
+      const next = await agentApi.status();
+      statusRef.current = next;
+      setStatus(next);
+      return next;
+    });
   }
   function dashboardEnabled() {
     const current = statusRef.current || status;
@@ -109,83 +130,91 @@ function App() {
   function extensionMarketEnabled() {
     return dashboardEnabled() || extensionSources.sources.some(source => source.enabled);
   }
-  async function refreshUpdateStatus() { setUpdateStatus(await agentApi.updateStatus()); }
-  async function refreshDashboardIdentity() {
-    const identity = await agentApi.dashboardIdentity();
-    setDashboardIdentity(identity);
-    if (identity.state !== 'independent') {
-      // identity_status may finish the delayed local SVN bootstrap. Read the file only after it returns.
-      try { await refreshSvnConnections(); } catch (error) { console.error(error); }
-    }
+  async function refreshUpdateStatus() {
+    return singleFlight('update-status', async () => { setUpdateStatus(await agentApi.updateStatus()); });
   }
-  async function refreshMcpTargets() { setMcpTargets(await agentApi.mcpTargets()); }
-  async function refreshAIServices() { setAiServices(await agentApi.listAIServices()); }
+  async function refreshDashboardIdentity() {
+    return singleFlight('dashboard-identity', async () => {
+      const identity = await agentApi.dashboardIdentity();
+      setDashboardIdentity(identity);
+      if (identity.state !== 'independent') {
+        // identity_status may finish the delayed local SVN bootstrap. Read the file only after it returns.
+        try { await refreshSvnConnections(); } catch (error) { console.error(error); }
+      }
+    });
+  }
+  async function refreshMcpTargets() {
+    return singleFlight('mcp-targets', async () => { setMcpTargets(await agentApi.mcpTargets()); });
+  }
+  async function refreshAIServices() {
+    return singleFlight('ai-services', async () => { setAiServices(await agentApi.listAIServices()); });
+  }
   async function refreshBuiltinAiToolContext() {
-    try {
-      setBuiltinAiToolContext(await agentApi.builtinAiToolContextSummary());
-    } catch {
-      setBuiltinAiToolContext(null);
-    }
+    return singleFlight('builtin-ai-tool-context', async () => {
+      try {
+        setBuiltinAiToolContext(await agentApi.builtinAiToolContextSummary());
+      } catch {
+        setBuiltinAiToolContext(null);
+      }
+    });
   }
   async function refreshApprovals() {
-    const [pending, history] = await Promise.all([agentApi.approvals(), agentApi.approvalHistory()]);
-    setApprovals(pending);
-    setApprovalHistory(history);
+    return singleFlight('approvals', async () => {
+      const [pending, history] = await Promise.all([agentApi.approvals(), agentApi.approvalHistory()]);
+      setApprovals(pending);
+      setApprovalHistory(history);
+    });
   }
   async function refreshSettings() { setSettings(await agentApi.settings()); }
   async function refreshRemoteExecutionSettings() { setRemoteExecutionSettings(await agentApi.remoteExecutionSettings()); }
   async function refreshLogin() { setLoginState(await agentApi.login()); }
   async function refreshSettingsPageData() {
-    setSettingsLoading(true);
-    setSettingsLoadError('');
-    const independent = statusRef.current?.mode === 'independent' || statusRef.current?.dashboard_enabled === false;
-    try {
-      const [settingsResult, remoteExecutionResult, loginResult, remoteClientsResult] = await Promise.allSettled([
-        withTimeout(agentApi.settings(), '审批设置'),
-        withTimeout(agentApi.remoteExecutionSettings(), '远程任务设置'),
-        withTimeout(agentApi.login(), '本地登录状态'),
-        withTimeout(agentApi.remoteClients(), '远程运维客户端配置'),
-      ] as const);
-      const errors: string[] = [];
-      if (settingsResult.status === 'fulfilled') setSettings(settingsResult.value);
-      else {
-        setSettings(null);
-        errors.push(formatError(settingsResult.reason, '审批设置读取失败'));
-      }
-      if (remoteExecutionResult.status === 'fulfilled') setRemoteExecutionSettings(remoteExecutionResult.value);
-      else {
-        if (independent) {
-          // Remote execution is intentionally unavailable in independent mode;
-          // keep local approval and tool settings usable when its optional
-          // config endpoint is not present.
-          setRemoteExecutionSettings({ enabled: false, access_mode: 'exhibit_linked', default_provider: 'himind.builtin' });
-        } else {
-          setRemoteExecutionSettings(null);
-          errors.push(formatError(remoteExecutionResult.reason, '远程任务设置读取失败'));
+    return singleFlight('settings-page', async () => {
+      setSettingsLoading(true);
+      setSettingsLoadError('');
+      const independent = statusRef.current?.mode === 'independent' || statusRef.current?.dashboard_enabled === false;
+      try {
+        const [settingsResult, remoteExecutionResult, loginResult, remoteClientsResult] = await Promise.allSettled([
+          withTimeout(agentApi.settings(), '审批设置'),
+          withTimeout(agentApi.remoteExecutionSettings(), '远程任务设置'),
+          withTimeout(agentApi.login(), '本地登录状态'),
+          withTimeout(agentApi.remoteClients(), '远程运维客户端配置'),
+        ] as const);
+        const errors: string[] = [];
+        if (settingsResult.status === 'fulfilled') setSettings(settingsResult.value);
+        else {
+          setSettings(null);
+          errors.push(formatError(settingsResult.reason, '审批设置读取失败'));
         }
-      }
-      if (loginResult.status === 'fulfilled') setLoginState(loginResult.value);
-      else {
-        if (independent) {
-          // A Dashboard account is optional for local-only operation.
+        if (remoteExecutionResult.status === 'fulfilled') setRemoteExecutionSettings(remoteExecutionResult.value);
+        else {
+          if (independent) {
+            setRemoteExecutionSettings({ enabled: false, access_mode: 'exhibit_linked', default_provider: 'himind.builtin' });
+          } else {
+            setRemoteExecutionSettings(null);
+            errors.push(formatError(remoteExecutionResult.reason, '远程任务设置读取失败'));
+          }
+        }
+        if (loginResult.status === 'fulfilled') setLoginState(loginResult.value);
+        else if (independent) {
           setLoginState({ status: 'local_only' });
         } else {
           setLoginState(null);
           errors.push(formatError(loginResult.reason, '本地登录状态读取失败'));
         }
+        if (remoteClientsResult.status === 'fulfilled') setRemoteClients(remoteClientsResult.value);
+        else setRemoteClients({ items: [] });
+        setSettingsLoadError(errors.join('；'));
+      } catch (error) {
+        setSettings(null);
+        setRemoteExecutionSettings(null);
+        setRemoteClients(null);
+        setLoginState(null);
+        setSettingsLoadError(formatError(error, 'Agent 配置读取失败'));
+      } finally {
+        setSettingsLoading(false);
       }
-      if (remoteClientsResult.status === 'fulfilled') setRemoteClients(remoteClientsResult.value);
-      else setRemoteClients({ items: [] });
-      setSettingsLoadError(errors.join('；'));
-    } catch (error) {
-      setSettings(null);
-      setRemoteExecutionSettings(null);
-      setRemoteClients(null);
-      setLoginState(null);
-      setSettingsLoadError(formatError(error, 'Agent 配置读取失败'));
-    } finally {
-      setSettingsLoading(false);
-    }
+    });
   }
   async function refreshLogs() { setLogs(await agentApi.logs()); }
   async function refreshExtensionProjects() {
@@ -224,29 +253,50 @@ function App() {
     }
   }
   async function refreshPlugins() {
-    setPluginsLoading(true);
-    try {
-      const [registry, capabilityItems] = await Promise.all([
-        withTimeout(agentApi.plugins(), '本机插件注册表'),
-        withTimeout(agentApi.capabilities(), '本机能力清单'),
-      ]);
-      setPluginRegistry(registry);
-      setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
+    return singleFlight('plugins', async () => {
+      setPluginsLoading(true);
       try {
-        const catalog = await withTimeout(agentApi.pluginCatalog(), '插件市场');
-        setPluginCatalog(Array.isArray(catalog) ? catalog : []);
+        const [registry, capabilityItems] = await Promise.all([
+          withTimeout(agentApi.plugins(), '本机插件注册表'),
+          withTimeout(agentApi.capabilities(), '本机能力清单'),
+        ]);
+        setPluginRegistry(registry);
+        setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
+        try {
+          const catalog = await withTimeout(agentApi.pluginCatalog(), '插件市场');
+          setPluginCatalog(Array.isArray(catalog) ? catalog : []);
+        } catch (error) {
+          setPluginCatalog([]);
+          console.error('Plugin catalog unavailable', error);
+        }
       } catch (error) {
+        setPluginRegistry(null);
+        setCapabilities([]);
         setPluginCatalog([]);
-        console.error('Plugin catalog unavailable', error);
+        console.error('Plugin registry unavailable', error);
+      } finally {
+        setPluginsLoading(false);
       }
-    } catch (error) {
-      setPluginRegistry(null);
-      setCapabilities([]);
-      setPluginCatalog([]);
-      console.error('Plugin registry unavailable', error);
-    } finally {
-      setPluginsLoading(false);
-    }
+    });
+  }
+
+  // Plugin views can be installed or rebuilt while the Agent window remains
+  // open.  Keep the navigation registry fresh without reloading the whole
+  // dashboard state, so newly registered quick entries become discoverable
+  // as soon as the window is focused again.
+  async function refreshPluginRegistry() {
+    return singleFlight('plugin-registry', async () => {
+      try {
+        const [registry, capabilityItems] = await Promise.all([
+          withTimeout(agentApi.plugins(), '本机插件注册表'),
+          withTimeout(agentApi.capabilities(), '本机能力清单'),
+        ]);
+        setPluginRegistry(registry);
+        setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
+      } catch (error) {
+        console.error('Plugin registry refresh unavailable', error);
+      }
+    });
   }
 
   async function refreshExtensionDesiredState() {
@@ -256,20 +306,23 @@ function App() {
       setExtensionDesiredLoading(false);
       return;
     }
-    setExtensionDesiredLoading(true);
-    try {
-      setExtensionDesiredState(await withTimeout(agentApi.extensionDesiredState(), '系统内置策略'));
-      setExtensionDesiredError(null);
-    } catch (error) {
-      setExtensionDesiredState(null);
-      setExtensionDesiredError(formatError(error, '系统内置策略读取失败'));
-    } finally {
-      setExtensionDesiredLoading(false);
-    }
+    return singleFlight('extension-desired-state', async () => {
+      setExtensionDesiredLoading(true);
+      try {
+        setExtensionDesiredState(await withTimeout(agentApi.extensionDesiredState(), '系统内置策略'));
+        setExtensionDesiredError(null);
+      } catch (error) {
+        setExtensionDesiredState(null);
+        setExtensionDesiredError(formatError(error, '系统内置策略读取失败'));
+      } finally {
+        setExtensionDesiredLoading(false);
+      }
+    });
   }
 
   async function refreshSkills() {
-    const [catalogResult, statusResult, marketResult] = await Promise.allSettled([
+    return singleFlight('skills', async () => {
+      const [catalogResult, statusResult, marketResult] = await Promise.allSettled([
       withTimeout(agentApi.skillCatalog(), '本地 Skill 目录'),
       withTimeout(agentApi.codexSkillStatus(), 'AI 工具技能状态'),
       withTimeout(agentApi.organizationSkillCatalog(), '技能市场'),
@@ -294,14 +347,16 @@ function App() {
 	  setOrganizationSkills([]);
 	  setSkillMarketError(formatError(marketResult.reason, '技能市场暂不可用'));
 	}
-    setSkillError(errors.length ? errors.join('；') : null);
+      setSkillError(errors.length ? errors.join('；') : null);
+    });
   }
 
-  async function refreshDevelopment() {
-    const [projects, pluginDraftResult, skillDraftResult] = await Promise.allSettled([
-      agentApi.extensionProjects(),
-      agentApi.pluginDrafts(),
-      agentApi.skillDrafts(),
+  async function refreshDevelopment(force = false) {
+    return singleFlight('development', async () => {
+      const [projects, pluginDraftResult, skillDraftResult] = await Promise.allSettled([
+      withTimeout(agentApi.extensionProjects(), '扩展项目'),
+      withTimeout(agentApi.pluginDrafts(), '插件草稿'),
+      withTimeout(agentApi.skillDrafts(), '技能草稿'),
     ]);
     try { setExtensionWorkspace(await agentApi.extensionWorkspace()); }
     catch (error) { console.error('Extension workspace unavailable', error); }
@@ -313,18 +368,19 @@ function App() {
       setPluginSubmissions([]);
       setSkillSubmissions([]);
       setExtensionInvitations([]);
-      return;
+        return;
     }
     const [remoteProjects, pluginSubmissionResult, skillSubmissionResult, invitationResult] = await Promise.allSettled([
-      agentApi.extensionCollaborationProjects(),
-      agentApi.pluginSubmissions(),
-      agentApi.skillSubmissions(),
-      agentApi.extensionCollaborationInvitations(),
+      withTimeout(agentApi.extensionCollaborationProjects(), '协作项目'),
+      withTimeout(agentApi.pluginSubmissions(), '插件审核状态'),
+      withTimeout(agentApi.skillSubmissions(), '技能审核状态'),
+      withTimeout(agentApi.extensionCollaborationInvitations(), '协作邀请'),
     ]);
     if (remoteProjects.status === 'fulfilled') setExtensionRemoteProjects(remoteProjects.value || []);
     if (pluginSubmissionResult.status === 'fulfilled') setPluginSubmissions(pluginSubmissionResult.value || []);
     if (skillSubmissionResult.status === 'fulfilled') setSkillSubmissions(skillSubmissionResult.value || []);
-    if (invitationResult.status === 'fulfilled') setExtensionInvitations(invitationResult.value || []);
+      if (invitationResult.status === 'fulfilled') setExtensionInvitations(invitationResult.value || []);
+    }, { force });
   }
   async function refreshExtensionSourceSettings() {
     setExtensionSources(await agentApi.extensionSources());
@@ -396,32 +452,20 @@ function App() {
     if (remoteProjectResult.status === 'fulfilled') setExtensionRemoteProjects(remoteProjectResult.value || []);
   }
 
-  async function refreshAll() {
-    let initialStatus: AgentStatus | null = null;
-    let statusRead = true;
+  async function refreshInitialPage() {
     try {
-      initialStatus = await refreshStatus();
+      await refreshStatus();
     } catch (error) {
-      statusRead = false;
       console.error('Agent status unavailable during initialization', error);
     }
-    const connected = statusRead && initialStatus
-      ? initialStatus.mode !== 'independent' && initialStatus.dashboard_enabled !== false
-      : false;
     const results = await Promise.allSettled([
       refreshUpdateStatus(),
       refreshDashboardIdentity(),
       refreshMcpTargets(),
-      refreshAIServices(),
-      refreshBuiltinAiToolContext(),
       refreshApprovals(),
-      refreshSettingsPageData(),
-      refreshPlugins(),
-      refreshSkills(),
-      refreshLogs(),
-      refreshDevelopment(),
+      refreshRemoteExecutionSettings(),
       refreshExtensionSourceSettings(),
-      ...(connected ? [refreshExtensionDesiredState()] : []),
+      refreshPluginRegistry(),
     ]);
     for (const result of results) {
       if (result.status === 'rejected') throw result.reason;
@@ -429,55 +473,42 @@ function App() {
   }
 
   useEffect(() => {
-    refreshAll().catch(error => notify('error', formatError(error, 'Agent 面板初始化失败')));
+    refreshInitialPage().catch(error => notify('error', formatError(error, 'Agent 面板初始化失败')));
     const timer = window.setInterval(() => {
-      Promise.all([refreshStatus(), refreshUpdateStatus(), refreshApprovals(), refreshLogin()]).catch(console.error);
-    }, 5000);
-    const identityTimer = window.setInterval(() => refreshDashboardIdentity().catch(console.error), 30000);
-    const toolContextTimer = window.setInterval(() => refreshBuiltinAiToolContext().catch(console.error), 30000);
-    const reviewTimer = window.setInterval(() => refreshReviewProgress().catch(console.error), 30000);
+      if (document.visibilityState !== 'hidden') Promise.all([refreshStatus(), refreshApprovals()]).catch(console.error);
+    }, 10000);
+    const updateTimer = window.setInterval(() => refreshUpdateStatus().catch(console.error), 60000);
     return () => {
       window.clearInterval(timer);
-      window.clearInterval(identityTimer);
-      window.clearInterval(toolContextTimer);
-      window.clearInterval(reviewTimer);
+      window.clearInterval(updateTimer);
     };
   }, []);
 
   useEffect(() => {
-    if (page !== 'settings') return;
-    const refreshSettingsOnVisibility = () => {
-      if (document.visibilityState === 'hidden') return;
-      Promise.all([refreshSettingsPageData(), refreshDashboardIdentity()]).catch(console.error);
-    };
-    refreshSettingsOnVisibility();
-    const timer = window.setInterval(refreshSettingsOnVisibility, 15000);
-    document.addEventListener('visibilitychange', refreshSettingsOnVisibility);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', refreshSettingsOnVisibility);
-    };
+    const operation = page === 'dashboard'
+      ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings()])
+      : page === 'ai'
+        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshBuiltinAiToolContext()])
+        : page === 'approvals'
+          ? refreshApprovals()
+          : page === 'plugins'
+            ? Promise.all([refreshExtensionDesiredState(), refreshPlugins()])
+            : page === 'skills'
+              ? Promise.all([refreshExtensionDesiredState(), refreshSkills(), refreshMcpTargets(), refreshPluginRegistry()])
+              : page === 'development'
+                ? refreshDevelopment()
+                : page === 'settings'
+                  ? refreshSettingsPageData()
+                  : Promise.resolve();
+    operation.catch(console.error);
   }, [page]);
 
   useEffect(() => {
-    if (page !== 'plugins' && page !== 'skills' && page !== 'development') return;
-    const refreshCurrentPage = () => {
-      if (document.visibilityState === 'hidden') return;
-      const operation = page === 'plugins'
-        ? Promise.all([refreshExtensionDesiredState(), refreshPlugins()])
-        : page === 'skills'
-          ? Promise.all([refreshExtensionDesiredState(), refreshSkills()])
-          : refreshDevelopment();
-      operation.catch(console.error);
-    };
-    const timer = window.setInterval(refreshCurrentPage, 15000);
-    window.addEventListener('focus', refreshCurrentPage);
-    document.addEventListener('visibilitychange', refreshCurrentPage);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener('focus', refreshCurrentPage);
-      document.removeEventListener('visibilitychange', refreshCurrentPage);
-    };
+    if (page !== 'development' || !dashboardEnabled()) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') refreshReviewProgress().catch(console.error);
+    }, 60000);
+    return () => window.clearInterval(timer);
   }, [page]);
 
   useEffect(() => {
@@ -667,6 +698,39 @@ function App() {
     }
     return Array.from(merged.values());
   }, [pluginCatalog, pluginRegistry]);
+
+  const quickPluginViews = useMemo<PluginQuickAccessView[]>(() => {
+    const views: PluginQuickAccessView[] = [];
+    for (const plugin of pluginRegistry?.items || []) {
+      if (!plugin.enabled || plugin.circuit_open) continue;
+      for (const view of plugin.views || []) {
+        // Missing location is treated as the historical/default navigation
+        // location so older registry payloads remain discoverable.
+        if ((view.location || 'plugin_navigation') !== 'plugin_navigation' || view.quick_access === false) continue;
+        const title = view.title.trim();
+        if (!title) continue;
+        // A view title is usually the clearest compact label. The plugin name
+        // is only a last resort for malformed/legacy registry entries; the
+        // full title remains available in the tooltip.
+        const shortTitle = view.short_title?.trim() || title || plugin.name?.trim() || plugin.id;
+        views.push({
+          plugin_id: plugin.id,
+          plugin_name: plugin.name?.trim() || plugin.id,
+          view_id: view.id,
+          title,
+          short_title: shortTitle,
+          icon: view.icon?.trim() || 'app-window',
+          order: view.order ?? 0,
+        });
+      }
+    }
+    return views.sort((left, right) =>
+      left.order - right.order
+      || left.short_title.localeCompare(right.short_title, 'zh-CN')
+      || left.plugin_name.localeCompare(right.plugin_name, 'zh-CN')
+      || left.view_id.localeCompare(right.view_id),
+    );
+  }, [pluginRegistry]);
 
   async function startDashboardAuthorization() {
     if (aiOperation) return;
@@ -992,12 +1056,13 @@ function App() {
       onRemoveSource={removeExtensionSource}
       onSelectWorkspace={() => run(selectExtensionWorkspace, undefined, '选择扩展仓库失败')}
       onCreate={async (input: CreateExtensionProjectInput) => {
-        if (developmentOperation) return;
+        if (developmentOperation) throw new Error('已有扩展操作正在进行，请稍后重试');
         setDevelopmentOperation('create');
         try {
           const project = await agentApi.createExtensionProject(input);
-          await refreshDevelopment();
+          await refreshDevelopment(true);
           notify('success', `已创建${project.kind === 'plugin' ? '插件' : '技能'}项目：${project.name}`);
+          return project;
         } catch (error) {
           notify('error', formatError(error, '新建扩展项目失败'));
           throw error;
@@ -1047,7 +1112,7 @@ function App() {
     if (page === 'settings' && (!settings || !remoteExecutionSettings || !loginState)) {
       return <SettingsLoadState loading={settingsLoading} error={settingsLoadError} onRetry={refreshSettingsPageData} />;
     }
-      if (page === 'settings') return <SettingsPage initialSection={settingsSection} independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} settings={settings} remoteExecutionSettings={remoteExecutionSettings} remoteClients={remoteClients} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除内网账号', '清除内网账号失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRemoteExecutionChange={(next, confirmed) => run(async () => { await agentApi.saveRemoteExecutionSettings(next, confirmed); await refreshRemoteExecutionSettings(); await refreshLogs(); }, next.enabled ? '远程任务设置已更新' : '已关闭远程任务', '远程任务设置更新失败')} onRemoteClientsChange={setRemoteClients} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onApprovalProfileChange={(profile, confirmed) => run(async () => { await agentApi.setApprovalProfile(profile, confirmed); await refreshSettings(); await refreshLogs(); }, '审批档位已更新', '审批档位更新失败')} onApprovalNotificationModeChange={mode => run(async () => { await agentApi.setApprovalNotificationMode(mode); await refreshSettings(); }, '审批提醒方式已更新', '审批提醒方式更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} onUnityEditorSettingsChange={editors => setSettings(current => current ? { ...current, editors } : current)} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={testSvnConnection} svnTesting={svnTesting} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} updateStatus={updateStatus} updateBusy={updateBusy} onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')} onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)} onCancelUpdateDownload={cancelUpdateDownload} onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)} onUpdatePreferences={(autoCheck, autoDownload) => runUpdateOperation(() => agentApi.setUpdatePreferences(autoCheck, autoDownload))} />;
+      if (page === 'settings') return <SettingsPage initialSection={settingsSection} independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} settings={settings} remoteExecutionSettings={remoteExecutionSettings} remoteClients={remoteClients} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除内网账号', '清除内网账号失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRemoteExecutionChange={(next, confirmed) => run(async () => { await agentApi.saveRemoteExecutionSettings(next, confirmed); await refreshRemoteExecutionSettings(); await refreshLogs(); }, next.enabled ? '远程任务设置已更新' : '已关闭远程任务', '远程任务设置更新失败')} onRemoteClientsChange={setRemoteClients} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onApprovalProfileChange={(profile, confirmed, durationSeconds) => run(async () => { await agentApi.setApprovalProfile(profile, confirmed ?? false, durationSeconds); await refreshSettings(); await refreshLogs(); }, '审批档位已更新', '审批档位更新失败')} onApprovalNotificationModeChange={mode => run(async () => { await agentApi.setApprovalNotificationMode(mode); await refreshSettings(); }, '审批提醒方式已更新', '审批提醒方式更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} onUnityEditorSettingsChange={editors => setSettings(current => current ? { ...current, editors } : current)} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={testSvnConnection} svnTesting={svnTesting} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} updateStatus={updateStatus} updateBusy={updateBusy} onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')} onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)} onCancelUpdateDownload={cancelUpdateDownload} onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)} onUpdatePreferences={(autoCheck, autoDownload) => runUpdateOperation(() => agentApi.setUpdatePreferences(autoCheck, autoDownload))} />;
     return <LogsPage logs={logs} onRefresh={() => run(refreshLogs)} onExport={() => run(async () => {
       const result = await agentApi.exportDiagnostics();
       if (!result.canceled) notify('success', `诊断包已导出：${result.path || ''}`);
@@ -1063,8 +1128,10 @@ function App() {
       agentVersion={status?.version || '--'}
       updateBusy={updateBusy}
       currentTask={status?.current_task || null}
+      quickPluginViews={quickPluginViews}
       onLoadTaskHistory={agentApi.taskHistory}
       onNavigate={(nextPage) => { if (nextPage === 'ai') setAiConnectionsTab('mcp'); if (nextPage === 'settings') setSettingsSection('remote'); setPage(nextPage); }}
+      onOpenPluginView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')}
       onOpenDashboard={() => run(agentApi.openDashboard)}
       onOpenBuiltinAi={() => { void openBuiltinAi(); }}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}

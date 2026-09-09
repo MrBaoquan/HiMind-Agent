@@ -78,6 +78,32 @@ pub(crate) struct ExtensionFeaturePack {
     pub plugin_ids: Vec<String>,
     #[serde(default)]
     pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub agent_preset_ids: Vec<String>,
+    #[serde(skip)]
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AgentPresetCatalogItem {
+    pub preset_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub version: String,
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ExtensionAgentPreset {
+    pub preset_id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub path: String,
+    pub sha256: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +119,8 @@ pub(crate) struct ExtensionSourceCatalog {
     pub skills: Vec<SkillCatalogItem>,
     #[serde(default)]
     pub feature_packs: Vec<ExtensionFeaturePack>,
+    #[serde(default)]
+    pub agent_presets: Vec<AgentPresetCatalogItem>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +139,7 @@ pub(crate) struct ExtensionSourceSnapshot {
     pub plugins: Vec<PluginCatalogItem>,
     pub skills: Vec<SkillCatalogItem>,
     pub feature_packs: Vec<ExtensionFeaturePack>,
+    pub agent_presets: Vec<ExtensionAgentPreset>,
     pub sources: Vec<ExtensionSourceStatus>,
     #[serde(skip_serializing)]
     plugin_versions: Vec<PluginCatalogItem>,
@@ -269,34 +298,51 @@ fn snapshot_with_cache(force: bool) -> Result<ExtensionSourceSnapshot, Box<dyn E
             }
         }
     }
-    let value = load_snapshot()?;
+    let value = load_snapshot(force)?;
     *snapshot_cache()
         .lock()
         .map_err(|_| "扩展源内存缓存不可用")? = Some((Instant::now(), value.clone()));
     Ok(value)
 }
 
-fn load_snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
+fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
     let mut result = ExtensionSourceSnapshot::default();
     let mut plugins = HashMap::<String, PluginCatalogItem>::new();
     let mut skills = HashMap::<String, SkillCatalogItem>::new();
     let mut feature_packs = HashMap::<String, ExtensionFeaturePack>::new();
+    let mut agent_presets = HashMap::<String, ExtensionAgentPreset>::new();
     for source in settings()?.sources.into_iter().filter(|item| item.enabled) {
-        let (catalog, using_cache, error) = match fetch_catalog(&source) {
-            Ok(catalog) => {
-                save_cached_catalog(&source.id, &catalog)?;
-                (Some(catalog), false, String::new())
-            }
-            Err(error) => match load_cached_catalog(&source.id) {
-                Ok(Some(catalog)) => match validate_catalog(&catalog, &source) {
-                    Ok(()) => (Some(catalog), true, error.to_string()),
+        let (catalog, using_cache, error) = if refresh_remote {
+            match fetch_catalog(&source) {
+                Ok(catalog) => {
+                    save_cached_catalog(&source.id, &catalog)?;
+                    (Some(catalog), false, String::new())
+                }
+                Err(error) => match load_cached_catalog(&source.id) {
+                    Ok(Some(catalog)) => match validate_catalog(&catalog, &source) {
+                        Ok(()) => (Some(catalog), true, error.to_string()),
+                        Err(cache_error) => {
+                            (None, false, format!("{error}; 缓存不再可信: {cache_error}"))
+                        }
+                    },
+                    Ok(None) => (None, false, error.to_string()),
                     Err(cache_error) => {
-                        (None, false, format!("{error}; 缓存不再可信: {cache_error}"))
+                        (None, false, format!("{error}; 缓存读取失败: {cache_error}"))
                     }
                 },
-                Ok(None) => (None, false, error.to_string()),
-                Err(cache_error) => (None, false, format!("{error}; 缓存读取失败: {cache_error}")),
-            },
+            }
+        } else {
+            // Ordinary catalog reads are local and deterministic. Network
+            // refresh belongs to refresh_snapshot/background reconciliation,
+            // so opening a page cannot stall on GitHub availability.
+            match load_cached_catalog(&source.id) {
+                Ok(Some(catalog)) => match validate_catalog(&catalog, &source) {
+                    Ok(()) => (Some(catalog), true, String::new()),
+                    Err(cache_error) => (None, false, format!("缓存不再可信: {cache_error}")),
+                },
+                Ok(None) => (None, false, "扩展源尚未同步".to_string()),
+                Err(cache_error) => (None, false, format!("缓存读取失败: {cache_error}")),
+            }
         };
         let mut status = ExtensionSourceStatus {
             source: source.clone(),
@@ -356,9 +402,43 @@ fn load_snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
                     skills.insert(item.skill_id.clone(), item.clone());
                 }
             }
-            for pack in catalog.feature_packs {
+            for mut pack in catalog.feature_packs {
                 validate_feature_pack(&pack)?;
-                feature_packs.entry(pack.id.clone()).or_insert(pack);
+                pack.source_id = source.id.clone();
+                if let Some(existing) = feature_packs.get(&pack.id) {
+                    if existing.source_id != pack.source_id {
+                        return Err(format!(
+                            "功能包 {} 同时来自多个 GitHub 源，请只保留一个可信来源",
+                            pack.id
+                        )
+                        .into());
+                    }
+                } else {
+                    feature_packs.insert(pack.id.clone(), pack);
+                }
+            }
+            for item in catalog.agent_presets {
+                validate_agent_preset(&item)?;
+                let normalized = ExtensionAgentPreset {
+                    preset_id: item.preset_id,
+                    name: item.name,
+                    description: item.description,
+                    version: item.version,
+                    path: item.path,
+                    sha256: item.sha256,
+                    source: format!("github:{}", source.id),
+                };
+                if let Some(existing) = agent_presets.get(&normalized.preset_id) {
+                    if existing.source != normalized.source {
+                        return Err(format!(
+                            "DSH preset {} 同时来自多个 GitHub 源，请只保留一个可信来源",
+                            normalized.preset_id
+                        )
+                        .into());
+                    }
+                } else {
+                    agent_presets.insert(normalized.preset_id.clone(), normalized);
+                }
             }
         }
         result.sources.push(status);
@@ -366,6 +446,7 @@ fn load_snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
     result.plugins = plugins.into_values().collect();
     result.skills = skills.into_values().collect();
     result.feature_packs = feature_packs.into_values().collect();
+    result.agent_presets = agent_presets.into_values().collect();
     result
         .plugins
         .sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
@@ -375,6 +456,9 @@ fn load_snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
     result
         .feature_packs
         .sort_by(|left, right| left.id.cmp(&right.id));
+    result
+        .agent_presets
+        .sort_by(|left, right| left.preset_id.cmp(&right.preset_id));
     sort_plugin_versions(&mut result.plugin_versions);
     sort_skill_versions(&mut result.skill_versions);
     Ok(result)
@@ -898,6 +982,8 @@ pub(crate) fn ensure_authoring_feature() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|value| value.to_string())
                 .collect(),
+            agent_preset_ids: Vec::new(),
+            source_id: String::new(),
         });
     if !plugin_ready {
         if !snapshot
@@ -976,6 +1062,190 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
         }
     }
     Ok(updated)
+}
+
+/// Reconcile DSH's user preset directory from extension-source catalogs.
+///
+/// Presets are source-managed only when the feature pack that owns them has a
+/// real local plugin or Skill installation. User-authored presets are never
+/// overwritten because they have no source marker.
+pub(crate) fn reconcile_dsh_presets(home: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let snapshot = refresh_snapshot()?;
+    let root = home.join(".agent-presets");
+    let mut desired = HashMap::<String, (&ExtensionAgentPreset, &ExtensionSourceConfig)>::new();
+    for pack in &snapshot.feature_packs {
+        if pack.agent_preset_ids.is_empty() || !feature_pack_ready(pack) {
+            continue;
+        }
+        let source = snapshot
+            .sources
+            .iter()
+            .map(|status| &status.source)
+            .find(|source| source.id == pack.source_id);
+        let Some(source) = source else { continue };
+        for preset_id in &pack.agent_preset_ids {
+            let Some(preset) = snapshot.agent_presets.iter().find(|item| {
+                item.preset_id == *preset_id && item.source == format!("github:{}", source.id)
+            }) else {
+                continue;
+            };
+            desired.entry(preset_id.clone()).or_insert((preset, source));
+        }
+    }
+
+    let mut changed = Vec::new();
+    let desired_ids = desired.keys().cloned().collect::<HashSet<_>>();
+    let unavailable_sources = snapshot
+        .sources
+        .iter()
+        .filter(|status| status.state == "unavailable")
+        .map(|status| status.source.id.clone())
+        .collect::<HashSet<_>>();
+    for (preset_id, (preset, source)) in desired {
+        let directory = root.join(&preset_id);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                // Never follow a file, junction, or symlink supplied by the user.
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        fs::create_dir_all(&root)?;
+        let marker_path = directory.join(".himind-source-preset.json");
+        if directory.is_dir() && !marker_path.is_file() {
+            // A user-owned preset wins over an extension source with the same id.
+            continue;
+        }
+        let Ok(composition) = fetch_preset_file(source, &preset.path) else {
+            continue;
+        };
+        let digest = format!("{:x}", Sha256::digest(&composition));
+        if !digest.eq_ignore_ascii_case(&preset.sha256) {
+            eprintln!("DSH preset {} 的 SHA-256 校验失败，跳过本次同步", preset_id);
+            continue;
+        }
+        let metadata_path = preset
+            .path
+            .rsplit_once('/')
+            .map(|(parent, _)| format!("{parent}/preset.yml"))
+            .unwrap_or_else(|| "preset.yml".to_string());
+        let metadata = fetch_preset_file(source, &metadata_path).unwrap_or_default();
+        fs::create_dir_all(&directory)?;
+        atomic_file::atomic_write(&directory.join("agent.cordis.yml"), &composition)?;
+        if metadata.is_empty() {
+            let _ = fs::remove_file(directory.join("preset.yml"));
+        } else {
+            atomic_file::atomic_write(&directory.join("preset.yml"), &metadata)?;
+        }
+        let marker = serde_json::json!({
+            "schema_version": 1,
+            "source_id": source.id,
+            "preset_id": preset.preset_id,
+            "version": preset.version,
+            "sha256": preset.sha256,
+        });
+        atomic_file::atomic_write(&marker_path, &serde_json::to_vec_pretty(&marker)?)?;
+        changed.push(format!("preset:{}@{}", preset_id, preset.version));
+    }
+
+    if root.is_dir() {
+        for entry in fs::read_dir(&root)?.flatten() {
+            let directory = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&directory) else {
+                continue;
+            };
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let marker_path = directory.join(".himind-source-preset.json");
+            if !marker_path.is_file() {
+                continue;
+            }
+            let Ok(marker) = serde_json::from_slice::<serde_json::Value>(&fs::read(&marker_path)?)
+            else {
+                continue;
+            };
+            let preset_id = marker
+                .get("preset_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let source_id = marker
+                .get("source_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if !should_remove_managed_preset(
+                preset_id,
+                source_id,
+                &desired_ids,
+                &unavailable_sources,
+            ) {
+                continue;
+            }
+            fs::remove_dir_all(&directory)?;
+            changed.push(format!("preset:{}:removed", preset_id));
+        }
+    }
+    Ok(changed)
+}
+
+pub(crate) fn reconcile_dsh_presets_now() -> Result<Vec<String>, Box<dyn Error>> {
+    let home = crate::runtime::builtin::interactive_home_path()
+        .map_err(|error| format!("DSH 用户目录不可用: {error}"))?;
+    reconcile_dsh_presets(&home)
+}
+
+fn feature_pack_ready(pack: &ExtensionFeaturePack) -> bool {
+    let plugin_ready = pack.plugin_ids.iter().any(|id| {
+        let local = crate::app::plugin_manager::local_status(id);
+        if local.current_version.is_empty() || !local.enabled {
+            return false;
+        }
+        provenance_matches_or_local("plugin", id, &pack.source_id)
+    });
+    let store = crate::skill::store::SkillStore::new();
+    let skill_ready = pack.skill_ids.iter().any(|id| {
+        let installed = store.get_record(id).ok().flatten().is_some();
+        installed && provenance_matches_or_local("skill", id, &pack.source_id)
+    });
+    (pack.plugin_ids.is_empty() && pack.skill_ids.is_empty()) || plugin_ready || skill_ready
+}
+
+fn provenance_matches_or_local(kind: &str, key: &str, source_id: &str) -> bool {
+    match read_provenance(kind, key) {
+        Ok(Some(record)) => record.source_id == source_id,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+fn fetch_preset_file(
+    source: &ExtensionSourceConfig,
+    path: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let normalized = path.trim().replace('\\', "/");
+    let safe = Path::new(&normalized);
+    if normalized.is_empty()
+        || safe.is_absolute()
+        || safe
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("DSH preset 路径无效".into());
+    }
+    let url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}",
+        source.repository, source.reference, normalized
+    );
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("HiMind-Agent")
+        .build()?
+        .get(url)
+        .send()?
+        .error_for_status()?;
+    Ok(response.bytes()?.to_vec())
 }
 
 fn resolve_plugin_order(
@@ -1134,6 +1404,18 @@ pub(crate) fn validate_catalog(
             &source.verification,
         )?;
     }
+    for pack in &catalog.feature_packs {
+        if !identities.insert(format!("feature_pack:{}", pack.id)) {
+            return Err(format!("扩展源包含重复功能包: {}", pack.id).into());
+        }
+        validate_feature_pack(pack)?;
+    }
+    for item in &catalog.agent_presets {
+        if !identities.insert(format!("agent_preset:{}", item.preset_id)) {
+            return Err(format!("扩展源包含重复 DSH preset: {}", item.preset_id).into());
+        }
+        validate_agent_preset(item)?;
+    }
     Ok(())
 }
 
@@ -1190,10 +1472,66 @@ fn normalize_skill_item(
 
 fn validate_feature_pack(pack: &ExtensionFeaturePack) -> Result<(), Box<dyn Error>> {
     validate_asset_key(&pack.id)?;
-    for key in pack.plugin_ids.iter().chain(pack.skill_ids.iter()) {
+    for key in pack
+        .plugin_ids
+        .iter()
+        .chain(pack.skill_ids.iter())
+        .chain(pack.agent_preset_ids.iter())
+    {
         validate_asset_key(key)?;
     }
     Ok(())
+}
+
+fn validate_agent_preset(item: &AgentPresetCatalogItem) -> Result<(), Box<dyn Error>> {
+    if !is_valid_dsh_preset_id(&item.preset_id) {
+        return Err(format!(
+            "DSH preset {} 的 ID 必须匹配小写字母、数字和连字符",
+            item.preset_id
+        )
+        .into());
+    }
+    if item.version.trim().is_empty() {
+        return Err(format!("DSH preset {} 缺少版本", item.preset_id).into());
+    }
+    if item.sha256.len() != 64 || !item.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("DSH preset {} 的 SHA-256 无效", item.preset_id).into());
+    }
+    let normalized = item.path.trim().replace('\\', "/");
+    let path = Path::new(&normalized);
+    if normalized.is_empty()
+        || !(normalized == "agent.cordis.yml" || normalized.ends_with("/agent.cordis.yml"))
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "DSH preset {} 必须指向仓库内的 agent.cordis.yml",
+            item.preset_id
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn is_valid_dsh_preset_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (byte == b'-' && index > 0)
+        })
+}
+
+fn should_remove_managed_preset(
+    preset_id: &str,
+    source_id: &str,
+    desired_ids: &HashSet<String>,
+    unavailable_sources: &HashSet<String>,
+) -> bool {
+    !preset_id.is_empty()
+        && !desired_ids.contains(preset_id)
+        && !unavailable_sources.contains(source_id)
 }
 
 fn validate_artifact(
@@ -1560,5 +1898,108 @@ mod tests {
         assert!(
             validate_catalog_signature("", "", "", &ExtensionSourceVerification::Required).is_err()
         );
+    }
+
+    #[test]
+    fn dsh_preset_validation_matches_official_directory_id_rules() {
+        assert!(is_valid_dsh_preset_id("himind-short-video"));
+        assert!(is_valid_dsh_preset_id("preset2"));
+        assert!(!is_valid_dsh_preset_id("Himind-short-video"));
+        assert!(!is_valid_dsh_preset_id("himind_short_video"));
+        assert!(!is_valid_dsh_preset_id("himind.short.video"));
+        assert!(!is_valid_dsh_preset_id("-short-video"));
+    }
+
+    #[test]
+    fn dsh_preset_catalog_item_requires_safe_path_and_digest() {
+        let valid = AgentPresetCatalogItem {
+            preset_id: "himind-short-video".to_string(),
+            name: "短视频创作".to_string(),
+            description: String::new(),
+            version: "0.1.0".to_string(),
+            path: "dsh/agent-presets/himind-short-video/agent.cordis.yml".to_string(),
+            sha256: "a".repeat(64),
+        };
+        assert!(validate_agent_preset(&valid).is_ok());
+
+        let mut root_preset = valid.clone();
+        root_preset.path = "agent.cordis.yml".to_string();
+        assert!(validate_agent_preset(&root_preset).is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.path = "../agent.cordis.yml".to_string();
+        assert!(validate_agent_preset(&invalid).is_err());
+
+        let mut invalid = valid;
+        invalid.sha256 = "not-a-sha256".to_string();
+        assert!(validate_agent_preset(&invalid).is_err());
+    }
+
+    #[test]
+    fn catalog_validation_checks_preset_entries_before_snapshot_merge() {
+        let source = ExtensionSourceConfig {
+            id: "github-test".to_string(),
+            name: "测试".to_string(),
+            repository: "Owner/repo".to_string(),
+            reference: "main".to_string(),
+            catalog_path: ".himind/catalog.json".to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+        };
+        let mut catalog: ExtensionSourceCatalog = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "plugins": [],
+            "skills": [],
+            "feature_packs": [],
+            "agent_presets": [{
+                "preset_id": "BadPreset",
+                "name": "错误",
+                "version": "1.0.0",
+                "path": "dsh/agent-presets/BadPreset/agent.cordis.yml",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }))
+        .unwrap();
+        assert!(validate_catalog(&catalog, &source).is_err());
+        catalog.agent_presets[0].preset_id = "good-preset".to_string();
+        catalog.agent_presets[0].path =
+            "dsh/agent-presets/good-preset/agent.cordis.yml".to_string();
+        assert!(validate_catalog(&catalog, &source).is_ok());
+    }
+
+    #[test]
+    fn feature_pack_rejects_unsafe_asset_ids() {
+        let pack = ExtensionFeaturePack {
+            id: "com.himind.feature.short-video".to_string(),
+            name: "短视频创作".to_string(),
+            plugin_ids: vec!["com.himind.short-video-creation".to_string()],
+            skill_ids: vec![],
+            agent_preset_ids: vec!["himind-short-video".to_string()],
+            source_id: String::new(),
+        };
+        assert!(validate_feature_pack(&pack).is_ok());
+
+        let mut invalid = pack;
+        invalid.agent_preset_ids = vec!["../short-video".to_string()];
+        assert!(validate_feature_pack(&invalid).is_err());
+    }
+
+    #[test]
+    fn unavailable_source_keeps_last_known_preset() {
+        let desired = HashSet::new();
+        let unavailable = HashSet::from(["github-short-video".to_string()]);
+        assert!(!should_remove_managed_preset(
+            "himind-short-video",
+            "github-short-video",
+            &desired,
+            &unavailable,
+        ));
+        assert!(should_remove_managed_preset(
+            "himind-short-video",
+            "github-short-video",
+            &desired,
+            &HashSet::new(),
+        ));
     }
 }

@@ -136,8 +136,10 @@ where
                 return Err("exhibit-linked Agent Run is missing its associated directory".into());
             }
         }
-        crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS => {
-            if settings.access_mode != crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS {
+        crate::app::remote_execution::ACCESS_MODE_MACHINE_UNRESTRICTED => {
+            if settings.access_mode
+                != crate::app::remote_execution::ACCESS_MODE_MACHINE_UNRESTRICTED
+            {
                 return Err("full computer access is not enabled on this Agent".into());
             }
         }

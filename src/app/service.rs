@@ -110,7 +110,8 @@ pub(crate) fn run_local_app(options: Options) -> Result<(), Box<dyn Error>> {
         distribution_update_signature_algorithm: String::new(),
     }));
 
-    start_background_services(&options, Arc::clone(&worker_status), None)?;
+    let gateway = CapabilityGateway::new(options.clone(), Arc::clone(&worker_status));
+    start_background_services(&options, Arc::clone(&worker_status), None, gateway)?;
 
     println!(
         "local agent app service listening on http://127.0.0.1:{}",
@@ -126,18 +127,18 @@ pub(crate) fn start_background_services(
     options: &Options,
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     approval_mgr: Option<Arc<ApprovalManager>>,
+    capability_gateway: CapabilityGateway,
 ) -> Result<(), Box<dyn Error>> {
     // A VS Code update replaces its versioned product.json. Repair an existing
     // HiMind enrollment before serving the Dashboard so ordinary Agent startup
     // restores the persistent provider allowlist automatically.
     if options.mode().dashboard_enabled() {
-        reconcile_vscode_import(options);
         let reconcile_options = options.clone();
         let _ = thread::Builder::new()
             .name("himind-vscode-reconcile-loop".to_string())
             .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(60));
                 reconcile_vscode_import(&reconcile_options);
+                std::thread::sleep(std::time::Duration::from_secs(60));
             });
         // 已登录且 DSH 会话已启动时，周期对账 Dashboard 分发的 AI 服务：
         // 模型目录变更 live 更新；凭据/路由变更自动重启 DSH 会话使用新环境。
@@ -178,6 +179,28 @@ pub(crate) fn start_background_services(
         state.local_service_error.clear();
     }
 
+    // GitHub extension sources and DSH presets are local Agent concerns. Run
+    // this loop for both modes so a connected Dashboard Worker outage cannot
+    // block local extension refresh or preset installation.
+    let source_reconcile_options = options.clone();
+    let _ = thread::Builder::new()
+        .name("himind-extension-source-reconcile-loop".to_string())
+        .spawn(move || loop {
+            match crate::app::extension_orchestrator::reconcile_local_sources() {
+                Ok(updated) => {
+                    for item in updated {
+                        eprintln!("local extension source updated: {item}");
+                    }
+                }
+                Err(error) => eprintln!("local extension source reconcile failed: {error}"),
+            }
+            if source_reconcile_options.mode().dashboard_enabled() {
+                thread::sleep(Duration::from_secs(60));
+            } else {
+                thread::sleep(Duration::from_secs(300));
+            }
+        });
+
     if options.mode().dashboard_enabled() {
         let worker_opts = options.clone();
         let ws = Arc::clone(&worker_status);
@@ -190,7 +213,6 @@ pub(crate) fn start_background_services(
             state.dashboard_worker_online = false;
             state.dashboard_worker_error.clear();
         }
-        let independent_options = options.clone();
         let _ =
             thread::Builder::new()
                 .name("himind-independent-update-loop".to_string())
@@ -220,32 +242,13 @@ pub(crate) fn start_background_services(
                         }
                     }
                 });
-        let _ = thread::Builder::new()
-            .name("himind-extension-reconcile-loop".to_string())
-            .spawn(move || {
-                let mut generation = String::new();
-                loop {
-                    match crate::app::extension_orchestrator::reconcile(
-                        &independent_options,
-                        "",
-                        &mut generation,
-                    ) {
-                        Ok(updated) => {
-                            for item in updated {
-                                eprintln!("independent extension updated: {item}");
-                            }
-                        }
-                        Err(error) => eprintln!("independent extension reconcile failed: {error}"),
-                    }
-                    thread::sleep(Duration::from_secs(300));
-                }
-            });
     }
 
     let http_ws = Arc::clone(&worker_status);
     let http_opts = options.clone();
+    let http_gateway = capability_gateway;
     thread::spawn(move || {
-        if let Err(error) = run_local_http_service(listener, http_ws, http_opts) {
+        if let Err(error) = run_local_http_service(listener, http_ws, http_opts, http_gateway) {
             eprintln!("local agent service failed: {error}");
         }
     });
@@ -257,6 +260,7 @@ fn run_local_http_service(
     listener: TcpListener,
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     options: Options,
+    capability_gateway: CapabilityGateway,
 ) -> Result<(), Box<dyn Error>> {
     const MAX_HTTP_CONNECTIONS: usize = 64;
     const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -287,12 +291,15 @@ fn run_local_http_service(
                 }
                 let worker_status = Arc::clone(&worker_status);
                 let options = options.clone();
+                let capability_gateway = capability_gateway.clone();
                 let active_connections = Arc::clone(&active_connections);
                 let active_connections_for_thread = Arc::clone(&active_connections);
                 let spawn_result = thread::Builder::new()
                     .name("himind-local-http-request".to_string())
                     .spawn(move || {
-                        if let Err(error) = handle_local_http(stream, worker_status, options) {
+                        if let Err(error) =
+                            handle_local_http(stream, worker_status, options, capability_gateway)
+                        {
                             eprintln!("local agent request failed: {error}");
                         }
                         active_connections_for_thread.fetch_sub(1, Ordering::AcqRel);
@@ -312,6 +319,7 @@ fn handle_local_http(
     mut stream: TcpStream,
     worker_status: Arc<Mutex<LocalWorkerStatus>>,
     options: Options,
+    gateway: CapabilityGateway,
 ) -> Result<(), Box<dyn Error>> {
     let request_bytes = match read_http_request(&mut stream) {
         Ok(bytes) => bytes,
@@ -427,7 +435,6 @@ fn handle_local_http(
             }
         }
     }
-    let gateway = CapabilityGateway::new(options.clone(), Arc::clone(&worker_status));
     match (method, path.as_str()) {
         ("POST", "/enroll") => {
             if !options.mode().dashboard_enabled() {

@@ -175,7 +175,7 @@ fn codex_sandbox_mode_for_claim(claim: &AgentRunClaim) -> Result<String, Box<dyn
         crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED => {
             Ok("workspace-write".to_string())
         }
-        crate::app::remote_execution::ACCESS_MODE_FULL_ACCESS => {
+        crate::app::remote_execution::ACCESS_MODE_MACHINE_UNRESTRICTED => {
             Ok("danger-full-access".to_string())
         }
         _ => Err("unsupported Agent Run access mode for Codex".into()),

@@ -1,9 +1,11 @@
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
@@ -46,6 +48,8 @@ use crate::svn::types::{
 };
 use crate::{Options, VERSION};
 
+const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub(crate) struct CapabilityGateway {
     options: Options,
@@ -53,11 +57,21 @@ pub(crate) struct CapabilityGateway {
     approval_manager: Arc<ApprovalManager>,
     downstream_mcp: DownstreamMcpManager,
     business_provider: Arc<dyn BusinessIntegrationProvider>,
+    registry_cache: Arc<Mutex<RegistryCache>>,
+}
+
+#[derive(Default)]
+struct RegistryCache {
+    revision: u64,
+    refreshed_at: Option<Instant>,
+    registry: Option<BTreeMap<String, CapabilityRegistration>>,
 }
 
 #[derive(Clone)]
 enum CapabilityHandler {
     SystemHealth,
+    CapabilityCatalogSearch,
+    CapabilityCatalogDescribe,
     AIClientList,
     AIClientStatus,
     AIClientImport,
@@ -185,6 +199,7 @@ impl CapabilityGateway {
         Self {
             downstream_mcp: DownstreamMcpManager::new(&options.state_path),
             business_provider: Arc::new(DashboardCatalogProvider::new(&options)),
+            registry_cache: Arc::new(Mutex::new(RegistryCache::default())),
             options,
             worker_status,
             approval_manager,
@@ -199,6 +214,16 @@ impl CapabilityGateway {
             .downcast_ref::<DashboardCatalogProvider>()
             .expect("test Gateway must use the Dashboard business integration provider");
         provider.replace_snapshot(snapshot);
+        self.invalidate_registry_cache();
+    }
+
+    #[cfg(test)]
+    fn invalidate_registry_cache(&self) {
+        if let Ok(mut cache) = self.registry_cache.lock() {
+            cache.revision = cache.revision.wrapping_add(1);
+            cache.refreshed_at = None;
+            cache.registry = None;
+        }
     }
 
     pub(crate) fn list_capabilities(
@@ -251,10 +276,237 @@ impl CapabilityGateway {
             .collect())
     }
 
+    pub(crate) fn search_capabilities(
+        &self,
+        context: &InvocationContext,
+        params: &Value,
+    ) -> Result<Value, Box<dyn Error>> {
+        let query = params
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let group = params
+            .get("group")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let surface = params
+            .get("surface")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let availability = params
+            .get("availability")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let source = params
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let all_capabilities = self.list_capabilities(context)?;
+        let generation = capability_catalog_generation(&all_capabilities);
+        let filter_generation =
+            capability_catalog_filter_generation(&query, &group, &surface, &availability, &source);
+        let offset = parse_capability_catalog_cursor(
+            params.get("cursor").and_then(Value::as_str),
+            &generation,
+            &filter_generation,
+        )?;
+        let mut capabilities = all_capabilities;
+        capabilities.retain(|capability| {
+            let searchable = format!(
+                "{} {} {} {}",
+                capability.id, capability.name, capability.description, capability.source
+            )
+            .to_ascii_lowercase();
+            (query.is_empty() || searchable.contains(&query))
+                && (group.is_empty() || capability.discovery_group() == group)
+                && (surface.is_empty() || capability.discovery_surface() == surface)
+                && (availability.is_empty() || capability.availability.as_str() == availability)
+                && (source.is_empty() || capability.source.to_ascii_lowercase().contains(&source))
+        });
+        if offset > capabilities.len() {
+            return Err("invalid capability catalog cursor".into());
+        }
+        let end = offset.saturating_add(limit).min(capabilities.len());
+        let items = capabilities[offset..end]
+            .iter()
+            .map(|capability| {
+                let schema_bytes = serde_json::to_vec(&capability.input_schema)
+                    .map(|schema| schema.len())
+                    .unwrap_or_default();
+                json!({
+                    "id": capability.id,
+                    "name": capability.name,
+                    "description": capability.description,
+                    "version": capability.version,
+                    "source": capability.source,
+                    "contractSource": capability.contract_source,
+                    "contractGeneration": capability.contract_generation,
+                    "availability": capability.availability,
+                    "riskLevel": capability.risk_level,
+                    "approvalRequired": capability.approval_required,
+                    "executionMode": capability.execution_mode,
+                    "supportsProgress": capability.supports_progress,
+                    "supportsCancel": capability.supports_cancel,
+                    "requiredScope": capability.required_scope,
+                    "dashboardRoute": capability.dashboard_route,
+                    "discoveryGroup": capability.discovery_group(),
+                    "discoverySurface": capability.discovery_surface(),
+                    "schemaBytes": schema_bytes,
+                    "schemaAvailable": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut result = json!({
+            "items": items,
+            "total": capabilities.len(),
+            "capabilityGeneration": generation
+        });
+        if end < capabilities.len() {
+            result["nextCursor"] = json!(format_capability_catalog_cursor(
+                result["capabilityGeneration"].as_str().unwrap_or_default(),
+                &filter_generation,
+                end
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn describe_capability(
+        &self,
+        context: &InvocationContext,
+        params: &Value,
+    ) -> Result<Value, Box<dyn Error>> {
+        let id = params
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("capability.catalog.describe requires a non-empty id")?;
+        let capability = self
+            .list_capabilities(context)?
+            .into_iter()
+            .find(|capability| capability.id == id)
+            .ok_or_else(|| format!("capability not found: {id}"))?;
+        Ok(json!({
+            "id": capability.id,
+            "name": capability.name,
+            "description": capability.description,
+            "version": capability.version,
+            "source": capability.source,
+            "contractSource": capability.contract_source,
+            "contractGeneration": capability.contract_generation,
+            "availability": capability.availability,
+            "riskLevel": capability.risk_level,
+            "approvalRequired": capability.approval_required,
+            "executionMode": capability.execution_mode,
+            "supportsProgress": capability.supports_progress,
+            "supportsCancel": capability.supports_cancel,
+            "idempotency": capability.idempotency,
+            "retryPolicy": capability.retry_policy,
+            "concurrency": capability.concurrency,
+            "requiredScope": capability.required_scope,
+            "dashboardRoute": capability.dashboard_route,
+            "discoveryGroup": capability.discovery_group(),
+            "discoverySurface": capability.discovery_surface(),
+            "inputSchema": capability.input_schema
+        }))
+    }
+
     fn registry(&self) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
+        loop {
+            let revision = {
+                let cache = self
+                    .registry_cache
+                    .lock()
+                    .map_err(|_| "capability registry cache lock poisoned")?;
+                if cache
+                    .refreshed_at
+                    .is_some_and(|refreshed_at| refreshed_at.elapsed() < REGISTRY_CACHE_TTL)
+                {
+                    if let Some(registry) = cache.registry.as_ref() {
+                        return Ok(registry.clone());
+                    }
+                }
+                cache.revision
+            };
+
+            // Registry construction scans local extension state and can be
+            // slow. Never hold the cache lock during that work. A revision
+            // guard prevents an older concurrent build from overwriting a
+            // newer invalidated catalog.
+            let registry = self.build_registry()?;
+            let mut cache = self
+                .registry_cache
+                .lock()
+                .map_err(|_| "capability registry cache lock poisoned")?;
+            if cache.revision != revision {
+                continue;
+            }
+            cache.refreshed_at = Some(Instant::now());
+            cache.registry = Some(registry.clone());
+            return Ok(registry);
+        }
+    }
+
+    fn cached_capability_count(&self) -> Option<usize> {
+        self.registry_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.registry.as_ref().map(BTreeMap::len))
+    }
+
+    fn build_registry(&self) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
         let mut registry = BTreeMap::new();
         let ai_client_targets = crate::app::ai_provider_import::known_adapter_ids();
         let builtins = [
+            registration(
+                "capability.catalog.search",
+                "能力目录搜索",
+                "按关键字、分组、surface、可用性和来源搜索当前可见能力，仅返回轻量摘要。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "maxLength": 2000 },
+                        "group": { "type": "string" },
+                        "surface": { "type": "string" },
+                        "availability": { "type": "string", "enum": ["local", "network_service", "control_plane"] },
+                        "source": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                        "cursor": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::CapabilityCatalogSearch,
+            ),
+            registration(
+                "capability.catalog.describe",
+                "能力详情",
+                "按稳定能力 ID 返回能力契约和完整输入 Schema。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string", "minLength": 1 } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::CapabilityCatalogDescribe,
+            ),
             registration(
                 "mcp.server.list",
                 "MCP 服务列表",
@@ -1635,7 +1887,7 @@ impl CapabilityGateway {
             // local decision so Dashboard never exposes a second pending
             // approval while the Agent is waiting for the user.
             let remote_approval_id = if approved
-                && self.options.mode().dashboard_enabled()
+                && should_sync_remote_approval(self.options.mode(), &registration.descriptor)
                 && !policy::is_local_ai_configuration_capability(capability_id)
             {
                 let agent_id =
@@ -1703,6 +1955,12 @@ impl CapabilityGateway {
         );
         match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
+            CapabilityHandler::CapabilityCatalogSearch => {
+                Ok(self.search_capabilities(context, &input)?)
+            }
+            CapabilityHandler::CapabilityCatalogDescribe => {
+                Ok(self.describe_capability(context, &input)?)
+            }
             CapabilityHandler::AIClientList => Ok(serde_json::to_value(
                 crate::app::ai_provider_import::status(&self.options),
             )?),
@@ -2212,6 +2470,7 @@ impl CapabilityGateway {
 
     pub(crate) fn health(&self, context: &InvocationContext) -> Value {
         let worker = local_worker_snapshot(&self.worker_status);
+        let cached_capability_count = self.cached_capability_count();
         let mcp_stdio = context.transport == InvocationTransport::Stdio;
         let worker_state = if mcp_stdio {
             "not_applicable"
@@ -2302,7 +2561,11 @@ impl CapabilityGateway {
             "local_service_online": worker["local_service_online"],
             "local_service_error": worker["local_service_error"],
             "capability_gateway": true,
-            "capabilities": self.list_capabilities(context).map(|items| items.len()).unwrap_or_default(),
+            // Health must remain constant-time even when Dashboard, GitHub or
+            // a downstream plugin is unavailable. The full catalog has its
+            // own endpoint and is populated lazily.
+            "capabilities": cached_capability_count.unwrap_or_default(),
+            "capabilities_cached": cached_capability_count.is_some(),
             "local_port": self.options.local_port,
             "profile": crate::store::paths::profile_name(),
         })
@@ -2829,7 +3092,7 @@ impl CapabilityGateway {
         {
             return Ok(None);
         }
-        if self.options.mode().dashboard_enabled() {
+        if should_sync_remote_approval(self.options.mode(), descriptor) {
             let args_digest = policy::args_digest(input)?;
             let generation = policy::approval_generation(descriptor.contract_generation.as_deref());
             match crate::approval::remote::active_grant(
@@ -2913,7 +3176,9 @@ impl CapabilityGateway {
         // Keep agent_local as the sole interactive approval surface. The
         // durable Dashboard request is created only after local approval and
         // is immediately resolved with the same decision.
-        let remote_approval_id = if approved && self.options.mode().dashboard_enabled() {
+        let remote_approval_id = if approved
+            && should_sync_remote_approval(self.options.mode(), descriptor)
+        {
             let agent_id = crate::api::client::load_agent_state(&self.options.state_path)?.agent_id;
             let args_digest = policy::args_digest(input)?;
             let generation = policy::approval_generation(descriptor.contract_generation.as_deref());
@@ -3472,6 +3737,81 @@ impl CapabilityGateway {
     }
 }
 
+fn capability_catalog_generation(capabilities: &[CapabilityDescriptor]) -> String {
+    let mut hasher = Sha256::new();
+    for capability in capabilities {
+        for field in [
+            capability.id.as_bytes(),
+            capability.version.as_bytes(),
+            capability.name.as_bytes(),
+            capability.description.as_bytes(),
+            capability.source.as_bytes(),
+            capability.contract_source.as_bytes(),
+            capability
+                .contract_generation
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        if let Ok(schema) = serde_json::to_vec(&capability.input_schema) {
+            hasher.update((schema.len() as u64).to_le_bytes());
+            hasher.update(schema);
+        }
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn capability_catalog_filter_generation(
+    query: &str,
+    group: &str,
+    surface: &str,
+    availability: &str,
+    source: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for field in [query, group, surface, availability, source] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn format_capability_catalog_cursor(
+    generation: &str,
+    filter_generation: &str,
+    offset: usize,
+) -> String {
+    format!("generation:{generation}|filter:{filter_generation}|offset:{offset}")
+}
+
+fn parse_capability_catalog_cursor(
+    cursor: Option<&str>,
+    generation: &str,
+    filter_generation: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let Some(cursor) = cursor.strip_prefix("generation:") else {
+        return Err("invalid capability catalog cursor".into());
+    };
+    let Some((cursor_generation, cursor)) = cursor.split_once("|filter:") else {
+        return Err("invalid capability catalog cursor".into());
+    };
+    let Some((cursor_filter, offset)) = cursor.split_once("|offset:") else {
+        return Err("invalid capability catalog cursor".into());
+    };
+    if cursor_generation != generation || cursor_filter != filter_generation {
+        return Err("capability catalog cursor is stale; request the first page again".into());
+    }
+    offset
+        .parse::<usize>()
+        .map_err(|_| "invalid capability catalog cursor".into())
+}
+
 fn is_svn_admin_capability(capability_id: &str) -> bool {
     matches!(
         capability_id,
@@ -3856,6 +4196,17 @@ fn is_dashboard_provider_handler(handler: &CapabilityHandler) -> bool {
             | CapabilityHandler::MediaJobGet
             | CapabilityHandler::MediaJobCancel
     )
+}
+
+/// Dashboard approval facts belong to organization control-plane operations.
+/// Local plugins and downstream MCP capabilities may still require the Agent's
+/// local approval policy, but must never turn a Connected local workflow into
+/// a Dashboard OAuth dependency.
+fn should_sync_remote_approval(
+    mode: crate::app::runtime_mode::AgentMode,
+    descriptor: &CapabilityDescriptor,
+) -> bool {
+    mode.dashboard_enabled() && descriptor.dashboard_provider
 }
 
 fn is_business_integration_handler(handler: &CapabilityHandler) -> bool {
@@ -5011,6 +5362,71 @@ mod tests {
     }
 
     #[test]
+    fn capability_catalog_cursor_binds_registry_and_filters() {
+        let generation = "sha256:registry";
+        let filters = "sha256:filters";
+        let cursor = format_capability_catalog_cursor(generation, filters, 20);
+        assert_eq!(
+            parse_capability_catalog_cursor(Some(&cursor), generation, filters).unwrap(),
+            20
+        );
+        assert!(parse_capability_catalog_cursor(Some(&cursor), "sha256:other", filters).is_err());
+        assert!(
+            parse_capability_catalog_cursor(Some(&cursor), generation, "sha256:other").is_err()
+        );
+        assert!(parse_capability_catalog_cursor(Some("offset:20"), generation, filters).is_err());
+    }
+
+    #[test]
+    fn replacing_business_catalog_invalidates_gateway_registry_cache() {
+        let mut options = crate::Options::from_env();
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let context = InvocationContext::local_http();
+        let before = gateway
+            .list_capabilities(&context)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        gateway.replace_business_catalog_for_test(BusinessCatalogSnapshot::dashboard(
+            "cache-invalidation-generation".into(),
+            vec![BusinessCapabilityContract {
+                id: "business.project.list".into(),
+                version: "2.0.0".into(),
+                name: "项目列表".into(),
+                description: "测试目录能力".into(),
+                risk_level: "read_only".into(),
+                scope: "business:project:read".into(),
+                route: "/api/integrations/ai/business/projects".into(),
+                http_method: "GET".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false
+                }),
+                execution_mode: "sync".into(),
+                supports_progress: false,
+                supports_cancel: false,
+                idempotency: "safe".into(),
+                approval_required: false,
+                retry_policy: "safe".into(),
+                concurrency: "parallel".into(),
+            }],
+        ));
+
+        let after = gateway
+            .list_capabilities(&context)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == "business.project.list")
+            .expect("replacement catalog capability remains visible");
+        assert_eq!(after.version, "2.0.0");
+        assert!(before.contains("business.project.list"));
+    }
+
+    #[test]
     fn health_distinguishes_mcp_stdio_from_mcp_over_local_http() {
         let mut options = crate::Options::from_env();
         options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
@@ -5038,6 +5454,8 @@ mod tests {
         assert_eq!(stdio["mcp_transport"], "stdio");
         assert_eq!(stdio["dashboard_worker_expected"], false);
         assert_eq!(stdio["dashboard_worker_state"], "not_applicable");
+        assert_eq!(stdio["capabilities"], 0);
+        assert_eq!(stdio["capabilities_cached"], false);
 
         let http = gateway.health(&InvocationContext::with_transport(
             InvocationSource::Mcp,
@@ -5051,6 +5469,7 @@ mod tests {
             http["dashboard_worker_reason_code"],
             "connected_agent_app_worker_error"
         );
+        assert_eq!(http["capabilities_cached"], false);
     }
 
     #[test]
@@ -5090,6 +5509,33 @@ mod tests {
             ),
             "R3"
         );
+    }
+
+    #[test]
+    fn remote_approval_sync_is_reserved_for_dashboard_provider() {
+        let mut local_plugin = registration(
+            "short.video.project.create",
+            "创建短视频项目",
+            "在本机项目目录创建短视频项目",
+            "local_write",
+            json!({"type":"object"}),
+            CapabilityHandler::PluginCapability("short.video.project.create".into()),
+        );
+        assert!(!local_plugin.descriptor.dashboard_provider);
+        assert!(!should_sync_remote_approval(
+            crate::app::runtime_mode::AgentMode::Connected,
+            &local_plugin.descriptor
+        ));
+
+        local_plugin.descriptor.dashboard_provider = true;
+        assert!(should_sync_remote_approval(
+            crate::app::runtime_mode::AgentMode::Connected,
+            &local_plugin.descriptor
+        ));
+        assert!(!should_sync_remote_approval(
+            crate::app::runtime_mode::AgentMode::Independent,
+            &local_plugin.descriptor
+        ));
     }
 
     #[test]
@@ -5595,6 +6041,30 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "target enum drifted for {capability_id}");
         }
+    }
+
+    #[test]
+    fn capability_catalog_cursor_is_bound_to_snapshot_and_filters() {
+        let generation = "sha256:generation";
+        let filter = capability_catalog_filter_generation("plugin", "", "", "", "");
+        let cursor = format_capability_catalog_cursor(generation, &filter, 20);
+        assert_eq!(
+            parse_capability_catalog_cursor(Some(&cursor), generation, &filter).unwrap(),
+            20
+        );
+        assert!(
+            parse_capability_catalog_cursor(Some(&cursor), "sha256:changed", &filter)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        let other_filter = capability_catalog_filter_generation("business", "", "", "", "");
+        assert!(
+            parse_capability_catalog_cursor(Some(&cursor), generation, &other_filter)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
     }
 
     #[test]

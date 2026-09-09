@@ -343,6 +343,7 @@ function presentConnectionError(error: unknown) {
   if (normalized.includes('ai 服务')) return '当前账号暂未分配可用的 AI 服务，请联系管理员。';
   if (normalized.includes('运行时') && normalized.includes('修复')) return 'HiMind AI 运行时需要修复，请在设置中处理。';
   if ((normalized.includes('运行时') || normalized.includes('组件')) && normalized.includes('安装')) return '请先安装 HiMind AI 运行时，再开始对话。';
+  if (normalized.includes('项目工作区') || normalized.includes('workspace') || normalized.includes('dsh')) return detail;
   if (normalized.includes('正在启动')) return '会话仍在准备中，请稍后重新连接。';
   return '服务暂时不可用，请稍后重试。';
 }
