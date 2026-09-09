@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -67,18 +68,24 @@ pub(crate) struct SkillStore {
 impl SkillStore {
     pub(crate) fn new() -> Self {
         let agent_home = crate::store::paths::agent_home();
-        // Tests run in parallel inside one process. Point the default store
-        // at a per-process temp root so parallel skill mutations never leak
-        // into the user's real Agent data directory (which otherwise makes
-        // registry-generation hashes unstable under `cargo test`). Explicit
-        // isolation tests that set HIMIND_AGENT_HOME still win.
+        // Tests run in parallel inside one process. Point the default store at a
+        // per-instance unique temp root: parallel skill tests bootstrap/install/
+        // remove skill packages under a shared root, which mutates
+        // registry-generation hashes between two computations inside one MCP
+        // activate call under `cargo test`. Generation hashes only depend on
+        // record content, so a fresh root that bootstraps the same seed stays
+        // deterministic while test stores never collide. HIMIND_AGENT_HOME is a
+        // process-global env var that parallel tests may flip (ai_services
+        // isolation) — never honor it here, or this store silently lands in
+        // another test's scratch root and gets deleted mid-test.
         #[cfg(test)]
-        let agent_home = match std::env::var_os("HIMIND_AGENT_HOME") {
-            Some(value) if !value.is_empty() => agent_home,
-            _ => std::env::temp_dir().join(format!(
-                "himind-agent-test-home-{}",
+        let agent_home = {
+            static NONCE: AtomicU64 = AtomicU64::new(0);
+            let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "himind-agent-test-home-{}-{nonce}",
                 std::process::id()
-            )),
+            ))
         };
         Self {
             root: agent_home.join("skills"),
