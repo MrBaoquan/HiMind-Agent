@@ -152,7 +152,14 @@ pub(crate) async fn get_dashboard_identity_status(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardIdentityStatus, String> {
     if !state.options.mode().dashboard_enabled() {
-        state.approval_manager.clear_identity()?;
+        // Independent mode has no Dashboard identity of its own. Clear only a
+        // leftover Dashboard binding (e.g. after switching from connected
+        // mode); a locally confirmed, unbounded full_access approval posture
+        // must survive restarts instead of being reset on every identity poll.
+        let settings = state.approval_manager.get_settings();
+        if !settings.owner_user_id.trim().is_empty() || !settings.agent_id.trim().is_empty() {
+            state.approval_manager.clear_identity()?;
+        }
         return Ok(crate::app::identity::independent_status(&state.options));
     }
     let options = state.options.clone();
