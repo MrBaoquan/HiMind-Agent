@@ -304,12 +304,7 @@ mod tests {
             let dir = root.join(Path::new(name));
             fs::create_dir_all(dir.clone()).unwrap();
             assert!(
-                should_skip_directory(
-                    &dir,
-                    name,
-                    "Unity",
-                    "source"
-                ),
+                should_skip_directory(&dir, name, "Unity", "source"),
                 "{} should be skipped for source package",
                 name
             );
@@ -366,7 +361,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root.join("saved/logs")).unwrap();
         let logs = root.join("saved").join("logs");
-        assert!(should_skip_directory(&logs, "saved/logs", "Unity", "release"));
+        assert!(should_skip_directory(
+            &logs,
+            "saved/logs",
+            "Unity",
+            "release"
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -375,7 +375,15 @@ mod tests {
         let root = temp_root("files");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        for name in ["art.zip", "backup.7z", "bundled.tar.gz", "libs.rar", "data.tar", "x.bz2", "y.xz"] {
+        for name in [
+            "art.zip",
+            "backup.7z",
+            "bundled.tar.gz",
+            "libs.rar",
+            "data.tar",
+            "x.bz2",
+            "y.xz",
+        ] {
             let file = root.join(name);
             fs::write(&file, b"x").unwrap();
             assert!(
@@ -384,7 +392,16 @@ mod tests {
                 name
             );
         }
-        for name in ["index.pdb", "cache.obj", "scene.log", "tmp.vc.db", "thumb.tmp", "run.dmp", "game.ilk", "proj.suo"] {
+        for name in [
+            "index.pdb",
+            "cache.obj",
+            "scene.log",
+            "tmp.vc.db",
+            "thumb.tmp",
+            "run.dmp",
+            "game.ilk",
+            "proj.suo",
+        ] {
             let file = root.join(name);
             fs::write(&file, b"x").unwrap();
             assert!(
@@ -393,7 +410,13 @@ mod tests {
                 name
             );
         }
-        let keep = ["main.cs", "scene.unity", "data.json", "texture.png", "config.asset"];
+        let keep = [
+            "main.cs",
+            "scene.unity",
+            "data.json",
+            "texture.png",
+            "config.asset",
+        ];
         for name in keep {
             let file = root.join(name);
             fs::write(&file, b"x").unwrap();
@@ -459,7 +482,13 @@ mod tests {
         assert_eq!(first.included_bytes, 4 + 128);
 
         let other = collect_package_snapshot(&[root.join("b".to_string())], engine, "source");
-        assert!(other.is_err() || other.as_ref().map(|s| s.cache_key != first.cache_key).unwrap_or(true));
+        assert!(
+            other.is_err()
+                || other
+                    .as_ref()
+                    .map(|s| s.cache_key != first.cache_key)
+                    .unwrap_or(true)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -475,16 +504,18 @@ mod tests {
         fs::write(root.join("src/Library/cache.bin"), b"cache").unwrap();
 
         let output = root.join("out.zip");
-        let stats = zip_directories(
-            &[root.join("src")],
-            &output,
-            "Unity",
-            "source",
-            |_, _| Ok(()),
-        )
+        let stats = zip_directories(&[root.join("src")], &output, "Unity", "source", |_, _| {
+            Ok(())
+        })
         .unwrap();
-        assert_eq!(stats.included_files, 2, "main.cs and helper.cs, Library and archive.zip pruned");
-        assert_eq!(stats.excluded_files, 1, "only archive.zip counts as excluded; Library is pruned before traversal");
+        assert_eq!(
+            stats.included_files, 2,
+            "main.cs and helper.cs, Library and archive.zip pruned"
+        );
+        assert_eq!(
+            stats.excluded_files, 1,
+            "only archive.zip counts as excluded; Library is pruned before traversal"
+        );
 
         let mut archive = zip::ZipArchive::new(File::open(&output).unwrap()).unwrap();
         let names: Vec<String> = (0..archive.len())
@@ -492,9 +523,15 @@ mod tests {
             .collect();
         assert!(names.contains(&"main.cs".to_string()));
         assert!(names.contains(&"Sub/helper.cs".to_string()));
-        assert!(!names.iter().any(|name| name.contains("Library") || name.contains("archive.zip")));
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("Library") || name.contains("archive.zip")));
         let mut content = String::new();
-        archive.by_name("main.cs").unwrap().read_to_string(&mut content).unwrap();
+        archive
+            .by_name("main.cs")
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(content, "hello");
         let _ = fs::remove_dir_all(&root);
     }

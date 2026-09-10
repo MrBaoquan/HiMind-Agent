@@ -1051,6 +1051,8 @@ mod tests {
 
         options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
         let connected_arguments = mcp_arguments(&options);
-        assert!(connected_arguments.iter().any(|argument| argument == "--api"));
+        assert!(connected_arguments
+            .iter()
+            .any(|argument| argument == "--api"));
     }
 }

@@ -411,6 +411,16 @@ function App() {
       setExtensionSourcesLoading(false);
     }
   }
+  async function addLocalExtensionSource(name: string, root: string, catalogPath?: string) {
+    setExtensionSourcesLoading(true);
+    try {
+      setExtensionSources(await agentApi.addLocalExtensionSource(name, root, catalogPath));
+      await refreshExtensionSources();
+      await Promise.all([refreshPlugins(), refreshSkills()]);
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
   async function updateExtensionSource(source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) {
     setExtensionSourcesLoading(true);
     try {
@@ -1052,6 +1062,7 @@ function App() {
       onRefresh={() => run(refreshDevelopment, undefined, '刷新扩展项目失败')}
       onRefreshSources={refreshExtensionSources}
       onAddSource={addExtensionSource}
+      onAddLocalSource={addLocalExtensionSource}
       onUpdateSourceConfig={updateExtensionSource}
       onRemoveSource={removeExtensionSource}
       onSelectWorkspace={() => run(selectExtensionWorkspace, undefined, '选择扩展仓库失败')}

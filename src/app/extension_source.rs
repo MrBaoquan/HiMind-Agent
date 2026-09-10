@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const CATALOG_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CATALOG_PATH: &str = ".himind/catalog.json";
+const LOCAL_CATALOG_PATH: &str = "extensions.json";
 const OFFICIAL_EXTENSION_REPOSITORY: &str = "MrBaoquan/himind-extensions";
 const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(crate) const AUTHORING_FEATURE_ID: &str = "com.himind.feature.extension-authoring";
@@ -20,6 +21,19 @@ const AUTHORING_SKILL_IDS: [&str; 2] = [
     "com.himind.skill.develop-himind-plugins",
     "com.himind.skill.develop-himind-skills",
 ];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExtensionSourceKind {
+    Github,
+    Local,
+}
+
+impl Default for ExtensionSourceKind {
+    fn default() -> Self {
+        Self::Github
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +58,8 @@ impl ExtensionSourceVerification {
 pub(crate) struct ExtensionSourceConfig {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub kind: ExtensionSourceKind,
     pub repository: String,
     pub reference: String,
     pub catalog_path: String,
@@ -216,6 +232,7 @@ pub(crate) fn github_source_config(
         } else {
             name.trim().chars().take(80).collect()
         },
+        kind: ExtensionSourceKind::Github,
         repository,
         reference,
         catalog_path,
@@ -230,6 +247,79 @@ pub(crate) fn upsert_source(
 ) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
     let mut current = settings()?;
     let id = source.id.clone();
+    if let Some(existing) = current.sources.iter_mut().find(|item| item.id == id) {
+        *existing = source;
+    } else {
+        current.sources.push(source);
+    }
+    current
+        .sources
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    save_settings(&current)?;
+    invalidate_snapshot_cache();
+    Ok(current)
+}
+
+pub(crate) fn add_local_source(
+    name: &str,
+    root: &str,
+    catalog_path: Option<&str>,
+) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
+    let root_path = Path::new(root.trim());
+    if !root_path.is_dir() {
+        return Err("本地扩展源必须是目录".into());
+    }
+    let root = root_path.canonicalize()?;
+    let catalog_path = validate_catalog_path(catalog_path.unwrap_or(LOCAL_CATALOG_PATH))?;
+    let catalog_file = root.join(&catalog_path);
+    if !catalog_file.is_file() {
+        return Err(format!("本地扩展源缺少目录文件: {catalog_path}").into());
+    }
+    let content = fs::read_to_string(&catalog_file)?;
+    let aggregate: LocalAggregateCatalog = serde_json::from_str(&content)
+        .map_err(|error| format!("本地扩展源目录文件格式无效: {error}"))?;
+    aggregate.validate()?;
+    for entry in &aggregate.extensions {
+        let dir = safe_local_child(&root, &entry.path)?;
+        let manifest_name = if entry.kind == "plugin" {
+            "plugin.json"
+        } else {
+            "skill.json"
+        };
+        if !dir.join(manifest_name).is_file() {
+            return Err(format!("扩展目录缺少 {manifest_name}: {}", entry.path).into());
+        }
+        let manifest_id = fs::read_to_string(dir.join(manifest_name))
+            .ok()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .and_then(|value| {
+                value
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        if manifest_id.as_deref() != Some(entry.id.trim()) {
+            return Err(format!("扩展清单 ID 与 manifest 不一致: {}", entry.path).into());
+        }
+    }
+    let root_display = crate::extension_workspace::display_path(&root);
+    let id = local_source_id(&root_display, &catalog_path);
+    let mut current = settings()?;
+    let source = ExtensionSourceConfig {
+        id: id.clone(),
+        name: if name.trim().is_empty() {
+            root_display.clone()
+        } else {
+            name.trim().chars().take(80).collect()
+        },
+        kind: ExtensionSourceKind::Local,
+        repository: root_display,
+        reference: String::new(),
+        catalog_path,
+        enabled: true,
+        auto_update: false,
+        verification: ExtensionSourceVerification::Optional,
+    };
     if let Some(existing) = current.sources.iter_mut().find(|item| item.id == id) {
         *existing = source;
     } else {
@@ -258,7 +348,12 @@ pub(crate) fn update_source(
     source.enabled = enabled;
     source.auto_update = auto_update;
     if let Some(value) = verification {
-        source.verification = source_verification(&source.repository, Some(value))?;
+        if source.kind == ExtensionSourceKind::Local {
+            // 本地目录源固定使用用户自定义制品校验，忽略传入的校验策略。
+            source.verification = ExtensionSourceVerification::Optional;
+        } else {
+            source.verification = source_verification(&source.repository, Some(value))?;
+        }
     }
     save_settings(&current)?;
     invalidate_snapshot_cache();
@@ -592,10 +687,16 @@ pub(crate) fn install_plugin(
             }
         };
         lock_changes.push(("plugin".to_string(), item.plugin_id.clone(), previous_lock));
-        if let Err(error) = crate::app::plugin_manager::install_public_catalog_item(
-            item,
-            source.verification.requires_signature(),
-        ) {
+        let install_result = if source.kind == ExtensionSourceKind::Local {
+            let dir = local_item_dir(&item.download_url)?;
+            crate::app::plugin_manager::install_local_package_from_source(&dir, "local")
+        } else {
+            crate::app::plugin_manager::install_public_catalog_item(
+                item,
+                source.verification.requires_signature(),
+            )
+        };
+        if let Err(error) = install_result {
             restore_plugin_install_state(&reference_changes);
             restore_provenance_changes(&provenance_changes);
             restore_lock_changes(&lock_changes);
@@ -751,7 +852,7 @@ pub(crate) fn plan_plugin(
                 current_version: local.current_version,
                 target_version: item.version,
                 action: action.to_string(),
-                reason: "GitHub 扩展源依赖".to_string(),
+                reason: "扩展源依赖".to_string(),
                 requested_by: plugin.name.clone(),
             }
         })
@@ -844,10 +945,7 @@ pub(crate) fn install_skill(
         compensate_plugin_changes(&plugin_changes);
         return Err(format!("记录 Skill 插件依赖失败: {error}").into());
     }
-    let record = match crate::app::skill_manager::install_public_catalog_item(
-        &item,
-        source.verification.requires_signature(),
-    ) {
+    let record = match install_skill_catalog_item(&item, source) {
         Ok(record) => record,
         Err(error) => {
             let _ = crate::app::plugin_manager::set_owner_references(&owner, &previous_references);
@@ -947,7 +1045,7 @@ pub(crate) fn plan_skill(
             } else {
                 "unavailable".to_string()
             },
-            reason: "GitHub 扩展源依赖".to_string(),
+            reason: "扩展源依赖".to_string(),
             requested_by: skill.name.clone(),
         });
     }
@@ -1030,7 +1128,7 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
         if provenance.asset_kind == "plugin" {
             let Some(item) = snapshot.plugins.iter().find(|item| {
                 item.plugin_id == provenance.asset_key
-                    && item.source == format!("github:{}", provenance.source_id)
+                    && item.source.ends_with(&format!(":{}", provenance.source_id))
             }) else {
                 continue;
             };
@@ -1044,7 +1142,7 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
         } else if provenance.asset_kind == "skill" {
             let Some(item) = snapshot.skills.iter().find(|item| {
                 item.skill_id == provenance.asset_key
-                    && item.source == format!("github:{}", provenance.source_id)
+                    && item.source.ends_with(&format!(":{}", provenance.source_id))
             }) else {
                 continue;
             };
@@ -1328,7 +1426,8 @@ fn source_for_catalog_item<'a>(
 ) -> Result<&'a ExtensionSourceConfig, Box<dyn Error>> {
     let source_id = source
         .strip_prefix("github:")
-        .ok_or("扩展目录项缺少 GitHub 来源身份")?;
+        .or_else(|| source.strip_prefix("local:"))
+        .ok_or("扩展目录项缺少来源身份")?;
     snapshot
         .sources
         .iter()
@@ -1338,6 +1437,11 @@ fn source_for_catalog_item<'a>(
 }
 
 fn fetch_catalog(source: &ExtensionSourceConfig) -> Result<ExtensionSourceCatalog, Box<dyn Error>> {
+    if source.kind == ExtensionSourceKind::Local {
+        let catalog = build_local_catalog(source)?;
+        validate_catalog(&catalog, source)?;
+        return Ok(catalog);
+    }
     let url = catalog_url(source)?;
     let catalog = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -1370,12 +1474,16 @@ pub(crate) fn validate_catalog(
             )
             .into());
         }
-        validate_artifact(
-            &source.repository,
-            &item.download_url,
-            item.file_size,
-            &item.sha256,
-        )?;
+        if source.kind == ExtensionSourceKind::Local {
+            validate_local_item_identity("plugin", &item.plugin_id)?;
+        } else {
+            validate_artifact(
+                &source.repository,
+                &item.download_url,
+                item.file_size,
+                &item.sha256,
+            )?;
+        }
         validate_catalog_signature(
             &item.signature,
             &item.signature_key_id,
@@ -1391,12 +1499,16 @@ pub(crate) fn validate_catalog(
             )
             .into());
         }
-        validate_artifact(
-            &source.repository,
-            &item.download_url,
-            item.file_size,
-            &item.sha256,
-        )?;
+        if source.kind == ExtensionSourceKind::Local {
+            validate_local_item_identity("skill", &item.skill_id)?;
+        } else {
+            validate_artifact(
+                &source.repository,
+                &item.download_url,
+                item.file_size,
+                &item.sha256,
+            )?;
+        }
         validate_catalog_signature(
             &item.signature,
             &item.signature_key_id,
@@ -1443,7 +1555,7 @@ fn normalize_plugin_item(
 ) -> Result<(), Box<dyn Error>> {
     validate_asset_identity("plugin", &item.plugin_id)?;
     item.governance = "optional".to_string();
-    item.source = format!("github:{}", source.id);
+    item.source = format!("{}:{}", source_kind_prefix(source.kind), source.id);
     item.assignment = "optional".to_string();
     item.management = "user_managed".to_string();
     item.install_mode = "prompt".to_string();
@@ -1459,7 +1571,7 @@ fn normalize_skill_item(
     source: &ExtensionSourceConfig,
 ) -> Result<(), Box<dyn Error>> {
     validate_asset_identity("skill", &item.skill_id)?;
-    item.source = format!("github:{}", source.id);
+    item.source = format!("{}:{}", source_kind_prefix(source.kind), source.id);
     item.assignment = "optional".to_string();
     item.management = "user_managed".to_string();
     item.install_mode = "prompt".to_string();
@@ -1468,6 +1580,45 @@ fn normalize_skill_item(
     item.allow_disable = true;
     item.allow_uninstall = true;
     Ok(())
+}
+
+fn source_kind_prefix(kind: ExtensionSourceKind) -> &'static str {
+    match kind {
+        ExtensionSourceKind::Github => "github",
+        ExtensionSourceKind::Local => "local",
+    }
+}
+
+fn local_item_dir(download_url: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = download_url
+        .strip_prefix("local:")
+        .ok_or("本地扩展目录项缺少本地路径")?;
+    if path.trim().is_empty() {
+        return Err("本地扩展目录项缺少本地路径".into());
+    }
+    let path = PathBuf::from(path);
+    if !path.is_dir() {
+        return Err(format!("本地扩展目录不存在: {}", path.display()).into());
+    }
+    Ok(path)
+}
+
+fn install_skill_catalog_item(
+    item: &SkillCatalogItem,
+    source: &ExtensionSourceConfig,
+) -> Result<crate::skill::types::SkillRecord, Box<dyn Error>> {
+    if source.kind == ExtensionSourceKind::Local {
+        let dir = local_item_dir(&item.download_url)?;
+        return crate::app::skill_manager::install_local_package_from_source(&dir, "local");
+    }
+    crate::app::skill_manager::install_public_catalog_item(
+        item,
+        source.verification.requires_signature(),
+    )
+}
+
+fn validate_local_item_identity(kind: &str, key: &str) -> Result<(), Box<dyn Error>> {
+    validate_asset_identity(kind, key)
 }
 
 fn validate_feature_pack(pack: &ExtensionFeaturePack) -> Result<(), Box<dyn Error>> {
@@ -1565,13 +1716,21 @@ fn settings_at(path: &Path) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
     }
     let mut ids = HashSet::new();
     for source in &value.sources {
-        if source.id
-            != source_id(
+        let expected = match source.kind {
+            ExtensionSourceKind::Github => source_id(
                 &normalize_repository(&source.repository)?,
                 &validate_reference(&source.reference)?,
                 &validate_catalog_path(&source.catalog_path)?,
-            )
-        {
+            ),
+            ExtensionSourceKind::Local => {
+                let catalog_path = validate_catalog_path(&source.catalog_path)?;
+                if source.repository.trim().is_empty() {
+                    return Err(format!("本地扩展源缺少目录: {}", source.name).into());
+                }
+                local_source_id(&source.repository, &catalog_path)
+            }
+        };
+        if source.id != expected {
             return Err(format!("扩展源配置身份无效: {}", source.name).into());
         }
         if !ids.insert(source.id.clone()) {
@@ -1644,6 +1803,9 @@ fn provenance_path(kind: &str, key: &str) -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn catalog_url(source: &ExtensionSourceConfig) -> Result<url::Url, Box<dyn Error>> {
+    if source.kind == ExtensionSourceKind::Local {
+        return Err("本地扩展源不使用仓库 URL".into());
+    }
     Ok(url::Url::parse(&format!(
         "https://raw.githubusercontent.com/{}/{}/{}",
         source.repository, source.reference, source.catalog_path
@@ -1653,6 +1815,218 @@ fn catalog_url(source: &ExtensionSourceConfig) -> Result<url::Url, Box<dyn Error
 fn source_id(repository: &str, reference: &str, catalog_path: &str) -> String {
     let digest = Sha256::digest(format!("{repository}\n{reference}\n{catalog_path}").as_bytes());
     format!("github-{:x}", digest)[..23].to_string()
+}
+
+fn local_source_id(repository: &str, catalog_path: &str) -> String {
+    let digest = Sha256::digest(format!("local:{repository}\n{catalog_path}").as_bytes());
+    format!("local-{:x}", digest)[..23].to_string()
+}
+
+// 本地目录源统一读取聚合仓库的聚合清单（默认 extensions.json），
+// 并从各扩展目录的 plugin.json / skill.json manifest 动态构建 catalog。
+fn build_local_catalog(
+    source: &ExtensionSourceConfig,
+) -> Result<ExtensionSourceCatalog, Box<dyn Error>> {
+    let root = PathBuf::from(&source.repository);
+    if !root.is_dir() {
+        return Err(format!("本地扩展源目录不存在: {}", source.repository).into());
+    }
+    let aggregate_path = root.join(&source.catalog_path);
+    let content = fs::read_to_string(&aggregate_path)
+        .map_err(|error| format!("本地扩展源缺少聚合清单 {}: {error}", source.catalog_path))?;
+    let aggregate: LocalAggregateCatalog = serde_json::from_str(&content)
+        .map_err(|error| format!("extensions.json 格式无效: {error}"))?;
+    aggregate.validate()?;
+    let mut catalog = ExtensionSourceCatalog {
+        schema_version: CATALOG_SCHEMA_VERSION,
+        source_id: source.id.clone(),
+        generation: String::new(),
+        plugins: Vec::new(),
+        skills: Vec::new(),
+        feature_packs: Vec::new(),
+        agent_presets: Vec::new(),
+    };
+    for entry in &aggregate.extensions {
+        let dir = safe_local_child(&root, &entry.path)?;
+        match entry.kind.as_str() {
+            "plugin" => {
+                let item = build_local_plugin_item(&dir, source)?;
+                if item.plugin_id != entry.id {
+                    return Err(format!("扩展清单 ID 与 manifest 不一致: {}", entry.path).into());
+                }
+                catalog.plugins.push(item);
+            }
+            "skill" => {
+                let item = build_local_skill_item(&dir, source)?;
+                if item.skill_id != entry.id {
+                    return Err(format!("扩展清单 ID 与 manifest 不一致: {}", entry.path).into());
+                }
+                catalog.skills.push(item);
+            }
+            _ => {
+                return Err(format!("extensions.json 包含不支持的扩展类型: {}", entry.kind).into())
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+fn build_local_plugin_item(
+    dir: &Path,
+    source: &ExtensionSourceConfig,
+) -> Result<PluginCatalogItem, Box<dyn Error>> {
+    let content = fs::read_to_string(dir.join("plugin.json"))?;
+    let manifest =
+        crate::capability::plugin::parse_plugin_manifest(content.trim_start_matches('\u{feff}'))?;
+    Ok(PluginCatalogItem {
+        plugin_id: manifest.id.clone(),
+        name: manifest.name.clone(),
+        description: manifest.description.clone(),
+        author_name: manifest.author.clone(),
+        categories: Vec::new(),
+        review_status: "local".to_string(),
+        governance: "optional".to_string(),
+        version: manifest.version.clone(),
+        release_notes: manifest.release_notes.clone(),
+        published_at: String::new(),
+        min_agent_version: manifest.min_agent_version.clone(),
+        channel: "local".to_string(),
+        artifact_id: String::new(),
+        file_name: String::new(),
+        file_size: 0,
+        sha256: String::new(),
+        signature: String::new(),
+        signature_key_id: String::new(),
+        signature_algorithm: String::new(),
+        download_url: format!("local:{}", dir.display()),
+        source: format!("local:{}", source.id),
+        assignment: "optional".to_string(),
+        management: "user_managed".to_string(),
+        install_mode: "prompt".to_string(),
+        organization_reason: String::new(),
+        managed: false,
+        allow_disable: true,
+        allow_uninstall: true,
+        capability_ids: manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect(),
+        permissions: manifest.permissions.clone(),
+        view_count: manifest.contributes.views.len(),
+        plugin_dependencies: manifest
+            .plugin_dependencies
+            .iter()
+            .map(
+                |dependency| crate::api::distribution::SkillPluginDependency {
+                    plugin_id: dependency.plugin_id.clone(),
+                    required: dependency.required,
+                    min_version: dependency.min_version.clone(),
+                },
+            )
+            .collect(),
+    })
+}
+
+fn build_local_skill_item(
+    dir: &Path,
+    source: &ExtensionSourceConfig,
+) -> Result<SkillCatalogItem, Box<dyn Error>> {
+    let manifest = crate::skill::manifest::load_skill_manifest(dir)?;
+    Ok(SkillCatalogItem {
+        skill_id: manifest.id.clone(),
+        name: manifest.name.clone(),
+        description: manifest.description.clone(),
+        author_name: manifest.author.clone(),
+        categories: manifest.categories.clone(),
+        version: manifest.version.clone(),
+        release_notes: manifest.release_notes.clone(),
+        published_at: String::new(),
+        min_agent_version: manifest.min_agent_version.clone(),
+        supported_clients: manifest.supported_clients.clone(),
+        capability_ids: manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect(),
+        plugin_dependencies: manifest
+            .plugin_dependencies
+            .iter()
+            .map(
+                |dependency| crate::api::distribution::SkillPluginDependency {
+                    plugin_id: dependency.plugin_id.clone(),
+                    required: dependency.required,
+                    min_version: dependency.min_version.clone().unwrap_or_default(),
+                },
+            )
+            .collect(),
+        risk_summary: manifest.risk_summary.clone(),
+        channel: "local".to_string(),
+        artifact_id: String::new(),
+        file_name: String::new(),
+        file_size: 0,
+        sha256: String::new(),
+        signature: String::new(),
+        signature_key_id: String::new(),
+        signature_algorithm: String::new(),
+        download_url: format!("local:{}", dir.display()),
+        source: format!("local:{}", source.id),
+        assignment: "optional".to_string(),
+        management: "user_managed".to_string(),
+        install_mode: "prompt".to_string(),
+        organization_reason: String::new(),
+        managed: false,
+        allow_disable: true,
+        allow_uninstall: true,
+    })
+}
+
+fn safe_local_child(root: &Path, relative: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let relative_path = Path::new(relative);
+    if relative.trim().is_empty() || relative_path.is_absolute() || relative.contains('\\') {
+        return Err(format!("扩展目录路径无效: {relative}").into());
+    }
+    let candidate = root.join(relative_path);
+    let canonical = candidate.canonicalize()?;
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("扩展目录路径越界: {relative}").into());
+    }
+    Ok(canonical)
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalAggregateCatalog {
+    extensions: Vec<LocalAggregateExtension>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalAggregateExtension {
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    path: String,
+}
+
+impl LocalAggregateCatalog {
+    fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.extensions.is_empty() {
+            return Err("extensions.json 未声明任何扩展".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for item in &self.extensions {
+            if item.id.trim().is_empty() || item.path.trim().is_empty() {
+                return Err("extensions.json 包含空的扩展 ID 或目录".into());
+            }
+            if !matches!(item.kind.as_str(), "plugin" | "skill") {
+                return Err(format!("extensions.json 包含不支持的扩展类型: {}", item.kind).into());
+            }
+            if !ids.insert(format!("{}:{}", item.kind, item.id.trim())) {
+                return Err(format!("extensions.json 包含重复扩展 ID: {}", item.id).into());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn normalize_repository(value: &str) -> Result<String, Box<dyn Error>> {
@@ -1800,6 +2174,7 @@ mod tests {
         let source = ExtensionSourceConfig {
             id: "github-test".to_string(),
             name: "测试".to_string(),
+            kind: ExtensionSourceKind::Github,
             repository: "Owner/repo".to_string(),
             reference: "main".to_string(),
             catalog_path: ".himind/catalog.json".to_string(),
@@ -1843,6 +2218,7 @@ mod tests {
             sources: vec![ExtensionSourceConfig {
                 id: source_id(repository, reference, catalog_path),
                 name: "测试".to_string(),
+                kind: ExtensionSourceKind::Github,
                 repository: repository.to_string(),
                 reference: reference.to_string(),
                 catalog_path: catalog_path.to_string(),
@@ -1940,6 +2316,7 @@ mod tests {
         let source = ExtensionSourceConfig {
             id: "github-test".to_string(),
             name: "测试".to_string(),
+            kind: ExtensionSourceKind::Github,
             repository: "Owner/repo".to_string(),
             reference: "main".to_string(),
             catalog_path: ".himind/catalog.json".to_string(),
@@ -2001,5 +2378,105 @@ mod tests {
             &desired,
             &HashSet::new(),
         ));
+    }
+
+    fn local_repo_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "himind-local-source-test-{}-{}",
+            std::process::id(),
+            tag
+        ))
+    }
+
+    fn write_local_aggregate(root: &Path, extension: &str) {
+        fs::create_dir_all(root.join("plugins/demo")).unwrap();
+        fs::write(
+            root.join("extensions.json"),
+            format!(
+                r#"{{"schema_version":1,"extensions":[{{"type":"plugin","id":"com.himind.demo","path":"{extension}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("plugins/demo/plugin.json"),
+            r#"{"id":"com.himind.demo","name":"演示","description":"测试","version":"1.0.0","min_agent_version":"0.3.0","capabilities":[],"permissions":[]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn local_source_id_is_stable_and_prefixed() {
+        let first = local_source_id(r"C:\extensions", "extensions.json");
+        let second = local_source_id(r"C:\extensions", "extensions.json");
+        let different = local_source_id(r"D:\extensions", "extensions.json");
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(first.starts_with("local-"));
+        assert_eq!(first.len(), 23);
+    }
+
+    #[test]
+    fn build_local_catalog_reads_aggregate_and_manifests() {
+        let root = local_repo_root("build");
+        write_local_aggregate(&root, "plugins/demo");
+        let source = ExtensionSourceConfig {
+            id: local_source_id(
+                &crate::extension_workspace::display_path(&root),
+                "extensions.json",
+            ),
+            name: "本地".to_string(),
+            kind: ExtensionSourceKind::Local,
+            repository: crate::extension_workspace::display_path(&root),
+            reference: String::new(),
+            catalog_path: "extensions.json".to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+        };
+        let catalog = build_local_catalog(&source).unwrap();
+        assert_eq!(catalog.plugins.len(), 1);
+        assert_eq!(catalog.plugins[0].plugin_id, "com.himind.demo");
+        assert_eq!(catalog.plugins[0].version, "1.0.0");
+        assert!(catalog.plugins[0].download_url.starts_with("local:"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_source_rejects_missing_aggregate() {
+        let root = local_repo_root("missing");
+        fs::create_dir_all(&root).unwrap();
+        let source = ExtensionSourceConfig {
+            id: "local-test".to_string(),
+            name: "本地".to_string(),
+            kind: ExtensionSourceKind::Local,
+            repository: crate::extension_workspace::display_path(&root),
+            reference: String::new(),
+            catalog_path: "extensions.json".to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+        };
+        assert!(build_local_catalog(&source).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_source_normalize_uses_local_prefix() {
+        let source = ExtensionSourceConfig {
+            id: "local-test".to_string(),
+            name: "本地".to_string(),
+            kind: ExtensionSourceKind::Local,
+            repository: r"C:\extensions".to_string(),
+            reference: String::new(),
+            catalog_path: "extensions.json".to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+        };
+        let mut item = plugin_item("https://github.com/Owner/repo/releases/download/v1/test.hmpkg");
+        normalize_plugin_item(&mut item, &source).unwrap();
+        assert_eq!(item.source, "local:local-test");
+        assert_eq!(item.governance, "optional");
+        assert_eq!(item.management, "user_managed");
     }
 }

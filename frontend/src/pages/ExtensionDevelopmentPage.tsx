@@ -47,6 +47,7 @@ type DevelopmentPageProps = {
   onRefresh: () => void;
   onRefreshSources: () => Promise<void>;
   onAddSource: (name: string, repository: string, reference: string, catalogPath: string, verification: ExtensionSourceConfig['verification']) => Promise<void>;
+  onAddLocalSource: (name: string, root: string, catalogPath?: string) => Promise<void>;
   onUpdateSourceConfig: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
   onRemoveSource: (sourceId: string) => Promise<void>;
   onSelectWorkspace: () => Promise<void>;
@@ -120,7 +121,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     </section>
     {createOpen ? <CreateProjectDialog busy={Boolean(props.busyAction)} onClose={() => setCreateOpen(false)} onCreate={async input => { try { const project = await props.onCreate(input); setQuery(''); setKindFilter('all'); setSelectedKey(`${project.kind}:${project.extension_id}`); setDetailOpen(true); setCreateOpen(false); return project; } catch (error) { /* The parent keeps the dialog open and shows the error. */ throw error; } }} /> : null}
     {removeProject ? <ConfirmRemoveDialog project={removeProject} dashboardEnabled={props.dashboardEnabled} busy={Boolean(props.busyAction)} onClose={() => setRemoveProject(null)} onConfirm={async () => { await props.onRemove(removeProject.id); setRemoveProject(null); }} /> : null}
-    <ExtensionSourcesDialog open={sourcesOpen} workspace={props.workspace} settings={props.extensionSources} snapshot={props.extensionSourceSnapshot} loading={props.extensionSourcesLoading || Boolean(props.busyAction)} error={props.extensionSourcesError} onClose={() => setSourcesOpen(false)} onSelectWorkspace={props.onSelectWorkspace} onDevelopWorkspace={props.onDevelopWorkspace} onRefresh={props.onRefreshSources} onAdd={props.onAddSource} onUpdate={props.onUpdateSourceConfig} onRemove={props.onRemoveSource} />
+    <ExtensionSourcesDialog open={sourcesOpen} workspace={props.workspace} settings={props.extensionSources} snapshot={props.extensionSourceSnapshot} loading={props.extensionSourcesLoading || Boolean(props.busyAction)} error={props.extensionSourcesError} onClose={() => setSourcesOpen(false)} onSelectWorkspace={props.onSelectWorkspace} onDevelopWorkspace={props.onDevelopWorkspace} onRefresh={props.onRefreshSources} onAdd={props.onAddSource} onAddLocal={props.onAddLocalSource} onUpdate={props.onUpdateSourceConfig} onRemove={props.onRemoveSource} />
   </div>;
 }
 

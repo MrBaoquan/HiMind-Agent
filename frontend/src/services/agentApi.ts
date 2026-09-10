@@ -327,6 +327,7 @@ export type ExtensionDesiredState = {
 export type ExtensionSourceConfig = {
     id: string;
     name: string;
+    kind?: 'github' | 'local';
     repository: string;
     reference: string;
     catalog_path: string;
@@ -1187,6 +1188,9 @@ export const agentApi = {
     extensionSources: () => invoke<ExtensionSourceSettings>('get_extension_sources'),
     addExtensionSource: (name: string, repository: string, reference: string, catalogPath?: string, verification: ExtensionSourceConfig['verification'] = 'required') =>
         invoke<ExtensionSourceSettings>('add_extension_source', { name, repository, reference, catalogPath, verification }),
+    addLocalExtensionSource: (name: string, root: string, catalogPath?: string) =>
+        invoke<ExtensionSourceSettings>('add_local_extension_source', { name, root, catalogPath }),
+    pickLocalExtensionSourceDir: () => invoke<string | null>('pick_local_extension_source_dir'),
     updateExtensionSource: (sourceId: string, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) =>
         invoke<ExtensionSourceSettings>('update_extension_source', { sourceId, enabled, autoUpdate, verification }),
     removeExtensionSource: (sourceId: string) => invoke<ExtensionSourceSettings>('remove_extension_source', { sourceId }),
