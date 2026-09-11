@@ -1591,7 +1591,7 @@ tr:last-child td { border-bottom: 0; }
 .extension-source-item.is-active .extension-source-mark { background: #277a4e; color: #fff; }
 .extension-source-item-main { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .extension-source-mark { flex: 0 0 auto; width: 24px; height: 24px; display: grid; place-items: center; border-radius: 6px; background: #eef6f1; color: #277a4e; }
-.extension-source-item-text { min-width: 0; display: grid; gap: 3px; }
+.extension-source-item-text { flex: 1 1 auto; min-width: 0; display: grid; gap: 3px; }
 .extension-source-item-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .extension-source-item-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .extension-source-kind { flex: 0 0 auto; padding: 1px 6px; border-radius: 4px; background: #f1f3f5; color: #6b7280; font-size: 9px; font-weight: 600; }
