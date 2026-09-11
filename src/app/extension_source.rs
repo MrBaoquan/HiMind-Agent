@@ -582,7 +582,10 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         }
     };
     for source in ordered_sources(enabled.clone(), &acquisitions) {
-        let (catalog, using_cache, error) = if refresh_remote {
+        // 本地源目录读取是廉价且确定的，每次都按磁盘重读，保证开发者刚改完就能
+        // 被取用；网络刷新只由 refresh_snapshot 触发，避免打开页面卡在 GitHub 可用性上。
+        let refresh = refresh_remote || source.kind == ExtensionSourceKind::Local;
+        let (catalog, using_cache, error) = if refresh {
             match fetch_catalog(&source) {
                 Ok(catalog) => {
                     save_cached_catalog(&source.id, &catalog)?;
@@ -602,9 +605,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 },
             }
         } else {
-            // Ordinary catalog reads are local and deterministic. Network
-            // refresh belongs to refresh_snapshot/background reconciliation,
-            // so opening a page cannot stall on GitHub availability.
+            // 远端源沿用缓存，网络刷新属于 refresh_snapshot 与后台对账。
             match load_cached_catalog(&source.id) {
                 Ok(Some(catalog)) => match validate_catalog(&catalog, &source) {
                     Ok(()) => (Some(catalog), true, String::new()),
@@ -1430,7 +1431,14 @@ pub(crate) struct ExtensionUnitInstallReport {
 
 /// 按取用侧把整个分发单元安装/更新到本机。逐个制品执行，单个失败不影响其余。
 pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport, Box<dyn Error>> {
-    let snapshot = refresh_snapshot()?;
+    // 本地取用侧每次都从磁盘重读，无需网络刷新；远端取用侧需要最新的发布目录。
+    let snapshot = if acquisition_for(&settings()?.acquisitions, unit_key)
+        == ExtensionSourceAcquisition::Local
+    {
+        snapshot()?
+    } else {
+        refresh_snapshot()?
+    };
     let unit = snapshot
         .units
         .iter()
@@ -2153,13 +2161,12 @@ fn ordered_sources(
     let mut ordered = Vec::new();
     for key in units {
         let mut members = grouped.remove(&key).unwrap_or_default();
-        if acquisition_for(acquisitions, &key) == ExtensionSourceAcquisition::Remote {
-            // 远端取用时远端优先；本地仍保留在后面兜底。
-            members.sort_by_key(|source| match source.kind {
-                ExtensionSourceKind::Github => 0,
-                ExtensionSourceKind::Local => 1,
-            });
-        }
+        // 取用侧优先：合并目录里同一 ID 的首个命中就是取用来源，安装与依赖解析
+        // 都按首个命中取值，所以这里必须让取用侧排在同单元其它成员之前。
+        let local_first = acquisition_for(acquisitions, &key) == ExtensionSourceAcquisition::Local;
+        members.sort_by_key(|source| {
+            u8::from((source.kind == ExtensionSourceKind::Local) != local_first)
+        });
         ordered.extend(members);
     }
     ordered
@@ -3458,6 +3465,45 @@ mod tests {
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].state, "empty");
         assert_ne!(units[0].unit_key, units[1].unit_key);
+    }
+
+    #[test]
+    fn ordered_sources_put_the_acquisition_side_first_within_a_unit() {
+        let remote = ExtensionSourceConfig {
+            id: "github-1".to_string(),
+            name: "GitHub 分发源".to_string(),
+            kind: ExtensionSourceKind::Github,
+            repository: "Owner/repo".to_string(),
+            reference: "main".to_string(),
+            catalog_path: DEFAULT_CATALOG_PATH.to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
+        };
+        let local = ExtensionSourceConfig {
+            id: "local-1".to_string(),
+            name: "本地工作区".to_string(),
+            kind: ExtensionSourceKind::Local,
+            repository: r"F:\repo".to_string(),
+            reference: String::new(),
+            catalog_path: LOCAL_CATALOG_PATH.to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+            upstream_repository: "Owner/repo".to_string(),
+        };
+        // 配置顺序里 GitHub 源在前：真实工作区就是这样登记的。
+        let sources = vec![remote.clone(), local.clone()];
+        let ordered = ordered_sources(sources.clone(), &BTreeMap::new());
+        assert_eq!(
+            ordered[0].id, "local-1",
+            "本地取用时本地源必须先命中，安装与依赖解析才会落到本地制品"
+        );
+        let mut remote_acquisition = BTreeMap::new();
+        remote_acquisition.insert(unit_key_of(&remote), ExtensionSourceAcquisition::Remote);
+        let ordered = ordered_sources(sources, &remote_acquisition);
+        assert_eq!(ordered[0].id, "github-1");
     }
 
     #[test]
