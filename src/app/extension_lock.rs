@@ -10,6 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCK_SCHEMA_VERSION: u32 = 1;
 
+/// 手动导入（既非扩展源、也非 GitHub 仓库）的本地制品来源标识。
+/// 与扩展源的 `local:<source_id>` 明确区分，避免台账把手工导入误认成扩展源提供。
+pub(crate) const ADHOC_SOURCE: &str = "adhoc";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExtensionLockDependency {
     pub asset_kind: String,

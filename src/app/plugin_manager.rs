@@ -27,6 +27,12 @@ use zip::ZipArchive;
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 100_000;
+const LOCAL_PLUGIN_LIMITS: crate::app::local_package::PackageLimits =
+    crate::app::local_package::PackageLimits {
+        max_files: MAX_PLUGIN_ARCHIVE_ENTRIES,
+        max_bytes: MAX_PLUGIN_EXTRACTED_BYTES,
+        label: "本地插件",
+    };
 
 #[derive(Default)]
 pub(crate) struct LocalPluginStatus {
@@ -444,42 +450,20 @@ fn read_plugin_manifest_from_archive(path: &Path) -> Result<PluginManifest, Box<
 }
 
 fn pack_local_plugin_directory(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
-    let file = File::create(target)?;
-    let mut archive = zip::ZipWriter::new(file);
-    let options =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut file_count = 0_usize;
-    let mut source_bytes = 0_u64;
-    for entry in walkdir::WalkDir::new(source)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        if path == source || path.is_dir() {
-            continue;
-        }
-        let relative = path
-            .strip_prefix(source)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if relative.starts_with('.') && relative != "." {
-            continue;
-        }
-        file_count += 1;
-        if file_count > MAX_PLUGIN_ARCHIVE_ENTRIES {
-            return Err("本地插件文件数量超过 100000 个限制".into());
-        }
-        source_bytes = source_bytes
-            .checked_add(entry.metadata()?.len())
-            .ok_or("本地插件大小溢出")?;
-        if source_bytes > MAX_PLUGIN_EXTRACTED_BYTES {
-            return Err("本地插件内容超过 512 MiB 限制".into());
-        }
-        archive.start_file(relative, options)?;
-        archive.write_all(&fs::read(path)?)?;
+    let staging = env::temp_dir().join(format!("himind-local-plugin-stage-{}", unique_suffix()));
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        crate::app::local_package::stage_local_package(
+            source,
+            &staging,
+            &LOCAL_PLUGIN_LIMITS,
+            |_| true,
+        )?;
+        crate::app::local_package::archive_directory(&staging, target)
+    })();
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
     }
-    archive.finish()?;
-    Ok(())
+    result
 }
 
 pub(crate) fn plan_install(
@@ -1261,8 +1245,10 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
         validate_manifest_contributions(&staging, &manifest)?;
         let version_dir = root.join("versions").join(&item.version);
         if version_dir.exists() {
-            let existing = fs::read(version_dir.join("checksums.sha256"))?;
-            let incoming = fs::read(staging.join("checksums.sha256"))?;
+            let existing =
+                parse_plugin_checksums(&fs::read_to_string(version_dir.join("checksums.sha256"))?)?;
+            let incoming =
+                parse_plugin_checksums(&fs::read_to_string(staging.join("checksums.sha256"))?)?;
             if existing != incoming {
                 return Err("同一插件版本已存在且内容不同，请提升版本号".into());
             }
@@ -1352,9 +1338,9 @@ fn ensure_agent_version_supported(minimum: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub(crate) fn verify_plugin_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
-    let checksum_path = root.join("checksums.sha256");
-    let content = fs::read_to_string(&checksum_path).map_err(|_| "插件包缺少 checksums.sha256")?;
+/// 解析 `checksums.sha256`，返回 `相对路径 -> 摘要`。行序只是打包产物，
+/// 不代表包内容，因此判断「同一版本内容是否一致」必须比较该映射。
+fn parse_plugin_checksums(content: &str) -> Result<HashMap<String, String>, Box<dyn Error>> {
     let mut expected = HashMap::new();
     for (index, line) in content.lines().enumerate() {
         let Some((checksum, relative)) = line.split_once("  ") else {
@@ -1380,6 +1366,13 @@ pub(crate) fn verify_plugin_checksums(root: &Path) -> Result<(), Box<dyn Error>>
             return Err(format!("checksums.sha256 包含重复路径: {relative}").into());
         }
     }
+    Ok(expected)
+}
+
+pub(crate) fn verify_plugin_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
+    let checksum_path = root.join("checksums.sha256");
+    let content = fs::read_to_string(&checksum_path).map_err(|_| "插件包缺少 checksums.sha256")?;
+    let expected = parse_plugin_checksums(&content)?;
 
     let mut actual_files = HashSet::new();
     for entry in walkdir::WalkDir::new(root) {
@@ -1458,6 +1451,7 @@ fn unique_suffix() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{
         add_dependency_reference_at, build_install_plan, build_install_plan_for_item,
         compare_versions, dependency_references_at, ensure_plugin_not_referenced,
@@ -1472,6 +1466,77 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn packs_local_workspace_into_a_verifiable_archive_without_dependency_directories() {
+        let source = env::temp_dir().join(format!("himind-local-plugin-{}", unique_suffix()));
+        fs::create_dir_all(source.join("node_modules").join("left-pad")).unwrap();
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::write(
+            source.join("plugin.json"),
+            r#"{"id":"com.himind.local-pack-test","name":"本地打包","description":"测试本地打包","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        fs::write(source.join("main.go"), "package main\n").unwrap();
+        fs::write(
+            source
+                .join("node_modules")
+                .join("left-pad")
+                .join("index.js"),
+            "module.exports = 1;\n",
+        )
+        .unwrap();
+        fs::write(source.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let target = env::temp_dir().join(format!("himind-local-pack-{}.hmpkg", unique_suffix()));
+        pack_local_plugin_directory(&source, &target).unwrap();
+        assert!(
+            !source.join("checksums.sha256").exists(),
+            "本地打包不得污染源码工作区"
+        );
+
+        let staging = env::temp_dir().join(format!("himind-local-pack-stage-{}", unique_suffix()));
+        fs::create_dir_all(&staging).unwrap();
+        let mut archive = ZipArchive::new(File::open(&target).unwrap()).unwrap();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let relative = entry.enclosed_name().unwrap().to_path_buf();
+            let output = staging.join(relative);
+            if entry.is_dir() {
+                fs::create_dir_all(output).unwrap();
+                continue;
+            }
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            std::io::copy(&mut entry, &mut File::create(output).unwrap()).unwrap();
+        }
+
+        verify_plugin_checksums(&staging).unwrap();
+        assert!(staging.join("plugin.json").is_file());
+        assert!(staging.join("main.go").is_file());
+        assert!(!staging.join("node_modules").exists());
+        assert!(!staging.join(".git").exists());
+
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(staging);
+        let _ = fs::remove_file(target);
+    }
+
+    #[test]
+    fn accepts_repackaged_plugin_version_when_manifest_layout_differs_but_content_matches() {
+        let installed =
+            "1111111111111111111111111111111111111111111111111111111111111111  main.go\n\
+2222222222222222222222222222222222222222222222222222222222222222  plugin.json\n";
+        let repackaged =
+            "2222222222222222222222222222222222222222222222222222222222222222  plugin.json\n\
+1111111111111111111111111111111111111111111111111111111111111111  main.go\n";
+        assert_eq!(
+            parse_plugin_checksums(installed).unwrap(),
+            parse_plugin_checksums(repackaged).unwrap()
+        );
+        assert_ne!(installed, repackaged);
+    }
 
     #[test]
     fn builtin_plugins_cannot_be_disabled_or_uninstalled() {

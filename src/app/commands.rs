@@ -8,6 +8,7 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::api::distribution::ExtensionDesiredState;
 use crate::api::types::AgentTaskHistoryItem;
+use crate::app::extension_lock::ADHOC_SOURCE;
 use crate::app::remote_clients;
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
@@ -1626,6 +1627,46 @@ pub(crate) async fn get_extension_source_snapshot(
 }
 
 #[tauri::command]
+pub(crate) async fn set_extension_unit_acquisition(
+    unit_key: String,
+    acquisition: String,
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let acquisition = match acquisition.as_str() {
+            "remote" => crate::app::extension_source::ExtensionSourceAcquisition::Remote,
+            "local" => crate::app::extension_source::ExtensionSourceAcquisition::Local,
+            other => return Err(format!("取用模式无效: {other}")),
+        };
+        crate::app::extension_source::set_unit_acquisition(&unit_key, acquisition)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn install_extension_unit(
+    state: State<'_, AgentState>,
+    unit_key: String,
+) -> Result<crate::app::extension_source::ExtensionUnitInstallReport, String> {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        crate::app::extension_source::install_unit(&unit_key).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let capability_facts = skill_capability_facts(&state)?;
+    for skill in &report.skills {
+        if let Ok(Some(record)) = crate::skill::store::SkillStore::new().get_record(&skill.asset_id)
+        {
+            let _ =
+                crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts);
+        }
+    }
+    let _ = crate::app::extension_source::reconcile_dsh_presets_now();
+    Ok(report)
+}
+
+#[tauri::command]
 pub(crate) fn get_extension_provenance(
 ) -> Result<Vec<crate::app::extension_source::ExtensionProvenance>, String> {
     crate::app::extension_source::list_provenance().map_err(|error| error.to_string())
@@ -1653,7 +1694,8 @@ pub(crate) fn import_local_plugin(
     else {
         return Err("已取消导入插件".to_string());
     };
-    crate::app::plugin_manager::install_local_package(&path).map_err(|error| error.to_string())?;
+    crate::app::plugin_manager::install_local_package_from_source(&path, ADHOC_SOURCE)
+        .map_err(|error| error.to_string())?;
     registry_json_for_control_plane(state.options.mode().control_plane_enabled())
         .map_err(|error| error.to_string())
 }
@@ -1948,7 +1990,7 @@ pub(crate) fn import_local_skill() -> Result<serde_json::Value, String> {
     else {
         return Err("已取消导入 Skill".to_string());
     };
-    let record = crate::app::skill_manager::install_local_package(&path)
+    let record = crate::app::skill_manager::install_local_package_from_source(&path, ADHOC_SOURCE)
         .map_err(|error| error.to_string())?;
     serde_json::to_value(record).map_err(|error| error.to_string())
 }
@@ -2016,15 +2058,11 @@ pub(crate) fn get_extension_workspace() -> crate::extension_workspace::Extension
 }
 
 #[tauri::command]
-pub(crate) fn select_extension_workspace(
+pub(crate) fn set_extension_workspace(
+    root: String,
 ) -> Result<crate::extension_workspace::ExtensionWorkspaceSettings, String> {
-    let Some(path) = rfd::FileDialog::new()
-        .set_title("选择 HiMind 扩展聚合仓库")
-        .pick_folder()
-    else {
-        return Err("已取消选择扩展聚合仓库".to_string());
-    };
-    crate::extension_workspace::select(&path).map_err(|error| error.to_string())
+    crate::extension_workspace::select(std::path::Path::new(root.trim()))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

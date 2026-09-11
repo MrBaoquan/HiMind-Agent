@@ -9,7 +9,7 @@ use crate::Options;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
@@ -21,6 +21,12 @@ use zip::ZipArchive;
 const MAX_SKILL_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SKILL_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SKILL_ARCHIVE_ENTRIES: usize = 20_000;
+const LOCAL_SKILL_LIMITS: crate::app::local_package::PackageLimits =
+    crate::app::local_package::PackageLimits {
+        max_files: MAX_SKILL_ARCHIVE_ENTRIES,
+        max_bytes: MAX_SKILL_EXTRACTED_BYTES,
+        label: "Skill 包",
+    };
 
 pub(crate) type SkillPluginInstallAction = plugin_manager::PluginDependencyAction;
 
@@ -59,6 +65,18 @@ pub(crate) fn install_local_package(path: &Path) -> Result<SkillRecord, Box<dyn 
     install_local_package_from_source(path, "local")
 }
 
+/// 本地扩展源指向开发工作区目录，缺少 checksums.sha256。按 Manifest 声明的
+/// contents 现场物化成规范包体，避免把 dist 制品等非包内文件带入安装。
+fn stage_local_skill_directory(source: &Path, staging: &Path) -> Result<(), Box<dyn Error>> {
+    let manifest = validate_skill_package_root(source)?;
+    crate::app::local_package::select_declared(
+        source,
+        staging,
+        &LOCAL_SKILL_LIMITS,
+        &manifest.contents,
+    )
+}
+
 pub(crate) fn install_local_package_from_source(
     path: &Path,
     source_kind: &str,
@@ -69,7 +87,8 @@ pub(crate) fn install_local_package_from_source(
     }
     let staging = env::temp_dir().join(format!("himind-local-skill-{}", unique_suffix()));
     let package_root = if source.is_dir() {
-        source.clone()
+        stage_local_skill_directory(&source, &staging)?;
+        staging.clone()
     } else {
         if !source
             .extension()
@@ -511,23 +530,7 @@ pub(crate) fn verify_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     let checksum_path = root.join("checksums.sha256");
     let content =
         fs::read_to_string(&checksum_path).map_err(|_| "Skill 包缺少 checksums.sha256")?;
-    let mut expected = HashMap::new();
-    for (index, line) in content.lines().enumerate() {
-        let Some((checksum, relative)) = line.split_once("  ") else {
-            return Err(format!("checksums.sha256 第 {} 行格式无效", index + 1).into());
-        };
-        if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(format!("checksums.sha256 第 {} 行摘要无效", index + 1).into());
-        }
-        validate_relative_package_path(relative)?;
-        if relative == "checksums.sha256"
-            || expected
-                .insert(relative.replace('\\', "/"), checksum.to_ascii_lowercase())
-                .is_some()
-        {
-            return Err(format!("checksums.sha256 包含无效或重复路径: {relative}").into());
-        }
-    }
+    let expected = crate::skill::manifest::parse_checksums(&content)?;
     let mut actual_files = HashSet::new();
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry?;

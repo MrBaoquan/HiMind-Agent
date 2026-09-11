@@ -334,11 +334,64 @@ export type ExtensionSourceConfig = {
     enabled: boolean;
     auto_update: boolean;
     verification: 'required' | 'optional';
+    upstream_repository?: string;
 };
 
 export type ExtensionSourceSettings = {
     schema_version: number;
     sources: ExtensionSourceConfig[];
+    acquisitions?: Record<string, 'local' | 'remote'>;
+};
+
+/// 分发单元内某个已安装制品的来源侧，用于判断本机生效版本是否与所选来源一致。
+export type ExtensionUnitInstallation = {
+    asset_kind: 'plugin' | 'skill' | string;
+    asset_id: string;
+    version: string;
+    source_id: string;
+    side: 'local' | 'remote' | 'development' | string;
+};
+
+/// 取用侧目录当前提供的制品，用于与 installed 对比得出可更新项。
+export type ExtensionUnitAsset = {
+    asset_kind: 'plugin' | 'skill' | string;
+    asset_id: string;
+    name: string;
+    version: string;
+};
+
+/// 分发单元的取用侧：本地开发工作区是默认的最新权威，GitHub 分发源为兜底。
+export type ExtensionSourceAcquisition = 'local' | 'remote';
+
+export type ExtensionDistributionUnit = {
+    unit_key: string;
+    name: string;
+    acquisition: ExtensionSourceAcquisition;
+    local_source_id?: string | null;
+    remote_source_id?: string | null;
+    repository: string;
+    local_root?: string | null;
+    plugin_count: number;
+    skill_count: number;
+    state: 'ready' | 'empty' | string;
+    plugin_ids: string[];
+    skill_ids: string[];
+    project_ids: string[];
+    installed: ExtensionUnitInstallation[];
+    assets: ExtensionUnitAsset[];
+};
+
+export type ExtensionUnitInstallReport = {
+    unit_key: string;
+    acquisition: ExtensionSourceAcquisition;
+    plugins: ExtensionUnitAsset[];
+    skills: ExtensionUnitAsset[];
+    errors: string[];
+};
+
+export type ExtensionSourceNotice = {
+    reason: string;
+    items: string[];
 };
 
 export type ExtensionSourceStatus = {
@@ -349,6 +402,7 @@ export type ExtensionSourceStatus = {
     generation: string;
     using_cache: boolean;
     error: string;
+    notices?: ExtensionSourceNotice[];
 };
 
 export type ExtensionFeaturePack = {
@@ -363,6 +417,7 @@ export type ExtensionSourceSnapshot = {
     skills: OrganizationSkillCatalogItem[];
     feature_packs: ExtensionFeaturePack[];
     sources: ExtensionSourceStatus[];
+    units?: ExtensionDistributionUnit[];
 };
 
 export type ExtensionProvenance = {
@@ -867,6 +922,7 @@ export type ExtensionProject = {
     source_subdirectory: string;
     source_commit: string;
     updated_at: string;
+    source_unit_key?: string;
 };
 
 export type ExtensionProjectSourceInput = {
@@ -1195,6 +1251,9 @@ export const agentApi = {
         invoke<ExtensionSourceSettings>('update_extension_source', { sourceId, enabled, autoUpdate, verification }),
     removeExtensionSource: (sourceId: string) => invoke<ExtensionSourceSettings>('remove_extension_source', { sourceId }),
     extensionSourceSnapshot: () => invoke<ExtensionSourceSnapshot>('get_extension_source_snapshot'),
+    setExtensionUnitAcquisition: (unitKey: string, acquisition: ExtensionSourceAcquisition) =>
+        invoke<ExtensionSourceSettings>('set_extension_unit_acquisition', { unitKey, acquisition }),
+    installExtensionUnit: (unitKey: string) => invoke<ExtensionUnitInstallReport>('install_extension_unit', { unitKey }),
     extensionProvenance: () => invoke<ExtensionProvenance[]>('get_extension_provenance'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
     queryPluginCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<PluginCatalogItem>>('query_plugin_catalog', { q, category, page, pageSize }),
@@ -1202,7 +1261,7 @@ export const agentApi = {
     pluginSubmissions: () => invoke<PluginSubmissionStatus[]>('list_plugin_submissions'),
     extensionProjects: () => invoke<ExtensionProject[]>('list_extension_projects'),
     extensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('get_extension_workspace'),
-    selectExtensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('select_extension_workspace'),
+    setExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceSettings>('set_extension_workspace', { root }),
     extensionCollaborationProjects: () => invoke<ExtensionRemoteProject[]>('list_extension_collaboration_projects'),
     openExtensionProjects: () => invoke<ExtensionProject[]>('open_extension_projects'),
     associateExtensionProject: (project: ExtensionRemoteProject) =>

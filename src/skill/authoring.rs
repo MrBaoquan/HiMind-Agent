@@ -191,6 +191,8 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
     let candidate_path = root.join(format!("{}-{}.hmskill", manifest.id, manifest.version));
     build_archive(&candidate_path, &package_files, checksums.as_bytes())?;
     let candidate_sha256 = sha256_file(&candidate_path)?;
+    // 构建即生效：候选包同时登记为开发直挂 Skill，本机无需安装即可测试。
+    crate::skill::development::register_skill(&package_root)?;
     let unchanged = previous
         .as_ref()
         .map(|draft| draft.candidate_sha256 == candidate_sha256)
@@ -284,6 +286,8 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
             fs::remove_dir_all(&package_root)?;
         }
         fs::rename(&staging, &package_root)?;
+        // 构建即生效：候选包同时登记为开发直挂 Skill，本机无需安装即可测试。
+        crate::skill::development::register_skill(&package_root)?;
 
         let readme = fs::read_to_string(package_root.join("SKILL.md"))?;
         let mut files = BTreeMap::new();
