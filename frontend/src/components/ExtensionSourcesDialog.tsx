@@ -205,6 +205,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
                   <button className="btn btn-icon btn-danger-quiet" title="移除本地工作区" aria-label={`移除 ${source.name || source.repository}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
                 </div>
                 {source.enabled && status?.error ? <div className="extension-source-item-error">{status.error}</div> : null}
+                {source.enabled && status?.notice ? <div className="extension-source-item-notice">{status.notice}</div> : null}
               </article>;
             })}
             {!localSources.length && !boundRoot ? <div className="extension-source-empty"><FolderOpen size={22} /><strong>尚未添加本地开发工作区</strong><small>选择包含 extensions.json 聚合清单的本地目录，即可在本机开发、构建并验证扩展。</small></div> : null}
@@ -240,6 +241,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
                   <button className="btn btn-icon btn-danger-quiet" title="移除扩展源" aria-label={`移除 ${source.name || source.repository}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
                 </div>
                 {source.enabled && status?.error ? <div className="extension-source-item-error">{status.error}</div> : null}
+                {source.enabled && status?.notice ? <div className="extension-source-item-notice">{status.notice}</div> : null}
               </article>;
             })}
             {!githubSources.length ? <div className="extension-source-empty"><GitBranch size={22} /><strong>尚未添加 GitHub 分发源</strong><small>本地工作区验证通过并推送到 GitHub 后，在此用仓库地址安装分发。</small><button className="btn btn-primary" disabled={loading} onClick={() => void addOfficialSource()}><Plus size={15} />添加 HiMind 扩展源</button></div> : null}

@@ -1608,6 +1608,7 @@ tr:last-child td { border-bottom: 0; }
 .extension-source-controls .toggle { margin: 0; }
 .extension-source-verification-select { width: 104px; min-height: 30px; font-size: 10px; }
 .extension-source-item-error { grid-column: 1 / -1; padding-top: 8px; border-top: 1px solid var(--border); color: var(--danger); font-size: 10px; overflow-wrap: anywhere; }
+.extension-source-item-notice { grid-column: 1 / -1; padding-top: 8px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 10px; overflow-wrap: anywhere; }
 .extension-source-empty { display: grid; justify-items: center; gap: 7px; padding: 34px 16px; color: var(--text-muted); }
 .extension-source-empty strong { color: var(--text); font-size: 12px; }
 .extension-source-empty small { max-width: 340px; text-align: center; font-size: 10px; line-height: 1.5; }

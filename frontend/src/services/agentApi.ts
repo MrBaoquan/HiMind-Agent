@@ -350,6 +350,7 @@ export type ExtensionSourceStatus = {
     generation: string;
     using_cache: boolean;
     error: string;
+    notice?: string;
 };
 
 export type ExtensionFeaturePack = {

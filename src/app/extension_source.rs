@@ -69,9 +69,9 @@ pub(crate) struct ExtensionSourceConfig {
     pub verification: ExtensionSourceVerification,
     /// GitHub 上游仓库（owner/repo）。本地目录源用于关联它对应的分发源，
     /// GitHub 源为空字符串。
-    /// 派生字段：每次读取时由工作区 `extensions.json` / git remote 现算，不落盘，
-    /// 避免本地仓库改了上游声明后配置里残留过期值。
-    #[serde(default, skip_serializing)]
+    /// 派生字段：每次读取时由工作区 `extensions.json` / git remote 现算，
+    /// 并在 `save_settings` 落盘前清空，避免配置里残留过期值。
+    #[serde(default)]
     pub upstream_repository: String,
 }
 
@@ -154,6 +154,8 @@ pub(crate) struct ExtensionSourceStatus {
     pub generation: String,
     pub using_cache: bool,
     pub error: String,
+    /// 合并说明（如同名扩展被其他来源优先采用），不影响来源可用状态。
+    pub notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -483,6 +485,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
     let mut skills = HashMap::<String, SkillCatalogItem>::new();
     let mut feature_packs = HashMap::<String, ExtensionFeaturePack>::new();
     let mut agent_presets = HashMap::<String, ExtensionAgentPreset>::new();
+    let mut conflicts = Vec::<(String, String)>::new();
     for source in settings()?.sources.into_iter().filter(|item| item.enabled) {
         let (catalog, using_cache, error) = if refresh_remote {
             match fetch_catalog(&source) {
@@ -529,6 +532,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             generation: String::new(),
             using_cache,
             error,
+            notice: String::new(),
         };
         if let Some(mut catalog) = catalog {
             status.plugin_count = catalog.plugins.len();
@@ -537,60 +541,101 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             for item in &mut catalog.plugins {
                 normalize_plugin_item(item, &source)?;
                 result.plugin_versions.push(item.clone());
-                if let Some(existing) = plugins.get(&item.plugin_id) {
-                    if existing.source != item.source {
-                        return Err(format!(
-                            "扩展 ID {} 同时来自多个 GitHub 源，请只保留一个可信来源",
-                            item.plugin_id
-                        )
-                        .into());
+                let existing = plugins
+                    .get(&item.plugin_id)
+                    .map(|value| (value.source.clone(), value.version.clone()));
+                match existing {
+                    Some((existing_source, _)) if existing_source != item.source => {
+                        if source_outranks(&item.source, &existing_source) {
+                            conflicts.push((
+                                source_id_of(&existing_source).to_string(),
+                                conflict_note("插件", &item.plugin_id, &item.source),
+                            ));
+                            plugins.insert(item.plugin_id.clone(), item.clone());
+                        } else {
+                            conflicts.push((
+                                source.id.clone(),
+                                conflict_note("插件", &item.plugin_id, &existing_source),
+                            ));
+                        }
                     }
-                    if crate::skill::resolver::compare_versions(&item.version, &existing.version)
-                        == std::cmp::Ordering::Greater
-                    {
+                    Some((_, existing_version)) => {
+                        if crate::skill::resolver::compare_versions(&item.version, &existing_version)
+                            == std::cmp::Ordering::Greater
+                        {
+                            plugins.insert(item.plugin_id.clone(), item.clone());
+                        }
+                    }
+                    None => {
                         plugins.insert(item.plugin_id.clone(), item.clone());
                     }
-                } else {
-                    plugins.insert(item.plugin_id.clone(), item.clone());
                 }
             }
             for item in &mut catalog.skills {
                 normalize_skill_item(item, &source)?;
                 result.skill_versions.push(item.clone());
-                if let Some(existing) = skills.get(&item.skill_id) {
-                    if existing.source != item.source {
-                        return Err(format!(
-                            "扩展 ID {} 同时来自多个 GitHub 源，请只保留一个可信来源",
-                            item.skill_id
-                        )
-                        .into());
+                let existing = skills
+                    .get(&item.skill_id)
+                    .map(|value| (value.source.clone(), value.version.clone()));
+                match existing {
+                    Some((existing_source, _)) if existing_source != item.source => {
+                        if source_outranks(&item.source, &existing_source) {
+                            conflicts.push((
+                                source_id_of(&existing_source).to_string(),
+                                conflict_note("Skill", &item.skill_id, &item.source),
+                            ));
+                            skills.insert(item.skill_id.clone(), item.clone());
+                        } else {
+                            conflicts.push((
+                                source.id.clone(),
+                                conflict_note("Skill", &item.skill_id, &existing_source),
+                            ));
+                        }
                     }
-                    if crate::skill::resolver::compare_versions(&item.version, &existing.version)
-                        == std::cmp::Ordering::Greater
-                    {
+                    Some((_, existing_version)) => {
+                        if crate::skill::resolver::compare_versions(&item.version, &existing_version)
+                            == std::cmp::Ordering::Greater
+                        {
+                            skills.insert(item.skill_id.clone(), item.clone());
+                        }
+                    }
+                    None => {
                         skills.insert(item.skill_id.clone(), item.clone());
                     }
-                } else {
-                    skills.insert(item.skill_id.clone(), item.clone());
                 }
             }
             for mut pack in catalog.feature_packs {
                 validate_feature_pack(&pack)?;
                 pack.source_id = source.id.clone();
-                if let Some(existing) = feature_packs.get(&pack.id) {
-                    if existing.source_id != pack.source_id {
-                        return Err(format!(
-                            "功能包 {} 同时来自多个 GitHub 源，请只保留一个可信来源",
-                            pack.id
-                        )
-                        .into());
+                let pack_identity = source_identity(&source);
+                let existing = feature_packs
+                    .get(&pack.id)
+                    .map(|value| value.source_id.clone());
+                match existing {
+                    Some(existing_source) if existing_source != pack.source_id => {
+                        let existing_identity = format!("github:{existing_source}");
+                        if source_outranks(&pack_identity, &existing_identity) {
+                            conflicts.push((
+                                existing_source,
+                                conflict_note("功能包", &pack.id, &pack_identity),
+                            ));
+                            feature_packs.insert(pack.id.clone(), pack);
+                        } else {
+                            conflicts.push((
+                                pack.source_id.clone(),
+                                conflict_note("功能包", &pack.id, &existing_identity),
+                            ));
+                        }
                     }
-                } else {
-                    feature_packs.insert(pack.id.clone(), pack);
+                    Some(_) => {}
+                    None => {
+                        feature_packs.insert(pack.id.clone(), pack);
+                    }
                 }
             }
             for item in catalog.agent_presets {
                 validate_agent_preset(&item)?;
+                let identity = source_identity(&source);
                 let normalized = ExtensionAgentPreset {
                     preset_id: item.preset_id,
                     name: item.name,
@@ -598,22 +643,51 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                     version: item.version,
                     path: item.path,
                     sha256: item.sha256,
-                    source: format!("github:{}", source.id),
+                    source: identity.clone(),
                 };
-                if let Some(existing) = agent_presets.get(&normalized.preset_id) {
-                    if existing.source != normalized.source {
-                        return Err(format!(
-                            "DSH preset {} 同时来自多个 GitHub 源，请只保留一个可信来源",
-                            normalized.preset_id
-                        )
-                        .into());
+                let existing = agent_presets
+                    .get(&normalized.preset_id)
+                    .map(|value| value.source.clone());
+                match existing {
+                    Some(existing_source) if existing_source != normalized.source => {
+                        if source_outranks(&identity, &existing_source) {
+                            conflicts.push((
+                                source_id_of(&existing_source).to_string(),
+                                conflict_note("DSH preset", &normalized.preset_id, &identity),
+                            ));
+                            agent_presets.insert(normalized.preset_id.clone(), normalized);
+                        } else {
+                            conflicts.push((
+                                source.id.clone(),
+                                conflict_note(
+                                    "DSH preset",
+                                    &normalized.preset_id,
+                                    &existing_source,
+                                ),
+                            ));
+                        }
                     }
-                } else {
-                    agent_presets.insert(normalized.preset_id.clone(), normalized);
+                    Some(_) => {}
+                    None => {
+                        agent_presets.insert(normalized.preset_id.clone(), normalized);
+                    }
                 }
             }
         }
         result.sources.push(status);
+    }
+    for (loser_source_id, note) in conflicts {
+        if let Some(status) = result
+            .sources
+            .iter_mut()
+            .find(|status| status.source.id == loser_source_id)
+        {
+            status.notice = if status.notice.is_empty() {
+                note
+            } else {
+                format!("{}; {note}", status.notice)
+            };
+        }
     }
     result.plugins = plugins.into_values().collect();
     result.skills = skills.into_values().collect();
@@ -1666,6 +1740,31 @@ fn source_kind_prefix(kind: ExtensionSourceKind) -> &'static str {
     }
 }
 
+fn source_identity(source: &ExtensionSourceConfig) -> String {
+    format!("{}:{}", source_kind_prefix(source.kind), source.id)
+}
+
+fn source_id_of(identity: &str) -> &str {
+    identity
+        .split_once(':')
+        .map(|(_, id)| id)
+        .unwrap_or(identity)
+}
+
+// 本地开发源与它对应的 GitHub 分发源必然携带同一批扩展 ID，两者并存是本机开发
+// 的正常形态：本地源优先，保证开发者看到的是本机构建；其余重复按配置顺序先到先得。
+fn source_outranks(candidate: &str, existing: &str) -> bool {
+    candidate.starts_with("local:") && !existing.starts_with("local:")
+}
+
+fn conflict_note(label: &str, key: &str, winner: &str) -> String {
+    if winner.starts_with("local:") {
+        format!("{label} {key} 已由本地开发源提供，本来源的同名项未参与合并")
+    } else {
+        format!("{label} {key} 已由配置顺序更早的来源提供，本来源的同名项未参与合并")
+    }
+}
+
 fn local_item_dir(download_url: &str) -> Result<PathBuf, Box<dyn Error>> {
     let path = download_url
         .strip_prefix("local:")
@@ -1863,8 +1962,19 @@ fn source_verification(
     Ok(verification)
 }
 
+fn persisted_settings(settings: &ExtensionSourceSettings) -> ExtensionSourceSettings {
+    let mut persisted = settings.clone();
+    for source in persisted.sources.iter_mut() {
+        source.upstream_repository = String::new();
+    }
+    persisted
+}
+
 fn save_settings(settings: &ExtensionSourceSettings) -> Result<(), Box<dyn Error>> {
-    atomic_file::atomic_write(&settings_path(), &serde_json::to_vec_pretty(settings)?)?;
+    atomic_file::atomic_write(
+        &settings_path(),
+        &serde_json::to_vec_pretty(&persisted_settings(settings))?,
+    )?;
     Ok(())
 }
 
@@ -2555,6 +2665,24 @@ mod tests {
     }
 
     #[test]
+    fn local_source_outranks_github_distribution_source_on_duplicate_ids() {
+        assert!(source_outranks("local:local-1a2b", "github:github-3c4d"));
+        assert!(!source_outranks("github:github-3c4d", "local:local-1a2b"));
+        assert!(!source_outranks("github:github-3c4d", "github:github-5e6f"));
+        assert!(!source_outranks("local:local-1a2b", "local:local-7g8h"));
+        assert_eq!(
+            conflict_note("插件", "com.himind.demo", "local:local-1a2b"),
+            "插件 com.himind.demo 已由本地开发源提供，本来源的同名项未参与合并"
+        );
+        assert_eq!(
+            conflict_note("插件", "com.himind.demo", "github:github-3c4d"),
+            "插件 com.himind.demo 已由配置顺序更早的来源提供，本来源的同名项未参与合并"
+        );
+        assert_eq!(source_id_of("local:local-1a2b"), "local-1a2b");
+        assert_eq!(source_id_of("github-3c4d"), "github-3c4d");
+    }
+
+    #[test]
     fn local_source_id_is_stable_and_prefixed() {
         let first = local_source_id(r"C:\extensions", "extensions.json");
         let second = local_source_id(r"C:\extensions", "extensions.json");
@@ -2745,7 +2873,7 @@ mod tests {
         .unwrap();
         let workspace_display = crate::extension_workspace::display_path(&workspace);
         let catalog_path = "extensions.json";
-        let value = ExtensionSourceSettings {
+        let mut value = ExtensionSourceSettings {
             schema_version: 1,
             sources: vec![workspace_source(
                 &local_source_id(&workspace_display, catalog_path),
@@ -2757,8 +2885,21 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         let loaded = settings_at(&path).unwrap();
         assert_eq!(loaded.sources[0].upstream_repository, "Owner/repo");
-        let persisted = String::from_utf8(fs::read(&path).unwrap()).unwrap();
-        assert!(!persisted.contains("upstream_repository"));
+        // 命令响应必须带派生字段，前端才能显示上游仓库并预填分发源。
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap()["sources"][0]["upstream_repository"],
+            "Owner/repo"
+        );
+        // 落盘必须清空派生字段，避免本地仓库改了声明后残留过期值。
+        let persisted = serde_json::to_value(persisted_settings(&loaded)).unwrap();
+        assert_eq!(persisted["sources"][0]["upstream_repository"], "");
+        // 旧配置里若已写入派生值，读取时也必须被重新派生覆盖。
+        value.sources[0].upstream_repository = "Stale/repo".to_string();
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert_eq!(
+            settings_at(&path).unwrap().sources[0].upstream_repository,
+            "Owner/repo"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
