@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { CircleAlert, FolderOpen, GitBranch, MessageCircle, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import type { ExtensionSourceConfig, ExtensionSourceSettings, ExtensionSourceSnapshot, ExtensionWorkspaceSettings } from '../services/agentApi';
+import { agentApi, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings } from '../services/agentApi';
 
 type Props = {
   open: boolean;
@@ -14,15 +14,18 @@ type Props = {
   onDevelopWorkspace: () => void;
   onRefresh: () => Promise<void>;
   onAdd: (name: string, repository: string, reference: string, catalogPath: string, verification: ExtensionSourceConfig['verification']) => Promise<void>;
+  onAddLocal: (name: string, root: string, catalogPath?: string) => Promise<void>;
   onUpdate: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
   onRemove: (sourceId: string) => Promise<void>;
 };
 
-export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, loading, error, onClose, onSelectWorkspace, onDevelopWorkspace, onRefresh, onAdd, onUpdate, onRemove }: Props) {
+export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, loading, error, onClose, onSelectWorkspace, onDevelopWorkspace, onRefresh, onAdd, onAddLocal, onUpdate, onRemove }: Props) {
+  const [sourceType, setSourceType] = useState<'github' | 'local'>('github');
   const [repository, setRepository] = useState('');
   const [name, setName] = useState('');
   const [reference, setReference] = useState('main');
   const [catalogPath, setCatalogPath] = useState('.himind/catalog.json');
+  const [localRoot, setLocalRoot] = useState('');
   const [verification, setVerification] = useState<ExtensionSourceConfig['verification']>('required');
   const [formOpen, setFormOpen] = useState(false);
   const [localError, setLocalError] = useState('');
@@ -41,13 +44,19 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
   async function addSource() {
     setLocalError('');
     try {
-      await onAdd(name.trim(), repository.trim(), reference.trim(), catalogPath.trim(), verification);
+      if (sourceType === 'local') {
+        await onAddLocal(name.trim(), localRoot.trim(), catalogPath.trim());
+      } else {
+        await onAdd(name.trim(), repository.trim(), reference.trim(), catalogPath.trim(), verification);
+      }
       setName('');
       setRepository('');
       setReference('main');
-      setCatalogPath('.himind/catalog.json');
+      setCatalogPath(sourceType === 'local' ? 'extensions.json' : '.himind/catalog.json');
+      setLocalRoot('');
       setVerification('required');
       setFormOpen(false);
+      setSourceType('github');
     } catch (reason) {
       setLocalError(messageOf(reason));
     }
@@ -72,6 +81,16 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
     setLocalError('');
     try { await onRemove(sourceId); }
     catch (reason) { setLocalError(messageOf(reason)); }
+  }
+
+  async function pickLocalRoot() {
+    setLocalError('');
+    try {
+      const picked = await agentApi.pickLocalExtensionSourceDir();
+      if (picked) setLocalRoot(picked);
+    } catch (reason) {
+      setLocalError(messageOf(reason));
+    }
   }
 
   return <div className="modal-backdrop extension-source-backdrop" role="presentation">
@@ -100,16 +119,17 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
         </div>
 
         {formOpen ? <section className="extension-source-form">
-          <div className="field-group"><label className="field-label" htmlFor="extension-source-repository">GitHub 仓库链接</label><input id="extension-source-repository" value={repository} onChange={event => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" /></div>
+          <div className="field-group"><label className="field-label" htmlFor="extension-source-type">来源类型</label><select id="extension-source-type" value={sourceType} onChange={event => { const next = event.target.value as 'github' | 'local'; setSourceType(next); setCatalogPath(next === 'local' ? 'extensions.json' : '.himind/catalog.json'); }}><option value="github">GitHub 仓库</option><option value="local">本地目录</option></select></div>
+          {sourceType === 'github' ? <div className="field-group"><label className="field-label" htmlFor="extension-source-repository">GitHub 仓库链接</label><input id="extension-source-repository" value={repository} onChange={event => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" /></div> : <div className="field-group"><label className="field-label" htmlFor="extension-source-local-root">本地聚合目录</label><div className="extension-source-local-row"><input id="extension-source-local-root" value={localRoot} onChange={event => setLocalRoot(event.target.value)} placeholder="F:\WebProjects\himind-extensions" /><button className="btn btn-icon" title="选择本地聚合目录" aria-label="选择本地聚合目录" disabled={loading} onClick={() => void pickLocalRoot()}><FolderOpen size={15} /></button></div><small>选择包含 extensions.json 聚合清单的本地目录，catalog 与制品均从本地读取。</small></div>}
           <details className="extension-source-advanced"><summary>高级设置</summary><div className="extension-source-advanced-fields">
             <div className="extension-source-form-row">
-              <div className="field-group"><label className="field-label" htmlFor="extension-source-name">名称</label><input id="extension-source-name" value={name} onChange={event => setName(event.target.value)} placeholder="自动使用仓库名称" /></div>
-              <div className="field-group"><label className="field-label" htmlFor="extension-source-reference">分支或 Tag</label><input id="extension-source-reference" value={reference} onChange={event => setReference(event.target.value)} placeholder="main" /></div>
+              <div className="field-group"><label className="field-label" htmlFor="extension-source-name">名称</label><input id="extension-source-name" value={name} onChange={event => setName(event.target.value)} placeholder="自动使用目录名或仓库名称" /></div>
+              {sourceType === 'github' ? <div className="field-group"><label className="field-label" htmlFor="extension-source-reference">分支或 Tag</label><input id="extension-source-reference" value={reference} onChange={event => setReference(event.target.value)} placeholder="main" /></div> : null}
             </div>
-            <div className="field-group"><label className="field-label" htmlFor="extension-source-catalog">目录文件</label><input id="extension-source-catalog" value={catalogPath} onChange={event => setCatalogPath(event.target.value)} placeholder=".himind/catalog.json" /></div>
-            <div className="field-group"><label className="field-label" htmlFor="extension-source-verification">来源校验</label><select id="extension-source-verification" value={verification} onChange={event => setVerification(event.target.value as ExtensionSourceConfig['verification'])}><option value="required">仅安装可信签名</option><option value="optional">允许用户自定义制品</option></select><small>选择用户自定义时，已有签名仍会严格校验。</small></div>
+            <div className="field-group"><label className="field-label" htmlFor="extension-source-catalog">目录文件</label><input id="extension-source-catalog" value={catalogPath} onChange={event => setCatalogPath(event.target.value)} placeholder={sourceType === 'local' ? 'extensions.json' : '.himind/catalog.json'} /></div>
+            {sourceType === 'github' ? <div className="field-group"><label className="field-label" htmlFor="extension-source-verification">来源校验</label><select id="extension-source-verification" value={verification} onChange={event => setVerification(event.target.value as ExtensionSourceConfig['verification'])}><option value="required">仅安装可信签名</option><option value="optional">允许用户自定义制品</option></select><small>选择用户自定义时，已有签名仍会严格校验。</small></div> : <small>本地目录源固定使用用户自定义制品校验，不要求签名。</small>}
           </div></details>
-          <div className="extension-source-form-actions"><button className="btn" onClick={() => setFormOpen(false)}>取消</button><button className="btn btn-primary" disabled={loading || !repository.trim() || !reference.trim() || !catalogPath.trim()} onClick={() => void addSource()}>保存</button></div>
+          <div className="extension-source-form-actions"><button className="btn" onClick={() => setFormOpen(false)}>取消</button><button className="btn btn-primary" disabled={loading || !name.trim() || (sourceType === 'github' ? (!repository.trim() || !reference.trim() || !catalogPath.trim()) : (!localRoot.trim() || !catalogPath.trim()))} onClick={() => void addSource()}>保存</button></div>
         </section> : null}
 
         {(localError || error) ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{localError || error}</span></div> : null}
@@ -119,20 +139,21 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
             const status = statuses.get(source.id);
             const ready = status?.state === 'ready';
             const official = source.repository.toLowerCase() === 'mrbaoquan/himind-extensions';
+            const local = source.kind === 'local';
             return <article className="extension-source-item" key={source.id}>
               <div className="extension-source-item-main">
                 <span className="extension-source-mark"><GitBranch size={17} /></span>
-                <div><strong>{source.name || source.repository}</strong><code>{source.repository}</code><small>{source.reference} · {source.catalog_path}</small></div>
+                <div><strong>{source.name || source.repository}</strong><code>{source.repository}</code>{local ? <small>本地目录 · {source.catalog_path}</small> : <small>{source.reference} · {source.catalog_path}</small>}</div>
               </div>
               <div className="extension-source-item-status">
                 <span><span className={`status-dot ${ready ? 'success' : source.enabled ? 'danger' : ''}`} />{!source.enabled ? '已停用' : ready ? (status?.using_cache ? '缓存可用' : '可用') : status ? '不可用' : '待刷新'}</span>
                 {status ? <small>{status.plugin_count} 个插件 · {status.skill_count} 个技能</small> : null}
-                <small>{source.verification === 'optional' ? '用户自定义来源' : '可信签名'}</small>
+                <small>{local ? '本地用户自定义来源' : (source.verification === 'optional' ? '用户自定义来源' : '可信签名')}</small>
               </div>
               <div className="extension-source-controls">
                 <label><span>启用</span><span className="toggle"><input type="checkbox" checked={source.enabled} disabled={loading} onChange={event => void updateSource(source, event.target.checked, source.auto_update, source.verification)} /><span className="slider" /></span></label>
-                <label><span>自动更新</span><span className="toggle"><input type="checkbox" checked={source.auto_update} disabled={loading || !source.enabled} onChange={event => void updateSource(source, source.enabled, event.target.checked, source.verification)} /><span className="slider" /></span></label>
-                <select className="extension-source-verification-select" title={official ? 'HiMind 官方源固定使用可信签名' : '来源校验'} aria-label={`${source.name || source.repository} 来源校验`} value={source.verification} disabled={loading || official} onChange={event => void updateSource(source, source.enabled, source.auto_update, event.target.value as ExtensionSourceConfig['verification'])}><option value="required">可信签名</option><option value="optional">用户自定义</option></select>
+                {!local ? <label><span>自动更新</span><span className="toggle"><input type="checkbox" checked={source.auto_update} disabled={loading || !source.enabled} onChange={event => void updateSource(source, source.enabled, event.target.checked, source.verification)} /><span className="slider" /></span></label> : null}
+                {local ? <span className="extension-source-verification-tag">用户自定义</span> : <select className="extension-source-verification-select" title={official ? 'HiMind 官方源固定使用可信签名' : '来源校验'} aria-label={`${source.name || source.repository} 来源校验`} value={source.verification} disabled={loading || official} onChange={event => void updateSource(source, source.enabled, source.auto_update, event.target.value as ExtensionSourceConfig['verification'])}><option value="required">可信签名</option><option value="optional">用户自定义</option></select>}
                 <button className="btn btn-icon btn-danger-quiet" title="移除扩展源" aria-label={`移除 ${source.name || source.repository}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
               </div>
               {source.enabled && status?.error ? <div className="extension-source-item-error">{status.error}</div> : null}

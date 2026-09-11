@@ -2478,9 +2478,10 @@ fn first_line(value: &str) -> String {
 mod tests {
     use super::{
         dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
-        managed_model_catalog, merge_profile_package, migrate_legacy_managed_settings,
-        native_dsh_provider_config, parse_native_dsh_provider_config, parse_runtime_version,
-        himind_mcp_arguments, remove_managed_runtime, render_himind_agent_overlay, render_himind_profile_patch,
+        himind_mcp_arguments, managed_model_catalog, merge_profile_package,
+        migrate_legacy_managed_settings, native_dsh_provider_config,
+        parse_native_dsh_provider_config, parse_runtime_version, remove_managed_runtime,
+        render_himind_agent_overlay, render_himind_profile_patch,
         render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
         skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter, versioned_home,
         InteractiveEventProjector,
@@ -2840,13 +2841,19 @@ mod tests {
         options.api_base = "https://dashboard.example".to_string();
         options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
         let arguments = himind_mcp_arguments(&options);
-        assert!(arguments.windows(2).any(|pair| pair == ["--mode", "independent"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--mode", "independent"]));
         assert!(!arguments.iter().any(|argument| argument == "--api"));
 
         options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
         let connected_arguments = himind_mcp_arguments(&options);
-        assert!(connected_arguments.windows(2).any(|pair| pair == ["--mode", "connected"]));
-        assert!(connected_arguments.iter().any(|argument| argument == "--api"));
+        assert!(connected_arguments
+            .windows(2)
+            .any(|pair| pair == ["--mode", "connected"]));
+        assert!(connected_arguments
+            .iter()
+            .any(|argument| argument == "--api"));
     }
 
     #[test]

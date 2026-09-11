@@ -1553,6 +1553,33 @@ pub(crate) async fn add_extension_source(
 }
 
 #[tauri::command]
+pub(crate) async fn add_local_extension_source(
+    name: String,
+    root: String,
+    catalog_path: Option<String>,
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings =
+            crate::app::extension_source::add_local_source(&name, &root, catalog_path.as_deref())
+                .map_err(|error| error.to_string())?;
+        let _ = crate::app::extension_source::reconcile_dsh_presets_now();
+        Ok(settings)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn pick_local_extension_source_dir() -> Result<Option<String>, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("选择本地扩展源聚合目录")
+        .pick_folder()
+        .ok_or("已取消选择本地扩展源目录")?;
+    let root = path.canonicalize().map_err(|error| error.to_string())?;
+    Ok(Some(crate::extension_workspace::display_path(&root)))
+}
+
+#[tauri::command]
 pub(crate) async fn update_extension_source(
     source_id: String,
     enabled: bool,
