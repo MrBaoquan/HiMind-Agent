@@ -2016,15 +2016,11 @@ pub(crate) fn get_extension_workspace() -> crate::extension_workspace::Extension
 }
 
 #[tauri::command]
-pub(crate) fn select_extension_workspace(
+pub(crate) fn set_extension_workspace(
+    root: String,
 ) -> Result<crate::extension_workspace::ExtensionWorkspaceSettings, String> {
-    let Some(path) = rfd::FileDialog::new()
-        .set_title("选择 HiMind 扩展聚合仓库")
-        .pick_folder()
-    else {
-        return Err("已取消选择扩展聚合仓库".to_string());
-    };
-    crate::extension_workspace::select(&path).map_err(|error| error.to_string())
+    crate::extension_workspace::select(std::path::Path::new(root.trim()))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

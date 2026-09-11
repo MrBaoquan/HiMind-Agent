@@ -18,6 +18,10 @@ import { errorDetail, formatError, type PageKey, type UiMessage } from './types'
 
 let nextNotificationId = 1;
 
+function workspaceLabel(root: string) {
+  return root.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '扩展聚合仓库';
+}
+
 function friendlyConnectionError(error: unknown, fallback: string) {
   const detail = errorDetail(error).toLowerCase();
   if (detail.includes('备份并重建')) return '原连接文件格式有误，请选择“备份并重建”。';
@@ -441,11 +445,11 @@ function App() {
       setExtensionSourcesLoading(false);
     }
   }
-  async function selectExtensionWorkspace() {
-    const workspace = await agentApi.selectExtensionWorkspace();
+  async function switchExtensionWorkspace(root: string) {
+    const workspace = await agentApi.setExtensionWorkspace(root);
     setExtensionWorkspace(workspace);
     await refreshDevelopment();
-    notify('success', `已选择扩展聚合仓库，共 ${workspace.extension_count} 个扩展`);
+    notify('success', `已切换开发工作区，共 ${workspace.extension_count} 个扩展`);
   }
 
   async function refreshReviewProgress() {
@@ -635,9 +639,10 @@ function App() {
     setBuiltinAiWorkspaceRequest(current => ({ ...current, revision: current.revision + 1 }));
   }
 
-  async function openExtensionWorkspaceAi() {
-    if (!extensionWorkspace.valid) {
-      notify('error', extensionWorkspace.error || '请先选择有效的扩展聚合仓库');
+  async function openExtensionWorkspaceAi(root: string) {
+    const target = root.trim();
+    if (!target) {
+      notify('error', '请先添加并选择本地开发工作区');
       return;
     }
     try {
@@ -648,9 +653,9 @@ function App() {
       return;
     }
     setBuiltinAiWorkspaceRequest(current => {
-      if (current.target?.kind === 'extension-workspace' && current.target.path === extensionWorkspace.root) return current;
+      if (current.target?.kind === 'extension-workspace' && current.target.path === target) return current;
       return {
-        target: { kind: 'extension-workspace', name: '扩展聚合仓库', path: extensionWorkspace.root },
+        target: { kind: 'extension-workspace', name: workspaceLabel(target), path: target },
         revision: current.revision + 1,
       };
     });
@@ -1065,7 +1070,7 @@ function App() {
       onAddLocalSource={addLocalExtensionSource}
       onUpdateSourceConfig={updateExtensionSource}
       onRemoveSource={removeExtensionSource}
-      onSelectWorkspace={() => run(selectExtensionWorkspace, undefined, '选择扩展仓库失败')}
+      onSetWorkspace={(root: string) => run(() => switchExtensionWorkspace(root), undefined, '切换开发工作区失败')}
       onCreate={async (input: CreateExtensionProjectInput) => {
         if (developmentOperation) throw new Error('已有扩展操作正在进行，请稍后重试');
         setDevelopmentOperation('create');
@@ -1096,7 +1101,7 @@ function App() {
         await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
       }, '构建完成，已启用到本机 AI 工具', '构建或启用失败')}
       onDevelopWithAi={(project) => { void openBuiltinAi(project); }}
-      onDevelopWorkspace={() => { void openExtensionWorkspaceAi(); }}
+      onDevelopWorkspace={(root: string) => { void openExtensionWorkspaceAi(root); }}
       onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else await agentApi.submitSkillDraft(extensionId, version); await refreshDevelopment(); }, '已提交 HiMind 工作台审核', '提交审核失败')}
       onOpenFolder={(path) => run(() => agentApi.openFolder(path), '项目目录已打开', '打开项目目录失败')}
       onRemove={(projectId) => runDevelopmentOperation(`remove:${projectId}`, async () => { await agentApi.removeExtensionProject(projectId); await refreshDevelopment(); }, '项目已移出工作台', '移出项目失败')}

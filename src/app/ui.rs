@@ -282,7 +282,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::plan_organization_skill_install,
             super::commands::list_extension_projects,
             super::commands::get_extension_workspace,
-            super::commands::select_extension_workspace,
+            super::commands::set_extension_workspace,
             super::commands::open_extension_projects,
             super::commands::associate_extension_project,
             super::commands::create_extension_project,

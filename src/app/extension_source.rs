@@ -67,6 +67,10 @@ pub(crate) struct ExtensionSourceConfig {
     pub auto_update: bool,
     #[serde(default)]
     pub verification: ExtensionSourceVerification,
+    /// GitHub 上游仓库（owner/repo）。本地目录源用于关联它对应的分发源，
+    /// GitHub 源为空字符串。
+    #[serde(default)]
+    pub upstream_repository: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +243,7 @@ pub(crate) fn github_source_config(
         enabled: true,
         auto_update: false,
         verification,
+        upstream_repository: String::new(),
     })
 }
 
@@ -304,6 +309,7 @@ pub(crate) fn add_local_source(
     }
     let root_display = crate::extension_workspace::display_path(&root);
     let id = local_source_id(&root_display, &catalog_path);
+    let upstream_repository = local_upstream_repository(&root, &aggregate.repository);
     let mut current = settings()?;
     let source = ExtensionSourceConfig {
         id: id.clone(),
@@ -319,6 +325,7 @@ pub(crate) fn add_local_source(
         enabled: true,
         auto_update: false,
         verification: ExtensionSourceVerification::Optional,
+        upstream_repository,
     };
     if let Some(existing) = current.sources.iter_mut().find(|item| item.id == id) {
         *existing = source;
@@ -330,6 +337,10 @@ pub(crate) fn add_local_source(
         .sort_by(|left, right| left.id.cmp(&right.id));
     save_settings(&current)?;
     invalidate_snapshot_cache();
+    // 第一个本地目录源自动成为当前开发工作区，避免“已添加工作区但无法开发”的断点。
+    if !crate::extension_workspace::settings().configured {
+        let _ = crate::extension_workspace::select(&root);
+    }
     Ok(current)
 }
 
@@ -363,6 +374,11 @@ pub(crate) fn update_source(
 pub(crate) fn remove_source(source_id: &str) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
     let mut current = settings()?;
     let previous = current.sources.len();
+    let removed = current
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .cloned();
     current.sources.retain(|source| source.id != source_id);
     if current.sources.len() == previous {
         return Err("扩展源不存在".into());
@@ -370,7 +386,65 @@ pub(crate) fn remove_source(source_id: &str) -> Result<ExtensionSourceSettings, 
     save_settings(&current)?;
     let _ = fs::remove_file(cache_path(source_id));
     invalidate_snapshot_cache();
+    if let Some(removed) = removed {
+        reconcile_workspace_after_removal(&removed, &current.sources);
+    }
     Ok(current)
+}
+
+enum WorkspaceAfterRemoval {
+    Keep,
+    Select(String),
+    Clear,
+}
+
+fn reconcile_workspace_after_removal(
+    removed: &ExtensionSourceConfig,
+    remaining: &[ExtensionSourceConfig],
+) {
+    let workspace = crate::extension_workspace::settings();
+    let current_root = (workspace.configured && !workspace.root.trim().is_empty())
+        .then(|| workspace.root.as_str());
+    match workspace_after_removal(removed, remaining, current_root) {
+        WorkspaceAfterRemoval::Keep => {}
+        WorkspaceAfterRemoval::Select(root) => {
+            let _ = crate::extension_workspace::select(Path::new(&root));
+        }
+        WorkspaceAfterRemoval::Clear => {
+            let _ = crate::extension_workspace::clear();
+        }
+    }
+}
+
+/// 移除本地目录源后，当前开发工作区不能指向已解绑的目录。
+fn workspace_after_removal(
+    removed: &ExtensionSourceConfig,
+    remaining: &[ExtensionSourceConfig],
+    current_root: Option<&str>,
+) -> WorkspaceAfterRemoval {
+    let Some(current_root) = current_root else {
+        return WorkspaceAfterRemoval::Keep;
+    };
+    if removed.kind != ExtensionSourceKind::Local || !paths_equal(current_root, &removed.repository) {
+        return WorkspaceAfterRemoval::Keep;
+    }
+    match remaining
+        .iter()
+        .find(|source| source.kind == ExtensionSourceKind::Local)
+    {
+        Some(next) => WorkspaceAfterRemoval::Select(next.repository.clone()),
+        None => WorkspaceAfterRemoval::Clear,
+    }
+}
+
+fn paths_equal(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    normalize(left) == normalize(right)
 }
 
 pub(crate) fn snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
@@ -1997,6 +2071,8 @@ fn safe_local_child(root: &Path, relative: &str) -> Result<PathBuf, Box<dyn Erro
 
 #[derive(Debug, Deserialize)]
 struct LocalAggregateCatalog {
+    #[serde(default)]
+    repository: String,
     extensions: Vec<LocalAggregateExtension>,
 }
 
@@ -2031,6 +2107,50 @@ impl LocalAggregateCatalog {
 
 fn normalize_repository(value: &str) -> Result<String, Box<dyn Error>> {
     Ok(crate::app::github_source::parse_source_url(value)?.repository)
+}
+
+/// 解析本地聚合目录对应的 GitHub 上游仓库（owner/repo）。
+/// 优先使用 `extensions.json` 的 `repository` 声明，其次回退到该目录的 git remote origin。
+fn local_upstream_repository(root: &Path, declared: &str) -> String {
+    let declared = declared.trim();
+    if !declared.is_empty() {
+        if let Ok(repository) = normalize_repository(declared) {
+            return repository;
+        }
+    }
+    git_origin_repository(root).unwrap_or_default()
+}
+
+fn git_origin_repository(root: &Path) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", "origin"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    normalize_git_remote(&value)
+}
+
+fn normalize_git_remote(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = if value.contains("://") {
+        value
+    } else if let Some((_, path)) = value.rsplit_once(':') {
+        path
+    } else {
+        value
+    };
+    normalize_repository(value).ok()
 }
 
 fn validate_reference(value: &str) -> Result<String, Box<dyn Error>> {
@@ -2181,6 +2301,7 @@ mod tests {
             enabled: true,
             auto_update: false,
             verification: ExtensionSourceVerification::Required,
+            upstream_repository: String::new(),
         };
         let mut item = plugin_item("https://github.com/Owner/repo/releases/download/v1/test.hmpkg");
         normalize_plugin_item(&mut item, &source).unwrap();
@@ -2225,6 +2346,7 @@ mod tests {
                 enabled: true,
                 auto_update: false,
                 verification: ExtensionSourceVerification::Required,
+                upstream_repository: String::new(),
             }],
         };
         fs::create_dir_all(&root).unwrap();
@@ -2323,6 +2445,7 @@ mod tests {
             enabled: true,
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
         };
         let mut catalog: ExtensionSourceCatalog = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
@@ -2432,6 +2555,7 @@ mod tests {
             enabled: true,
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
         };
         let catalog = build_local_catalog(&source).unwrap();
         assert_eq!(catalog.plugins.len(), 1);
@@ -2455,6 +2579,7 @@ mod tests {
             enabled: true,
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
         };
         assert!(build_local_catalog(&source).is_err());
         let _ = fs::remove_dir_all(&root);
@@ -2472,11 +2597,103 @@ mod tests {
             enabled: true,
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
         };
         let mut item = plugin_item("https://github.com/Owner/repo/releases/download/v1/test.hmpkg");
         normalize_plugin_item(&mut item, &source).unwrap();
         assert_eq!(item.source, "local:local-test");
         assert_eq!(item.governance, "optional");
         assert_eq!(item.management, "user_managed");
+    }
+
+    #[test]
+    fn normalize_git_remote_accepts_https_and_ssh() {
+        assert_eq!(
+            normalize_git_remote("https://github.com/MrBaoquan/himind-extensions.git").as_deref(),
+            Some("MrBaoquan/himind-extensions")
+        );
+        assert_eq!(
+            normalize_git_remote("git@github.com:MrBaoquan/himind-extensions.git").as_deref(),
+            Some("MrBaoquan/himind-extensions")
+        );
+        assert_eq!(normalize_git_remote("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn local_upstream_repository_prefers_declared_catalog_value() {
+        assert_eq!(
+            local_upstream_repository(
+                Path::new(r"C:\missing-workspace"),
+                "https://github.com/Owner/repo.git"
+            ),
+            "Owner/repo"
+        );
+        assert_eq!(
+            local_upstream_repository(Path::new(r"C:\missing-workspace"), "Owner/repo"),
+            "Owner/repo"
+        );
+        assert_eq!(
+            local_upstream_repository(Path::new(r"C:\missing-workspace"), "not a repository"),
+            String::new()
+        );
+    }
+
+    fn workspace_source(
+        id: &str,
+        kind: ExtensionSourceKind,
+        repository: &str,
+    ) -> ExtensionSourceConfig {
+        ExtensionSourceConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind,
+            repository: repository.to_string(),
+            reference: String::new(),
+            catalog_path: "extensions.json".to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
+        }
+    }
+
+    #[test]
+    fn removal_keeps_workspace_when_removed_source_is_unrelated() {
+        let local = workspace_source("local-a", ExtensionSourceKind::Local, r"C:\extensions\a");
+        let github = workspace_source("github-a", ExtensionSourceKind::Github, "Owner/repo");
+        assert!(matches!(
+            workspace_after_removal(&github, std::slice::from_ref(&local), Some(r"C:\extensions\a")),
+            WorkspaceAfterRemoval::Keep
+        ));
+        assert!(matches!(
+            workspace_after_removal(&local, &[], None),
+            WorkspaceAfterRemoval::Keep
+        ));
+        let other = workspace_source("local-b", ExtensionSourceKind::Local, r"C:\extensions\b");
+        assert!(matches!(
+            workspace_after_removal(&local, std::slice::from_ref(&other), Some(r"C:\extensions\b")),
+            WorkspaceAfterRemoval::Keep
+        ));
+    }
+
+    #[test]
+    fn removal_falls_back_to_remaining_local_source() {
+        let removed = workspace_source("local-a", ExtensionSourceKind::Local, r"C:\extensions\a");
+        let next = workspace_source("local-b", ExtensionSourceKind::Local, r"C:\extensions\b");
+        let github = workspace_source("github-a", ExtensionSourceKind::Github, "Owner/repo");
+        match workspace_after_removal(&removed, &[github, next.clone()], Some("c:/EXTENSIONS/a/")) {
+            WorkspaceAfterRemoval::Select(root) => assert_eq!(root, next.repository),
+            _ => panic!("应回退到剩余本地源"),
+        }
+    }
+
+    #[test]
+    fn removal_clears_workspace_without_remaining_local_source() {
+        let removed = workspace_source("local-a", ExtensionSourceKind::Local, r"C:\extensions\a");
+        let github = workspace_source("github-a", ExtensionSourceKind::Github, "Owner/repo");
+        assert!(matches!(
+            workspace_after_removal(&removed, &[github], Some(r"C:\extensions\a")),
+            WorkspaceAfterRemoval::Clear
+        ));
     }
 }

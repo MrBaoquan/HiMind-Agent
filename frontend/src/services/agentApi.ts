@@ -334,6 +334,7 @@ export type ExtensionSourceConfig = {
     enabled: boolean;
     auto_update: boolean;
     verification: 'required' | 'optional';
+    upstream_repository?: string;
 };
 
 export type ExtensionSourceSettings = {
@@ -1202,7 +1203,7 @@ export const agentApi = {
     pluginSubmissions: () => invoke<PluginSubmissionStatus[]>('list_plugin_submissions'),
     extensionProjects: () => invoke<ExtensionProject[]>('list_extension_projects'),
     extensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('get_extension_workspace'),
-    selectExtensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('select_extension_workspace'),
+    setExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceSettings>('set_extension_workspace', { root }),
     extensionCollaborationProjects: () => invoke<ExtensionRemoteProject[]>('list_extension_collaboration_projects'),
     openExtensionProjects: () => invoke<ExtensionProject[]>('open_extension_projects'),
     associateExtensionProject: (project: ExtensionRemoteProject) =>
