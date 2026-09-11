@@ -23,7 +23,9 @@ fn is_pruned(relative: &str) -> bool {
 }
 
 /// 把开发工作区目录物化成可安装的扩展包：按 `select` 收集文件复制到 `staging`，
-/// 并生成与官方制品一致的 `checksums.sha256`（按小写路径排序），返回纳入的相对路径。
+/// 并生成规范 `checksums.sha256`（按小写路径排序，保证本地产出确定），返回纳入的相对路径。
+/// 官方制品的清单行序并不固定（取决于打包机枚举顺序），因此清单只用于描述内容，
+/// 判断「同一版本内容是否一致」必须比较解析后的映射。
 pub(crate) fn stage_local_package(
     source: &Path,
     staging: &Path,
