@@ -69,7 +69,9 @@ pub(crate) struct ExtensionSourceConfig {
     pub verification: ExtensionSourceVerification,
     /// GitHub 上游仓库（owner/repo）。本地目录源用于关联它对应的分发源，
     /// GitHub 源为空字符串。
-    #[serde(default)]
+    /// 派生字段：每次读取时由工作区 `extensions.json` / git remote 现算，不落盘，
+    /// 避免本地仓库改了上游声明后配置里残留过期值。
+    #[serde(default, skip_serializing)]
     pub upstream_repository: String,
 }
 
@@ -309,7 +311,6 @@ pub(crate) fn add_local_source(
     }
     let root_display = crate::extension_workspace::display_path(&root);
     let id = local_source_id(&root_display, &catalog_path);
-    let upstream_repository = local_upstream_repository(&root, &aggregate.repository);
     let mut current = settings()?;
     let source = ExtensionSourceConfig {
         id: id.clone(),
@@ -325,7 +326,7 @@ pub(crate) fn add_local_source(
         enabled: true,
         auto_update: false,
         verification: ExtensionSourceVerification::Optional,
-        upstream_repository,
+        upstream_repository: String::new(),
     };
     if let Some(existing) = current.sources.iter_mut().find(|item| item.id == id) {
         *existing = source;
@@ -337,6 +338,7 @@ pub(crate) fn add_local_source(
         .sort_by(|left, right| left.id.cmp(&right.id));
     save_settings(&current)?;
     invalidate_snapshot_cache();
+    apply_local_upstreams(&mut current);
     // 第一个本地目录源自动成为当前开发工作区，避免“已添加工作区但无法开发”的断点。
     if !crate::extension_workspace::settings().configured {
         let _ = crate::extension_workspace::select(&root);
@@ -425,7 +427,8 @@ fn workspace_after_removal(
     let Some(current_root) = current_root else {
         return WorkspaceAfterRemoval::Keep;
     };
-    if removed.kind != ExtensionSourceKind::Local || !paths_equal(current_root, &removed.repository) {
+    if removed.kind != ExtensionSourceKind::Local || !paths_equal(current_root, &removed.repository)
+    {
         return WorkspaceAfterRemoval::Keep;
     }
     match remaining
@@ -1784,7 +1787,7 @@ fn settings_at(path: &Path) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
     if !path.is_file() {
         return Ok(ExtensionSourceSettings::default());
     }
-    let value: ExtensionSourceSettings = serde_json::from_slice(&fs::read(path)?)?;
+    let mut value: ExtensionSourceSettings = serde_json::from_slice(&fs::read(path)?)?;
     if value.schema_version != SETTINGS_SCHEMA_VERSION {
         return Err(format!("扩展源配置版本不受支持: {}", value.schema_version).into());
     }
@@ -1811,7 +1814,31 @@ fn settings_at(path: &Path) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
             return Err(format!("扩展源配置重复: {}", source.id).into());
         }
     }
+    apply_local_upstreams(&mut value);
     Ok(value)
+}
+
+fn apply_local_upstreams(settings: &mut ExtensionSourceSettings) {
+    for source in settings.sources.iter_mut() {
+        source.upstream_repository = if source.kind == ExtensionSourceKind::Local {
+            resolve_local_upstream(&source.repository, &source.catalog_path)
+        } else {
+            String::new()
+        };
+    }
+}
+
+fn resolve_local_upstream(root: &str, catalog_path: &str) -> String {
+    let root = Path::new(root.trim());
+    if !root.is_dir() {
+        return String::new();
+    }
+    let declared = fs::read_to_string(root.join(catalog_path))
+        .ok()
+        .and_then(|content| serde_json::from_str::<LocalAggregateCatalog>(&content).ok())
+        .map(|aggregate| aggregate.repository)
+        .unwrap_or_default();
+    local_upstream_repository(root, &declared)
 }
 
 fn parse_verification(value: Option<&str>) -> Result<ExtensionSourceVerification, Box<dyn Error>> {
@@ -2662,7 +2689,11 @@ mod tests {
         let local = workspace_source("local-a", ExtensionSourceKind::Local, r"C:\extensions\a");
         let github = workspace_source("github-a", ExtensionSourceKind::Github, "Owner/repo");
         assert!(matches!(
-            workspace_after_removal(&github, std::slice::from_ref(&local), Some(r"C:\extensions\a")),
+            workspace_after_removal(
+                &github,
+                std::slice::from_ref(&local),
+                Some(r"C:\extensions\a")
+            ),
             WorkspaceAfterRemoval::Keep
         ));
         assert!(matches!(
@@ -2671,7 +2702,11 @@ mod tests {
         ));
         let other = workspace_source("local-b", ExtensionSourceKind::Local, r"C:\extensions\b");
         assert!(matches!(
-            workspace_after_removal(&local, std::slice::from_ref(&other), Some(r"C:\extensions\b")),
+            workspace_after_removal(
+                &local,
+                std::slice::from_ref(&other),
+                Some(r"C:\extensions\b")
+            ),
             WorkspaceAfterRemoval::Keep
         ));
     }
@@ -2695,5 +2730,35 @@ mod tests {
             workspace_after_removal(&removed, &[github], Some(r"C:\extensions\a")),
             WorkspaceAfterRemoval::Clear
         ));
+    }
+
+    #[test]
+    fn settings_derive_local_upstream_repository_without_persisting_it() {
+        let root =
+            std::env::temp_dir().join(format!("himind-local-upstream-test-{}", std::process::id()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join("extensions.json"),
+            r#"{"schema_version":1,"repository":"https://github.com/Owner/repo.git","extensions":[{"type":"plugin","id":"demo","path":"plugins/demo"}]}"#,
+        )
+        .unwrap();
+        let workspace_display = crate::extension_workspace::display_path(&workspace);
+        let catalog_path = "extensions.json";
+        let value = ExtensionSourceSettings {
+            schema_version: 1,
+            sources: vec![workspace_source(
+                &local_source_id(&workspace_display, catalog_path),
+                ExtensionSourceKind::Local,
+                &workspace_display,
+            )],
+        };
+        let path = root.join("extension-sources.json");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let loaded = settings_at(&path).unwrap();
+        assert_eq!(loaded.sources[0].upstream_repository, "Owner/repo");
+        let persisted = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(!persisted.contains("upstream_repository"));
+        let _ = fs::remove_dir_all(root);
     }
 }
