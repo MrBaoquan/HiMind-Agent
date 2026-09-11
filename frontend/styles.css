@@ -1608,7 +1608,6 @@ tr:last-child td { border-bottom: 0; }
 .extension-source-item-status > span { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 600; }
 .extension-source-item-status small { color: var(--text-muted); font-size: 9px; }
 .extension-source-controls { display: flex; align-items: center; gap: 6px; }
-.extension-source-switch { display: inline-flex; align-items: center; }
 .extension-source-controls .toggle { margin: 0; }
 .extension-source-verification-select { width: 92px; min-height: 26px; padding: 2px 6px; font-size: 10px; }
 .extension-source-message { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; width: 100%; margin-top: 7px; padding: 6px 0 0; border: 0; border-top: 1px solid var(--border); background: none; font: inherit; font-size: 10px; line-height: 1.45; text-align: left; cursor: pointer; }

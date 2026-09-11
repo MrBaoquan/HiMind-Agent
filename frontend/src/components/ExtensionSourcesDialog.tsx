@@ -266,9 +266,10 @@ function statusLabel(enabled: boolean, status?: ExtensionSourceStatus) {
 }
 
 function SourceSwitch({ title, label, checked, disabled, onChange }: { title: string; label: string; checked: boolean; disabled: boolean; onChange: (value: boolean) => void }) {
-  return <span className="extension-source-switch" title={title}>
-    <span className="toggle compact"><input type="checkbox" checked={checked} disabled={disabled} aria-label={label} onChange={event => onChange(event.target.checked)} /><span className="slider" /></span>
-  </span>;
+  return <label className="toggle compact" title={title}>
+    <input type="checkbox" checked={checked} disabled={disabled} aria-label={label} onChange={event => onChange(event.target.checked)} />
+    <span className="slider" />
+  </label>;
 }
 
 function SourceMessage({ kind, text }: { kind: 'error' | 'notice'; text: string }) {
