@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CircleAlert, FolderOpen, GitBranch, MessageCircle, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { agentApi, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings } from '../services/agentApi';
+import { ChevronDown, CircleAlert, FolderCheck, FolderOpen, GitBranch, Info, MessageCircle, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { agentApi, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
 
 type Props = {
   open: boolean;
@@ -135,11 +135,11 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
 
   return <div className="modal-backdrop extension-source-backdrop" role="presentation">
     <div className="modal extension-source-dialog" role="dialog" aria-modal="true" aria-labelledby="extension-source-title">
-      <div className="modal-header">
-        <div><h3 id="extension-source-title">扩展源</h3><p>本地开发工作区与 GitHub 分发源</p></div>
+      <div className="modal-header extension-source-header">
+        <div className="extension-source-heading"><h3 id="extension-source-title">扩展源</h3><span>本地开发工作区与 GitHub 分发源</span></div>
         <div className="actions-row">
-          <button className="btn btn-icon" title="刷新扩展源" aria-label="刷新扩展源" disabled={loading} onClick={() => void onRefresh().catch(reason => setLocalError(messageOf(reason)))}><RefreshCw className={loading ? 'spin' : ''} size={16} /></button>
-          <button className="btn btn-icon" title="关闭" aria-label="关闭" onClick={onClose}><X size={16} /></button>
+          <button className="btn btn-icon" title="刷新扩展源" aria-label="刷新扩展源" disabled={loading} onClick={() => void onRefresh().catch(reason => setLocalError(messageOf(reason)))}><RefreshCw className={loading ? 'spin' : ''} size={15} /></button>
+          <button className="btn btn-icon" title="关闭" aria-label="关闭" onClick={onClose}><X size={15} /></button>
         </div>
       </div>
       <div className="modal-body extension-source-body">
@@ -167,18 +167,19 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
             </div>
           </div>
           <div className="extension-source-list">
-            {boundRoot ? <article className="extension-source-item is-workspace is-active">
+            {boundRoot ? <article className="extension-source-item is-active">
               <div className="extension-source-item-main">
-                <span className="extension-source-mark"><FolderOpen size={17} /></span>
-                <div><strong>当前工作区</strong><code title={boundRoot}>{boundRoot}</code><small>已绑定为当前开发工作区，但未登记为本地开发工作区；登记后才会作为扩展源参与刷新与安装。</small></div>
+                <span className="extension-source-mark"><FolderOpen size={15} /></span>
+                <strong>当前工作区</strong>
+                <code title={boundRoot}>{boundRoot}</code>
+                <span className="extension-source-tag">未登记</span>
               </div>
               <div className="extension-source-item-status">
                 <span><span className="status-dot success" />当前开发工作区</span>
-                <small>未登记为本地源</small>
               </div>
               <div className="extension-source-controls">
-                <button className="btn btn-primary" disabled={loading} onClick={() => void registerWorkspace(boundRoot)}><Plus size={14} />登记为本地源</button>
-                <button className="btn" disabled={loading} onClick={() => onDevelopWorkspace(boundRoot)}><MessageCircle size={14} />用 AI 开发</button>
+                <button className="btn btn-icon" title="登记为本地源" aria-label="登记为本地源" disabled={loading} onClick={() => void registerWorkspace(boundRoot)}><Plus size={15} /></button>
+                <button className="btn btn-icon" title="用 AI 开发" aria-label="用 AI 开发当前工作区" disabled={loading} onClick={() => onDevelopWorkspace(boundRoot)}><MessageCircle size={15} /></button>
               </div>
             </article> : null}
             {localSources.map(source => {
@@ -187,28 +188,33 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
               const active = activeRoot !== '' && normalizePath(source.repository) === activeRoot;
               const upstream = (source.upstream_repository || '').trim();
               const upstreamAdded = Boolean(upstream) && githubSources.some(item => normalizePath(item.repository) === normalizePath(upstream));
-              return <article className={`extension-source-item is-workspace${active ? ' is-active' : ''}`} key={source.id}>
+              const label = source.name || source.repository;
+              return <article className={`extension-source-item${active ? ' is-active' : ''}`} key={source.id}>
                 <div className="extension-source-item-main">
-                  <span className="extension-source-mark"><FolderOpen size={17} /></span>
-                  <div><strong>{source.name || source.repository}</strong><code title={source.repository}>{source.repository}</code><small>{upstream ? `上游仓库 ${upstream}` : '未识别上游仓库，可在 extensions.json 声明 repository 或配置 git remote'} · {source.catalog_path}</small></div>
+                  <span className="extension-source-mark"><FolderOpen size={15} /></span>
+                  <strong title={label}>{label}</strong>
+                  {label === source.repository ? null : <code title={`${source.repository} · 目录文件 ${source.catalog_path}`}>{source.repository}</code>}
+                  {upstream
+                    ? <span className={`extension-source-upstream${upstreamAdded ? ' is-added' : ''}`} title={upstreamAdded ? `已添加为分发源：${upstream}` : `上游仓库 ${upstream}，可用「添加为分发源」按仓库地址安装`}><GitBranch size={11} /><span>{upstream}</span></span>
+                    : <span className="extension-source-upstream" title="未识别上游仓库，可在 extensions.json 声明 repository 或配置 git remote origin"><GitBranch size={11} /><span>未识别上游仓库</span></span>}
+                  {active ? <span className="extension-source-tag">当前工作区</span> : null}
                 </div>
                 <div className="extension-source-item-status">
-                  <span><span className={`status-dot ${ready ? 'success' : source.enabled ? 'danger' : ''}`} />{!source.enabled ? '已停用' : ready ? (status?.using_cache ? '缓存可用' : '可用') : status ? '不可用' : '待刷新'}</span>
-                  {status ? <small>{status.plugin_count} 个插件 · {status.skill_count} 个技能</small> : null}
-                  <small>{active ? '当前开发工作区' : '本地用户自定义来源'}</small>
+                  <span><span className={`status-dot ${ready ? 'success' : source.enabled ? 'danger' : ''}`} />{statusLabel(source.enabled, status)}</span>
+                  {status ? <small>{status.plugin_count} 插件 · {status.skill_count} 技能</small> : null}
                 </div>
                 <div className="extension-source-controls">
-                  <label><span>启用</span><span className="toggle"><input type="checkbox" checked={source.enabled} disabled={loading} onChange={event => void updateSource(source, event.target.checked, source.auto_update, source.verification)} /><span className="slider" /></span></label>
-                  {!active ? <button className="btn" disabled={loading} onClick={() => void setActiveWorkspace(source)}><FolderOpen size={14} />设为工作区</button> : null}
-                  <button className="btn btn-primary" disabled={loading} onClick={() => void developWorkspace(source)}><MessageCircle size={14} />用 AI 开发</button>
-                  {upstream && !upstreamAdded ? <button className="btn" disabled={loading} title={`用 ${upstream} 添加 GitHub 分发源`} onClick={() => prefillUpstreamSource(source)}><GitBranch size={14} />添加为分发源</button> : null}
-                  <button className="btn btn-icon btn-danger-quiet" title="移除本地工作区" aria-label={`移除 ${source.name || source.repository}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
+                  <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={loading} onChange={value => void updateSource(source, value, source.auto_update, source.verification)} />
+                  {active ? null : <button className="btn btn-icon" title="设为工作区" aria-label={`设为工作区 ${label}`} disabled={loading} onClick={() => void setActiveWorkspace(source)}><FolderCheck size={15} /></button>}
+                  <button className="btn btn-icon" title="用 AI 开发" aria-label={`用 AI 开发 ${label}`} disabled={loading} onClick={() => void developWorkspace(source)}><MessageCircle size={15} /></button>
+                  {upstream && !upstreamAdded ? <button className="btn btn-icon" title={`添加为分发源：${upstream}`} aria-label={`添加为分发源 ${upstream}`} disabled={loading} onClick={() => prefillUpstreamSource(source)}><GitBranch size={15} /></button> : null}
+                  <button className="btn btn-icon btn-danger-quiet" title="移除本地工作区" aria-label={`移除 ${label}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
                 </div>
-                {source.enabled && status?.error ? <div className="extension-source-item-error">{status.error}</div> : null}
-                {source.enabled && status?.notice ? <div className="extension-source-item-notice">{status.notice}</div> : null}
+                {source.enabled && status?.error ? <SourceMessage kind="error" text={status.error} /> : null}
+                {source.enabled && status?.notice ? <SourceMessage kind="notice" text={status.notice} /> : null}
               </article>;
             })}
-            {!localSources.length && !boundRoot ? <div className="extension-source-empty"><FolderOpen size={22} /><strong>尚未添加本地开发工作区</strong><small>选择包含 extensions.json 聚合清单的本地目录，即可在本机开发、构建并验证扩展。</small></div> : null}
+            {!localSources.length && !boundRoot ? <div className="extension-source-empty"><FolderOpen size={18} /><strong>尚未添加本地开发工作区</strong><small>选择包含 extensions.json 聚合清单的本地目录，即可在本机开发、构建并验证扩展。</small></div> : null}
           </div>
         </section>
 
@@ -224,32 +230,55 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
               const status = statuses.get(source.id);
               const ready = status?.state === 'ready';
               const official = source.repository.toLowerCase() === 'mrbaoquan/himind-extensions';
+              const label = source.name || source.repository;
               return <article className="extension-source-item" key={source.id}>
                 <div className="extension-source-item-main">
-                  <span className="extension-source-mark"><GitBranch size={17} /></span>
-                  <div><strong>{source.name || source.repository}</strong><code>{source.repository}</code><small>{source.reference} · {source.catalog_path}</small></div>
+                  <span className="extension-source-mark"><GitBranch size={15} /></span>
+                  <strong title={label}>{label}</strong>
+                  <code title={`${source.repository} · ${source.reference} · 目录文件 ${source.catalog_path}`}>{label === source.repository ? source.reference : source.repository}</code>
                 </div>
                 <div className="extension-source-item-status">
-                  <span><span className={`status-dot ${ready ? 'success' : source.enabled ? 'danger' : ''}`} />{!source.enabled ? '已停用' : ready ? (status?.using_cache ? '缓存可用' : '可用') : status ? '不可用' : '待刷新'}</span>
-                  {status ? <small>{status.plugin_count} 个插件 · {status.skill_count} 个技能</small> : null}
-                  <small>{source.verification === 'optional' ? '用户自定义来源' : '可信签名'}</small>
+                  <span><span className={`status-dot ${ready ? 'success' : source.enabled ? 'danger' : ''}`} />{statusLabel(source.enabled, status)}</span>
+                  {status ? <small>{status.plugin_count} 插件 · {status.skill_count} 技能</small> : null}
                 </div>
                 <div className="extension-source-controls">
-                  <label><span>启用</span><span className="toggle"><input type="checkbox" checked={source.enabled} disabled={loading} onChange={event => void updateSource(source, event.target.checked, source.auto_update, source.verification)} /><span className="slider" /></span></label>
-                  <label><span>自动更新</span><span className="toggle"><input type="checkbox" checked={source.auto_update} disabled={loading || !source.enabled} onChange={event => void updateSource(source, source.enabled, event.target.checked, source.verification)} /><span className="slider" /></span></label>
-                  <select className="extension-source-verification-select" title={official ? 'HiMind 官方源固定使用可信签名' : '来源校验'} aria-label={`${source.name || source.repository} 来源校验`} value={source.verification} disabled={loading || official} onChange={event => void updateSource(source, source.enabled, source.auto_update, event.target.value as ExtensionSourceConfig['verification'])}><option value="required">可信签名</option><option value="optional">用户自定义</option></select>
-                  <button className="btn btn-icon btn-danger-quiet" title="移除扩展源" aria-label={`移除 ${source.name || source.repository}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
+                  <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={loading} onChange={value => void updateSource(source, value, source.auto_update, source.verification)} />
+                  <SourceSwitch title="自动更新" label={`自动更新 ${label}`} checked={source.auto_update} disabled={loading || !source.enabled} onChange={value => void updateSource(source, source.enabled, value, source.verification)} />
+                  <select className="extension-source-verification-select" title={official ? 'HiMind 官方源固定使用可信签名' : '来源校验'} aria-label={`${label} 来源校验`} value={source.verification} disabled={loading || official} onChange={event => void updateSource(source, source.enabled, source.auto_update, event.target.value as ExtensionSourceConfig['verification'])}><option value="required">可信签名</option><option value="optional">用户自定义</option></select>
+                  <button className="btn btn-icon btn-danger-quiet" title="移除扩展源" aria-label={`移除 ${label}`} disabled={loading} onClick={() => void removeSource(source.id)}><Trash2 size={15} /></button>
                 </div>
-                {source.enabled && status?.error ? <div className="extension-source-item-error">{status.error}</div> : null}
-                {source.enabled && status?.notice ? <div className="extension-source-item-notice">{status.notice}</div> : null}
+                {source.enabled && status?.error ? <SourceMessage kind="error" text={status.error} /> : null}
+                {source.enabled && status?.notice ? <SourceMessage kind="notice" text={status.notice} /> : null}
               </article>;
             })}
-            {!githubSources.length ? <div className="extension-source-empty"><GitBranch size={22} /><strong>尚未添加 GitHub 分发源</strong><small>本地工作区验证通过并推送到 GitHub 后，在此用仓库地址安装分发。</small><button className="btn btn-primary" disabled={loading} onClick={() => void addOfficialSource()}><Plus size={15} />添加 HiMind 扩展源</button></div> : null}
+            {!githubSources.length ? <div className="extension-source-empty"><GitBranch size={18} /><strong>尚未添加 GitHub 分发源</strong><small>本地工作区验证通过并推送到 GitHub 后，在此用仓库地址安装分发。</small><button className="btn btn-primary" disabled={loading} onClick={() => void addOfficialSource()}><Plus size={14} />添加 HiMind 扩展源</button></div> : null}
           </div>
         </section>
       </div>
     </div>
   </div>;
+}
+
+function statusLabel(enabled: boolean, status?: ExtensionSourceStatus) {
+  if (!enabled) return '已停用';
+  if (status?.state === 'ready') return status.using_cache ? '缓存可用' : '可用';
+  return status ? '不可用' : '待刷新';
+}
+
+function SourceSwitch({ title, label, checked, disabled, onChange }: { title: string; label: string; checked: boolean; disabled: boolean; onChange: (value: boolean) => void }) {
+  return <span className="extension-source-switch" title={title}>
+    <span className="toggle compact"><input type="checkbox" checked={checked} disabled={disabled} aria-label={label} onChange={event => onChange(event.target.checked)} /><span className="slider" /></span>
+  </span>;
+}
+
+function SourceMessage({ kind, text }: { kind: 'error' | 'notice'; text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const Icon = kind === 'error' ? CircleAlert : Info;
+  return <button type="button" className={`extension-source-message is-${kind}${expanded ? ' is-expanded' : ''}`} aria-expanded={expanded} title={expanded ? '点击收起' : text} onClick={() => setExpanded(value => !value)}>
+    <Icon size={13} />
+    <span>{text}</span>
+    <ChevronDown className="extension-source-message-caret" size={13} />
+  </button>;
 }
 
 function messageOf(reason: unknown) {
