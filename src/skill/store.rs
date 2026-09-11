@@ -413,8 +413,12 @@ impl SkillStore {
         transaction.stage("staged")?;
         let version_root = versions_root.join(expected_version);
         if version_root.exists() {
-            let existing = fs::read(version_root.join("checksums.sha256"))?;
-            let incoming = fs::read(staging.join("checksums.sha256"))?;
+            let existing = crate::skill::manifest::parse_checksums(&fs::read_to_string(
+                version_root.join("checksums.sha256"),
+            )?)?;
+            let incoming = crate::skill::manifest::parse_checksums(&fs::read_to_string(
+                staging.join("checksums.sha256"),
+            )?)?;
             if existing != incoming {
                 let _ = fs::remove_dir_all(&staging);
                 return Err("同一 Skill 版本已存在且内容不同，请提升版本号".into());
@@ -613,6 +617,14 @@ mod tests {
         ))
     }
 
+    fn write_checksums(root: &Path, entries: &[(&str, char)]) {
+        let content = entries
+            .iter()
+            .map(|(path, digit)| format!("{}  {path}\n", digit.to_string().repeat(64)))
+            .collect::<String>();
+        fs::write(root.join("checksums.sha256"), content).unwrap();
+    }
+
     #[test]
     fn retires_removed_builtin_skill_seed() {
         let root = test_store_root();
@@ -726,20 +738,57 @@ mod tests {
             contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
         };
         write_skill_package(&package, &manifest, "# First").unwrap();
-        fs::write(package.join("checksums.sha256"), "first package checksums").unwrap();
+        write_checksums(&package, &[("SKILL.md", 'a')]);
         store
             .install_organization_package(&package, &manifest.id, &manifest.version)
             .unwrap();
         write_skill_package(&package, &manifest, "# Changed").unwrap();
-        fs::write(
-            package.join("checksums.sha256"),
-            "changed package checksums",
-        )
-        .unwrap();
+        write_checksums(&package, &[("SKILL.md", 'b')]);
         let error = store
             .install_organization_package(&package, &manifest.id, &manifest.version)
             .unwrap_err();
         assert!(error.to_string().contains("内容不同"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_existing_version_when_manifest_layout_differs_but_content_matches() {
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
+        let package = root.join("package");
+        let manifest = SkillManifest {
+            id: "com.himind.skill.repackaged-test".to_string(),
+            name: "Repackaged Test".to_string(),
+            author: String::new(),
+            categories: vec![],
+            version: "1.0.0".to_string(),
+            scope: SkillScope::Organization,
+            description: String::new(),
+            release_notes: "测试等价重打包。".to_string(),
+            min_agent_version: crate::VERSION.to_string(),
+            supported_clients: vec!["codex".to_string()],
+            capabilities: vec![],
+            plugin_dependencies: vec![],
+            risk_summary: "read_only".to_string(),
+            contents: vec!["skill.json".to_string(), "SKILL.md".to_string()],
+        };
+        write_skill_package(&package, &manifest, "# Same").unwrap();
+        write_checksums(&package, &[("SKILL.md", 'a'), ("skill.json", 'b')]);
+        store
+            .install_organization_package(&package, &manifest.id, &manifest.version)
+            .unwrap();
+        write_skill_package(&package, &manifest, "# Same").unwrap();
+        let rewritten = [
+            ("skill.json", 'B'),
+            ("SKILL.md", 'A'),
+        ]
+        .iter()
+        .map(|(path, digit)| format!("{}  {path}\n", digit.to_string().repeat(64)))
+        .collect::<String>();
+        fs::write(package.join("checksums.sha256"), rewritten).unwrap();
+        store
+            .install_organization_package(&package, &manifest.id, &manifest.version)
+            .expect("同一内容的重打包版本必须可重装");
         let _ = fs::remove_dir_all(root);
     }
 

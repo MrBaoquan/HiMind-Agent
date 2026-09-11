@@ -461,7 +461,12 @@ function App() {
       await refreshExtensionSources();
       await Promise.all([refreshPlugins(), refreshSkills()]);
       const total = report.plugins.length + report.skills.length;
-      notify('success', total ? `已从${report.acquisition === 'remote' ? 'GitHub 分发源' : '本地开发工作区'}安装 ${total} 项扩展` : '该扩展单元没有可安装的扩展');
+      const origin = report.acquisition === 'remote' ? 'GitHub 分发源' : '本地开发工作区';
+      if (report.errors.length) {
+        notify('error', `从${origin}安装失败：${report.errors.join('；')}`);
+        return;
+      }
+      notify('success', total ? `已从${origin}安装 ${total} 项扩展` : '该扩展单元没有可安装的扩展');
     } finally {
       setExtensionSourcesLoading(false);
     }

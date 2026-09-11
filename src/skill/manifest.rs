@@ -1,5 +1,5 @@
 use crate::skill::types::{SkillManifest, SkillScope};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -121,6 +121,29 @@ pub(crate) fn write_skill_package(
     )?;
     fs::write(skill_readme_path(root), readme)?;
     Ok(())
+}
+
+/// 解析 `checksums.sha256`，返回 `相对路径 -> 摘要`。行序只是打包产物，
+/// 不代表包内容，因此判断「同一版本内容是否一致」必须比较该映射。
+pub(crate) fn parse_checksums(content: &str) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    let mut expected = HashMap::new();
+    for (index, line) in content.lines().enumerate() {
+        let Some((checksum, relative)) = line.split_once("  ") else {
+            return Err(format!("checksums.sha256 第 {} 行格式无效", index + 1).into());
+        };
+        if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("checksums.sha256 第 {} 行摘要无效", index + 1).into());
+        }
+        validate_relative_package_path(relative)?;
+        if relative == "checksums.sha256"
+            || expected
+                .insert(relative.replace('\\', "/"), checksum.to_ascii_lowercase())
+                .is_some()
+        {
+            return Err(format!("checksums.sha256 包含无效或重复路径: {relative}").into());
+        }
+    }
+    Ok(expected)
 }
 
 pub(crate) fn validate_relative_package_path(path: &str) -> Result<(), Box<dyn Error>> {

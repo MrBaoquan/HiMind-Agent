@@ -13,6 +13,7 @@ pub(crate) mod extension_source;
 pub(crate) mod github_source;
 pub mod http;
 pub(crate) mod identity;
+pub(crate) mod local_package;
 pub(crate) mod mcp_downstream;
 pub(crate) mod mcp_probe;
 pub(crate) mod mcp_registry;

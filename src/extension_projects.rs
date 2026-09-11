@@ -680,8 +680,9 @@ fn draft_project_record(
     (record.kind == kind && record.extension_id == extension_id).then_some(record)
 }
 
-/// 把绑定到 Agent 内部草稿目录或已失效目录的项目记录重新绑回扩展源声明的源码工作区。
-/// 这是 `legacy_candidate` 误绑的修复通道，保证「用 AI 开发」始终改到源码。
+/// 把绑定到 Agent 内部草稿目录或已失效目录的项目记录重新绑回扩展源声明的源码工作区，
+/// 并把历史遗留的来源标记归一为 `extension_source`。这是 `legacy_candidate` 误绑的修复通道，
+/// 保证「用 AI 开发」始终改到源码。
 fn rebind_extension_source_workspaces(
     records: &mut Vec<ProjectRecord>,
     workspaces: &[crate::app::extension_source::LocalSourceWorkspace],
@@ -691,25 +692,29 @@ fn rebind_extension_source_workspaces(
     }
     let mut changed = false;
     for record in records.iter_mut() {
-        if record.workspace_path.is_dir()
-            && !is_agent_managed(&record.workspace_path)
-            && project_record_from_path(&record.workspace_path, &record.source).is_ok()
-        {
-            continue;
-        }
-        let Some(discovered) = workspaces
-            .iter()
-            .find(|item| item.kind == record.kind.as_str() && item.extension_id == record.extension_id)
-        else {
+        let Some(discovered) = workspaces.iter().find(|item| {
+            item.kind == record.kind.as_str() && item.extension_id == record.extension_id
+        }) else {
             continue;
         };
-        if record.workspace_path == discovered.path {
+        let bound = record.workspace_path.is_dir()
+            && !is_agent_managed(&record.workspace_path)
+            && project_record_from_path(&record.workspace_path, &record.source).is_ok();
+        if bound && record.workspace_path != discovered.path {
             continue;
         }
         let Ok(candidate) = project_record_from_path(&discovered.path, "extension_source") else {
             continue;
         };
-        record.workspace_path = candidate.workspace_path;
+        if !bound {
+            record.workspace_path = candidate.workspace_path;
+        }
+        if record.source == "extension_source"
+            && record.source_repository == discovered.repository
+            && record.source_subdirectory == discovered.subdirectory
+        {
+            continue;
+        }
         record.source = "extension_source".to_string();
         record.source_repository = discovered.repository.clone();
         record.source_subdirectory = discovered.subdirectory.clone();
@@ -852,7 +857,7 @@ mod tests {
                 ..project_record_from_path(&source, "extension_source").unwrap()
             },
         ];
-        let unrelated = project_record_from_path(&source, "legacy_candidate").unwrap();
+        let mut stale_label = vec![project_record_from_path(&source, "legacy_candidate").unwrap()];
 
         assert!(rebind_extension_source_workspaces(&mut records, &workspaces));
         assert_eq!(records[0].workspace_path, source);
@@ -861,8 +866,14 @@ mod tests {
         assert_eq!(records[0].source_subdirectory, "plugins/rebind-test");
         assert_eq!(records[1].source, "extension_source");
         assert!(
-            !rebind_extension_source_workspaces(&mut vec![unrelated], &workspaces),
-            "已绑定源码工作区的记录不应被改写"
+            rebind_extension_source_workspaces(&mut stale_label, &workspaces),
+            "已指向源码工作区但来源标记陈旧的记录应被归一"
+        );
+        assert_eq!(stale_label[0].workspace_path, source);
+        assert_eq!(stale_label[0].source, "extension_source");
+        assert!(
+            !rebind_extension_source_workspaces(&mut stale_label, &workspaces),
+            "归一后必须收敛，不再重复改写"
         );
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(draft.parent().unwrap());
