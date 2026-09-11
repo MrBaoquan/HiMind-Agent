@@ -778,13 +778,10 @@ mod tests {
             .install_organization_package(&package, &manifest.id, &manifest.version)
             .unwrap();
         write_skill_package(&package, &manifest, "# Same").unwrap();
-        let rewritten = [
-            ("skill.json", 'B'),
-            ("SKILL.md", 'A'),
-        ]
-        .iter()
-        .map(|(path, digit)| format!("{}  {path}\n", digit.to_string().repeat(64)))
-        .collect::<String>();
+        let rewritten = [("skill.json", 'B'), ("SKILL.md", 'A')]
+            .iter()
+            .map(|(path, digit)| format!("{}  {path}\n", digit.to_string().repeat(64)))
+            .collect::<String>();
         fs::write(package.join("checksums.sha256"), rewritten).unwrap();
         store
             .install_organization_package(&package, &manifest.id, &manifest.version)

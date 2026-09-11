@@ -50,14 +50,14 @@ pub(crate) fn stage_local_package(
         if relative == CHECKSUMS_FILE || is_pruned(&relative) || !select(&relative) {
             continue;
         }
-        entries.push((relative, entry.path().to_path_buf(), entry.metadata()?.len()));
+        entries.push((
+            relative,
+            entry.path().to_path_buf(),
+            entry.metadata()?.len(),
+        ));
     }
     if entries.len() > limits.max_files {
-        return Err(format!(
-            "{}文件数量超过 {} 个限制",
-            limits.label, limits.max_files
-        )
-        .into());
+        return Err(format!("{}文件数量超过 {} 个限制", limits.label, limits.max_files).into());
     }
     let total_bytes = entries
         .iter()

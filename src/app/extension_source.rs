@@ -575,11 +575,9 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         .cloned()
         .collect::<Vec<_>>();
     let unit_of = unit_source_ids(&enabled);
-    let same_unit = |left: &str, right: &str| {
-        match (unit_of.get(left), unit_of.get(right)) {
-            (Some(left), Some(right)) => left == right,
-            _ => false,
-        }
+    let same_unit = |left: &str, right: &str| match (unit_of.get(left), unit_of.get(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
     };
     for source in ordered_sources(enabled.clone(), &acquisitions) {
         // 本地源目录读取是廉价且确定的，每次都按磁盘重读，保证开发者刚改完就能
@@ -1416,7 +1414,10 @@ fn set_acquisition_at(
                 .insert(unit_key.to_string(), acquisition);
         }
     }
-    atomic_file::atomic_write(path, &serde_json::to_vec_pretty(&persisted_settings(&current))?)?;
+    atomic_file::atomic_write(
+        path,
+        &serde_json::to_vec_pretty(&persisted_settings(&current))?,
+    )?;
     settings_at(path)
 }
 
@@ -1476,9 +1477,7 @@ pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport,
                     .errors
                     .push(format!("Skill {} 安装失败: {error}", asset.asset_id)),
             },
-            other => report
-                .errors
-                .push(format!("不支持的扩展类型: {other}")),
+            other => report.errors.push(format!("不支持的扩展类型: {other}")),
         }
     }
     Ok(report)
@@ -2137,10 +2136,7 @@ fn acquisition_for(
     acquisitions: &BTreeMap<String, ExtensionSourceAcquisition>,
     unit_key: &str,
 ) -> ExtensionSourceAcquisition {
-    acquisitions
-        .get(unit_key)
-        .copied()
-        .unwrap_or_default()
+    acquisitions.get(unit_key).copied().unwrap_or_default()
 }
 
 /// 按分发单元聚合后展开来源顺序：单元之间保持配置顺序，单元内部按取用模式
@@ -2267,27 +2263,25 @@ fn build_units(
         skill_ids.sort();
         let plugin_count = plugin_ids.len();
         let skill_count = skill_ids.len();
-        let mut catalog_assets = assets
-            .plugins
-            .into_iter()
-            .map(|(asset_id, name, version)| ExtensionUnitAsset {
-                asset_kind: "plugin".to_string(),
-                asset_id,
-                name,
-                version,
-            })
-            .chain(
-                assets
-                    .skills
-                    .into_iter()
-                    .map(|(asset_id, name, version)| ExtensionUnitAsset {
+        let mut catalog_assets =
+            assets
+                .plugins
+                .into_iter()
+                .map(|(asset_id, name, version)| ExtensionUnitAsset {
+                    asset_kind: "plugin".to_string(),
+                    asset_id,
+                    name,
+                    version,
+                })
+                .chain(assets.skills.into_iter().map(|(asset_id, name, version)| {
+                    ExtensionUnitAsset {
                         asset_kind: "skill".to_string(),
                         asset_id,
                         name,
                         version,
-                    }),
-            )
-            .collect::<Vec<_>>();
+                    }
+                }))
+                .collect::<Vec<_>>();
         catalog_assets.sort_by(|left, right| {
             (left.asset_kind.as_str(), left.asset_id.as_str())
                 .cmp(&(right.asset_kind.as_str(), right.asset_id.as_str()))
@@ -2798,9 +2792,11 @@ pub(crate) fn local_source_workspaces() -> Vec<LocalSourceWorkspace> {
         return Vec::new();
     };
     let mut workspaces = Vec::new();
-    for source in current.sources.iter().filter(|source| {
-        source.kind == ExtensionSourceKind::Local && source.enabled
-    }) {
+    for source in current
+        .sources
+        .iter()
+        .filter(|source| source.kind == ExtensionSourceKind::Local && source.enabled)
+    {
         let root = PathBuf::from(&source.repository);
         let Ok(content) = fs::read_to_string(root.join(&source.catalog_path)) else {
             continue;
@@ -3357,8 +3353,12 @@ mod tests {
         assert!(settings_at(&path).unwrap().acquisitions.is_empty());
 
         assert!(
-            set_acquisition_at(&path, "remote:owner/unknown", ExtensionSourceAcquisition::Remote)
-                .is_err(),
+            set_acquisition_at(
+                &path,
+                "remote:owner/unknown",
+                ExtensionSourceAcquisition::Remote
+            )
+            .is_err(),
             "未知分发单元必须拒绝写入"
         );
         let _ = fs::remove_dir_all(root);
@@ -3396,14 +3396,22 @@ mod tests {
         catalogs.insert(
             local_identity.clone(),
             SourceCatalogAssets {
-                plugins: vec![("com.himind.local-only".to_string(), "本地".to_string(), "2.0.0".to_string())],
+                plugins: vec![(
+                    "com.himind.local-only".to_string(),
+                    "本地".to_string(),
+                    "2.0.0".to_string(),
+                )],
                 skills: Vec::new(),
             },
         );
         catalogs.insert(
             remote_identity,
             SourceCatalogAssets {
-                plugins: vec![("com.himind.shared".to_string(), "远端".to_string(), "1.0.0".to_string())],
+                plugins: vec![(
+                    "com.himind.shared".to_string(),
+                    "远端".to_string(),
+                    "1.0.0".to_string(),
+                )],
                 skills: Vec::new(),
             },
         );

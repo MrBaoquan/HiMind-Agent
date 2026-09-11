@@ -154,7 +154,9 @@ pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
     for record in &mut records {
         record.source_unit_key = workspaces
             .iter()
-            .find(|item| item.kind == record.kind.as_str() && item.extension_id == record.extension_id)
+            .find(|item| {
+                item.kind == record.kind.as_str() && item.extension_id == record.extension_id
+            })
             .map(|item| item.unit_key.clone())
             .unwrap_or_default();
     }
@@ -859,7 +861,10 @@ mod tests {
         ];
         let mut stale_label = vec![project_record_from_path(&source, "legacy_candidate").unwrap()];
 
-        assert!(rebind_extension_source_workspaces(&mut records, &workspaces));
+        assert!(rebind_extension_source_workspaces(
+            &mut records,
+            &workspaces
+        ));
         assert_eq!(records[0].workspace_path, source);
         assert_eq!(records[0].source, "extension_source");
         assert_eq!(records[0].source_repository, "Owner/repo");

@@ -1245,9 +1245,8 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
         validate_manifest_contributions(&staging, &manifest)?;
         let version_dir = root.join("versions").join(&item.version);
         if version_dir.exists() {
-            let existing = parse_plugin_checksums(&fs::read_to_string(
-                version_dir.join("checksums.sha256"),
-            )?)?;
+            let existing =
+                parse_plugin_checksums(&fs::read_to_string(version_dir.join("checksums.sha256"))?)?;
             let incoming =
                 parse_plugin_checksums(&fs::read_to_string(staging.join("checksums.sha256"))?)?;
             if existing != incoming {
@@ -1480,7 +1479,10 @@ mod tests {
         .unwrap();
         fs::write(source.join("main.go"), "package main\n").unwrap();
         fs::write(
-            source.join("node_modules").join("left-pad").join("index.js"),
+            source
+                .join("node_modules")
+                .join("left-pad")
+                .join("index.js"),
             "module.exports = 1;\n",
         )
         .unwrap();
@@ -1523,9 +1525,11 @@ mod tests {
 
     #[test]
     fn accepts_repackaged_plugin_version_when_manifest_layout_differs_but_content_matches() {
-        let installed = "1111111111111111111111111111111111111111111111111111111111111111  main.go\n\
+        let installed =
+            "1111111111111111111111111111111111111111111111111111111111111111  main.go\n\
 2222222222222222222222222222222222222222222222222222222222222222  plugin.json\n";
-        let repackaged = "2222222222222222222222222222222222222222222222222222222222222222  plugin.json\n\
+        let repackaged =
+            "2222222222222222222222222222222222222222222222222222222222222222  plugin.json\n\
 1111111111111111111111111111111111111111111111111111111111111111  main.go\n";
         assert_eq!(
             parse_plugin_checksums(installed).unwrap(),
