@@ -1569,7 +1569,7 @@ tr:last-child td { border-bottom: 0; }
 .development-page .page-header { flex: 0 0 auto; margin-bottom: 12px; }
 .extension-source-dialog { width: min(720px, 100%); }
 .extension-source-header { align-items: center; padding: 11px 14px; }
-.extension-source-body { max-height: min(72vh, 560px); padding: 12px 14px; overflow-y: auto; }
+.extension-source-body { max-height: min(80vh, 600px); padding: 12px 14px; overflow-y: auto; }
 .extension-source-form { margin-bottom: 10px; padding: 11px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .extension-source-form-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
 .extension-source-form-head strong { flex: 0 0 auto; font-size: 12px; }
