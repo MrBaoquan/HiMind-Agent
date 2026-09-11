@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Check, ChevronDown, CircleAlert, FolderCheck, FolderOpen, GitBranch, Info, MessageCircle, MoreHorizontal, Plus, RefreshCw, ShieldCheck, Trash2, X } from 'lucide-react';
-import { agentApi, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
+import { ChevronDown, CircleAlert, FolderCheck, FolderOpen, GitBranch, Info, MessageCircle, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
+import { agentApi, type ExtensionSourceConfig, type ExtensionSourceNotice, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
 
 type Props = {
   open: boolean;
@@ -189,12 +189,8 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
             countText="未登记为本地源"
             actions={<>
               <span className="extension-source-slot" />
-              <Menu label="当前工作区更多操作" icon={<MoreHorizontal size={15} />} disabled={loading}>
-                {close => <>
-                  <MenuItem icon={<FolderCheck size={14} />} label="登记为本地源" disabled={loading} onClick={() => { close(); void registerWorkspace(boundRoot); }} />
-                  <MenuItem icon={<MessageCircle size={14} />} label="用 AI 开发" disabled={loading} onClick={() => { close(); onDevelopWorkspace(boundRoot); }} />
-                </>}
-              </Menu>
+              <IconAction icon={<FolderCheck size={14} />} label="登记为本地源" title="把当前工作区登记为本地开发源" disabled={loading} onClick={() => void registerWorkspace(boundRoot)} />
+              <IconAction icon={<MessageCircle size={14} />} label="用 AI 开发" title="打开当前工作区的扩展开发工作台" disabled={loading} onClick={() => onDevelopWorkspace(boundRoot)} />
             </>}
           /> : null}
           {localSources.map(source => {
@@ -217,19 +213,14 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
               countText={status ? `${status.plugin_count} 插件 · ${status.skill_count} 技能` : ''}
               actions={<>
                 <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={loading} onChange={value => void updateSource(source, value, source.auto_update, source.verification)} />
-                <Menu label={`${label} 更多操作`} icon={<MoreHorizontal size={15} />} disabled={loading}>
-                  {close => <>
-                    <MenuItem icon={<MessageCircle size={14} />} label="用 AI 开发" disabled={loading} onClick={() => { close(); void developWorkspace(source); }} />
-                    {active ? null : <MenuItem icon={<FolderCheck size={14} />} label="设为当前工作区" disabled={loading} onClick={() => { close(); void setActiveWorkspace(source); }} />}
-                    {upstream && !upstreamAdded ? <MenuItem icon={<GitBranch size={14} />} label="添加为分发源" title={upstream} disabled={loading} onClick={() => { close(); prefillUpstreamSource(source); }} /> : null}
-                    <div className="app-menu-separator" />
-                    <MenuItem danger icon={<Trash2 size={14} />} label="移除" disabled={loading} onClick={() => { close(); void removeSource(source.id); }} />
-                  </>}
-                </Menu>
+                <IconAction icon={<MessageCircle size={14} />} label="用 AI 开发" title="设为当前工作区并打开扩展开发工作台" disabled={loading} onClick={() => void developWorkspace(source)} />
+                {active ? null : <IconAction icon={<FolderCheck size={14} />} label="设为当前工作区" title="设为当前工作区" disabled={loading} onClick={() => void setActiveWorkspace(source)} />}
+                {upstream && !upstreamAdded ? <IconAction icon={<GitBranch size={14} />} label="添加为分发源" title={`按上游仓库 ${upstream} 添加分发源`} disabled={loading} onClick={() => prefillUpstreamSource(source)} /> : null}
+                <IconAction danger icon={<Trash2 size={14} />} label="移除" title={`移除 ${label}`} disabled={loading} onClick={() => void removeSource(source.id)} />
               </>}
               messages={<>
-                {source.enabled && status?.error ? <SourceMessage kind="error" text={status.error} /> : null}
-                {source.enabled && status?.notice ? <SourceMessage kind="notice" text={status.notice} /> : null}
+                {source.enabled && status?.error ? <SourceError text={status.error} /> : null}
+                {source.enabled && status?.notices?.length ? <SourceNotices notices={status.notices} /> : null}
               </>}
             />;
           })}
@@ -249,20 +240,13 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
               countText={status ? `${status.plugin_count} 插件 · ${status.skill_count} 技能` : ''}
               actions={<>
                 <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={loading} onChange={value => void updateSource(source, value, source.auto_update, source.verification)} />
-                <Menu label={`${label} 更多操作`} icon={<MoreHorizontal size={15} />} disabled={loading}>
-                  {close => <>
-                    <MenuItem checked={source.auto_update} label="自动更新" disabled={loading || !source.enabled} onClick={() => { close(); void updateSource(source, source.enabled, !source.auto_update, source.verification); }} />
-                    <div className="app-menu-separator" />
-                    <MenuItem checked={source.verification === 'required'} label="仅安装可信签名" title={official ? 'HiMind 官方源固定使用可信签名' : undefined} disabled={loading || official} onClick={() => { close(); void updateSource(source, source.enabled, source.auto_update, 'required'); }} />
-                    <MenuItem checked={source.verification === 'optional'} label="允许用户自定义制品" title={official ? 'HiMind 官方源固定使用可信签名' : undefined} disabled={loading || official} onClick={() => { close(); void updateSource(source, source.enabled, source.auto_update, 'optional'); }} />
-                    <div className="app-menu-separator" />
-                    <MenuItem danger icon={<Trash2 size={14} />} label="移除" disabled={loading} onClick={() => { close(); void removeSource(source.id); }} />
-                  </>}
-                </Menu>
+                <IconAction active={source.auto_update} icon={<RefreshCw size={14} />} label="自动更新" title={source.auto_update ? '自动更新已开启，点击关闭' : '自动更新已关闭，点击开启'} disabled={loading || !source.enabled} onClick={() => void updateSource(source, source.enabled, !source.auto_update, source.verification)} />
+                <VerificationSegment value={source.verification} disabled={loading || official} onChange={value => void updateSource(source, source.enabled, source.auto_update, value)} />
+                <IconAction danger icon={<Trash2 size={14} />} label="移除" title={`移除 ${label}`} disabled={loading} onClick={() => void removeSource(source.id)} />
               </>}
               messages={<>
-                {source.enabled && status?.error ? <SourceMessage kind="error" text={status.error} /> : null}
-                {source.enabled && status?.notice ? <SourceMessage kind="notice" text={status.notice} /> : null}
+                {source.enabled && status?.error ? <SourceError text={status.error} /> : null}
+                {source.enabled && status?.notices?.length ? <SourceNotices notices={status.notices} /> : null}
               </>}
             />;
           })}
@@ -362,17 +346,15 @@ function Menu({ label, icon, variant = 'icon', disabled, children }: {
   </div>;
 }
 
-function MenuItem({ icon, label, title, checked, danger, disabled, onClick }: {
-  icon?: ReactNode;
+function MenuItem({ icon, label, title, disabled, onClick }: {
+  icon: ReactNode;
   label: string;
   title?: string;
-  checked?: boolean;
-  danger?: boolean;
   disabled?: boolean;
   onClick: () => void;
 }) {
-  return <button type="button" role="menuitem" className={danger ? 'danger' : undefined} title={title} disabled={disabled} onClick={onClick}>
-    {checked === undefined ? (icon ?? <span className="extension-source-menu-blank" />) : checked ? <Check size={14} /> : <span className="extension-source-menu-blank" />}
+  return <button type="button" role="menuitem" title={title} disabled={disabled} onClick={onClick}>
+    {icon}
     <span>{label}</span>
   </button>;
 }
@@ -401,14 +383,58 @@ function SourceSwitch({ title, label, checked, disabled, onChange }: { title: st
   </label>;
 }
 
-function SourceMessage({ kind, text }: { kind: 'error' | 'notice'; text: string }) {
+function IconAction({ icon, label, title, danger, active, disabled, onClick }: {
+  icon: ReactNode;
+  label: string;
+  title?: string;
+  danger?: boolean;
+  active?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return <button type="button" className={`btn btn-icon${danger ? ' is-danger' : ''}${active ? ' is-on' : ''}`} title={title || label} aria-label={label} aria-pressed={active} disabled={disabled} onClick={onClick}>{icon}</button>;
+}
+
+function VerificationSegment({ value, disabled, onChange }: {
+  value: ExtensionSourceConfig['verification'];
+  disabled: boolean;
+  onChange: (value: ExtensionSourceConfig['verification']) => void;
+}) {
+  const options = [
+    { key: 'required' as const, icon: <ShieldCheck size={14} />, label: '仅安装可信签名' },
+    { key: 'optional' as const, icon: <ShieldAlert size={14} />, label: '允许用户自定义制品' },
+  ];
+  return <div className="extension-source-segment" role="group" aria-label="来源校验">
+    {options.map(option => <button key={option.key} type="button" className={`btn btn-icon${value === option.key ? ' is-on' : ''}`} title={option.label} aria-label={option.label} aria-pressed={value === option.key} disabled={disabled} onClick={() => onChange(option.key)}>{option.icon}</button>)}
+  </div>;
+}
+
+function SourceError({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
-  const Icon = kind === 'error' ? CircleAlert : Info;
-  return <button type="button" className={`extension-source-message is-${kind}${expanded ? ' is-expanded' : ''}`} aria-expanded={expanded} title={expanded ? '点击收起' : text} onClick={() => setExpanded(value => !value)}>
-    <Icon size={13} />
+  return <button type="button" className={`extension-source-error${expanded ? ' is-expanded' : ''}`} aria-expanded={expanded} title={expanded ? '点击收起' : text} onClick={() => setExpanded(value => !value)}>
+    <CircleAlert size={12} />
     <span>{text}</span>
-    <ChevronDown className="extension-source-message-caret" size={13} />
+    <ChevronDown className="extension-source-error-caret" size={12} />
   </button>;
+}
+
+function SourceNotices({ notices }: { notices: ExtensionSourceNotice[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const total = notices.reduce((sum, notice) => sum + notice.items.length, 0);
+  return <div className={`extension-source-notice${expanded ? ' is-expanded' : ''}`}>
+    <button type="button" className="extension-source-notice-head" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
+      <Info size={12} />
+      <span>同名扩展由其他来源提供</span>
+      <span className="extension-source-notice-count">{total}</span>
+      <ChevronDown className="extension-source-notice-caret" size={12} />
+    </button>
+    {expanded ? <div className="extension-source-notice-body">
+      {notices.map(notice => <div className="extension-source-notice-group" key={notice.reason}>
+        <span className="extension-source-notice-reason">{notice.reason}</span>
+        <div className="extension-source-notice-items">{notice.items.map(item => <span key={item}>{item}</span>)}</div>
+      </div>)}
+    </div> : null}
+  </div>;
 }
 
 function messageOf(reason: unknown) {

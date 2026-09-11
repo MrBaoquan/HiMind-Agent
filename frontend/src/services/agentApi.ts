@@ -342,6 +342,11 @@ export type ExtensionSourceSettings = {
     sources: ExtensionSourceConfig[];
 };
 
+export type ExtensionSourceNotice = {
+    reason: string;
+    items: string[];
+};
+
 export type ExtensionSourceStatus = {
     source: ExtensionSourceConfig;
     state: 'ready' | 'unavailable' | string;
@@ -350,7 +355,7 @@ export type ExtensionSourceStatus = {
     generation: string;
     using_cache: boolean;
     error: string;
-    notice?: string;
+    notices?: ExtensionSourceNotice[];
 };
 
 export type ExtensionFeaturePack = {

@@ -155,7 +155,14 @@ pub(crate) struct ExtensionSourceStatus {
     pub using_cache: bool,
     pub error: String,
     /// 合并说明（如同名扩展被其他来源优先采用），不影响来源可用状态。
-    pub notice: String,
+    pub notices: Vec<ExtensionSourceNotice>,
+}
+
+/// 同名扩展未参与合并的说明：按原因分组，避免把每一项拼成一句长文本。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionSourceNotice {
+    pub reason: String,
+    pub items: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -485,7 +492,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
     let mut skills = HashMap::<String, SkillCatalogItem>::new();
     let mut feature_packs = HashMap::<String, ExtensionFeaturePack>::new();
     let mut agent_presets = HashMap::<String, ExtensionAgentPreset>::new();
-    let mut conflicts = Vec::<(String, String)>::new();
+    let mut conflicts = Vec::<(String, String, String)>::new();
     for source in settings()?.sources.into_iter().filter(|item| item.enabled) {
         let (catalog, using_cache, error) = if refresh_remote {
             match fetch_catalog(&source) {
@@ -532,7 +539,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             generation: String::new(),
             using_cache,
             error,
-            notice: String::new(),
+            notices: Vec::new(),
         };
         if let Some(mut catalog) = catalog {
             status.plugin_count = catalog.plugins.len();
@@ -547,21 +554,27 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 match existing {
                     Some((existing_source, _)) if existing_source != item.source => {
                         if source_outranks(&item.source, &existing_source) {
-                            conflicts.push((
-                                source_id_of(&existing_source).to_string(),
-                                conflict_note("插件", &item.plugin_id, &item.source),
+                            conflicts.push(conflict(
+                                source_id_of(&existing_source),
+                                "插件",
+                                &item.plugin_id,
+                                &item.source,
                             ));
                             plugins.insert(item.plugin_id.clone(), item.clone());
                         } else {
-                            conflicts.push((
-                                source.id.clone(),
-                                conflict_note("插件", &item.plugin_id, &existing_source),
+                            conflicts.push(conflict(
+                                &source.id,
+                                "插件",
+                                &item.plugin_id,
+                                &existing_source,
                             ));
                         }
                     }
                     Some((_, existing_version)) => {
-                        if crate::skill::resolver::compare_versions(&item.version, &existing_version)
-                            == std::cmp::Ordering::Greater
+                        if crate::skill::resolver::compare_versions(
+                            &item.version,
+                            &existing_version,
+                        ) == std::cmp::Ordering::Greater
                         {
                             plugins.insert(item.plugin_id.clone(), item.clone());
                         }
@@ -580,21 +593,27 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 match existing {
                     Some((existing_source, _)) if existing_source != item.source => {
                         if source_outranks(&item.source, &existing_source) {
-                            conflicts.push((
-                                source_id_of(&existing_source).to_string(),
-                                conflict_note("Skill", &item.skill_id, &item.source),
+                            conflicts.push(conflict(
+                                source_id_of(&existing_source),
+                                "Skill",
+                                &item.skill_id,
+                                &item.source,
                             ));
                             skills.insert(item.skill_id.clone(), item.clone());
                         } else {
-                            conflicts.push((
-                                source.id.clone(),
-                                conflict_note("Skill", &item.skill_id, &existing_source),
+                            conflicts.push(conflict(
+                                &source.id,
+                                "Skill",
+                                &item.skill_id,
+                                &existing_source,
                             ));
                         }
                     }
                     Some((_, existing_version)) => {
-                        if crate::skill::resolver::compare_versions(&item.version, &existing_version)
-                            == std::cmp::Ordering::Greater
+                        if crate::skill::resolver::compare_versions(
+                            &item.version,
+                            &existing_version,
+                        ) == std::cmp::Ordering::Greater
                         {
                             skills.insert(item.skill_id.clone(), item.clone());
                         }
@@ -615,15 +634,19 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                     Some(existing_source) if existing_source != pack.source_id => {
                         let existing_identity = format!("github:{existing_source}");
                         if source_outranks(&pack_identity, &existing_identity) {
-                            conflicts.push((
-                                existing_source,
-                                conflict_note("功能包", &pack.id, &pack_identity),
+                            conflicts.push(conflict(
+                                &existing_source,
+                                "功能包",
+                                &pack.id,
+                                &pack_identity,
                             ));
                             feature_packs.insert(pack.id.clone(), pack);
                         } else {
-                            conflicts.push((
-                                pack.source_id.clone(),
-                                conflict_note("功能包", &pack.id, &existing_identity),
+                            conflicts.push(conflict(
+                                &pack.source_id,
+                                "功能包",
+                                &pack.id,
+                                &existing_identity,
                             ));
                         }
                     }
@@ -651,19 +674,19 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 match existing {
                     Some(existing_source) if existing_source != normalized.source => {
                         if source_outranks(&identity, &existing_source) {
-                            conflicts.push((
-                                source_id_of(&existing_source).to_string(),
-                                conflict_note("DSH preset", &normalized.preset_id, &identity),
+                            conflicts.push(conflict(
+                                source_id_of(&existing_source),
+                                "DSH preset",
+                                &normalized.preset_id,
+                                &identity,
                             ));
                             agent_presets.insert(normalized.preset_id.clone(), normalized);
                         } else {
-                            conflicts.push((
-                                source.id.clone(),
-                                conflict_note(
-                                    "DSH preset",
-                                    &normalized.preset_id,
-                                    &existing_source,
-                                ),
+                            conflicts.push(conflict(
+                                &source.id,
+                                "DSH preset",
+                                &normalized.preset_id,
+                                &existing_source,
                             ));
                         }
                     }
@@ -676,17 +699,23 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         }
         result.sources.push(status);
     }
-    for (loser_source_id, note) in conflicts {
+    for (loser_source_id, reason, item) in conflicts {
         if let Some(status) = result
             .sources
             .iter_mut()
             .find(|status| status.source.id == loser_source_id)
         {
-            status.notice = if status.notice.is_empty() {
-                note
-            } else {
-                format!("{}; {note}", status.notice)
-            };
+            match status
+                .notices
+                .iter_mut()
+                .find(|notice| notice.reason == reason)
+            {
+                Some(notice) => notice.items.push(item),
+                None => status.notices.push(ExtensionSourceNotice {
+                    reason,
+                    items: vec![item],
+                }),
+            }
         }
     }
     result.plugins = plugins.into_values().collect();
@@ -1757,12 +1786,25 @@ fn source_outranks(candidate: &str, existing: &str) -> bool {
     candidate.starts_with("local:") && !existing.starts_with("local:")
 }
 
-fn conflict_note(label: &str, key: &str, winner: &str) -> String {
+fn conflict_reason(winner: &str) -> &'static str {
     if winner.starts_with("local:") {
-        format!("{label} {key} 已由本地开发源提供，本来源的同名项未参与合并")
+        "由本地开发源优先提供"
     } else {
-        format!("{label} {key} 已由配置顺序更早的来源提供，本来源的同名项未参与合并")
+        "由配置顺序更早的来源优先提供"
     }
+}
+
+fn conflict(
+    loser_source_id: &str,
+    label: &str,
+    key: &str,
+    winner: &str,
+) -> (String, String, String) {
+    (
+        loser_source_id.to_string(),
+        conflict_reason(winner).to_string(),
+        format!("{label} {key}"),
+    )
 }
 
 fn local_item_dir(download_url: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -2670,13 +2712,18 @@ mod tests {
         assert!(!source_outranks("github:github-3c4d", "local:local-1a2b"));
         assert!(!source_outranks("github:github-3c4d", "github:github-5e6f"));
         assert!(!source_outranks("local:local-1a2b", "local:local-7g8h"));
+        assert_eq!(conflict_reason("local:local-1a2b"), "由本地开发源优先提供");
         assert_eq!(
-            conflict_note("插件", "com.himind.demo", "local:local-1a2b"),
-            "插件 com.himind.demo 已由本地开发源提供，本来源的同名项未参与合并"
+            conflict_reason("github:github-3c4d"),
+            "由配置顺序更早的来源优先提供"
         );
         assert_eq!(
-            conflict_note("插件", "com.himind.demo", "github:github-3c4d"),
-            "插件 com.himind.demo 已由配置顺序更早的来源提供，本来源的同名项未参与合并"
+            conflict("github-3c4d", "插件", "com.himind.demo", "local:local-1a2b"),
+            (
+                "github-3c4d".to_string(),
+                "由本地开发源优先提供".to_string(),
+                "插件 com.himind.demo".to_string()
+            )
         );
         assert_eq!(source_id_of("local:local-1a2b"), "local-1a2b");
         assert_eq!(source_id_of("github-3c4d"), "github-3c4d");
