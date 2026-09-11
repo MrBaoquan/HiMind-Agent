@@ -248,6 +248,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::update_extension_source,
             super::commands::remove_extension_source,
             super::commands::get_extension_source_snapshot,
+            super::commands::set_extension_unit_acquisition,
+            super::commands::install_extension_unit,
             super::commands::get_extension_provenance,
             super::commands::get_extension_lock,
             super::commands::import_local_plugin,

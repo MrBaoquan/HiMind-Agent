@@ -178,6 +178,25 @@ impl SkillStore {
     pub(crate) fn list_records(&self) -> Result<Vec<SkillRecord>, Box<dyn Error>> {
         let mut items = Vec::new();
         let mut seen = HashSet::new();
+        // 开发直挂的 Skill 是本机最新权威，与已安装记录同名时直接取代。
+        for record in crate::skill::development::records() {
+            if seen.insert(record.manifest.id.clone()) {
+                items.push(record);
+            }
+        }
+        for record in self.installed_records()? {
+            if seen.insert(record.manifest.id.clone()) {
+                items.push(record);
+            }
+        }
+        items.sort_by(|left, right| left.manifest.id.cmp(&right.manifest.id));
+        Ok(items)
+    }
+
+    /// 只列本机已安装记录，不含开发直挂覆盖层。
+    fn installed_records(&self) -> Result<Vec<SkillRecord>, Box<dyn Error>> {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
         for scope_root in [
             self.root.join("builtin"),
             self.root.join("managed"),
@@ -203,6 +222,17 @@ impl SkillStore {
     }
 
     pub(crate) fn get_record(&self, skill_id: &str) -> Result<Option<SkillRecord>, Box<dyn Error>> {
+        if let Some(record) = crate::skill::development::record(skill_id) {
+            return Ok(Some(record));
+        }
+        self.installed_record(skill_id)
+    }
+
+    /// 只查本机已安装记录，不并入开发直挂覆盖层。
+    pub(crate) fn installed_record(
+        &self,
+        skill_id: &str,
+    ) -> Result<Option<SkillRecord>, Box<dyn Error>> {
         for scope_root in [
             self.root.join("builtin"),
             self.root.join("managed"),
@@ -252,8 +282,13 @@ impl SkillStore {
     }
 
     pub(crate) fn remove_installed_skill(&self, skill_id: &str) -> Result<bool, Box<dyn Error>> {
-        let Some(record) = self.get_record(skill_id)? else {
-            return Ok(false);
+        // 开发直挂不是「安装」，卸载动作对它只能是停止直挂，否则界面会残留一个删不掉的技能。
+        let development = crate::skill::development::is_development_skill(skill_id);
+        if development {
+            crate::skill::development::unregister_skill(skill_id)?;
+        }
+        let Some(record) = self.installed_record(skill_id)? else {
+            return Ok(development);
         };
         if record.manifest.scope == SkillScope::Builtin {
             return Err("系统内置技能不能卸载".into());
@@ -593,7 +628,7 @@ mod tests {
         fs::write(retired_builtin.join("legacy.txt"), "retired").unwrap();
         fs::write(retired_managed.join("legacy.txt"), "retired").unwrap();
         store.bootstrap_builtin_skills().unwrap();
-        let records = store.list_records().unwrap();
+        let records = store.installed_records().unwrap();
         assert!(records.is_empty());
         assert!(!retired_builtin.exists());
         assert!(!retired_managed.exists());

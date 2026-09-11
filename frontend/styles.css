@@ -1613,6 +1613,26 @@ tr:last-child td { border-bottom: 0; }
 .extension-source-item-actions .is-on { border-color: var(--primary); color: var(--primary); background: #eff6ff; }
 .extension-source-item-actions .is-danger:hover { border-color: #fecaca; color: #b91c1c; background: #fef2f2; }
 .extension-source-slot { flex: 0 0 auto; width: 30px; }
+.extension-source-unit { display: grid; gap: 6px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; }
+.extension-source-unit.is-active { border-color: #277a4e; }
+.extension-source-unit.is-active .extension-source-mark { background: #277a4e; color: #fff; }
+.extension-source-unit-head { display: grid; grid-template-columns: minmax(0, 1fr) 112px 172px; align-items: center; gap: 12px; }
+.extension-source-unit-members { display: grid; gap: 4px; padding-left: 33px; }
+.extension-source-member { display: grid; gap: 4px; }
+.extension-source-member-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.extension-source-member-main code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 10px; }
+.extension-source-member-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.extension-source-member-actions .btn-icon { width: 26px; min-height: 26px; }
+.extension-source-member-actions .toggle { margin: 0; }
+.extension-source-member-actions .is-on { border-color: var(--primary); color: var(--primary); background: #eff6ff; }
+.extension-source-member-actions .is-danger:hover { border-color: #fecaca; color: #b91c1c; background: #fef2f2; }
+.extension-source-acquisition { display: flex; }
+.extension-source-acquisition .btn { min-height: 26px; padding: 0 7px; font-size: 10px; }
+.extension-source-acquisition .btn:first-child { border-radius: 6px 0 0 6px; }
+.extension-source-acquisition .btn:last-child { margin-left: -1px; border-radius: 0 6px 6px 0; }
+.btn-install { flex: 0 0 auto; min-height: 26px; padding: 0 9px; gap: 4px; font-size: 10px; }
+.extension-source-consistency { display: flex; align-items: center; gap: 6px; margin: 0; padding: 5px 8px; border-radius: 6px; color: #92400e; background: #fffbeb; font-size: 10px; line-height: 1.45; }
+.extension-source-consistency > svg { flex: 0 0 auto; }
 .extension-source-segment { display: flex; }
 .extension-source-segment .btn-icon:first-child { border-radius: 6px 0 0 6px; }
 .extension-source-segment .btn-icon:last-child { margin-left: -1px; border-radius: 0 6px 6px 0; }

@@ -212,6 +212,14 @@ fn development_plugins() -> Vec<DevelopmentPlugin> {
     development_plugins_at(&development_registry_path())
 }
 
+/// 免安装直挂的插件及其源码/产物目录，供分发单元状态展示。
+pub(crate) fn development_plugin_entries() -> Vec<(String, PathBuf)> {
+    development_plugins()
+        .into_iter()
+        .map(|entry| (entry.id, PathBuf::from(entry.path)))
+        .collect()
+}
+
 fn development_plugins_at(path: &std::path::Path) -> Vec<DevelopmentPlugin> {
     fs::read_to_string(path)
         .ok()

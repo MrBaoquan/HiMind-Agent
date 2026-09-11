@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ChevronDown, CircleAlert, FolderCheck, FolderOpen, GitBranch, Info, MessageCircle, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
-import { agentApi, type ExtensionSourceConfig, type ExtensionSourceNotice, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
+import { ChevronDown, CircleAlert, Download, FolderCheck, FolderOpen, GitBranch, Info, MessageCircle, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
+import { agentApi, type ExtensionDistributionUnit, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceNotice, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
 
 type Props = {
   open: boolean;
@@ -17,9 +17,32 @@ type Props = {
   onAddLocal: (name: string, root: string, catalogPath?: string) => Promise<void>;
   onUpdate: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
   onRemove: (sourceId: string) => Promise<void>;
+  onSetAcquisition: (unitKey: string, acquisition: ExtensionSourceAcquisition) => Promise<void>;
+  onInstallUnit: (unitKey: string) => Promise<void>;
 };
 
-export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, loading, error, onClose, onSetWorkspace, onDevelopWorkspace, onRefresh, onAdd, onAddLocal, onUpdate, onRemove }: Props) {
+/// 一个分发单元 = 同一份扩展内容的本地开发工作区与 GitHub 分发源。
+type UnitGroup = {
+  key: string;
+  unit?: ExtensionDistributionUnit;
+  local?: ExtensionSourceConfig;
+  remote?: ExtensionSourceConfig;
+};
+
+type UnitHandlers = {
+  loading: boolean;
+  activeRoot: string;
+  statuses: Map<string, ExtensionSourceStatus>;
+  onSetAcquisition: (unitKey: string, acquisition: ExtensionSourceAcquisition) => Promise<void>;
+  onInstallUnit: (unitKey: string) => Promise<void>;
+  onUpdate: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
+  onRemove: (sourceId: string) => Promise<void>;
+  onSetWorkspace: (source: ExtensionSourceConfig) => Promise<void>;
+  onDevelopWorkspace: (source: ExtensionSourceConfig) => Promise<void>;
+  onPrefillUpstream: (source: ExtensionSourceConfig) => void;
+};
+
+export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, loading, error, onClose, onSetWorkspace, onDevelopWorkspace, onRefresh, onAdd, onAddLocal, onUpdate, onRemove, onSetAcquisition, onInstallUnit }: Props) {
   const [sourceType, setSourceType] = useState<'github' | 'local'>('github');
   const [repository, setRepository] = useState('');
   const [name, setName] = useState('');
@@ -30,11 +53,10 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
   const [formOpen, setFormOpen] = useState(false);
   const [localError, setLocalError] = useState('');
   const statuses = useMemo(() => new Map((snapshot?.sources || []).map(item => [item.source.id, item])), [snapshot]);
-  const localSources = useMemo(() => settings.sources.filter(source => source.kind === 'local'), [settings.sources]);
-  const githubSources = useMemo(() => settings.sources.filter(source => source.kind !== 'local'), [settings.sources]);
+  const units = useMemo(() => buildUnitGroups(snapshot, settings), [snapshot, settings]);
   const activeRoot = workspace.valid ? normalizePath(workspace.root) : '';
-  const boundRoot = activeRoot !== '' && !localSources.some(source => normalizePath(source.repository) === activeRoot) ? workspace.root : '';
-  const officialAdded = githubSources.some(source => normalizePath(source.repository) === 'mrbaoquan/himind-extensions');
+  const boundRoot = activeRoot !== '' && !settings.sources.some(source => source.kind === 'local' && normalizePath(source.repository) === activeRoot) ? workspace.root : '';
+  const officialAdded = settings.sources.some(source => source.kind !== 'local' && normalizePath(source.repository) === 'mrbaoquan/himind-extensions');
 
   useEffect(() => {
     if (!open) return;
@@ -134,6 +156,31 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
     }
   }
 
+  async function switchAcquisition(unitKey: string, acquisition: ExtensionSourceAcquisition) {
+    setLocalError('');
+    try { await onSetAcquisition(unitKey, acquisition); }
+    catch (reason) { setLocalError(messageOf(reason)); }
+  }
+
+  async function installUnit(unitKey: string) {
+    setLocalError('');
+    try { await onInstallUnit(unitKey); }
+    catch (reason) { setLocalError(messageOf(reason)); }
+  }
+
+  const handlers: UnitHandlers = {
+    loading,
+    activeRoot,
+    statuses,
+    onSetAcquisition: switchAcquisition,
+    onInstallUnit: installUnit,
+    onUpdate: updateSource,
+    onRemove: removeSource,
+    onSetWorkspace: setActiveWorkspace,
+    onDevelopWorkspace: developWorkspace,
+    onPrefillUpstream: prefillUpstreamSource,
+  };
+
   return <div className="modal-backdrop extension-source-backdrop" role="presentation">
     <div className="modal extension-source-dialog" role="dialog" aria-modal="true" aria-labelledby="extension-source-title">
       <div className="modal-header extension-source-header">
@@ -176,125 +223,214 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
 
         {(localError || error) ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{localError || error}</span></div> : null}
 
-        <div className="extension-source-columns" aria-hidden="true"><span>来源 · {settings.sources.length + (boundRoot ? 1 : 0)}</span><span>状态</span><span>操作</span></div>
+        <div className="extension-source-columns" aria-hidden="true"><span>扩展单元 · {units.length + (boundRoot ? 1 : 0)}</span><span>状态</span><span>操作</span></div>
 
         <div className="extension-source-list">
-          {boundRoot ? <SourceRow
-            active
-            kind="workspace"
-            title={baseName(boundRoot)}
-            meta={boundRoot}
-            dot="success"
-            statusText="已绑定"
-            countText="未登记为本地源"
-            actions={<>
-              <span className="extension-source-slot" />
-              <IconAction icon={<FolderCheck size={14} />} label="登记为本地源" title="把当前工作区登记为本地开发源" disabled={loading} onClick={() => void registerWorkspace(boundRoot)} />
-              <IconAction icon={<MessageCircle size={14} />} label="用 AI 开发" title="打开当前工作区的扩展开发工作台" disabled={loading} onClick={() => onDevelopWorkspace(boundRoot)} />
-            </>}
-          /> : null}
-          {localSources.map(source => {
-            const status = statuses.get(source.id);
-            const ready = status?.state === 'ready';
-            const active = activeRoot !== '' && normalizePath(source.repository) === activeRoot;
-            const upstream = (source.upstream_repository || '').trim();
-            const upstreamAdded = Boolean(upstream) && githubSources.some(item => normalizePath(item.repository) === normalizePath(upstream));
-            const label = displayName(source);
-            return <SourceRow
-              key={source.id}
-              active={active}
-              kind="workspace"
-              title={label}
-              meta={source.repository}
-              upstream={upstream}
-              upstreamAdded={upstreamAdded}
-              dot={ready ? 'success' : source.enabled ? 'danger' : ''}
-              statusText={statusLabel(source.enabled, status)}
-              countText={status ? `${status.plugin_count} 插件 · ${status.skill_count} 技能` : ''}
-              actions={<>
-                <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={loading} onChange={value => void updateSource(source, value, source.auto_update, source.verification)} />
-                <IconAction icon={<MessageCircle size={14} />} label="用 AI 开发" title="设为当前工作区并打开扩展开发工作台" disabled={loading} onClick={() => void developWorkspace(source)} />
-                {active ? null : <IconAction icon={<FolderCheck size={14} />} label="设为当前工作区" title="设为当前工作区" disabled={loading} onClick={() => void setActiveWorkspace(source)} />}
-                {upstream && !upstreamAdded ? <IconAction icon={<GitBranch size={14} />} label="添加为分发源" title={`按上游仓库 ${upstream} 添加分发源`} disabled={loading} onClick={() => prefillUpstreamSource(source)} /> : null}
-                <IconAction danger icon={<Trash2 size={14} />} label="移除" title={`移除 ${label}`} disabled={loading} onClick={() => void removeSource(source.id)} />
-              </>}
-              messages={<>
-                {source.enabled && status?.error ? <SourceError text={status.error} /> : null}
-                {source.enabled && status?.notices?.length ? <SourceNotices notices={status.notices} /> : null}
-              </>}
-            />;
-          })}
-          {githubSources.map(source => {
-            const status = statuses.get(source.id);
-            const ready = status?.state === 'ready';
-            const official = normalizePath(source.repository) === 'mrbaoquan/himind-extensions';
-            const label = displayName(source);
-            return <SourceRow
-              key={source.id}
-              kind="distribution"
-              title={label}
-              meta={source.repository}
-              reference={source.reference}
-              dot={ready ? 'success' : source.enabled ? 'danger' : ''}
-              statusText={statusLabel(source.enabled, status)}
-              countText={status ? `${status.plugin_count} 插件 · ${status.skill_count} 技能` : ''}
-              actions={<>
-                <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={loading} onChange={value => void updateSource(source, value, source.auto_update, source.verification)} />
-                <IconAction active={source.auto_update} icon={<RefreshCw size={14} />} label="自动更新" title={source.auto_update ? '自动更新已开启，点击关闭' : '自动更新已关闭，点击开启'} disabled={loading || !source.enabled} onClick={() => void updateSource(source, source.enabled, !source.auto_update, source.verification)} />
-                <VerificationSegment value={source.verification} disabled={loading || official} onChange={value => void updateSource(source, source.enabled, source.auto_update, value)} />
-                <IconAction danger icon={<Trash2 size={14} />} label="移除" title={`移除 ${label}`} disabled={loading} onClick={() => void removeSource(source.id)} />
-              </>}
-              messages={<>
-                {source.enabled && status?.error ? <SourceError text={status.error} /> : null}
-                {source.enabled && status?.notices?.length ? <SourceNotices notices={status.notices} /> : null}
-              </>}
-            />;
-          })}
-          {!settings.sources.length && !boundRoot ? <div className="extension-source-empty"><FolderOpen size={18} /><strong>尚未添加扩展源</strong><small>用右上角「添加来源」登记本地开发工作区，或用 GitHub 仓库地址安装分发源。</small></div> : null}
+          {boundRoot ? <BoundWorkspaceRow root={boundRoot} loading={loading} onRegister={() => void registerWorkspace(boundRoot)} onDevelop={() => onDevelopWorkspace(boundRoot)} /> : null}
+          {units.map(group => <UnitRow key={group.key} group={group} handlers={handlers} />)}
+          {!units.length && !boundRoot ? <div className="extension-source-empty"><FolderOpen size={18} /><strong>尚未添加扩展源</strong><small>用右上角「添加来源」登记本地开发工作区，或用 GitHub 仓库地址安装分发源。</small></div> : null}
         </div>
       </div>
     </div>
   </div>;
 }
 
-function SourceRow({ active, kind, title, meta, reference, upstream, upstreamAdded, dot, statusText, countText, actions, messages }: {
-  active?: boolean;
-  kind: 'workspace' | 'distribution';
-  title: string;
-  meta: string;
-  reference?: string;
-  upstream?: string;
-  upstreamAdded?: boolean;
-  dot: '' | 'success' | 'danger';
-  statusText: string;
-  countText: string;
-  actions: ReactNode;
-  messages?: ReactNode;
-}) {
-  const upstreamTitle = upstream ? (upstreamAdded ? `已添加为分发源：${upstream}` : `上游仓库 ${upstream}，可用「添加为分发源」按仓库地址安装`) : '未识别上游仓库，可在 extensions.json 声明 repository 或配置 git remote origin';
-  return <article className={`extension-source-item${active ? ' is-active' : ''}`}>
-    <div className="extension-source-item-main">
-      <span className="extension-source-mark">{kind === 'workspace' ? <FolderOpen size={15} /> : <GitBranch size={15} />}</span>
-      <div className="extension-source-item-text">
-        <div className="extension-source-item-title">
-          <strong title={title}>{title}</strong>
-          <span className="extension-source-kind">{kind === 'workspace' ? '工作区' : '分发源'}</span>
-          {active ? <span className="extension-source-tag">当前工作区</span> : null}
-        </div>
-        <div className="extension-source-item-meta">
-          <code title={meta}>{meta}</code>
-          {reference ? <span className="extension-source-ref" title={`分支或 Tag ${reference}`}>{reference}</span> : null}
-          {upstream === undefined ? null : <span className={`extension-source-upstream${upstreamAdded ? ' is-added' : ''}${upstream ? '' : ' is-missing'}`} title={upstreamTitle}><GitBranch size={11} /><span>{upstream || '未识别上游仓库'}</span></span>}
+function UnitRow({ group, handlers }: { group: UnitGroup; handlers: UnitHandlers }) {
+  const { unit, local, remote } = group;
+  const status = unitStatus(group, handlers.statuses);
+  const install = unitInstallState(group);
+  const label = unitTitle(group);
+  const active = Boolean(local) && handlers.activeRoot !== '' && normalizePath(local!.repository) === handlers.activeRoot;
+  return <article className={`extension-source-unit${active ? ' is-active' : ''}`}>
+    <div className="extension-source-unit-head">
+      <div className="extension-source-item-main">
+        <span className="extension-source-mark">{local ? <FolderOpen size={15} /> : <GitBranch size={15} />}</span>
+        <div className="extension-source-item-text">
+          <div className="extension-source-item-title">
+            <strong title={label}>{label}</strong>
+            {local ? <span className="extension-source-kind">本地工作区</span> : null}
+            {remote ? <span className="extension-source-kind">分发源</span> : null}
+            {active ? <span className="extension-source-tag">当前工作区</span> : null}
+          </div>
+          {local && remote ? <div className="extension-source-item-meta"><code title={unit?.repository || remote.repository}>{unit?.repository || remote.repository}</code></div> : null}
         </div>
       </div>
+      <div className="extension-source-item-status">
+        <span><span className={`status-dot ${status.dot}`} />{status.text}</span>
+        <small>{unitSummary(group, install)}</small>
+      </div>
+      <div className="extension-source-item-actions">
+        {local && remote ? <AcquisitionSegment value={unit?.acquisition || 'local'} disabled={handlers.loading} onChange={value => void handlers.onSetAcquisition(unit!.unit_key, value)} /> : null}
+        {unit ? <button className="btn btn-install" title={installTitle(group, install)} disabled={handlers.loading || unit.state !== 'ready'} onClick={() => void handlers.onInstallUnit(unit.unit_key)}><Download size={14} />{installLabel(install)}</button> : <span className="extension-source-slot" />}
+      </div>
     </div>
-    <div className="extension-source-item-status">
-      <span><span className={`status-dot ${dot}`} />{statusText}</span>
-      <small>{countText}</small>
+    <div className="extension-source-unit-members">
+      {local ? <MemberRow source={local} kind="local" handlers={handlers} active={active} upstreamAdded={Boolean(remote) || hasUpstreamSource(local, handlers)} /> : null}
+      {remote ? <MemberRow source={remote} kind="remote" handlers={handlers} active={false} /> : null}
     </div>
-    <div className="extension-source-item-actions">{actions}</div>
-    {messages}
+    {install.mismatch ? <p className="extension-source-consistency"><CircleAlert size={12} /><span>本机生效版本来自{unit?.acquisition === 'local' ? 'GitHub 分发源' : '本地开发工作区'}，与当前取用侧不一致，可用「{installLabel(install)}」按取用侧重装。</span></p> : null}
   </article>;
+}
+
+function MemberRow({ source, kind, handlers, active, upstreamAdded }: { source: ExtensionSourceConfig; kind: 'local' | 'remote'; handlers: UnitHandlers; active: boolean; upstreamAdded?: boolean }) {
+  const status = handlers.statuses.get(source.id);
+  const official = kind === 'remote' && normalizePath(source.repository) === 'mrbaoquan/himind-extensions';
+  const upstream = (source.upstream_repository || '').trim();
+  const label = displayName(source);
+  return <div className="extension-source-member">
+    <div className="extension-source-member-main">
+      <span className="extension-source-kind">{kind === 'local' ? '本地工作区' : '分发源'}</span>
+      <code title={source.repository}>{source.repository}</code>
+      {kind === 'remote' ? <span className="extension-source-ref" title={`分支或 Tag ${source.reference}`}>{source.reference}</span> : null}
+      {kind === 'local' ? <span className={`extension-source-upstream${upstreamAdded ? ' is-added' : ''}${upstream ? '' : ' is-missing'}`} title={upstreamTitle(upstream, upstreamAdded)}><GitBranch size={11} /><span>{upstream || '未识别上游仓库'}</span></span> : null}
+    </div>
+    <div className="extension-source-member-actions">
+      <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={handlers.loading} onChange={value => void handlers.onUpdate(source, value, source.auto_update, source.verification)} />
+      {kind === 'local' ? <>
+        <IconAction icon={<MessageCircle size={14} />} label="用 AI 开发" title="设为当前工作区并打开扩展开发工作台" disabled={handlers.loading} onClick={() => void handlers.onDevelopWorkspace(source)} />
+        {active ? null : <IconAction icon={<FolderCheck size={14} />} label="设为当前工作区" title="设为当前工作区" disabled={handlers.loading} onClick={() => void handlers.onSetWorkspace(source)} />}
+        {upstream && !upstreamAdded ? <IconAction icon={<GitBranch size={14} />} label="添加为分发源" title={`按上游仓库 ${upstream} 添加分发源`} disabled={handlers.loading} onClick={() => handlers.onPrefillUpstream(source)} /> : null}
+      </> : <>
+        <IconAction active={source.auto_update} icon={<RefreshCw size={14} />} label="自动更新" title={source.auto_update ? '自动更新已开启，点击关闭' : '自动更新已关闭，点击开启'} disabled={handlers.loading || !source.enabled} onClick={() => void handlers.onUpdate(source, source.enabled, !source.auto_update, source.verification)} />
+        <VerificationSegment value={source.verification} disabled={handlers.loading || official} onChange={value => void handlers.onUpdate(source, source.enabled, source.auto_update, value)} />
+      </>}
+      <IconAction danger icon={<Trash2 size={14} />} label="移除" title={`移除 ${label}`} disabled={handlers.loading} onClick={() => void handlers.onRemove(source.id)} />
+    </div>
+    {source.enabled && status?.error ? <SourceError text={status.error} /> : null}
+    {source.enabled && status?.notices?.length ? <SourceNotices notices={status.notices} /> : null}
+  </div>;
+}
+
+function BoundWorkspaceRow({ root, loading, onRegister, onDevelop }: { root: string; loading: boolean; onRegister: () => void; onDevelop: () => void }) {
+  return <article className="extension-source-unit is-active">
+    <div className="extension-source-unit-head">
+      <div className="extension-source-item-main">
+        <span className="extension-source-mark"><FolderCheck size={15} /></span>
+        <div className="extension-source-item-text">
+          <div className="extension-source-item-title">
+            <strong title={baseName(root)}>{baseName(root)}</strong>
+            <span className="extension-source-kind">本地工作区</span>
+            <span className="extension-source-tag">当前工作区</span>
+          </div>
+        </div>
+      </div>
+      <div className="extension-source-item-status">
+        <span><span className="status-dot success" />已绑定</span>
+        <small>未登记为本地源</small>
+      </div>
+      <div className="extension-source-item-actions">
+        <span className="extension-source-slot" />
+        <IconAction icon={<FolderCheck size={14} />} label="登记为本地源" title="把当前工作区登记为本地开发源" disabled={loading} onClick={onRegister} />
+        <IconAction icon={<MessageCircle size={14} />} label="用 AI 开发" title="打开当前工作区的扩展开发工作台" disabled={loading} onClick={onDevelop} />
+      </div>
+    </div>
+    <div className="extension-source-unit-members">
+      <div className="extension-source-member">
+        <div className="extension-source-member-main"><span className="extension-source-kind">本地工作区</span><code title={root}>{root}</code></div>
+      </div>
+    </div>
+  </article>;
+}
+
+function AcquisitionSegment({ value, disabled, onChange }: { value: ExtensionSourceAcquisition; disabled: boolean; onChange: (value: ExtensionSourceAcquisition) => void }) {
+  const options: { key: ExtensionSourceAcquisition; label: string; title: string }[] = [
+    { key: 'local', label: '本地', title: '取用本地开发工作区：本地是扩展源码的最新权威' },
+    { key: 'remote', label: '远端', title: '取用 GitHub 分发源：按仓库分支安装已发布制品' },
+  ];
+  return <div className="extension-source-acquisition" role="group" aria-label="取用来源">
+    {options.map(option => <button key={option.key} type="button" className={`btn${value === option.key ? ' is-on' : ''}`} title={option.title} aria-pressed={value === option.key} disabled={disabled} onClick={() => onChange(option.key)}>{option.label}</button>)}
+  </div>;
+}
+
+function buildUnitGroups(snapshot: ExtensionSourceSnapshot | null, settings: ExtensionSourceSettings): UnitGroup[] {
+  const byId = new Map(settings.sources.map(source => [source.id, source]));
+  const claimed = new Set<string>();
+  const groups: UnitGroup[] = [];
+  for (const unit of snapshot?.units || []) {
+    const local = unit.local_source_id ? byId.get(unit.local_source_id) : undefined;
+    const remote = unit.remote_source_id ? byId.get(unit.remote_source_id) : undefined;
+    if (local) claimed.add(local.id);
+    if (remote) claimed.add(remote.id);
+    groups.push({ key: unit.unit_key, unit, local, remote });
+  }
+  for (const source of settings.sources) {
+    if (claimed.has(source.id)) continue;
+    groups.push(source.kind === 'local'
+      ? { key: `source:${source.id}`, local: source }
+      : { key: `source:${source.id}`, remote: source });
+  }
+  return groups;
+}
+
+function unitTitle(group: UnitGroup) {
+  const unitName = (group.unit?.name || '').trim();
+  if (unitName) return unitName;
+  const source = group.local || group.remote;
+  return source ? displayName(source) : '扩展单元';
+}
+
+function unitStatus(group: UnitGroup, statuses: Map<string, ExtensionSourceStatus>): { dot: '' | 'success' | 'danger'; text: string } {
+  const members = [group.local, group.remote].filter(Boolean) as ExtensionSourceConfig[];
+  const enabled = members.filter(source => source.enabled);
+  if (members.length && !enabled.length) return { dot: '', text: '已停用' };
+  const ready = enabled.find(source => statuses.get(source.id)?.state === 'ready');
+  if (!ready) return { dot: 'danger', text: enabled.some(source => statuses.has(source.id)) ? '不可用' : '待刷新' };
+  return { dot: 'success', text: statuses.get(ready.id)?.using_cache ? '缓存可用' : '可用' };
+}
+
+function unitInstallState(group: UnitGroup) {
+  const unit = group.unit;
+  if (!unit) return { installed: 0, updates: 0, mismatch: false };
+  const installed = new Map(unit.installed.map(item => [`${item.asset_kind}:${item.asset_id}`, item]));
+  let updates = 0;
+  let mismatch = false;
+  for (const asset of unit.assets) {
+    const record = installed.get(`${asset.asset_kind}:${asset.asset_id}`);
+    if (!record) {
+      updates += 1;
+      continue;
+    }
+    if (record.version !== asset.version) updates += 1;
+    // 免安装的开发挂载就是本地工作区的当前内容，按本地侧计。
+    if ((record.side === 'development' ? 'local' : record.side) !== unit.acquisition) mismatch = true;
+  }
+  return { installed: unit.installed.length, updates, mismatch };
+}
+
+function unitSummary(group: UnitGroup, install: { installed: number; updates: number }) {
+  const parts: string[] = [];
+  if (group.unit) {
+    if (group.unit.state === 'ready') {
+      if (group.unit.plugin_count) parts.push(`${group.unit.plugin_count} 插件`);
+      if (group.unit.skill_count) parts.push(`${group.unit.skill_count} 技能`);
+    }
+    if (!parts.length) parts.push('未提供扩展');
+  }
+  if (install.installed) parts.push(`已装 ${install.installed}`);
+  if (install.updates) parts.push(`${install.updates} 项待更新`);
+  return parts.join(' · ');
+}
+
+function installLabel(install: { installed: number; updates: number }) {
+  if (install.updates) return `更新 ${install.updates} 项`;
+  return install.installed ? '重新安装' : '安装到本机';
+}
+
+function installTitle(group: UnitGroup, install: { installed: number; updates: number }) {
+  const side = group.unit?.acquisition === 'remote' ? 'GitHub 分发源' : '本地开发工作区';
+  const base = `按当前取用侧（${side}）把该扩展单元的插件与技能安装到本机`;
+  return install.updates ? `${base}，共 ${install.updates} 项待安装或更新` : base;
+}
+
+function hasUpstreamSource(source: ExtensionSourceConfig, handlers: UnitHandlers) {
+  const upstream = normalizePath(source.upstream_repository || '');
+  if (!upstream) return false;
+  return [...handlers.statuses.values()].some(item => item.source.kind !== 'local' && normalizePath(item.source.repository) === upstream);
+}
+
+function upstreamTitle(upstream: string, added?: boolean) {
+  if (!upstream) return '未识别上游仓库，可在 extensions.json 声明 repository 或配置 git remote origin';
+  return added ? `已添加为分发源：${upstream}` : `上游仓库 ${upstream}，可用「添加为分发源」按仓库地址安装`;
 }
 
 function Menu({ label, icon, variant = 'icon', disabled, children }: {
@@ -368,12 +504,6 @@ function displayName(source: ExtensionSourceConfig) {
   const name = (source.name || '').trim();
   if (name && normalizePath(name) !== normalizePath(source.repository)) return name;
   return baseName(source.repository);
-}
-
-function statusLabel(enabled: boolean, status?: ExtensionSourceStatus) {
-  if (!enabled) return '已停用';
-  if (status?.state === 'ready') return status.using_cache ? '缓存可用' : '可用';
-  return status ? '不可用' : '待刷新';
 }
 
 function SourceSwitch({ title, label, checked, disabled, onChange }: { title: string; label: string; checked: boolean; disabled: boolean; onChange: (value: boolean) => void }) {

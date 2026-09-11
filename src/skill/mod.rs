@@ -3,6 +3,7 @@ pub(crate) mod cli;
 pub(crate) mod clients;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod development;
 pub(crate) mod direct;
 pub(crate) mod manifest;
 pub(crate) mod resolver;

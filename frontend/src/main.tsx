@@ -13,7 +13,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -441,6 +441,27 @@ function App() {
       setExtensionSources(await agentApi.removeExtensionSource(sourceId));
       await refreshExtensionSources();
       await Promise.all([refreshPlugins(), refreshSkills()]);
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
+  async function setExtensionUnitAcquisition(unitKey: string, acquisition: ExtensionSourceAcquisition) {
+    setExtensionSourcesLoading(true);
+    try {
+      setExtensionSources(await agentApi.setExtensionUnitAcquisition(unitKey, acquisition));
+      await refreshExtensionSources();
+    } finally {
+      setExtensionSourcesLoading(false);
+    }
+  }
+  async function installExtensionUnit(unitKey: string) {
+    setExtensionSourcesLoading(true);
+    try {
+      const report = await agentApi.installExtensionUnit(unitKey);
+      await refreshExtensionSources();
+      await Promise.all([refreshPlugins(), refreshSkills()]);
+      const total = report.plugins.length + report.skills.length;
+      notify('success', total ? `已从${report.acquisition === 'remote' ? 'GitHub 分发源' : '本地开发工作区'}安装 ${total} 项扩展` : '该扩展单元没有可安装的扩展');
     } finally {
       setExtensionSourcesLoading(false);
     }
@@ -1070,6 +1091,8 @@ function App() {
       onAddLocalSource={addLocalExtensionSource}
       onUpdateSourceConfig={updateExtensionSource}
       onRemoveSource={removeExtensionSource}
+      onSetUnitAcquisition={setExtensionUnitAcquisition}
+      onInstallUnit={installExtensionUnit}
       onSetWorkspace={(root: string) => run(() => switchExtensionWorkspace(root), undefined, '切换开发工作区失败')}
       onCreate={async (input: CreateExtensionProjectInput) => {
         if (developmentOperation) throw new Error('已有扩展操作正在进行，请稍后重试');

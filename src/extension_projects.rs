@@ -47,6 +47,9 @@ struct ProjectRecord {
     #[serde(default)]
     source_commit: String,
     updated_at: String,
+    /// 由扩展源实时派生的分发单元键，不落盘。
+    #[serde(skip)]
+    source_unit_key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +70,9 @@ pub(crate) struct ExtensionProject {
     pub source_subdirectory: String,
     pub source_commit: String,
     pub updated_at: String,
+    /// 所属扩展分发单元键，由扩展源实时派生，不落盘。
+    #[serde(default)]
+    pub source_unit_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,8 +127,10 @@ pub(crate) enum ExtensionCandidate {
 pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
     let path = registry_path();
     let mut records = read_records(&path)?;
-    let mut changed = migrate_legacy_projects(&mut records);
+    let workspaces = crate::app::extension_source::local_source_workspaces();
+    let mut changed = migrate_legacy_projects(&mut records, &workspaces);
     changed |= merge_shared_workspace_projects(&mut records);
+    changed |= rebind_extension_source_workspaces(&mut records, &workspaces);
 
     for record in &mut records {
         if !record.workspace_path.is_dir() {
@@ -142,6 +150,13 @@ pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
                 }
             }
         }
+    }
+    for record in &mut records {
+        record.source_unit_key = workspaces
+            .iter()
+            .find(|item| item.kind == record.kind.as_str() && item.extension_id == record.extension_id)
+            .map(|item| item.unit_key.clone())
+            .unwrap_or_default();
     }
     records.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     if changed {
@@ -566,6 +581,7 @@ fn record(
         source_subdirectory: String::new(),
         source_commit: String::new(),
         updated_at: now_stamp(),
+        source_unit_key: String::new(),
     }
 }
 
@@ -600,52 +616,111 @@ fn normalize_slug(value: &str) -> Result<String, Box<dyn Error>> {
     Ok(value)
 }
 
-fn migrate_legacy_projects(records: &mut Vec<ProjectRecord>) -> bool {
+fn migrate_legacy_projects(
+    records: &mut Vec<ProjectRecord>,
+    workspaces: &[crate::app::extension_source::LocalSourceWorkspace],
+) -> bool {
     let mut changed = false;
     for draft in crate::plugin_authoring::list().unwrap_or_default() {
         let id = format!("plugin:{}", draft.manifest.id);
         if records.iter().any(|record| record.id == id) {
             continue;
         }
-        let candidates = [
-            draft.workspace_path.clone(),
-            draft.development_path.clone(),
-            draft
-                .candidate_path
-                .parent()
-                .map(|path| path.join("package")),
-        ];
-        if let Some(record) = candidates
-            .into_iter()
-            .flatten()
-            .find_map(|path| project_record_from_path(&path, "legacy_candidate").ok())
-        {
-            records.push(record);
-            changed = true;
-        }
+        let Some(record) = draft_project_record(
+            ExtensionProjectKind::Plugin,
+            &draft.manifest.id,
+            draft.workspace_path.as_deref(),
+            workspaces,
+        ) else {
+            continue;
+        };
+        records.push(record);
+        changed = true;
     }
     for draft in crate::skill::authoring::list().unwrap_or_default() {
         let id = format!("skill:{}", draft.manifest.id);
         if records.iter().any(|record| record.id == id) {
             continue;
         }
-        let candidates = [
-            draft.workspace_path.clone(),
-            draft
-                .candidate_path
-                .parent()
-                .map(|path| path.join("package")),
-        ];
-        if let Some(record) = candidates
-            .into_iter()
-            .flatten()
-            .find_map(|path| project_record_from_path(&path, "legacy_candidate").ok())
-        {
-            records.push(record);
-            changed = true;
-        }
+        let Some(record) = draft_project_record(
+            ExtensionProjectKind::Skill,
+            &draft.manifest.id,
+            draft.workspace_path.as_deref(),
+            workspaces,
+        ) else {
+            continue;
+        };
+        records.push(record);
+        changed = true;
     }
     changed
+}
+
+/// 只接受真正的扩展源码工作区：优先用扩展源 `extensions.json` 声明的目录，
+/// 其次用候选包所在目录，绝不绑定 Agent 内部草稿目录。
+fn draft_project_record(
+    kind: ExtensionProjectKind,
+    extension_id: &str,
+    workspace: Option<&Path>,
+    workspaces: &[crate::app::extension_source::LocalSourceWorkspace],
+) -> Option<ProjectRecord> {
+    let kind_name = kind.as_str();
+    if let Some(discovered) = workspaces
+        .iter()
+        .find(|item| item.kind == kind_name && item.extension_id == extension_id)
+    {
+        if let Ok(mut record) = project_record_from_path(&discovered.path, "extension_source") {
+            record.source_repository = discovered.repository.clone();
+            record.source_subdirectory = discovered.subdirectory.clone();
+            return Some(record);
+        }
+    }
+    let workspace = workspace.filter(|path| !is_agent_managed(path))?;
+    let record = project_record_from_path(workspace, "candidate_workspace").ok()?;
+    (record.kind == kind && record.extension_id == extension_id).then_some(record)
+}
+
+/// 把绑定到 Agent 内部草稿目录或已失效目录的项目记录重新绑回扩展源声明的源码工作区。
+/// 这是 `legacy_candidate` 误绑的修复通道，保证「用 AI 开发」始终改到源码。
+fn rebind_extension_source_workspaces(
+    records: &mut Vec<ProjectRecord>,
+    workspaces: &[crate::app::extension_source::LocalSourceWorkspace],
+) -> bool {
+    if workspaces.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for record in records.iter_mut() {
+        if record.workspace_path.is_dir()
+            && !is_agent_managed(&record.workspace_path)
+            && project_record_from_path(&record.workspace_path, &record.source).is_ok()
+        {
+            continue;
+        }
+        let Some(discovered) = workspaces
+            .iter()
+            .find(|item| item.kind == record.kind.as_str() && item.extension_id == record.extension_id)
+        else {
+            continue;
+        };
+        if record.workspace_path == discovered.path {
+            continue;
+        }
+        let Ok(candidate) = project_record_from_path(&discovered.path, "extension_source") else {
+            continue;
+        };
+        record.workspace_path = candidate.workspace_path;
+        record.source = "extension_source".to_string();
+        record.source_repository = discovered.repository.clone();
+        record.source_subdirectory = discovered.subdirectory.clone();
+        record.updated_at = now_stamp();
+        changed = true;
+    }
+    changed
+}
+
+fn is_agent_managed(path: &Path) -> bool {
+    crate::extension_workspace::is_agent_managed_path(path)
 }
 
 fn cleanup_temporary_candidates(root: &Path) {
@@ -714,6 +789,7 @@ impl From<ProjectRecord> for ExtensionProject {
             source_subdirectory: value.source_subdirectory,
             source_commit: value.source_commit,
             updated_at: value.updated_at,
+            source_unit_key: value.source_unit_key,
         }
     }
 }
@@ -721,6 +797,7 @@ impl From<ProjectRecord> for ExtensionProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::extension_source::LocalSourceWorkspace;
 
     #[test]
     fn detects_plugin_and_skill_projects_with_stable_ids() {
@@ -748,6 +825,105 @@ mod tests {
         assert_eq!(plugin_record.kind, ExtensionProjectKind::Plugin);
         assert_eq!(skill_record.kind, ExtensionProjectKind::Skill);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rebinds_projects_stuck_on_agent_draft_directories_to_the_source_workspace() {
+        let source = env::temp_dir().join(format!("himind-project-source-{}", now_stamp()));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("plugin.json"),
+            r#"{"id":"com.himind.rebind-test","name":"回绑插件","description":"测试回绑","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        let draft = draft_directory("rebind-test");
+        let workspaces = vec![LocalSourceWorkspace {
+            kind: "plugin".to_string(),
+            extension_id: "com.himind.rebind-test".to_string(),
+            path: source.clone(),
+            repository: "Owner/repo".to_string(),
+            subdirectory: "plugins/rebind-test".to_string(),
+            unit_key: "remote:owner/repo".to_string(),
+        }];
+        let mut records = vec![
+            project_record_from_path(&draft, "legacy_candidate").unwrap(),
+            ProjectRecord {
+                workspace_path: source.clone(),
+                ..project_record_from_path(&source, "extension_source").unwrap()
+            },
+        ];
+        let unrelated = project_record_from_path(&source, "legacy_candidate").unwrap();
+
+        assert!(rebind_extension_source_workspaces(&mut records, &workspaces));
+        assert_eq!(records[0].workspace_path, source);
+        assert_eq!(records[0].source, "extension_source");
+        assert_eq!(records[0].source_repository, "Owner/repo");
+        assert_eq!(records[0].source_subdirectory, "plugins/rebind-test");
+        assert_eq!(records[1].source, "extension_source");
+        assert!(
+            !rebind_extension_source_workspaces(&mut vec![unrelated], &workspaces),
+            "已绑定源码工作区的记录不应被改写"
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(draft.parent().unwrap());
+    }
+
+    #[test]
+    fn draft_project_record_prefers_the_declared_source_workspace_over_the_draft_path() {
+        let source = env::temp_dir().join(format!("himind-project-declared-{}", now_stamp()));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("plugin.json"),
+            r#"{"id":"com.himind.declared-test","name":"声明插件","description":"测试声明目录","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        let draft = draft_directory("declared-test");
+        let workspaces = vec![LocalSourceWorkspace {
+            kind: "plugin".to_string(),
+            extension_id: "com.himind.declared-test".to_string(),
+            path: source.clone(),
+            repository: String::new(),
+            subdirectory: String::new(),
+            unit_key: String::new(),
+        }];
+
+        let record = draft_project_record(
+            ExtensionProjectKind::Plugin,
+            "com.himind.declared-test",
+            Some(&draft),
+            &workspaces,
+        )
+        .unwrap();
+        assert_eq!(record.workspace_path, source);
+        assert_eq!(record.source, "extension_source");
+
+        assert!(
+            draft_project_record(
+                ExtensionProjectKind::Plugin,
+                "com.himind.declared-test",
+                Some(&draft),
+                &[],
+            )
+            .is_none(),
+            "没有扩展源声明时不得绑定 Agent 草稿目录"
+        );
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(draft.parent().unwrap());
+    }
+
+    /// `CARGO_MANIFEST_DIR` 下的目录会被判定为 Agent 自管路径，用它模拟草稿产物目录。
+    fn draft_directory(tag: &str) -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("himind-agent-test-drafts")
+            .join(tag);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("plugin.json"),
+            r#"{"id":"com.himind.rebind-test","name":"草稿插件","description":"草稿","version":"0.1.0"}"#,
+        )
+        .unwrap();
+        path
     }
 
     #[test]
