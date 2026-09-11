@@ -33,6 +33,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
   const localSources = useMemo(() => settings.sources.filter(source => source.kind === 'local'), [settings.sources]);
   const githubSources = useMemo(() => settings.sources.filter(source => source.kind !== 'local'), [settings.sources]);
   const activeRoot = workspace.valid ? normalizePath(workspace.root) : '';
+  const boundRoot = activeRoot !== '' && !localSources.some(source => normalizePath(source.repository) === activeRoot) ? workspace.root : '';
 
   useEffect(() => {
     if (!open) return;
@@ -83,6 +84,12 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
       if (normalizePath(source.repository) !== activeRoot) await onSetWorkspace(source.repository);
       onDevelopWorkspace(source.repository);
     } catch (reason) { setLocalError(messageOf(reason)); }
+  }
+
+  async function registerWorkspace(root: string) {
+    setLocalError('');
+    try { await onAddLocal('', root); }
+    catch (reason) { setLocalError(messageOf(reason)); }
   }
 
   function prefillUpstreamSource(source: ExtensionSourceConfig) {
@@ -147,7 +154,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
             <div className="field-group"><label className="field-label" htmlFor="extension-source-catalog">目录文件</label><input id="extension-source-catalog" value={catalogPath} onChange={event => setCatalogPath(event.target.value)} placeholder={sourceType === 'local' ? 'extensions.json' : '.himind/catalog.json'} /></div>
             {sourceType === 'github' ? <div className="field-group"><label className="field-label" htmlFor="extension-source-verification">来源校验</label><select id="extension-source-verification" value={verification} onChange={event => setVerification(event.target.value as ExtensionSourceConfig['verification'])}><option value="required">仅安装可信签名</option><option value="optional">允许用户自定义制品</option></select><small>选择用户自定义时，已有签名仍会严格校验。</small></div> : <small>本地目录源固定使用用户自定义制品校验，不要求签名。</small>}
           </div></details>
-          <div className="extension-source-form-actions"><button className="btn" onClick={() => setFormOpen(false)}>取消</button><button className="btn btn-primary" disabled={loading || !name.trim() || (sourceType === 'github' ? (!repository.trim() || !reference.trim() || !catalogPath.trim()) : (!localRoot.trim() || !catalogPath.trim()))} onClick={() => void addSource()}>保存</button></div>
+          <div className="extension-source-form-actions"><button className="btn" onClick={() => setFormOpen(false)}>取消</button><button className="btn btn-primary" disabled={loading || (sourceType === 'github' ? (!repository.trim() || !reference.trim() || !catalogPath.trim()) : (!localRoot.trim() || !catalogPath.trim()))} onClick={() => void addSource()}>保存</button></div>
         </section> : null}
 
         {(localError || error) ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{localError || error}</span></div> : null}
@@ -160,6 +167,20 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
             </div>
           </div>
           <div className="extension-source-list">
+            {boundRoot ? <article className="extension-source-item is-workspace is-active">
+              <div className="extension-source-item-main">
+                <span className="extension-source-mark"><FolderOpen size={17} /></span>
+                <div><strong>当前工作区</strong><code title={boundRoot}>{boundRoot}</code><small>已绑定为当前开发工作区，但未登记为本地开发工作区；登记后才会作为扩展源参与刷新与安装。</small></div>
+              </div>
+              <div className="extension-source-item-status">
+                <span><span className="status-dot success" />当前开发工作区</span>
+                <small>未登记为本地源</small>
+              </div>
+              <div className="extension-source-controls">
+                <button className="btn btn-primary" disabled={loading} onClick={() => void registerWorkspace(boundRoot)}><Plus size={14} />登记为本地源</button>
+                <button className="btn" disabled={loading} onClick={() => onDevelopWorkspace(boundRoot)}><MessageCircle size={14} />用 AI 开发</button>
+              </div>
+            </article> : null}
             {localSources.map(source => {
               const status = statuses.get(source.id);
               const ready = status?.state === 'ready';
@@ -186,7 +207,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, lo
                 {source.enabled && status?.error ? <div className="extension-source-item-error">{status.error}</div> : null}
               </article>;
             })}
-            {!localSources.length ? <div className="extension-source-empty"><FolderOpen size={22} /><strong>尚未添加本地开发工作区</strong><small>选择包含 extensions.json 聚合清单的本地目录，即可在本机开发、构建并验证扩展。</small></div> : null}
+            {!localSources.length && !boundRoot ? <div className="extension-source-empty"><FolderOpen size={22} /><strong>尚未添加本地开发工作区</strong><small>选择包含 extensions.json 聚合清单的本地目录，即可在本机开发、构建并验证扩展。</small></div> : null}
           </div>
         </section>
 
