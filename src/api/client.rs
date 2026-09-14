@@ -29,6 +29,7 @@ pub struct LocalAgentTicketPrincipal {
 
 const TASK_CANCELED_ERROR: &str = "task canceled by user";
 const AGENT_CREDENTIAL_ROTATION_INTERVAL: u64 = 30 * 24 * 60 * 60;
+const TASK_POLL_WAIT_SECONDS: &str = "20";
 
 #[derive(Debug)]
 pub struct TaskCancelGuard {
@@ -457,7 +458,7 @@ pub fn poll_tasks(
 ) -> Result<Vec<Task>, Box<dyn Error>> {
     let tasks = client
         .get(format!("{}/api/agent/tasks/poll", api_base))
-        .query(&[("agent_id", agent_id), ("wait", "10")])
+        .query(&[("agent_id", agent_id), ("wait", TASK_POLL_WAIT_SECONDS)])
         .header("Authorization", agent_authorization(agent_id, credential))
         .send()?
         .error_for_status()?

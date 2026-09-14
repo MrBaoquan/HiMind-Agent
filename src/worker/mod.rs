@@ -1,4 +1,4 @@
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client, StatusCode};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -168,10 +168,12 @@ pub(crate) fn run_loop(
     let heartbeat_interval = options.interval_seconds.max(1);
     let heartbeat_restart_requested = Arc::clone(&restart_requested);
     let heartbeat_thread = thread::spawn(move || {
+        const HEARTBEAT_FAILURE_OFFLINE_THRESHOLD: u32 = 3;
         let mut runtime_installations = crate::runtime::probe_installations();
         let mut last_runtime_probe = Instant::now();
         let mut last_identity_error = String::new();
         let mut last_heartbeat_error = String::new();
+        let mut heartbeat_failures: u32 = 0;
         while !heartbeat_stop_for_thread.load(Ordering::Relaxed) {
             if !heartbeat_options.mode().dashboard_enabled() {
                 set_status(&heartbeat_status, "not_applicable", false, "", "");
@@ -248,6 +250,7 @@ pub(crate) fn run_loop(
                 Some(&remote_execution),
             ) {
                 Ok(true) => {
+                    heartbeat_failures = 0;
                     if !last_heartbeat_error.is_empty() {
                         if let Some(logs) = heartbeat_logs.as_ref() {
                             logs.add_log("info", "Dashboard 心跳已恢复");
@@ -309,6 +312,7 @@ pub(crate) fn run_loop(
                     break;
                 }
                 Err(error) => {
+                    heartbeat_failures = heartbeat_failures.saturating_add(1);
                     let message = error.to_string();
                     if message != last_heartbeat_error {
                         if let Some(logs) = heartbeat_logs.as_ref() {
@@ -318,7 +322,11 @@ pub(crate) fn run_loop(
                     }
                     set_status(
                         &heartbeat_status,
-                        "offline",
+                        if heartbeat_failures >= HEARTBEAT_FAILURE_OFFLINE_THRESHOLD {
+                            "offline"
+                        } else {
+                            "connecting"
+                        },
                         false,
                         &heartbeat_agent_id,
                         &format!("Dashboard Agent 心跳失败：{message}"),
@@ -419,6 +427,8 @@ pub(crate) fn run_loop(
         handle: Some(reconcile_thread),
     };
 
+    let mut poll_retry_delay = Duration::from_secs(2);
+    let mut last_poll_error = String::new();
     loop {
         if !options.mode().dashboard_enabled() {
             return Ok(());
@@ -428,12 +438,48 @@ pub(crate) fn run_loop(
         {
             return Err("Dashboard Agent 身份已更新，正在重新连接任务 Worker".into());
         }
-        let tasks = poll_tasks(
+        let tasks = match poll_tasks(
             &client,
             &options.api_base,
             &state.agent_id,
             &state.credential,
-        )?;
+        ) {
+            Ok(tasks) => {
+                poll_retry_delay = Duration::from_secs(2);
+                if !last_poll_error.is_empty() {
+                    if let Some(logs) = approval_mgr.as_ref() {
+                        logs.add_log("info", "Dashboard 任务轮询已恢复");
+                    }
+                    last_poll_error.clear();
+                }
+                tasks
+            }
+            Err(error) if is_transient_dashboard_error(error.as_ref()) => {
+                let message = error.to_string();
+                if message != last_poll_error {
+                    if let Some(logs) = approval_mgr.as_ref() {
+                        logs.add_log(
+                            "warn",
+                            &format!("Dashboard 任务轮询暂时不可用，将自动重试: {message}"),
+                        );
+                    }
+                    last_poll_error = message.clone();
+                }
+                set_status(
+                    &worker_status,
+                    "connecting",
+                    false,
+                    &state.agent_id,
+                    &format!("Dashboard 任务轮询暂时不可用，正在自动重试：{message}"),
+                );
+                thread::sleep(poll_retry_delay);
+                poll_retry_delay = poll_retry_delay
+                    .saturating_mul(2)
+                    .min(Duration::from_secs(30));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         for task in tasks {
             execute_task(
                 &client,
@@ -513,11 +559,30 @@ pub(crate) fn run_supervisor(
                         &format!("Dashboard Worker 已停止并准备重连: {message}"),
                     );
                 }
+                let was_online = worker_status
+                    .lock()
+                    .map(|state| state.dashboard_worker_online)
+                    .unwrap_or(false);
+                let current_agent_id = worker_status
+                    .lock()
+                    .map(|state| state.dashboard_agent_id.clone())
+                    .unwrap_or_default();
+                if was_online {
+                    retry_delay = Duration::from_secs(2);
+                }
                 set_status(
                     &Some(Arc::clone(&worker_status)),
-                    "offline",
+                    if is_transient_dashboard_error(error.as_ref()) {
+                        "connecting"
+                    } else {
+                        "offline"
+                    },
                     false,
-                    "",
+                    if is_transient_dashboard_error(error.as_ref()) {
+                        &current_agent_id
+                    } else {
+                        ""
+                    },
                     &message,
                 );
                 eprintln!("agent worker stopped: {}", message);
@@ -543,6 +608,7 @@ fn set_status(
             state.dashboard_worker_state = worker_state.to_string();
             state.dashboard_worker_reason_code = match worker_state {
                 "online" => "connected_agent_app_worker",
+                "connecting" if !error.trim().is_empty() => "connected_agent_app_reconnecting",
                 "connecting" => "connected_agent_app_starting",
                 "offline" => "connected_agent_app_worker_error",
                 "not_applicable" if state.worker_transport == "stdio" => {
@@ -553,5 +619,73 @@ fn set_status(
             }
             .to_string();
         }
+    }
+}
+
+fn is_transient_dashboard_error(error: &(dyn Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        if error.is_timeout() || error.is_connect() || error.is_request() {
+            return true;
+        }
+        if matches!(
+            error.status(),
+            Some(
+                StatusCode::REQUEST_TIMEOUT
+                    | StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            )
+        ) {
+            return true;
+        }
+    }
+    is_transient_dashboard_message(&error.to_string())
+}
+
+fn is_transient_dashboard_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "408",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "dns",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_dashboard_message;
+
+    #[test]
+    fn transient_dashboard_failures_are_retryable() {
+        for message in [
+            "HTTP status client error (502 Bad Gateway)",
+            "connection refused",
+            "operation timed out",
+            "connection reset by peer",
+        ] {
+            assert!(is_transient_dashboard_message(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn authentication_failures_are_not_treated_as_transient() {
+        assert!(!is_transient_dashboard_message("401 Unauthorized"));
+        assert!(!is_transient_dashboard_message(
+            "stored Agent credential is no longer valid"
+        ));
     }
 }
