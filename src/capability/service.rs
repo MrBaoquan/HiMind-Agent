@@ -1400,7 +1400,7 @@ impl CapabilityGateway {
                     "properties": {
                         "workspace_root": {"type":"string"}, "artifact_path": {"type":"string"},
                         "product_id": {"type":"string"}, "product_name": {"type":"string"},
-                        "product_type": {"type":"string", "enum":["desktop_agent","agent_plugin","organization_skill","desktop_app","runtime_component","knowledge_edge_node"]},
+                        "product_type": {"type":"string", "enum":["desktop_agent","agent_plugin","organization_skill","desktop_app","runtime_component","knowledge_edge_node","edge_node"]},
                         "version": {"type":"string"},
                         "channel": {"type":"string"}, "platform": {"type":"string"}, "architecture": {"type":"string"},
                         "package_type": {"type":"string", "enum":["directory-zip","apk","unity-addressables","content"]},
@@ -5002,6 +5002,7 @@ fn validate_distribution_publish_request(
             | "desktop_app"
             | "runtime_component"
             | "knowledge_edge_node"
+            | "edge_node"
     ) {
         return Err("不支持的 product_type".into());
     }
