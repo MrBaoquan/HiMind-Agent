@@ -6,8 +6,13 @@ use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+mod runner;
 mod store;
 
+#[allow(unused_imports)]
+pub(crate) use runner::{
+    WorkflowRunOutcome, WorkflowRunner, WorkflowStepExecution, WorkflowStepExecutor,
+};
 pub(crate) use store::{InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";

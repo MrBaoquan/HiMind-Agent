@@ -331,6 +331,18 @@ impl LocalRunLedger {
         Ok(true)
     }
 
+    pub(crate) fn next_runtime_sequence(&self, run_id: &str) -> Result<u64, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let next: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(sequence), -1) + 1
+             FROM runtime_events
+             WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        Ok(next.max(0) as u64)
+    }
+
     pub(crate) fn enqueue_projection(
         &self,
         projection_type: &str,
