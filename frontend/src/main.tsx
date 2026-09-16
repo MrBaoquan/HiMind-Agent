@@ -13,7 +13,8 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { WorkflowsPage } from './pages/WorkflowsPage';
+import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkflowCenterSnapshot, type WorkflowRunSnapshot } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -67,6 +68,9 @@ function App() {
   const [extensionDesiredError, setExtensionDesiredError] = useState<string | null>(null);
   const [extensionDesiredLoading, setExtensionDesiredLoading] = useState(false);
   const [pluginsLoading, setPluginsLoading] = useState(true);
+  const [workflowCenter, setWorkflowCenter] = useState<WorkflowCenterSnapshot | null>(null);
+  const [workflowLoading, setWorkflowLoading] = useState(true);
+  const [workflowError, setWorkflowError] = useState('');
   const [capabilities, setCapabilities] = useState<CapabilityItem[]>([]);
   const [pluginCatalog, setPluginCatalog] = useState<import('./services/agentApi').PluginCatalogItem[]>([]);
   const [pluginDrafts, setPluginDrafts] = useState<AuthoringPluginDraft[]>([]);
@@ -290,6 +294,25 @@ function App() {
         setPluginsLoading(false);
       }
     });
+  }
+
+  async function refreshWorkflowCenter() {
+    return singleFlight('workflow-center', async () => {
+      setWorkflowLoading(true);
+      setWorkflowError('');
+      try {
+        setWorkflowCenter(await withTimeout(agentApi.workflowCenter(), '工作流中心'));
+      } catch (error) {
+        setWorkflowCenter(null);
+        setWorkflowError(formatError(error, '工作流中心读取失败'));
+      } finally {
+        setWorkflowLoading(false);
+      }
+    });
+  }
+
+  async function loadWorkflowRun(runId: string): Promise<WorkflowRunSnapshot> {
+    return withTimeout(agentApi.workflowRun(runId), '工作流运行详情');
   }
 
   // Plugin views can be installed or rebuilt while the Agent window remains
@@ -527,6 +550,7 @@ function App() {
       refreshRemoteExecutionSettings(),
       refreshExtensionSourceSettings(),
       refreshPluginRegistry(),
+      refreshWorkflowCenter(),
     ]);
     for (const result of results) {
       if (result.status === 'rejected') throw result.reason;
@@ -554,6 +578,8 @@ function App() {
           ? refreshApprovals()
           : page === 'plugins'
             ? Promise.all([refreshExtensionDesiredState(), refreshPlugins()])
+            : page === 'workflows'
+              ? refreshWorkflowCenter()
             : page === 'skills'
               ? Promise.all([refreshExtensionDesiredState(), refreshSkills(), refreshMcpTargets(), refreshPluginRegistry()])
               : page === 'development'
@@ -1009,6 +1035,7 @@ function App() {
       onRemoveAIClient={(target) => run(async () => { await agentApi.removeAIClient(target); await refreshAIServices(); }, `已取消 ${target} 注册`, '取消客户端注册失败')}
     />;
     if (page === 'approvals') return <ApprovalsPage independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} approvals={approvals} history={approvalHistory} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} onOpenSettings={() => { setSettingsSection('approval'); setPage('settings'); }} />;
+    if (page === 'workflows') return <WorkflowsPage snapshot={workflowCenter} loading={workflowLoading} error={workflowError} onRefresh={() => { void refreshWorkflowCenter(); }} onLoadRun={loadWorkflowRun} />;
     if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} dashboardEnabled={dashboardEnabled()} marketEnabled={extensionMarketEnabled()} desired={extensionDesiredState} desiredLoading={extensionDesiredLoading} desiredError={extensionDesiredError} skillStatus={skillStatus} onQueryCatalog={agentApi.queryPluginCatalog} onRefresh={() => run(async () => { await Promise.all([refreshExtensionDesiredState(), refreshPlugins()]); })} onLoadVersions={agentApi.pluginVersions} onPlanInstall={agentApi.planPluginInstall} onImportLocal={() => run(async () => { const registry = await agentApi.importLocalPlugin(); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); }, '本地插件已导入', '导入本地插件失败')} onImportGithub={async (sourceUrl) => { const registry = await agentApi.importGithubPlugin(sourceUrl); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub 插件已导入'); }} onInstall={(pluginId, version) => run(async () => { await agentApi.installPlugin(pluginId, version); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, `已安装插件${version ? ` v${version}` : ''}`, '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, enabled ? '插件已启用' : '插件已停用', '更新插件状态失败')} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}

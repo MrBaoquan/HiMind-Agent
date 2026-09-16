@@ -3634,6 +3634,93 @@ pub(crate) async fn invoke_plugin_view_capability(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub(crate) fn get_workflow_center() -> Result<serde_json::Value, String> {
+    workflow_center_snapshot().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
+    workflow_run_snapshot(&run_id).map_err(|error| error.to_string())
+}
+
+fn workflow_center_snapshot() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let mut workflows = Vec::new();
+    for item in store.list()? {
+        let view = store.view_json(&item.package)?;
+        workflows.push(json!({
+            "package": item.package,
+            "enabled": item.enabled,
+            "previous_version": item.previous_version,
+            "package_digest": item.package_digest,
+            "source": item.source,
+            "installed_at": item.installed_at,
+            "updated_at": item.updated_at,
+            "view": view,
+        }));
+    }
+    let mut runs = Vec::new();
+    for run in ledger
+        .list_runs(100)?
+        .into_iter()
+        .filter(|run| run.source == crate::agent_core_contracts::InteractionSource::Workflow)
+    {
+        let projections = ledger.projections_for_aggregate(&run.run_id, 100)?;
+        let projection_status = projections
+            .first()
+            .map(|projection| projection.status.clone())
+            .unwrap_or_else(|| "none".to_string());
+        runs.push(json!({
+            "run": run,
+            "projection_count": projections.len(),
+            "projection_status": projection_status,
+        }));
+    }
+    Ok(json!({
+        "workflows": workflows,
+        "runs": runs,
+    }))
+}
+
+fn workflow_run_snapshot(run_id: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let run = ledger
+        .get_run(run_id)?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let interaction = ledger.get_interaction(&run.interaction_id)?;
+    let events = ledger.list_events(run_id)?;
+    let projections = ledger.projections_for_aggregate(run_id, 100)?;
+    let package_id = interaction
+        .as_ref()
+        .and_then(|interaction| interaction.business_context.get("workflow"))
+        .and_then(|workflow| workflow.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    let workflow = store
+        .list()?
+        .into_iter()
+        .find(|item| item.package.id == package_id)
+        .map(|item| {
+            let view = store.view_json(&item.package)?;
+            Ok::<_, Box<dyn std::error::Error>>(json!({
+                "package": item.package,
+                "enabled": item.enabled,
+                "view": view,
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
+        "run": run,
+        "interaction": interaction,
+        "events": events,
+        "projections": projections,
+        "workflow": workflow,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::present_builtin_ai_start_error;

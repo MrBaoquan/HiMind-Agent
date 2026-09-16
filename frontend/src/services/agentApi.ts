@@ -169,6 +169,112 @@ export type RemoteClientOverview = {
     settings_file?: string;
 };
 
+export type WorkflowStep = {
+    id: string;
+    title: string;
+    capability_id: string;
+    execution_mode: string;
+    risk_level: string;
+    approval_required: boolean;
+    depends_on: string[];
+};
+
+export type WorkflowArtifact = {
+    id: string;
+    artifact_type: string;
+    name: string;
+    schema: string;
+    required: boolean;
+};
+
+export type WorkflowPackage = {
+    schema_version: string;
+    id: string;
+    version: string;
+    name: string;
+    description: string;
+    min_agent_version: string;
+    capabilities: string[];
+    dependencies: {
+        skills: string[];
+        plugins: string[];
+        connectors: string[];
+        runtimes: string[];
+    };
+    steps: WorkflowStep[];
+    artifacts: WorkflowArtifact[];
+    ui: { mode: 'standard' | 'declarative' | 'custom' | string; entry: string; surfaces: string[] };
+    supported_runtimes: string[];
+};
+
+export type WorkflowView = {
+    schema_version: string;
+    title: string;
+    sections: Array<{ id: string; title: string; fields?: string[]; artifacts?: string[] }>;
+    actions: string[];
+};
+
+export type WorkflowLocalRun = {
+    run_id: string;
+    interaction_id: string;
+    status: 'queued' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'canceled' | string;
+    current_step_id: string;
+    runtime_provider: string;
+    workspace_ref: string;
+    steps: Array<{
+        step_id: string;
+        title: string;
+        status: string;
+        capability_id: string;
+        attempt: number;
+        started_at: string;
+        finished_at: string;
+        error: string;
+    }>;
+    approvals: Array<{ approval_id: string; capability_id: string; risk_level: string; status: string; owner: string }>;
+    artifacts: Array<{ artifact_id: string; artifact_type: string; name: string; uri: string; sha256: string; size_bytes: number }>;
+    error: string;
+    created_at: string;
+    updated_at: string;
+};
+
+export type WorkflowCenterItem = {
+    package: WorkflowPackage;
+    enabled: boolean;
+    previous_version: string;
+    package_digest: string;
+    source: string;
+    installed_at: string;
+    updated_at: string;
+    view: WorkflowView | null;
+};
+
+export type WorkflowCenterSnapshot = {
+    workflows: WorkflowCenterItem[];
+    runs: Array<{
+        run: WorkflowLocalRun;
+        projection_count: number;
+        projection_status: string;
+    }>;
+};
+
+export type WorkflowRunSnapshot = {
+    run: WorkflowLocalRun;
+    interaction: unknown;
+    events: Array<{
+        event_id: string;
+        step_id: string;
+        capability_id: string;
+        sequence: number;
+        occurred_at: string;
+        provider: string;
+        event_type: string;
+        payload: unknown;
+    }>;
+    projections: Array<{ id: number; status: string; attempts: number; last_error: string; payload: unknown }>;
+    workflow: { package: WorkflowPackage; enabled: boolean; view: WorkflowView | null } | null;
+};
+
 export type BuiltinAIRuntimeStatus = {
     provider: 'himind.builtin' | string;
     status: 'ready' | 'unavailable' | string;
@@ -1295,6 +1401,8 @@ export const agentApi = {
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),
     plugins: () => invoke<PluginRegistry>('get_plugin_registry'),
+    workflowCenter: () => invoke<WorkflowCenterSnapshot>('get_workflow_center'),
+    workflowRun: (runId: string) => invoke<WorkflowRunSnapshot>('get_workflow_run', { runId }),
     importLocalPlugin: () => invoke<PluginRegistry>('import_local_plugin'),
     importGithubPlugin: (sourceUrl: string) => invoke<PluginRegistry>('import_github_plugin_url', { sourceUrl }),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),

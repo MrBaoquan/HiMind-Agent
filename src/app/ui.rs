@@ -241,6 +241,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_svn_connection,
             super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
+            super::commands::get_workflow_center,
+            super::commands::get_workflow_run,
             super::commands::get_extension_sources,
             super::commands::add_extension_source,
             super::commands::add_local_extension_source,

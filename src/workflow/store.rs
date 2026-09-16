@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
@@ -126,6 +127,24 @@ impl WorkflowStore {
         }
         items.sort_by(|left, right| left.package.id.cmp(&right.package.id));
         Ok(items)
+    }
+
+    pub(crate) fn view_json(
+        &self,
+        package: &WorkflowPackage,
+    ) -> Result<Option<Value>, Box<dyn Error>> {
+        if package.ui.entry.trim().is_empty() {
+            return Ok(None);
+        }
+        let path = self
+            .product_root(&package.id)?
+            .join("versions")
+            .join(safe_segment(&package.version)?)
+            .join(&package.ui.entry);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
     }
 
     pub(crate) fn set_enabled(

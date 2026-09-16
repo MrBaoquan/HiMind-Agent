@@ -36,6 +36,7 @@ const navSections = [
     items: [
       { key: 'ai', icon: Cable, label: 'AI 连接' },
       { key: 'skills', icon: BookOpen, label: '技能' },
+      { key: 'workflows', icon: Workflow, label: '工作流' },
       { key: 'plugins', icon: Blocks, label: '插件' },
     ],
   },
@@ -165,6 +166,7 @@ function AppMenuBar({ currentPage, agentVersion, updateBusy, dashboardEnabled, o
               <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('approvals'))}><ClipboardCheck size={16} /><span>审批</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('ai'))}><Cable size={16} /><span>AI 连接</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('skills'))}><BookOpen size={16} /><span>技能</span></button>
+              <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('workflows'))}><Workflow size={16} /><span>工作流</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('plugins'))}><Blocks size={16} /><span>插件</span></button>
               <button type="button" role="menuitem" onClick={() => runAction(() => onNavigate('settings'))}><Settings size={16} /><span>设置</span></button>
             </div>
@@ -215,7 +217,7 @@ function AppMenuBar({ currentPage, agentVersion, updateBusy, dashboardEnabled, o
 }
 
 function pageLabel(page: PageKey) {
-  return ({ dashboard: '概览', 'builtin-ai': 'HiMind AI', approvals: '审批', ai: 'AI 连接', skills: '技能', plugins: '插件', development: '扩展', settings: '设置', logs: '日志' } as Record<PageKey, string>)[page];
+  return ({ dashboard: '概览', 'builtin-ai': 'HiMind AI', approvals: '审批', ai: 'AI 连接', skills: '技能', workflows: '工作流', plugins: '插件', development: '扩展', settings: '设置', logs: '日志' } as Record<PageKey, string>)[page];
 }
 
 export function Shell({ currentPage, approvalCount, identity, dashboardEnabled, agentVersion, updateBusy, currentTask, quickPluginViews, onLoadTaskHistory, onNavigate, onOpenPluginView, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onQuit, children }: ShellProps) {
