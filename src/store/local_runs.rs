@@ -490,6 +490,25 @@ impl LocalRunLedger {
         Ok(())
     }
 
+    pub(crate) fn mark_projection_dead_letter(
+        &self,
+        id: i64,
+        error: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE projection_outbox
+             SET status = 'dead_letter',
+                 attempts = attempts + 1,
+                 next_attempt_at = '',
+                 last_error = ?2,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![id, error, unix_now_string()],
+        )?;
+        Ok(())
+    }
+
     fn connection(&self) -> Result<Connection, Box<dyn Error>> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -737,6 +756,28 @@ mod tests {
         assert_eq!(ledger.pending_projections(10).unwrap().len(), 1);
         ledger.mark_projection_projected(first).unwrap();
         assert!(ledger.pending_projections(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn projection_outbox_can_enter_dead_letter() {
+        let ledger = ledger();
+        let payload = json!({"run_id": "run-1"});
+        let id = ledger
+            .enqueue_projection("run_projection", "run-1", "run:run-1", &payload)
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(id, "payload conflict")
+            .unwrap();
+        assert!(ledger.pending_projections(10).unwrap().is_empty());
+        let connection = ledger.connection().unwrap();
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM projection_outbox WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "dead_letter");
     }
 
     #[test]

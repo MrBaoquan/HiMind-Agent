@@ -133,6 +133,25 @@ pub(crate) fn start_background_services(
     // HiMind enrollment before serving the Dashboard so ordinary Agent startup
     // restores the persistent provider allowlist automatically.
     if options.mode().dashboard_enabled() {
+        let projection_options = options.clone();
+        let _ = thread::Builder::new()
+            .name("himind-agent-core-projection-loop".to_string())
+            .spawn(move || loop {
+                match crate::agent_core_projection::flush_pending_projections(&projection_options) {
+                    Ok(report) if report != Default::default() => {
+                        eprintln!(
+                            "agent core projections projected={} retried={} dead_letter={} skipped={}",
+                            report.projected,
+                            report.retried,
+                            report.dead_letter,
+                            report.skipped
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("agent core projection flush failed: {error}"),
+                }
+                thread::sleep(Duration::from_secs(30));
+            });
         let reconcile_options = options.clone();
         let _ = thread::Builder::new()
             .name("himind-vscode-reconcile-loop".to_string())

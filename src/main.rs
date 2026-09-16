@@ -16,6 +16,8 @@ use std::time::Duration;
 #[allow(dead_code)]
 mod agent_core_contracts;
 #[allow(dead_code)]
+mod agent_core_projection;
+#[allow(dead_code)]
 mod agent_core_service;
 mod api;
 mod app;
