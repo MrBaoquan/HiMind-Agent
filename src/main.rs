@@ -150,6 +150,11 @@ fn main() {
             eprintln!("plugin command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = workflow_cli_arguments() {
+        if let Err(error) = run_workflow_cli(&arguments) {
+            eprintln!("workflow command failed: {error}");
+            std::process::exit(1);
+        }
     } else if let Some(arguments) = runtime_cli_arguments() {
         if let Err(error) = run_runtime_cli(&options, &arguments) {
             eprintln!("runtime command failed: {error}");
@@ -292,6 +297,37 @@ fn extension_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "extension")?;
     Some(arguments[index + 1..].to_vec())
+}
+
+fn workflow_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "workflow")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_workflow_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action, path] if action == "validate" => {
+            let package = workflow::load_from_directory(PathBuf::from(path).as_path())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "valid": true,
+                    "id": package.id,
+                    "version": package.version,
+                    "name": package.name,
+                    "steps": package.steps.len(),
+                    "artifacts": package.artifacts.len(),
+                    "capabilities": package.capabilities,
+                    "ui": package.ui,
+                }))?
+            );
+        }
+        _ => {
+            return Err("usage: himind-agent workflow validate <package-dir>".into());
+        }
+    }
+    Ok(())
 }
 
 /// Local, scriptable view of the extension sources.
