@@ -5,6 +5,7 @@ use std::collections::HashSet;
 pub(crate) const INTERACTION_ENVELOPE_SCHEMA_VERSION: &str = "interaction_envelope.v1";
 pub(crate) const LOCAL_RUN_SCHEMA_VERSION: &str = "local_run.v1";
 pub(crate) const RUNTIME_EVENT_SCHEMA_VERSION: &str = "runtime_event.v1";
+pub(crate) const RUN_PROJECTION_SCHEMA_VERSION: &str = "run_projection.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -325,6 +326,36 @@ impl RuntimeEvent {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunProjection {
+    pub schema_version: String,
+    pub projection_id: String,
+    pub idempotency_key: String,
+    pub sent_at: String,
+    pub interaction: InteractionEnvelope,
+    pub run: LocalRun,
+}
+
+impl RunProjection {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        require_schema_version(
+            "run projection",
+            &self.schema_version,
+            RUN_PROJECTION_SCHEMA_VERSION,
+        )?;
+        require_text("projection_id", &self.projection_id)?;
+        require_text("idempotency_key", &self.idempotency_key)?;
+        require_text("sent_at", &self.sent_at)?;
+        self.interaction.validate()?;
+        self.run.validate()?;
+        if self.run.interaction_id != self.interaction.interaction_id {
+            return Err("run projection interaction identity does not match".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn require_schema_version(name: &str, actual: &str, expected: &str) -> Result<(), String> {
     if actual != expected {
         return Err(format!(
@@ -441,6 +472,7 @@ mod tests {
             include_str!("../contracts/agent-core/v1/interaction-envelope.schema.json"),
             include_str!("../contracts/agent-core/v1/local-run.schema.json"),
             include_str!("../contracts/agent-core/v1/runtime-event.schema.json"),
+            include_str!("../contracts/agent-core/v1/run-projection.schema.json"),
             include_str!("../contracts/agent-core/v1/connector-manifest.schema.json"),
             include_str!("../contracts/agent-core/v1/workflow-package.schema.json"),
         ] {

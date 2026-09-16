@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/run-projection.schema.json",
+  "title": "HiMind Run Projection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "projection_id",
+    "idempotency_key",
+    "sent_at",
+    "interaction",
+    "run"
+  ],
+  "properties": {
+    "schema_version": { "const": "run_projection.v1" },
+    "projection_id": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "sent_at": { "type": "string", "minLength": 1 },
+    "interaction": { "$ref": "interaction-envelope.schema.json" },
+    "run": { "$ref": "local-run.schema.json" }
+  }
+}
