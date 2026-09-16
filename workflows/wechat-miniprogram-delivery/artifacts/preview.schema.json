@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WeChat Mini Program Preview",
+  "type": "object",
+  "required": ["app_id", "version", "commit_sha", "preview_artifact_id"],
+  "properties": {
+    "app_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "commit_sha": { "type": "string", "minLength": 1 },
+    "preview_artifact_id": { "type": "string", "minLength": 1 },
+    "expires_at": { "type": "string" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WeChat Mini Program Release",
+  "type": "object",
+  "required": ["app_id", "version", "commit_sha", "release_status"],
+  "properties": {
+    "app_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "commit_sha": { "type": "string", "minLength": 1 },
+    "release_status": {
+      "enum": ["preview", "experience", "review_pending", "review_submitted", "released", "rolled_back"]
+    },
+    "platform_evidence": { "type": "string" },
+    "rollback_target": { "type": "string" }
+  },
+  "additionalProperties": false
+}

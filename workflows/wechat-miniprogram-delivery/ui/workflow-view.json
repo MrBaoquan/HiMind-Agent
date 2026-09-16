@@ -1,0 +1,28 @@
+{
+  "schema_version": "workflow_view.v1",
+  "title": "微信小程序开发闭环",
+  "sections": [
+    {
+      "id": "application",
+      "title": "应用与仓库",
+      "fields": ["app_id", "repository_ref", "branch", "environment", "commit_sha"]
+    },
+    {
+      "id": "verification",
+      "title": "测试与构建",
+      "artifacts": ["test-report", "preview"]
+    },
+    {
+      "id": "release",
+      "title": "体验版与发布",
+      "artifacts": ["experience-version", "release-record"]
+    }
+  ],
+  "actions": [
+    "preview",
+    "upload_experience",
+    "prepare_review",
+    "record_release",
+    "rollback"
+  ]
+}

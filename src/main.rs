@@ -38,6 +38,8 @@ mod store;
 mod svn;
 mod upload;
 mod worker;
+#[allow(dead_code)]
+mod workflow;
 
 use api::client::{is_task_canceled_error, TaskCancelGuard};
 use api::types::Task;
