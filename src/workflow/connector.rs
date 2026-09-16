@@ -84,6 +84,43 @@ impl WorkflowConnectorManifest {
                 return Err(format!("connector {} capabilities are invalid", self.id));
             }
         }
+        if !self.health_check.is_null() {
+            let health = self
+                .health_check
+                .as_object()
+                .ok_or_else(|| format!("connector {} health_check must be an object", self.id))?;
+            if !health.is_empty() {
+                let check_type = health
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match check_type {
+                    "capability" => {
+                        let target = health
+                            .get("target")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                format!("connector {} health_check target is required", self.id)
+                            })?;
+                        if !capability_ids.contains(target) {
+                            return Err(format!(
+                                "connector {} health_check target is not declared: {target}",
+                                self.id
+                            ));
+                        }
+                    }
+                    "none" => {}
+                    _ => {
+                        return Err(format!(
+                            "connector {} health_check type is invalid: {check_type}",
+                            self.id
+                        ))
+                    }
+                }
+            }
+        }
         let mut credential_handles = std::collections::HashSet::new();
         for credential in &self.credentials {
             validate_identifier("connector credential handle", &credential.handle)?;
@@ -182,5 +219,15 @@ mod tests {
             }],
         };
         manifest.validate().unwrap();
+
+        let mut invalid = manifest.clone();
+        invalid.health_check = serde_json::json!({
+            "type": "capability",
+            "target": "wechat.miniprogram.upload"
+        });
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .contains("health_check target is not declared"));
     }
 }

@@ -30,6 +30,7 @@ pub(crate) struct WorkflowConnectorPreflight {
     pub available: bool,
     pub availability: String,
     pub credential_ownership: String,
+    pub health_check: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -145,6 +146,12 @@ pub(crate) fn preflight(
                 available,
                 availability: connector.availability.clone(),
                 credential_ownership: connector.credential_ownership.clone(),
+                health_check: connector
+                    .health_check
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none")
+                    .to_string(),
             }
         })
         .collect::<Vec<_>>();
