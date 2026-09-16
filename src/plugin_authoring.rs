@@ -286,7 +286,7 @@ pub(crate) fn test(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dy
         fs::remove_dir_all(&root)?;
     }
     extract_and_validate(&draft.candidate_path, &root, &draft.manifest)?;
-    let mut registry_snapshot = DevelopmentRegistrySnapshot::capture()?;
+    let mut registry_snapshot = DevelopmentRegistrySnapshot::capture(&draft.manifest.id)?;
     crate::capability::plugin::register_development_plugin(&root)?;
     // Candidate tests use an isolated development registration only for the
     // duration of validation.  Do not leave a stale registry entry after the
@@ -372,14 +372,25 @@ fn development_registry_path_for_test() -> PathBuf {
 struct DevelopmentRegistrySnapshot {
     path: PathBuf,
     content: Option<Vec<u8>>,
+    health_path: PathBuf,
+    health_content: Option<Vec<u8>>,
     armed: bool,
 }
 
 impl DevelopmentRegistrySnapshot {
-    fn capture() -> Result<Self, Box<dyn Error>> {
+    fn capture(plugin_id: &str) -> Result<Self, Box<dyn Error>> {
         let path = development_registry_path_for_test();
+        // A candidate test registers the draft as a development plugin.  Any
+        // health record left behind by that attempt would otherwise make the
+        // next real activation look like a previously failing plugin, so it is
+        // captured and restored together with the registry file.
+        let health_path = path
+            .with_file_name("plugin-development-health")
+            .join(format!("{plugin_id}.json"));
         Ok(Self {
             content: fs::read(&path).ok(),
+            health_content: fs::read(&health_path).ok(),
+            health_path,
             path,
             armed: true,
         })
@@ -402,6 +413,19 @@ impl DevelopmentRegistrySnapshot {
             None => {
                 if self.path.exists() {
                     fs::remove_file(&self.path)?;
+                }
+            }
+        }
+        match self.health_content.as_deref() {
+            Some(content) => {
+                if let Some(parent) = self.health_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&self.health_path, content)?;
+            }
+            None => {
+                if self.health_path.exists() {
+                    fs::remove_file(&self.health_path)?;
                 }
             }
         }

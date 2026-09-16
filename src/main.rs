@@ -127,6 +127,11 @@ fn main() {
             eprintln!("auth command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = extension_cli_arguments() {
+        if let Err(error) = run_extension_cli(&arguments) {
+            eprintln!("extension command failed: {error}");
+            std::process::exit(1);
+        }
     } else if let Some(arguments) = skill_cli_arguments() {
         if let Err(error) = run_skill_cli(&options, &arguments) {
             eprintln!("skill command failed: {error}");
@@ -273,6 +278,110 @@ fn skill_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "skill")?;
     Some(arguments[index + 1..].to_vec())
+}
+
+fn extension_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "extension")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+/// Local, scriptable view of the extension sources.
+///
+/// The development workspace is driven from the UI, but source management is
+/// also needed from shells and verification scripts: listing and refreshing the
+/// snapshot, adding or removing a source, planning an install and reading
+/// provenance.  Every action returns the same JSON the UI consumes.
+fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [source, action] if source == "source" && action == "list" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::extension_source::settings()?)?
+            );
+        }
+        [source, action] if source == "source" && action == "refresh" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::extension_source::refresh_snapshot()?)?
+            );
+        }
+        [source, action, name, repository, reference] if source == "source" && action == "add" => {
+            let settings =
+                app::extension_source::add_github_source(name, repository, reference, None, None)?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        [source, action, name, repository, reference, catalog_path]
+            if source == "source" && action == "add" =>
+        {
+            let settings = app::extension_source::add_github_source(
+                name,
+                repository,
+                reference,
+                Some(catalog_path),
+                None,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        [source, action, name, repository, reference, catalog_path, verification]
+            if source == "source" && action == "add" =>
+        {
+            let settings = app::extension_source::add_github_source(
+                name,
+                repository,
+                reference,
+                Some(catalog_path),
+                Some(verification),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        [source, action, source_id] if source == "source" && action == "remove" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::extension_source::remove_source(source_id)?)?
+            );
+        }
+        [source, action, kind, id] if source == "source" && action == "plan" => {
+            let value = match kind.as_str() {
+                "plugin" => serde_json::to_value(app::extension_source::plan_plugin(id, None)?)?,
+                "skill" => serde_json::to_value(app::extension_source::plan_skill(id, None)?)?,
+                _ => return Err("扩展类型必须是 plugin 或 skill".into()),
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        [source, action, kind, id] | [source, action, kind, id, _]
+            if source == "source" && action == "install" =>
+        {
+            let version = arguments.get(4).map(String::as_str);
+            let value = match kind.as_str() {
+                "plugin" => {
+                    serde_json::to_value(app::extension_source::install_plugin(id, version)?)?
+                }
+                "skill" => {
+                    let (catalog_item, record) = app::extension_source::install_skill(id, version)?;
+                    serde_json::json!({ "catalog_item": catalog_item, "record": record })
+                }
+                _ => return Err("扩展类型必须是 plugin 或 skill".into()),
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        [source, action] if source == "source" && action == "provenance" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::extension_source::list_provenance()?)?
+            );
+        }
+        [source, action] if source == "source" && action == "update" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::extension_source::reconcile_auto_updates()?)?
+            );
+        }
+        _ => {
+            return Err("usage: himind-agent extension source <list|refresh|add name github-url [ref] [catalog-path] [required|optional]|remove source-id|plan plugin|skill id|install plugin|skill id [version]|provenance|update>".into());
+        }
+    }
+    Ok(())
 }
 
 fn runtime_cli_arguments() -> Option<Vec<String>> {

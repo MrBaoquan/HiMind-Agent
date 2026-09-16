@@ -946,6 +946,7 @@ fn rollback_root_with_lock(
         &previous_manifest,
         "local_rollback",
     )?;
+    crate::capability::service::invalidate_capability_discovery();
     Ok(())
 }
 
@@ -959,11 +960,15 @@ pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
         return Err("核心或组织管理插件不允许卸载".into());
     }
     ensure_plugin_not_referenced(&root)?;
-    if root.exists() {
+    let existed = root.exists();
+    if existed {
         fs::remove_dir_all(root)?;
     }
     remove_owner_references(&format!("plugin:{plugin_id}"));
     let _ = crate::app::extension_lock::remove("plugin", plugin_id);
+    if existed {
+        crate::capability::service::invalidate_capability_discovery();
+    }
     Ok(())
 }
 
@@ -973,11 +978,15 @@ pub(crate) fn remove_for_policy(plugin_id: &str) -> Result<(), Box<dyn Error>> {
     }
     let root = plugin_root(plugin_id)?;
     ensure_plugin_not_referenced(&root)?;
-    if root.exists() {
+    let existed = root.exists();
+    if existed {
         fs::remove_dir_all(root)?;
     }
     remove_owner_references(&format!("plugin:{plugin_id}"));
     let _ = crate::app::extension_lock::remove("plugin", plugin_id);
+    if existed {
+        crate::capability::service::invalidate_capability_discovery();
+    }
     Ok(())
 }
 
@@ -1006,6 +1015,7 @@ pub(crate) fn apply_effective_policy(
             "allow_uninstall": allow_uninstall,
         }))?,
     )?;
+    crate::capability::service::invalidate_capability_discovery();
     Ok(())
 }
 
@@ -1030,6 +1040,7 @@ pub(crate) fn set_enabled(plugin_id: &str, enabled: bool) -> Result<(), Box<dyn 
     } else {
         fs::write(marker, b"disabled")?;
     }
+    crate::capability::service::invalidate_capability_discovery();
     Ok(())
 }
 

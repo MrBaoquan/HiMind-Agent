@@ -1480,6 +1480,9 @@ pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport,
             other => report.errors.push(format!("不支持的扩展类型: {other}")),
         }
     }
+    if !report.plugins.is_empty() {
+        crate::capability::service::invalidate_capability_discovery();
+    }
     Ok(report)
 }
 

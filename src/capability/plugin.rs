@@ -186,6 +186,14 @@ fn register_development_plugin_at(
         path: root.to_string_lossy().to_string(),
     });
     write_development_plugins_at(registry_path, &entries)?;
+    // A development registration changes the discoverable capability set, and
+    // carrying a previous health record forward would hide the new build.
+    clear_plugin_health(
+        &registry_path
+            .with_file_name("plugin-development-health")
+            .join(format!("{}.json", manifest.id)),
+    );
+    crate::capability::service::invalidate_capability_discovery();
     Ok(manifest.id)
 }
 
@@ -198,8 +206,14 @@ fn unregister_development_plugin_at(
     registry_path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
     let mut entries = development_plugins_at(registry_path);
+    let original_len = entries.len();
     entries.retain(|entry| entry.id != plugin_id);
-    write_development_plugins_at(registry_path, &entries)
+    let changed = entries.len() != original_len;
+    write_development_plugins_at(registry_path, &entries)?;
+    if changed {
+        crate::capability::service::invalidate_capability_discovery();
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -908,6 +922,7 @@ fn write_plugin_health(
 
 fn record_plugin_failure(root: &std::path::Path, error: &str) {
     let mut health = read_plugin_health(root);
+    let was_unhealthy = health.failure_count >= PLUGIN_FAILURE_THRESHOLD;
     health.failure_count = health
         .failure_count
         .saturating_add(1)
@@ -918,6 +933,10 @@ fn record_plugin_failure(root: &std::path::Path, error: &str) {
         .map(|value| value.as_secs());
     health.last_error = Some(error.chars().take(2048).collect());
     let _ = write_plugin_health(root, &health);
+    if !was_unhealthy && health.failure_count >= PLUGIN_FAILURE_THRESHOLD {
+        // The plugin just crossed into the unavailable state.
+        crate::capability::service::invalidate_capability_discovery();
+    }
 }
 
 fn clear_plugin_health(root: &std::path::Path) {
@@ -932,6 +951,7 @@ pub(crate) fn reset_plugin_health(plugin_id: &str) -> Result<(), Box<dyn Error>>
             .with_file_name("plugin-development-health")
             .join(format!("{plugin_id}.json")),
     );
+    crate::capability::service::invalidate_capability_discovery();
     Ok(())
 }
 

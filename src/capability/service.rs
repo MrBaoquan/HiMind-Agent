@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,19 @@ use crate::{Options, VERSION};
 
 const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// Bumped whenever the discoverable capability set changes.
+///
+/// The registry cache lives on the Gateway instance, while the mutating call
+/// sites (plugin install/uninstall/rollback, MCP server add/remove, extension
+/// source install) are free functions without access to it.  A process-wide
+/// epoch lets those paths announce the change so the next capability listing
+/// rebuilds instead of waiting out `REGISTRY_CACHE_TTL`.
+static CAPABILITY_DISCOVERY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn invalidate_capability_discovery() {
+    CAPABILITY_DISCOVERY_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 #[derive(Clone)]
 pub(crate) struct CapabilityGateway {
     options: Options,
@@ -63,6 +77,7 @@ pub(crate) struct CapabilityGateway {
 #[derive(Default)]
 struct RegistryCache {
     revision: u64,
+    epoch: u64,
     refreshed_at: Option<Instant>,
     registry: Option<BTreeMap<String, CapabilityRegistration>>,
 }
@@ -434,9 +449,20 @@ impl CapabilityGateway {
                     .registry_cache
                     .lock()
                     .map_err(|_| "capability registry cache lock poisoned")?;
+                // The discovery epoch is process-wide, so in a test binary every
+                // other test that mutates plugins or MCP servers would knock
+                // this cache out from under the test currently running.  Tests
+                // therefore keep the plain TTL behaviour and assert the epoch
+                // contract directly instead.
+                #[cfg(not(test))]
+                let epoch_current =
+                    cache.epoch == CAPABILITY_DISCOVERY_EPOCH.load(Ordering::Acquire);
+                #[cfg(test)]
+                let epoch_current = true;
                 if cache
                     .refreshed_at
                     .is_some_and(|refreshed_at| refreshed_at.elapsed() < REGISTRY_CACHE_TTL)
+                    && epoch_current
                 {
                     if let Some(registry) = cache.registry.as_ref() {
                         return Ok(registry.clone());
@@ -457,6 +483,7 @@ impl CapabilityGateway {
             if cache.revision != revision {
                 continue;
             }
+            cache.epoch = CAPABILITY_DISCOVERY_EPOCH.load(Ordering::Acquire);
             cache.refreshed_at = Some(Instant::now());
             cache.registry = Some(registry.clone());
             return Ok(registry);
@@ -5376,6 +5403,28 @@ mod tests {
             parse_capability_catalog_cursor(Some(&cursor), generation, "sha256:other").is_err()
         );
         assert!(parse_capability_catalog_cursor(Some("offset:20"), generation, filters).is_err());
+    }
+
+    #[test]
+    fn capability_discovery_invalidation_advances_the_epoch() {
+        let before = CAPABILITY_DISCOVERY_EPOCH.load(Ordering::Acquire);
+        invalidate_capability_discovery();
+        let after = CAPABILITY_DISCOVERY_EPOCH.load(Ordering::Acquire);
+        assert!(
+            after > before,
+            "expected a newer discovery epoch, got {after} (before {before})"
+        );
+    }
+
+    #[test]
+    fn plugin_mutation_paths_announce_a_capability_change() {
+        let before = CAPABILITY_DISCOVERY_EPOCH.load(Ordering::Acquire);
+        crate::capability::plugin::reset_plugin_health("himind-test-absent-plugin").unwrap();
+        let after = CAPABILITY_DISCOVERY_EPOCH.load(Ordering::Acquire);
+        assert!(
+            after > before,
+            "plugin health reset must invalidate capability discovery"
+        );
     }
 
     #[test]

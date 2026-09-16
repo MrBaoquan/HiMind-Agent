@@ -34,6 +34,7 @@ type DevelopmentPageProps = {
   extensionSourceSnapshot: ExtensionSourceSnapshot | null;
   extensionSourcesLoading: boolean;
   extensionSourcesError: string;
+  projectsError: string;
   projects: ExtensionProject[];
   remoteProjects: ExtensionRemoteProject[];
   pluginDrafts: AuthoringPluginDraft[];
@@ -108,6 +109,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
       </div>
       <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索项目" /></label>
     </div>
+    {props.projectsError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>工程列表读取失败</strong><span>{props.projectsError}</span></div><button className="btn" onClick={props.onRefresh}>重试</button></div> : null}
     <section className={`development-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
       <aside className="development-project-list">
         <div className="development-list-heading"><strong>项目</strong><span>{visible.length}</span></div>

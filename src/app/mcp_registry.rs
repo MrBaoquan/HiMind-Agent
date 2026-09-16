@@ -266,6 +266,7 @@ pub(crate) fn upsert(
     server: McpServerSpec,
 ) -> Result<McpServerSpec, Box<dyn Error>> {
     let config = mcp_settings::upsert(agent_state_path, server.into_config())?;
+    crate::capability::service::invalidate_capability_discovery();
     Ok(McpServerSpec::from_config(config))
 }
 
@@ -277,7 +278,11 @@ pub(crate) fn upsert_config(
 }
 
 pub(crate) fn remove(agent_state_path: &Path, stable_id: &str) -> Result<bool, Box<dyn Error>> {
-    Ok(mcp_settings::remove(agent_state_path, stable_id)?)
+    let removed = mcp_settings::remove(agent_state_path, stable_id)?;
+    if removed {
+        crate::capability::service::invalidate_capability_discovery();
+    }
+    Ok(removed)
 }
 
 pub(crate) fn remove_config(

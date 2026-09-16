@@ -86,6 +86,7 @@ function App() {
   const [extensionSourceSnapshot, setExtensionSourceSnapshot] = useState<ExtensionSourceSnapshot | null>(null);
   const [extensionSourcesLoading, setExtensionSourcesLoading] = useState(false);
   const [extensionSourcesError, setExtensionSourcesError] = useState('');
+  const [extensionProjectsError, setExtensionProjectsError] = useState('');
   const [extensionRemoteProjects, setExtensionRemoteProjects] = useState<ExtensionRemoteProject[]>([]);
   const [extensionInvitations, setExtensionInvitations] = useState<ExtensionCollaborationInvitation[]>([]);
   const [developmentOperation, setDevelopmentOperation] = useState<string | null>(null);
@@ -223,7 +224,13 @@ function App() {
   }
   async function refreshLogs() { setLogs(await agentApi.logs()); }
   async function refreshExtensionProjects() {
-    setExtensionProjects(await agentApi.extensionProjects());
+    try {
+      setExtensionProjects(await agentApi.extensionProjects());
+      setExtensionProjectsError('');
+    } catch (error) {
+      setExtensionProjectsError(formatError(error, '扩展项目读取失败'));
+      throw error;
+    }
     try { setExtensionRemoteProjects(await agentApi.extensionCollaborationProjects()); }
     catch { setExtensionRemoteProjects([]); }
   }
@@ -368,7 +375,17 @@ function App() {
     ]);
     try { setExtensionWorkspace(await agentApi.extensionWorkspace()); }
     catch (error) { console.error('Extension workspace unavailable', error); }
-    if (projects.status === 'fulfilled') setExtensionProjects(projects.value || []);
+    if (projects.status === 'fulfilled') {
+      setExtensionProjects(projects.value || []);
+      setExtensionProjectsError('');
+    } else {
+      // Keep the failure visible on the page: the project list is the entry
+      // point of the development workspace, so a silent empty list looks like
+      // "no projects" instead of a broken Agent call.
+      setExtensionProjectsError(
+        formatError(projects.reason, '扩展项目读取失败'),
+      );
+    }
     if (pluginDraftResult.status === 'fulfilled') setPluginDrafts(pluginDraftResult.value || []);
     if (skillDraftResult.status === 'fulfilled') setSkillDrafts(skillDraftResult.value || []);
     if (!dashboardEnabled()) {
@@ -1100,6 +1117,7 @@ function App() {
       extensionSourceSnapshot={extensionSourceSnapshot}
       extensionSourcesLoading={extensionSourcesLoading}
       extensionSourcesError={extensionSourcesError}
+      projectsError={extensionProjectsError}
       projects={extensionProjects}
       remoteProjects={extensionRemoteProjects}
       invitations={extensionInvitations}
