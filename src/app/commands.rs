@@ -3753,8 +3753,19 @@ fn resume_workflow_with_gateway(
         crate::capability::types::InvocationSource::Workflow,
         "workflow-ui",
     );
-    let report =
-        crate::workflow::preflight(&package, VERSION, &gateway.list_capabilities(&context)?);
+    let capabilities = gateway.list_capabilities(&context)?;
+    let probe_context = context.clone().without_agent_core_run();
+    let report = crate::workflow::preflight_with_connector_probes(
+        &package,
+        VERSION,
+        &capabilities,
+        &input,
+        |capability_id, input| {
+            let mut context = probe_context.clone();
+            context.request_id = format!("{}:health:{capability_id}", context.request_id);
+            gateway.invoke(&context, capability_id, input)
+        },
+    );
     if !report.ready {
         return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
     }
@@ -3779,8 +3790,19 @@ fn start_workflow_with_gateway(
         crate::capability::types::InvocationSource::Workflow,
         "workflow-ui",
     );
-    let report =
-        crate::workflow::preflight(&package, VERSION, &gateway.list_capabilities(&context)?);
+    let capabilities = gateway.list_capabilities(&context)?;
+    let probe_context = context.clone().without_agent_core_run();
+    let report = crate::workflow::preflight_with_connector_probes(
+        &package,
+        VERSION,
+        &capabilities,
+        &input,
+        |capability_id, input| {
+            let mut context = probe_context.clone();
+            context.request_id = format!("{}:health:{capability_id}", context.request_id);
+            gateway.invoke(&context, capability_id, input)
+        },
+    );
     if !report.ready {
         return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
     }

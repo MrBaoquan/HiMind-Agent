@@ -375,7 +375,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                 }))?
             );
         }
-        [action, reference] if action == "doctor" => {
+        [action, reference] | [action, reference, _] if action == "doctor" => {
             let store = workflow::WorkflowStore::open_default()?;
             let package = workflow_package_from_reference(&store, reference)?;
             let gateway = CapabilityGateway::new(
@@ -384,14 +384,29 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                     store::types::LocalWorkerStatus::default(),
                 )),
             );
-            let report = workflow::preflight(
-                &package,
-                VERSION,
-                &gateway.list_capabilities(&capability::types::InvocationContext::new(
-                    capability::types::InvocationSource::Cli,
-                    "workflow-doctor",
-                ))?,
+            let context = capability::types::InvocationContext::new(
+                capability::types::InvocationSource::Cli,
+                "workflow-doctor",
             );
+            let capabilities = gateway.list_capabilities(&context)?;
+            let report = if arguments.len() > 2 {
+                let input = workflow_cli_input(arguments.get(2))?;
+                let probe_context = context.clone().without_agent_core_run();
+                workflow::preflight_with_connector_probes(
+                    &package,
+                    VERSION,
+                    &capabilities,
+                    &input,
+                    |capability_id, input| {
+                        let mut context = probe_context.clone();
+                        context.request_id =
+                            format!("{}:health:{capability_id}", context.request_id);
+                        gateway.invoke(&context, capability_id, input)
+                    },
+                )
+            } else {
+                workflow::preflight(&package, VERSION, &capabilities)
+            };
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.ready {
                 return Err("workflow preflight failed".into());
@@ -538,7 +553,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <validate <dir>|doctor <dir|id>|install <dir> [--require-signature]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <validate <dir>|doctor <dir|id> [input-json|@file]|install <dir> [--require-signature]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }
@@ -595,7 +610,19 @@ fn run_workflow_package(
         capability::types::InvocationSource::Workflow,
         "workflow-runner",
     );
-    let report = workflow::preflight(package, VERSION, &gateway.list_capabilities(&context)?);
+    let capabilities = gateway.list_capabilities(&context)?;
+    let probe_context = context.clone().without_agent_core_run();
+    let report = workflow::preflight_with_connector_probes(
+        package,
+        VERSION,
+        &capabilities,
+        &input,
+        |capability_id, input| {
+            let mut context = probe_context.clone();
+            context.request_id = format!("{}:health:{capability_id}", context.request_id);
+            gateway.invoke(&context, capability_id, input)
+        },
+    );
     if !report.ready {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Err("workflow preflight failed".into());

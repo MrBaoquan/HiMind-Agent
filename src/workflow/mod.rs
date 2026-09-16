@@ -27,8 +27,8 @@ pub(crate) use connector::{
 pub(crate) use executor::WorkflowGatewayExecutor;
 #[allow(unused_imports)]
 pub(crate) use preflight::{
-    preflight, WorkflowCapabilityPreflight, WorkflowConnectorPreflight, WorkflowPreflight,
-    WorkflowToolPreflight,
+    preflight, preflight_with_connector_probes, probe_connectors, WorkflowCapabilityPreflight,
+    WorkflowConnectorPreflight, WorkflowConnectorProbe, WorkflowPreflight, WorkflowToolPreflight,
 };
 #[allow(unused_imports)]
 pub(crate) use runner::{

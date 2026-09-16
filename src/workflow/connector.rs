@@ -110,6 +110,14 @@ impl WorkflowConnectorManifest {
                                 self.id
                             ));
                         }
+                        if let Some(input) = health.get("input") {
+                            if !input.is_object() {
+                                return Err(format!(
+                                    "connector {} health_check input must be an object",
+                                    self.id
+                                ));
+                            }
+                        }
                     }
                     "none" => {}
                     _ => {

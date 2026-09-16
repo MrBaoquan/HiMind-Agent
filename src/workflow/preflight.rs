@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
+use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use super::WorkflowPackage;
@@ -31,6 +32,17 @@ pub(crate) struct WorkflowConnectorPreflight {
     pub availability: String,
     pub credential_ownership: String,
     pub health_check: String,
+    pub health_target: String,
+    pub health_status: String,
+    pub health_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkflowConnectorProbe {
+    pub id: String,
+    pub status: String,
+    pub target: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -152,6 +164,23 @@ pub(crate) fn preflight(
                     .and_then(Value::as_str)
                     .unwrap_or("none")
                     .to_string(),
+                health_target: connector
+                    .health_check
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                health_status: if connector
+                    .health_check
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == "capability")
+                {
+                    "not_run".to_string()
+                } else {
+                    "not_configured".to_string()
+                },
+                health_message: String::new(),
             }
         })
         .collect::<Vec<_>>();
@@ -222,6 +251,162 @@ pub(crate) fn preflight(
         blockers,
         warnings,
     }
+}
+
+pub(crate) fn preflight_with_connector_probes<F>(
+    package: &WorkflowPackage,
+    agent_version: &str,
+    available_capabilities: &[CapabilityDescriptor],
+    input: &Value,
+    invoke: F,
+) -> WorkflowPreflight
+where
+    F: FnMut(&str, Value) -> Result<Value, Box<dyn Error>>,
+{
+    let mut report = preflight(package, agent_version, available_capabilities);
+    let probes = probe_connectors(package, available_capabilities, input, invoke);
+    apply_connector_probes(&mut report, &probes);
+    report
+}
+
+pub(crate) fn probe_connectors<F>(
+    package: &WorkflowPackage,
+    available_capabilities: &[CapabilityDescriptor],
+    input: &Value,
+    mut invoke: F,
+) -> Vec<WorkflowConnectorProbe>
+where
+    F: FnMut(&str, Value) -> Result<Value, Box<dyn Error>>,
+{
+    let capability_map = available_capabilities
+        .iter()
+        .map(|capability| (capability.id.as_str(), capability))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    package
+        .connectors
+        .iter()
+        .map(|connector| {
+            let health = connector.health_check.as_object();
+            let check_type = health
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            if check_type != "capability" {
+                return WorkflowConnectorProbe {
+                    id: connector.id.clone(),
+                    status: "not_configured".to_string(),
+                    target: String::new(),
+                    message: String::new(),
+                };
+            }
+            let target = health
+                .and_then(|value| value.get("target"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let Some(capability) = capability_map.get(target.as_str()).copied() else {
+                return WorkflowConnectorProbe {
+                    id: connector.id.clone(),
+                    status: "failed".to_string(),
+                    target,
+                    message: "health target capability is unavailable".to_string(),
+                };
+            };
+            let effective_risk = crate::approval::policy::effective_risk_level(
+                &capability.id,
+                &capability.risk_level,
+            );
+            if crate::approval::policy::risk_rank(effective_risk)
+                > crate::approval::policy::risk_rank("R1")
+            {
+                return WorkflowConnectorProbe {
+                    id: connector.id.clone(),
+                    status: "failed".to_string(),
+                    target,
+                    message: format!(
+                        "health target capability must be read_only/R1, got {effective_risk}"
+                    ),
+                };
+            }
+            let probe_input = connector_health_input(
+                &capability.input_schema,
+                input,
+                health.and_then(|value| value.get("input")),
+            );
+            match invoke(&target, probe_input) {
+                Ok(_) => WorkflowConnectorProbe {
+                    id: connector.id.clone(),
+                    status: "passed".to_string(),
+                    target,
+                    message: String::new(),
+                },
+                Err(error) => WorkflowConnectorProbe {
+                    id: connector.id.clone(),
+                    status: "failed".to_string(),
+                    target,
+                    message: error.to_string(),
+                },
+            }
+        })
+        .collect()
+}
+
+fn apply_connector_probes(report: &mut WorkflowPreflight, probes: &[WorkflowConnectorProbe]) {
+    for probe in probes {
+        if let Some(connector) = report
+            .connectors
+            .iter_mut()
+            .find(|connector| connector.id == probe.id)
+        {
+            connector.health_status = probe.status.clone();
+            connector.health_target = probe.target.clone();
+            connector.health_message = probe.message.clone();
+        }
+        if probe.status == "failed" {
+            report.blockers.push(format!(
+                "connector {} health probe failed: {}",
+                probe.id,
+                if probe.message.trim().is_empty() {
+                    "unknown error"
+                } else {
+                    probe.message.as_str()
+                }
+            ));
+        }
+    }
+    report.ready = report.blockers.is_empty();
+}
+
+fn connector_health_input(
+    schema: &Value,
+    workflow_input: &Value,
+    health_input: Option<&Value>,
+) -> Value {
+    let mut input = workflow_input.as_object().cloned().unwrap_or_default();
+    if let Some(overrides) = health_input.and_then(Value::as_object) {
+        input.extend(overrides.clone());
+    }
+    filter_capability_input(schema, &Value::Object(input))
+}
+
+fn filter_capability_input(schema: &Value, input: &Value) -> Value {
+    let Some(input) = input.as_object() else {
+        return input.clone();
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Value::Object(input.clone());
+    };
+    if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
+        return Value::Object(input.clone());
+    }
+    Value::Object(
+        input
+            .iter()
+            .filter(|(name, _)| properties.contains_key(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 fn required_tools(requirements: &Value) -> Vec<String> {
@@ -375,6 +560,31 @@ mod tests {
         }
     }
 
+    fn connector_health_package(target: &str) -> WorkflowPackage {
+        let mut package = package(Vec::new());
+        package.capabilities = vec![target.to_string()];
+        package.connectors = vec![crate::workflow::WorkflowConnectorManifest {
+            schema_version: crate::workflow::connector::CONNECTOR_MANIFEST_SCHEMA_VERSION
+                .to_string(),
+            id: "test-connector".to_string(),
+            version: "1.0.0".to_string(),
+            name: "Test Connector".to_string(),
+            description: String::new(),
+            availability: "local".to_string(),
+            credential_ownership: "agent".to_string(),
+            auth: vec!["none".to_string()],
+            capabilities: vec![target.to_string()],
+            scopes: Vec::new(),
+            supported_platforms: Vec::new(),
+            health_check: json!({
+                "type": "capability",
+                "target": target
+            }),
+            credentials: Vec::new(),
+        }];
+        package
+    }
+
     #[test]
     fn blocks_missing_capability_and_tool() {
         let report = preflight(
@@ -402,5 +612,80 @@ mod tests {
             &[capability("system.health")],
         );
         assert!(report.ready, "{:?}", report.blockers);
+    }
+
+    #[test]
+    fn connector_health_probe_filters_input_and_records_success() {
+        let mut capability = capability("wechat.miniprogram.project.inspect");
+        capability.input_schema = json!({
+            "type": "object",
+            "properties": {
+                "workspace_root": {"type": "string"},
+                "project_root": {"type": "string"}
+            },
+            "required": ["workspace_root", "project_root"],
+            "additionalProperties": false
+        });
+        let mut observed = Value::Null;
+        let report = preflight_with_connector_probes(
+            &connector_health_package(&capability.id),
+            "0.3.47",
+            &[capability],
+            &json!({
+                "workspace_root": "C:\\workspace",
+                "project_root": "C:\\workspace\\miniprogram",
+                "credential_handles": {"private_key_path": "wechat-key"}
+            }),
+            |target, input| {
+                assert_eq!(target, "wechat.miniprogram.project.inspect");
+                observed = input;
+                Ok(json!({"ok": true}))
+            },
+        );
+        assert!(report.ready, "{:?}", report.blockers);
+        assert_eq!(report.connectors[0].health_status, "passed");
+        assert_eq!(observed["workspace_root"], "C:\\workspace");
+        assert_eq!(observed["project_root"], "C:\\workspace\\miniprogram");
+        assert!(observed.get("credential_handles").is_none());
+    }
+
+    #[test]
+    fn connector_health_probe_failure_blocks_preflight() {
+        let capability = capability("wechat.miniprogram.project.inspect");
+        let report = preflight_with_connector_probes(
+            &connector_health_package(&capability.id),
+            "0.3.47",
+            &[capability],
+            &json!({}),
+            |_, _| Err("plugin failed to start".into()),
+        );
+        assert!(!report.ready);
+        assert_eq!(report.connectors[0].health_status, "failed");
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("plugin failed to start")));
+    }
+
+    #[test]
+    fn connector_health_probe_rejects_mutating_target() {
+        let mut capability = capability("wechat.miniprogram.upload");
+        capability.risk_level = "local_write".to_string();
+        let mut invoked = false;
+        let report = preflight_with_connector_probes(
+            &connector_health_package(&capability.id),
+            "0.3.47",
+            &[capability],
+            &json!({}),
+            |_, _| {
+                invoked = true;
+                Ok(json!({"ok": true}))
+            },
+        );
+        assert!(!invoked);
+        assert!(!report.ready);
+        assert!(report.connectors[0]
+            .health_message
+            .contains("must be read_only"));
     }
 }
