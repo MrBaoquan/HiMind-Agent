@@ -63,6 +63,11 @@ pub(crate) struct WorkflowRunOutcome {
     pub completed_steps: Vec<String>,
 }
 
+enum WorkflowStepOutcome {
+    Execution(WorkflowStepExecution),
+    LoopFeedback { iteration: u32, latest: Value },
+}
+
 pub(crate) struct WorkflowRunner {
     ledger: LocalRunLedger,
 }
@@ -225,6 +230,7 @@ impl WorkflowRunner {
         let mut completed_steps = Vec::new();
 
         loop {
+            self.resume_feedback_loop(package, &mut run)?;
             let Some(step) = next_ready_step(package, &run)? else {
                 let all_succeeded = run.steps.iter().all(|step| {
                     matches!(
@@ -332,10 +338,12 @@ impl WorkflowRunner {
                     &condition_context,
                 )
             } else if step.capability_id.trim().is_empty() && step.approval_required {
-                Ok(WorkflowStepExecution::output(serde_json::json!({
-                    "manual_approved": true,
-                    "step_id": step.id,
-                })))
+                Ok(WorkflowStepOutcome::Execution(
+                    WorkflowStepExecution::output(serde_json::json!({
+                        "manual_approved": true,
+                        "step_id": step.id,
+                    })),
+                ))
             } else {
                 let step_input = execution_input_from_context(
                     package,
@@ -344,7 +352,9 @@ impl WorkflowRunner {
                     &condition_context,
                     step,
                 )?;
-                executor.execute(package, step, &step_input)
+                executor
+                    .execute(package, step, &step_input)
+                    .map(WorkflowStepOutcome::Execution)
             };
             let candidate = candidate_for_step(package, &run, step)?;
             let run_step = run
@@ -354,7 +364,27 @@ impl WorkflowRunner {
                 .ok_or("workflow step state disappeared")?;
             run_step.finished_at = timestamp();
             match result {
-                Ok(execution) => {
+                Ok(WorkflowStepOutcome::LoopFeedback { iteration, latest }) => {
+                    run_step.status = LocalStepStatus::Waiting;
+                    run_step.finished_at = timestamp();
+                    run.status = LocalRunStatus::Waiting;
+                    run.current_step_id = step.id.clone();
+                    run.updated_at = timestamp();
+                    self.persist_run(&run)?;
+                    self.append_event(
+                        &run,
+                        step,
+                        RuntimeEventType::Progress,
+                        serde_json::json!({
+                            "loop_id": step.id,
+                            "iteration": iteration,
+                            "waiting_for_feedback": true,
+                            "latest": latest,
+                        }),
+                    )?;
+                    return Ok(outcome(run, step.id.clone(), completed_steps));
+                }
+                Ok(WorkflowStepOutcome::Execution(execution)) => {
                     let artifacts = normalize_artifacts(
                         package,
                         step,
@@ -436,6 +466,88 @@ impl WorkflowRunner {
         Ok(run)
     }
 
+    fn resume_feedback_loop(
+        &self,
+        package: &WorkflowPackage,
+        run: &mut LocalRun,
+    ) -> Result<(), Box<dyn Error>> {
+        if run.status != LocalRunStatus::Waiting || run.current_step_id.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(step) = package
+            .steps
+            .iter()
+            .find(|step| step.id == run.current_step_id)
+        else {
+            return Ok(());
+        };
+        let Some(loop_config) = step.loop_config.as_ref() else {
+            return Ok(());
+        };
+        if !loop_config.pause_for_feedback || !self.loop_is_waiting_for_feedback(run, &step.id)? {
+            return Ok(());
+        }
+        if let Some(run_step) = run
+            .steps
+            .iter_mut()
+            .find(|candidate| candidate.step_id == step.id)
+        {
+            run_step.status = LocalStepStatus::Pending;
+        }
+        run.status = LocalRunStatus::Queued;
+        run.current_step_id.clear();
+        run.updated_at = timestamp();
+        self.persist_run(run)?;
+        Ok(())
+    }
+
+    fn loop_is_waiting_for_feedback(
+        &self,
+        run: &LocalRun,
+        loop_id: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        Ok(self
+            .ledger
+            .list_events(&run.run_id)?
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type == RuntimeEventType::Progress
+                    && event.payload.get("loop_id").and_then(Value::as_str) == Some(loop_id)
+            })
+            .and_then(|event| {
+                event
+                    .payload
+                    .get("waiting_for_feedback")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false))
+    }
+
+    fn loop_history_from_events(
+        &self,
+        run: &LocalRun,
+        loop_id: &str,
+    ) -> Result<Vec<Value>, Box<dyn Error>> {
+        use std::collections::BTreeMap;
+
+        let mut by_iteration = BTreeMap::new();
+        for event in self.ledger.list_events(&run.run_id)? {
+            if event.event_type != RuntimeEventType::Progress
+                || event.payload.get("loop_id").and_then(Value::as_str) != Some(loop_id)
+            {
+                continue;
+            }
+            let Some(iteration) = event.payload.get("iteration").and_then(Value::as_u64) else {
+                continue;
+            };
+            if let Some(latest) = event.payload.get("latest") {
+                by_iteration.insert(iteration, latest.clone());
+            }
+        }
+        Ok(by_iteration.into_values().collect())
+    }
+
     fn execute_loop_step(
         &self,
         package: &WorkflowPackage,
@@ -445,15 +557,18 @@ impl WorkflowRunner {
         step: &WorkflowStep,
         loop_config: &super::WorkflowLoop,
         base_context: &Value,
-    ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
-        let mut history = Vec::new();
+    ) -> Result<WorkflowStepOutcome, Box<dyn Error>> {
+        let mut history = self.loop_history_from_events(parent_run, &step.id)?;
         let mut artifacts = Vec::new();
         let child_package = WorkflowPackage {
             steps: loop_config.steps.clone(),
             candidate: None,
             ..package.clone()
         };
-        for iteration in 1..=loop_config.max_iterations {
+        let start_iteration = u32::try_from(history.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        for iteration in start_iteration..=loop_config.max_iterations {
             let request_id = run_suffix(&format!(
                 "{}_loop_{}_{}",
                 parent_run.run_id, step.id, iteration
@@ -463,21 +578,34 @@ impl WorkflowRunner {
                 "iteration": iteration,
                 "history": history.clone(),
             });
-            let child_run = self.start_with_parent(
-                "local-agent",
-                &child_package,
-                &request_id,
-                workflow_input,
-                &parent_run.run_id,
-            )?;
-            let outcome = self.run_ready_internal(
-                &child_package,
-                child_run,
-                workflow_input,
-                executor,
-                false,
-                Some(&loop_context),
-            )?;
+            let child_run_id = format!("workflow_run_{request_id}");
+            let child_run = if let Some(existing) = self.ledger.get_run(&child_run_id)? {
+                existing
+            } else {
+                self.start_with_parent(
+                    "local-agent",
+                    &child_package,
+                    &request_id,
+                    workflow_input,
+                    &parent_run.run_id,
+                )?
+            };
+            let outcome = if child_run.status.is_terminal() {
+                WorkflowRunOutcome {
+                    run: child_run,
+                    blocked_step_id: String::new(),
+                    completed_steps: Vec::new(),
+                }
+            } else {
+                self.run_ready_internal(
+                    &child_package,
+                    child_run,
+                    workflow_input,
+                    executor,
+                    false,
+                    Some(&loop_context),
+                )?
+            };
             match outcome.run.status {
                 LocalRunStatus::Succeeded => {}
                 status => {
@@ -530,7 +658,7 @@ impl WorkflowRunner {
                 }),
             )?;
             if should_exit || !should_continue {
-                return Ok(WorkflowStepExecution {
+                return Ok(WorkflowStepOutcome::Execution(WorkflowStepExecution {
                     output: serde_json::json!({
                         "loop_id": step.id,
                         "iterations": history,
@@ -541,7 +669,10 @@ impl WorkflowRunner {
                         .map(local_artifact_to_output)
                         .collect(),
                     usage: None,
-                });
+                }));
+            }
+            if loop_config.pause_for_feedback {
+                return Ok(WorkflowStepOutcome::LoopFeedback { iteration, latest });
             }
         }
         Err(format!(
@@ -1497,6 +1628,7 @@ mod tests {
             runtime: None,
             loop_config: Some(Box::new(super::super::WorkflowLoop {
                 max_iterations: 4,
+                pause_for_feedback: false,
                 continue_when: Some(super::super::WorkflowCondition {
                     operator: "not_equals".to_string(),
                     path: "loops.DEV-LOOP.latest.steps.BODY.feedback.decision".to_string(),

@@ -93,6 +93,7 @@
       "depends_on": ["WX-PREPARE"],
       "loop": {
         "max_iterations": 6,
+        "pause_for_feedback": true,
         "continue_when": {
           "operator": "not_equals",
           "path": "loops.DEV-LOOP.latest.steps.DEV-REVIEW.feedback.decision",

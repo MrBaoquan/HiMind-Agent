@@ -114,6 +114,7 @@
       "required": ["max_iterations", "steps"],
       "properties": {
         "max_iterations": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "pause_for_feedback": { "type": "boolean" },
         "continue_when": { "$ref": "#/$defs/condition" },
         "exit_when": { "$ref": "#/$defs/condition" },
         "steps": {

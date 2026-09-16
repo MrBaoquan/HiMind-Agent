@@ -11,6 +11,7 @@ type WorkflowsPageProps = {
   onLoadRun: (runId: string) => Promise<WorkflowRunSnapshot>;
   onApprove: (runId: string, stepId: string) => Promise<void>;
   onReject: (runId: string, stepId: string) => Promise<void>;
+  onResume: (runId: string) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
 };
 
@@ -41,7 +42,7 @@ function formatTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, onApprove, onReject, onCancel }: WorkflowsPageProps) {
+export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, onApprove, onReject, onResume, onCancel }: WorkflowsPageProps) {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('');
   const [selectedRunId, setSelectedRunId] = useState('');
   const [runDetail, setRunDetail] = useState<WorkflowRunSnapshot | null>(null);
@@ -90,6 +91,12 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, 
   const waiting = runs.filter(item => item.run.status === 'waiting').length;
   const succeeded = runs.filter(item => item.run.status === 'succeeded').length;
   const artifacts = selectedWorkflow?.package.artifacts.length || 0;
+  const waitingForFeedback = Boolean(runDetail && runDetail.run.status === 'waiting' && runDetail.events.some(event =>
+    event.step_id === runDetail.run.current_step_id
+    && typeof event.payload === 'object'
+    && event.payload !== null
+    && (event.payload as { waiting_for_feedback?: boolean }).waiting_for_feedback === true,
+  ));
 
   return (
     <div className="workflow-page">
@@ -187,7 +194,18 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, 
                   <Pill kind={statusKind(runDetail.run.status)}>{statusLabel(runDetail.run.status)}</Pill>
                   <span>{runDetail.run.artifacts.length} Artifact · {runDetail.events.length} Event</span>
                 </div>
-                {runDetail.run.status === 'waiting' && runDetail.run.current_step_id ? (
+                {waitingForFeedback ? (
+                  <div className="workflow-run-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={Boolean(actionBusy)}
+                      onClick={() => void performRunAction(runDetail.run.run_id, 'resume', () => onResume(runDetail.run.run_id))}
+                    >
+                      <CheckCircle2 size={14} />{actionBusy === 'resume' ? '继续中' : '使用当前输入继续'}
+                    </button>
+                  </div>
+                ) : runDetail.run.status === 'waiting' && runDetail.run.current_step_id ? (
                   <div className="workflow-run-actions">
                     <button
                       type="button"

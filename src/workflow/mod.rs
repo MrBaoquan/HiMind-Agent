@@ -133,6 +133,8 @@ pub(crate) struct WorkflowRuntimeStep {
 pub(crate) struct WorkflowLoop {
     pub max_iterations: u32,
     #[serde(default)]
+    pub pause_for_feedback: bool,
+    #[serde(default)]
     pub continue_when: Option<WorkflowCondition>,
     #[serde(default)]
     pub exit_when: Option<WorkflowCondition>,
@@ -846,6 +848,7 @@ mod tests {
         step.capability_id.clear();
         step.loop_config = Some(Box::new(WorkflowLoop {
             max_iterations: 4,
+            pause_for_feedback: false,
             continue_when: Some(WorkflowCondition {
                 operator: "not_equals".to_string(),
                 path: "loops.DEV.latest.feedback".to_string(),
@@ -888,6 +891,7 @@ mod tests {
         step.capability_id.clear();
         step.loop_config = Some(Box::new(WorkflowLoop {
             max_iterations: 4,
+            pause_for_feedback: false,
             continue_when: None,
             exit_when: None,
             steps: vec![WorkflowStep {

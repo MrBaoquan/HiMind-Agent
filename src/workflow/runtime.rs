@@ -25,7 +25,7 @@ pub(crate) fn execute_runtime_step(
     let output = match provider.as_str() {
         "personal.codex" => execute_codex(&workspace, &prompt)?,
         "personal.github-copilot" => execute_copilot(&workspace, &prompt)?,
-        "himind.fixture" => fixture_runtime_output(&step.id),
+        "himind.fixture" => fixture_runtime_output(&step.id, input),
         "himind.builtin" => crate::runtime::deepseek_harness::execute_workflow(
             options.ok_or("himind.builtin runtime step is unavailable without Agent options")?,
             &workspace,
@@ -115,12 +115,23 @@ fn resolve_provider(provider: &str) -> Result<String, Box<dyn Error>> {
     Ok(provider.to_string())
 }
 
-fn fixture_runtime_output(step_id: &str) -> String {
+fn fixture_runtime_output(step_id: &str, input: &Value) -> String {
     if step_id.contains("REVIEW") {
+        let iteration = input
+            .get("workflow_context")
+            .and_then(|context| context.get("loops"))
+            .and_then(|loops| loops.get("DEV-LOOP"))
+            .and_then(|loop_state| loop_state.get("iteration"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
         serde_json::json!({
             "feedback": {
-                "decision": "accepted",
-                "reason": "fixture review accepted the current change"
+                "decision": if iteration >= 2 { "accepted" } else { "rejected" },
+                "reason": if iteration >= 2 {
+                    "fixture review accepted the current change"
+                } else {
+                    "fixture review requests another iteration"
+                }
             }
         })
         .to_string()
