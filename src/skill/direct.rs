@@ -10,6 +10,7 @@ use super::clients::{directory_client, SkillClientDefinition, DIRECTORY_CLIENTS}
 use super::copilot::{self, DirectSkillTarget};
 use crate::skill::resolver::CapabilityFact;
 use crate::skill::store::SkillStore;
+use crate::skill::target::{self, SkillTarget};
 use crate::skill::types::SkillRecord;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -24,7 +25,7 @@ pub(crate) fn status_json(
     let store = SkillStore::new();
     let mut result = BTreeMap::new();
     for definition in DIRECTORY_CLIENTS {
-        let target = resolve_target(&store, definition);
+        let target = resolve_target(&store, definition)?;
         let detected = target_detected(&target, definition);
         let mut status =
             copilot::status_for_target(definition.id, target, agent_version, capability_facts)?;
@@ -59,7 +60,7 @@ pub(crate) fn sync_json(
     let store = SkillStore::new();
     let mut result = BTreeMap::new();
     for definition in DIRECTORY_CLIENTS {
-        let target = resolve_target(&store, definition);
+        let target = resolve_target(&store, definition)?;
         if !target_detected(&target, definition) {
             continue;
         }
@@ -87,7 +88,7 @@ pub(crate) fn sync_record_json(
     copilot::sync_record_for_target(
         definition.id,
         definition.name,
-        resolve_target(&SkillStore::new(), definition),
+        resolve_target(&SkillStore::new(), definition)?,
         record,
         agent_version,
         capability_facts,
@@ -105,7 +106,7 @@ pub(crate) fn repair_json(
     copilot::repair_for_target(
         definition.id,
         definition.name,
-        resolve_target(&SkillStore::new(), definition),
+        resolve_target(&SkillStore::new(), definition)?,
         skill_id,
         preserve_modified,
         agent_version,
@@ -121,7 +122,7 @@ pub(crate) fn uninstall_for_client(
     copilot::uninstall_for_target(
         definition.id,
         definition.name,
-        resolve_target(&SkillStore::new(), definition),
+        resolve_target(&SkillStore::new(), definition)?,
         skill_id,
     )
 }
@@ -147,53 +148,70 @@ pub(crate) fn active_client_ids() -> Vec<&'static str> {
     DIRECTORY_CLIENTS
         .iter()
         .filter(|definition| {
-            let target = resolve_target(&store, definition);
-            target_detected(&target, definition)
+            resolve_target(&store, definition)
+                .map(|target| target_detected(&target, definition))
+                .unwrap_or(false)
         })
         .map(|definition| definition.id)
         .collect()
 }
 
-fn resolve_target(store: &SkillStore, definition: &SkillClientDefinition) -> DirectSkillTarget {
+fn resolve_target(
+    store: &SkillStore,
+    definition: &SkillClientDefinition,
+) -> Result<DirectSkillTarget, Box<dyn Error>> {
+    // A selected project target is explicit and must not be shadowed by a
+    // client-specific global directory environment variable.
+    if let Some(workspace) = target::resolve_workspace_root(None)? {
+        return SkillTarget::workspace(&workspace, definition.project_dir, "workspace");
+    }
     if let Some(path) = env::var_os(definition.env_key) {
-        return DirectSkillTarget {
-            root: PathBuf::from(path),
-            source: format!("env:{}", definition.env_key),
-            configured: true,
-        };
+        return Ok(SkillTarget::global(
+            PathBuf::from(path),
+            format!("env:{}", definition.env_key),
+            true,
+        ));
     }
     let home = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from);
-    let workspace = env::var_os("HIMIND_SKILL_WORKSPACE").map(PathBuf::from);
-    if let Some(workspace) = workspace {
-        let project = workspace.join(Path::new(definition.project_dir));
-        if project.exists() {
-            return DirectSkillTarget {
-                root: project,
-                source: "workspace".to_string(),
-                configured: true,
-            };
-        }
-    }
     if let Some(home) = home {
-        return DirectSkillTarget {
-            root: home.join(Path::new(definition.user_dir)),
-            source: format!("userprofile:{}", definition.user_dir),
-            configured: false,
-        };
+        return Ok(SkillTarget::global(
+            home.join(Path::new(definition.user_dir)),
+            format!("userprofile:{}", definition.user_dir),
+            false,
+        ));
     }
-    DirectSkillTarget {
-        root: store.rendered_skill_root(definition.id, ".preview"),
-        source: "preview".to_string(),
-        configured: false,
-    }
+    Ok(SkillTarget::global(
+        store.rendered_skill_root(definition.id, ".preview"),
+        "preview",
+        false,
+    ))
 }
 
 fn target_detected(target: &DirectSkillTarget, definition: &SkillClientDefinition) -> bool {
-    if target.configured || target.root.exists() {
+    if target.is_workspace() {
+        // The standard `.agents/skills` projection covers portable Skills
+        // (that path is owned by the Codex adapter).  Other client-specific
+        // project directories are only created when the project already uses
+        // that client, the machine has it installed, or the user pointed at it
+        // explicitly.  Rendering into every registered client would scatter a
+        // dozen dot-folders through a repository that has nothing to do with
+        // those tools.
+        if target.root.exists() || env::var_os(definition.env_key).is_some() {
+            return true;
+        }
+        return workspace_client_installed(definition);
+    }
+    if target.root.exists() || target.configured || env::var_os(definition.env_key).is_some() {
         return true;
     }
+    workspace_client_installed(definition)
+}
+
+/// Whether this machine has the client installed, inferred from the parent of
+/// its user-level Skill directory (`~/.cursor`, `~/.claude`, ...).
+fn workspace_client_installed(definition: &SkillClientDefinition) -> bool {
     let Some(home) = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
@@ -203,4 +221,46 @@ fn target_detected(target: &DirectSkillTarget, definition: &SkillClientDefinitio
     home.join(Path::new(definition.user_dir))
         .parent()
         .is_some_and(Path::exists)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unused_client() -> SkillClientDefinition {
+        SkillClientDefinition {
+            id: "himind-test-unused-client",
+            name: "Unused Test Client",
+            env_key: "HIMIND_TEST_UNUSED_CLIENT_SKILL_DIR",
+            project_dir: ".himind-test-unused/skills",
+            user_dir: ".himind-test-unused-client-not-installed/skills",
+            support_level: "compatible",
+            support_note: "",
+            mcp_target_ids: &[],
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "himind-direct-client-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn project_targets_skip_clients_the_machine_does_not_use() {
+        let root = workspace_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let definition = unused_client();
+        let target = SkillTarget::workspace(&root, definition.project_dir, "workspace").unwrap();
+
+        assert!(!target_detected(&target, &definition));
+        std::fs::create_dir_all(&target.root).unwrap();
+        assert!(target_detected(&target, &definition));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

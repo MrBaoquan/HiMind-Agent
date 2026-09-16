@@ -541,7 +541,7 @@ fn project_record_from_path(path: &Path, source: &str) -> Result<ProjectRecord, 
             source,
         ));
     }
-    if skill_path.is_file() {
+    if skill_path.is_file() || path.join("SKILL.md").is_file() {
         let manifest = load_skill_manifest(path)?;
         return Ok(skill_record(manifest, path, source));
     }

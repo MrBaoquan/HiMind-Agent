@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,6 +68,7 @@ pub(crate) struct SkillStore {
 
 impl SkillStore {
     pub(crate) fn new() -> Self {
+        #[cfg(not(test))]
         let agent_home = crate::store::paths::agent_home();
         // Tests run in parallel inside one process. Point the default store at a
         // per-instance unique temp root: parallel skill tests bootstrap/install/

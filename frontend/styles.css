@@ -32,6 +32,12 @@
 
 .skill-page { height: auto; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .skill-page .page-header { margin-bottom: 12px; }
+.skill-workspace-target { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.skill-workspace-target > div:first-child { min-width: 0; display: grid; gap: 3px; }
+.skill-workspace-target strong { font-size: 11px; font-weight: 650; }
+.skill-workspace-target span { overflow: hidden; color: var(--text-muted); font-family: Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.skill-workspace-target small { overflow: hidden; color: var(--text-subtle); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.skill-workspace-target .actions-row { flex: 0 0 auto; }
 .skill-summary-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .skill-summary-strip > div { min-height: 66px; display: flex; align-items: center; gap: 9px; padding: 12px 14px; border-right: 1px solid var(--border); }
 .skill-summary-strip > div:last-child { border-right: 0; }
@@ -160,6 +166,17 @@
 .skill-inline-warning { min-height: 34px; display: flex; align-items: center; gap: 8px; margin: -2px 0 10px; padding: 7px 10px; border-left: 3px solid var(--warning); color: #92400e; background: #fffbeb; font-size: 10px; }
 .skill-inline-warning svg { flex: 0 0 auto; }
 .skill-inline-warning code { font-family: Consolas, monospace; }
+.skill-project-sources { margin: -2px 0 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.skill-sync-note { color: var(--text-subtle); font-size: 9px; white-space: nowrap; }
+.skill-project-sources summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; color: var(--text); font-size: 10px; font-weight: 600; cursor: pointer; }
+.skill-project-sources summary small { color: var(--text-muted); font-size: 9px; font-weight: 500; }
+.skill-project-sources > div { max-height: 176px; overflow-y: auto; border-top: 1px solid var(--border); }
+.skill-project-sources > div > div { display: grid; gap: 2px; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+.skill-project-sources > div > div:last-child { border-bottom: 0; }
+.skill-project-sources span { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.skill-project-sources strong { font-size: 10px; font-weight: 600; }
+.skill-project-sources small { color: var(--text-subtle); font-size: 9px; }
+.skill-project-sources code { overflow: hidden; color: var(--text-muted); font-family: Consolas, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .skill-workspace { min-width: 0; min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(210px, 250px) minmax(0, 1fr); overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 1px 2px rgba(17, 24, 39, .04); }
 .skill-marketplace-workspace { grid-template-columns: minmax(270px, 320px) minmax(0, 1fr); }
 .skill-marketplace-workspace .skill-browser { grid-template-rows: auto auto 30px minmax(0, 1fr); }
@@ -1500,6 +1517,9 @@ tr:last-child td { border-bottom: 0; }
   .plugin-toolbar { align-items: flex-start; flex-direction: column; padding-bottom: 10px; }
   .skill-view-toolbar { align-items: center; flex-direction: row; padding-bottom: 0; }
   .skill-view-toolbar .plugin-tabs { min-width: 0; gap: 11px; }
+  .skill-workspace-target { align-items: flex-start; flex-direction: column; }
+  .skill-workspace-target .actions-row { width: 100%; }
+  .skill-workspace-target .actions-row .btn { flex: 1 1 130px; }
   .skill-sync-compact > span { display: none; }
   .plugin-search { width: 100%; }
   .plugin-toolbar-meta { width: 100%; justify-content: space-between; }

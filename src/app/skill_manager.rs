@@ -1,7 +1,9 @@
 use crate::api::distribution::{skill_catalog, skill_versions, SkillCatalogItem};
 use crate::app::plugin_manager;
 use crate::app::system::verify_extension_artifact_signature;
-use crate::skill::manifest::{validate_relative_package_path, validate_skill_package_root};
+use crate::skill::manifest::{
+    normalize_standard_package, validate_relative_package_path, validate_skill_package_root,
+};
 use crate::skill::resolver::compare_versions;
 use crate::skill::store::{SkillManagementPolicy, SkillStore};
 use crate::skill::types::SkillRecord;
@@ -60,21 +62,31 @@ pub(crate) fn install(
     install_with_dependencies(options, agent_id, skill_id, None, &[])
 }
 
-/// Installs a local .hmskill archive or unpacked user-managed Skill package.
+/// Installs a local .hmskill/ZIP archive or unpacked user-managed Skill package.
 pub(crate) fn install_local_package(path: &Path) -> Result<SkillRecord, Box<dyn Error>> {
     install_local_package_from_source(path, "local")
 }
 
-/// 本地扩展源指向开发工作区目录，缺少 checksums.sha256。按 Manifest 声明的
-/// contents 现场物化成规范包体，避免把 dist 制品等非包内文件带入安装。
+/// Local standard Agent Skills directories may not contain HiMind metadata.
+/// Materialize all portable files and synthesize the internal manifest/checksums
+/// in staging; legacy HiMind projects still honor their declared contents.
 fn stage_local_skill_directory(source: &Path, staging: &Path) -> Result<(), Box<dyn Error>> {
-    let manifest = validate_skill_package_root(source)?;
-    crate::app::local_package::select_declared(
-        source,
-        staging,
-        &LOCAL_SKILL_LIMITS,
-        &manifest.contents,
-    )
+    if source.join("skill.json").is_file() {
+        let manifest = validate_skill_package_root(source)?;
+        return crate::app::local_package::select_declared(
+            source,
+            staging,
+            &LOCAL_SKILL_LIMITS,
+            &manifest.contents,
+        );
+    }
+    if !source.join("SKILL.md").is_file() {
+        return Err("本地 Skill 目录缺少 SKILL.md".into());
+    }
+    crate::skill::manifest::validate_standard_skill_directory(source)?;
+    crate::app::local_package::stage_local_package(source, staging, &LOCAL_SKILL_LIMITS, |_| true)?;
+    normalize_standard_package(staging)?;
+    Ok(())
 }
 
 pub(crate) fn install_local_package_from_source(
@@ -93,14 +105,17 @@ pub(crate) fn install_local_package_from_source(
         if !source
             .extension()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("hmskill"))
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("hmskill") || value.eq_ignore_ascii_case("zip")
+            })
         {
-            return Err("本地 Skill 文件必须是 .hmskill".into());
+            return Err("本地 Skill 文件必须是 .hmskill 或 .zip".into());
         }
         if fs::metadata(&source)?.len() > MAX_SKILL_ARCHIVE_BYTES {
             return Err("本地 Skill 包超过 16 MiB 限制".into());
         }
         extract_archive(&source, &staging)?;
+        normalize_standard_package(&staging)?;
         staging.clone()
     };
     let result: Result<SkillRecord, Box<dyn Error>> = (|| {
@@ -165,6 +180,7 @@ pub(crate) fn install_public_catalog_item(
     let staging = env::temp_dir().join(format!("himind-public-skill-{}", unique_suffix()));
     let result: Result<SkillRecord, Box<dyn Error>> = (|| {
         extract_archive(&archive, &staging)?;
+        crate::skill::manifest::normalize_standard_package(&staging)?;
         validate_package_size(&staging)?;
         verify_checksums(&staging)?;
         verify_declared_contents(&staging)?;
@@ -285,6 +301,7 @@ pub(crate) fn install_with_dependencies(
     }
     let result: Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> = (|| {
         extract_archive(&archive, &staging)?;
+        crate::skill::manifest::normalize_standard_package(&staging)?;
         verify_checksums(&staging)?;
         verify_declared_contents(&staging)?;
         let store = SkillStore::new();
@@ -500,19 +517,34 @@ pub(crate) fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), 
         return Err("Skill ZIP 文件数量超过 20000 个限制".into());
     }
     let mut extracted_bytes = 0_u64;
+    let mut seen_paths = HashSet::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
+        let relative = entry
+            .enclosed_name()
+            .ok_or("Skill ZIP 包含非法路径")?
+            .to_path_buf();
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        if is_archive_metadata_path(&normalized) {
+            continue;
+        }
         extracted_bytes = extracted_bytes
             .checked_add(entry.size())
             .ok_or("Skill ZIP 解压大小溢出")?;
         if extracted_bytes > MAX_SKILL_EXTRACTED_BYTES {
             return Err("Skill ZIP 解压后超过 64 MiB 限制".into());
         }
-        let relative = entry
-            .enclosed_name()
-            .ok_or("Skill ZIP 包含非法路径")?
-            .to_path_buf();
         validate_relative_package_path(&relative.to_string_lossy())?;
+        let collision_key = normalized.to_ascii_lowercase();
+        if !seen_paths.insert(collision_key) {
+            return Err(format!("Skill ZIP 包含重复或大小写冲突路径: {normalized}").into());
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(format!("Skill ZIP 不允许符号链接: {normalized}").into());
+        }
         let output = target.join(relative);
         if entry.is_dir() {
             fs::create_dir_all(output)?;
@@ -524,6 +556,16 @@ pub(crate) fn extract_archive(archive_path: &Path, target: &Path) -> Result<(), 
         std::io::copy(&mut entry, &mut File::create(output)?)?;
     }
     Ok(())
+}
+
+fn is_archive_metadata_path(path: &str) -> bool {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .any(|component| {
+            component == "__MACOSX"
+                || component.eq_ignore_ascii_case(".ds_store")
+                || component.eq_ignore_ascii_case("thumbs.db")
+        })
 }
 
 pub(crate) fn verify_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -554,7 +596,7 @@ pub(crate) fn verify_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     if let Some(missing) = expected.keys().find(|name| !actual_files.contains(*name)) {
         return Err(format!("checksums.sha256 引用了缺失文件: {missing}").into());
     }
-    for required in ["skill.json", "SKILL.md"] {
+    for required in ["SKILL.md"] {
         if !actual_files.contains(required) {
             return Err(format!("Skill 包缺少必需文件: {required}").into());
         }
@@ -617,11 +659,14 @@ fn unique_suffix() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{verify_checksums, verify_declared_contents};
+    use super::{extract_archive, verify_checksums, verify_declared_contents};
     use crate::api::distribution::SkillCatalogItem;
     use crate::app::system::verify_extension_artifact_signature;
+    use crate::skill::manifest::normalize_standard_package;
     use sha2::{Digest, Sha256};
     use std::fs;
+    use std::io::Write;
+    use zip::write::FileOptions;
 
     fn catalog_skill() -> SkillCatalogItem {
         SkillCatalogItem {
@@ -731,6 +776,86 @@ mod tests {
         fs::write(root.join("SKILL.md"), b"# Demo").unwrap();
         fs::write(root.join("extra.md"), b"extra").unwrap();
         assert!(verify_declared_contents(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imports_wrapped_standard_skill_zip_with_nested_resources() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-standard-skill-zip-test-{}",
+            super::unique_suffix()
+        ));
+        let archive_path = root.with_extension("zip");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&root).unwrap();
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let entries = [
+            (
+                "wechatide-skill/SKILL.md",
+                "---\nname: wechatide-skill\nversion: 0.3.9\ndescription: >-\n  WeChat workflow skill.\n---\n# WeChat IDE\n",
+            ),
+            ("wechatide-skill/skill.yaml", "version: 0.3.9\n"),
+            ("wechatide-skill/references/tool-index.md", "tools\n"),
+            ("wechatide-skill/skills/automator/SKILL.md", "---\nname: automator\ndescription: automation\n---\n"),
+            ("wechatide-skill/skills/installer/scripts/check.mjs", "console.log('ok')\n"),
+        ];
+        for (name, content) in entries {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+
+        extract_archive(&archive_path, &extracted).unwrap();
+        let manifest = normalize_standard_package(&extracted).unwrap();
+        assert_eq!(manifest.id, "wechatide-skill");
+        assert_eq!(manifest.version, "0.3.9");
+        assert!(extracted.join("references/tool-index.md").is_file());
+        assert!(extracted
+            .join("skills/installer/scripts/check.mjs")
+            .is_file());
+        verify_checksums(&extracted).unwrap();
+        verify_declared_contents(&extracted).unwrap();
+
+        let _ = fs::remove_file(archive_path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ignores_desktop_archive_metadata_around_standard_skill_wrapper() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-standard-skill-metadata-test-{}",
+            super::unique_suffix()
+        ));
+        let archive_path = root.with_extension("zip");
+        let extracted = root.join("extracted");
+        fs::create_dir_all(&root).unwrap();
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let entries = [
+            (
+                "wechatide-skill/SKILL.md",
+                "---\nname: wechatide-skill\ndescription: WeChat workflow.\n---\n",
+            ),
+            ("wechatide-skill/skill.yaml", "version: 0.3.9\n"),
+            ("__MACOSX/._wechatide-skill", "metadata"),
+            ("wechatide-skill/.DS_Store", "metadata"),
+        ];
+        for (name, content) in entries {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+
+        extract_archive(&archive_path, &extracted).unwrap();
+        let manifest = normalize_standard_package(&extracted).unwrap();
+        assert_eq!(manifest.id, "wechatide-skill");
+        assert!(!extracted.join(".DS_Store").exists());
+        assert!(!extracted.join("__MACOSX").exists());
+
+        let _ = fs::remove_file(archive_path);
         let _ = fs::remove_dir_all(root);
     }
 }

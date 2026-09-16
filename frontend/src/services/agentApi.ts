@@ -646,6 +646,34 @@ export type CapabilityItem = {
 };
 
 export type SkillScope = 'builtin' | 'organization' | 'user';
+export type SkillTargetKind = 'global' | 'workspace';
+
+export type SkillWorkspaceStatus = {
+    configured: boolean;
+    valid: boolean;
+    root: string;
+    workspace_id: string;
+    agents_skills_root: string;
+    lock_path: string;
+    managed_skill_count: number;
+    managed_skills?: Array<{ skill_id: string; version: string; enabled: boolean }>;
+    error: string;
+};
+
+export type SkillImportResponse = {
+    record: SkillRecord;
+    clients: Record<string, CodexSkillActionResponse | Record<string, unknown>>;
+    deployment: 'current-target' | string;
+};
+
+export type DiscoveredProjectSkill = {
+    skill_id?: string;
+    name: string;
+    description: string;
+    path: string;
+    managed_by_himind: boolean;
+    management_mode: 'managed' | 'native' | string;
+};
 
 export type SkillCapabilityDependency = {
     id: string;
@@ -717,6 +745,8 @@ export type CodexSkillStatusItem = {
     installed_version?: string | null;
     managing_profile?: string | null;
     available_version: string;
+    pinned_version?: string | null;
+    update_available?: boolean;
     last_synced_at?: string | null;
     managed_files: string[];
     modified_files: string[];
@@ -1043,11 +1073,24 @@ export type CodexSkillStatusResponse = {
     target_root: string;
     target_source: string;
     target_configured: boolean;
+    target_kind?: SkillTargetKind;
+    workspace_root?: string | null;
+    workspace_id?: string | null;
+    project_skills?: DiscoveredProjectSkill[];
+    project_skill_conflicts?: SkillConflict[];
     target_exists: boolean;
-    target_mode: 'builtin' | 'configured' | 'detected' | 'preview';
+    target_mode: 'builtin' | 'configured' | 'detected' | 'workspace' | 'preview';
     sync_mode?: 'copy' | 'symlink';
+    render_mode?: 'copy' | 'symlink';
     items: CodexSkillStatusItem[];
     clients?: Record<string, CodexSkillStatusResponse>;
+};
+
+export type SkillConflict = {
+    skill_id: string;
+    managed_paths: string[];
+    native_paths: string[];
+    reason: string;
 };
 
 export type SkillSyncSettings = {
@@ -1081,6 +1124,9 @@ export type CodexSkillSyncResponse = {
     target_root: string;
     target_source: string;
     target_configured: boolean;
+    target_kind?: SkillTargetKind;
+    workspace_root?: string | null;
+    workspace_id?: string | null;
     rendered: CodexSkillSyncRendered[];
     skipped: CodexSkillSyncSkipped[];
     blocked: CodexSkillSyncBlocked[];
@@ -1092,6 +1138,10 @@ export type CodexSkillUninstallResponse = {
     target_root: string;
     target_source: string;
     target_configured: boolean;
+    target_kind?: SkillTargetKind;
+    workspace_root?: string | null;
+    workspace_id?: string | null;
+    package_removed?: boolean;
     removed: {
         skill_id: string;
         removed: boolean;
@@ -1106,6 +1156,9 @@ export type SkillClientUnregisterResponse = {
     target_root?: string | null;
     target_source?: string | null;
     target_configured?: boolean;
+    target_kind?: SkillTargetKind;
+    workspace_root?: string | null;
+    workspace_id?: string | null;
     removed: {
         skill_id: string;
         removed: boolean;
@@ -1127,9 +1180,13 @@ export type CodexSkillActionResponse = {
     target_root: string;
     target_source?: string;
     target_configured?: boolean;
+    target_kind?: SkillTargetKind;
+    workspace_root?: string | null;
+    workspace_id?: string | null;
     rendered: CodexSkillSyncRendered;
     backup_root?: string | null;
     clients?: Record<string, CodexSkillActionResponse>;
+    lock_updated?: boolean;
 };
 
 export type CustomAIService = {
@@ -1294,8 +1351,8 @@ export const agentApi = {
     pluginVersions: (pluginId: string) => invoke<PluginCatalogItem[]>('get_plugin_versions', { pluginId }),
     planPluginInstall: (pluginId: string, version?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version }),
     skillCatalog: () => invoke<SkillCatalogResponse>('get_skill_catalog'),
-    importLocalSkill: () => invoke<SkillRecord>('import_local_skill'),
-    importGithubSkill: (sourceUrl: string) => invoke<SkillRecord>('import_github_skill_url', { sourceUrl }),
+    importLocalSkill: () => invoke<SkillImportResponse>('import_local_skill'),
+    importGithubSkill: (sourceUrl: string) => invoke<SkillImportResponse>('import_github_skill_url', { sourceUrl }),
     organizationSkillCatalog: () => invoke<OrganizationSkillCatalogItem[]>('get_organization_skill_catalog'),
     queryOrganizationSkillCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<OrganizationSkillCatalogItem>>('query_organization_skill_catalog', { q, category, page, pageSize }),
     skillVersions: (skillId: string) => invoke<OrganizationSkillCatalogItem[]>('get_skill_versions', { skillId }),
@@ -1310,10 +1367,15 @@ export const agentApi = {
     confirmSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('confirm_skill_draft', { skillId, version }),
     submitSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version }),
     codexSkillStatus: () => invoke<CodexSkillStatusResponse>('get_codex_skill_status'),
+    skillWorkspace: () => invoke<SkillWorkspaceStatus>('get_skill_workspace'),
+    setSkillWorkspace: (path?: string) => invoke<SkillWorkspaceStatus>('set_skill_workspace', { path: path || null }),
+    setSkillWorkspaceEnabled: (skillId: string, enabled: boolean) => invoke<boolean>('set_skill_workspace_enabled', { skillId, enabled }),
+    pickSkillWorkspace: () => invoke<SkillWorkspaceStatus>('pick_skill_workspace'),
     skillSyncSettings: () => invoke<SkillSyncSettings>('get_skill_sync_settings'),
     setSkillSyncMode: (mode: SkillSyncSettings['mode']) => invoke<SkillSyncSettings>('set_skill_sync_mode', { mode }),
     syncCodexSkills: () => invoke<CodexSkillSyncResponse>('sync_codex_skills'),
     syncCodexSkill: (skillId: string) => invoke<CodexSkillActionResponse>('sync_codex_skill', { skillId }),
+    updateSkillWorkspace: (skillId: string) => invoke<CodexSkillActionResponse>('update_skill_workspace', { skillId }),
     syncSkillClient: (skillId: string, clientId: string) => invoke<CodexSkillActionResponse>('sync_skill_client', { skillId, clientId }),
     repairCodexSkill: (skillId: string, preserveModified = true) => invoke<CodexSkillActionResponse>('repair_codex_skill', { skillId, preserveModified }),
     uninstallCodexSkill: (skillId: string) => invoke<CodexSkillUninstallResponse>('uninstall_codex_skill', { skillId }),

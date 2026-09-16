@@ -1977,10 +1977,12 @@ pub(crate) async fn get_skill_catalog(
 }
 
 #[tauri::command]
-pub(crate) fn import_local_skill() -> Result<serde_json::Value, String> {
+pub(crate) fn import_local_skill(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("导入本地 HiMind Skill")
-        .add_filter("HiMind Skill", &["hmskill"])
+        .add_filter("HiMind Skill", &["hmskill", "zip"])
         .pick_file()
         .or_else(|| {
             rfd::FileDialog::new()
@@ -1992,7 +1994,51 @@ pub(crate) fn import_local_skill() -> Result<serde_json::Value, String> {
     };
     let record = crate::app::skill_manager::install_local_package_from_source(&path, ADHOC_SOURCE)
         .map_err(|error| error.to_string())?;
-    serde_json::to_value(record).map_err(|error| error.to_string())
+    imported_skill_result(&state, record)
+}
+
+#[tauri::command]
+pub(crate) fn get_skill_workspace() -> crate::skill::target::SkillWorkspaceStatus {
+    crate::skill::target::workspace_status()
+}
+
+#[tauri::command]
+pub(crate) fn set_skill_workspace(
+    path: Option<String>,
+) -> Result<crate::skill::target::SkillWorkspaceStatus, String> {
+    crate::skill::target::set_workspace(path.as_deref()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_skill_workspace_enabled(
+    skill_id: String,
+    enabled: bool,
+    state: State<'_, AgentState>,
+) -> Result<bool, String> {
+    let capability_facts = skill_capability_facts(&state)?;
+    let value = crate::skill::set_workspace_skill_enabled_json(
+        &skill_id,
+        enabled,
+        VERSION,
+        &capability_facts,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(value
+        .get("updated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
+}
+
+#[tauri::command]
+pub(crate) fn pick_skill_workspace() -> Result<crate::skill::target::SkillWorkspaceStatus, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择项目 Skill 工作区")
+        .pick_folder()
+    else {
+        return Err("已取消选择项目 Skill 工作区".to_string());
+    };
+    crate::skill::target::set_workspace(Some(&path.to_string_lossy()))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2000,18 +2046,42 @@ pub(crate) fn import_github_skill(
     repository: String,
     reference: String,
     subpath: Option<String>,
+    state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
-    crate::app::github_source::import_skill(
+    let value = crate::app::github_source::import_skill(
         &repository,
         &reference,
         subpath.as_deref().unwrap_or(""),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let record = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    imported_skill_result(&state, record)
 }
 
 #[tauri::command]
-pub(crate) fn import_github_skill_url(source_url: String) -> Result<serde_json::Value, String> {
-    crate::app::github_source::import_skill(&source_url, "", "").map_err(|error| error.to_string())
+pub(crate) fn import_github_skill_url(
+    source_url: String,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let value = crate::app::github_source::import_skill(&source_url, "", "")
+        .map_err(|error| error.to_string())?;
+    let record = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    imported_skill_result(&state, record)
+}
+
+fn imported_skill_result(
+    state: &AgentState,
+    record: crate::skill::types::SkillRecord,
+) -> Result<serde_json::Value, String> {
+    let capability_facts = skill_capability_facts(state)?;
+    let clients =
+        crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
+            .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "record": record,
+        "clients": clients,
+        "deployment": "current-target",
+    }))
 }
 
 #[tauri::command]
@@ -2308,7 +2378,7 @@ pub(crate) fn import_skill_candidate(
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("选择 HiMind Skill 候选包")
-        .add_filter("HiMind Skill 包", &["hmskill"])
+        .add_filter("HiMind Skill 包", &["hmskill", "zip"])
         .pick_file()
     else {
         return Err("已取消选择 Skill 候选包".to_string());
@@ -2704,6 +2774,7 @@ pub(crate) fn sync_codex_skill(
         .get_record(&skill_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    crate::skill::ensure_workspace_record_is_current(&record).map_err(|error| error.to_string())?;
     let clients =
         crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
             .map_err(|error| error.to_string())?;
@@ -2711,6 +2782,41 @@ pub(crate) fn sync_codex_skill(
         .ok_or_else(|| "该 Skill 未声明任何 Agent 支持的 AI 客户端".to_string())?;
     if let Some(object) = primary.as_object_mut() {
         object.insert("clients".to_string(), serde_json::json!(clients));
+    }
+    Ok(primary)
+}
+
+/// Explicitly advance the selected project to the Store's current Skill
+/// version.  Ordinary sync/repair operations remain pinned to the workspace
+/// lock; this command is the only per-Skill action that changes that lock.
+#[tauri::command]
+pub(crate) fn update_skill_workspace(
+    skill_id: String,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let capability_facts = skill_capability_facts(&state)?;
+    let value = crate::skill::update_workspace_skill_json(&skill_id, VERSION, &capability_facts)
+        .map_err(|error| error.to_string())?;
+    let clients: std::collections::BTreeMap<String, serde_json::Value> = value
+        .get("clients")
+        .and_then(serde_json::Value::as_object)
+        .map(|items| {
+            items
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut primary = primary_skill_client(&clients)
+        .ok_or_else(|| "该 Skill 未声明任何 Agent 支持的 AI 客户端".to_string())?;
+    if let Some(object) = primary.as_object_mut() {
+        object.insert("clients".to_string(), serde_json::json!(clients));
+        object.insert("lock_updated".to_string(), serde_json::Value::Bool(true));
+        for key in ["previous_version", "workspace_root", "lock_path"] {
+            if let Some(entry) = value.get(key) {
+                object.insert(key.to_string(), entry.clone());
+            }
+        }
     }
     Ok(primary)
 }
@@ -2768,16 +2874,85 @@ pub(crate) fn repair_codex_skill(
 pub(crate) fn uninstall_codex_skill(skill_id: String) -> Result<serde_json::Value, String> {
     let clients = crate::skill::uninstall_supported_clients_json(&skill_id)
         .map_err(|error| error.to_string())?;
+    if let Some(workspace_root) =
+        crate::skill::target::resolve_workspace_root(None).map_err(|error| error.to_string())?
+    {
+        // A full uninstall also forgets the project assignment, including a
+        // disabled entry the user left behind.
+        if let Ok(target) = crate::skill::target::SkillTarget::workspace(
+            &workspace_root,
+            ".agents/skills",
+            "workspace",
+        ) {
+            let _ = crate::skill::target::remove_workspace_skill_entry(&target, &skill_id);
+        }
+        let target_root = clients
+            .get("clients")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|items| items.get("codex").or_else(|| items.values().next()))
+            .and_then(|client| client.get("target_root"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| workspace_root.to_string_lossy().to_string());
+        let removed = clients
+            .get("clients")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|items| {
+                items.values().any(|client| {
+                    client
+                        .get("removed")
+                        .and_then(|value| value.get("removed"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+            });
+        return Ok(serde_json::json!({
+            "client_id": "agent",
+            "target_root": target_root,
+            "target_source": "workspace",
+            "target_configured": true,
+            "target_kind": crate::skill::target::TARGET_KIND_WORKSPACE,
+            "workspace_root": workspace_root.to_string_lossy().to_string(),
+            "workspace_id": crate::skill::target::workspace_id(&workspace_root),
+            "package_removed": false,
+            "removed": {
+                "skill_id": skill_id,
+                "removed": removed,
+            },
+            "clients": clients.get("clients").cloned().unwrap_or_default(),
+        }));
+    }
     let store = crate::skill::store::SkillStore::new();
-    let removed = store
-        .remove_installed_skill(&skill_id)
-        .map_err(|error| error.to_string())?;
-    crate::app::plugin_manager::remove_owner_references(&format!("skill:{skill_id}"));
+    let global_target = crate::skill::target::SkillTarget::global(
+        store.root().to_path_buf(),
+        "agent-skill-store",
+        true,
+    );
+    let remaining_deployments =
+        crate::skill::target::other_deployments_for_skill(&skill_id, &global_target)
+            .map_err(|error| error.to_string())?;
+    let removed = if remaining_deployments.is_empty() {
+        let removed = store
+            .remove_installed_skill(&skill_id)
+            .map_err(|error| error.to_string())?;
+        if removed {
+            crate::app::plugin_manager::remove_owner_references(&format!("skill:{skill_id}"));
+        }
+        removed
+    } else {
+        false
+    };
     Ok(serde_json::json!({
         "client_id": "agent",
         "target_root": store.root().to_string_lossy().to_string(),
         "target_source": "agent-skill-store",
         "target_configured": true,
+        "target_kind": crate::skill::target::TARGET_KIND_GLOBAL,
+        "workspace_root": serde_json::Value::Null,
+        "workspace_id": serde_json::Value::Null,
+        "package_removed": removed,
+        "package_retained": !remaining_deployments.is_empty(),
+        "remaining_deployments": remaining_deployments,
         "removed": {
             "skill_id": skill_id,
             "removed": removed,
@@ -2805,7 +2980,43 @@ fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_js
         .get("codex")
         .cloned()
         .ok_or_else(|| "Agent 未返回 Codex 客户端状态".to_string())?;
+    let mut project_skills = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    if let Some(client_map) = clients.as_object() {
+        for client in client_map.values() {
+            let Some(items) = client
+                .get("project_skills")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for item in items {
+                let path = item
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if seen_paths.insert(path.to_string()) {
+                    project_skills.push(item.clone());
+                }
+            }
+        }
+    }
+    project_skills.sort_by(|left, right| {
+        left.get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
     if let Some(object) = codex.as_object_mut() {
+        object.insert(
+            "project_skills".to_string(),
+            serde_json::Value::Array(project_skills),
+        );
         object.insert("clients".to_string(), clients);
     }
     Ok(codex)

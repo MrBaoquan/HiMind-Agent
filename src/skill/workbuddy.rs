@@ -1,6 +1,7 @@
 use crate::skill::copilot::{self, DirectSkillTarget};
 use crate::skill::resolver::CapabilityFact;
 use crate::skill::store::SkillStore;
+use crate::skill::target::{self, SkillTarget};
 use crate::skill::types::SkillRecord;
 use std::env;
 use std::error::Error;
@@ -15,7 +16,7 @@ pub(crate) fn status_json(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     copilot::status_for_target(
         CLIENT_ID,
-        resolve_target(&SkillStore::new()),
+        resolve_target(&SkillStore::new())?,
         agent_version,
         capability_facts,
     )
@@ -28,7 +29,7 @@ pub(crate) fn sync_json(
     copilot::sync_for_target(
         CLIENT_ID,
         CLIENT_NAME,
-        resolve_target(&SkillStore::new()),
+        resolve_target(&SkillStore::new())?,
         agent_version,
         capability_facts,
     )
@@ -42,7 +43,7 @@ pub(crate) fn sync_record_json(
     copilot::sync_record_for_target(
         CLIENT_ID,
         CLIENT_NAME,
-        resolve_target(&SkillStore::new()),
+        resolve_target(&SkillStore::new())?,
         record,
         agent_version,
         capability_facts,
@@ -58,7 +59,7 @@ pub(crate) fn repair_json(
     copilot::repair_for_target(
         CLIENT_ID,
         CLIENT_NAME,
-        resolve_target(&SkillStore::new()),
+        resolve_target(&SkillStore::new())?,
         skill_id,
         preserve_modified,
         agent_version,
@@ -70,43 +71,50 @@ pub(crate) fn uninstall_json(skill_id: &str) -> Result<serde_json::Value, Box<dy
     copilot::uninstall_for_target(
         CLIENT_ID,
         CLIENT_NAME,
-        resolve_target(&SkillStore::new()),
+        resolve_target(&SkillStore::new())?,
         skill_id,
     )
 }
 
-fn resolve_target(store: &SkillStore) -> DirectSkillTarget {
+fn resolve_target(store: &SkillStore) -> Result<DirectSkillTarget, Box<dyn Error>> {
+    if let Some(workspace) = target::resolve_workspace_root(None)? {
+        return SkillTarget::workspace(
+            &workspace,
+            ".workbuddy/skills",
+            "workspace",
+        );
+    }
     if let Some(path) = env::var_os("HIMIND_WORKBUDDY_SKILL_DIR") {
-        return DirectSkillTarget {
-            root: PathBuf::from(path),
-            source: "env:HIMIND_WORKBUDDY_SKILL_DIR".to_string(),
-            configured: true,
-        };
+        return Ok(SkillTarget::global(
+            PathBuf::from(path),
+            "env:HIMIND_WORKBUDDY_SKILL_DIR",
+            true,
+        ));
     }
     if let Some(path) = env::var_os("WORKBUDDY_HOME") {
-        return DirectSkillTarget {
-            root: PathBuf::from(path).join("skills"),
-            source: "env:WORKBUDDY_HOME".to_string(),
-            configured: true,
-        };
+        return Ok(SkillTarget::global(
+            PathBuf::from(path).join("skills"),
+            "env:WORKBUDDY_HOME",
+            true,
+        ));
     }
     if let Some(userprofile) = env::var_os("USERPROFILE") {
-        return DirectSkillTarget {
-            root: PathBuf::from(userprofile).join(".workbuddy").join("skills"),
-            source: "userprofile:dot-workbuddy".to_string(),
-            configured: false,
-        };
+        return Ok(SkillTarget::global(
+            PathBuf::from(userprofile).join(".workbuddy").join("skills"),
+            "userprofile:dot-workbuddy",
+            false,
+        ));
     }
     if let Some(home) = env::var_os("HOME") {
-        return DirectSkillTarget {
-            root: PathBuf::from(home).join(".workbuddy").join("skills"),
-            source: "home:dot-workbuddy".to_string(),
-            configured: false,
-        };
+        return Ok(SkillTarget::global(
+            PathBuf::from(home).join(".workbuddy").join("skills"),
+            "home:dot-workbuddy",
+            false,
+        ));
     }
-    DirectSkillTarget {
-        root: store.rendered_skill_root(CLIENT_ID, ".preview"),
-        source: "preview".to_string(),
-        configured: false,
-    }
+    Ok(SkillTarget::global(
+        store.rendered_skill_root(CLIENT_ID, ".preview"),
+        "preview",
+        false,
+    ))
 }

@@ -40,8 +40,8 @@ pub(crate) fn import_skill(
     let source = resolve_source(repository, reference, subpath)?;
     let root = download_source(&source.repository, &source.reference)?;
     let result = (|| {
-        let package = package_root(&root, &source.subpath, "skill.json")?;
-        let identity = package_identity(&package, "skill.json")?;
+        let package = skill_package_root(&root, &source.subpath)?;
+        let identity = skill_package_identity(&package)?;
         let binding = bind_extension_source(&root, &source, "skill", &identity.0, &identity.1)?;
         let record =
             crate::app::skill_manager::install_local_package_from_source(&package, "github")?;
@@ -261,6 +261,41 @@ fn package_root(root: &Path, subpath: &str, marker: &str) -> Result<PathBuf, Box
     Ok(package)
 }
 
+fn skill_package_root(root: &Path, subpath: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let relative = subpath.trim().replace('\\', "/");
+    if !relative.is_empty() {
+        validate_subpath(&relative)?;
+        let candidate = archive_relative_path(root, &relative)?;
+        if !candidate.join("skill.json").is_file() && !candidate.join("SKILL.md").is_file() {
+            return Err(format!("GitHub 子目录缺少 skill.json 或 SKILL.md: {relative}").into());
+        }
+        return Ok(candidate);
+    }
+    let mut matches = Vec::new();
+    for entry in walkdir::WalkDir::new(root).max_depth(4) {
+        let entry = entry?;
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        if entry.path().join("skill.json").is_file() || entry.path().join("SKILL.md").is_file() {
+            matches.push(entry.path().to_path_buf());
+        }
+    }
+    matches.sort_by_key(|path| path.components().count());
+    match matches.first() {
+        Some(path)
+            if matches
+                .iter()
+                .skip(1)
+                .all(|candidate| candidate.components().count() > path.components().count()) =>
+        {
+            Ok(path.clone())
+        }
+        Some(_) => Err("GitHub 仓库中找到多个同层 Skill 包，请指定子目录".into()),
+        None => Err("GitHub 仓库中未找到 skill.json 或 SKILL.md".into()),
+    }
+}
+
 fn archive_relative_path(root: &Path, relative: &str) -> Result<PathBuf, Box<dyn Error>> {
     let direct = root.join(relative);
     if direct.exists() {
@@ -296,6 +331,29 @@ fn package_identity(package: &Path, marker: &str) -> Result<(String, String), Bo
         .and_then(|value| value.as_str())
         .ok_or_else(|| format!("{marker} 缺少 version"))?;
     Ok((id.to_string(), version.to_string()))
+}
+
+fn skill_package_identity(package: &Path) -> Result<(String, String), Box<dyn Error>> {
+    if package.join("skill.json").is_file() {
+        return package_identity(package, "skill.json");
+    }
+    let readme = fs::read_to_string(package.join("SKILL.md"))?;
+    let (name, _, frontmatter_version) = crate::skill::manifest::parse_skill_frontmatter(&readme)?;
+    let version = frontmatter_version
+        .or_else(|| {
+            let content = fs::read_to_string(package.join("skill.yaml")).ok()?;
+            let value = serde_yaml::from_str::<serde_yaml::Value>(&content).ok()?;
+            value.get("version").and_then(|item| match item {
+                serde_yaml::Value::String(value) => Some(value.clone()),
+                serde_yaml::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| {
+            crate::skill::manifest::standard_skill_version(package)
+                .unwrap_or_else(|_| "0.0.0".to_string())
+        });
+    Ok((name, version))
 }
 
 fn bind_extension_source(

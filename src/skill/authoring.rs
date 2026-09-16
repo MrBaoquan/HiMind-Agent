@@ -244,8 +244,14 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
 
 pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft, Box<dyn Error>> {
     let source = input.package_path.canonicalize()?;
-    if source.extension().and_then(|value| value.to_str()) != Some("hmskill") {
-        return Err("Skill 候选包必须使用 .hmskill 扩展名".into());
+    if !source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("hmskill") || value.eq_ignore_ascii_case("zip")
+        })
+    {
+        return Err("Skill 候选包必须使用 .hmskill 或 .zip 扩展名".into());
     }
     if fs::metadata(&source)?.len() > MAX_SKILL_ARCHIVE_BYTES {
         return Err("Skill 候选包超过 16 MiB".into());
@@ -257,13 +263,18 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
     }
     let import_result = (|| -> Result<AuthoringDraft, Box<dyn Error>> {
         crate::app::skill_manager::extract_archive(&source, &staging)?;
+        crate::skill::manifest::normalize_standard_package(&staging)?;
         crate::app::skill_manager::verify_checksums(&staging)?;
         crate::app::skill_manager::verify_declared_contents(&staging)?;
         let manifest = crate::skill::manifest::validate_skill_package_root(&staging)?;
-        if manifest.release_notes.trim().is_empty() {
+        let himind_package = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("hmskill"));
+        if himind_package && manifest.release_notes.trim().is_empty() {
             return Err("请在 skill.json 中填写本版本更新说明 release_notes".into());
         }
-        if manifest.author.trim().is_empty() {
+        if himind_package && manifest.author.trim().is_empty() {
             return Err("请在 skill.json 中填写作者 author".into());
         }
 
@@ -274,7 +285,14 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
             .is_some_and(|draft| draft.candidate_sha256 == candidate_sha256);
         let root = draft_version_root(&manifest.id, &manifest.version);
         fs::create_dir_all(&root)?;
-        let candidate_path = root.join(format!("{}-{}.hmskill", manifest.id, manifest.version));
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("hmskill");
+        let candidate_path = root.join(format!(
+            "{}-{}.{}",
+            manifest.id, manifest.version, extension
+        ));
         let same_candidate = candidate_path
             .canonicalize()
             .is_ok_and(|path| path == source);
@@ -297,7 +315,7 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
             }
             files.insert(
                 relative.clone(),
-                fs::read_to_string(package_root.join(relative))?,
+                String::from_utf8_lossy(&fs::read(package_root.join(relative))?).into_owned(),
             );
         }
         let draft = AuthoringDraft {

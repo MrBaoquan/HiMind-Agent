@@ -13,7 +13,7 @@ import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
+import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput } from './services/agentApi';
 import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
@@ -73,6 +73,7 @@ function App() {
   const [pluginSubmissions, setPluginSubmissions] = useState<PluginSubmissionStatus[]>([]);
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogResponse | null>(null);
   const [skillStatus, setSkillStatus] = useState<CodexSkillStatusResponse | null>(null);
+  const [skillWorkspace, setSkillWorkspace] = useState<SkillWorkspaceStatus>({ configured: false, valid: false, root: '', workspace_id: '', agents_skills_root: '', lock_path: '', managed_skill_count: 0, error: '' });
   const [organizationSkills, setOrganizationSkills] = useState<OrganizationSkillCatalogItem[]>([]);
   const [skillMarketError, setSkillMarketError] = useState<string | null>(null);
   const [skillDrafts, setSkillDrafts] = useState<AuthoringSkillDraft[]>([]);
@@ -326,10 +327,11 @@ function App() {
 
   async function refreshSkills() {
     return singleFlight('skills', async () => {
-      const [catalogResult, statusResult, marketResult] = await Promise.allSettled([
+      const [catalogResult, statusResult, marketResult, workspaceResult] = await Promise.allSettled([
       withTimeout(agentApi.skillCatalog(), '本地 Skill 目录'),
       withTimeout(agentApi.codexSkillStatus(), 'AI 工具技能状态'),
       withTimeout(agentApi.organizationSkillCatalog(), '技能市场'),
+      withTimeout(agentApi.skillWorkspace(), '项目 Skill 工作区'),
     ]);
     const errors: string[] = [];
     if (catalogResult.status === 'fulfilled') {
@@ -351,6 +353,8 @@ function App() {
 	  setOrganizationSkills([]);
 	  setSkillMarketError(formatError(marketResult.reason, '技能市场暂不可用'));
 	}
+	if (workspaceResult.status === 'fulfilled') setSkillWorkspace(workspaceResult.value);
+	else setSkillWorkspace(current => ({ ...current, error: formatError(workspaceResult.reason, '项目 Skill 工作区读取失败') }));
       setSkillError(errors.length ? errors.join('；') : null);
     });
   }
@@ -992,6 +996,7 @@ function App() {
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}
       status={skillStatus}
+      workspace={skillWorkspace}
       mcpTargets={mcpTargets}
       error={skillError}
       marketplace={organizationSkills}
@@ -1015,12 +1020,26 @@ function App() {
           : result.blocked.length;
         return blocked ? `技能同步完成，${blocked} 项需要处理` : '技能已同步';
       }, '技能同步失败')}
+      onPickWorkspace={() => runSkillOperation('workspace', async () => { const next = await agentApi.pickSkillWorkspace(); setSkillWorkspace(next); await refreshSkills(); return `已切换项目 Skill 工作区：${next.root}`; }, '选择项目 Skill 工作区失败')}
+      onClearWorkspace={() => runSkillOperation('workspace-clear', async () => { const next = await agentApi.setSkillWorkspace(); setSkillWorkspace(next); await refreshSkills(); return '已恢复全局 Skill 目标'; }, '清除项目 Skill 工作区失败')}
       onSyncSkill={(skillId) => runSkillOperation(`sync:${skillId}`, async () => {
         const result = await agentApi.syncCodexSkill(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
         return result.rendered.state === 'skipped' ? '技能已注册' : '技能注册完成';
       }, '注册技能失败')}
+      onUpdateWorkspace={(skillId) => runSkillOperation(`workspace-update:${skillId}`, async () => {
+        const result = await agentApi.updateSkillWorkspace(skillId);
+        await refreshSkills();
+        await invalidateBuiltinAiToolContext();
+        return result.rendered?.state === 'skipped' ? '当前项目已是最新版本' : '当前项目 Skill 已更新';
+      }, '更新当前项目 Skill 失败')}
+      onSetWorkspaceEnabled={(skillId, enabled) => runSkillOperation(`workspace-enabled:${skillId}`, async () => {
+        await agentApi.setSkillWorkspaceEnabled(skillId, enabled);
+        await refreshSkills();
+        await invalidateBuiltinAiToolContext();
+        return enabled ? '当前项目 Skill 已启用' : '当前项目 Skill 已禁用';
+      }, '更新当前项目 Skill 状态失败')}
       onSyncSkillClient={(skillId, clientId) => runSkillOperation(`register:${clientId}:${skillId}`, async () => {
         const result = await agentApi.syncSkillClient(skillId, clientId);
         await refreshSkills();
@@ -1066,11 +1085,12 @@ function App() {
         const result = await agentApi.uninstallCodexSkill(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
+        if (result.target_kind === 'workspace') return result.removed.removed ? `已从当前项目移除 ${result.removed.skill_id}` : `${result.removed.skill_id} 未在当前项目注册`;
         return result.removed.removed ? `已卸载 ${result.removed.skill_id}` : `未卸载 ${result.removed.skill_id}`;
       }, '卸载技能失败')}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path), '目录已打开', '打开目录失败')}
-      onImportLocal={() => run(async () => { const record = await agentApi.importLocalSkill(); await refreshSkills(); await invalidateBuiltinAiToolContext(); return record; }, '本地 Skill 已导入', '导入本地 Skill 失败')}
-      onImportGithub={async (sourceUrl) => { await agentApi.importGithubSkill(sourceUrl); await refreshSkills(); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub Skill 已导入'); }}
+       onImportLocal={() => run(async () => { const result = await agentApi.importLocalSkill(); await refreshSkills(); await invalidateBuiltinAiToolContext(); return result.record; }, skillWorkspace.valid ? '本地 Skill 已导入并部署到当前项目' : '本地 Skill 已导入并部署到全局', '导入本地 Skill 失败')}
+       onImportGithub={async (sourceUrl) => { await agentApi.importGithubSkill(sourceUrl); await refreshSkills(); await invalidateBuiltinAiToolContext(); notify('success', skillWorkspace.valid ? 'GitHub Skill 已导入并部署到当前项目' : 'GitHub Skill 已导入并部署到全局'); }}
       onOpenAiConnections={() => { setAiConnectionsTab('mcp'); setPage('ai'); }}
     />;
     if (page === 'development') return <ExtensionDevelopmentPage

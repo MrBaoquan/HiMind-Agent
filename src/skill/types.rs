@@ -87,12 +87,24 @@ pub(crate) struct SkillReceipt {
     pub rendered_at: String,
     #[serde(default = "default_render_mode")]
     pub render_mode: String,
+    /// Where this client projection is installed.  Old receipts predate
+    /// project targets and are treated as global installations.
+    #[serde(default = "default_target_kind")]
+    pub target_kind: String,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub files: Vec<String>,
     pub checksums: BTreeMap<String, String>,
 }
 
 fn default_render_mode() -> String {
     "copy".to_string()
+}
+
+fn default_target_kind() -> String {
+    crate::skill::target::TARGET_KIND_GLOBAL.to_string()
 }
 
 fn default_agent_profile() -> String {
@@ -121,5 +133,8 @@ mod tests {
 
         assert_eq!(receipt.agent_profile, "production");
         assert_eq!(receipt.render_mode, "copy");
+        assert_eq!(receipt.target_kind, "global");
+        assert_eq!(receipt.workspace_root, None);
+        assert_eq!(receipt.workspace_id, None);
     }
 }

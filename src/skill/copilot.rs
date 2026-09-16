@@ -2,6 +2,7 @@ use crate::skill::clients::manifest_supports_client;
 use crate::skill::manifest::validate_skill_id;
 use crate::skill::resolver::{CapabilityFact, SkillReadiness};
 use crate::skill::store::{SkillStore, SKILL_SYNC_MODE_SYMLINK};
+use crate::skill::target::SkillTarget;
 use crate::skill::types::{SkillReceipt, SkillRecord};
 use serde::Serialize;
 use serde_json::json;
@@ -19,12 +20,7 @@ use walkdir::WalkDir;
 const CLIENT_ID: &str = "github-copilot";
 const RECEIPT_NAME: &str = ".himind-render.json";
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DirectSkillTarget {
-    pub(super) root: PathBuf,
-    pub(super) source: String,
-    pub(super) configured: bool,
-}
+pub(crate) type DirectSkillTarget = SkillTarget;
 
 #[derive(Debug, Clone, Serialize)]
 struct RenderOutcome {
@@ -44,13 +40,15 @@ pub(crate) fn status_for_target(
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let store = SkillStore::new();
     store.bootstrap_builtin_skills()?;
-    let sync_mode = store.sync_mode()?;
+    let configured_sync_mode = store.sync_mode()?;
+    let sync_mode = crate::skill::target::effective_sync_mode(&configured_sync_mode, &target);
     let items = store
         .list_records()?
         .into_iter()
         .map(|record| {
             skill_status_entry(
                 &target.root,
+                &target,
                 agent_version,
                 capability_facts,
                 record,
@@ -60,12 +58,26 @@ pub(crate) fn status_for_target(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
         "client_id": client_id,
-        "target_root": target.root.to_string_lossy().to_string(),
+        "target_root": crate::skill::target::display_path(&target.root),
         "target_source": target.source,
         "target_configured": target.configured,
+        "target_kind": target.target_kind,
+        "workspace_root": target.workspace_root.as_deref().map(crate::skill::target::display_path),
+        "workspace_id": target.workspace_id,
+        "project_skills": if target.is_workspace() {
+            crate::skill::target::discover_project_skills(&target.root)
+        } else {
+            Vec::new()
+        },
+        "project_skill_conflicts": target
+            .workspace_root
+            .as_deref()
+            .map(crate::skill::target::discover_project_skill_conflicts)
+            .unwrap_or_default(),
         "target_exists": target.root.exists(),
         "target_mode": target_mode(&target),
-        "sync_mode": sync_mode,
+        "sync_mode": configured_sync_mode,
+        "render_mode": sync_mode,
         "items": items,
     }))
 }
@@ -86,6 +98,13 @@ pub(crate) fn sync_for_target(
         if !manifest_supports_client(&record.manifest, client_id) {
             continue;
         }
+        if !crate::skill::target::target_allows_record(
+            &target,
+            &record.manifest.id,
+            Some(&record.manifest.version),
+        )? {
+            continue;
+        }
         let readiness =
             SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, client_id);
         match readiness.state.as_str() {
@@ -94,16 +113,14 @@ pub(crate) fn sync_for_target(
                 "version": record.manifest.version,
                 "reasons": readiness.reasons,
             })),
-            "degraded" | "ready" => {
-                match render_skill(&target.root, &record, client_id, client_name) {
-                    Ok(outcome) => rendered.push(outcome),
-                    Err(error) => skipped.push(json!({
-                        "skill_id": record.manifest.id,
-                        "version": record.manifest.version,
-                        "error": error.to_string(),
-                    })),
-                }
-            }
+            "degraded" | "ready" => match render_skill(&target, &record, client_id, client_name) {
+                Ok(outcome) => rendered.push(outcome),
+                Err(error) => skipped.push(json!({
+                    "skill_id": record.manifest.id,
+                    "version": record.manifest.version,
+                    "error": error.to_string(),
+                })),
+            },
             other => skipped.push(json!({
                 "skill_id": record.manifest.id,
                 "version": record.manifest.version,
@@ -113,9 +130,12 @@ pub(crate) fn sync_for_target(
     }
     Ok(json!({
         "client_id": client_id,
-        "target_root": target.root.to_string_lossy().to_string(),
+        "target_root": crate::skill::target::display_path(&target.root),
         "target_source": target.source,
         "target_configured": target.configured,
+        "target_kind": target.target_kind,
+        "workspace_root": target.workspace_root.as_deref().map(crate::skill::target::display_path),
+        "workspace_id": target.workspace_id,
         "rendered": rendered,
         "skipped": skipped,
         "blocked": blocked,
@@ -144,33 +164,47 @@ pub(crate) fn repair_for_target(
     }
     let rendered_root = target.root.join(skill_slug(&record)?);
     let backup_root = if rendered_root.exists() {
-        match read_receipt(&rendered_root) {
-            Ok(receipt) if validate_rendered_skill(&rendered_root, &receipt).is_ok() => None,
-            _ if preserve_modified => {
-                let backup = target.root.join(format!(
-                    ".himind-{}-user-backup-{}",
-                    skill_slug(&record)?,
-                    unique_stamp()
-                ));
-                fs::rename(&rendered_root, &backup)?;
-                Some(backup)
-            }
-            _ => {
-                fs::remove_dir_all(&rendered_root)?;
-                None
-            }
+        let receipt = read_receipt(&rendered_root).map_err(|_| {
+            format!(
+                "{client_name} Skill 目录不是 HiMind 托管目录，拒绝修复: {}",
+                rendered_root.display()
+            )
+        })?;
+        if receipt.client != client_id || receipt.skill_id != record.manifest.id {
+            return Err(format!("{client_name} Skill 托管收据与修复目标不匹配").into());
+        }
+        if receipt.target_kind != target.target_kind || receipt.workspace_id != target.workspace_id
+        {
+            return Err(format!("{client_name} Skill 托管收据属于其他安装目标，拒绝修复").into());
+        }
+        if validate_rendered_skill(&rendered_root, &receipt).is_ok() {
+            None
+        } else if preserve_modified {
+            let backup = target.root.join(format!(
+                ".himind-{}-user-backup-{}",
+                skill_slug(&record)?,
+                unique_stamp()
+            ));
+            fs::rename(&rendered_root, &backup)?;
+            Some(backup)
+        } else {
+            fs::remove_dir_all(&rendered_root)?;
+            None
         }
     } else {
         None
     };
-    let outcome = render_skill(&target.root, &record, client_id, client_name)?;
+    let outcome = render_skill(&target, &record, client_id, client_name)?;
     Ok(json!({
         "client_id": client_id,
-        "target_root": target.root.to_string_lossy().to_string(),
+        "target_root": crate::skill::target::display_path(&target.root),
         "target_source": target.source,
         "target_configured": target.configured,
+        "target_kind": target.target_kind,
+        "workspace_root": target.workspace_root.as_deref().map(crate::skill::target::display_path),
+        "workspace_id": target.workspace_id,
         "rendered": outcome,
-        "backup_root": backup_root.map(|path| path.to_string_lossy().to_string()),
+        "backup_root": backup_root.map(|path| crate::skill::target::display_path(&path)),
     }))
 }
 
@@ -187,12 +221,15 @@ pub(crate) fn sync_record_for_target(
     if readiness.state == "blocked" {
         return Err(format!("Skill is blocked: {}", readiness.reasons.join(", ")).into());
     }
-    let outcome = render_skill(&target.root, record, client_id, client_name)?;
+    let outcome = render_skill(&target, record, client_id, client_name)?;
     Ok(json!({
         "client_id": client_id,
-        "target_root": target.root.to_string_lossy().to_string(),
+        "target_root": crate::skill::target::display_path(&target.root),
         "target_source": target.source,
         "target_configured": target.configured,
+        "target_kind": target.target_kind,
+        "workspace_root": target.workspace_root.as_deref().map(crate::skill::target::display_path),
+        "workspace_id": target.workspace_id,
         "rendered": outcome,
     }))
 }
@@ -204,24 +241,29 @@ pub(crate) fn uninstall_for_target(
     skill_id: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     validate_skill_id(skill_id)?;
-    let removed = uninstall_skill(&target.root, skill_id, client_id, client_name)?;
+    let removed = uninstall_skill(&target, skill_id, client_id, client_name)?;
     Ok(json!({
         "client_id": client_id,
-        "target_root": target.root.to_string_lossy().to_string(),
+        "target_root": crate::skill::target::display_path(&target.root),
         "target_source": target.source,
         "target_configured": target.configured,
+        "target_kind": target.target_kind,
+        "workspace_root": target.workspace_root.as_deref().map(crate::skill::target::display_path),
+        "workspace_id": target.workspace_id,
         "removed": removed,
     }))
 }
 
 fn skill_status_entry(
     target_root: &Path,
+    target: &SkillTarget,
     agent_version: &str,
     capability_facts: &[CapabilityFact],
     record: SkillRecord,
     client_id: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let sync_mode = SkillStore::new().sync_mode()?;
+    let configured_sync_mode = SkillStore::new().sync_mode()?;
+    let sync_mode = crate::skill::target::effective_sync_mode(&configured_sync_mode, target);
     let readiness =
         SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, client_id);
     let rendered_root = target_root.join(skill_slug(&record)?);
@@ -239,12 +281,38 @@ fn skill_status_entry(
         .map(|receipt| {
             receipt.client == client_id
                 && receipt.skill_id == record.manifest.id
-                && receipt.render_mode == sync_mode
+                && receipt.target_kind == target.target_kind
+                && receipt.workspace_root
+                    == target
+                        .workspace_root
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string())
+                && receipt.workspace_id == target.workspace_id
                 && modified_files.is_empty()
                 && validate_rendered_skill(&rendered_root, receipt).is_ok()
         })
         .unwrap_or(false);
+    // See the Codex adapter: a receipt that differs only in render mode is
+    // valid content written in the previous style, not a user edit.
+    let mode_stale = receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.render_mode != sync_mode);
     let supported = manifest_supports_client(&record.manifest, client_id);
+    // Keep the same pin semantics as the Codex adapter: a project that
+    // deliberately holds an older version is not "outdated", it simply has an
+    // explicit update available.
+    let pinned_version = target
+        .workspace_root
+        .as_deref()
+        .map(|root| crate::skill::target::workspace_pinned_version(root, &record.manifest.id))
+        .transpose()?
+        .flatten();
+    let expected_version = pinned_version
+        .clone()
+        .unwrap_or_else(|| record.manifest.version.clone());
+    let update_available = pinned_version
+        .as_deref()
+        .is_some_and(|version| version != record.manifest.version);
     let client_state = if !supported {
         "unsupported"
     } else if readiness.state == "blocked" {
@@ -253,12 +321,16 @@ fn skill_status_entry(
         "not_installed"
     } else if !receipt_ok {
         "modified"
+    } else if update_available && mode_stale {
+        "outdated"
     } else if receipt
         .as_ref()
-        .map(|receipt| receipt.version != record.manifest.version)
+        .map(|receipt| receipt.version != expected_version)
         .unwrap_or(false)
     {
         "outdated"
+    } else if mode_stale {
+        "modified"
     } else {
         "installed"
     };
@@ -272,13 +344,15 @@ fn skill_status_entry(
     Ok(json!({
         "record": record,
         "readiness": readiness,
-        "rendered_root": rendered_root.to_string_lossy().to_string(),
+        "rendered_root": crate::skill::target::display_path(&rendered_root),
         "rendered": rendered_root.exists(),
         "rendered_valid": receipt_ok,
         "client_state": client_state,
         "installed_version": receipt.as_ref().map(|value| value.version.clone()),
         "managing_profile": managing_profile,
         "available_version": record.manifest.version,
+        "pinned_version": pinned_version,
+        "update_available": update_available,
         "last_synced_at": receipt.as_ref().map(|value| value.rendered_at.clone()),
         "managed_files": receipt.as_ref().map(|value| value.files.clone()).unwrap_or_default(),
         "modified_files": modified_files,
@@ -287,13 +361,15 @@ fn skill_status_entry(
 }
 
 fn render_skill(
-    target_root: &Path,
+    target: &SkillTarget,
     record: &SkillRecord,
     client_id: &str,
     client_name: &str,
 ) -> Result<RenderOutcome, Box<dyn Error>> {
-    let sync_mode = SkillStore::new().sync_mode()?;
+    let configured_sync_mode = SkillStore::new().sync_mode()?;
+    let sync_mode = crate::skill::target::effective_sync_mode(&configured_sync_mode, target);
     let slug = skill_slug(record)?;
+    let target_root = &target.root;
     let rendered_root = target_root.join(&slug);
     let stamp = unique_stamp();
     let staging_root = target_root.join(format!(".himind-{slug}-staging-{stamp}"));
@@ -316,12 +392,28 @@ fn render_skill(
             )
             .into());
         }
+        if receipt.target_kind != target.target_kind || receipt.workspace_id != target.workspace_id
+        {
+            return Err(format!(
+                "{client_name} Skill 托管收据属于其他安装目标，拒绝覆盖: {}",
+                rendered_root.display()
+            )
+            .into());
+        }
         validate_rendered_skill(&rendered_root, &receipt)?;
         if receipt.version == record.manifest.version
             && receipt.source_root == record.version_root.to_string_lossy()
             && receipt.render_mode == sync_mode
             && receipt.checksums == checksums
         {
+            crate::skill::target::record_deployment(
+                target,
+                client_id,
+                &record.manifest.id,
+                &record.manifest.version,
+                &rendered_root,
+            )?;
+            crate::skill::target::record_workspace_skill(target, record, "himind-store")?;
             return Ok(RenderOutcome {
                 skill_id: record.manifest.id.clone(),
                 version: record.manifest.version.clone(),
@@ -343,6 +435,12 @@ fn render_skill(
         rendered_root: rendered_root.to_string_lossy().to_string(),
         rendered_at: stamp,
         render_mode: sync_mode,
+        target_kind: target.target_kind.clone(),
+        workspace_root: target
+            .workspace_root
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        workspace_id: target.workspace_id.clone(),
         files: files.clone(),
         checksums,
     };
@@ -363,6 +461,14 @@ fn render_skill(
     if backup_root.exists() {
         fs::remove_dir_all(&backup_root)?;
     }
+    crate::skill::target::record_deployment(
+        target,
+        client_id,
+        &record.manifest.id,
+        &record.manifest.version,
+        &rendered_root,
+    )?;
+    crate::skill::target::record_workspace_skill(target, record, "himind-store")?;
     Ok(RenderOutcome {
         skill_id: record.manifest.id.clone(),
         version: record.manifest.version.clone(),
@@ -374,7 +480,7 @@ fn render_skill(
 }
 
 fn uninstall_skill(
-    target_root: &Path,
+    target: &SkillTarget,
     skill_id: &str,
     client_id: &str,
     client_name: &str,
@@ -385,8 +491,10 @@ fn uninstall_skill(
         .next()
         .ok_or("Skill ID 缺少可用目录名")?;
     validate_skill_slug(slug)?;
-    let rendered_root = target_root.join(slug);
+    let rendered_root = target.root.join(slug);
     if !rendered_root.exists() {
+        let _ = crate::skill::target::remove_deployment(target, client_id, skill_id);
+        crate::skill::target::remove_workspace_skill_if_unused(target, skill_id)?;
         return Ok(json!({"skill_id": skill_id, "removed": false}));
     }
     let receipt = read_receipt(&rendered_root).map_err(|_| {
@@ -398,14 +506,21 @@ fn uninstall_skill(
     if receipt.client != client_id || receipt.skill_id != skill_id {
         return Err(format!("{client_name} Skill 托管收据与卸载目标不匹配").into());
     }
+    if receipt.target_kind != target.target_kind || receipt.workspace_id != target.workspace_id {
+        return Err(format!("{client_name} Skill 托管收据属于其他安装目标，拒绝卸载").into());
+    }
     validate_rendered_skill(&rendered_root, &receipt)?;
     fs::remove_dir_all(&rendered_root)?;
+    crate::skill::target::remove_deployment(target, client_id, skill_id)?;
+    crate::skill::target::remove_workspace_skill_if_unused(target, skill_id)?;
     Ok(json!({"skill_id": skill_id, "removed": true}))
 }
 
 fn target_mode(target: &DirectSkillTarget) -> &'static str {
     if target.source == "preview" {
         "preview"
+    } else if target.is_workspace() {
+        "workspace"
     } else if target.configured {
         "configured"
     } else {
@@ -457,6 +572,10 @@ fn copy_skill_tree(
             );
         }
         let relative = entry.path().strip_prefix(source_root)?;
+        let relative_name = relative.to_string_lossy().replace('\\', "/");
+        if crate::skill::manifest::is_internal_package_file(&relative_name) {
+            continue;
+        }
         let destination = target_root.join(relative);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&destination)?;
@@ -485,6 +604,9 @@ fn collect_rendered_files(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
                 .to_string_lossy()
                 .replace('\\', "/");
             if relative != RECEIPT_NAME {
+                if crate::skill::manifest::is_internal_package_file(&relative) {
+                    continue;
+                }
                 files.push(relative);
             }
         }
@@ -504,6 +626,9 @@ fn compute_checksums(root: &Path) -> Result<BTreeMap<String, String>, Box<dyn Er
                 .to_string_lossy()
                 .replace('\\', "/");
             if relative != RECEIPT_NAME {
+                if crate::skill::manifest::is_internal_package_file(&relative) {
+                    continue;
+                }
                 checksums.insert(
                     relative,
                     format!("{:x}", Sha256::digest(fs::read(entry.path())?)),
@@ -630,8 +755,9 @@ mod tests {
         let root = env::temp_dir().join(format!("himind-copilot-test-{}", unique_stamp()));
         let target = root.join("target");
         let record = record(&root);
+        let target = SkillTarget::global(target.clone(), "test", true);
         let outcome = render_skill(&target, &record, CLIENT_ID, "Copilot").unwrap();
-        assert_eq!(outcome.rendered_root, target.join("copilot-test"));
+        assert_eq!(outcome.rendered_root, target.root.join("copilot-test"));
         assert!(outcome.rendered_root.join("SKILL.md").exists());
         assert!(!outcome.rendered_root.join("current").exists());
         assert_eq!(
@@ -646,6 +772,7 @@ mod tests {
         let root = env::temp_dir().join(format!("himind-workbuddy-test-{}", unique_stamp()));
         let target = root.join("target");
         let record = record(&root);
+        let target = SkillTarget::global(target.clone(), "test", true);
         let outcome = render_skill(&target, &record, "workbuddy", "WorkBuddy").unwrap();
         let receipt = read_receipt(&outcome.rendered_root).unwrap();
         assert_eq!(receipt.client, "workbuddy");
@@ -665,8 +792,46 @@ mod tests {
         let unmanaged = target.join("copilot-test");
         fs::create_dir_all(&unmanaged).unwrap();
         fs::write(unmanaged.join("SKILL.md"), "manual").unwrap();
+        let target = SkillTarget::global(target.clone(), "test", true);
         let error = render_skill(&target, &record, CLIENT_ID, "Copilot").unwrap_err();
         assert!(error.to_string().contains("拒绝覆盖"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_receipt_cannot_be_uninstalled_from_another_workspace() {
+        // A project projection is materialized content, never a link into the
+        // machine-local Store.
+        let root = env::temp_dir().join(format!("himind-copilot-copy-{}", unique_stamp()));
+        let record = record(&root);
+        let workspace = root.join("project");
+        fs::create_dir_all(&workspace).unwrap();
+        let target = SkillTarget::workspace(&workspace, ".agents/skills", "workspace").unwrap();
+        let outcome = render_skill(&target, &record, CLIENT_ID, "Copilot").unwrap();
+        let rendered_skill = outcome.rendered_root.join("SKILL.md");
+        let metadata = fs::symlink_metadata(&rendered_skill).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(
+            read_receipt(&outcome.rendered_root).unwrap().render_mode,
+            crate::skill::store::SKILL_SYNC_MODE_COPY
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_receipt_is_isolated_from_other_targets() {
+        let root = env::temp_dir().join(format!("himind-copilot-isolation-{}", unique_stamp()));
+        let record = record(&root);
+        let workspace_a = root.join("project-a");
+        fs::create_dir_all(&workspace_a).unwrap();
+        let target_a = SkillTarget::workspace(&workspace_a, ".agents/skills", "workspace").unwrap();
+        let target_b = SkillTarget::global(target_a.root.clone(), "legacy-global", true);
+        render_skill(&target_a, &record, CLIENT_ID, "Copilot").unwrap();
+        let error =
+            uninstall_skill(&target_b, &record.manifest.id, CLIENT_ID, "Copilot").unwrap_err();
+        assert!(error.to_string().contains("属于其他安装目标"));
+        assert!(target_a.root.join("copilot-test").exists());
         let _ = fs::remove_dir_all(root);
     }
 }

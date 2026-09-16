@@ -1194,7 +1194,7 @@ impl CapabilityGateway {
             registration(
                 "extension.skill.candidate.save",
                 "保存 Skill 候选",
-                "校验并原样保存不可变 .hmskill 候选包，返回 Skill 身份和 SHA-256。",
+                "校验并原样保存不可变 .hmskill 或 .zip 候选包，返回 Skill 身份和 SHA-256。",
                 "local_write",
                 json!({
                     "type": "object",
@@ -4874,7 +4874,7 @@ fn validate_mcp_candidate_package(
                     "extension_package_required",
                     "package",
                     "package_path is required",
-                    "传入工作区内已生成并校验的 .hmpkg 或 .hmskill 文件",
+                    "传入工作区内已生成并校验的 .hmpkg、.hmskill 或 .zip 文件",
                     false,
                 )],
                 Vec::new(),
@@ -4902,7 +4902,7 @@ fn validate_mcp_candidate_package(
                 "extension_package_invalid",
                 "package",
                 format!("无法访问候选包: {error}"),
-                "传入存在且可访问的 .hmpkg 或 .hmskill 文件",
+                "传入存在且可访问的 .hmpkg、.hmskill 或 .zip 文件",
                 true,
             )],
             Vec::new(),

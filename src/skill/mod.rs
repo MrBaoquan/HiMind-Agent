@@ -8,6 +8,7 @@ pub(crate) mod direct;
 pub(crate) mod manifest;
 pub(crate) mod resolver;
 pub(crate) mod store;
+pub(crate) mod target;
 pub(crate) mod types;
 
 use crate::capability::service::CapabilityGateway;
@@ -107,6 +108,7 @@ pub(crate) fn mcp_resources_json(
         for content in &record.manifest.contents {
             if content.eq_ignore_ascii_case("skill.json")
                 || content.eq_ignore_ascii_case("SKILL.md")
+                || crate::skill::manifest::is_internal_package_file(content)
             {
                 continue;
             }
@@ -131,6 +133,9 @@ pub(crate) fn mcp_resource_read(
         .ok_or("不支持的 HiMind Skill Resource URI")?;
     let (skill_id, relative) = value.split_once('/').ok_or("Skill Resource URI 缺少路径")?;
     crate::skill::manifest::validate_relative_package_path(relative)?;
+    if crate::skill::manifest::is_internal_package_file(relative) {
+        return Err("Skill Resource 不允许读取 HiMind 内部元数据".into());
+    }
     let record = ready_mcp_records(agent_version, capability_facts)?
         .into_iter()
         .find(|record| record.manifest.id == skill_id)
@@ -247,6 +252,7 @@ pub(crate) fn sync_record_to_supported_clients(
     agent_version: &str,
     capability_facts: &[CapabilityFact],
 ) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    ensure_workspace_record_is_current(record)?;
     let mut clients = BTreeMap::new();
     for normalized in sync_client_ids(record) {
         if clients.contains_key(&normalized) {
@@ -262,11 +268,133 @@ pub(crate) fn sync_record_to_supported_clients(
     Ok(clients)
 }
 
+/// A regular per-Skill sync is a repair operation for the current target.  In
+/// a workspace it must not turn a newer Store record into an implicit project
+/// upgrade; users use the explicit workspace-update action for that.  A Skill
+/// with no lock/deployment is still allowed here because the same operation is
+/// the first explicit install into a selected project.
+pub(crate) fn ensure_workspace_record_is_current(
+    record: &SkillRecord,
+) -> Result<(), Box<dyn Error>> {
+    let Some(workspace_root) = crate::skill::target::resolve_workspace_root(None)? else {
+        return Ok(());
+    };
+    let lock = crate::skill::target::read_workspace_lock(&workspace_root)?;
+    if let Some(entry) = lock.skills.get(&record.manifest.id) {
+        if entry.management != crate::skill::target::MANAGEMENT_MODE_MANAGED {
+            return Err(format!(
+                "工作区 Skill {} 由项目原生目录管理，HiMind 不会覆盖",
+                record.manifest.id
+            )
+            .into());
+        }
+        if !entry.enabled {
+            return Err(format!(
+                "工作区 Skill {} 已被禁用，请先启用后再同步",
+                record.manifest.id
+            )
+            .into());
+        }
+        if entry.version != record.manifest.version {
+            return Err(format!(
+                "工作区 Skill {} 已锁定 v{}，当前 Store 为 v{}；请使用“更新工作区版本”",
+                record.manifest.id, entry.version, record.manifest.version
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    if let Some(pinned) =
+        crate::skill::target::workspace_pinned_version(&workspace_root, &record.manifest.id)?
+    {
+        if pinned != record.manifest.version {
+            return Err(format!(
+                "工作区 Skill {} 已锁定 v{}，当前 Store 为 v{}；请使用“更新工作区版本”",
+                record.manifest.id, pinned, record.manifest.version
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Synchronize one Skill to one explicitly selected AI client.
 ///
 /// The regular sync path intentionally targets every active, supported client.
 /// This narrower operation is used by the UI and MCP management surfaces when
 /// a user wants to repair one client without changing the others.
+pub(crate) fn update_workspace_skill_json(
+    skill_id: &str,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Value, Box<dyn Error>> {
+    let workspace = crate::skill::target::resolve_workspace_root(None)?
+        .ok_or("更新工作区 Skill 需要先显式选择项目工作区")?;
+    let store = SkillStore::new();
+    store.bootstrap_builtin_skills()?;
+    let record = store
+        .get_record(skill_id)?
+        .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    let target =
+        crate::skill::target::SkillTarget::workspace(&workspace, ".agents/skills", "workspace")?;
+    let previous = crate::skill::target::workspace_pinned_version(&workspace, skill_id)?;
+    crate::skill::target::record_workspace_skill(&target, &record, "himind-store")?;
+    let clients = sync_record_to_supported_clients(&record, agent_version, capability_facts)?;
+    Ok(json!({
+        "skill_id": record.manifest.id,
+        "workspace_root": workspace.to_string_lossy().to_string(),
+        "previous_version": previous,
+        "version": record.manifest.version,
+        "lock_updated": true,
+        "lock_path": crate::skill::target::workspace_lock_path(&workspace)
+            .to_string_lossy()
+            .to_string(),
+        "clients": clients,
+    }))
+}
+
+/// Enable or disable a Skill inside the selected project.  Disabling removes
+/// the project projection while keeping the pinned lock entry; enabling
+/// re-projects only when the project and the Store already agree on a version.
+pub(crate) fn set_workspace_skill_enabled_json(
+    skill_id: &str,
+    enabled: bool,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<Value, Box<dyn Error>> {
+    let workspace = crate::skill::target::resolve_workspace_root(None)?
+        .ok_or("切换工作区 Skill 状态需要先显式选择项目工作区")?;
+    let store = SkillStore::new();
+    store.bootstrap_builtin_skills()?;
+    let record = store
+        .get_record(skill_id)?
+        .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    let target =
+        crate::skill::target::SkillTarget::workspace(&workspace, ".agents/skills", "workspace")?;
+    let created =
+        crate::skill::target::ensure_workspace_skill_entry(&target, &record, "himind-store")?;
+    let updated = crate::skill::target::set_workspace_skill_enabled(&workspace, skill_id, enabled)?;
+    let mut reprojected = false;
+    if updated && !enabled {
+        unregister_skill_clients_json(skill_id)?;
+    } else if updated {
+        let pinned = crate::skill::target::workspace_pinned_version(&workspace, skill_id)?;
+        if pinned.as_deref() == Some(record.manifest.version.as_str()) {
+            sync_record_to_supported_clients(&record, agent_version, capability_facts)?;
+            reprojected = true;
+        }
+    }
+    Ok(json!({
+        "skill_id": skill_id,
+        "workspace_root": workspace.to_string_lossy().to_string(),
+        "enabled": enabled,
+        "assignment_created": created,
+        "updated": updated,
+        "reprojected": reprojected,
+        "pinned_version": crate::skill::target::workspace_pinned_version(&workspace, skill_id)?,
+    }))
+}
+
 pub(crate) fn sync_skill_client_json(
     skill_id: &str,
     client_id: &str,
@@ -278,6 +406,7 @@ pub(crate) fn sync_skill_client_json(
     let record = store
         .get_record(skill_id)?
         .ok_or_else(|| format!("Skill not found: {skill_id}"))?;
+    ensure_workspace_record_is_current(&record)?;
     let normalized = client_id.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return Err("client_id 不能为空".into());
@@ -358,6 +487,7 @@ pub(crate) fn repair_record_for_supported_clients(
     agent_version: &str,
     capability_facts: &[CapabilityFact],
 ) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    ensure_workspace_record_is_current(record)?;
     let mut clients = BTreeMap::new();
     for normalized in sync_client_ids(record) {
         if clients.contains_key(&normalized) {
@@ -390,9 +520,14 @@ fn himind_ai_status_json(
 ) -> Result<Value, Box<dyn Error>> {
     let store = SkillStore::new();
     store.bootstrap_builtin_skills()?;
+    let workspace_root = crate::skill::target::resolve_workspace_root(None)?;
     let items = store
         .list_records()?
         .into_iter()
+        .filter(|record| {
+            crate::skill::target::skill_visible_to_himind(record, workspace_root.as_deref())
+                .unwrap_or(false)
+        })
         .map(|record| {
             let readiness = SkillReadiness::resolve(
                 &record.manifest,
@@ -436,6 +571,8 @@ fn himind_ai_status_json(
         "target_configured": true,
         "target_exists": store.root().exists(),
         "target_mode": "builtin",
+        "target_kind": if workspace_root.is_some() { "workspace" } else { "global" },
+        "workspace_root": workspace_root,
         "sync_mode": store.sync_mode()?,
         "items": items,
     }))
@@ -447,10 +584,14 @@ fn himind_ai_sync_json(
 ) -> Result<Value, Box<dyn Error>> {
     let store = SkillStore::new();
     store.bootstrap_builtin_skills()?;
+    let workspace_root = crate::skill::target::resolve_workspace_root(None)?;
     let mut rendered = Vec::new();
     let mut blocked = Vec::new();
     for record in store.list_records()? {
         if !manifest_supports_client(&record.manifest, "himind-ai") {
+            continue;
+        }
+        if !crate::skill::target::skill_visible_to_himind(&record, workspace_root.as_deref())? {
             continue;
         }
         let readiness = SkillReadiness::resolve(
@@ -474,6 +615,8 @@ fn himind_ai_sync_json(
         "target_root": store.root().to_string_lossy().to_string(),
         "target_source": "agent-skill-store",
         "target_configured": true,
+        "target_kind": if workspace_root.is_some() { "workspace" } else { "global" },
+        "workspace_root": workspace_root,
         "rendered": rendered,
         "skipped": [],
         "blocked": blocked,
@@ -494,11 +637,25 @@ fn himind_ai_sync_record_json(
     if readiness.state == "blocked" {
         return Err(format!("Skill is blocked: {}", readiness.reasons.join(", ")).into());
     }
+    let store = SkillStore::new();
+    let target = if let Some(workspace) = crate::skill::target::resolve_workspace_root(None)? {
+        crate::skill::target::SkillTarget::workspace(&workspace, ".agents/skills", "workspace")?
+    } else {
+        crate::skill::target::SkillTarget::global(
+            store.root().to_path_buf(),
+            "agent-skill-store",
+            true,
+        )
+    };
+    crate::skill::target::record_workspace_skill(&target, record, "himind-store")?;
     Ok(json!({
         "client_id": "himind-ai",
-        "target_root": SkillStore::new().root().to_string_lossy().to_string(),
+        "target_root": store.root().to_string_lossy().to_string(),
         "target_source": "agent-skill-store",
         "target_configured": true,
+        "target_kind": target.target_kind,
+        "workspace_root": target.workspace_root,
+        "workspace_id": target.workspace_id,
         "rendered": himind_ai_rendered_result(record),
         "activation": "next_session",
     }))

@@ -22,13 +22,14 @@ import {
   X,
 } from 'lucide-react';
 import { EmptyState, PageHeader, Pill, Tags } from '../components/Common';
-import type { CatalogPage, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, McpTargetDescriptor, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillInstallPlan, SkillSyncSettings } from '../services/agentApi';
+import type { CatalogPage, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, McpTargetDescriptor, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillInstallPlan, SkillSyncSettings, SkillWorkspaceStatus } from '../services/agentApi';
 import { FUNCTIONAL_CATEGORIES, categorySearchText, functionalCategoryLabels, functionalCategoryMatches } from '../data/categoryCatalog';
 import { ManagedCapabilitiesPanel } from './ManagedCapabilitiesPage';
 
 type SkillsWorkspacePageProps = {
   catalog: SkillCatalogResponse | null;
   status: CodexSkillStatusResponse | null;
+  workspace: SkillWorkspaceStatus;
   mcpTargets: McpTargetDescriptor[];
   error: string | null;
   marketplace: OrganizationSkillCatalogItem[];
@@ -44,7 +45,11 @@ type SkillsWorkspacePageProps = {
   busyAction: string | null;
   onRefresh: () => void;
   onSyncAll: () => void;
+  onPickWorkspace: () => void;
+  onClearWorkspace: () => void;
   onSyncSkill: (skillId: string) => void;
+  onUpdateWorkspace: (skillId: string) => void;
+  onSetWorkspaceEnabled: (skillId: string, enabled: boolean) => void;
   syncMode: SkillSyncSettings['mode'];
   onSetSyncMode: (mode: SkillSyncSettings['mode']) => void;
   onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>;
@@ -63,7 +68,7 @@ type SkillsWorkspacePageProps = {
 
 type ViewKey = 'marketplace' | 'installed' | 'system';
 
-export function SkillsWorkspacePage({ catalog, status, mcpTargets, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, marketEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onSyncSkill, onSyncSkillClient, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onUnregisterClient, onUnregisterClients, onOpenDirectory, onImportLocal, onImportGithub, onOpenAiConnections }: SkillsWorkspacePageProps) {
+export function SkillsWorkspacePage({ catalog, status, workspace, mcpTargets, error, marketplace, marketplaceError, desired, desiredLoading, desiredError, pluginRegistry, dashboardEnabled, marketEnabled, onQueryMarketplace, availablePlugins, busyAction, syncMode, onSetSyncMode, onRefresh, onSyncAll, onPickWorkspace, onClearWorkspace, onSyncSkill, onUpdateWorkspace, onSetWorkspaceEnabled, onSyncSkillClient, onLoadVersions, onPlanMarketplace, onInstallMarketplace, onRepair, onUninstall, onUnregisterClient, onUnregisterClients, onOpenDirectory, onImportLocal, onImportGithub, onOpenAiConnections }: SkillsWorkspacePageProps) {
   const [query, setQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [marketplaceItems, setMarketplaceItems] = useState<OrganizationSkillCatalogItem[]>(marketplace);
@@ -171,6 +176,11 @@ export function SkillsWorkspacePage({ catalog, status, mcpTargets, error, market
 	const selectedMarket = visibleMarket.find(item => item.skill_id === selectedId) || visibleMarket[0];
 	  const installedCount = localItems.length;
   const isBusy = Boolean(busyAction);
+  // A selected project always renders copies; the copy/symlink preference only
+  // applies to the global target.
+  const effectiveSyncMode: 'copy' | 'symlink' = workspace.valid
+    ? (status?.render_mode || 'copy')
+    : syncMode;
 
   async function openInstallPlan(skillId: string, version?: string) {
     setPlanLoading(true);
@@ -198,15 +208,22 @@ export function SkillsWorkspacePage({ catalog, status, mcpTargets, error, market
 
       <SkillClientSummary status={status} mcpTargets={mcpTargets} onOpenAiConnections={onOpenAiConnections} />
 
+      <section className="skill-workspace-target" aria-label="Skill 安装目标">
+        <div><strong>{workspace.valid ? '当前项目 Skill 工作区' : '全局 Skill 目标'}</strong><span>{workspace.valid ? workspace.root : '全局用户级目录'}{workspace.valid && status?.project_skills?.length ? ` · 已发现 ${status.project_skills.length} 个仓库 Skill` : ''}</span><small>Agent Skills/Codex 写入：{workspace.valid ? workspace.agents_skills_root : (status?.target_root || '尚未确定')}</small>{workspace.valid ? <small>HiMind 托管：{workspace.managed_skill_count} 个 · 锁文件：{workspace.lock_path}</small> : null}</div>
+        <div className="actions-row"><button className="btn" type="button" onClick={onPickWorkspace} disabled={isBusy}><FolderOpen size={14} />选择当前项目</button>{workspace.valid ? <button className="btn" type="button" onClick={onClearWorkspace} disabled={isBusy}>恢复全局</button> : null}</div>
+      </section>
+
       {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>技能状态读取失败</strong><span>{error}</span></div></div> : null}
 
       {externalSkillTargetsUnavailable(status) && view !== 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>尚未发现外部 AI 工具的技能目录；已安装技能仍可由 HiMind AI 直接使用。</span></div> : null}
+	  {workspace.valid && status?.project_skill_conflicts?.length ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>发现 {status.project_skill_conflicts.length} 个项目 Skill 冲突：同一 Skill ID 同时存在 HiMind 托管副本和项目原生副本。HiMind 不会覆盖或卸载原生 Skill，请在项目中明确保留哪一份。</span></div> : null}
+	  {workspace.valid && status?.project_skills?.length ? <details className="skill-project-sources"><summary><span>项目 Skill 来源</span><small>{status.project_skills.length} 个</small></summary><div>{status.project_skills.map(projectSkill => <div key={`${projectSkill.path}:${projectSkill.skill_id || projectSkill.name}`}><span><strong>{projectSkill.name}</strong><small>{projectSkill.management_mode === 'managed' ? 'HiMind 托管' : '项目原生'}</small></span><code>{projectSkill.path}</code></div>)}</div></details> : null}
 	  {marketEnabled && marketplaceError && view === 'marketplace' ? <div className="skill-inline-warning"><CircleAlert size={15} /><span>{marketplaceError}</span></div> : null}
 	  <div className="plugin-toolbar skill-view-toolbar"><div className="plugin-tabs" role="tablist" aria-label="技能视图">
 	    {marketEnabled ? <button role="tab" aria-selected={view === 'marketplace'} className={view === 'marketplace' ? 'active' : ''} onClick={() => setView('marketplace')}>市场 <span>{marketplace.length}</span></button> : null}
 	    <button role="tab" aria-selected={view === 'installed'} className={view === 'installed' ? 'active' : ''} onClick={() => setView('installed')}>已安装 <span>{installedCount}</span></button>
 	    {dashboardEnabled ? <button role="tab" aria-selected={view === 'system'} className={view === 'system' ? 'active' : ''} onClick={() => setView('system')}>受管理 <span>{systemSkillCount}</span></button> : null}
-	  </div><div className="skill-sync-compact"><span>安装方式</span><div className="segmented-control" role="group" aria-label="技能安装方式"><button type="button" title="复制文件" aria-label="复制文件" aria-pressed={syncMode === 'copy'} className={syncMode === 'copy' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('copy')}><Files size={13} />复制</button><button type="button" title="软链接" aria-label="软链接" aria-pressed={syncMode === 'symlink'} className={syncMode === 'symlink' ? 'active' : ''} disabled={isBusy} onClick={() => onSetSyncMode('symlink')}><Link2 size={13} />链接</button></div></div></div>
+	  </div><div className="skill-sync-compact"><span>安装方式</span><div className="segmented-control" role="group" aria-label="技能安装方式"><button type="button" title={workspace.valid ? '项目投影固定复制文件' : '复制文件'} aria-label="复制文件" aria-pressed={effectiveSyncMode === 'copy'} className={effectiveSyncMode === 'copy' ? 'active' : ''} disabled={isBusy || workspace.valid} onClick={() => onSetSyncMode('copy')}><Files size={13} />复制</button><button type="button" title={workspace.valid ? '项目投影不使用软链接' : '软链接'} aria-label="软链接" aria-pressed={effectiveSyncMode === 'symlink'} className={effectiveSyncMode === 'symlink' ? 'active' : ''} disabled={isBusy || workspace.valid} onClick={() => onSetSyncMode('symlink')}><Link2 size={13} />链接</button></div>{workspace.valid ? <small className="skill-sync-note">项目投影固定复制</small> : null}</div></div>
 
       {dashboardEnabled && view === 'system' ? <ManagedCapabilitiesPanel assetKind="skill" desired={desired} loading={desiredLoading} error={desiredError} registry={pluginRegistry} skillStatus={status} /> : <section className={`skill-workspace ${view === 'marketplace' ? 'skill-marketplace-workspace' : ''} ${view === 'marketplace' && !visibleMarket.length ? 'catalog-empty-workspace' : ''} compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
         <aside className="skill-browser">
@@ -224,15 +241,15 @@ export function SkillsWorkspacePage({ catalog, status, mcpTargets, error, market
 
         <main className="skill-detail">
 		  <button className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回技能列表</button>
-          {view === 'marketplace' ? (selectedMarket ? <MarketSkillDetail item={selectedMarket} installed={installedById.get(selectedMarket.skill_id)} availablePlugins={availablePlugins} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlan={(version) => void openInstallPlan(selectedMarket.skill_id, version)} planLoading={planLoading} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />) : (selected ? <SkillDetail item={selected} clientStatus={status} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />)}
+          {view === 'marketplace' ? (selectedMarket ? <MarketSkillDetail item={selectedMarket} installed={installedById.get(selectedMarket.skill_id)} availablePlugins={availablePlugins} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlan={(version) => void openInstallPlan(selectedMarket.skill_id, version)} planLoading={planLoading} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />) : (selected ? <SkillDetail item={selected} workspace={workspace} clientStatus={status} availablePlugins={availablePlugins} catalogPolicy={marketplace.find(item => item.skill_id === selected.record.manifest.id)} busyAction={busyAction} onLoadVersions={onLoadVersions} onPlanVersion={(version) => void openInstallPlan(selected.record.manifest.id, version)} onSync={onSyncSkill} onUpdateWorkspace={onUpdateWorkspace} onSetWorkspaceEnabled={onSetWorkspaceEnabled} onRepair={onRepair} onUninstall={() => setPendingUninstall(selected)} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} onOpenDirectory={onOpenDirectory} /> : <EmptyState icon={Sparkles} title="选择一个技能" text="查看功能、依赖和版本。" />)}
         </main>
       </section>}
 
       {pendingUninstall ? <div className="skill-dialog-backdrop" role="presentation"><div className="skill-dialog" role="dialog" aria-modal="true" aria-labelledby="skill-uninstall-title">
-        <div className="skill-dialog-head"><strong id="skill-uninstall-title">卸载技能</strong><button className="btn btn-icon" aria-label="关闭" onClick={() => setPendingUninstall(null)}><X size={16} /></button></div>
-        <p>将卸载 <strong>{pendingUninstall.record.manifest.name}</strong>，并清理它在各 AI 工具中的分发副本。</p>
+        <div className="skill-dialog-head"><strong id="skill-uninstall-title">{workspace.valid ? '从项目移除技能' : '卸载技能'}</strong><button className="btn btn-icon" aria-label="关闭" onClick={() => setPendingUninstall(null)}><X size={16} /></button></div>
+        <p>{workspace.valid ? <>将从当前项目的 AI 工具目录中移除 <strong>{pendingUninstall.record.manifest.name}</strong>，全局 Skill Store 和其他项目不受影响。</> : <>将卸载 <strong>{pendingUninstall.record.manifest.name}</strong>，并清理它在各 AI 工具中的分发副本。</>}</p>
         {pendingUninstall.modified_files.length ? <div className="skill-dialog-warning"><CircleAlert size={16} />检测到用户修改。请先使用“修复并备份”保留当前文件。</div> : null}
-        <div className="skill-dialog-actions"><button className="btn" onClick={() => setPendingUninstall(null)}>取消</button><button className="btn btn-danger" disabled={isBusy || pendingUninstall.modified_files.length > 0} onClick={() => { onUninstall(pendingUninstall.record.manifest.id); setPendingUninstall(null); }}><Trash2 size={15} />确认卸载</button></div>
+        <div className="skill-dialog-actions"><button className="btn" onClick={() => setPendingUninstall(null)}>取消</button><button className="btn btn-danger" disabled={isBusy || pendingUninstall.modified_files.length > 0} onClick={() => { onUninstall(pendingUninstall.record.manifest.id); setPendingUninstall(null); }}><Trash2 size={15} />{workspace.valid ? '从项目移除' : '确认卸载'}</button></div>
       </div></div> : null}
 	  {installPlan || planError ? <InstallPlanDialog plan={installPlan} error={planError} currentVersion={installPlan ? installedById.get(installPlan.skill.skill_id)?.record.manifest.version : undefined} busy={isBusy} onClose={() => { setInstallPlan(null); setPlanError(''); }} onInstall={(optionalIds) => { if (installPlan) onInstallMarketplace(installPlan.skill.skill_id, installPlan.skill.version, optionalIds); setInstallPlan(null); }} /> : null}
 	  {githubOpen ? <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="github-skill-title"><div className="modal-header"><div><h3 id="github-skill-title">从 GitHub 导入 Skill</h3><p>粘贴仓库链接即可；子目录和版本可按 UPM 方式写在链接中。</p></div><button className="btn btn-icon" aria-label="关闭" title="关闭" onClick={() => setGithubOpen(false)}><X size={16} /></button></div><div className="modal-body"><div className="field-group"><label className="field-label" htmlFor="github-skill-source-url">GitHub 链接</label><input id="github-skill-source-url" value={githubSourceUrl} onChange={event => setGithubSourceUrl(event.target.value)} placeholder="https://github.com/owner/repository.git?path=/skills/example#v1.0.0" /></div>{githubError ? <div className="inline-feedback visible" role="status">{githubError}</div> : null}<div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={() => setGithubOpen(false)}>取消</button><button className="btn btn-primary" disabled={githubBusy || !githubSourceUrl.trim()} onClick={async () => { setGithubBusy(true); setGithubError(''); try { await onImportGithub(githubSourceUrl.trim()); setGithubOpen(false); } catch (error) { setGithubError(error instanceof Error ? error.message : 'GitHub Skill 导入失败'); } finally { setGithubBusy(false); } }}>{githubBusy ? '导入中...' : '导入 Skill'}</button></div></div></div></div></div> : null}
@@ -285,7 +302,7 @@ function skillClientDescriptors(status: CodexSkillStatusResponse | null, mcpTarg
     return {
       id,
       name: clientStatus?.client_name || SKILL_CLIENT_NAMES[id] || id,
-      detected: Boolean(clientStatus?.client_detected || clientStatus?.target_exists || clientStatus?.target_configured),
+      detected: Boolean(clientStatus?.client_detected || clientStatus?.target_exists || (clientStatus?.target_configured && clientStatus?.target_kind !== 'workspace')),
       supportLevel: clientStatus?.support_level || (['himind-ai', 'codex'].includes(id) ? 'official' : 'compatible'),
       supportNote: clientStatus?.support_note || '',
     };
@@ -454,7 +471,7 @@ function SkillListItem({ item, selected, onSelect }: { item: CodexSkillStatusIte
   return <button className={`skill-browser-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(manifest.id)}><span className={`skill-state-rail ${stateTone(item.client_state)}`} /><span className="skill-browser-item-copy"><strong>{manifest.name}</strong><small>作者：{manifest.author || '未知作者'}</small><small>{manifest.description || manifest.id}</small></span><span className={`skill-state-label ${stateTone(item.client_state)}`}>{clientStateLabel(item.client_state)}</span></button>;
 }
 
-function SkillDetail({ item, clientStatus, availablePlugins, catalogPolicy, busyAction, onLoadVersions, onPlanVersion, onSync, onRepair, onUninstall, onSyncSkillClient, onUnregisterClient, onUnregisterClients, onOpenDirectory }: { item: CodexSkillStatusItem; clientStatus: CodexSkillStatusResponse | null; availablePlugins: PluginCatalogItem[]; catalogPolicy?: OrganizationSkillCatalogItem; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onPlanVersion: (version: string) => void; onSync: (id: string) => void; onRepair: (id: string) => void; onUninstall: () => void; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void; onOpenDirectory: (path: string) => void }) {
+function SkillDetail({ item, workspace, clientStatus, availablePlugins, catalogPolicy, busyAction, onLoadVersions, onPlanVersion, onSync, onUpdateWorkspace, onSetWorkspaceEnabled, onRepair, onUninstall, onSyncSkillClient, onUnregisterClient, onUnregisterClients, onOpenDirectory }: { item: CodexSkillStatusItem; workspace: SkillWorkspaceStatus; clientStatus: CodexSkillStatusResponse | null; availablePlugins: PluginCatalogItem[]; catalogPolicy?: OrganizationSkillCatalogItem; busyAction: string | null; onLoadVersions: (skillId: string) => Promise<OrganizationSkillCatalogItem[]>; onPlanVersion: (version: string) => void; onSync: (id: string) => void; onUpdateWorkspace: (id: string) => void; onSetWorkspaceEnabled: (id: string, enabled: boolean) => void; onRepair: (id: string) => void; onUninstall: () => void; onSyncSkillClient: (skillId: string, clientId: string) => void; onUnregisterClient: (skillId: string, clientId: string) => void; onUnregisterClients: (skillId: string) => void; onOpenDirectory: (path: string) => void }) {
   const manifest = item.record.manifest;
   const actionBusy = Boolean(busyAction?.endsWith(manifest.id));
   const [tab, setTab] = useState<'details' | 'versions'>('details');
@@ -462,6 +479,9 @@ function SkillDetail({ item, clientStatus, availablePlugins, catalogPolicy, busy
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsError, setVersionsError] = useState('');
   const managed = catalogPolicy?.management !== 'user_managed' && Boolean(catalogPolicy?.managed);
+  const workspaceManaged = workspace.managed_skills?.find(entry => entry.skill_id === manifest.id);
+  const workspaceUpdateBusy = busyAction === `workspace-update:${manifest.id}`;
+  const workspaceEnabledBusy = busyAction === `workspace-enabled:${manifest.id}`;
 
   useEffect(() => {
     if (tab !== 'versions' || !catalogPolicy) return;
@@ -473,6 +493,7 @@ function SkillDetail({ item, clientStatus, availablePlugins, catalogPolicy, busy
   }, [catalogPolicy, manifest.id, onLoadVersions, tab]);
   return <>
     <header className="skill-detail-header"><div className="skill-detail-title"><span className="skill-detail-mark">{manifest.name.slice(0, 1).toUpperCase()}</span><div><div className="skill-title-line"><h3>{manifest.name}</h3><Pill kind={statePill(item.client_state)}>{clientStateLabel(item.client_state)}</Pill></div><small className="skill-detail-source">作者：{manifest.author || '未知作者'}</small></div></div><div className="skill-detail-actions">
+      {workspace.valid && item.update_available ? <button className="btn btn-primary" title={`当前项目锁定 v${item.pinned_version || ''}，技能库已是 v${item.available_version}`} disabled={workspaceUpdateBusy || Boolean(busyAction)} onClick={() => onUpdateWorkspace(manifest.id)}><RefreshCw className={workspaceUpdateBusy ? 'spin' : ''} size={15} />更新当前项目到 v{item.available_version}</button> : null}
       {item.available_actions.includes('repair') ? <button className="btn" disabled={actionBusy} onClick={() => onRepair(manifest.id)}><Wrench size={15} />{item.client_state === 'modified' ? '修复并备份' : '重新同步'}</button> : null}
       {item.available_actions.includes('uninstall') && catalogPolicy?.allow_uninstall !== false ? <button className="btn btn-danger-quiet" disabled={actionBusy} onClick={onUninstall}><Trash2 size={15} />卸载</button> : null}
     </div></header>
@@ -482,6 +503,7 @@ function SkillDetail({ item, clientStatus, availablePlugins, catalogPolicy, busy
     {tab === 'versions' ? <SkillVersionList versions={versions} currentVersion={item.installed_version || manifest.version} lockedLabel={catalogPolicy?.assignment === 'blocked' ? '不可安装' : managed ? '由组织管理' : undefined} loading={versionsLoading} error={versionsError} onSelect={catalogPolicy ? onPlanVersion : undefined} /> : <>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>功能</strong></div></div><p className="skill-release-notes">{manifest.description || '暂无功能说明。'}</p></section>
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>AI 工具</strong><small>管理技能注册</small></div></div><SkillClientAvailability status={clientStatus} skillId={manifest.id} busyAction={busyAction} canRegisterAll={item.available_actions.includes('install') || item.available_actions.includes('update')} allowUnregister={catalogPolicy?.allow_uninstall !== false} onRegisterAll={onSync} onSyncSkillClient={onSyncSkillClient} onUnregisterClient={onUnregisterClient} onUnregisterClients={onUnregisterClients} /></section>
+      {workspace.valid && workspaceManaged ? <section className="skill-detail-section"><div className="skill-section-title"><div><strong>当前项目管理</strong><small>锁定 v{workspaceManaged.version} · {workspaceManaged.enabled ? '已启用' : '已禁用'}</small></div><button type="button" className="btn" disabled={workspaceEnabledBusy || Boolean(busyAction)} onClick={() => onSetWorkspaceEnabled(manifest.id, !workspaceManaged.enabled)}>{workspaceManaged.enabled ? '在项目中停用' : '在项目中启用'}</button></div><p className="skill-release-notes">当前项目使用锁文件里的版本，技能库更新不会自动改项目。停用会移除该项目里的 HiMind 投影并停止同步，锁定版本仍保留，启用后可重新同步。</p></section> : null}
       <section className="skill-detail-section"><div className="skill-section-title"><div><strong>依赖</strong></div></div><div className="skill-dependency-list">{(manifest.plugin_dependencies || []).map(dependency => <div key={dependency.plugin_id}><span className="status-dot success" /><PluginDependencyIdentity pluginId={dependency.plugin_id} plugins={availablePlugins} /><span>{dependency.required ? '必需' : '可选'}</span><strong>{dependency.min_version ? `v${dependency.min_version} 及以上` : '不限版本'}</strong></div>)}{!manifest.plugin_dependencies?.length ? <span className="skill-section-empty">无依赖</span> : null}</div></section>
       <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>Skill ID</span><code>{manifest.id}</code></div><div><span>作者</span><strong>{manifest.author || '未知作者'}</strong></div><div><span>来源</span><strong>{scopeLabel(manifest.scope)}</strong></div><div><span>最近同步</span><strong>{formatSyncedAt(item.last_synced_at)}</strong></div><div className="wide"><span>本地目录</span><code>{item.rendered_root || '--'}</code></div></div><div className="skill-file-summary"><span /><button className="text-action" disabled={!item.rendered} onClick={() => onOpenDirectory(item.rendered_root)}><FolderOpen size={14} />打开目录</button></div></details>
     </>}

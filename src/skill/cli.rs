@@ -9,7 +9,63 @@ use crate::{Options, VERSION};
 use std::error::Error;
 
 pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    match arguments.first().map(String::as_str) {
+    // Project deployments are explicit and process-scoped. This avoids
+    // changing the machine-wide target just because a CLI was run in a repo.
+    // Accept the target flags before or after the subcommand so both common
+    // forms work: `skill --workspace X sync` and `skill sync --workspace X`.
+    let mut command = Vec::with_capacity(arguments.len());
+    let mut workspace = None;
+    let mut global = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--workspace" => {
+                let path = arguments
+                    .get(index + 1)
+                    .ok_or("--workspace requires a project directory")?;
+                if global {
+                    return Err("--workspace 与 --global 不能同时使用".into());
+                }
+                workspace = Some(crate::skill::target::canonical_workspace_root(
+                    std::path::Path::new(path),
+                )?);
+                index += 2;
+            }
+            "--global" => {
+                if workspace.is_some() {
+                    return Err("--workspace 与 --global 不能同时使用".into());
+                }
+                global = true;
+                index += 1;
+            }
+            value => {
+                command.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    if let Some(root) = workspace {
+        std::env::remove_var("HIMIND_SKILL_TARGET");
+        std::env::set_var("HIMIND_SKILL_WORKSPACE", root);
+    } else if global {
+        std::env::set_var(
+            "HIMIND_SKILL_TARGET",
+            crate::skill::target::TARGET_KIND_GLOBAL,
+        );
+        std::env::remove_var("HIMIND_SKILL_WORKSPACE");
+    } else {
+        // A persisted workspace is a desktop UI preference, not an implicit
+        // CLI mutation target.  CLI commands default to the global target so
+        // a previous UI selection cannot redirect an import or uninstall into
+        // a repository unexpectedly.  Use --workspace explicitly for a
+        // project operation.
+        std::env::set_var(
+            "HIMIND_SKILL_TARGET",
+            crate::skill::target::TARGET_KIND_GLOBAL,
+        );
+        std::env::remove_var("HIMIND_SKILL_WORKSPACE");
+    }
+    match command.first().map(String::as_str) {
         Some("catalog") | Some("list") => {
             let capability_facts = capability_facts_for_cli(options)?;
             print_json(catalog_json(VERSION, "codex", &capability_facts)?)?
@@ -18,19 +74,34 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             let capability_facts = capability_facts_for_cli(options)?;
             print_json(client_status_json(VERSION, &capability_facts)?)?
         }
-        Some("import-local") if arguments.len() == 2 => {
+        Some("import-local") | Some("install-local") if command.len() == 2 => {
             let record = crate::app::skill_manager::install_local_package(
-                std::path::Path::new(&arguments[1]),
+                std::path::Path::new(&command[1]),
             )?;
-            print_json(serde_json::to_value(record)?)?
+            let capability_facts = capability_facts_for_cli(options)?;
+            let clients = sync_record_to_supported_clients(&record, VERSION, &capability_facts)?;
+            print_json(serde_json::json!({
+                "record": record,
+                "clients": clients,
+                "deployment": "current-target",
+            }))?
         }
-        Some("import-github") if arguments.len() >= 2 && arguments.len() <= 4 => {
-            let record = crate::app::github_source::import_skill(
-                &arguments[1],
-                arguments.get(2).map(String::as_str).unwrap_or_default(),
-                arguments.get(3).map(String::as_str).unwrap_or_default(),
+        Some("import-github") | Some("install-github")
+            if command.len() >= 2 && command.len() <= 4 =>
+        {
+            let value = crate::app::github_source::import_skill(
+                &command[1],
+                command.get(2).map(String::as_str).unwrap_or_default(),
+                command.get(3).map(String::as_str).unwrap_or_default(),
             )?;
-            print_json(record)?
+            let record = serde_json::from_value::<crate::skill::types::SkillRecord>(value)?;
+            let capability_facts = capability_facts_for_cli(options)?;
+            let clients = sync_record_to_supported_clients(&record, VERSION, &capability_facts)?;
+            print_json(serde_json::json!({
+                "record": record,
+                "clients": clients,
+                "deployment": "current-target",
+            }))?
         }
         Some("sync") => {
             let capability_facts = capability_facts_for_cli(options)?;
@@ -42,10 +113,10 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
 				"items": crate::app::skill_manager::catalog(options, &state.agent_id)?,
 			}))?
 		}
-        Some("install") if arguments.len() == 2 => {
+        Some("install") if command.len() == 2 => {
 			let state = paired_agent_state(options)?;
 			let (catalog_item, record) =
-				crate::app::skill_manager::install(options, &state.agent_id, &arguments[1])?;
+				crate::app::skill_manager::install(options, &state.agent_id, &command[1])?;
 			let capability_facts = capability_facts_for_cli(options)?;
 			let clients =
 				sync_record_to_supported_clients(&record, VERSION, &capability_facts)?;
@@ -58,78 +129,102 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
 				"clients": clients,
 			}))?
 		}
-        Some("author") if arguments.get(1).map(String::as_str) == Some("list") => {
+        Some("author") if command.get(1).map(String::as_str) == Some("list") => {
             print_json(serde_json::json!({ "items": crate::skill::authoring::list()? }))?
         }
-        Some("plan") if arguments.len() == 2 => {
+        Some("plan") if command.len() == 2 => {
             let state = paired_agent_state(options)?;
             print_json(serde_json::to_value(
-                crate::app::skill_manager::plan_install(options, &state.agent_id, &arguments[1], None)?,
+                crate::app::skill_manager::plan_install(options, &state.agent_id, &command[1], None)?,
             )?)?
         }
         Some("author")
-            if arguments.get(1).map(String::as_str) == Some("save")
-                && arguments.len() == 3 =>
+            if command.get(1).map(String::as_str) == Some("save")
+                && command.len() == 3 =>
         {
-            let path = arguments[2].strip_prefix('@').unwrap_or(&arguments[2]);
+            let path = command[2].strip_prefix('@').unwrap_or(&command[2]);
             let input = serde_json::from_str::<crate::skill::authoring::SkillDraftInput>(
                 &std::fs::read_to_string(path)?,
             )?;
             print_json(serde_json::to_value(crate::skill::authoring::save(input)?)?)?
         }
         Some("author")
-            if arguments.get(1).map(String::as_str) == Some("test")
-                && arguments.len() == 4 =>
+            if command.get(1).map(String::as_str) == Some("test")
+                && command.len() == 4 =>
         {
             let capability_facts = capability_facts_for_cli(options)?;
             print_json(serde_json::to_value(crate::skill::authoring::test(
-                &arguments[2],
-                &arguments[3],
+                &command[2],
+                &command[3],
                 &capability_facts,
             )?)?)?
         }
         Some("author")
-            if arguments.get(1).map(String::as_str) == Some("confirm")
-                && arguments.len() == 4 =>
+            if command.get(1).map(String::as_str) == Some("confirm")
+                && command.len() == 4 =>
         {
             print_json(serde_json::to_value(crate::skill::authoring::confirm(
-                &arguments[2],
-                &arguments[3],
+                &command[2],
+                &command[3],
             )?)?)?
         }
         Some("author")
-            if arguments.get(1).map(String::as_str) == Some("submit")
-                && arguments.len() == 4 =>
+            if command.get(1).map(String::as_str) == Some("submit")
+                && command.len() == 4 =>
         {
             let state = paired_agent_state(options)?;
             print_json(serde_json::to_value(crate::skill::authoring::submit(
                 options,
                 &state.agent_id,
-                &arguments[2],
-                &arguments[3],
+                &command[2],
+                &command[3],
             )?)?)?
         }
-        Some("uninstall") if arguments.len() == 2 => {
-            print_json(uninstall_supported_clients_json(&arguments[1])?)?
+        Some("uninstall") if command.len() == 2 => {
+            print_json(uninstall_supported_clients_json(&command[1])?)?
         }
-        Some("register") if arguments.len() == 3 => {
+        Some("register") if command.len() == 3 => {
             let capability_facts = capability_facts_for_cli(options)?;
             print_json(sync_skill_client_json(
-                &arguments[1],
-                &arguments[2],
+                &command[1],
+                &command[2],
                 VERSION,
                 &capability_facts,
             )?)?
         }
-        Some("unregister") if arguments.len() == 3 => {
-            print_json(unregister_skill_client_json(&arguments[1], &arguments[2])?)?
+        Some("unregister") if command.len() == 3 => {
+            print_json(unregister_skill_client_json(&command[1], &command[2])?)?
         }
-        Some("unregister-all") if arguments.len() == 2 => {
-            print_json(unregister_skill_clients_json(&arguments[1])?)?
+        Some("unregister-all") if command.len() == 2 => {
+            print_json(unregister_skill_clients_json(&command[1])?)?
+        }
+        Some("update-workspace") if command.len() == 2 => {
+            let capability_facts = capability_facts_for_cli(options)?;
+            print_json(crate::skill::update_workspace_skill_json(
+                &command[1],
+                VERSION,
+                &capability_facts,
+            )?)?
+        }
+        Some("set-workspace-enabled") if command.len() == 3 => {
+            let enabled = match command[2].trim().to_ascii_lowercase().as_str() {
+                "true" | "enabled" | "on" | "1" => true,
+                "false" | "disabled" | "off" | "0" => false,
+                other => {
+                    return Err(format!("启用状态必须是 true 或 false，收到: {other}").into())
+                }
+            };
+            let capability_facts = capability_facts_for_cli(options)?;
+            print_json(crate::skill::set_workspace_skill_enabled_json(
+                &command[1],
+                enabled,
+                VERSION,
+                &capability_facts,
+            )?)?
         }
         _ => {
             return Err(
-                "usage: himind-agent skill <catalog|import-local path|import-github github-url [ref] [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|register <skill-id> <client-id>|unregister <skill-id> <client-id>|unregister-all <skill-id>|uninstall <skill-id>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
+                "usage: himind-agent skill [--workspace <project-root>|--global] <catalog|import-local path|install-local path|import-github github-url [ref] [subpath]|install-github github-url [ref] [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|register <skill-id> <client-id>|unregister <skill-id> <client-id>|unregister-all <skill-id>|uninstall <skill-id>|update-workspace <skill-id>|set-workspace-enabled <skill-id> <true|false>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
             )
         }
     }
