@@ -408,6 +408,16 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             let runs = ledger.list_runs(100)?;
             println!("{}", serde_json::to_string_pretty(&runs)?);
         }
+        [action] if action == "recover" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let recovered = ledger.recover_running_runs(false, 100)?;
+            println!("{}", serde_json::to_string_pretty(&recovered)?);
+        }
+        [action, force] if action == "recover" && force == "--force" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let recovered = ledger.recover_running_runs(true, 100)?;
+            println!("{}", serde_json::to_string_pretty(&recovered)?);
+        }
         [action, run_id] if action == "show" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let run = ledger
@@ -519,7 +529,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <validate <dir>|doctor <dir|id>|install <dir>|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <validate <dir>|doctor <dir|id>|install <dir>|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }

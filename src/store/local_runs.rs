@@ -5,7 +5,9 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::agent_core_contracts::{InteractionEnvelope, LocalRun, LocalRunStatus, RuntimeEvent};
+use crate::agent_core_contracts::{
+    InteractionEnvelope, LocalRun, LocalRunStatus, RuntimeEvent, RuntimeEventType,
+};
 
 pub(crate) const LOCAL_RUN_DB_FILE: &str = "local-runs.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
@@ -250,6 +252,165 @@ impl LocalRunLedger {
             runs.push(serde_json::from_str(&row?)?);
         }
         Ok(runs)
+    }
+
+    pub(crate) fn acquire_run_lease(
+        &self,
+        run_id: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, Box<dyn Error>> {
+        require_text("run lease owner", owner)?;
+        let status: Option<String> = {
+            let connection = self.connection()?;
+            connection
+                .query_row(
+                    "SELECT status FROM local_runs WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        let Some(status) = status else {
+            return Ok(false);
+        };
+        if status != "queued" && status != "running" && status != "waiting" {
+            return Ok(false);
+        }
+        let now = unix_now_i64();
+        let expires_at = now.saturating_add(ttl_seconds.max(30) as i64);
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "INSERT INTO local_run_leases(run_id, owner, expires_at, heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id) DO UPDATE SET
+                owner = excluded.owner,
+                expires_at = excluded.expires_at,
+                heartbeat_at = excluded.heartbeat_at
+             WHERE local_run_leases.owner = excluded.owner
+                OR local_run_leases.expires_at <= ?4",
+            params![run_id, owner, expires_at, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn renew_run_lease(
+        &self,
+        run_id: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, Box<dyn Error>> {
+        let now = unix_now_i64();
+        let expires_at = now.saturating_add(ttl_seconds.max(30) as i64);
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE local_run_leases
+             SET expires_at = ?3, heartbeat_at = ?4
+             WHERE run_id = ?1 AND owner = ?2",
+            params![run_id, owner, expires_at, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn release_run_lease(
+        &self,
+        run_id: &str,
+        owner: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM local_run_leases WHERE run_id = ?1 AND owner = ?2",
+            params![run_id, owner],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn recover_running_runs(
+        &self,
+        force: bool,
+        limit: usize,
+    ) -> Result<Vec<LocalRun>, Box<dyn Error>> {
+        let run_ids = if force {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT run_id
+                 FROM local_runs
+                 WHERE status = 'running'
+                 ORDER BY updated_at ASC
+                 LIMIT ?1",
+            )?;
+            let run_ids = statement
+                .query_map(params![limit.clamp(1, 100) as i64], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            run_ids
+        } else {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT local_runs.run_id
+                 FROM local_runs
+                 JOIN local_run_leases
+                   ON local_run_leases.run_id = local_runs.run_id
+                 WHERE local_runs.status = 'running'
+                   AND local_run_leases.expires_at <= ?2
+                 ORDER BY local_run_leases.expires_at ASC
+                 LIMIT ?1",
+            )?;
+            let run_ids = statement
+                .query_map(params![limit.clamp(1, 100) as i64, unix_now_i64()], |row| {
+                    row.get(0)
+                })?
+                .collect::<Result<Vec<String>, _>>()?;
+            run_ids
+        };
+        let mut recovered = Vec::new();
+        for run_id in run_ids {
+            let Some(mut run) = self.get_run(&run_id)? else {
+                continue;
+            };
+            if run.status != LocalRunStatus::Running {
+                continue;
+            }
+            let interrupted_step_id = run.current_step_id.clone();
+            for step in &mut run.steps {
+                if step.status == crate::agent_core_contracts::LocalStepStatus::Running {
+                    step.status = crate::agent_core_contracts::LocalStepStatus::Pending;
+                    step.started_at.clear();
+                    step.finished_at.clear();
+                    step.error.clear();
+                }
+            }
+            run.status = LocalRunStatus::Queued;
+            run.error = "workflow run recovered after lease expiry".to_string();
+            run.current_step_id.clear();
+            run.updated_at = unix_now_string();
+            self.save_run(&run)?;
+            self.clear_run_lease(&run_id)?;
+            let sequence = self.next_runtime_sequence(&run_id)?;
+            self.append_event(&RuntimeEvent {
+                schema_version: crate::agent_core_contracts::RUNTIME_EVENT_SCHEMA_VERSION
+                    .to_string(),
+                event_id: format!("{run_id}:recovery:{sequence}"),
+                run_id: run_id.clone(),
+                step_id: interrupted_step_id,
+                capability_id: String::new(),
+                sequence,
+                occurred_at: run.updated_at.clone(),
+                provider: run.runtime_provider.clone(),
+                event_type: RuntimeEventType::Error,
+                payload: serde_json::json!({"recovered": true}),
+            })?;
+            recovered.push(run);
+        }
+        Ok(recovered)
+    }
+
+    fn clear_run_lease(&self, run_id: &str) -> Result<(), Box<dyn Error>> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM local_run_leases WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn append_event(&self, event: &RuntimeEvent) -> Result<bool, Box<dyn Error>> {
@@ -641,6 +802,14 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
             ON local_runs(interaction_id);
          CREATE INDEX IF NOT EXISTS idx_local_runs_status_updated
             ON local_runs(status, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS local_run_leases(
+            run_id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            heartbeat_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_local_run_leases_expiry
+            ON local_run_leases(expires_at);
          CREATE TABLE IF NOT EXISTS runtime_events(
             event_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL REFERENCES local_runs(run_id) ON DELETE CASCADE,
@@ -692,6 +861,13 @@ fn unix_now_string() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+fn unix_now_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -872,6 +1048,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_run_lease_recovers_running_step_to_pending() {
+        let ledger = ledger();
+        ledger.record_interaction(&interaction()).unwrap();
+        ledger.save_run(&run(LocalRunStatus::Running)).unwrap();
+        assert!(ledger.acquire_run_lease("run-1", "owner-a", 300).unwrap());
+        assert!(!ledger.acquire_run_lease("run-1", "owner-b", 300).unwrap());
+        assert!(ledger.recover_running_runs(false, 10).unwrap().is_empty());
+
+        let connection = ledger.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE local_run_leases SET expires_at = 0 WHERE run_id = 'run-1'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let recovered = ledger.recover_running_runs(false, 10).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, LocalRunStatus::Queued);
+        assert_eq!(recovered[0].steps[0].status, LocalStepStatus::Pending);
+        assert!(ledger.list_events("run-1").unwrap().iter().any(|event| {
+            event.payload.get("recovered").and_then(Value::as_bool) == Some(true)
+        }));
+    }
+
+    #[test]
     fn sqlite_schema_contains_core_ledger_tables() {
         let ledger = ledger();
         let connection = ledger.connection().unwrap();
@@ -879,6 +1082,7 @@ mod tests {
             "local_schema_migrations",
             "local_interactions",
             "local_runs",
+            "local_run_leases",
             "runtime_events",
             "projection_outbox",
         ] {

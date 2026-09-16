@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use super::{WorkflowPackage, WorkflowStep};
 use crate::agent_core_contracts::{
@@ -70,6 +73,52 @@ enum WorkflowStepOutcome {
 
 pub(crate) struct WorkflowRunner {
     ledger: LocalRunLedger,
+}
+
+struct RunLeaseGuard {
+    ledger: LocalRunLedger,
+    run_id: String,
+    owner: String,
+    stop_tx: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RunLeaseGuard {
+    fn acquire(ledger: LocalRunLedger, run_id: &str) -> Result<Self, Box<dyn Error>> {
+        let owner = format!("workflow-pid-{}-{}", std::process::id(), run_id);
+        if !ledger.acquire_run_lease(run_id, &owner, 300)? {
+            return Err(format!("workflow run is leased by another process: {run_id}").into());
+        }
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let thread_ledger = ledger.clone();
+        let thread_run_id = run_id.to_string();
+        let thread_owner = owner.clone();
+        let thread = thread::spawn(move || loop {
+            match stop_rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = thread_ledger.renew_run_lease(&thread_run_id, &thread_owner, 300);
+                }
+            }
+        });
+        Ok(Self {
+            ledger,
+            run_id: run_id.to_string(),
+            owner,
+            stop_tx,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for RunLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = self.ledger.release_run_lease(&self.run_id, &self.owner);
+    }
 }
 
 impl WorkflowRunner {
@@ -227,6 +276,7 @@ impl WorkflowRunner {
         if run.status.is_terminal() {
             return Ok(outcome(run, String::new(), Vec::new()));
         }
+        let _lease = RunLeaseGuard::acquire(self.ledger.clone(), &run.run_id)?;
         let mut completed_steps = Vec::new();
 
         loop {
