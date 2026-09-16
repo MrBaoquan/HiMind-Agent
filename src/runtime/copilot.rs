@@ -167,7 +167,7 @@ fn spawn_copilot(invocation: &CopilotInvocation) -> Result<Child, Box<dyn Error>
     Ok(command.spawn()?)
 }
 
-fn resolve_copilot_executable() -> Result<(OsString, String), Box<dyn Error>> {
+pub(crate) fn resolve_copilot_executable() -> Result<(OsString, String), Box<dyn Error>> {
     if let Some(executable) =
         env::var_os("HIMIND_GITHUB_COPILOT_EXECUTABLE").filter(|value| !value.is_empty())
     {

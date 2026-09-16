@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Workflow Development Result",
+  "type": "object",
+  "required": ["schema_version", "provider", "workspace", "summary"],
+  "properties": {
+    "schema_version": { "const": "workflow_runtime_result.v1" },
+    "provider": { "type": "string", "minLength": 1 },
+    "workspace": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string" },
+    "changes": { "type": "array", "items": { "type": "string" } },
+    "verification": { "type": "array" }
+  },
+  "additionalProperties": true
+}

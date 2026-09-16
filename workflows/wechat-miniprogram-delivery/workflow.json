@@ -1,16 +1,17 @@
 {
   "schema_version": "workflow_package.v1",
   "id": "com.himind.workflow.wechat-miniprogram-delivery",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "name": "微信小程序开发闭环",
-  "description": "从真实需求、开发证据、测试、预览和体验版到人工验收、审核、发布与回滚的微信小程序交付工作流。",
+  "description": "外层交付状态机加内层多轮开发 Loop：修改、测试、构建、自我复核、冻结候选、预览、上传、验收、审核、发布和条件回滚。",
   "min_agent_version": "0.3.47",
   "local_requirements": {
     "platform": "windows",
     "workspace": "git",
     "required_tools": [
       "node",
-      "npm"
+      "npm",
+      "git"
     ],
     "recommended_tools": [
       "wechat-miniprogram-devtools",
@@ -20,10 +21,16 @@
   "optional_providers": [
     "himind.dashboard"
   ],
+  "candidate": {
+    "required": true,
+    "artifact_id": "candidate",
+    "source": "git",
+    "allow_dirty": true
+  },
   "capabilities": [
+    "workflow.candidate.freeze",
     "wechat.miniprogram.requirements.snapshot",
     "wechat.miniprogram.project.inspect",
-    "wechat.miniprogram.development.record",
     "wechat.miniprogram.dependencies.prepare",
     "wechat.miniprogram.test",
     "wechat.miniprogram.build",
@@ -46,127 +53,206 @@
       "wechat-miniprogram"
     ],
     "runtimes": [
-      "himind.builtin"
+      "personal.codex",
+      "personal.github-copilot"
     ]
   },
   "steps": [
     {
-      "id": "WX-01",
-      "title": "需求和验收解析",
+      "id": "WX-REQUIREMENTS",
+      "title": "需求与验收快照",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.requirements.snapshot",
       "execution_mode": "sync",
       "risk_level": "local_write"
     },
     {
-      "id": "WX-02",
-      "title": "应用上下文准备",
+      "id": "WX-CONTEXT",
+      "title": "应用与仓库检查",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.project.inspect",
       "execution_mode": "sync",
       "risk_level": "read_only",
-      "depends_on": ["WX-01"]
+      "depends_on": ["WX-REQUIREMENTS"]
     },
     {
-      "id": "WX-03",
-      "title": "工作区准备",
+      "id": "WX-PREPARE",
+      "title": "依赖准备",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.dependencies.prepare",
       "execution_mode": "long_running",
       "risk_level": "process",
-      "depends_on": ["WX-02"]
+      "depends_on": ["WX-CONTEXT"]
     },
     {
-      "id": "WX-04",
-      "title": "方案和任务拆分",
-      "capability_id": "wechat.miniprogram.development.record",
-      "input": { "stage": "plan" },
-      "execution_mode": "sync",
-      "risk_level": "local_write",
-      "depends_on": ["WX-03"]
-    },
-    {
-      "id": "WX-05",
-      "title": "代码与资源配置",
-      "capability_id": "wechat.miniprogram.development.record",
-      "input": { "stage": "changes" },
-      "execution_mode": "sync",
-      "risk_level": "local_write",
-      "depends_on": ["WX-04"]
-    },
-    {
-      "id": "WX-06",
-      "title": "静态检查和测试",
-      "capability_id": "wechat.miniprogram.test",
+      "id": "DEV-LOOP",
+      "title": "多轮开发与验证",
+      "kind": "loop",
       "execution_mode": "long_running",
-      "risk_level": "process",
-      "depends_on": ["WX-05"]
+      "risk_level": "local_write",
+      "depends_on": ["WX-PREPARE"],
+      "loop": {
+        "max_iterations": 6,
+        "continue_when": {
+          "operator": "not_equals",
+          "path": "loops.DEV-LOOP.latest.steps.DEV-REVIEW.feedback.decision",
+          "value": "accepted"
+        },
+        "exit_when": {
+          "operator": "equals",
+          "path": "loops.DEV-LOOP.latest.steps.DEV-REVIEW.feedback.decision",
+          "value": "accepted"
+        },
+        "steps": [
+          {
+            "id": "DEV-CODE",
+            "title": "修改代码",
+            "kind": "runtime",
+            "execution_mode": "long_running",
+            "risk_level": "local_write",
+            "runtime": {
+              "provider": "auto",
+              "prompt": "根据需求、验收标准、当前代码、最近测试和构建结果修改微信小程序工程。完成后返回 JSON，包含 summary、changes、verification，不得输出私钥或任何 Secret。",
+              "workspace_path": "input.project_root",
+              "result_schema": "schemas/development-result.schema.json",
+              "allow_network": false
+            }
+          },
+          {
+            "id": "DEV-TEST",
+            "title": "执行测试",
+            "kind": "capability",
+            "capability_id": "wechat.miniprogram.test",
+            "execution_mode": "long_running",
+            "risk_level": "process",
+            "depends_on": ["DEV-CODE"]
+          },
+          {
+            "id": "DEV-BUILD",
+            "title": "构建检查",
+            "kind": "capability",
+            "capability_id": "wechat.miniprogram.build",
+            "execution_mode": "long_running",
+            "risk_level": "process",
+            "depends_on": ["DEV-TEST"]
+          },
+          {
+            "id": "DEV-REVIEW",
+            "title": "开发自检与反馈",
+            "kind": "runtime",
+            "execution_mode": "sync",
+            "risk_level": "read_only",
+            "depends_on": ["DEV-BUILD"],
+            "runtime": {
+              "provider": "auto",
+              "prompt": "独立检查需求、验收标准、代码变更、测试和构建结果。若仍有明确缺口，返回 rejected；若已满足条件，返回 accepted。必须返回 JSON：{\"feedback\":{\"decision\":\"accepted|rejected\",\"reason\":\"...\"}}。",
+              "workspace_path": "input.project_root",
+              "result_schema": "schemas/development-feedback.schema.json",
+              "allow_network": false
+            }
+          }
+        ]
+      }
     },
     {
-      "id": "WX-07",
-      "title": "构建与预览",
+      "id": "WX-CANDIDATE",
+      "title": "冻结交付候选",
+      "kind": "capability",
+      "capability_id": "workflow.candidate.freeze",
+      "candidate_action": "freeze",
+      "execution_mode": "sync",
+      "risk_level": "local_write",
+      "depends_on": ["DEV-LOOP"]
+    },
+    {
+      "id": "WX-PREVIEW",
+      "title": "构建并生成预览",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.preview",
+      "candidate_action": "require",
       "execution_mode": "long_running",
-      "risk_level": "network",
+      "risk_level": "R3",
       "approval_required": true,
-      "depends_on": ["WX-06"]
+      "depends_on": ["WX-CANDIDATE"]
     },
     {
-      "id": "WX-08",
-      "title": "真实体验版上传",
+      "id": "WX-UPLOAD",
+      "title": "上传体验版",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.upload",
+      "candidate_action": "require",
       "execution_mode": "long_running",
       "risk_level": "R3",
       "approval_required": true,
-      "depends_on": ["WX-07"]
+      "depends_on": ["WX-PREVIEW"]
     },
     {
-      "id": "WX-09",
+      "id": "WX-ACCEPTANCE",
       "title": "人工验收",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.acceptance.record",
+      "candidate_action": "require",
       "execution_mode": "sync",
       "risk_level": "local_write",
-      "depends_on": ["WX-08"]
+      "depends_on": ["WX-UPLOAD"]
     },
     {
-      "id": "WX-10",
+      "id": "WX-ORGANIZATION-APPROVAL",
       "title": "组织审批",
+      "kind": "manual",
+      "candidate_action": "require",
       "execution_mode": "sync",
       "risk_level": "R3",
       "approval_required": true,
-      "depends_on": ["WX-09"]
+      "depends_on": ["WX-ACCEPTANCE"]
     },
     {
-      "id": "WX-11",
-      "title": "微信审核准备",
+      "id": "WX-REVIEW-PREPARE",
+      "title": "审核材料准备",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.review.prepare",
+      "candidate_action": "require",
       "execution_mode": "sync",
       "risk_level": "local_write",
-      "depends_on": ["WX-10"]
+      "depends_on": ["WX-ORGANIZATION-APPROVAL"]
     },
     {
-      "id": "WX-12",
-      "title": "提交审核",
+      "id": "WX-REVIEW-SUBMIT",
+      "title": "记录审核提交",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.review.submit",
+      "candidate_action": "require",
       "execution_mode": "sync",
       "risk_level": "R3",
       "approval_required": true,
-      "depends_on": ["WX-11"]
+      "depends_on": ["WX-REVIEW-PREPARE"]
     },
     {
-      "id": "WX-13",
-      "title": "正式发布",
+      "id": "WX-RELEASE",
+      "title": "记录正式发布",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.release.record",
+      "candidate_action": "require",
       "execution_mode": "sync",
       "risk_level": "R3",
       "approval_required": true,
-      "depends_on": ["WX-12"]
+      "depends_on": ["WX-REVIEW-SUBMIT"]
     },
     {
-      "id": "WX-14",
-      "title": "监控和回滚",
+      "id": "WX-ROLLBACK",
+      "title": "条件回滚",
+      "kind": "capability",
       "capability_id": "wechat.miniprogram.rollback",
+      "candidate_action": "require",
+      "when": {
+        "operator": "equals",
+        "path": "input.rollback_requested",
+        "value": true
+      },
       "execution_mode": "sync",
       "risk_level": "R3",
       "approval_required": true,
-      "depends_on": ["WX-13"]
+      "depends_on": ["WX-RELEASE"]
     }
   ],
   "artifacts": [
@@ -174,47 +260,63 @@
       "id": "requirement-snapshot",
       "artifact_type": "requirement_snapshot",
       "name": "需求与验收快照",
-      "required": true
+      "required": true,
+      "validation": "advisory",
+      "max_bytes": 4194304
     },
     {
-      "id": "development-record",
-      "artifact_type": "development_record",
-      "name": "开发变更记录",
-      "required": true
+      "id": "candidate",
+      "artifact_type": "candidate",
+      "name": "不可变交付候选",
+      "schema": "artifacts/candidate.schema.json",
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 1048576
     },
     {
       "id": "test-report",
       "artifact_type": "test_report",
       "name": "测试报告",
       "schema": "artifacts/test-report.schema.json",
-      "required": true
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 4194304
     },
     {
       "id": "preview",
       "artifact_type": "wechat_preview",
-      "name": "微信预览码",
+      "name": "微信预览记录",
       "schema": "artifacts/preview.schema.json",
-      "required": true
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 1048576
     },
     {
       "id": "experience-version",
       "artifact_type": "wechat_experience_version",
       "name": "体验版记录",
-      "required": true
+      "schema": "artifacts/experience-version.schema.json",
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 4194304
     },
     {
       "id": "acceptance-report",
       "artifact_type": "acceptance_report",
       "name": "人工验收报告",
       "schema": "artifacts/acceptance-report.schema.json",
-      "required": true
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 4194304
     },
     {
       "id": "release-record",
       "artifact_type": "release_record",
       "name": "发布与回滚记录",
       "schema": "artifacts/release.schema.json",
-      "required": true
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 4194304
     }
   ],
   "ui": {

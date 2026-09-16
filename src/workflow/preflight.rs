@@ -290,6 +290,7 @@ mod tests {
             },
             supported_runtimes: vec!["himind.builtin".to_string()],
             created_at: String::new(),
+            source_root: PathBuf::new(),
         }
     }
 

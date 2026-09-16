@@ -6,11 +6,18 @@ use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+mod candidate;
+mod condition;
 mod executor;
 mod preflight;
 mod runner;
+mod runtime;
 mod store;
 
+#[allow(unused_imports)]
+pub(crate) use candidate::{freeze_candidate, read_candidate};
+#[allow(unused_imports)]
+pub(crate) use condition::evaluate_condition;
 #[allow(unused_imports)]
 pub(crate) use executor::WorkflowGatewayExecutor;
 #[allow(unused_imports)]
@@ -22,6 +29,7 @@ pub(crate) use runner::{
     WorkflowArtifactOutput, WorkflowRunOutcome, WorkflowRunner, WorkflowStepExecution,
     WorkflowStepExecutor,
 };
+pub(crate) use runtime::execute_runtime_step;
 pub(crate) use store::{InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
@@ -54,6 +62,8 @@ pub(crate) struct WorkflowPackage {
     pub supported_runtimes: Vec<String>,
     #[serde(default)]
     pub created_at: String,
+    #[serde(skip)]
+    pub source_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,8 +270,9 @@ pub(crate) fn load_from_directory(root: &Path) -> Result<WorkflowPackage, Box<dy
     let path = root.join("workflow.json");
     let source = fs::read_to_string(&path)
         .map_err(|error| format!("read workflow package {}: {error}", path.display()))?;
-    let package: WorkflowPackage = serde_json::from_str(&source)?;
+    let mut package: WorkflowPackage = serde_json::from_str(&source)?;
     package.validate().map_err(std::io::Error::other)?;
+    package.source_root = root.canonicalize()?;
     validate_package_assets(root, &package)?;
     Ok(package)
 }
@@ -565,7 +576,41 @@ fn validate_loop_step(
     if let Some(condition) = loop_config.exit_when.as_ref() {
         validate_condition(condition, 0)?;
     }
+    if loop_config.steps.iter().any(step_scope_requires_approval) {
+        return Err(format!(
+            "workflow loop step {} cannot contain approval-required steps; approvals belong outside the loop",
+            step.id
+        ));
+    }
+    if loop_config
+        .steps
+        .iter()
+        .any(step_scope_has_candidate_action)
+    {
+        return Err(format!(
+            "workflow loop step {} cannot freeze or require a candidate; candidate binding belongs outside the loop",
+            step.id
+        ));
+    }
     validate_step_scope(&loop_config.steps, global_step_ids, depth)
+}
+
+fn step_scope_requires_approval(step: &WorkflowStep) -> bool {
+    step.approval_required
+        || step
+            .loop_config
+            .as_ref()
+            .is_some_and(|loop_config| loop_config.steps.iter().any(step_scope_requires_approval))
+}
+
+fn step_scope_has_candidate_action(step: &WorkflowStep) -> bool {
+    !step.candidate_action.is_empty()
+        || step.loop_config.as_ref().is_some_and(|loop_config| {
+            loop_config
+                .steps
+                .iter()
+                .any(step_scope_has_candidate_action)
+        })
 }
 
 fn validate_condition(condition: &WorkflowCondition, depth: usize) -> Result<(), String> {
@@ -697,10 +742,11 @@ mod tests {
             package.id,
             "com.himind.workflow.wechat-miniprogram-delivery"
         );
-        assert!(package.steps.iter().any(|step| step.id == "WX-14"));
+        assert!(package.steps.iter().any(|step| step.id == "DEV-LOOP"));
+        assert!(package.steps.iter().any(|step| step.id == "WX-CANDIDATE"));
         assert!(package
             .capabilities
-            .contains(&"wechat.miniprogram.upload".to_string()));
+            .contains(&"workflow.candidate.freeze".to_string()));
     }
 
     #[test]
@@ -868,10 +914,13 @@ mod tests {
             source: "git".to_string(),
             allow_dirty: false,
         });
-        package.steps[0].candidate_action = "freeze".to_string();
-        package.validate().unwrap();
-
-        package.steps[0].candidate_action.clear();
+        package
+            .steps
+            .iter_mut()
+            .find(|step| step.id == "WX-CANDIDATE")
+            .unwrap()
+            .candidate_action
+            .clear();
         assert!(package
             .validate()
             .unwrap_err()

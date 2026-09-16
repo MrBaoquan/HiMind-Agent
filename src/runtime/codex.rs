@@ -255,7 +255,7 @@ fn codex_sandbox_mode() -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn resolve_codex_executable() -> Result<(OsString, String), Box<dyn Error>> {
+pub(crate) fn resolve_codex_executable() -> Result<(OsString, String), Box<dyn Error>> {
     if let Some(executable) =
         env::var_os("HIMIND_CODEX_EXECUTABLE").filter(|value| !value.is_empty())
     {

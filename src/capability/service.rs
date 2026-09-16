@@ -85,6 +85,7 @@ struct RegistryCache {
 #[derive(Clone)]
 enum CapabilityHandler {
     SystemHealth,
+    WorkflowCandidateFreeze,
     CapabilityCatalogSearch,
     CapabilityCatalogDescribe,
     AIClientList,
@@ -911,6 +912,25 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::SystemHealth,
+            ),
+            registration(
+                "workflow.candidate.freeze",
+                "冻结交付候选",
+                "读取真实 Git HEAD、Tree Digest 和工作区状态，生成不可变 Candidate Artifact。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "project_root": { "type": "string" },
+                        "repository_root": { "type": "string" },
+                        "candidate_artifact_id": { "type": "string", "minLength": 1 },
+                        "allow_dirty": { "type": "boolean" },
+                        "workflow_context": { "type": "object" }
+                    },
+                    "required": ["candidate_artifact_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowCandidateFreeze,
             ),
             registration(
                 "inner_admin.login_status",
@@ -2006,6 +2026,7 @@ impl CapabilityGateway {
         };
         let result = match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
+            CapabilityHandler::WorkflowCandidateFreeze => crate::workflow::freeze_candidate(&input),
             CapabilityHandler::CapabilityCatalogSearch => {
                 Ok(self.search_capabilities(context, &input)?)
             }

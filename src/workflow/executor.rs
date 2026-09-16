@@ -27,6 +27,9 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
         step: &WorkflowStep,
         input: &Value,
     ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
+        if step.runtime.is_some() {
+            return super::execute_runtime_step(_package, step, input);
+        }
         let capability_id = step.capability_id.trim();
         if capability_id.is_empty() {
             return Err(format!(
