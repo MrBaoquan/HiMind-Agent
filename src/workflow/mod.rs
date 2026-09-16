@@ -44,6 +44,8 @@ pub(crate) struct WorkflowPackage {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub dependencies: WorkflowDependencies,
+    #[serde(default)]
+    pub candidate: Option<WorkflowCandidatePolicy>,
     pub steps: Vec<WorkflowStep>,
     #[serde(default)]
     pub artifacts: Vec<WorkflowArtifact>,
@@ -67,13 +69,23 @@ pub(crate) struct WorkflowDependencies {
     pub runtimes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowStep {
     pub id: String,
     pub title: String,
     #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
     pub capability_id: String,
+    #[serde(default)]
+    pub runtime: Option<WorkflowRuntimeStep>,
+    #[serde(default, rename = "loop")]
+    pub loop_config: Option<Box<WorkflowLoop>>,
+    #[serde(default)]
+    pub when: Option<WorkflowCondition>,
+    #[serde(default)]
+    pub candidate_action: String,
     #[serde(default = "default_object")]
     pub input: Value,
     pub execution_mode: String,
@@ -83,6 +95,54 @@ pub(crate) struct WorkflowStep {
     pub approval_required: bool,
     #[serde(default)]
     pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowRuntimeStep {
+    pub provider: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub workspace_path: String,
+    #[serde(default)]
+    pub result_schema: String,
+    #[serde(default)]
+    pub allow_network: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowLoop {
+    pub max_iterations: u32,
+    #[serde(default)]
+    pub continue_when: Option<WorkflowCondition>,
+    #[serde(default)]
+    pub exit_when: Option<WorkflowCondition>,
+    pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowCondition {
+    pub operator: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub value: Value,
+    #[serde(default)]
+    pub conditions: Vec<WorkflowCondition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowCandidatePolicy {
+    #[serde(default = "default_true")]
+    pub required: bool,
+    pub artifact_id: String,
+    #[serde(default = "default_git_source")]
+    pub source: String,
+    #[serde(default)]
+    pub allow_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +155,10 @@ pub(crate) struct WorkflowArtifact {
     pub schema: String,
     #[serde(default)]
     pub required: bool,
+    #[serde(default)]
+    pub validation: String,
+    #[serde(default = "default_artifact_max_bytes")]
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,51 +191,14 @@ impl WorkflowPackage {
         validate_unique_text("optional provider", &self.optional_providers)?;
         validate_unique_text("supported runtime", &self.supported_runtimes)?;
 
-        if self.steps.is_empty() {
-            return Err("workflow must contain at least one step".to_string());
+        if let Some(candidate) = self.candidate.as_ref() {
+            validate_workflow_id(&candidate.artifact_id)?;
+            if candidate.source != "git" {
+                return Err("workflow candidate source must be git".to_string());
+            }
         }
         let mut step_ids = HashSet::new();
-        for step in &self.steps {
-            validate_workflow_id(&step.id)?;
-            if step.title.trim().is_empty() {
-                return Err(format!("workflow step {} title is required", step.id));
-            }
-            if !matches!(
-                step.execution_mode.as_str(),
-                "sync" | "long_running" | "provider_defined"
-            ) {
-                return Err(format!(
-                    "workflow step {} execution_mode is invalid",
-                    step.id
-                ));
-            }
-            if !step.input.is_object() {
-                return Err(format!("workflow step {} input must be an object", step.id));
-            }
-            if step.approval_required && step.risk_level.trim().is_empty() {
-                return Err(format!(
-                    "workflow step {} approval requires a risk level",
-                    step.id
-                ));
-            }
-            if !step_ids.insert(step.id.as_str()) {
-                return Err(format!("duplicate workflow step id: {}", step.id));
-            }
-        }
-        for step in &self.steps {
-            for dependency in &step.depends_on {
-                if dependency == &step.id {
-                    return Err(format!("workflow step {} depends on itself", step.id));
-                }
-                if !step_ids.contains(dependency.as_str()) {
-                    return Err(format!(
-                        "workflow step {} references missing dependency {}",
-                        step.id, dependency
-                    ));
-                }
-            }
-        }
-        validate_step_graph(&self.steps)?;
+        validate_step_scope(&self.steps, &mut step_ids, 0)?;
 
         let mut artifact_ids = HashSet::new();
         for artifact in &self.artifacts {
@@ -185,10 +212,31 @@ impl WorkflowPackage {
             if !artifact.schema.trim().is_empty() {
                 validate_relative_asset_path(&artifact.schema)?;
             }
+            if !matches!(artifact.validation.as_str(), "" | "strict" | "advisory") {
+                return Err(format!(
+                    "workflow artifact {} validation is invalid",
+                    artifact.id
+                ));
+            }
+            if artifact.max_bytes == 0 || artifact.max_bytes > 1024 * 1024 * 1024 {
+                return Err(format!(
+                    "workflow artifact {} max_bytes is out of range",
+                    artifact.id
+                ));
+            }
             if !artifact_ids.insert(artifact.id.as_str()) {
                 return Err(format!("duplicate workflow artifact id: {}", artifact.id));
             }
         }
+        if let Some(candidate) = self.candidate.as_ref() {
+            if !artifact_ids.contains(candidate.artifact_id.as_str()) {
+                return Err(format!(
+                    "workflow candidate artifact is not declared: {}",
+                    candidate.artifact_id
+                ));
+            }
+        }
+        validate_candidate_actions(&self.steps, self.candidate.as_ref())?;
 
         if !matches!(self.ui.mode.as_str(), "standard" | "declarative" | "custom") {
             return Err("workflow ui mode is invalid".to_string());
@@ -239,6 +287,18 @@ fn default_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_git_source() -> String {
+    "git".to_string()
+}
+
+fn default_artifact_max_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
 fn validate_unique_text(name: &str, values: &[String]) -> Result<(), String> {
     let mut seen = HashSet::new();
     for value in values {
@@ -272,6 +332,7 @@ fn validate_package_assets(root: &Path, package: &WorkflowPackage) -> Result<(),
         .map(|artifact| artifact.schema.as_str())
         .filter(|value| !value.trim().is_empty())
         .collect::<Vec<_>>();
+    collect_runtime_schema_assets(&package.steps, &mut assets);
     if !package.ui.entry.trim().is_empty() {
         assets.push(package.ui.entry.as_str());
     }
@@ -283,6 +344,306 @@ fn validate_package_assets(root: &Path, package: &WorkflowPackage) -> Result<(),
         if !canonical_target.starts_with(&canonical_root) || !canonical_target.is_file() {
             return Err(format!("workflow asset escapes package or is not a file: {asset}").into());
         }
+    }
+    Ok(())
+}
+
+fn collect_runtime_schema_assets<'a>(steps: &'a [WorkflowStep], assets: &mut Vec<&'a str>) {
+    for step in steps {
+        if let Some(runtime) = step.runtime.as_ref() {
+            if !runtime.result_schema.trim().is_empty() {
+                assets.push(runtime.result_schema.as_str());
+            }
+        }
+        if let Some(loop_config) = step.loop_config.as_ref() {
+            collect_runtime_schema_assets(&loop_config.steps, assets);
+        }
+    }
+}
+
+fn validate_step_scope(
+    steps: &[WorkflowStep],
+    global_step_ids: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), String> {
+    if steps.is_empty() {
+        return Err("workflow step scope must contain at least one step".to_string());
+    }
+    if depth > 8 {
+        return Err("workflow loop nesting exceeds 8 levels".to_string());
+    }
+    let mut scope_ids = HashSet::new();
+    for step in steps {
+        validate_workflow_id(&step.id)?;
+        if !global_step_ids.insert(step.id.clone()) {
+            return Err(format!("duplicate workflow step id: {}", step.id));
+        }
+        if step.title.trim().is_empty() {
+            return Err(format!("workflow step {} title is required", step.id));
+        }
+        if !matches!(
+            step.execution_mode.as_str(),
+            "sync" | "long_running" | "provider_defined"
+        ) {
+            return Err(format!(
+                "workflow step {} execution_mode is invalid",
+                step.id
+            ));
+        }
+        if !step.input.is_object() {
+            return Err(format!("workflow step {} input must be an object", step.id));
+        }
+        if step.approval_required && step.risk_level.trim().is_empty() {
+            return Err(format!(
+                "workflow step {} approval requires a risk level",
+                step.id
+            ));
+        }
+        let kind = normalized_step_kind(step)?;
+        match kind {
+            "capability" => {
+                if step.capability_id.trim().is_empty() {
+                    return Err(format!(
+                        "workflow capability step {} requires capability_id",
+                        step.id
+                    ));
+                }
+                if step.runtime.is_some() || step.loop_config.is_some() {
+                    return Err(format!(
+                        "workflow capability step {} cannot declare runtime or loop",
+                        step.id
+                    ));
+                }
+            }
+            "runtime" => {
+                if !step.capability_id.trim().is_empty() {
+                    return Err(format!(
+                        "workflow runtime step {} cannot declare capability_id",
+                        step.id
+                    ));
+                }
+                validate_runtime_step(step)?;
+                if step.loop_config.is_some() {
+                    return Err(format!(
+                        "workflow runtime step {} cannot declare a loop",
+                        step.id
+                    ));
+                }
+            }
+            "loop" => {
+                if !step.capability_id.trim().is_empty() || step.runtime.is_some() {
+                    return Err(format!(
+                        "workflow loop step {} cannot declare capability_id or runtime",
+                        step.id
+                    ));
+                }
+                validate_loop_step(step, global_step_ids, depth + 1)?;
+            }
+            "manual" | "provider_defined" => {
+                if !step.capability_id.trim().is_empty() {
+                    return Err(format!(
+                        "workflow {} step {} cannot declare capability_id",
+                        kind, step.id
+                    ));
+                }
+                if step.runtime.is_some() || step.loop_config.is_some() {
+                    return Err(format!(
+                        "workflow {} step {} cannot declare runtime or loop",
+                        kind, step.id
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+        if let Some(condition) = step.when.as_ref() {
+            validate_condition(condition, 0)?;
+        }
+        if !matches!(step.candidate_action.as_str(), "" | "freeze" | "require") {
+            return Err(format!(
+                "workflow step {} candidate_action is invalid",
+                step.id
+            ));
+        }
+        scope_ids.insert(step.id.as_str());
+    }
+    for step in steps {
+        for dependency in &step.depends_on {
+            if dependency == &step.id {
+                return Err(format!("workflow step {} depends on itself", step.id));
+            }
+            if !scope_ids.contains(dependency.as_str()) {
+                return Err(format!(
+                    "workflow step {} references missing dependency {}",
+                    step.id, dependency
+                ));
+            }
+        }
+    }
+    validate_step_graph(steps)?;
+    Ok(())
+}
+
+fn normalized_step_kind(step: &WorkflowStep) -> Result<&'static str, String> {
+    if !step.kind.trim().is_empty() {
+        return match step.kind.trim() {
+            "capability" => Ok("capability"),
+            "runtime" => Ok("runtime"),
+            "loop" => Ok("loop"),
+            "manual" => Ok("manual"),
+            "provider_defined" => Ok("provider_defined"),
+            value => Err(format!(
+                "workflow step {} kind is invalid: {value}",
+                step.id
+            )),
+        };
+    }
+    if step.loop_config.is_some() {
+        return Ok("loop");
+    }
+    if step.runtime.is_some() {
+        return Ok("runtime");
+    }
+    if !step.capability_id.trim().is_empty() {
+        return Ok("capability");
+    }
+    if step.approval_required {
+        return Ok("manual");
+    }
+    if step.execution_mode == "provider_defined" {
+        return Ok("provider_defined");
+    }
+    Ok("manual")
+}
+
+fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
+    let runtime = step
+        .runtime
+        .as_ref()
+        .ok_or_else(|| format!("workflow runtime step {} requires runtime", step.id))?;
+    if runtime.provider.trim().is_empty() {
+        return Err(format!(
+            "workflow runtime step {} provider is required",
+            step.id
+        ));
+    }
+    if runtime.prompt.trim().is_empty() {
+        return Err(format!(
+            "workflow runtime step {} prompt is required",
+            step.id
+        ));
+    }
+    if !runtime.result_schema.trim().is_empty() {
+        validate_relative_asset_path(&runtime.result_schema)?;
+    }
+    Ok(())
+}
+
+fn validate_loop_step(
+    step: &WorkflowStep,
+    global_step_ids: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), String> {
+    let loop_config = step
+        .loop_config
+        .as_ref()
+        .ok_or_else(|| format!("workflow loop step {} requires loop", step.id))?;
+    if !(1..=20).contains(&loop_config.max_iterations) {
+        return Err(format!(
+            "workflow loop step {} max_iterations must be between 1 and 20",
+            step.id
+        ));
+    }
+    if loop_config.continue_when.is_none() && loop_config.exit_when.is_none() {
+        return Err(format!(
+            "workflow loop step {} requires continue_when or exit_when",
+            step.id
+        ));
+    }
+    if let Some(condition) = loop_config.continue_when.as_ref() {
+        validate_condition(condition, 0)?;
+    }
+    if let Some(condition) = loop_config.exit_when.as_ref() {
+        validate_condition(condition, 0)?;
+    }
+    validate_step_scope(&loop_config.steps, global_step_ids, depth)
+}
+
+fn validate_condition(condition: &WorkflowCondition, depth: usize) -> Result<(), String> {
+    if depth > 8 {
+        return Err("workflow condition nesting exceeds 8 levels".to_string());
+    }
+    match condition.operator.as_str() {
+        "all" | "any" => {
+            if condition.conditions.is_empty() {
+                return Err(format!(
+                    "workflow condition {} requires conditions",
+                    condition.operator
+                ));
+            }
+            for child in &condition.conditions {
+                validate_condition(child, depth + 1)?;
+            }
+        }
+        "not" => {
+            if condition.conditions.len() != 1 {
+                return Err("workflow not condition requires exactly one child".to_string());
+            }
+            validate_condition(&condition.conditions[0], depth + 1)?;
+        }
+        "equals" | "not_equals" | "exists" | "contains" | "gt" | "gte" | "lt" | "lte" => {
+            if condition.path.trim().is_empty() {
+                return Err(format!(
+                    "workflow condition {} requires path",
+                    condition.operator
+                ));
+            }
+        }
+        value => return Err(format!("workflow condition operator is invalid: {value}")),
+    }
+    Ok(())
+}
+
+fn validate_candidate_actions(
+    steps: &[WorkflowStep],
+    candidate: Option<&WorkflowCandidatePolicy>,
+) -> Result<(), String> {
+    fn walk(
+        steps: &[WorkflowStep],
+        candidate_present: bool,
+        freeze_count: &mut u32,
+    ) -> Result<(), String> {
+        for step in steps {
+            match step.candidate_action.as_str() {
+                "" => {}
+                "freeze" => {
+                    if !candidate_present {
+                        return Err(format!(
+                            "workflow step {} freezes an undeclared candidate",
+                            step.id
+                        ));
+                    }
+                    *freeze_count += 1;
+                }
+                "require" => {
+                    if !candidate_present {
+                        return Err(format!(
+                            "workflow step {} requires an undeclared candidate",
+                            step.id
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            if let Some(loop_config) = step.loop_config.as_ref() {
+                walk(&loop_config.steps, candidate_present, freeze_count)?;
+            }
+        }
+        Ok(())
+    }
+    let mut freeze_count = 0;
+    walk(steps, candidate.is_some(), &mut freeze_count)?;
+    if candidate.is_some_and(|candidate| candidate.required) && freeze_count != 1 {
+        return Err("workflow candidate requires exactly one freeze step".to_string());
     }
     Ok(())
 }
@@ -386,6 +747,135 @@ mod tests {
             .to_string()
             .contains("unavailable"));
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn accepts_runtime_step_and_condition_contracts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        let step = &mut package.steps[0];
+        step.kind = "runtime".to_string();
+        step.capability_id.clear();
+        step.runtime = Some(WorkflowRuntimeStep {
+            provider: "personal.codex".to_string(),
+            prompt: "Implement the next change from the current feedback.".to_string(),
+            workspace_path: "input.project_root".to_string(),
+            result_schema: String::new(),
+            allow_network: false,
+        });
+        step.when = Some(WorkflowCondition {
+            operator: "all".to_string(),
+            path: String::new(),
+            value: Value::Null,
+            conditions: vec![WorkflowCondition {
+                operator: "equals".to_string(),
+                path: "input.mode".to_string(),
+                value: Value::String("develop".to_string()),
+                conditions: Vec::new(),
+            }],
+        });
+        package.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_bounded_development_loop() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        let step = &mut package.steps[0];
+        step.kind = "loop".to_string();
+        step.capability_id.clear();
+        step.loop_config = Some(Box::new(WorkflowLoop {
+            max_iterations: 4,
+            continue_when: Some(WorkflowCondition {
+                operator: "not_equals".to_string(),
+                path: "loops.DEV.latest.feedback".to_string(),
+                value: Value::String("accepted".to_string()),
+                conditions: Vec::new(),
+            }),
+            exit_when: Some(WorkflowCondition {
+                operator: "equals".to_string(),
+                path: "loops.DEV.latest.feedback".to_string(),
+                value: Value::String("accepted".to_string()),
+                conditions: Vec::new(),
+            }),
+            steps: vec![WorkflowStep {
+                id: "DEV-BODY".to_string(),
+                title: "Runtime development iteration".to_string(),
+                kind: "provider_defined".to_string(),
+                capability_id: String::new(),
+                runtime: None,
+                loop_config: None,
+                when: None,
+                candidate_action: String::new(),
+                input: default_object(),
+                execution_mode: "provider_defined".to_string(),
+                risk_level: "local_write".to_string(),
+                approval_required: false,
+                depends_on: Vec::new(),
+            }],
+        }));
+        package.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_loop_without_iteration_condition() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        let step = &mut package.steps[0];
+        step.kind = "loop".to_string();
+        step.capability_id.clear();
+        step.loop_config = Some(Box::new(WorkflowLoop {
+            max_iterations: 4,
+            continue_when: None,
+            exit_when: None,
+            steps: vec![WorkflowStep {
+                id: "DEV-BODY".to_string(),
+                title: "Body".to_string(),
+                kind: "manual".to_string(),
+                capability_id: String::new(),
+                runtime: None,
+                loop_config: None,
+                when: None,
+                candidate_action: String::new(),
+                input: default_object(),
+                execution_mode: "sync".to_string(),
+                risk_level: "read_only".to_string(),
+                approval_required: false,
+                depends_on: Vec::new(),
+            }],
+        }));
+        assert!(package
+            .validate()
+            .unwrap_err()
+            .contains("requires continue_when or exit_when"));
+    }
+
+    #[test]
+    fn candidate_requires_one_freeze_step() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        package.candidate = Some(WorkflowCandidatePolicy {
+            required: true,
+            artifact_id: "release-record".to_string(),
+            source: "git".to_string(),
+            allow_dirty: false,
+        });
+        package.steps[0].candidate_action = "freeze".to_string();
+        package.validate().unwrap();
+
+        package.steps[0].candidate_action.clear();
+        assert!(package
+            .validate()
+            .unwrap_err()
+            .contains("exactly one freeze step"));
     }
 
     fn copy_dir(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {

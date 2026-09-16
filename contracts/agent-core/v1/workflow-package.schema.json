@@ -37,45 +37,15 @@
       "items": { "type": "string", "minLength": 1 }
     },
     "dependencies": { "type": "object" },
+    "candidate": { "$ref": "#/$defs/candidate" },
     "steps": {
       "type": "array",
       "minItems": 1,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "title", "execution_mode"],
-        "properties": {
-          "id": { "type": "string", "minLength": 1 },
-          "title": { "type": "string", "minLength": 1 },
-          "capability_id": { "type": "string" },
-          "input": { "type": "object" },
-          "execution_mode": {
-            "enum": ["sync", "long_running", "provider_defined"]
-          },
-          "risk_level": { "type": "string" },
-          "approval_required": { "type": "boolean" },
-          "depends_on": {
-            "type": "array",
-            "items": { "type": "string", "minLength": 1 },
-            "uniqueItems": true
-          }
-        }
-      }
+      "items": { "$ref": "#/$defs/step" }
     },
     "artifacts": {
       "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "artifact_type", "name"],
-        "properties": {
-          "id": { "type": "string", "minLength": 1 },
-          "artifact_type": { "type": "string", "minLength": 1 },
-          "name": { "type": "string", "minLength": 1 },
-          "schema": { "type": "string" },
-          "required": { "type": "boolean" }
-        }
-      }
+      "items": { "$ref": "#/$defs/artifact" }
     },
     "ui": {
       "type": "object",
@@ -96,5 +66,119 @@
       "items": { "type": "string", "minLength": 1 }
     },
     "created_at": { "type": "string" }
+  },
+  "$defs": {
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operator"],
+      "properties": {
+        "operator": {
+          "enum": [
+            "all",
+            "any",
+            "not",
+            "equals",
+            "not_equals",
+            "exists",
+            "contains",
+            "gt",
+            "gte",
+            "lt",
+            "lte"
+          ]
+        },
+        "path": { "type": "string" },
+        "value": true,
+        "conditions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/condition" }
+        }
+      }
+    },
+    "runtime_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "prompt"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "prompt": { "type": "string", "minLength": 1 },
+        "workspace_path": { "type": "string" },
+        "result_schema": { "type": "string" },
+        "allow_network": { "type": "boolean" }
+      }
+    },
+    "loop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_iterations", "steps"],
+      "properties": {
+        "max_iterations": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "continue_when": { "$ref": "#/$defs/condition" },
+        "exit_when": { "$ref": "#/$defs/condition" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "execution_mode"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "kind": {
+          "enum": ["capability", "runtime", "manual", "loop", "provider_defined"]
+        },
+        "capability_id": { "type": "string" },
+        "runtime": { "$ref": "#/$defs/runtime_step" },
+        "loop": { "$ref": "#/$defs/loop" },
+        "when": { "$ref": "#/$defs/condition" },
+        "candidate_action": { "enum": ["", "freeze", "require"] },
+        "input": { "type": "object" },
+        "execution_mode": {
+          "enum": ["sync", "long_running", "provider_defined"]
+        },
+        "risk_level": { "type": "string" },
+        "approval_required": { "type": "boolean" },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "artifact_id": { "type": "string", "minLength": 1 },
+        "source": { "const": "git" },
+        "allow_dirty": { "type": "boolean" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "artifact_type", "name"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "artifact_type": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "schema": { "type": "string" },
+        "required": { "type": "boolean" },
+        "validation": { "enum": ["", "strict", "advisory"] },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1073741824
+        }
+      }
+    }
   }
 }

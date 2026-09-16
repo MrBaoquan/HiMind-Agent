@@ -848,7 +848,12 @@ mod tests {
             WorkflowStep {
                 id: "STEP-1".to_string(),
                 title: "First".to_string(),
+                kind: "capability".to_string(),
                 capability_id: "test.first".to_string(),
+                runtime: None,
+                loop_config: None,
+                when: None,
+                candidate_action: String::new(),
                 input: serde_json::json!({}),
                 execution_mode: "sync".to_string(),
                 risk_level: "read_only".to_string(),
@@ -858,7 +863,12 @@ mod tests {
             WorkflowStep {
                 id: "STEP-2".to_string(),
                 title: "Second".to_string(),
+                kind: "capability".to_string(),
                 capability_id: "test.second".to_string(),
+                runtime: None,
+                loop_config: None,
+                when: None,
+                candidate_action: String::new(),
                 input: serde_json::json!({"fixed": true}),
                 execution_mode: "sync".to_string(),
                 risk_level: "read_only".to_string(),
@@ -872,6 +882,8 @@ mod tests {
             name: "Record".to_string(),
             schema: String::new(),
             required: true,
+            validation: "strict".to_string(),
+            max_bytes: 1024,
         }];
         let executor = ArtifactExecutor {
             second_step_input: RefCell::new(Value::Null),
