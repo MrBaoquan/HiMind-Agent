@@ -21,7 +21,8 @@ pub(crate) use candidate::{freeze_candidate, read_candidate};
 pub(crate) use condition::evaluate_condition;
 #[allow(unused_imports)]
 pub(crate) use connector::{
-    load_connector_manifests, WorkflowConnectorCredential, WorkflowConnectorManifest,
+    execute_http_health_check, load_connector_manifests, WorkflowConnectorCredential,
+    WorkflowConnectorManifest, WorkflowHttpHealthCheck,
 };
 #[allow(unused_imports)]
 pub(crate) use executor::WorkflowGatewayExecutor;

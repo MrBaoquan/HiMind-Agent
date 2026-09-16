@@ -153,29 +153,35 @@ pub(crate) fn preflight(
                     ));
                 }
             }
+            let health_type = connector
+                .health_check
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
             WorkflowConnectorPreflight {
                 id: connector.id.clone(),
                 available,
                 availability: connector.availability.clone(),
                 credential_ownership: connector.credential_ownership.clone(),
-                health_check: connector
-                    .health_check
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("none")
-                    .to_string(),
-                health_target: connector
-                    .health_check
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                health_status: if connector
-                    .health_check
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value == "capability")
-                {
+                health_check: health_type.to_string(),
+                health_target: if health_type == "capability" {
+                    connector
+                        .health_check
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                } else if health_type == "http" {
+                    connector
+                        .health_check
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    String::new()
+                },
+                health_status: if matches!(health_type, "capability" | "http") {
                     "not_run".to_string()
                 } else {
                     "not_configured".to_string()
@@ -291,6 +297,34 @@ where
                 .and_then(|value| value.get("type"))
                 .and_then(Value::as_str)
                 .unwrap_or("none");
+            if check_type == "http" {
+                let check =
+                    match super::WorkflowHttpHealthCheck::from_manifest(&connector.health_check) {
+                        Ok(check) => check,
+                        Err(error) => {
+                            return WorkflowConnectorProbe {
+                                id: connector.id.clone(),
+                                status: "failed".to_string(),
+                                target: String::new(),
+                                message: error,
+                            };
+                        }
+                    };
+                return match super::execute_http_health_check(&check) {
+                    Ok(status) => WorkflowConnectorProbe {
+                        id: connector.id.clone(),
+                        status: "passed".to_string(),
+                        target: check.url,
+                        message: format!("HTTP status {status}"),
+                    },
+                    Err(error) => WorkflowConnectorProbe {
+                        id: connector.id.clone(),
+                        status: "failed".to_string(),
+                        target: check.url,
+                        message: error.to_string(),
+                    },
+                };
+            }
             if check_type != "capability" {
                 return WorkflowConnectorProbe {
                     id: connector.id.clone(),
@@ -493,6 +527,9 @@ mod tests {
     use super::*;
     use crate::capability::types::CapabilityAvailability;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     fn package(required_tools: Vec<&str>) -> WorkflowPackage {
         WorkflowPackage {
@@ -687,5 +724,38 @@ mod tests {
         assert!(report.connectors[0]
             .health_message
             .contains("must be read_only"));
+    }
+
+    #[test]
+    fn connector_http_health_probe_records_real_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let target = format!("http://{address}/health");
+        let mut package = connector_health_package("network.health");
+        package.capabilities.clear();
+        package.connectors[0].capabilities.clear();
+        package.connectors[0].health_check = json!({
+            "type": "http",
+            "url": target,
+            "method": "GET",
+            "expected_status": [200],
+            "timeout_seconds": 3
+        });
+        let report =
+            preflight_with_connector_probes(&package, "0.3.47", &[], &json!({}), |_, _| {
+                panic!("Capability probe must not be called for HTTP health checks")
+            });
+        assert!(report.ready, "{:?}", report.blockers);
+        assert_eq!(report.connectors[0].health_status, "passed");
+        assert!(report.connectors[0].health_message.contains("200"));
+        server.join().unwrap();
     }
 }

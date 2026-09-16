@@ -881,7 +881,7 @@ mod tests {
             "归一后必须收敛，不再重复改写"
         );
         let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(draft.parent().unwrap());
+        let _ = fs::remove_dir_all(draft);
     }
 
     #[test]
@@ -924,7 +924,7 @@ mod tests {
             "没有扩展源声明时不得绑定 Agent 草稿目录"
         );
         let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(draft.parent().unwrap());
+        let _ = fs::remove_dir_all(draft);
     }
 
     /// `CARGO_MANIFEST_DIR` 下的目录会被判定为 Agent 自管路径，用它模拟草稿产物目录。

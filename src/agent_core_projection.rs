@@ -185,6 +185,7 @@ mod tests {
         };
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
             .unwrap();
         let record = ProjectionOutboxRecord {
