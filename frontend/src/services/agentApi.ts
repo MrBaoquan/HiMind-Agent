@@ -1407,6 +1407,7 @@ export const agentApi = {
     rejectWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('reject_workflow_step', { runId, stepId }),
     cancelWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('cancel_workflow_run', { runId }),
     resumeWorkflowRun: (runId: string) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('resume_workflow_run', { runId }),
+    startWorkflowRun: (packageId: string, input: Record<string, unknown>) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('start_workflow_run', { packageId, input }),
     importLocalPlugin: () => invoke<PluginRegistry>('import_local_plugin'),
     importGithubPlugin: (sourceUrl: string) => invoke<PluginRegistry>('import_github_plugin_url', { sourceUrl }),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),

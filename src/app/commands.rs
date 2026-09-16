@@ -3689,6 +3689,20 @@ pub(crate) async fn resume_workflow_run(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub(crate) async fn start_workflow_run(
+    state: State<'_, AgentState>,
+    package_id: String,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        start_workflow_with_gateway(gateway, &package_id, input).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn decide_workflow_step(
     run_id: &str,
     step_id: &str,
@@ -3745,6 +3759,34 @@ fn resume_workflow_with_gateway(
         return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
     }
     let runner = crate::workflow::WorkflowRunner::open_default()?;
+    let executor = crate::workflow::WorkflowGatewayExecutor::new(gateway, context);
+    let outcome = runner.run_ready(&package, run, &input, &executor)?;
+    Ok(serde_json::to_value(outcome)?)
+}
+
+fn start_workflow_with_gateway(
+    gateway: CapabilityGateway,
+    package_id: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let package = crate::workflow::WorkflowStore::open_default()?
+        .list()?
+        .into_iter()
+        .find(|item| item.package.id == package_id && item.enabled)
+        .map(|item| item.package)
+        .ok_or_else(|| format!("workflow package not found or disabled: {package_id}"))?;
+    let context = InvocationContext::new(
+        crate::capability::types::InvocationSource::Workflow,
+        "workflow-ui",
+    );
+    let report =
+        crate::workflow::preflight(&package, VERSION, &gateway.list_capabilities(&context)?);
+    if !report.ready {
+        return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
+    }
+    let runner = crate::workflow::WorkflowRunner::open_default()?;
+    let request_id = format!("ui_{}", crate::workflow_request_id());
+    let run = runner.start("local-agent", &package, &request_id, &input)?;
     let executor = crate::workflow::WorkflowGatewayExecutor::new(gateway, context);
     let outcome = runner.run_ready(&package, run, &input, &executor)?;
     Ok(serde_json::to_value(outcome)?)

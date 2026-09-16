@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, Clock3, FileText, RefreshCw, ShieldCheck, Workflow } from 'lucide-react';
+import { CheckCircle2, Clock3, FileText, Play, RefreshCw, ShieldCheck, Workflow, X } from 'lucide-react';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
 import type { WorkflowCenterSnapshot, WorkflowLocalRun, WorkflowRunSnapshot } from '../services/agentApi';
 
@@ -13,6 +13,7 @@ type WorkflowsPageProps = {
   onReject: (runId: string, stepId: string) => Promise<void>;
   onResume: (runId: string) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
+  onStart: (packageId: string, input: Record<string, unknown>) => Promise<void>;
 };
 
 function statusKind(status: string): 'success' | 'warn' | 'danger' | 'neutral' {
@@ -42,13 +43,17 @@ function formatTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, onApprove, onReject, onResume, onCancel }: WorkflowsPageProps) {
+export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, onApprove, onReject, onResume, onCancel, onStart }: WorkflowsPageProps) {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('');
   const [selectedRunId, setSelectedRunId] = useState('');
   const [runDetail, setRunDetail] = useState<WorkflowRunSnapshot | null>(null);
   const [runLoading, setRunLoading] = useState(false);
   const [runError, setRunError] = useState('');
   const [actionBusy, setActionBusy] = useState('');
+  const [startOpen, setStartOpen] = useState(false);
+  const [startInput, setStartInput] = useState('');
+  const [startError, setStartError] = useState('');
+  const [startBusy, setStartBusy] = useState(false);
 
   const workflows = snapshot?.workflows || [];
   const runs = snapshot?.runs || [];
@@ -98,6 +103,53 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, 
     && (event.payload as { waiting_for_feedback?: boolean }).waiting_for_feedback === true,
   ));
 
+  function openStart() {
+    if (!selectedWorkflow) return;
+    const input: Record<string, unknown> = {};
+    for (const section of selectedWorkflow.view?.sections || []) {
+      for (const field of section.fields || []) {
+        if (field === 'credential_handles') {
+          input[field] = { private_key_path: 'wechat-upload-private-key' };
+        } else if (field === 'acceptance_criteria' || field === 'constraints' || field === 'scripts' || field === 'evidence_paths') {
+          input[field] = [];
+        } else if (field === 'passed') {
+          input[field] = true;
+        } else if (field === 'rollback_requested') {
+          input[field] = false;
+        } else if (field === 'package_manager') {
+          input[field] = 'npm';
+        } else if (field === 'install_mode') {
+          input[field] = 'install';
+        } else if (field === 'environment') {
+          input[field] = 'development';
+        } else {
+          input[field] = '';
+        }
+      }
+    }
+    setStartInput(JSON.stringify(input, null, 2));
+    setStartError('');
+    setStartOpen(true);
+  }
+
+  async function submitStart() {
+    if (!selectedWorkflow) return;
+    setStartBusy(true);
+    setStartError('');
+    try {
+      const parsed = JSON.parse(startInput);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('input must be an object');
+      }
+      await onStart(selectedWorkflow.package.id, parsed);
+      setStartOpen(false);
+    } catch {
+      setStartError('输入必须是有效的 JSON 对象');
+    } finally {
+      setStartBusy(false);
+    }
+  }
+
   return (
     <div className="workflow-page">
       <PageHeader
@@ -143,7 +195,10 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, 
                   <h2>{selectedWorkflow.package.name}</h2>
                   <p>{selectedWorkflow.package.description}</p>
                 </div>
-                <Pill kind={selectedWorkflow.enabled ? 'success' : 'neutral'}>{selectedWorkflow.enabled ? '可运行' : '已停用'}</Pill>
+                <div className="workflow-detail-actions">
+                  <Pill kind={selectedWorkflow.enabled ? 'success' : 'neutral'}>{selectedWorkflow.enabled ? '可运行' : '已停用'}</Pill>
+                  <button type="button" className="btn btn-primary" disabled={!selectedWorkflow.enabled} onClick={openStart}><Play size={14} />运行</button>
+                </div>
               </div>
               <div className="workflow-meta-grid">
                 <div><span>版本</span><strong>v{selectedWorkflow.package.version}</strong></div>
@@ -247,6 +302,22 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, 
           </div>
         </section>
       </div>
+      {startOpen && selectedWorkflow ? (
+        <div className="modal-backdrop" role="presentation" onClick={event => { if (event.currentTarget === event.target) setStartOpen(false); }}>
+          <section className="modal workflow-start-modal" role="dialog" aria-modal="true" aria-labelledby="workflow-start-title">
+            <div className="workflow-start-head">
+              <div><span>Workflow Package</span><h2 id="workflow-start-title">{selectedWorkflow.package.name}</h2></div>
+              <button type="button" className="btn btn-icon" title="关闭" aria-label="关闭" onClick={() => setStartOpen(false)}><X size={16} /></button>
+            </div>
+            <textarea value={startInput} onChange={event => setStartInput(event.target.value)} spellCheck={false} />
+            {startError ? <div className="workflow-inline-error">{startError}</div> : null}
+            <div className="modal-actions">
+              <button type="button" className="btn" onClick={() => setStartOpen(false)}>取消</button>
+              <button type="button" className="btn btn-primary" disabled={startBusy} onClick={() => void submitStart()}><Play size={14} />{startBusy ? '正在启动' : '启动运行'}</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

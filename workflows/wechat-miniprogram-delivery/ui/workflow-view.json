@@ -5,26 +5,30 @@
     {
       "id": "requirement",
       "title": "需求与验收",
-      "artifacts": ["requirement-snapshot", "development-record"]
+      "fields": ["requirement", "acceptance_criteria", "constraints", "feedback"],
+      "artifacts": ["requirement-snapshot"]
     },
     {
       "id": "application",
       "title": "应用与仓库",
-      "fields": ["app_id", "project_root", "repository_ref", "branch", "environment", "commit_sha"]
+      "fields": ["workspace_root", "project_root", "app_id", "credential_handles", "repository_ref", "branch", "environment", "commit_sha"]
     },
     {
       "id": "verification",
       "title": "测试与构建",
+      "fields": ["package_manager", "install_mode", "scripts", "version", "description"],
       "artifacts": ["test-report", "preview"]
     },
     {
       "id": "acceptance",
       "title": "体验与验收",
+      "fields": ["tester", "passed", "evidence_paths", "notes"],
       "artifacts": ["experience-version", "acceptance-report"]
     },
     {
       "id": "release",
       "title": "审核、发布与回滚",
+      "fields": ["submission_receipt", "release_evidence_path", "target_version", "rollback_requested"],
       "artifacts": ["release-record"]
     }
   ],

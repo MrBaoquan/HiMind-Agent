@@ -104,6 +104,7 @@
 .workflow-list small, .workflow-run-list small { color: var(--text-muted); font-size: 9px; }
 .workflow-detail-panel { padding: 16px; overflow-y: auto; }
 .workflow-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.workflow-detail-actions { display: flex; align-items: center; gap: 8px; }
 .workflow-detail-head > div { min-width: 0; }
 .workflow-detail-head span { color: var(--text-muted); font-size: 9px; text-transform: uppercase; }
 .workflow-detail-head h2 { margin: 4px 0 0; font-size: 18px; font-weight: 650; }
@@ -142,6 +143,14 @@
 .workflow-run-artifacts strong { font-size: 10px; }
 .workflow-run-artifacts small { color: var(--text-muted); font-family: Consolas, monospace; font-size: 9px; }
 .workflow-inline-error { padding: 8px 10px; border-left: 3px solid var(--danger); color: #991b1b; background: #fef2f2; font-size: 10px; }
+.workflow-start-modal { width: min(720px, calc(100vw - 40px)); max-height: min(760px, calc(100vh - 40px)); display: flex; flex-direction: column; }
+.workflow-start-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+.workflow-start-head > div { min-width: 0; }
+.workflow-start-head span { color: var(--text-muted); font-size: 9px; text-transform: uppercase; }
+.workflow-start-head h2 { margin: 3px 0 0; font-size: 17px; font-weight: 650; }
+.workflow-start-modal textarea { min-height: 420px; flex: 1; resize: vertical; padding: 12px; border: 1px solid var(--border-strong); border-radius: 6px; outline: 0; color: var(--text); background: #fbfcfe; font-family: Consolas, monospace; font-size: 11px; line-height: 1.55; }
+.workflow-start-modal textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.workflow-start-modal .modal-actions { margin-top: 12px; }
 
 @media (max-width: 1100px) {
   .workflow-layout { grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.4fr); }
