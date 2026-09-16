@@ -691,6 +691,16 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 app::extension_source::add_github_source(name, repository, reference, None, None)?;
             println!("{}", serde_json::to_string_pretty(&settings)?);
         }
+        [source, action, name, root] if source == "source" && action == "add-local" => {
+            let settings = app::extension_source::add_local_source(name, root, None)?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        [source, action, name, root, catalog_path]
+            if source == "source" && action == "add-local" =>
+        {
+            let settings = app::extension_source::add_local_source(name, root, Some(catalog_path))?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
         [source, action, name, repository, reference, catalog_path]
             if source == "source" && action == "add" =>
         {
@@ -725,7 +735,10 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let value = match kind.as_str() {
                 "plugin" => serde_json::to_value(app::extension_source::plan_plugin(id, None)?)?,
                 "skill" => serde_json::to_value(app::extension_source::plan_skill(id, None)?)?,
-                _ => return Err("扩展类型必须是 plugin 或 skill".into()),
+                "workflow" => {
+                    serde_json::to_value(app::extension_source::plan_workflow(id, None)?)?
+                }
+                _ => return Err("扩展类型必须是 plugin、skill 或 workflow".into()),
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
@@ -741,7 +754,15 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     let (catalog_item, record) = app::extension_source::install_skill(id, version)?;
                     serde_json::json!({ "catalog_item": catalog_item, "record": record })
                 }
-                _ => return Err("扩展类型必须是 plugin 或 skill".into()),
+                "workflow" => {
+                    let (catalog_item, installed) =
+                        app::extension_source::install_workflow(id, version)?;
+                    serde_json::json!({
+                        "catalog_item": catalog_item,
+                        "installation": workflow_installation_json(&installed),
+                    })
+                }
+                _ => return Err("扩展类型必须是 plugin、skill 或 workflow".into()),
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
@@ -758,7 +779,7 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             );
         }
         _ => {
-            return Err("usage: himind-agent extension source <list|refresh|add name github-url [ref] [catalog-path] [required|optional]|remove source-id|plan plugin|skill id|install plugin|skill id [version]|provenance|update>".into());
+            return Err("usage: himind-agent extension source <list|refresh|add name github-url [ref] [catalog-path] [required|optional]|add-local name path [catalog-path]|remove source-id|plan plugin|skill|workflow id|install plugin|skill|workflow id [version]|provenance|update>".into());
         }
     }
     Ok(())

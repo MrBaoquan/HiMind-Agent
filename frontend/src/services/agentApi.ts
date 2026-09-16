@@ -479,9 +479,11 @@ export type ExtensionDistributionUnit = {
     local_root?: string | null;
     plugin_count: number;
     skill_count: number;
+    workflow_count: number;
     state: 'ready' | 'empty' | string;
     plugin_ids: string[];
     skill_ids: string[];
+    workflow_ids: string[];
     project_ids: string[];
     installed: ExtensionUnitInstallation[];
     assets: ExtensionUnitAsset[];
@@ -492,6 +494,7 @@ export type ExtensionUnitInstallReport = {
     acquisition: ExtensionSourceAcquisition;
     plugins: ExtensionUnitAsset[];
     skills: ExtensionUnitAsset[];
+    workflows: ExtensionUnitAsset[];
     errors: string[];
 };
 
@@ -505,6 +508,7 @@ export type ExtensionSourceStatus = {
     state: 'ready' | 'unavailable' | string;
     plugin_count: number;
     skill_count: number;
+    workflow_count: number;
     generation: string;
     using_cache: boolean;
     error: string;
@@ -518,9 +522,38 @@ export type ExtensionFeaturePack = {
     skill_ids: string[];
 };
 
+export type WorkflowCatalogItem = {
+    workflow_id: string;
+    name: string;
+    description: string;
+    version: string;
+    release_notes: string;
+    published_at: string;
+    min_agent_version: string;
+    capability_ids: string[];
+    channel: string;
+    artifact_id: string;
+    file_name: string;
+    file_size: number;
+    sha256: string;
+    signature: string;
+    signature_key_id: string;
+    signature_algorithm: string;
+    download_url: string;
+    source: string;
+    assignment: string;
+    management: string;
+    install_mode: string;
+    organization_reason: string;
+    managed: boolean;
+    allow_disable: boolean;
+    allow_uninstall: boolean;
+};
+
 export type ExtensionSourceSnapshot = {
     plugins: PluginCatalogItem[];
     skills: OrganizationSkillCatalogItem[];
+    workflows: WorkflowCatalogItem[];
     feature_packs: ExtensionFeaturePack[];
     sources: ExtensionSourceStatus[];
     units?: ExtensionDistributionUnit[];

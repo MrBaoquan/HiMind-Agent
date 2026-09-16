@@ -357,17 +357,18 @@ fn read_catalog(root: &Path) -> Result<Catalog, Box<dyn std::error::Error>> {
         if item.id.trim().is_empty() || item.path.trim().is_empty() {
             return Err("extensions.json 包含空的扩展 ID 或目录".into());
         }
-        if item.kind != "plugin" && item.kind != "skill" {
+        if item.kind != "plugin" && item.kind != "skill" && item.kind != "workflow" {
             return Err(format!("extensions.json 包含不支持的扩展类型: {}", item.kind).into());
         }
         if !ids.insert(format!("{}:{}", item.kind, item.id.trim())) {
             return Err(format!("extensions.json 包含重复扩展 ID: {}", item.id).into());
         }
         let path = safe_child_path(root, &item.path)?;
-        let manifest_name = if item.kind == "plugin" {
-            "plugin.json"
-        } else {
-            "skill.json"
+        let manifest_name = match item.kind.as_str() {
+            "plugin" => "plugin.json",
+            "skill" => "skill.json",
+            "workflow" => "workflow.json",
+            _ => unreachable!(),
         };
         if !path.join(manifest_name).is_file() {
             return Err(format!("扩展目录缺少 {manifest_name}: {}", item.path).into());

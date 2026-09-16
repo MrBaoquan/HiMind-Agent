@@ -403,6 +403,7 @@ function unitSummary(group: UnitGroup, install: { installed: number; updates: nu
     if (group.unit.state === 'ready') {
       if (group.unit.plugin_count) parts.push(`${group.unit.plugin_count} 插件`);
       if (group.unit.skill_count) parts.push(`${group.unit.skill_count} 技能`);
+      if (group.unit.workflow_count) parts.push(`${group.unit.workflow_count} Workflow`);
     }
     if (!parts.length) parts.push('未提供扩展');
   }
@@ -418,7 +419,7 @@ function installLabel(install: { installed: number; updates: number }) {
 
 function installTitle(group: UnitGroup, install: { installed: number; updates: number }) {
   const side = group.unit?.acquisition === 'remote' ? 'GitHub 分发源' : '本地开发工作区';
-  const base = `按当前取用侧（${side}）把该扩展单元的插件与技能安装到本机`;
+  const base = `按当前取用侧（${side}）把该扩展单元的插件、技能与 Workflow 安装到本机`;
   return install.updates ? `${base}，共 ${install.updates} 项待安装或更新` : base;
 }
 

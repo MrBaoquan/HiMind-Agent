@@ -1,4 +1,4 @@
-use crate::api::distribution::{PluginCatalogItem, SkillCatalogItem};
+use crate::api::distribution::{PluginCatalogItem, SkillCatalogItem, WorkflowCatalogItem};
 use crate::store::{atomic_file, paths};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -86,11 +86,14 @@ pub(crate) struct ExtensionDistributionUnit {
     pub local_root: Option<String>,
     pub plugin_count: usize,
     pub skill_count: usize,
+    pub workflow_count: usize,
     pub state: String,
     #[serde(default)]
     pub plugin_ids: Vec<String>,
     #[serde(default)]
     pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub workflow_ids: Vec<String>,
     #[serde(default)]
     pub project_ids: Vec<String>,
     #[serde(default)]
@@ -210,6 +213,8 @@ pub(crate) struct ExtensionSourceCatalog {
     #[serde(default)]
     pub skills: Vec<SkillCatalogItem>,
     #[serde(default)]
+    pub workflows: Vec<WorkflowCatalogItem>,
+    #[serde(default)]
     pub feature_packs: Vec<ExtensionFeaturePack>,
     #[serde(default)]
     pub agent_presets: Vec<AgentPresetCatalogItem>,
@@ -221,6 +226,7 @@ pub(crate) struct ExtensionSourceStatus {
     pub state: String,
     pub plugin_count: usize,
     pub skill_count: usize,
+    pub workflow_count: usize,
     pub generation: String,
     pub using_cache: bool,
     pub error: String,
@@ -239,6 +245,7 @@ pub(crate) struct ExtensionSourceNotice {
 pub(crate) struct ExtensionSourceSnapshot {
     pub plugins: Vec<PluginCatalogItem>,
     pub skills: Vec<SkillCatalogItem>,
+    pub workflows: Vec<WorkflowCatalogItem>,
     pub feature_packs: Vec<ExtensionFeaturePack>,
     pub agent_presets: Vec<ExtensionAgentPreset>,
     pub sources: Vec<ExtensionSourceStatus>,
@@ -248,6 +255,8 @@ pub(crate) struct ExtensionSourceSnapshot {
     plugin_versions: Vec<PluginCatalogItem>,
     #[serde(skip_serializing)]
     skill_versions: Vec<SkillCatalogItem>,
+    #[serde(skip_serializing)]
+    workflow_versions: Vec<WorkflowCatalogItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -369,10 +378,11 @@ pub(crate) fn add_local_source(
     aggregate.validate()?;
     for entry in &aggregate.extensions {
         let dir = safe_local_child(&root, &entry.path)?;
-        let manifest_name = if entry.kind == "plugin" {
-            "plugin.json"
-        } else {
-            "skill.json"
+        let manifest_name = match entry.kind.as_str() {
+            "plugin" => "plugin.json",
+            "skill" => "skill.json",
+            "workflow" => "workflow.json",
+            _ => unreachable!(),
         };
         if !dir.join(manifest_name).is_file() {
             return Err(format!("扩展目录缺少 {manifest_name}: {}", entry.path).into());
@@ -562,6 +572,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
     let mut result = ExtensionSourceSnapshot::default();
     let mut plugins = HashMap::<String, PluginCatalogItem>::new();
     let mut skills = HashMap::<String, SkillCatalogItem>::new();
+    let mut workflows = HashMap::<String, WorkflowCatalogItem>::new();
     let mut feature_packs = HashMap::<String, ExtensionFeaturePack>::new();
     let mut agent_presets = HashMap::<String, ExtensionAgentPreset>::new();
     let mut conflicts = Vec::<(String, String, String)>::new();
@@ -623,6 +634,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             .to_string(),
             plugin_count: 0,
             skill_count: 0,
+            workflow_count: 0,
             generation: String::new(),
             using_cache,
             error,
@@ -631,6 +643,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         if let Some(mut catalog) = catalog {
             status.plugin_count = catalog.plugins.len();
             status.skill_count = catalog.skills.len();
+            status.workflow_count = catalog.workflows.len();
             status.generation = catalog.generation.clone();
             let identity = source_identity(&source);
             let mut assets = SourceCatalogAssets::default();
@@ -723,6 +736,52 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                     }
                     None => {
                         skills.insert(item.skill_id.clone(), item.clone());
+                    }
+                }
+            }
+            for item in &mut catalog.workflows {
+                normalize_workflow_item(item, &source)?;
+                assets.workflows.push((
+                    item.workflow_id.clone(),
+                    item.name.clone(),
+                    item.version.clone(),
+                ));
+                result.workflow_versions.push(item.clone());
+                let existing = workflows
+                    .get(&item.workflow_id)
+                    .map(|value| (value.source.clone(), value.version.clone()));
+                match existing {
+                    Some((existing_source, _)) if existing_source != item.source => {
+                        if same_unit(&item.source, &existing_source) {
+                            // 同一分发单元内已按取用模式排好序，落选侧静默让位。
+                        } else if source_outranks(&item.source, &existing_source) {
+                            conflicts.push(conflict(
+                                source_id_of(&existing_source),
+                                "Workflow",
+                                &item.workflow_id,
+                                &item.source,
+                            ));
+                            workflows.insert(item.workflow_id.clone(), item.clone());
+                        } else {
+                            conflicts.push(conflict(
+                                &source.id,
+                                "Workflow",
+                                &item.workflow_id,
+                                &existing_source,
+                            ));
+                        }
+                    }
+                    Some((_, existing_version)) => {
+                        if crate::skill::resolver::compare_versions(
+                            &item.version,
+                            &existing_version,
+                        ) == std::cmp::Ordering::Greater
+                        {
+                            workflows.insert(item.workflow_id.clone(), item.clone());
+                        }
+                    }
+                    None => {
+                        workflows.insert(item.workflow_id.clone(), item.clone());
                     }
                 }
             }
@@ -833,6 +892,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
     result.units = units;
     result.plugins = plugins.into_values().collect();
     result.skills = skills.into_values().collect();
+    result.workflows = workflows.into_values().collect();
     result.feature_packs = feature_packs.into_values().collect();
     result.agent_presets = agent_presets.into_values().collect();
     result
@@ -842,6 +902,9 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         .skills
         .sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
     result
+        .workflows
+        .sort_by(|left, right| left.workflow_id.cmp(&right.workflow_id));
+    result
         .feature_packs
         .sort_by(|left, right| left.id.cmp(&right.id));
     result
@@ -849,6 +912,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         .sort_by(|left, right| left.preset_id.cmp(&right.preset_id));
     sort_plugin_versions(&mut result.plugin_versions);
     sort_skill_versions(&mut result.skill_versions);
+    sort_workflow_versions(&mut result.workflow_versions);
     Ok(result)
 }
 
@@ -970,6 +1034,16 @@ pub(crate) fn skill_versions(skill_id: &str) -> Result<Vec<SkillCatalogItem>, Bo
         .collect())
 }
 
+pub(crate) fn workflow_versions(
+    workflow_id: &str,
+) -> Result<Vec<WorkflowCatalogItem>, Box<dyn Error>> {
+    Ok(snapshot()?
+        .workflow_versions
+        .into_iter()
+        .filter(|item| item.workflow_id == workflow_id)
+        .collect())
+}
+
 fn sort_plugin_versions(items: &mut [PluginCatalogItem]) {
     items.sort_by(|left, right| {
         left.plugin_id
@@ -982,6 +1056,14 @@ fn sort_skill_versions(items: &mut [SkillCatalogItem]) {
     items.sort_by(|left, right| {
         left.skill_id
             .cmp(&right.skill_id)
+            .then_with(|| crate::skill::resolver::compare_versions(&right.version, &left.version))
+    });
+}
+
+fn sort_workflow_versions(items: &mut [WorkflowCatalogItem]) {
+    items.sort_by(|left, right| {
+        left.workflow_id
+            .cmp(&right.workflow_id)
             .then_with(|| crate::skill::resolver::compare_versions(&right.version, &left.version))
     });
 }
@@ -1379,6 +1461,80 @@ pub(crate) fn install_skill(
     Ok((item, record))
 }
 
+pub(crate) fn install_workflow(
+    workflow_id: &str,
+    version: Option<&str>,
+) -> Result<(WorkflowCatalogItem, crate::workflow::InstalledWorkflow), Box<dyn Error>> {
+    let snapshot = snapshot()?;
+    let item = snapshot
+        .workflow_versions
+        .iter()
+        .find(|item| {
+            item.workflow_id == workflow_id
+                && version
+                    .map(|requested| requested == item.version)
+                    .unwrap_or(true)
+        })
+        .cloned()
+        .ok_or_else(|| format!("扩展源中未找到 Workflow: {workflow_id}"))?;
+    let source = source_for_catalog_item(&snapshot, &item.source)?;
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    let previous_installation = store
+        .list()?
+        .into_iter()
+        .find(|installed| installed.package.id == item.workflow_id);
+    let previous_provenance = read_provenance("workflow", &item.workflow_id)?;
+    let require_signature = source.verification.requires_signature();
+    let installed = if source.kind == ExtensionSourceKind::Local {
+        crate::app::workflow_manager::install_local_catalog_item(&item, require_signature)?
+    } else {
+        crate::app::workflow_manager::install_public_catalog_item(&item, require_signature)?
+    };
+    if let Err(error) = save_provenance(
+        source,
+        "workflow",
+        &item.workflow_id,
+        &item.version,
+        &item.download_url,
+        &item.sha256,
+        &item.signature_key_id,
+    ) {
+        compensate_workflow_installation(&store, &item.workflow_id, previous_installation.as_ref());
+        return Err(error);
+    }
+    if let Err(error) = crate::app::extension_lock::record_source_workflow(source, &item) {
+        restore_provenance_changes(&[(
+            "workflow".to_string(),
+            item.workflow_id.clone(),
+            previous_provenance,
+        )]);
+        compensate_workflow_installation(&store, &item.workflow_id, previous_installation.as_ref());
+        return Err(error);
+    }
+    Ok((item, installed))
+}
+
+fn compensate_workflow_installation(
+    store: &crate::workflow::WorkflowStore,
+    workflow_id: &str,
+    previous: Option<&crate::workflow::InstalledWorkflow>,
+) {
+    let current = store.list().ok().and_then(|items| {
+        items
+            .into_iter()
+            .find(|item| item.package.id == workflow_id)
+    });
+    match (previous, current) {
+        (Some(previous), Some(current)) if previous.package.version != current.package.version => {
+            let _ = store.rollback(workflow_id);
+        }
+        (None, Some(_)) => {
+            let _ = store.remove(workflow_id);
+        }
+        _ => {}
+    }
+}
+
 /// 切换某个分发单元的取用侧。`Local` 是默认值，显式选回本地时不落盘。
 pub(crate) fn set_unit_acquisition(
     unit_key: &str,
@@ -1427,6 +1583,7 @@ pub(crate) struct ExtensionUnitInstallReport {
     pub acquisition: ExtensionSourceAcquisition,
     pub plugins: Vec<ExtensionUnitAsset>,
     pub skills: Vec<ExtensionUnitAsset>,
+    pub workflows: Vec<ExtensionUnitAsset>,
     pub errors: Vec<String>,
 }
 
@@ -1451,6 +1608,7 @@ pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport,
         acquisition: unit.acquisition.clone(),
         plugins: Vec::new(),
         skills: Vec::new(),
+        workflows: Vec::new(),
         errors: Vec::new(),
     };
     for asset in &unit.assets {
@@ -1476,6 +1634,17 @@ pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport,
                 Err(error) => report
                     .errors
                     .push(format!("Skill {} 安装失败: {error}", asset.asset_id)),
+            },
+            "workflow" => match install_workflow(&asset.asset_id, Some(&asset.version)) {
+                Ok((item, _)) => report.workflows.push(ExtensionUnitAsset {
+                    asset_kind: "workflow".to_string(),
+                    asset_id: item.workflow_id,
+                    name: item.name,
+                    version: item.version,
+                }),
+                Err(error) => report
+                    .errors
+                    .push(format!("Workflow {} 安装失败: {error}", asset.asset_id)),
             },
             other => report.errors.push(format!("不支持的扩展类型: {other}")),
         }
@@ -1549,6 +1718,20 @@ pub(crate) fn plan_skill(
         ready: blocked_reasons.is_empty(),
         blocked_reasons,
     })
+}
+
+pub(crate) fn plan_workflow(
+    workflow_id: &str,
+    version: Option<&str>,
+) -> Result<WorkflowCatalogItem, Box<dyn Error>> {
+    workflow_versions(workflow_id)?
+        .into_iter()
+        .find(|item| {
+            version
+                .map(|requested| requested == item.version)
+                .unwrap_or(true)
+        })
+        .ok_or_else(|| format!("扩展源中未找到 Workflow: {workflow_id}").into())
 }
 
 pub(crate) fn ensure_authoring_feature() -> Result<(), Box<dyn Error>> {
@@ -2010,6 +2193,31 @@ pub(crate) fn validate_catalog(
             &source.verification,
         )?;
     }
+    for item in &catalog.workflows {
+        if !identities.insert(format!("workflow:{}:{}", item.workflow_id, item.version)) {
+            return Err(format!(
+                "扩展源包含重复 Workflow 版本: {} {}",
+                item.workflow_id, item.version
+            )
+            .into());
+        }
+        if source.kind == ExtensionSourceKind::Local {
+            validate_local_item_identity("workflow", &item.workflow_id)?;
+        } else {
+            validate_artifact(
+                &source.repository,
+                &item.download_url,
+                item.file_size,
+                &item.sha256,
+            )?;
+        }
+        validate_catalog_signature(
+            &item.signature,
+            &item.signature_key_id,
+            &item.signature_algorithm,
+            &source.verification,
+        )?;
+    }
     for pack in &catalog.feature_packs {
         if !identities.insert(format!("feature_pack:{}", pack.id)) {
             return Err(format!("扩展源包含重复功能包: {}", pack.id).into());
@@ -2065,6 +2273,22 @@ fn normalize_skill_item(
     source: &ExtensionSourceConfig,
 ) -> Result<(), Box<dyn Error>> {
     validate_asset_identity("skill", &item.skill_id)?;
+    item.source = format!("{}:{}", source_kind_prefix(source.kind), source.id);
+    item.assignment = "optional".to_string();
+    item.management = "user_managed".to_string();
+    item.install_mode = "prompt".to_string();
+    item.organization_reason.clear();
+    item.managed = false;
+    item.allow_disable = true;
+    item.allow_uninstall = true;
+    Ok(())
+}
+
+fn normalize_workflow_item(
+    item: &mut WorkflowCatalogItem,
+    source: &ExtensionSourceConfig,
+) -> Result<(), Box<dyn Error>> {
+    validate_asset_identity("workflow", &item.workflow_id)?;
     item.source = format!("{}:{}", source_kind_prefix(source.kind), source.id);
     item.assignment = "optional".to_string();
     item.management = "user_managed".to_string();
@@ -2183,6 +2407,7 @@ fn unit_source_ids(sources: &[ExtensionSourceConfig]) -> HashMap<String, String>
 struct SourceCatalogAssets {
     plugins: Vec<(String, String, String)>,
     skills: Vec<(String, String, String)>,
+    workflows: Vec<(String, String, String)>,
 }
 
 fn build_units(
@@ -2262,10 +2487,17 @@ fn build_units(
             .iter()
             .map(|item| item.0.clone())
             .collect::<Vec<_>>();
+        let mut workflow_ids = assets
+            .workflows
+            .iter()
+            .map(|item| item.0.clone())
+            .collect::<Vec<_>>();
         plugin_ids.sort();
         skill_ids.sort();
+        workflow_ids.sort();
         let plugin_count = plugin_ids.len();
         let skill_count = skill_ids.len();
+        let workflow_count = workflow_ids.len();
         let mut catalog_assets =
             assets
                 .plugins
@@ -2284,6 +2516,17 @@ fn build_units(
                         version,
                     }
                 }))
+                .chain(
+                    assets
+                        .workflows
+                        .into_iter()
+                        .map(|(asset_id, name, version)| ExtensionUnitAsset {
+                            asset_kind: "workflow".to_string(),
+                            asset_id,
+                            name,
+                            version,
+                        }),
+                )
                 .collect::<Vec<_>>();
         catalog_assets.sort_by(|left, right| {
             (left.asset_kind.as_str(), left.asset_id.as_str())
@@ -2299,13 +2542,15 @@ fn build_units(
             local_root: local.map(|source| source.repository.clone()),
             plugin_count,
             skill_count,
-            state: if plugin_count + skill_count == 0 {
+            workflow_count,
+            state: if plugin_count + skill_count + workflow_count == 0 {
                 "empty".to_string()
             } else {
                 "ready".to_string()
             },
             plugin_ids,
             skill_ids,
+            workflow_ids,
             project_ids: Vec::new(),
             installed: Vec::new(),
             assets: catalog_assets,
@@ -2633,6 +2878,7 @@ fn build_local_catalog(
         generation: String::new(),
         plugins: Vec::new(),
         skills: Vec::new(),
+        workflows: Vec::new(),
         feature_packs: Vec::new(),
         agent_presets: Vec::new(),
     };
@@ -2652,6 +2898,13 @@ fn build_local_catalog(
                     return Err(format!("扩展清单 ID 与 manifest 不一致: {}", entry.path).into());
                 }
                 catalog.skills.push(item);
+            }
+            "workflow" => {
+                let item = build_local_workflow_item(&dir, source)?;
+                if item.workflow_id != entry.id {
+                    return Err(format!("扩展清单 ID 与 manifest 不一致: {}", entry.path).into());
+                }
+                catalog.workflows.push(item);
             }
             _ => {
                 return Err(format!("extensions.json 包含不支持的扩展类型: {}", entry.kind).into())
@@ -2751,6 +3004,40 @@ fn build_local_skill_item(
             )
             .collect(),
         risk_summary: manifest.risk_summary.clone(),
+        channel: "local".to_string(),
+        artifact_id: String::new(),
+        file_name: String::new(),
+        file_size: 0,
+        sha256: String::new(),
+        signature: String::new(),
+        signature_key_id: String::new(),
+        signature_algorithm: String::new(),
+        download_url: format!("local:{}", dir.display()),
+        source: format!("local:{}", source.id),
+        assignment: "optional".to_string(),
+        management: "user_managed".to_string(),
+        install_mode: "prompt".to_string(),
+        organization_reason: String::new(),
+        managed: false,
+        allow_disable: true,
+        allow_uninstall: true,
+    })
+}
+
+fn build_local_workflow_item(
+    dir: &Path,
+    source: &ExtensionSourceConfig,
+) -> Result<WorkflowCatalogItem, Box<dyn Error>> {
+    let package = crate::workflow::load_from_directory(dir)?;
+    Ok(WorkflowCatalogItem {
+        workflow_id: package.id.clone(),
+        name: package.name.clone(),
+        description: package.description.clone(),
+        version: package.version.clone(),
+        release_notes: String::new(),
+        published_at: String::new(),
+        min_agent_version: package.min_agent_version.clone(),
+        capability_ids: package.capabilities.clone(),
         channel: "local".to_string(),
         artifact_id: String::new(),
         file_name: String::new(),
@@ -2873,7 +3160,7 @@ impl LocalAggregateCatalog {
             if item.id.trim().is_empty() || item.path.trim().is_empty() {
                 return Err("extensions.json 包含空的扩展 ID 或目录".into());
             }
-            if !matches!(item.kind.as_str(), "plugin" | "skill") {
+            if !matches!(item.kind.as_str(), "plugin" | "skill" | "workflow") {
                 return Err(format!("extensions.json 包含不支持的扩展类型: {}", item.kind).into());
             }
             if !ids.insert(format!("{}:{}", item.kind, item.id.trim())) {
@@ -2962,7 +3249,7 @@ fn validate_catalog_path(value: &str) -> Result<String, Box<dyn Error>> {
 }
 
 fn validate_asset_identity(kind: &str, key: &str) -> Result<(), Box<dyn Error>> {
-    if !matches!(kind, "plugin" | "skill") {
+    if !matches!(kind, "plugin" | "skill" | "workflow") {
         return Err("扩展类型无效".into());
     }
     validate_asset_key(key)
@@ -3022,6 +3309,36 @@ mod tests {
             permissions: vec![],
             view_count: 0,
             plugin_dependencies: vec![],
+        }
+    }
+
+    fn workflow_item(url: &str) -> WorkflowCatalogItem {
+        WorkflowCatalogItem {
+            workflow_id: "com.himind.workflow.test".to_string(),
+            name: "Workflow Test".to_string(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            release_notes: String::new(),
+            published_at: String::new(),
+            min_agent_version: "0.3.0".to_string(),
+            capability_ids: vec!["system.health".to_string()],
+            channel: "stable".to_string(),
+            artifact_id: String::new(),
+            file_name: "test.hmwf".to_string(),
+            file_size: 8,
+            sha256: "a".repeat(64),
+            signature: "c2ln".to_string(),
+            signature_key_id: "test".to_string(),
+            signature_algorithm: "rsa-pss-sha256".to_string(),
+            download_url: url.to_string(),
+            source: String::new(),
+            assignment: String::new(),
+            management: String::new(),
+            install_mode: String::new(),
+            organization_reason: String::new(),
+            managed: true,
+            allow_disable: false,
+            allow_uninstall: false,
         }
     }
 
@@ -3088,6 +3405,42 @@ mod tests {
         assert_eq!(item.management, "user_managed");
         assert!(!item.managed);
         assert!(item.allow_disable && item.allow_uninstall);
+    }
+
+    #[test]
+    fn github_workflow_catalog_item_is_validated_and_normalized() {
+        let source = ExtensionSourceConfig {
+            id: "github-test".to_string(),
+            name: "测试".to_string(),
+            kind: ExtensionSourceKind::Github,
+            repository: "Owner/repo".to_string(),
+            reference: "main".to_string(),
+            catalog_path: ".himind/catalog.json".to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
+        };
+        let mut item =
+            workflow_item("https://github.com/Owner/repo/releases/download/v1/test.hmwf");
+        item.signature.clear();
+        item.signature_key_id.clear();
+        item.signature_algorithm.clear();
+        let catalog = ExtensionSourceCatalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            source_id: source.id.clone(),
+            generation: String::new(),
+            plugins: Vec::new(),
+            skills: Vec::new(),
+            workflows: vec![item.clone()],
+            feature_packs: Vec::new(),
+            agent_presets: Vec::new(),
+        };
+        validate_catalog(&catalog, &source).unwrap();
+        normalize_workflow_item(&mut item, &source).unwrap();
+        assert_eq!(item.source, format!("github:{}", source.id));
+        assert_eq!(item.management, "user_managed");
+        assert!(!item.managed);
     }
 
     #[test]
@@ -3405,6 +3758,7 @@ mod tests {
                     "2.0.0".to_string(),
                 )],
                 skills: Vec::new(),
+                workflows: Vec::new(),
             },
         );
         catalogs.insert(
@@ -3416,6 +3770,7 @@ mod tests {
                     "1.0.0".to_string(),
                 )],
                 skills: Vec::new(),
+                workflows: Vec::new(),
             },
         );
 

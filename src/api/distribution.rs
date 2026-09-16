@@ -269,6 +269,49 @@ pub struct SkillCatalogItem {
     pub allow_uninstall: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkflowCatalogItem {
+    pub workflow_id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
+    pub published_at: String,
+    pub min_agent_version: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub capability_ids: Vec<String>,
+    pub channel: String,
+    pub artifact_id: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub signature_key_id: String,
+    #[serde(default)]
+    pub signature_algorithm: String,
+    pub download_url: String,
+    #[serde(default = "default_marketplace_source")]
+    pub source: String,
+    #[serde(default = "default_optional_assignment")]
+    pub assignment: String,
+    #[serde(default = "default_user_management")]
+    pub management: String,
+    #[serde(default = "default_prompt_mode")]
+    pub install_mode: String,
+    #[serde(default)]
+    pub organization_reason: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default = "default_true")]
+    pub allow_disable: bool,
+    #[serde(default = "default_true")]
+    pub allow_uninstall: bool,
+}
+
 fn default_marketplace_source() -> String {
     "marketplace".to_string()
 }
