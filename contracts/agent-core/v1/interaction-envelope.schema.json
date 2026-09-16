@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/interaction-envelope.schema.json",
+  "title": "HiMind Interaction Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "interaction_id",
+    "correlation_id",
+    "idempotency_key",
+    "source",
+    "transport",
+    "principal",
+    "agent_id",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "interaction_envelope.v1" },
+    "interaction_id": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "source": {
+      "enum": [
+        "dashboard",
+        "dingtalk",
+        "mcp",
+        "acp",
+        "cli",
+        "cron",
+        "tauri",
+        "local",
+        "workflow"
+      ]
+    },
+    "transport": {
+      "enum": ["http", "websocket", "stdio", "local", "queue"]
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_principal_id"],
+      "properties": {
+        "local_principal_id": { "type": "string", "minLength": 1 },
+        "delegated_user_id": { "type": "string" },
+        "ai_client_id": { "type": "string" }
+      }
+    },
+    "agent_id": { "type": "string", "minLength": 1 },
+    "device_id": { "type": "string" },
+    "workspace_ref": { "type": "string" },
+    "business_context": { "type": "object" },
+    "reply_target": { "type": "object" },
+    "attachments": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "policy_context": { "type": "object" },
+    "runtime_hint": { "type": "string" },
+    "created_at": { "type": "string", "minLength": 1 }
+  }
+}

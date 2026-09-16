@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/runtime-event.schema.json",
+  "title": "HiMind Runtime Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "run_id",
+    "sequence",
+    "occurred_at",
+    "provider",
+    "event_type"
+  ],
+  "properties": {
+    "schema_version": { "const": "runtime_event.v1" },
+    "event_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "step_id": { "type": "string" },
+    "capability_id": { "type": "string" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "occurred_at": { "type": "string", "minLength": 1 },
+    "provider": { "type": "string", "minLength": 1 },
+    "event_type": {
+      "enum": [
+        "turn_started",
+        "turn_completed",
+        "message_delta",
+        "message",
+        "plan",
+        "progress",
+        "tool_started",
+        "tool_completed",
+        "approval_requested",
+        "approval_resolved",
+        "question_requested",
+        "question_resolved",
+        "artifact_created",
+        "usage_recorded",
+        "error"
+      ]
+    },
+    "payload": { "type": "object" }
+  }
+}

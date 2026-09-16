@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/local-run.schema.json",
+  "title": "HiMind Local Run v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "interaction_id",
+    "source",
+    "transport",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "local_run.v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "interaction_id": { "type": "string", "minLength": 1 },
+    "parent_run_id": { "type": "string" },
+    "source": {
+      "enum": [
+        "dashboard",
+        "dingtalk",
+        "mcp",
+        "acp",
+        "cli",
+        "cron",
+        "tauri",
+        "local",
+        "workflow"
+      ]
+    },
+    "transport": {
+      "enum": ["http", "websocket", "stdio", "local", "queue"]
+    },
+    "status": {
+      "enum": ["queued", "running", "waiting", "succeeded", "failed", "canceled"]
+    },
+    "runtime_provider": { "type": "string" },
+    "workspace_ref": { "type": "string" },
+    "current_step_id": { "type": "string" },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step_id", "title", "status"],
+        "properties": {
+          "step_id": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "status": {
+            "enum": ["pending", "running", "waiting", "succeeded", "failed", "canceled", "skipped"]
+          },
+          "capability_id": { "type": "string" },
+          "runtime_provider": { "type": "string" },
+          "attempt": { "type": "integer", "minimum": 0 },
+          "started_at": { "type": "string" },
+          "finished_at": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      }
+    },
+    "approvals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["approval_id", "capability_id", "risk_level", "status"],
+        "properties": {
+          "approval_id": { "type": "string", "minLength": 1 },
+          "capability_id": { "type": "string", "minLength": 1 },
+          "risk_level": { "type": "string", "minLength": 1 },
+          "status": {
+            "enum": ["pending", "approved", "rejected", "expired", "interrupted"]
+          },
+          "owner": { "type": "string" },
+          "expires_at": { "type": "string" }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact_id", "artifact_type", "name"],
+        "properties": {
+          "artifact_id": { "type": "string", "minLength": 1 },
+          "artifact_type": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "uri": { "type": "string" },
+          "sha256": { "type": "string" },
+          "size_bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "estimated_cost": { "type": "number", "minimum": 0 },
+        "currency": { "type": "string" },
+        "billing_owner": { "type": "string" }
+      }
+    },
+    "error": { "type": "string" },
+    "created_at": { "type": "string", "minLength": 1 },
+    "updated_at": { "type": "string", "minLength": 1 }
+  }
+}

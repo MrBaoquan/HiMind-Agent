@@ -13,6 +13,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
+#[allow(dead_code)]
+mod agent_core_contracts;
 mod api;
 mod app;
 mod approval;
