@@ -323,11 +323,74 @@ fn run_workflow_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 }))?
             );
         }
+        [action, path] if action == "install" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let item = store.install_from_directory(PathBuf::from(path).as_path())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&item))?
+            );
+        }
+        [action] if action == "list" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let items = store
+                .list()?
+                .iter()
+                .map(workflow_installation_json)
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        [action, package_id] if action == "enable" || action == "disable" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let item = store.set_enabled(package_id, action == "enable")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&item))?
+            );
+        }
+        [action, package_id] if action == "rollback" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let item = store.rollback(package_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&item))?
+            );
+        }
+        [action, package_id] if action == "remove" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let removed = store.remove(package_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "removed": removed,
+                    "package_id": package_id,
+                }))?
+            );
+        }
         _ => {
-            return Err("usage: himind-agent workflow validate <package-dir>".into());
+            return Err(
+                "usage: himind-agent workflow <validate <dir>|install <dir>|list|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                    .into(),
+            );
         }
     }
     Ok(())
+}
+
+fn workflow_installation_json(item: &workflow::InstalledWorkflow) -> Value {
+    json!({
+        "id": item.package.id,
+        "name": item.package.name,
+        "version": item.package.version,
+        "previous_version": item.previous_version,
+        "enabled": item.enabled,
+        "package_digest": item.package_digest,
+        "source": item.source,
+        "installed_at": item.installed_at,
+        "updated_at": item.updated_at,
+        "steps": item.package.steps.len(),
+        "artifacts": item.package.artifacts.len(),
+    })
 }
 
 /// Local, scriptable view of the extension sources.
