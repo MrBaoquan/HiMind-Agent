@@ -91,6 +91,7 @@ fn protocol_open_requested(args: &[String]) -> bool {
 }
 
 fn main() {
+    configure_process_stacks();
     let options = Options::from_env();
     let arguments = env::args().collect::<Vec<_>>();
     let mcp_mode = should_run_mcp(env!("CARGO_BIN_NAME"), &arguments);
@@ -156,10 +157,30 @@ fn main() {
             eprintln!("agent ui failed: {error}");
             std::process::exit(1);
         }
+        app::crash::record_event("info", "Agent 正常退出");
     } else if let Err(error) = worker::run_loop(options, None, None) {
         eprintln!("agent failed: {error}");
         std::process::exit(1);
     }
+}
+
+/// Give every thread of this process a generous stack.
+///
+/// The Windows Agent died twice with STATUS_STACK_OVERFLOW while executing
+/// `__chkstk`, which means a thread exhausted its stack instead of failing
+/// gracefully.  A larger reserve does not fix an unbounded recursion, but it
+/// keeps a deep-but-legitimate call chain from killing the whole process, and
+/// it makes the eventual crash dump point at the real recursion instead of the
+/// guard page.  `RUST_MIN_STACK` is read by `std` for each spawned thread, so
+/// setting it before any spawn covers the plain `thread::spawn` call sites.
+fn configure_process_stacks() {
+    const STACK_BYTES: &str = "8388608";
+    if env::var_os("RUST_MIN_STACK").is_none() {
+        env::set_var("RUST_MIN_STACK", STACK_BYTES);
+    }
+    app::crash::install_panic_hook();
+    app::crash::install_exception_dump_filter();
+    app::crash::run_selftest_if_requested();
 }
 
 fn should_run_mcp(binary_name: &str, arguments: &[String]) -> bool {
@@ -543,13 +564,14 @@ impl Options {
     }
 
     fn from_env() -> Self {
-        let mut api_base =
-            env::var("DASHBOARD_API_BASE").unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let mut api_base = env::var("DASHBOARD_API_BASE")
+            .or_else(|_| env::var("HIMIND_DEVELOPMENT_AGENT_API_BASE"))
+            .unwrap_or_else(|_| default_dashboard_api_base().to_string());
         let mut state_path = default_state_path();
         let mut once = false;
         let mut interval_seconds = 10;
         let mut local_app = false;
-        let mut local_port = 18181;
+        let mut local_port = default_local_port();
         let mut reenroll = false;
         let enrollment_token = env::var("HIMIND_AGENT_ENROLLMENT_TOKEN").unwrap_or_default();
         let mut mode_override = None;
@@ -580,7 +602,7 @@ impl Options {
                     i += 1;
                 }
                 "--local-port" if i + 1 < args.len() => {
-                    local_port = args[i + 1].parse().unwrap_or(18181);
+                    local_port = args[i + 1].parse().unwrap_or(local_port);
                     i += 1;
                 }
                 _ => {}
@@ -607,6 +629,33 @@ impl Options {
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
         }
+    }
+}
+
+/// The local development ports are fixed by the repository tooling:
+/// Dashboard/API on 18083 and the development Agent on 18082.  A debug build
+/// follows that topology by default so a plain `cargo run -- --local-app`
+/// cannot collide with the installed production Agent on 18181.  Release
+/// builds keep the shipped 18181 default.
+fn default_local_port() -> u16 {
+    const DEVELOPMENT_PORT: u16 = 18082;
+    const PRODUCTION_PORT: u16 = 18181;
+    env::var("HIMIND_AGENT_LOCAL_PORT")
+        .or_else(|_| env::var("HIMIND_DEVELOPMENT_AGENT_PORT"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(if cfg!(debug_assertions) {
+            DEVELOPMENT_PORT
+        } else {
+            PRODUCTION_PORT
+        })
+}
+
+fn default_dashboard_api_base() -> &'static str {
+    if cfg!(debug_assertions) {
+        "http://127.0.0.1:18083"
+    } else {
+        "http://localhost:8080"
     }
 }
 
@@ -693,8 +742,25 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_plugin_view_launch, protocol_open_requested, should_run_mcp, PluginViewLaunch,
+        default_dashboard_api_base, default_local_port, parse_plugin_view_launch,
+        protocol_open_requested, should_run_mcp, PluginViewLaunch,
     };
+    use std::env;
+
+    #[test]
+    fn development_builds_default_to_the_fixed_local_ports() {
+        if cfg!(debug_assertions) {
+            assert_eq!(default_dashboard_api_base(), "http://127.0.0.1:18083");
+        }
+        let overridden = env::var("HIMIND_AGENT_LOCAL_PORT").is_ok()
+            || env::var("HIMIND_DEVELOPMENT_AGENT_PORT").is_ok();
+        if !overridden {
+            assert_eq!(
+                default_local_port(),
+                if cfg!(debug_assertions) { 18082 } else { 18181 }
+            );
+        }
+    }
 
     #[test]
     fn selects_mcp_mode_by_binary_target_or_explicit_argument() {

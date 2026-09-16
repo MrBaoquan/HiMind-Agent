@@ -5,6 +5,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_PUBLIC_KEY_PATH");
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_KEY_ID");
     println!("cargo:rerun-if-changed=icons/icon.ico");
+    // Windows agent threads run long-lived orchestration work (Dashboard
+    // heartbeat/polling, plugin reconciliation, Skill rendering).  The MSVC
+    // default 1 MiB main-thread reserve is too small for deep-but-legitimate
+    // call chains in debug builds: the agent previously died with
+    // STATUS_STACK_OVERFLOW (0xc00000fd) inside __chkstk.  Reserve 8 MiB.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg=/STACK:8388608");
+    }
     write_embedded_update_key();
 
     let icon_path = Path::new("icons/icon.ico");

@@ -70,7 +70,7 @@ MCP 接入由统一 Registry、目标适配和真实探测组成。Registry 继�
 
 外部 AI 通过 stdio companion 调用时，companion 只启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。`system.health` 的 `local_service_expected=false`、`dashboard_worker_state=not_applicable`、`dashboard_worker_expected=false`、`dashboard_worker_reason_code=stdio_companion_gateway_only` 是正常状态；外部工具必须先看 `dashboard_worker_expected` 和 `local_service_expected`，不要把对应的 `*_online=false` 当成 MCP 故障。调用项目/展项业务能力时先使用 `business.exhibit.list` 或 `context.resolve`，后续 `exhibit_id` 必须传返回项的 `pid`，`EX-xxxx` 只是展示编号；误用会得到 `EXHIBIT_ROUTE_ID_REQUIRED` 结构化提示。完整流程见 [MCP 业务调用指南](docs/mcp-business-calling-guide.md)。
 
-Agent Skills 分发与 MCP 注册是两套独立适配器，共享同一客户端注册表。新建 Skill 使用 `agent-skills` 可移植能力标识，历史上声明 Codex、GitHub Copilot 或 WorkBuddy 的标准 `SKILL.md` 也按 Agent Skills 兼容包处理；仅声明 `himind-ai` 的内部 Skill 不会外部分发。Agent 只向本机已检测到的目录型客户端同步，当前覆盖 HiMind AI、Codex、GitHub Copilot、WorkBuddy、Claude、Qoder、ZCode、Cursor、Windsurf、Trae、CodeBuddy、Antigravity、Gemini CLI、OpenCode、Kimi Code、Kiro 与 Qwen Code。客户端路径、支持级别和 MCP 入口均由注册表集中维护，新增客户端不需要复制同步流程。
+Agent Skills 分发与 MCP 注册是两套独立适配器，共享同一客户端注册表。新建 Skill 使用 `agent-skills` 可移植能力标识，历史上声明 Codex、GitHub Copilot 或 WorkBuddy 的标准 `SKILL.md` 也按 Agent Skills 兼容包处理；仅声明 `himind-ai` 的内部 Skill 不会外部分发。Agent 只向本机已检测到的目录型客户端同步，当前覆盖 HiMind AI、Codex、GitHub Copilot、WorkBuddy、Claude、Qoder、ZCode、Cursor、Windsurf、Trae、CodeBuddy、Antigravity、Gemini CLI、OpenCode、Kimi Code、Kiro 与 Qwen Code。客户端路径、支持级别和 MCP 入口均由注册表集中维护，新增客户端不需要复制同步流程。独立模式下 Skill 管理分为全局托管、工作区托管和项目原生三类：全局托管由 HiMind Store 负责安装、更新、回滚和卸载；工作区托管必须显式指定项目，默认锁定版本并写入项目 `.himind/skills.lock.json`，实际 `SKILL.md` 仍投影到 `.agents/skills` 或客户端原生项目目录；项目原生 Skill 由 Git 管理，HiMind 只发现、校验和报告冲突。CLI 变更命令没有目标参数时默认全局，使用 `himind-agent skill --workspace <project-root>` 才写入项目；`--global` 可显式恢复全局目标。`import-local`/`install-local` 和 GitHub 导入会进入本机 Store 并部署到当前明确目标，同一 Skill 可同时部署到多个项目；项目原生 Skill 只发现、不覆盖、不卸载。项目投影固定使用复制模式，只写入 `.agents/skills` 和本机已安装客户端对应的项目目录，复制/软链接偏好只作用于全局目标。工作区托管 Skill 的常规同步和修复只作用于锁文件锁定的版本，技能库出现新版本时状态显示为已锁定且可更新，只有显式“更新当前项目到 vX”才会改写锁文件；在项目中停用会移除该项目的 HiMind 投影并停止同步，锁文件保留禁用条目和锁定版本，重新启用后按锁定版本再次投影；项目原生 Skill 与托管副本同名时只输出只读冲突报告。详见仓库 ADR 0069。
 
 启用的个人 MCP 会话会在 Agent MCP 中以 `mcp.<server>.<tool>` 聚合暴露，stdio 服务在 Agent 生命周期内复用并在配置变化或故障后重连；HTTP 服务沿用 Streamable HTTP 和会话请求头。DSH 已通过原生配置层接收个人 MCP，因此不会在 Agent 桥接中重复展示。单个下游服务失败不会影响 Agent 自有能力。
 
@@ -85,19 +85,23 @@ Agent 的 Dashboard 用户身份使用 OAuth 设备授权和轮换 refresh token
 开发模式可直接执行：
 
 ```powershell
-cargo run -- --local-app --local-port 18181
+cargo run -- --local-app
 ```
+
+本地开发端口是固定的：Dashboard/API 使用 `18083`，开发 Agent 使用 `18082`。Debug 构建默认按这套拓扑启动（`http://127.0.0.1:18083` + 端口 `18082`），所以直接 `cargo run` 不会撞上已安装的生产 Agent（`18181`）。需要覆盖时用 `--local-port`、`--api`，或 `HIMIND_AGENT_LOCAL_PORT` / `HIMIND_DEVELOPMENT_AGENT_PORT`、`DASHBOARD_API_BASE` / `HIMIND_DEVELOPMENT_AGENT_API_BASE`。
 
 ## Worker 调试模式
 
 ```powershell
-cargo run -- --api http://localhost:8080
+cargo run -- --api http://127.0.0.1:18083
 ```
 
-连接 Docker runtime Dashboard：
+开发态 Dashboard 由 `scripts/development/start.ps1` 起在 `18083`；只跑 Agent 时用 `scripts/development/start-agent.ps1`，它默认就是 `-Port 18082 -ApiBase http://127.0.0.1:18083`。
+
+连接其它 Dashboard API：
 
 ```powershell
-cargo run -- --api http://localhost:18080
+cargo run -- --api http://localhost:8080
 ```
 
 常驻模式会持续心跳并拉取任务。如果 Dashboard runtime 重启导致旧 Agent ID 失效，Agent 会自动重新注册并继续运行。
@@ -105,13 +109,13 @@ cargo run -- --api http://localhost:18080
 只执行一次心跳和任务轮询：
 
 ```powershell
-cargo run -- --api http://localhost:8080 --once
+cargo run -- --api http://127.0.0.1:18083 --once
 ```
 
 runtime 单轮调试：
 
 ```powershell
-cargo run -- --api http://localhost:18080 --once
+cargo run -- --api http://127.0.0.1:18083 --once
 ```
 
 默认扫描根目录：
