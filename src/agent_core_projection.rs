@@ -69,6 +69,7 @@ pub(crate) fn flush_pending_projections(
     Ok(report)
 }
 
+#[derive(Debug)]
 enum DeliveryError {
     Transient(String),
     Permanent(String),
@@ -139,6 +140,10 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn retry_delay_backs_off_and_caps() {
@@ -155,5 +160,58 @@ mod tests {
         assert!(is_transient_status(StatusCode::BAD_GATEWAY));
         assert!(!is_transient_status(StatusCode::CONFLICT));
         assert!(!is_transient_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn projection_delivery_posts_expected_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            let normalized = request.to_ascii_lowercase();
+            assert!(
+                request.starts_with("POST /api/integrations/agent-core/v1/projections HTTP/1.1")
+            );
+            assert!(normalized.contains("authorization: bearer test-token"));
+            assert!(normalized.contains("x-himind-agent-id: agent-1"));
+            assert!(normalized.contains("content-type: application/json"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+
+        let options = crate::Options {
+            api_base: format!("http://{address}"),
+            ..crate::Options::from_env()
+        };
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let record = ProjectionOutboxRecord {
+            id: 1,
+            projection_type: "run_projection".to_string(),
+            aggregate_id: "run-1".to_string(),
+            dedupe_key: "projection:run-1".to_string(),
+            payload: json!({
+                "schema_version": "run_projection.v1",
+                "projection_id": "projection-1",
+                "idempotency_key": "projection-idem-1",
+                "sent_at": "1",
+                "interaction": {},
+                "run": {}
+            }),
+            status: "pending".to_string(),
+            attempts: 0,
+            next_attempt_at: String::new(),
+            last_error: String::new(),
+        };
+        deliver_projection(&client, &options, "agent-1", "test-token", &record).unwrap();
+        server.join().unwrap();
     }
 }
