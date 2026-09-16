@@ -1,0 +1,74 @@
+{
+  "schema_version": "run_projection.v1",
+  "projection_id": "projection_run-example_1",
+  "idempotency_key": "projection:run-example:1",
+  "sent_at": "2026-09-16T00:00:02Z",
+  "interaction": {
+    "schema_version": "interaction_envelope.v1",
+    "interaction_id": "int-run-example",
+    "correlation_id": "corr-run-example",
+    "idempotency_key": "interaction:run-example",
+    "source": "mcp",
+    "transport": "stdio",
+    "principal": {
+      "local_principal_id": "ai-client:codex",
+      "delegated_user_id": "",
+      "ai_client_id": "codex"
+    },
+    "agent_id": "agent-example",
+    "device_id": "",
+    "workspace_ref": "F:/workspace/mini-program",
+    "business_context": {},
+    "reply_target": {},
+    "attachments": [],
+    "policy_context": {},
+    "runtime_hint": "himind.builtin",
+    "created_at": "2026-09-16T00:00:00Z"
+  },
+  "run": {
+    "schema_version": "local_run.v1",
+    "run_id": "run-example",
+    "interaction_id": "int-run-example",
+    "parent_run_id": "",
+    "source": "mcp",
+    "transport": "stdio",
+    "status": "succeeded",
+    "runtime_provider": "himind.builtin",
+    "workspace_ref": "F:/workspace/mini-program",
+    "current_step_id": "",
+    "steps": [
+      {
+        "step_id": "WX-07",
+        "title": "构建与预览",
+        "status": "succeeded",
+        "capability_id": "wechat.miniprogram.preview",
+        "runtime_provider": "himind.builtin",
+        "attempt": 1,
+        "started_at": "2026-09-16T00:00:00Z",
+        "finished_at": "2026-09-16T00:00:01Z",
+        "error": ""
+      }
+    ],
+    "approvals": [],
+    "artifacts": [
+      {
+        "artifact_id": "preview-1",
+        "artifact_type": "wechat_preview",
+        "name": "preview.png",
+        "uri": "local://preview-1",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size_bytes": 1234
+      }
+    ],
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 50,
+      "estimated_cost": 0.01,
+      "currency": "CNY",
+      "billing_owner": "himind"
+    },
+    "error": "",
+    "created_at": "2026-09-16T00:00:00Z",
+    "updated_at": "2026-09-16T00:00:02Z"
+  }
+}

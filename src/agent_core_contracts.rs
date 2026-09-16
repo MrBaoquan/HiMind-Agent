@@ -480,4 +480,13 @@ mod tests {
             assert!(value.get("$id").and_then(Value::as_str).is_some());
         }
     }
+
+    #[test]
+    fn shared_run_projection_fixture_is_valid() {
+        let projection: RunProjection = serde_json::from_str(include_str!(
+            "../contracts/agent-core/v1/examples/run-projection.example.json"
+        ))
+        .unwrap();
+        projection.validate().unwrap();
+    }
 }
