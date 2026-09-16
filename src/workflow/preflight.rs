@@ -25,12 +25,21 @@ pub(crate) struct WorkflowToolPreflight {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkflowConnectorPreflight {
+    pub id: String,
+    pub available: bool,
+    pub availability: String,
+    pub credential_ownership: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WorkflowPreflight {
     pub ready: bool,
     pub package_id: String,
     pub package_version: String,
     pub agent_version: String,
     pub capabilities: Vec<WorkflowCapabilityPreflight>,
+    pub connectors: Vec<WorkflowConnectorPreflight>,
     pub tools: Vec<WorkflowToolPreflight>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
@@ -102,6 +111,44 @@ pub(crate) fn preflight(
         }
     }
 
+    let dashboard_available = available_capabilities
+        .iter()
+        .any(|capability| capability.dashboard_provider);
+    let connectors = package
+        .connectors
+        .iter()
+        .map(|connector| {
+            let available = connector.availability() != CapabilityAvailability::ControlPlane
+                || dashboard_available;
+            if !available {
+                blockers.push(format!(
+                    "required workflow connector is unavailable: {}",
+                    connector.id
+                ));
+            }
+            if connector.credential_ownership == "dashboard" && !dashboard_available {
+                blockers.push(format!(
+                    "workflow connector {} requires Dashboard credential ownership",
+                    connector.id
+                ));
+            }
+            for capability_id in &connector.capabilities {
+                if !package.capabilities.contains(capability_id) {
+                    blockers.push(format!(
+                        "workflow connector {} exposes undeclared capability: {capability_id}",
+                        connector.id
+                    ));
+                }
+            }
+            WorkflowConnectorPreflight {
+                id: connector.id.clone(),
+                available,
+                availability: connector.availability.clone(),
+                credential_ownership: connector.credential_ownership.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+
     let mut tools = Vec::new();
     for tool in required_tools(&package.local_requirements) {
         let resolved = resolve_executable(&tool);
@@ -163,6 +210,7 @@ pub(crate) fn preflight(
         package_version: package.version.clone(),
         agent_version: agent_version.to_string(),
         capabilities,
+        connectors,
         tools,
         blockers,
         warnings,
@@ -291,6 +339,7 @@ mod tests {
             supported_runtimes: vec!["himind.builtin".to_string()],
             created_at: String::new(),
             source_root: PathBuf::new(),
+            connectors: Vec::new(),
         }
     }
 

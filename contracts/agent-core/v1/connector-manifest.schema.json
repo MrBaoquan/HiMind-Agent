@@ -47,6 +47,20 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
-    "health_check": { "type": "object" }
+    "health_check": { "type": "object" },
+    "credentials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["handle", "target", "kind"],
+        "properties": {
+          "handle": { "type": "string", "minLength": 1 },
+          "target": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["file_path", "secret"] },
+          "required": { "type": "boolean" }
+        }
+      }
+    }
   }
 }

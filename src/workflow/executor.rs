@@ -23,12 +23,12 @@ impl WorkflowGatewayExecutor {
 impl WorkflowStepExecutor for WorkflowGatewayExecutor {
     fn execute(
         &self,
-        _package: &WorkflowPackage,
+        package: &WorkflowPackage,
         step: &WorkflowStep,
         input: &Value,
     ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
         if step.runtime.is_some() {
-            return super::execute_runtime_step(_package, step, input);
+            return super::execute_runtime_step(package, step, input, Some(self.gateway.options()));
         }
         let capability_id = step.capability_id.trim();
         if capability_id.is_empty() {
@@ -46,7 +46,8 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
             .into_iter()
             .find(|capability| capability.id == capability_id)
             .ok_or_else(|| format!("capability not found: {capability_id}"))?;
-        let input = capability_input(&capability.input_schema, input);
+        let input = resolve_connector_credentials(package, step, input)?;
+        let input = capability_input(&capability.input_schema, &input);
         let output = self.gateway.invoke(&context, capability_id, input)?;
         let (artifacts, usage) = workflow_result_metadata(&output)?;
         Ok(WorkflowStepExecution {
@@ -55,6 +56,57 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
             usage,
         })
     }
+}
+
+fn resolve_connector_credentials(
+    package: &WorkflowPackage,
+    step: &WorkflowStep,
+    input: &Value,
+) -> Result<Value, Box<dyn Error>> {
+    let mut input = input
+        .as_object()
+        .cloned()
+        .ok_or("workflow capability input must be an object")?;
+    let handles = input
+        .get("credential_handles")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for connector in &package.connectors {
+        if !connector.capabilities.contains(&step.capability_id) {
+            continue;
+        }
+        for credential in &connector.credentials {
+            if input.contains_key(&credential.target) {
+                continue;
+            }
+            let handle = handles
+                .get(&credential.target)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(credential.handle.as_str());
+            let resolved = crate::store::connector_credentials::resolve(handle)?;
+            let Some(resolved) = resolved else {
+                if credential.required {
+                    return Err(
+                        format!("workflow connector credential is missing: {handle}").into(),
+                    );
+                }
+                continue;
+            };
+            if resolved.connector_id != connector.id {
+                return Err(format!(
+                    "workflow connector credential {} belongs to {}, not {}",
+                    handle, resolved.connector_id, connector.id
+                )
+                .into());
+            }
+            input.insert(credential.target.clone(), Value::String(resolved.value));
+        }
+    }
+    input.remove("credential_handles");
+    Ok(Value::Object(input))
 }
 
 fn capability_input(schema: &Value, input: &Value) -> Value {
@@ -162,5 +214,54 @@ mod tests {
                 "workflow_context": {"run_id": "run-1"}
             })
         );
+    }
+
+    #[test]
+    fn removes_credential_handles_from_capability_input() {
+        let package = WorkflowPackage {
+            schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
+            id: "com.himind.workflow.test".to_string(),
+            version: "1.0.0".to_string(),
+            name: "Test".to_string(),
+            description: String::new(),
+            min_agent_version: "0.3.47".to_string(),
+            local_requirements: serde_json::json!({}),
+            optional_providers: Vec::new(),
+            capabilities: vec!["test.capability".to_string()],
+            dependencies: Default::default(),
+            candidate: None,
+            steps: Vec::new(),
+            artifacts: Vec::new(),
+            ui: super::super::WorkflowUi {
+                mode: "standard".to_string(),
+                entry: String::new(),
+                surfaces: Vec::new(),
+            },
+            supported_runtimes: Vec::new(),
+            created_at: String::new(),
+            source_root: std::path::PathBuf::new(),
+            connectors: Vec::new(),
+        };
+        let step = WorkflowStep {
+            id: "TEST".to_string(),
+            title: "Test".to_string(),
+            kind: "capability".to_string(),
+            capability_id: "test.capability".to_string(),
+            runtime: None,
+            loop_config: None,
+            when: None,
+            candidate_action: String::new(),
+            input: serde_json::json!({}),
+            execution_mode: "sync".to_string(),
+            risk_level: "read_only".to_string(),
+            approval_required: false,
+            depends_on: Vec::new(),
+        };
+        let input = serde_json::json!({
+            "project_root": "C:\\work",
+            "credential_handles": {"private_key_path": "wechat-key"}
+        });
+        let resolved = resolve_connector_credentials(&package, &step, &input).unwrap();
+        assert!(resolved.get("credential_handles").is_none());
     }
 }

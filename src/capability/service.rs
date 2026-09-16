@@ -222,6 +222,10 @@ impl CapabilityGateway {
         }
     }
 
+    pub(crate) fn options(&self) -> &Options {
+        &self.options
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_business_catalog_for_test(&self, snapshot: BusinessCatalogSnapshot) {
         let provider = self

@@ -151,6 +151,11 @@ fn main() {
             eprintln!("plugin command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = credential_cli_arguments() {
+        if let Err(error) = run_credential_cli(&arguments) {
+            eprintln!("credential command failed: {error}");
+            std::process::exit(1);
+        }
     } else if let Some(arguments) = workflow_cli_arguments() {
         if let Err(error) = run_workflow_cli(&options, &arguments) {
             eprintln!("workflow command failed: {error}");
@@ -304,6 +309,52 @@ fn workflow_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "workflow")?;
     Some(arguments[index + 1..].to_vec())
+}
+
+fn credential_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "credential")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_credential_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action] if action == "list" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_credentials::list()?)?
+            );
+        }
+        [action, handle, connector_id, path] if action == "set-file" => {
+            let summary = store::connector_credentials::set_file_path(
+                handle,
+                connector_id,
+                PathBuf::from(path).as_path(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        [action, handle, connector_id, secret] if action == "set-secret" => {
+            let summary =
+                store::connector_credentials::set_secret(handle, connector_id, secret)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        [action, handle] if action == "remove" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "removed": store::connector_credentials::remove(handle)?,
+                    "handle": handle,
+                }))?
+            );
+        }
+        _ => {
+            return Err(
+                "usage: himind-agent credential <list|set-file <handle> <connector-id> <path>|set-secret <handle> <connector-id> <secret>|remove <handle>>"
+                    .into(),
+            )
+        }
+    }
+    Ok(())
 }
 
 fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {

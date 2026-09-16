@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 
 use super::{WorkflowPackage, WorkflowStep, WorkflowStepExecution};
 use crate::runtime::{codex, copilot, process};
+use crate::Options;
 
 const RUNTIME_OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -12,6 +13,7 @@ pub(crate) fn execute_runtime_step(
     package: &WorkflowPackage,
     step: &WorkflowStep,
     input: &Value,
+    options: Option<&Options>,
 ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
     let runtime = step
         .runtime
@@ -24,12 +26,11 @@ pub(crate) fn execute_runtime_step(
         "personal.codex" => execute_codex(&workspace, &prompt)?,
         "personal.github-copilot" => execute_copilot(&workspace, &prompt)?,
         "himind.fixture" => fixture_runtime_output(&step.id),
-        "himind.builtin" => {
-            return Err(
-                "himind.builtin Runtime Step requires the local DSH headless adapter, which is not available in this build"
-                    .into(),
-            )
-        }
+        "himind.builtin" => crate::runtime::deepseek_harness::execute_workflow(
+            options.ok_or("himind.builtin runtime step is unavailable without Agent options")?,
+            &workspace,
+            &prompt,
+        )?,
         value => return Err(format!("unsupported workflow runtime provider: {value}").into()),
     };
     let structured = parse_runtime_payload(&output);

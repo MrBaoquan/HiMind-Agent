@@ -744,6 +744,65 @@ pub(crate) fn prepare_interactive_launch(
     })
 }
 
+pub(crate) fn execute_workflow(
+    options: &Options,
+    workspace: &str,
+    prompt: &str,
+) -> Result<String, Box<dyn Error>> {
+    let workspace = process::canonical_workspace(workspace)?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("DSH workflow prompt is empty".into());
+    }
+    let launch =
+        prepare_interactive_launch(options, Some(&workspace)).map_err(std::io::Error::other)?;
+    let mut command = Command::new(&launch.executable);
+    command
+        .args([
+            OsString::from("--profile"),
+            OsString::from(HIMIND_HEADLESS_PROFILE),
+            OsString::from("--patch"),
+            launch.agent_patch.as_os_str().to_os_string(),
+            OsString::from(prompt),
+        ])
+        .current_dir(&launch.workspace)
+        .env(DSH_HOME_ENV, &launch.home)
+        .env("DSH_TELEMETRY_MODE", "DISABLED")
+        .env("DSH_PERMISSION_MODE", "workspace-write")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !launch.api_key.trim().is_empty() {
+        command.env(
+            launch.api_key_env.as_deref().unwrap_or("DEEPSEEK_API_KEY"),
+            &launch.api_key,
+        );
+    }
+    if !launch.base_url.trim().is_empty() {
+        command.env("DEEPSEEK_BASE_URL", &launch.base_url);
+    }
+    process::remove_himind_secret_environment(&mut command);
+    command.env("DEEPSEEK_API_KEY", &launch.api_key);
+    command.env("DEEPSEEK_BASE_URL", &launch.base_url);
+    process::configure_hidden_process(&mut command);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "DSH workflow runtime failed: {}",
+            process::summarize_output(
+                String::from_utf8_lossy(&output.stderr).trim(),
+                OUTPUT_CAPTURE_LIMIT
+            )
+        )
+        .into());
+    }
+    Ok(process::summarize_output(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        OUTPUT_CAPTURE_LIMIT,
+    ))
+}
+
 fn prepare_independent_interactive_launch(
     options: &Options,
     executable: String,

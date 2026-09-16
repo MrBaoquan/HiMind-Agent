@@ -1193,6 +1193,7 @@ mod tests {
             supported_runtimes: vec!["personal.codex".to_string()],
             created_at: String::new(),
             source_root: PathBuf::new(),
+            connectors: Vec::new(),
         }
     }
 

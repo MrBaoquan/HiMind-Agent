@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 mod candidate;
 mod condition;
+mod connector;
 mod executor;
 mod preflight;
 mod runner;
@@ -19,10 +20,15 @@ pub(crate) use candidate::{freeze_candidate, read_candidate};
 #[allow(unused_imports)]
 pub(crate) use condition::evaluate_condition;
 #[allow(unused_imports)]
+pub(crate) use connector::{
+    load_connector_manifests, WorkflowConnectorCredential, WorkflowConnectorManifest,
+};
+#[allow(unused_imports)]
 pub(crate) use executor::WorkflowGatewayExecutor;
 #[allow(unused_imports)]
 pub(crate) use preflight::{
-    preflight, WorkflowCapabilityPreflight, WorkflowPreflight, WorkflowToolPreflight,
+    preflight, WorkflowCapabilityPreflight, WorkflowConnectorPreflight, WorkflowPreflight,
+    WorkflowToolPreflight,
 };
 #[allow(unused_imports)]
 pub(crate) use runner::{
@@ -64,6 +70,8 @@ pub(crate) struct WorkflowPackage {
     pub created_at: String,
     #[serde(skip)]
     pub source_root: PathBuf,
+    #[serde(skip)]
+    pub connectors: Vec<WorkflowConnectorManifest>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +281,8 @@ pub(crate) fn load_from_directory(root: &Path) -> Result<WorkflowPackage, Box<dy
     let mut package: WorkflowPackage = serde_json::from_str(&source)?;
     package.validate().map_err(std::io::Error::other)?;
     package.source_root = root.canonicalize()?;
+    package.connectors =
+        load_connector_manifests(&package.source_root, &package.dependencies.connectors)?;
     validate_package_assets(root, &package)?;
     Ok(package)
 }

@@ -11,7 +11,7 @@ pub(crate) mod artifacts;
 pub(crate) mod builtin;
 pub(crate) mod codex;
 pub(crate) mod copilot;
-mod deepseek_harness;
+pub(crate) mod deepseek_harness;
 pub(crate) mod native;
 pub(crate) mod process;
 
