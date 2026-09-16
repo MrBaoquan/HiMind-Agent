@@ -18,6 +18,11 @@ pub(crate) struct AgentCoreRunRecorder {
 
 impl AgentCoreRunRecorder {
     pub(crate) fn open_default() -> Result<Self, Box<dyn Error>> {
+        #[cfg(test)]
+        {
+            return Err("default Agent Core ledger is disabled in unit tests".into());
+        }
+        #[cfg(not(test))]
         Ok(Self {
             ledger: LocalRunLedger::open_default()?,
         })

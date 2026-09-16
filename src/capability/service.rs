@@ -1980,7 +1980,29 @@ impl CapabilityGateway {
             context.session_id_hash.as_str(),
             context.request_id.as_str(),
         );
-        match registration.handler {
+        let agent_core_recording = if should_record_agent_core_run(capability_id) {
+            match crate::agent_core_service::AgentCoreRunRecorder::open_default() {
+                Ok(recorder) => {
+                    let agent_id = crate::api::client::load_agent_state(&self.options.state_path)
+                        .map(|state| state.agent_id)
+                        .unwrap_or_else(|_| "local-agent".to_string());
+                    match recorder.begin(&agent_id, context, capability_id) {
+                        Ok(run) => Some((recorder, run)),
+                        Err(error) => {
+                            eprintln!("local run begin failed for {capability_id}: {error}");
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("local run ledger unavailable for {capability_id}: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let result = match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
             CapabilityHandler::CapabilityCatalogSearch => {
                 Ok(self.search_capabilities(context, &input)?)
@@ -2492,7 +2514,17 @@ impl CapabilityGateway {
                     approval_proof.as_ref(),
                 )
             }
+        };
+        if let Some((recorder, run)) = agent_core_recording {
+            let recording_result = match &result {
+                Ok(value) => recorder.complete(run, value),
+                Err(error) => recorder.fail(run, &error.to_string()),
+            };
+            if let Err(error) = recording_result {
+                eprintln!("local run completion failed for {capability_id}: {error}");
+            }
         }
+        result
     }
 
     pub(crate) fn health(&self, context: &InvocationContext) -> Value {
@@ -3992,6 +4024,17 @@ fn extension_review_identity(input: &Value) -> Result<(String, String), Box<dyn 
         return Err("id is required and must be a review identifier".into());
     }
     Ok((kind, id))
+}
+
+fn should_record_agent_core_run(capability_id: &str) -> bool {
+    !matches!(
+        capability_id,
+        "system.health"
+            | "capability.catalog.search"
+            | "capability.catalog.describe"
+            | "capability.catalog.activate"
+            | "capability.catalog.invoke"
+    )
 }
 
 fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
