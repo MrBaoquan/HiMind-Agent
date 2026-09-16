@@ -148,8 +148,22 @@
 .workflow-start-head > div { min-width: 0; }
 .workflow-start-head span { color: var(--text-muted); font-size: 9px; text-transform: uppercase; }
 .workflow-start-head h2 { margin: 3px 0 0; font-size: 17px; font-weight: 650; }
-.workflow-start-modal textarea { min-height: 420px; flex: 1; resize: vertical; padding: 12px; border: 1px solid var(--border-strong); border-radius: 6px; outline: 0; color: var(--text); background: #fbfcfe; font-family: Consolas, monospace; font-size: 11px; line-height: 1.55; }
-.workflow-start-modal textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.workflow-start-modal .workflow-start-json { min-height: 420px; flex: 1; resize: vertical; padding: 12px; border: 1px solid var(--border-strong); border-radius: 6px; outline: 0; color: var(--text); background: #fbfcfe; font-family: Consolas, monospace; font-size: 11px; line-height: 1.55; }
+.workflow-start-mode { width: fit-content; margin-bottom: 10px; }
+.workflow-start-form { min-height: 0; flex: 1; display: grid; align-content: start; gap: 14px; padding-right: 4px; overflow-y: auto; }
+.workflow-start-form > section { display: grid; gap: 8px; }
+.workflow-start-form h3 { margin: 0; font-size: 12px; font-weight: 650; }
+.workflow-start-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.workflow-start-fields > label { min-width: 0; display: grid; gap: 5px; color: var(--text-muted); font-size: 10px; }
+.workflow-start-fields > label > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.workflow-start-fields em { color: var(--danger); font-size: 8px; font-style: normal; }
+.workflow-start-fields input, .workflow-start-fields select, .workflow-start-fields textarea { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 6px; outline: 0; color: var(--text); background: #fbfcfe; font-family: inherit; font-size: 11px; }
+.workflow-start-fields textarea { resize: vertical; line-height: 1.5; }
+.workflow-start-fields input:focus, .workflow-start-fields select:focus, .workflow-start-fields textarea:focus, .workflow-start-modal .workflow-start-json:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.workflow-start-field-wide { grid-column: 1 / -1; }
+.workflow-start-toggle { min-height: 38px; display: flex !important; align-items: center; gap: 8px; padding: 8px 9px; border: 1px solid var(--border); border-radius: 6px; background: #fbfcfe; }
+.workflow-start-toggle input { width: 15px; height: 15px; }
+.workflow-start-empty { padding: 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-muted); background: #fbfcfe; font-size: 11px; }
 .workflow-start-modal .modal-actions { margin-top: 12px; }
 
 @media (max-width: 1100px) {
@@ -164,6 +178,7 @@
   .workflow-layout { display: flex; flex-direction: column; overflow-y: auto; }
   .workflow-list-panel, .workflow-detail-panel, .workflow-runs-panel { min-height: 280px; }
   .workflow-meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .workflow-start-fields { grid-template-columns: 1fr; }
   .workflow-meta-grid > div:nth-child(2) { border-right: 0; }
   .workflow-meta-grid > div:nth-child(-n + 2) { border-bottom: 1px solid var(--border); }
 }

@@ -210,8 +210,19 @@ export type WorkflowPackage = {
 export type WorkflowView = {
     schema_version: string;
     title: string;
-    sections: Array<{ id: string; title: string; fields?: string[]; artifacts?: string[] }>;
+    sections: Array<{ id: string; title: string; fields?: WorkflowViewField[]; artifacts?: string[] }>;
     actions: string[];
+};
+
+export type WorkflowViewField = string | {
+    id: string;
+    label?: string;
+    type?: 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'list' | 'json' | 'credential' | string;
+    required?: boolean;
+    default?: unknown;
+    options?: string[];
+    placeholder?: string;
+    target?: string;
 };
 
 export type WorkflowLocalRun = {

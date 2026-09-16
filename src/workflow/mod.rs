@@ -192,6 +192,55 @@ pub(crate) struct WorkflowUi {
     pub surfaces: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowViewManifest {
+    schema_version: String,
+    title: String,
+    #[serde(default)]
+    sections: Vec<WorkflowViewSection>,
+    #[serde(default)]
+    actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowViewSection {
+    id: String,
+    title: String,
+    #[serde(default)]
+    fields: Vec<WorkflowViewField>,
+    #[serde(default)]
+    artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum WorkflowViewField {
+    Id(String),
+    Definition(WorkflowViewFieldDefinition),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowViewFieldDefinition {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default = "default_workflow_view_field_type", rename = "type")]
+    field_type: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    default: Value,
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    placeholder: String,
+    #[serde(default)]
+    target: String,
+}
+
 impl WorkflowPackage {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.schema_version != WORKFLOW_PACKAGE_SCHEMA_VERSION {
@@ -360,6 +409,7 @@ fn validate_package_assets(root: &Path, package: &WorkflowPackage) -> Result<(),
     if !package.ui.entry.trim().is_empty() {
         assets.push(package.ui.entry.as_str());
     }
+    let mut validated_view = false;
     for asset in assets {
         let target = canonical_root.join(asset);
         let canonical_target = target
@@ -368,8 +418,91 @@ fn validate_package_assets(root: &Path, package: &WorkflowPackage) -> Result<(),
         if !canonical_target.starts_with(&canonical_root) || !canonical_target.is_file() {
             return Err(format!("workflow asset escapes package or is not a file: {asset}").into());
         }
+        if !package.ui.entry.trim().is_empty() && asset == package.ui.entry && !validated_view {
+            validate_workflow_view(root, &package.ui.entry)?;
+            validated_view = true;
+        }
     }
     Ok(())
+}
+
+fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>> {
+    let path = root.join(entry);
+    let view: WorkflowViewManifest = serde_json::from_slice(&fs::read(&path)?)?;
+    if view.schema_version != "workflow_view.v1" {
+        return Err("workflow view schema_version is invalid".into());
+    }
+    if view.title.trim().is_empty() {
+        return Err("workflow view title is required".into());
+    }
+    let mut section_ids = HashSet::new();
+    let mut field_ids = HashSet::new();
+    for section in &view.sections {
+        validate_workflow_id(&section.id).map_err(std::io::Error::other)?;
+        if section.title.trim().is_empty() {
+            return Err(format!("workflow view section {} title is required", section.id).into());
+        }
+        if !section_ids.insert(section.id.as_str()) {
+            return Err(format!("duplicate workflow view section: {}", section.id).into());
+        }
+        for field in &section.fields {
+            let definition = match field {
+                WorkflowViewField::Id(id) => {
+                    validate_workflow_id(id).map_err(std::io::Error::other)?;
+                    if !field_ids.insert(id.as_str()) {
+                        return Err(format!("duplicate workflow view field: {id}").into());
+                    }
+                    continue;
+                }
+                WorkflowViewField::Definition(definition) => definition,
+            };
+            validate_workflow_id(&definition.id).map_err(std::io::Error::other)?;
+            if !field_ids.insert(definition.id.as_str()) {
+                return Err(format!("duplicate workflow view field: {}", definition.id).into());
+            }
+            if !matches!(
+                definition.field_type.as_str(),
+                "text"
+                    | "textarea"
+                    | "number"
+                    | "boolean"
+                    | "select"
+                    | "list"
+                    | "json"
+                    | "credential"
+            ) {
+                return Err(
+                    format!("workflow view field {} type is invalid", definition.id).into(),
+                );
+            }
+            if definition.field_type == "select" && definition.options.is_empty() {
+                return Err(format!(
+                    "workflow view select field {} requires options",
+                    definition.id
+                )
+                .into());
+            }
+            if definition.field_type == "credential" && definition.target.trim().is_empty() {
+                return Err(format!(
+                    "workflow view credential field {} requires a target",
+                    definition.id
+                )
+                .into());
+            }
+        }
+    }
+    let mut actions = HashSet::new();
+    for action in &view.actions {
+        validate_workflow_id(action).map_err(std::io::Error::other)?;
+        if !actions.insert(action.as_str()) {
+            return Err(format!("duplicate workflow view action: {action}").into());
+        }
+    }
+    Ok(())
+}
+
+fn default_workflow_view_field_type() -> String {
+    "text".to_string()
 }
 
 fn collect_runtime_schema_assets<'a>(steps: &'a [WorkflowStep], assets: &mut Vec<&'a str>) {
@@ -805,6 +938,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unavailable"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn rejects_invalid_declarative_ui_field_type() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let temp = std::env::temp_dir().join(format!(
+            "himind-workflow-invalid-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        copy_dir(&root, &temp).unwrap();
+        let view_path = temp.join("ui/workflow-view.json");
+        let mut view: Value = serde_json::from_slice(&fs::read(&view_path).unwrap()).unwrap();
+        view["sections"][0]["fields"][0]["type"] = Value::String("script".to_string());
+        fs::write(&view_path, serde_json::to_vec_pretty(&view).unwrap()).unwrap();
+        assert!(load_from_directory(&temp)
+            .unwrap_err()
+            .to_string()
+            .contains("type is invalid"));
         let _ = fs::remove_dir_all(temp);
     }
 
