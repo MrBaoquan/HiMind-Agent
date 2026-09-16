@@ -434,6 +434,12 @@ struct SkillCatalogResponse {
     items: Vec<SkillCatalogItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkflowCatalogResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    items: Vec<WorkflowCatalogItem>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillSubmissionStatus {
     pub id: String,
@@ -741,6 +747,41 @@ pub fn skill_versions(
         .send()?
         .error_for_status()?
         .json::<SkillCatalogResponse>()?
+        .items)
+}
+
+pub fn workflow_catalog(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<Vec<WorkflowCatalogItem>, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/workflows/catalog"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<WorkflowCatalogResponse>()?
+        .items)
+}
+
+pub fn workflow_versions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    workflow_id: &str,
+) -> Result<Vec<WorkflowCatalogItem>, Box<dyn Error>> {
+    let workflow_id =
+        url::form_urlencoded::byte_serialize(workflow_id.as_bytes()).collect::<String>();
+    Ok(client
+        .get(format!(
+            "{api_base}/api/agent/workflows/catalog/{workflow_id}/versions"
+        ))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<WorkflowCatalogResponse>()?
         .items)
 }
 

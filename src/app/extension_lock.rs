@@ -239,6 +239,27 @@ pub(crate) fn record_skill(
     })
 }
 
+pub(crate) fn record_workflow(
+    item: &crate::api::distribution::WorkflowCatalogItem,
+) -> Result<(), Box<dyn Error>> {
+    upsert(ExtensionLockEntry {
+        asset_kind: "workflow".to_string(),
+        asset_id: item.workflow_id.clone(),
+        version: item.version.clone(),
+        source_id: item.source.clone(),
+        source: item.source.clone(),
+        repository: String::new(),
+        reference: String::new(),
+        catalog_path: String::new(),
+        source_commit: String::new(),
+        artifact_url: item.download_url.clone(),
+        sha256: item.sha256.clone(),
+        dependencies: Vec::new(),
+        agent_profile: paths::profile_name(),
+        updated_at: now_stamp(),
+    })
+}
+
 pub(crate) fn record_source_skill(
     source: &crate::app::extension_source::ExtensionSourceConfig,
     item: &crate::api::distribution::SkillCatalogItem,

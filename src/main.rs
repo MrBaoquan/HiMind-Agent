@@ -418,6 +418,27 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             let input = workflow_cli_input(arguments.get(2))?;
             run_workflow_package(options, &package, input, "")?;
         }
+        [action] if action == "remote-list" => {
+            let state = api::client::load_agent_state(&options.state_path)?;
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+            let items = api::distribution::workflow_catalog(
+                &client,
+                &options.api_base,
+                &state.agent_id,
+                &state.credential,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        [action, workflow_id] | [action, workflow_id, _] if action == "remote-install" => {
+            let version = arguments.get(2).map(String::as_str);
+            let installed = install_dashboard_workflow(options, workflow_id, version)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&installed))?
+            );
+        }
         [action] if action == "runs" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let runs = ledger.list_runs(100)?;
@@ -553,12 +574,63 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <validate <dir>|doctor <dir|id> [input-json|@file]|install <dir> [--require-signature]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <validate <dir>|doctor <dir|id> [input-json|@file]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }
     }
     Ok(())
+}
+
+fn install_dashboard_workflow(
+    options: &Options,
+    workflow_id: &str,
+    version: Option<&str>,
+) -> Result<workflow::InstalledWorkflow, Box<dyn Error>> {
+    let state = api::client::load_agent_state(&options.state_path)?;
+    options.set_agent_credential(&state.credential);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let item = if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
+        api::distribution::workflow_versions(
+            &client,
+            &options.api_base,
+            &state.agent_id,
+            &state.credential,
+            workflow_id,
+        )?
+        .into_iter()
+        .find(|item| item.version == version)
+        .ok_or_else(|| format!("Workflow 版本 v{version} 不可用"))?
+    } else {
+        api::distribution::workflow_catalog(
+            &client,
+            &options.api_base,
+            &state.agent_id,
+            &state.credential,
+        )?
+        .into_iter()
+        .find(|item| item.workflow_id == workflow_id)
+        .ok_or_else(|| format!("Workflow 未上架或当前不可用: {workflow_id}"))?
+    };
+    let store = workflow::WorkflowStore::open_default()?;
+    let previous = store
+        .list()?
+        .into_iter()
+        .find(|installed| installed.package.id == item.workflow_id);
+    let installed =
+        app::workflow_manager::install_dashboard_catalog_item(&item, options, &state.agent_id)?;
+    if let Err(error) = app::extension_lock::record_workflow(&item) {
+        match (previous.as_ref(), store.rollback(&item.workflow_id)) {
+            (Some(previous), Ok(_)) if previous.package.version != item.version => {}
+            _ => {
+                let _ = store.remove(&item.workflow_id);
+            }
+        }
+        return Err(error);
+    }
+    Ok(installed)
 }
 
 fn workflow_package_from_reference(

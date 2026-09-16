@@ -45,6 +45,32 @@ pub(crate) fn install_public_catalog_item(
     result
 }
 
+pub(crate) fn install_dashboard_catalog_item(
+    item: &WorkflowCatalogItem,
+    options: &crate::Options,
+    agent_id: &str,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    if item.assignment == "blocked" {
+        return Err("该 Workflow 已被组织禁止安装".into());
+    }
+    ensure_agent_version_supported(&item.min_agent_version)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .user_agent("HiMind-Agent")
+        .build()?;
+    let archive = download_dashboard(&client, item, options, agent_id)?;
+    let staging =
+        std::env::temp_dir().join(format!("himind-dashboard-workflow-{}", unique_suffix()));
+    let result = (|| {
+        extract_archive(&archive, &staging)?;
+        let root = package_root(&staging)?;
+        install_from_directory(item, &root, true)
+    })();
+    let _ = fs::remove_file(archive);
+    let _ = fs::remove_dir_all(staging);
+    result
+}
+
 fn install_from_directory(
     item: &WorkflowCatalogItem,
     root: &Path,
@@ -114,6 +140,75 @@ fn download_public(
         &item.signature_key_id,
         &item.signature_algorithm,
         require_signature,
+    ) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn download_dashboard(
+    client: &Client,
+    item: &WorkflowCatalogItem,
+    options: &crate::Options,
+    agent_id: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if item.file_size == 0 || item.file_size > MAX_WORKFLOW_ARCHIVE_BYTES {
+        return Err("Workflow 制品大小无效或超过 256 MiB 限制".into());
+    }
+    let api = url::Url::parse(&options.api_base)?;
+    let url = url::Url::parse(&item.download_url)?;
+    if api.scheme() != url.scheme()
+        || api.host_str() != url.host_str()
+        || api.port_or_known_default() != url.port_or_known_default()
+    {
+        return Err("组织 Workflow 制品下载地址必须与 Dashboard 同源".into());
+    }
+    let mut response = client
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Agent {agent_id}:{}", options.agent_credential()),
+        )
+        .send()?
+        .error_for_status()?;
+    let path = std::env::temp_dir().join(format!(
+        "himind-dashboard-workflow-{}.hmwf",
+        unique_suffix()
+    ));
+    let mut file = File::create(&path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = response.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_WORKFLOW_ARCHIVE_BYTES || total > item.file_size {
+            let _ = fs::remove_file(&path);
+            return Err("Workflow 制品实际大小超过发布记录".into());
+        }
+        file.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+    }
+    file.flush()?;
+    if total != item.file_size {
+        let _ = fs::remove_file(&path);
+        return Err("Workflow 制品实际大小与发布记录不一致".into());
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&item.sha256) {
+        let _ = fs::remove_file(&path);
+        return Err("Workflow 制品 SHA-256 校验失败".into());
+    }
+    if let Err(error) = verify_extension_artifact_signature(
+        &path,
+        &item.signature,
+        &item.signature_key_id,
+        &item.signature_algorithm,
+        true,
     ) {
         let _ = fs::remove_file(&path);
         return Err(error);
@@ -231,9 +326,26 @@ fn unique_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use rand::rngs::OsRng;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread;
     use zip::write::FileOptions;
     use zip::CompressionMethod;
     use zip::ZipWriter;
+
+    static SIGNING_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn signing_env_lock() -> MutexGuard<'static, ()> {
+        SIGNING_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
 
     fn item(url: &str) -> WorkflowCatalogItem {
         WorkflowCatalogItem {
@@ -317,5 +429,93 @@ mod tests {
         assert!(!staging.parent().unwrap().join("outside.txt").is_file());
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(staging);
+    }
+
+    #[test]
+    fn dashboard_download_requires_same_origin_auth_and_signature() {
+        let _guard = signing_env_lock();
+        let payload = b"workflow archive";
+        let sha256 = format!("{:x}", Sha256::digest(payload));
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        let signature = private_key
+            .sign_with_rng(&mut rng, Pss::new::<Sha256>(), &Sha256::digest(payload))
+            .unwrap();
+        let key_id = "dashboard-workflow-test-key";
+        let trusted_root = std::env::temp_dir().join(format!(
+            "himind-dashboard-workflow-keys-{}",
+            unique_suffix()
+        ));
+        fs::create_dir_all(&trusted_root).unwrap();
+        fs::write(
+            trusted_root.join(format!("{key_id}.pem")),
+            public_key.to_public_key_pem(LineEnding::LF).unwrap(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]).to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(payload).unwrap();
+            request
+        });
+
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &trusted_root);
+        let mut options = crate::Options::from_env();
+        options.api_base = format!("http://{address}");
+        options.set_agent_credential("test-credential");
+        let item = WorkflowCatalogItem {
+            file_size: payload.len() as u64,
+            sha256,
+            signature: BASE64_STANDARD.encode(signature),
+            signature_key_id: key_id.to_string(),
+            signature_algorithm: "rsa-pss-sha256".to_string(),
+            download_url: format!("http://{address}/api/agent/workflows/artifacts/test"),
+            ..item("http://unused")
+        };
+        let downloaded = download_dashboard(
+            &Client::builder().no_proxy().build().unwrap(),
+            &item,
+            &options,
+            "agent-1",
+        )
+        .unwrap();
+        let request = server.join().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: agent agent-1:test-credential"));
+        assert_eq!(fs::read(&downloaded).unwrap(), payload);
+        let _ = fs::remove_file(downloaded);
+
+        let mut cross_origin = item.clone();
+        cross_origin.download_url =
+            "http://127.0.0.1:9/api/agent/workflows/artifacts/test".to_string();
+        assert!(download_dashboard(
+            &Client::builder().no_proxy().build().unwrap(),
+            &cross_origin,
+            &options,
+            "agent-1"
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(trusted_root);
     }
 }
