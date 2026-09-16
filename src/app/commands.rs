@@ -3644,6 +3644,112 @@ pub(crate) fn get_workflow_run(run_id: String) -> Result<serde_json::Value, Stri
     workflow_run_snapshot(&run_id).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub(crate) fn approve_workflow_step(
+    run_id: String,
+    step_id: String,
+) -> Result<serde_json::Value, String> {
+    decide_workflow_step(&run_id, &step_id, true).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn reject_workflow_step(
+    run_id: String,
+    step_id: String,
+) -> Result<serde_json::Value, String> {
+    decide_workflow_step(&run_id, &step_id, false).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn cancel_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
+    let runner =
+        crate::workflow::WorkflowRunner::open_default().map_err(|error| error.to_string())?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()
+        .map_err(|error| error.to_string())?;
+    let run = ledger
+        .get_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let run = runner
+        .cancel(run, "workflow canceled from Agent UI")
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(run).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn resume_workflow_run(
+    state: State<'_, AgentState>,
+    run_id: String,
+) -> Result<serde_json::Value, String> {
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        resume_workflow_with_gateway(gateway, &run_id).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn decide_workflow_step(
+    run_id: &str,
+    step_id: &str,
+    approved: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let runner = crate::workflow::WorkflowRunner::open_default()?;
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let run = ledger
+        .get_run(run_id)?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let run = if approved {
+        runner.approve_step(run, step_id)?
+    } else {
+        runner.reject_step(run, step_id)?
+    };
+    Ok(serde_json::to_value(run)?)
+}
+
+fn resume_workflow_with_gateway(
+    gateway: CapabilityGateway,
+    run_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let run = ledger
+        .get_run(run_id)?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let interaction = ledger
+        .get_interaction(&run.interaction_id)?
+        .ok_or("workflow run interaction is missing")?;
+    let package_id = interaction
+        .business_context
+        .get("workflow")
+        .and_then(|workflow| workflow.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("workflow run does not contain a package reference")?;
+    let input = interaction
+        .business_context
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let package = crate::workflow::WorkflowStore::open_default()?
+        .list()?
+        .into_iter()
+        .find(|item| item.package.id == package_id && item.enabled)
+        .map(|item| item.package)
+        .ok_or_else(|| format!("workflow package not found or disabled: {package_id}"))?;
+    let context = InvocationContext::new(
+        crate::capability::types::InvocationSource::Workflow,
+        "workflow-ui",
+    );
+    let report =
+        crate::workflow::preflight(&package, VERSION, &gateway.list_capabilities(&context)?);
+    if !report.ready {
+        return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
+    }
+    let runner = crate::workflow::WorkflowRunner::open_default()?;
+    let executor = crate::workflow::WorkflowGatewayExecutor::new(gateway, context);
+    let outcome = runner.run_ready(&package, run, &input, &executor)?;
+    Ok(serde_json::to_value(outcome)?)
+}
+
 fn workflow_center_snapshot() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let store = crate::workflow::WorkflowStore::open_default()?;
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;

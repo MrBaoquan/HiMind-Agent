@@ -133,6 +133,7 @@
 .workflow-run-detail { min-height: 0; flex: 1; padding: 11px; border-top: 1px solid var(--border); overflow-y: auto; }
 .workflow-run-status { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .workflow-run-status > span:last-child { color: var(--text-muted); font-size: 9px; }
+.workflow-run-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
 .workflow-run-artifacts { display: grid; gap: 6px; margin-top: 10px; }
 .workflow-run-artifacts > div { min-width: 0; display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; }
 .workflow-run-artifacts svg { flex: 0 0 auto; color: var(--success); }

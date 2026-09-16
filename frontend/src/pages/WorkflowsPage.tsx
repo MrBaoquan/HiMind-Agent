@@ -9,6 +9,9 @@ type WorkflowsPageProps = {
   error: string;
   onRefresh: () => void;
   onLoadRun: (runId: string) => Promise<WorkflowRunSnapshot>;
+  onApprove: (runId: string, stepId: string) => Promise<void>;
+  onReject: (runId: string, stepId: string) => Promise<void>;
+  onCancel: (runId: string) => Promise<void>;
 };
 
 function statusKind(status: string): 'success' | 'warn' | 'danger' | 'neutral' {
@@ -38,12 +41,13 @@ function formatTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun }: WorkflowsPageProps) {
+export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun, onApprove, onReject, onCancel }: WorkflowsPageProps) {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('');
   const [selectedRunId, setSelectedRunId] = useState('');
   const [runDetail, setRunDetail] = useState<WorkflowRunSnapshot | null>(null);
   const [runLoading, setRunLoading] = useState(false);
   const [runError, setRunError] = useState('');
+  const [actionBusy, setActionBusy] = useState('');
 
   const workflows = snapshot?.workflows || [];
   const runs = snapshot?.runs || [];
@@ -67,6 +71,19 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun }
       setRunError('运行详情读取失败');
     } finally {
       setRunLoading(false);
+    }
+  }
+
+  async function performRunAction(runId: string, action: string, operation: () => Promise<void>) {
+    setActionBusy(action);
+    setRunError('');
+    try {
+      await operation();
+      await openRun(runId);
+    } catch {
+      setRunError('工作流操作失败，请查看 Agent 日志后重试');
+    } finally {
+      setActionBusy('');
     }
   }
 
@@ -170,6 +187,38 @@ export function WorkflowsPage({ snapshot, loading, error, onRefresh, onLoadRun }
                   <Pill kind={statusKind(runDetail.run.status)}>{statusLabel(runDetail.run.status)}</Pill>
                   <span>{runDetail.run.artifacts.length} Artifact · {runDetail.events.length} Event</span>
                 </div>
+                {runDetail.run.status === 'waiting' && runDetail.run.current_step_id ? (
+                  <div className="workflow-run-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={Boolean(actionBusy)}
+                      onClick={() => void performRunAction(runDetail.run.run_id, 'approve', () => onApprove(runDetail.run.run_id, runDetail.run.current_step_id))}
+                    >
+                      <CheckCircle2 size={14} />{actionBusy === 'approve' ? '处理中' : '批准并继续'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={Boolean(actionBusy)}
+                      onClick={() => void performRunAction(runDetail.run.run_id, 'reject', () => onReject(runDetail.run.run_id, runDetail.run.current_step_id))}
+                    >
+                      拒绝
+                    </button>
+                  </div>
+                ) : null}
+                {runDetail.run.status === 'running' || runDetail.run.status === 'queued' || runDetail.run.status === 'waiting' ? (
+                  <div className="workflow-run-actions">
+                    <button
+                      type="button"
+                      className="btn btn-danger-quiet"
+                      disabled={Boolean(actionBusy)}
+                      onClick={() => void performRunAction(runDetail.run.run_id, 'cancel', () => onCancel(runDetail.run.run_id))}
+                    >
+                      {actionBusy === 'cancel' ? '正在取消' : '取消运行'}
+                    </button>
+                  </div>
+                ) : null}
                 <div className="workflow-run-artifacts">
                   {runDetail.run.artifacts.map(artifact => (
                     <div key={artifact.artifact_id}><FileText size={14} /><span><strong>{artifact.name}</strong><small>{artifact.artifact_id}</small></span></div>
