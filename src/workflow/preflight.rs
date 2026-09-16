@@ -363,11 +363,24 @@ where
                     ),
                 };
             }
-            let probe_input = connector_health_input(
-                &capability.input_schema,
-                input,
-                health.and_then(|value| value.get("input")),
-            );
+            let probe_input =
+                connector_health_input(input, health.and_then(|value| value.get("input")));
+            let probe_input = match super::connector::resolve_connector_credentials_for_capability(
+                package,
+                &target,
+                &probe_input,
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    return WorkflowConnectorProbe {
+                        id: connector.id.clone(),
+                        status: "failed".to_string(),
+                        target,
+                        message: error.to_string(),
+                    };
+                }
+            };
+            let probe_input = filter_capability_input(&capability.input_schema, &probe_input);
             match invoke(&target, probe_input) {
                 Ok(_) => WorkflowConnectorProbe {
                     id: connector.id.clone(),
@@ -412,16 +425,12 @@ fn apply_connector_probes(report: &mut WorkflowPreflight, probes: &[WorkflowConn
     report.ready = report.blockers.is_empty();
 }
 
-fn connector_health_input(
-    schema: &Value,
-    workflow_input: &Value,
-    health_input: Option<&Value>,
-) -> Value {
+fn connector_health_input(workflow_input: &Value, health_input: Option<&Value>) -> Value {
     let mut input = workflow_input.as_object().cloned().unwrap_or_default();
     if let Some(overrides) = health_input.and_then(Value::as_object) {
         input.extend(overrides.clone());
     }
-    filter_capability_input(schema, &Value::Object(input))
+    Value::Object(input)
 }
 
 fn filter_capability_input(schema: &Value, input: &Value) -> Value {

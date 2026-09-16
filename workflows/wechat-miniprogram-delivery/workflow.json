@@ -31,6 +31,7 @@
     "workflow.candidate.freeze",
     "wechat.miniprogram.requirements.snapshot",
     "wechat.miniprogram.project.inspect",
+    "wechat.miniprogram.ci.readiness",
     "wechat.miniprogram.dependencies.prepare",
     "wechat.miniprogram.test",
     "wechat.miniprogram.build",

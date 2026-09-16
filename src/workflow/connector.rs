@@ -322,6 +322,64 @@ pub(crate) fn load_connector_manifests(
     Ok(manifests)
 }
 
+pub(crate) fn resolve_connector_credentials_for_capability(
+    package: &super::WorkflowPackage,
+    capability_id: &str,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut input = input
+        .as_object()
+        .cloned()
+        .ok_or("workflow capability input must be an object")?;
+    let handles = input
+        .get("credential_handles")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for connector in &package.connectors {
+        if !connector
+            .capabilities
+            .iter()
+            .any(|item| item == capability_id)
+        {
+            continue;
+        }
+        for credential in &connector.credentials {
+            if input.contains_key(&credential.target) {
+                continue;
+            }
+            let handle = handles
+                .get(&credential.target)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(credential.handle.as_str());
+            let resolved = crate::store::connector_credentials::resolve(handle)?;
+            let Some(resolved) = resolved else {
+                if credential.required {
+                    return Err(
+                        format!("workflow connector credential is missing: {handle}").into(),
+                    );
+                }
+                continue;
+            };
+            if resolved.connector_id != connector.id {
+                return Err(format!(
+                    "workflow connector credential {} belongs to {}, not {}",
+                    handle, resolved.connector_id, connector.id
+                )
+                .into());
+            }
+            input.insert(
+                credential.target.clone(),
+                serde_json::Value::String(resolved.value),
+            );
+        }
+    }
+    input.remove("credential_handles");
+    Ok(serde_json::Value::Object(input))
+}
+
 fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty()
         || value.len() > 200

@@ -46,7 +46,11 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
             .into_iter()
             .find(|capability| capability.id == capability_id)
             .ok_or_else(|| format!("capability not found: {capability_id}"))?;
-        let input = resolve_connector_credentials(package, step, input)?;
+        let input = super::connector::resolve_connector_credentials_for_capability(
+            package,
+            &step.capability_id,
+            input,
+        )?;
         let input = capability_input(&capability.input_schema, &input);
         let output = self.gateway.invoke(&context, capability_id, input)?;
         let (artifacts, usage) = workflow_result_metadata(&output)?;
@@ -56,57 +60,6 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
             usage,
         })
     }
-}
-
-fn resolve_connector_credentials(
-    package: &WorkflowPackage,
-    step: &WorkflowStep,
-    input: &Value,
-) -> Result<Value, Box<dyn Error>> {
-    let mut input = input
-        .as_object()
-        .cloned()
-        .ok_or("workflow capability input must be an object")?;
-    let handles = input
-        .get("credential_handles")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for connector in &package.connectors {
-        if !connector.capabilities.contains(&step.capability_id) {
-            continue;
-        }
-        for credential in &connector.credentials {
-            if input.contains_key(&credential.target) {
-                continue;
-            }
-            let handle = handles
-                .get(&credential.target)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(credential.handle.as_str());
-            let resolved = crate::store::connector_credentials::resolve(handle)?;
-            let Some(resolved) = resolved else {
-                if credential.required {
-                    return Err(
-                        format!("workflow connector credential is missing: {handle}").into(),
-                    );
-                }
-                continue;
-            };
-            if resolved.connector_id != connector.id {
-                return Err(format!(
-                    "workflow connector credential {} belongs to {}, not {}",
-                    handle, resolved.connector_id, connector.id
-                )
-                .into());
-            }
-            input.insert(credential.target.clone(), Value::String(resolved.value));
-        }
-    }
-    input.remove("credential_handles");
-    Ok(Value::Object(input))
 }
 
 fn capability_input(schema: &Value, input: &Value) -> Value {
@@ -261,7 +214,12 @@ mod tests {
             "project_root": "C:\\work",
             "credential_handles": {"private_key_path": "wechat-key"}
         });
-        let resolved = resolve_connector_credentials(&package, &step, &input).unwrap();
+        let resolved = crate::workflow::connector::resolve_connector_credentials_for_capability(
+            &package,
+            &step.capability_id,
+            &input,
+        )
+        .unwrap();
         assert!(resolved.get("credential_handles").is_none());
     }
 }

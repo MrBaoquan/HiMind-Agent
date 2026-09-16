@@ -9,6 +9,7 @@
   "auth": ["api_key"],
   "capabilities": [
     "wechat.miniprogram.project.inspect",
+    "wechat.miniprogram.ci.readiness",
     "wechat.miniprogram.dependencies.prepare",
     "wechat.miniprogram.test",
     "wechat.miniprogram.build",
@@ -24,7 +25,10 @@
   "supported_platforms": ["windows"],
   "health_check": {
     "type": "capability",
-    "target": "wechat.miniprogram.project.inspect"
+    "target": "wechat.miniprogram.ci.readiness",
+    "input": {
+      "require_ci_installed": false
+    }
   },
   "credentials": [
     {

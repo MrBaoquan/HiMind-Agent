@@ -175,6 +175,12 @@
           "placeholder": "平台回执或人工提交证据引用"
         },
         {
+          "id": "manual_evidence_path",
+          "label": "人工审核证据",
+          "type": "text",
+          "placeholder": "人工提交审核后的截图、回执或记录文件路径"
+        },
+        {
           "id": "release_evidence_path",
           "label": "发布证据",
           "type": "text",
