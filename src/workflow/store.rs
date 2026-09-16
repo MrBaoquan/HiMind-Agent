@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,7 +58,16 @@ impl WorkflowStore {
         &self,
         source: &Path,
     ) -> Result<InstalledWorkflow, Box<dyn Error>> {
+        self.install_from_directory_with_policy(source, false)
+    }
+
+    pub(crate) fn install_from_directory_with_policy(
+        &self,
+        source: &Path,
+        require_signature: bool,
+    ) -> Result<InstalledWorkflow, Box<dyn Error>> {
         let source = source.canonicalize()?;
+        validate_package_integrity(&source, require_signature)?;
         let package = load_from_directory(&source)?;
         let product_root = self.product_root(&package.id)?;
         fs::create_dir_all(product_root.join("versions"))?;
@@ -82,6 +92,21 @@ impl WorkflowStore {
                 fs::remove_dir_all(&staging)?;
             }
             copy_package(&source, &staging)?;
+            if let Err(error) = validate_package_integrity(&staging, require_signature) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+            let staged_digest = match package_digest(&staging) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(error);
+                }
+            };
+            if staged_digest != digest {
+                let _ = fs::remove_dir_all(&staging);
+                return Err("workflow package changed while it was being installed".into());
+            }
             if let Some(parent) = version_root.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -198,6 +223,7 @@ impl WorkflowStore {
             .product_root(&installation.package_id)?
             .join("versions")
             .join(safe_segment(&installation.current_version)?);
+        validate_package_integrity(&version_root, false)?;
         let package = load_from_directory(&version_root)?;
         Ok(InstalledWorkflow {
             package,
@@ -234,6 +260,83 @@ impl WorkflowStore {
         )?;
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSignatureMetadata {
+    algorithm: String,
+    key_id: String,
+    signature: String,
+}
+
+fn validate_package_integrity(root: &Path, require_signature: bool) -> Result<(), Box<dyn Error>> {
+    let checksums_path = root.join("checksums.sha256");
+    let signature_path = root.join("manifest.sig");
+    if !checksums_path.is_file() {
+        if require_signature || signature_path.is_file() {
+            return Err("workflow package checksums.sha256 is required".into());
+        }
+        return Ok(());
+    }
+    let checksums: HashMap<String, String> =
+        crate::skill::manifest::parse_checksums(&fs::read_to_string(&checksums_path)?)?;
+    let actual_files = package_files_without_signature_metadata(root)?;
+    for relative in &actual_files {
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        let expected = checksums.get(&normalized).ok_or_else(|| {
+            format!("workflow package file is not covered by checksums.sha256: {normalized}")
+        })?;
+        let actual = sha256_file(&root.join(relative))?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!("workflow package checksum mismatch: {normalized}").into());
+        }
+    }
+    for relative in checksums.keys() {
+        if !actual_files
+            .iter()
+            .any(|path| path.to_string_lossy().replace('\\', "/") == *relative)
+        {
+            return Err(
+                format!("workflow checksums.sha256 references missing file: {relative}").into(),
+            );
+        }
+    }
+    if signature_path.is_file() {
+        let metadata: WorkflowSignatureMetadata =
+            serde_json::from_slice(&fs::read(&signature_path)?)?;
+        crate::app::system::verify_extension_artifact_signature(
+            &checksums_path,
+            &metadata.signature,
+            &metadata.key_id,
+            &metadata.algorithm,
+            true,
+        )?;
+    } else if require_signature {
+        return Err("workflow package manifest.sig is required".into());
+    }
+    Ok(())
+}
+
+fn package_files_without_signature_metadata(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(root)?.to_path_buf();
+        if relative == Path::new("checksums.sha256") || relative == Path::new("manifest.sig") {
+            continue;
+        }
+        files.push(relative);
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
+    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
 }
 
 fn copy_package(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
@@ -326,6 +429,13 @@ fn unique_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use rand::rngs::OsRng;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static SIGNING_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn source_package() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -339,6 +449,36 @@ mod tests {
             std::process::id(),
             unique_suffix()
         )))
+    }
+
+    fn package_copy() -> PathBuf {
+        let target = std::env::temp_dir().join(format!(
+            "himind-workflow-package-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        copy_package(&source_package(), &target).unwrap();
+        target
+    }
+
+    fn write_checksums(root: &Path) {
+        let mut rows = Vec::new();
+        for relative in package_files_without_signature_metadata(root).unwrap() {
+            let digest = sha256_file(&root.join(&relative)).unwrap();
+            rows.push(format!(
+                "{digest}  {}\n",
+                relative.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        rows.sort();
+        fs::write(root.join("checksums.sha256"), rows.concat()).unwrap();
+    }
+
+    fn signing_env_lock() -> MutexGuard<'static, ()> {
+        SIGNING_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
     }
 
     #[test]
@@ -381,5 +521,92 @@ mod tests {
         readme.push_str("\nchanged\n");
         fs::write(version_root.join("README.md"), readme).unwrap();
         assert!(store.install_from_directory(&source).is_err());
+    }
+
+    #[test]
+    fn require_signature_rejects_package_without_checksums() {
+        let package = package_copy();
+        let error = validate_package_integrity(&package, true).unwrap_err();
+        assert!(error.to_string().contains("checksums.sha256"));
+        let _ = fs::remove_dir_all(package);
+    }
+
+    #[test]
+    fn checksum_mismatch_is_rejected() {
+        let package = package_copy();
+        write_checksums(&package);
+        let mut readme = fs::read_to_string(package.join("README.md")).unwrap();
+        readme.push_str("\ntampered\n");
+        fs::write(package.join("README.md"), readme).unwrap();
+        let error = validate_package_integrity(&package, false).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        let _ = fs::remove_dir_all(package);
+    }
+
+    #[test]
+    fn require_signature_rejects_package_without_signature() {
+        let package = package_copy();
+        write_checksums(&package);
+        let error = validate_package_integrity(&package, true).unwrap_err();
+        assert!(error.to_string().contains("manifest.sig"));
+        let _ = fs::remove_dir_all(package);
+    }
+
+    #[test]
+    fn malformed_signature_metadata_is_rejected() {
+        let package = package_copy();
+        write_checksums(&package);
+        fs::write(package.join("manifest.sig"), b"{not-json").unwrap();
+        assert!(validate_package_integrity(&package, true).is_err());
+        let _ = fs::remove_dir_all(package);
+    }
+
+    #[test]
+    fn valid_signature_allows_required_install() {
+        let _guard = signing_env_lock();
+        let package = package_copy();
+        write_checksums(&package);
+
+        let key_id = "workflow-store-test-key";
+        let trusted_root = std::env::temp_dir().join(format!(
+            "himind-workflow-trusted-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        fs::create_dir_all(&trusted_root).unwrap();
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        fs::write(
+            trusted_root.join(format!("{key_id}.pem")),
+            public_key.to_public_key_pem(LineEnding::LF).unwrap(),
+        )
+        .unwrap();
+        let digest = Sha256::digest(fs::read(package.join("checksums.sha256")).unwrap());
+        let signature = private_key
+            .sign_with_rng(&mut rng, Pss::new::<Sha256>(), &digest)
+            .unwrap();
+        fs::write(
+            package.join("manifest.sig"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "algorithm": "rsa-pss-sha256",
+                "key_id": key_id,
+                "signature": BASE64_STANDARD.encode(signature),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &trusted_root);
+        let result = store().install_from_directory_with_policy(&package, true);
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(package);
+        let _ = fs::remove_dir_all(trusted_root);
     }
 }

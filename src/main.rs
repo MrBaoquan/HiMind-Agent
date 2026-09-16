@@ -491,6 +491,15 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                 serde_json::to_string_pretty(&workflow_installation_json(&item))?
             );
         }
+        [action, path, policy] if action == "install" && policy == "--require-signature" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let item =
+                store.install_from_directory_with_policy(PathBuf::from(path).as_path(), true)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&item))?
+            );
+        }
         [action] if action == "list" => {
             let store = workflow::WorkflowStore::open_default()?;
             let items = store
@@ -529,7 +538,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <validate <dir>|doctor <dir|id>|install <dir>|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <validate <dir>|doctor <dir|id>|install <dir> [--require-signature]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }
