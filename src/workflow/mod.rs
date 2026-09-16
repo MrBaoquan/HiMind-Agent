@@ -6,12 +6,21 @@ use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+mod executor;
+mod preflight;
 mod runner;
 mod store;
 
 #[allow(unused_imports)]
+pub(crate) use executor::WorkflowGatewayExecutor;
+#[allow(unused_imports)]
+pub(crate) use preflight::{
+    preflight, WorkflowCapabilityPreflight, WorkflowPreflight, WorkflowToolPreflight,
+};
+#[allow(unused_imports)]
 pub(crate) use runner::{
-    WorkflowRunOutcome, WorkflowRunner, WorkflowStepExecution, WorkflowStepExecutor,
+    WorkflowArtifactOutput, WorkflowRunOutcome, WorkflowRunner, WorkflowStepExecution,
+    WorkflowStepExecutor,
 };
 pub(crate) use store::{InstalledWorkflow, WorkflowStore};
 
@@ -65,6 +74,8 @@ pub(crate) struct WorkflowStep {
     pub title: String,
     #[serde(default)]
     pub capability_id: String,
+    #[serde(default = "default_object")]
+    pub input: Value,
     pub execution_mode: String,
     #[serde(default)]
     pub risk_level: String,
@@ -133,6 +144,9 @@ impl WorkflowPackage {
                     "workflow step {} execution_mode is invalid",
                     step.id
                 ));
+            }
+            if !step.input.is_object() {
+                return Err(format!("workflow step {} input must be an object", step.id));
             }
             if step.approval_required && step.risk_level.trim().is_empty() {
                 return Err(format!(
@@ -219,6 +233,10 @@ fn validate_workflow_id(value: &str) -> Result<(), String> {
         return Err(format!("invalid workflow identifier: {value}"));
     }
     Ok(())
+}
+
+fn default_object() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 fn validate_unique_text(name: &str, values: &[String]) -> Result<(), String> {

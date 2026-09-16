@@ -1980,7 +1980,9 @@ impl CapabilityGateway {
             context.session_id_hash.as_str(),
             context.request_id.as_str(),
         );
-        let agent_core_recording = if should_record_agent_core_run(capability_id) {
+        let agent_core_recording = if context.record_agent_core_run
+            && should_record_agent_core_run(capability_id)
+        {
             match crate::agent_core_service::AgentCoreRunRecorder::open_default() {
                 Ok(recorder) => {
                     let agent_id = crate::api::client::load_agent_state(&self.options.state_path)

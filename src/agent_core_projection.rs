@@ -170,19 +170,13 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 16 * 1024];
             let size = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..size]);
-            let normalized = request.to_ascii_lowercase();
-            assert!(
-                request.starts_with("POST /api/integrations/agent-core/v1/projections HTTP/1.1")
-            );
-            assert!(normalized.contains("authorization: bearer test-token"));
-            assert!(normalized.contains("x-himind-agent-id: agent-1"));
-            assert!(normalized.contains("content-type: application/json"));
+            let request = String::from_utf8_lossy(&request[..size]).to_string();
             stream
                 .write_all(
                     b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
                 )
                 .unwrap();
+            request
         });
 
         let options = crate::Options {
@@ -212,6 +206,11 @@ mod tests {
             last_error: String::new(),
         };
         deliver_projection(&client, &options, "agent-1", "test-token", &record).unwrap();
-        server.join().unwrap();
+        let request = server.join().unwrap();
+        let normalized = request.to_ascii_lowercase();
+        assert!(request.starts_with("POST /api/integrations/agent-core/v1/projections HTTP/1.1"));
+        assert!(normalized.contains("authorization: bearer test-token"));
+        assert!(normalized.contains("x-himind-agent-id: agent-1"));
+        assert!(normalized.contains("content-type: application/json"));
     }
 }

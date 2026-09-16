@@ -133,6 +133,7 @@ pub(crate) enum InvocationSource {
     DashboardWorker,
     Cli,
     Mcp,
+    Workflow,
 }
 
 /// The protocol/client that reached the Gateway is independent from the
@@ -167,6 +168,7 @@ impl InvocationSource {
             Self::DashboardWorker => "dashboard_worker",
             Self::Cli => "cli",
             Self::Mcp => "mcp",
+            Self::Workflow => "workflow",
         }
     }
 }
@@ -178,6 +180,7 @@ pub(crate) struct InvocationContext {
     pub principal: String,
     pub session_id_hash: String,
     pub request_id: String,
+    pub record_agent_core_run: bool,
 }
 
 impl InvocationContext {
@@ -188,6 +191,7 @@ impl InvocationContext {
             InvocationSource::DashboardWorker => InvocationTransport::Internal,
             InvocationSource::Cli => InvocationTransport::Cli,
             InvocationSource::Mcp => InvocationTransport::Stdio,
+            InvocationSource::Workflow => InvocationTransport::Internal,
         };
         Self::with_transport(source, transport, principal)
     }
@@ -203,7 +207,13 @@ impl InvocationContext {
             principal: principal.into(),
             session_id_hash: String::new(),
             request_id: next_request_id(),
+            record_agent_core_run: true,
         }
+    }
+
+    pub(crate) fn without_agent_core_run(mut self) -> Self {
+        self.record_agent_core_run = false;
+        self
     }
 
     pub(crate) fn dashboard_user(user_id: &str, session_id_hash: &str) -> Self {

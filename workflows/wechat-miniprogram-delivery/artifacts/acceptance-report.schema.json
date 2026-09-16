@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WeChat Mini Program Acceptance Report",
+  "type": "object",
+  "required": ["schema_version", "tester", "passed", "evidence_paths"],
+  "properties": {
+    "schema_version": { "const": "wechat_acceptance_report.v1" },
+    "tester": { "type": "string", "minLength": 1 },
+    "passed": { "type": "boolean" },
+    "evidence_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "notes": { "type": "string" }
+  }
+}

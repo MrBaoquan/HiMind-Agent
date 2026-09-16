@@ -3,9 +3,14 @@
   "title": "微信小程序开发闭环",
   "sections": [
     {
+      "id": "requirement",
+      "title": "需求与验收",
+      "artifacts": ["requirement-snapshot", "development-record"]
+    },
+    {
       "id": "application",
       "title": "应用与仓库",
-      "fields": ["app_id", "repository_ref", "branch", "environment", "commit_sha"]
+      "fields": ["app_id", "project_root", "repository_ref", "branch", "environment", "commit_sha"]
     },
     {
       "id": "verification",
@@ -13,15 +18,28 @@
       "artifacts": ["test-report", "preview"]
     },
     {
+      "id": "acceptance",
+      "title": "体验与验收",
+      "artifacts": ["experience-version", "acceptance-report"]
+    },
+    {
       "id": "release",
-      "title": "体验版与发布",
-      "artifacts": ["experience-version", "release-record"]
+      "title": "审核、发布与回滚",
+      "artifacts": ["release-record"]
     }
   ],
   "actions": [
+    "snapshot_requirements",
+    "inspect_project",
+    "prepare_dependencies",
+    "record_development",
+    "run_tests",
     "preview",
     "upload_experience",
+    "record_acceptance",
+    "approve",
     "prepare_review",
+    "submit_review",
     "record_release",
     "rollback"
   ]

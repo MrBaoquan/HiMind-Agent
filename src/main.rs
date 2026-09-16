@@ -45,6 +45,7 @@ use api::client::{is_task_canceled_error, TaskCancelGuard};
 use api::types::Task;
 use approval::manager::ApprovalManager;
 use approval::types::RequestType;
+use capability::service::CapabilityGateway;
 use remote::sync::execute_sync_exhibits;
 use scan::service::execute_scan;
 use store::outbox::{
@@ -151,7 +152,7 @@ fn main() {
             std::process::exit(1);
         }
     } else if let Some(arguments) = workflow_cli_arguments() {
-        if let Err(error) = run_workflow_cli(&arguments) {
+        if let Err(error) = run_workflow_cli(&options, &arguments) {
             eprintln!("workflow command failed: {error}");
             std::process::exit(1);
         }
@@ -305,7 +306,7 @@ fn workflow_cli_arguments() -> Option<Vec<String>> {
     Some(arguments[index + 1..].to_vec())
 }
 
-fn run_workflow_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments {
         [action, path] if action == "validate" => {
             let package = workflow::load_from_directory(PathBuf::from(path).as_path())?;
@@ -322,6 +323,104 @@ fn run_workflow_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     "ui": package.ui,
                 }))?
             );
+        }
+        [action, reference] if action == "doctor" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let package = workflow_package_from_reference(&store, reference)?;
+            let gateway = CapabilityGateway::new(
+                options.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    store::types::LocalWorkerStatus::default(),
+                )),
+            );
+            let report = workflow::preflight(
+                &package,
+                VERSION,
+                &gateway.list_capabilities(&capability::types::InvocationContext::new(
+                    capability::types::InvocationSource::Cli,
+                    "workflow-doctor",
+                ))?,
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.ready {
+                return Err("workflow preflight failed".into());
+            }
+        }
+        [action, reference] | [action, reference, _] if action == "run" => {
+            let store = workflow::WorkflowStore::open_default()?;
+            let package = workflow_package_from_reference(&store, reference)?;
+            let input = workflow_cli_input(arguments.get(2))?;
+            run_workflow_package(options, &package, input, "")?;
+        }
+        [action] if action == "runs" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let runs = ledger.list_runs(100)?;
+            println!("{}", serde_json::to_string_pretty(&runs)?);
+        }
+        [action, run_id] if action == "show" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let run = ledger
+                .get_run(run_id)?
+                .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+            let events = ledger.list_events(run_id)?;
+            let projections = ledger.projections_for_aggregate(run_id, 100)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "run": run,
+                    "events": events,
+                    "projections": projections,
+                }))?
+            );
+        }
+        [action, run_id, step_id] if action == "approve" || action == "reject" => {
+            let runner = workflow::WorkflowRunner::open_default()?;
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let run = ledger
+                .get_run(run_id)?
+                .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+            let run = if action == "approve" {
+                runner.approve_step(run, step_id)?
+            } else {
+                runner.reject_step(run, step_id)?
+            };
+            println!("{}", serde_json::to_string_pretty(&run)?);
+        }
+        [action, run_id] if action == "cancel" => {
+            let runner = workflow::WorkflowRunner::open_default()?;
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let run = ledger
+                .get_run(run_id)?
+                .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+            let run = runner.cancel(run, "workflow canceled by user")?;
+            println!("{}", serde_json::to_string_pretty(&run)?);
+        }
+        [action, run_id] | [action, run_id, _] if action == "resume" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let run = ledger
+                .get_run(run_id)?
+                .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+            let interaction = ledger
+                .get_interaction(&run.interaction_id)?
+                .ok_or("workflow run interaction is missing")?;
+            let package_reference = interaction
+                .business_context
+                .get("workflow")
+                .and_then(|workflow| workflow.get("id"))
+                .and_then(Value::as_str)
+                .ok_or("workflow run does not contain a package reference")?;
+            let input = if let Some(value) = arguments.get(2) {
+                workflow_cli_input(Some(value))?
+            } else {
+                interaction
+                    .business_context
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}))
+            };
+            let store = workflow::WorkflowStore::open_default()?;
+            let package = workflow_package_from_reference(&store, package_reference)?;
+            run_workflow_package(options, &package, input, run_id)?;
         }
         [action, path] if action == "install" => {
             let store = workflow::WorkflowStore::open_default()?;
@@ -369,12 +468,89 @@ fn run_workflow_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <validate <dir>|install <dir>|list|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <validate <dir>|doctor <dir|id>|install <dir>|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }
     }
     Ok(())
+}
+
+fn workflow_package_from_reference(
+    store: &workflow::WorkflowStore,
+    reference: &str,
+) -> Result<workflow::WorkflowPackage, Box<dyn Error>> {
+    let path = PathBuf::from(reference);
+    if path.join("workflow.json").is_file() {
+        return workflow::load_from_directory(&path);
+    }
+    store
+        .list()?
+        .into_iter()
+        .find(|item| item.package.id == reference && item.enabled)
+        .map(|item| item.package)
+        .ok_or_else(|| format!("workflow package not found or disabled: {reference}").into())
+}
+
+fn workflow_cli_input(value: Option<&String>) -> Result<Value, Box<dyn Error>> {
+    let Some(value) = value else {
+        return Ok(json!({}));
+    };
+    let path = value.strip_prefix('@').unwrap_or(value);
+    let raw = if std::path::Path::new(path).is_file() {
+        std::fs::read_to_string(path)?
+    } else {
+        value.clone()
+    };
+    let input: Value = serde_json::from_str(&raw)?;
+    if !input.is_object() {
+        return Err("workflow input must be a JSON object".into());
+    }
+    Ok(input)
+}
+
+fn run_workflow_package(
+    options: &Options,
+    package: &workflow::WorkflowPackage,
+    input: Value,
+    resume_run_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let gateway = CapabilityGateway::new(
+        options.clone(),
+        Arc::new(std::sync::Mutex::new(
+            store::types::LocalWorkerStatus::default(),
+        )),
+    );
+    let context = capability::types::InvocationContext::new(
+        capability::types::InvocationSource::Workflow,
+        "workflow-runner",
+    );
+    let report = workflow::preflight(package, VERSION, &gateway.list_capabilities(&context)?);
+    if !report.ready {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Err("workflow preflight failed".into());
+    }
+    let runner = workflow::WorkflowRunner::open_default()?;
+    let ledger = store::local_runs::LocalRunLedger::open_default()?;
+    let run = if resume_run_id.is_empty() {
+        runner.start("local-agent", package, &workflow_request_id(), &input)?
+    } else {
+        ledger
+            .get_run(resume_run_id)?
+            .ok_or_else(|| format!("workflow run not found: {resume_run_id}"))?
+    };
+    let executor = workflow::WorkflowGatewayExecutor::new(gateway, context);
+    let outcome = runner.run_ready(package, run, &input, &executor)?;
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
+    Ok(())
+}
+
+fn workflow_request_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    format!("{millis}_{}", std::process::id())
 }
 
 fn workflow_installation_json(item: &workflow::InstalledWorkflow) -> Value {

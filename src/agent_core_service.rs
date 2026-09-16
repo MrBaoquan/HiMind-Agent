@@ -28,7 +28,6 @@ impl AgentCoreRunRecorder {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn with_ledger(ledger: LocalRunLedger) -> Self {
         Self { ledger }
     }
@@ -186,6 +185,7 @@ impl AgentCoreRunRecorder {
             InvocationSource::DashboardWorker => InteractionSource::Dashboard,
             InvocationSource::Cli => InteractionSource::Cli,
             InvocationSource::Mcp => InteractionSource::Mcp,
+            InvocationSource::Workflow => InteractionSource::Workflow,
         };
         let transport = match context.transport {
             InvocationTransport::LocalHttp => InteractionTransport::Http,

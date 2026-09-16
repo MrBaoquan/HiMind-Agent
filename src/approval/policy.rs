@@ -80,6 +80,13 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
         // fixed Go test/build command. Keep that known capability at the
         // local R2 tier while unknown process vocabularies still fail closed.
         "R2"
+    } else if capability_id.starts_with("wechat.miniprogram.")
+        && declared.trim().eq_ignore_ascii_case("process")
+    {
+        // The WeChat plugin runs fixed package-manager scripts without a
+        // shell. Upload, release and platform actions remain network/system
+        // risks and require an explicit Workflow approval gate.
+        "R2"
     } else {
         match declared.trim().to_ascii_uppercase().as_str() {
             "READ_ONLY" => "R1",
@@ -192,6 +199,14 @@ mod tests {
         assert_eq!(
             effective_risk_level("extension.plugin.build", "process"),
             "R2"
+        );
+        assert_eq!(
+            effective_risk_level("wechat.miniprogram.test", "process"),
+            "R2"
+        );
+        assert_eq!(
+            effective_risk_level("wechat.miniprogram.preview", "network"),
+            "R3"
         );
         assert_eq!(effective_risk_level("third.party.process", "process"), "R3");
     }

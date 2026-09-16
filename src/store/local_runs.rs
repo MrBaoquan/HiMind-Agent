@@ -331,6 +331,22 @@ impl LocalRunLedger {
         Ok(true)
     }
 
+    pub(crate) fn list_events(&self, run_id: &str) -> Result<Vec<RuntimeEvent>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT payload_json
+             FROM runtime_events
+             WHERE run_id = ?1
+             ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(serde_json::from_str(&row?)?);
+        }
+        Ok(events)
+    }
+
     pub(crate) fn next_runtime_sequence(&self, run_id: &str) -> Result<u64, Box<dyn Error>> {
         let connection = self.connection()?;
         let next: i64 = connection.query_row(
@@ -440,6 +456,69 @@ impl LocalRunLedger {
                 row.get::<_, String>(8)?,
             ))
         })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                id,
+                projection_type,
+                aggregate_id,
+                dedupe_key,
+                payload,
+                status,
+                attempts,
+                next_attempt_at,
+                last_error,
+            ) = row?;
+            records.push(ProjectionOutboxRecord {
+                id,
+                projection_type,
+                aggregate_id,
+                dedupe_key,
+                payload: serde_json::from_str(&payload)?,
+                status,
+                attempts: attempts.max(0) as u32,
+                next_attempt_at,
+                last_error,
+            });
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn projections_for_aggregate(
+        &self,
+        aggregate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProjectionOutboxRecord>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id,
+                    projection_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    attempts,
+                    next_attempt_at,
+                    last_error
+             FROM projection_outbox
+             WHERE aggregate_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![aggregate_id, limit.clamp(1, 500) as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })?;
         let mut records = Vec::new();
         for row in rows {
             let (
