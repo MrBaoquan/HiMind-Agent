@@ -15,6 +15,7 @@ import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { ExtensionsPage } from './pages/ExtensionsPage';
 import { InboxPage } from './pages/InboxPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { TaskCenterPage } from './pages/TaskCenterPage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
 import { SchedulesPage } from './pages/SchedulesPage';
 import { agentApi, type AIServiceListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
@@ -43,7 +44,7 @@ function authorizationFailure(progress: DashboardAuthorizationProgress) {
 function initialPage(): PageKey {
   try {
     const saved = window.localStorage.getItem('himind.page');
-    const allowed: PageKey[] = ['dashboard', 'builtin-ai', 'ai', 'approvals', 'inbox', 'workflows', 'schedules', 'extensions', 'plugins', 'skills', 'development', 'settings', 'logs'];
+    const allowed: PageKey[] = ['dashboard', 'builtin-ai', 'ai', 'approvals', 'inbox', 'tasks', 'workflows', 'schedules', 'extensions', 'plugins', 'skills', 'development', 'settings', 'logs'];
     if (saved && allowed.includes(saved as PageKey)) return saved as PageKey;
   } catch {
     // Webview storage can be unavailable; fall back to the overview.
@@ -1243,6 +1244,7 @@ function App() {
       onOpenApprovalHistory={() => navigate('approvals')}
     />;
     if (page === 'approvals') return <ApprovalsPage independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} approvals={approvals} history={approvalHistory} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} onOpenSettings={() => { setSettingsSection('approval'); setPage('settings'); }} />;
+    if (page === 'tasks') return <TaskCenterPage dashboardEnabled={dashboardEnabled()} currentTask={status?.current_task || null} onLoadTaskHistory={agentApi.taskHistory} onOpenDashboard={() => run(agentApi.openDashboard)} />;
     if (page === 'extensions') return <ExtensionsPage
       loading={pluginsLoading || workflowLoading || extensionSourcesLoading}
       error={workflowError || skillError || extensionSourcesError}
@@ -1547,7 +1549,6 @@ function App() {
       updateBusy={updateBusy}
       currentTask={status?.current_task || null}
       quickPluginViews={quickPluginViews}
-      onLoadTaskHistory={agentApi.taskHistory}
       onNavigate={navigate}
       onOpenPluginView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')}
       onOpenDashboard={() => run(agentApi.openDashboard)}

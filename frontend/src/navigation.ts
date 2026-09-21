@@ -34,6 +34,7 @@ export const navigationSections: NavigationSection[] = [
     items: [
       { key: 'dashboard', icon: LayoutDashboard, label: '概览' },
       { key: 'inbox', icon: ListChecks, label: '待处理', badgeKey: 'inbox' },
+      { key: 'tasks', icon: ListChecks, label: '任务中心' },
       { key: 'workflows', icon: Workflow, label: '工作流' },
       { key: 'schedules', icon: CalendarClock, label: '定时任务' },
     ],
