@@ -1,0 +1,19 @@
+{
+  "schema_version": "workflow_package.v1",
+  "id": "com.himind.workflow.legacy-fixture",
+  "version": "1.0.0",
+  "name": "Legacy Workflow Fixture",
+  "min_agent_version": "0.3.0",
+  "steps": [
+    {
+      "id": "LEGACY-STEP",
+      "title": "Legacy provider-defined step",
+      "kind": "provider_defined",
+      "execution_mode": "provider_defined"
+    }
+  ],
+  "artifacts": [],
+  "ui": {
+    "mode": "standard"
+  }
+}

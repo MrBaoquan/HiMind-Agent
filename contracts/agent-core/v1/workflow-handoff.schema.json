@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/workflow-handoff.schema.json",
+  "title": "HiMind Workflow Handoff v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "handoff_id",
+    "project_id",
+    "workflow_id",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "workflow_handoff.v1" },
+    "handoff_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "target_id": { "type": "string" },
+    "environment": { "type": "string" },
+    "workspace_root": { "type": "string" },
+    "from_run_id": { "type": "string" },
+    "from_checkpoint_id": { "type": "string" },
+    "workflow_id": { "type": "string", "minLength": 1 },
+    "entrypoint": { "type": "string" },
+    "exitpoint": { "type": "string" },
+    "development_checkpoint": { "type": ["object", "null"] },
+    "candidate": { "type": ["object", "null"] },
+    "seed_artifacts": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "notes": { "type": "string" },
+    "created_at": { "type": "string", "minLength": 1 }
+  }
+}

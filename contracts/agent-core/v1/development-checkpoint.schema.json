@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/development-checkpoint.schema.json",
+  "title": "HiMind Development Checkpoint v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "checkpoint_id",
+    "project_id",
+    "workspace_root",
+    "repository_root",
+    "commit_sha",
+    "tree_digest",
+    "dirty",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "development_checkpoint.v1" },
+    "checkpoint_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "target_id": { "type": "string" },
+    "environment": { "type": "string" },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "repository_root": { "type": "string", "minLength": 1 },
+    "branch": { "type": "string" },
+    "commit_sha": { "type": "string", "minLength": 1 },
+    "tree_digest": { "type": "string", "minLength": 1 },
+    "dirty": { "type": "boolean" },
+    "status_digest": { "type": "string" },
+    "tests": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "created_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "client": { "type": "string" },
+        "session_id": { "type": "string" },
+        "lease_id": { "type": "string" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "created_at": { "type": "string", "minLength": 1 }
+  }
+}

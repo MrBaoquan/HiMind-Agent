@@ -25,7 +25,7 @@ HiMind Agent 是可独立安装和运行的 Windows 客户端，提供本机 AI�
 
 业务协议说明见 [业务对接协议](docs/business-integration-protocol.md)，仓库与分发边界见 [仓库边界](docs/repository-boundaries.md)。
 
-Independent GitHub 安装、自更新和扩展源配置见 [GitHub 独立发布](docs/github-release.md)。正式发布使用本地 `scripts/publish-github-release.ps1`，不依赖 GitHub Actions。
+Independent GitHub 安装、Agent/Runtime 独立 Release、自更新和扩展源配置见 [GitHub 独立发布](docs/github-release.md)。Agent 正式发布使用本地 `scripts/publish-github-release.ps1`，首方 Runtime 使用主仓库 `scripts/runtime/publish-github-runtime-release.ps1`，两者都不依赖 GitHub Actions。
 
 ## 安装与本地应用服务
 

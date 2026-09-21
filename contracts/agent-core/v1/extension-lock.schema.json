@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.dev/contracts/agent-core/v1/extension-lock.schema.json",
+  "title": "HiMind Extension Lock v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "root",
+    "dependencies",
+    "generated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "extension_lock.v1" },
+    "root": { "$ref": "#/$defs/asset" },
+    "dependencies": {
+      "type": "array",
+      "maxItems": 512,
+      "items": { "$ref": "#/$defs/dependency" }
+    },
+    "environment": { "$ref": "#/$defs/environment" },
+    "generated_at": { "type": "string", "minLength": 1 }
+  },
+  "$defs": {
+    "kind": {
+      "enum": ["plugin", "skill", "workflow"]
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "version", "sha256"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/kind" },
+        "id": { "$ref": "#/$defs/id" },
+        "version": { "$ref": "#/$defs/version" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "version", "sha256", "required"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/kind" },
+        "id": { "$ref": "#/$defs/id" },
+        "version": { "$ref": "#/$defs/version" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "source_id": { "type": "string", "maxLength": 300 },
+        "required": { "type": "boolean" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/environmentCapability" }
+        },
+        "connectors": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/environmentConnector" }
+        },
+        "runtimes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/environmentRuntime" }
+        }
+      }
+    },
+    "environmentCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "required"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "provider": { "type": "string", "maxLength": 500 },
+        "availability": { "type": "string", "maxLength": 50 },
+        "required": { "type": "boolean" }
+      }
+    },
+    "environmentConnector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "required"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "availability": { "type": "string", "maxLength": 50 },
+        "credential_ownership": { "type": "string", "maxLength": 50 },
+        "policy_revision": { "type": "integer", "minimum": 0 },
+        "credentials": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/environmentConnectorCredential" }
+        },
+        "required": { "type": "boolean" }
+      }
+    },
+    "environmentConnectorCredential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["handle", "target", "required"],
+      "properties": {
+        "handle": { "$ref": "#/$defs/id" },
+        "target": { "type": "string", "maxLength": 200 },
+        "kind": { "type": "string", "maxLength": 50 },
+        "required": { "type": "boolean" }
+      }
+    },
+    "environmentRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "required"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "status": { "type": "string", "maxLength": 50 },
+        "version": { "type": "string", "maxLength": 100 },
+        "required": { "type": "boolean" }
+      }
+    }
+  }
+}

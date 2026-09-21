@@ -1,0 +1,45 @@
+{
+  "schema_version": "engineering_project.v1",
+  "project_id": "kerun-user",
+  "name": "可润微信小程序",
+  "aliases": ["随州小程序", "科技馆小程序"],
+  "source_root": ".",
+  "targets": [
+    {
+      "id": "szkjg",
+      "name": "随州科技馆",
+      "aliases": ["随州馆"],
+      "app_id": "wxe160ef55f03dd853",
+      "source_root": ".",
+      "build_root": "dist/wx",
+      "environments": {
+        "development": {
+          "name": "开发环境",
+          "build_script": "build",
+          "package_manager": "npm"
+        },
+        "production": {
+          "name": "生产环境",
+          "build_script": "build:prod",
+          "package_manager": "npm"
+        }
+      },
+      "delivery": {
+        "workflow_id": "com.himind.workflow.wechat-miniprogram-experience-upload",
+        "upload_channel": "wechatide",
+        "client": "Copilot",
+        "default_environment": "development"
+      }
+    }
+  ],
+  "workflows": {
+    "develop": "com.himind.workflow.wechat-miniprogram-development",
+    "deliver": "com.himind.workflow.wechat-miniprogram-experience-upload"
+  },
+  "dependencies": {
+    "skills": ["wechatide-skill"],
+    "plugins": ["com.himind.wechat-miniprogram-tools"],
+    "connectors": ["wechat-miniprogram"],
+    "runtimes": ["himind.builtin"]
+  }
+}

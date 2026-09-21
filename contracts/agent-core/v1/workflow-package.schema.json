@@ -38,6 +38,19 @@
     },
     "dependencies": { "type": "object" },
     "candidate": { "$ref": "#/$defs/candidate" },
+    "execution_policy": {
+      "enum": ["strict", "segmented", "flexible"]
+    },
+    "entrypoints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/endpoint" }
+    },
+    "default_entrypoint": { "type": "string" },
+    "exits": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/endpoint" }
+    },
+    "default_exitpoint": { "type": "string" },
     "steps": {
       "type": "array",
       "minItems": 1,
@@ -105,7 +118,18 @@
         "prompt": { "type": "string", "minLength": 1 },
         "workspace_path": { "type": "string" },
         "result_schema": { "type": "string" },
-        "allow_network": { "type": "boolean" }
+        "allow_network": { "type": "boolean" },
+        "input_artifacts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "tool_policy": { "enum": ["", "default", "none"] },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400
+        }
       }
     },
     "loop": {
@@ -138,10 +162,14 @@
         "runtime": { "$ref": "#/$defs/runtime_step" },
         "loop": { "$ref": "#/$defs/loop" },
         "when": { "$ref": "#/$defs/condition" },
+        "fail_when": { "$ref": "#/$defs/condition" },
         "candidate_action": { "enum": ["", "freeze", "require"] },
         "input": { "type": "object" },
         "execution_mode": {
           "enum": ["sync", "long_running", "provider_defined"]
+        },
+        "on_failure": {
+          "enum": ["", "fail", "continue"]
         },
         "risk_level": { "type": "string" },
         "approval_required": { "type": "boolean" },
@@ -161,6 +189,26 @@
         "artifact_id": { "type": "string", "minLength": 1 },
         "source": { "const": "git" },
         "allow_dirty": { "type": "boolean" }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "at_step"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "at_step": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "requires": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "produces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
       }
     },
     "artifact": {

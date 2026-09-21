@@ -28,6 +28,18 @@ must explicitly pass `-DefaultMode connected`. Independent GitHub releases use
 `./scripts/publish-github-release.ps1`, which always produces an `independent`
 installer and does not depend on GitHub Actions.
 
+The GitHub repository may contain two independent release families:
+
+- Agent releases use `v<agent-version>` and `himind-agent-update.json`.
+- Runtime releases use `runtime-v<runtime-version>` and
+  `himind-runtime-release.json`.
+
+Runtime releases are GitHub prereleases so older Agent clients that still use
+`/releases/latest` cannot mistake them for Agent updates. Current Agent versions
+discover both products by scanning release assets and matching the product
+manifest. The first Independent Agent install therefore remains useful after a
+Runtime-only release is published.
+
 The local publisher requires the update signing private key, public key and key
 ID by default. The public key is embedded in the Agent and installed into the
 trusted key directory; the private key is used only by the local signing step.

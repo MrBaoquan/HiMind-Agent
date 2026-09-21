@@ -42,12 +42,12 @@
       "required": ["local_principal_id"],
       "properties": {
         "local_principal_id": { "type": "string", "minLength": 1 },
-        "delegated_user_id": { "type": "string" },
-        "ai_client_id": { "type": "string" }
+        "delegated_user_id": { "type": "string", "maxLength": 240 },
+        "ai_client_id": { "type": "string", "maxLength": 160 }
       }
     },
     "agent_id": { "type": "string", "minLength": 1 },
-    "device_id": { "type": "string" },
+    "device_id": { "type": "string", "maxLength": 240 },
     "workspace_ref": { "type": "string" },
     "business_context": { "type": "object" },
     "reply_target": { "type": "object" },
