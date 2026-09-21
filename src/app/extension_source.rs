@@ -101,6 +101,24 @@ pub(crate) struct ExtensionDistributionUnit {
     /// 取用侧目录当前提供的制品版本，用于与 `installed` 对比得出可更新项。
     #[serde(default)]
     pub assets: Vec<ExtensionUnitAsset>,
+    /// 非取用侧的情况。取用侧是本地时这里描述 GitHub 发布，反之描述本地源码；
+    /// 单元只有一侧来源时为 `None`。
+    #[serde(default)]
+    pub other_side: Option<ExtensionUnitOtherSide>,
+}
+
+/// 单元里「另一侧」的可用性与版本落差。
+///
+/// 取用侧决定市场和安装看到的内容，另一侧的更高版本不会自动顶上来。UI 用这里的
+/// 计数提示开发者「远端已经有更新，可以切换取用侧」，避免本地预览掩盖线上版本。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExtensionUnitOtherSide {
+    /// `local` 或 `remote`。
+    pub side: String,
+    /// 该侧目录是否已加载。来源停用或读取失败时为 false。
+    pub available: bool,
+    /// 该侧存在更高版本的制品数量。
+    pub newer_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +127,21 @@ pub(crate) struct ExtensionUnitAsset {
     pub asset_id: String,
     pub name: String,
     pub version: String,
+    /// 来源绑定字段。安装请求必须使用同一来源和版本，不能仅按 ID 反查。
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub artifact_url: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub signature_key_id: String,
+    #[serde(default)]
+    pub signature_algorithm: String,
+    #[serde(default)]
+    pub channel: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +150,8 @@ pub(crate) struct ExtensionUnitInstallation {
     pub asset_id: String,
     pub version: String,
     pub source_id: String,
+    #[serde(default)]
+    pub sha256: String,
     /// `local` / `remote` 表示该安装来自本单元取用侧，`foreign` 表示来自
     /// 其它来源（含免安装的开发挂载与本地文件安装）。
     pub side: String,
@@ -654,6 +689,25 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                     item.name.clone(),
                     item.version.clone(),
                 ));
+                assets.asset_details.insert(
+                    format!("plugin:{}", item.plugin_id),
+                    ExtensionUnitAsset {
+                        asset_kind: "plugin".to_string(),
+                        asset_id: item.plugin_id.clone(),
+                        name: item.name.clone(),
+                        version: item.version.clone(),
+                        source_id: source.id.clone(),
+                        source_kind: match source.kind {
+                            ExtensionSourceKind::Local => "local".to_string(),
+                            ExtensionSourceKind::Github => "github".to_string(),
+                        },
+                        artifact_url: item.download_url.clone(),
+                        sha256: item.sha256.clone(),
+                        signature_key_id: item.signature_key_id.clone(),
+                        signature_algorithm: item.signature_algorithm.clone(),
+                        channel: item.channel.clone(),
+                    },
+                );
                 result.plugin_versions.push(item.clone());
                 let existing = plugins
                     .get(&item.plugin_id)
@@ -700,6 +754,25 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                     item.name.clone(),
                     item.version.clone(),
                 ));
+                assets.asset_details.insert(
+                    format!("skill:{}", item.skill_id),
+                    ExtensionUnitAsset {
+                        asset_kind: "skill".to_string(),
+                        asset_id: item.skill_id.clone(),
+                        name: item.name.clone(),
+                        version: item.version.clone(),
+                        source_id: source.id.clone(),
+                        source_kind: match source.kind {
+                            ExtensionSourceKind::Local => "local".to_string(),
+                            ExtensionSourceKind::Github => "github".to_string(),
+                        },
+                        artifact_url: item.download_url.clone(),
+                        sha256: item.sha256.clone(),
+                        signature_key_id: item.signature_key_id.clone(),
+                        signature_algorithm: item.signature_algorithm.clone(),
+                        channel: item.channel.clone(),
+                    },
+                );
                 result.skill_versions.push(item.clone());
                 let existing = skills
                     .get(&item.skill_id)
@@ -746,6 +819,25 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                     item.name.clone(),
                     item.version.clone(),
                 ));
+                assets.asset_details.insert(
+                    format!("workflow:{}", item.workflow_id),
+                    ExtensionUnitAsset {
+                        asset_kind: "workflow".to_string(),
+                        asset_id: item.workflow_id.clone(),
+                        name: item.name.clone(),
+                        version: item.version.clone(),
+                        source_id: source.id.clone(),
+                        source_kind: match source.kind {
+                            ExtensionSourceKind::Local => "local".to_string(),
+                            ExtensionSourceKind::Github => "github".to_string(),
+                        },
+                        artifact_url: item.download_url.clone(),
+                        sha256: item.sha256.clone(),
+                        signature_key_id: item.signature_key_id.clone(),
+                        signature_algorithm: item.signature_algorithm.clone(),
+                        channel: item.channel.clone(),
+                    },
+                );
                 result.workflow_versions.push(item.clone());
                 let existing = workflows
                     .get(&item.workflow_id)
@@ -937,6 +1029,7 @@ fn attach_unit_installations(units: &mut [ExtensionDistributionUnit]) {
                 asset_id: entry.asset_id.clone(),
                 version: entry.version.clone(),
                 source_id: entry.source_id.clone(),
+                sha256: entry.sha256.clone(),
                 side: side.to_string(),
             });
         }
@@ -949,6 +1042,7 @@ fn attach_unit_installations(units: &mut [ExtensionDistributionUnit]) {
                 asset_id: plugin_id.clone(),
                 version: plugin_manifest_version(path).unwrap_or_default(),
                 source_id: "development".to_string(),
+                sha256: String::new(),
                 side: "development".to_string(),
             });
         }
@@ -961,6 +1055,7 @@ fn attach_unit_installations(units: &mut [ExtensionDistributionUnit]) {
                 asset_id: skill_id.clone(),
                 version: skill_manifest_version(path).unwrap_or_default(),
                 source_id: "development".to_string(),
+                sha256: String::new(),
                 side: "development".to_string(),
             });
         }
@@ -1122,16 +1217,50 @@ pub(crate) fn install_plugin(
     plugin_id: &str,
     version: Option<&str>,
 ) -> Result<PluginCatalogItem, Box<dyn Error>> {
+    install_plugin_bound(plugin_id, version, None, None)
+}
+
+pub(crate) fn install_plugin_bound(
+    plugin_id: &str,
+    version: Option<&str>,
+    expected_source_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<PluginCatalogItem, Box<dyn Error>> {
     let snapshot = snapshot()?;
+    let plugin_versions = snapshot.plugin_versions.clone();
+    let selected_source = plugin_versions
+        .iter()
+        .find(|item| {
+            item.plugin_id == plugin_id
+                && version.map(|value| value == item.version).unwrap_or(true)
+                && expected_source_id
+                    .map(|source_id| item.source.ends_with(&format!(":{source_id}")))
+                    .unwrap_or(true)
+        })
+        .map(|item| item.source.clone())
+        .ok_or_else(|| format!("扩展源中未找到插件: {plugin_id}"))?;
     let mut order = Vec::new();
     let mut visiting = HashSet::new();
     resolve_plugin_order(
-        &snapshot.plugin_versions,
+        &plugin_versions,
         plugin_id,
         version,
+        &selected_source,
         &mut visiting,
         &mut order,
     )?;
+    if let Some(root) = order.iter().find(|item| item.plugin_id == plugin_id) {
+        if let Some(source_id) = expected_source_id {
+            if !root.source.ends_with(&format!(":{source_id}")) {
+                return Err(format!("插件 {} 未匹配请求来源 {}", plugin_id, source_id).into());
+            }
+        }
+        if let Some(sha256) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+            if !root.sha256.eq_ignore_ascii_case(sha256) {
+                return Err(format!("插件 {} 制品摘要与请求不一致", plugin_id).into());
+            }
+        }
+    }
     let mut changes = Vec::new();
     let mut reference_changes = Vec::new();
     let mut provenance_changes = Vec::new();
@@ -1283,12 +1412,34 @@ pub(crate) fn plan_plugin(
     plugin_id: &str,
     version: Option<&str>,
 ) -> Result<crate::app::plugin_manager::PluginInstallPlan, Box<dyn Error>> {
+    plan_plugin_bound(plugin_id, version, None, None)
+}
+
+pub(crate) fn plan_plugin_bound(
+    plugin_id: &str,
+    version: Option<&str>,
+    expected_source_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<crate::app::plugin_manager::PluginInstallPlan, Box<dyn Error>> {
     let snapshot = snapshot()?;
+    let plugin_versions = snapshot.plugin_versions.clone();
+    let selected_source = plugin_versions
+        .iter()
+        .find(|item| {
+            item.plugin_id == plugin_id
+                && version.map(|value| value == item.version).unwrap_or(true)
+                && expected_source_id
+                    .map(|source_id| item.source.ends_with(&format!(":{source_id}")))
+                    .unwrap_or(true)
+        })
+        .map(|item| item.source.clone())
+        .ok_or_else(|| format!("扩展源中未找到插件: {plugin_id}"))?;
     let mut order = Vec::new();
     resolve_plugin_order(
-        &snapshot.plugin_versions,
+        &plugin_versions,
         plugin_id,
         version,
+        &selected_source,
         &mut HashSet::new(),
         &mut order,
     )?;
@@ -1297,6 +1448,16 @@ pub(crate) fn plan_plugin(
         .find(|item| item.plugin_id == plugin_id)
         .cloned()
         .ok_or("扩展源中未找到插件")?;
+    if let Some(source_id) = expected_source_id {
+        if !plugin.source.ends_with(&format!(":{source_id}")) {
+            return Err(format!("插件 {} 未匹配请求来源 {}", plugin_id, source_id).into());
+        }
+    }
+    if let Some(sha256) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+        if !plugin.sha256.eq_ignore_ascii_case(sha256) {
+            return Err(format!("插件 {} 制品摘要与请求不一致", plugin_id).into());
+        }
+    }
     let dependency_actions = order
         .into_iter()
         .filter(|item| item.plugin_id != plugin_id)
@@ -1338,6 +1499,15 @@ pub(crate) fn install_skill(
     skill_id: &str,
     version: Option<&str>,
 ) -> Result<(SkillCatalogItem, crate::skill::types::SkillRecord), Box<dyn Error>> {
+    install_skill_bound(skill_id, version, None, None)
+}
+
+pub(crate) fn install_skill_bound(
+    skill_id: &str,
+    version: Option<&str>,
+    expected_source_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<(SkillCatalogItem, crate::skill::types::SkillRecord), Box<dyn Error>> {
     let snapshot = snapshot()?;
     let item = snapshot
         .skill_versions
@@ -1347,9 +1517,17 @@ pub(crate) fn install_skill(
                 && version
                     .map(|requested| requested == item.version)
                     .unwrap_or(true)
+                && expected_source_id
+                    .map(|source_id| item.source.ends_with(&format!(":{source_id}")))
+                    .unwrap_or(true)
         })
         .cloned()
         .ok_or_else(|| format!("扩展源中未找到 Skill: {skill_id}"))?;
+    if let Some(sha256) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+        if !item.sha256.eq_ignore_ascii_case(sha256) {
+            return Err(format!("Skill {} 制品摘要与请求不一致", skill_id).into());
+        }
+    }
     // Resolve the source before mutating any local dependency state so a
     // malformed catalog cannot leave a partially installed dependency set.
     let source = source_for_catalog_item(&snapshot, &item.source)?;
@@ -1384,7 +1562,9 @@ pub(crate) fn install_skill(
         if satisfied {
             continue;
         }
-        if let Err(error) = install_plugin(&dependency.plugin_id, None) {
+        if let Err(error) =
+            install_plugin_bound(&dependency.plugin_id, None, Some(&source.id), None)
+        {
             restore_provenance_changes(&plugin_provenance_changes);
             restore_lock_changes(&lock_changes);
             compensate_plugin_changes(&plugin_changes);
@@ -1465,6 +1645,15 @@ pub(crate) fn install_workflow(
     workflow_id: &str,
     version: Option<&str>,
 ) -> Result<(WorkflowCatalogItem, crate::workflow::InstalledWorkflow), Box<dyn Error>> {
+    install_workflow_bound(workflow_id, version, None, None)
+}
+
+pub(crate) fn install_workflow_bound(
+    workflow_id: &str,
+    version: Option<&str>,
+    expected_source_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<(WorkflowCatalogItem, crate::workflow::InstalledWorkflow), Box<dyn Error>> {
     let snapshot = snapshot()?;
     let item = snapshot
         .workflow_versions
@@ -1474,9 +1663,17 @@ pub(crate) fn install_workflow(
                 && version
                     .map(|requested| requested == item.version)
                     .unwrap_or(true)
+                && expected_source_id
+                    .map(|source_id| item.source.ends_with(&format!(":{source_id}")))
+                    .unwrap_or(true)
         })
         .cloned()
         .ok_or_else(|| format!("扩展源中未找到 Workflow: {workflow_id}"))?;
+    if let Some(sha256) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+        if !item.sha256.eq_ignore_ascii_case(sha256) {
+            return Err(format!("Workflow {} 制品摘要与请求不一致", workflow_id).into());
+        }
+    }
     let source = source_for_catalog_item(&snapshot, &item.source)?;
     let store = crate::workflow::WorkflowStore::open_default()?;
     let previous_installation = store
@@ -1535,6 +1732,23 @@ fn compensate_workflow_installation(
     }
 }
 
+/// 只切换某个来源的启用状态，保留它已有的自动更新与校验策略。
+///
+/// CLI 与 UI 共用同一条更新路径，避免脚本化验收时出现“命令行改了配置但没落盘”
+/// 这类分叉。
+pub(crate) fn set_source_enabled(
+    source_id: &str,
+    enabled: bool,
+) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
+    let auto_update = settings()?
+        .sources
+        .iter()
+        .find(|item| item.id == source_id)
+        .map(|item| item.auto_update)
+        .ok_or("扩展源不存在")?;
+    update_source(source_id, enabled, auto_update, None)
+}
+
 /// 切换某个分发单元的取用侧。`Local` 是默认值，显式选回本地时不落盘。
 pub(crate) fn set_unit_acquisition(
     unit_key: &str,
@@ -1589,6 +1803,15 @@ pub(crate) struct ExtensionUnitInstallReport {
 
 /// 按取用侧把整个分发单元安装/更新到本机。逐个制品执行，单个失败不影响其余。
 pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport, Box<dyn Error>> {
+    install_unit_bound(unit_key, None)
+}
+
+/// 安装分发单元的来源锁定入口。UI 会传入当前快照里的 source_id；旧的
+/// CLI 调用可以省略该字段，但仍会拒绝不可用首选来源和混合来源制品。
+pub(crate) fn install_unit_bound(
+    unit_key: &str,
+    expected_source_id: Option<&str>,
+) -> Result<ExtensionUnitInstallReport, Box<dyn Error>> {
     // 本地取用侧每次都从磁盘重读，无需网络刷新；远端取用侧需要最新的发布目录。
     let snapshot = if acquisition_for(&settings()?.acquisitions, unit_key)
         == ExtensionSourceAcquisition::Local
@@ -1603,6 +1826,25 @@ pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport,
         .find(|unit| unit.unit_key == unit_key)
         .cloned()
         .ok_or_else(|| format!("扩展分发单元不存在: {unit_key}"))?;
+    if unit.state != "ready" {
+        return Err(format!("扩展分发单元当前不可安装: {}", unit.state).into());
+    }
+    let source_id = match unit.acquisition {
+        ExtensionSourceAcquisition::Local => unit.local_source_id.clone(),
+        ExtensionSourceAcquisition::Remote => unit.remote_source_id.clone(),
+    }
+    .ok_or_else(|| "当前取用模式没有可用来源".to_string())?;
+    if let Some(expected) = expected_source_id.filter(|value| !value.trim().is_empty()) {
+        if expected != source_id {
+            return Err(format!(
+                "扩展来源已变化，请刷新后重试（请求 {expected}，当前 {source_id}）"
+            )
+            .into());
+        }
+    }
+    if unit.assets.iter().any(|asset| asset.source_id != source_id) {
+        return Err("扩展单元包含未绑定当前来源的制品，已阻止安装".into());
+    }
     let mut report = ExtensionUnitInstallReport {
         unit_key: unit.unit_key.clone(),
         acquisition: unit.acquisition.clone(),
@@ -1613,34 +1855,70 @@ pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport,
     };
     for asset in &unit.assets {
         match asset.asset_kind.as_str() {
-            "plugin" => match install_plugin(&asset.asset_id, Some(&asset.version)) {
+            "plugin" => match install_plugin_bound(
+                &asset.asset_id,
+                Some(&asset.version),
+                Some(&asset.source_id),
+                Some(&asset.sha256),
+            ) {
                 Ok(item) => report.plugins.push(ExtensionUnitAsset {
                     asset_kind: "plugin".to_string(),
                     asset_id: item.plugin_id,
                     name: item.name,
                     version: item.version,
+                    source_id: asset.source_id.clone(),
+                    source_kind: asset.source_kind.clone(),
+                    artifact_url: asset.artifact_url.clone(),
+                    sha256: asset.sha256.clone(),
+                    signature_key_id: asset.signature_key_id.clone(),
+                    signature_algorithm: asset.signature_algorithm.clone(),
+                    channel: asset.channel.clone(),
                 }),
                 Err(error) => report
                     .errors
                     .push(format!("插件 {} 安装失败: {error}", asset.asset_id)),
             },
-            "skill" => match install_skill(&asset.asset_id, Some(&asset.version)) {
+            "skill" => match install_skill_bound(
+                &asset.asset_id,
+                Some(&asset.version),
+                Some(&asset.source_id),
+                Some(&asset.sha256),
+            ) {
                 Ok((item, _)) => report.skills.push(ExtensionUnitAsset {
                     asset_kind: "skill".to_string(),
                     asset_id: item.skill_id,
                     name: item.name,
                     version: item.version,
+                    source_id: asset.source_id.clone(),
+                    source_kind: asset.source_kind.clone(),
+                    artifact_url: asset.artifact_url.clone(),
+                    sha256: asset.sha256.clone(),
+                    signature_key_id: asset.signature_key_id.clone(),
+                    signature_algorithm: asset.signature_algorithm.clone(),
+                    channel: asset.channel.clone(),
                 }),
                 Err(error) => report
                     .errors
                     .push(format!("Skill {} 安装失败: {error}", asset.asset_id)),
             },
-            "workflow" => match install_workflow(&asset.asset_id, Some(&asset.version)) {
+            "workflow" => match install_workflow_bound(
+                &asset.asset_id,
+                Some(&asset.version),
+                Some(&asset.source_id),
+                Some(&asset.sha256),
+            ) {
                 Ok((item, _)) => report.workflows.push(ExtensionUnitAsset {
                     asset_kind: "workflow".to_string(),
                     asset_id: item.workflow_id,
                     name: item.name,
                     version: item.version,
+                    source_id: asset.source_id.clone(),
+                    source_kind: asset.source_kind.clone(),
+                    artifact_url: asset.artifact_url.clone(),
+                    sha256: asset.sha256.clone(),
+                    signature_key_id: asset.signature_key_id.clone(),
+                    signature_algorithm: asset.signature_algorithm.clone(),
+                    channel: asset.channel.clone(),
                 }),
                 Err(error) => report
                     .errors
@@ -1659,6 +1937,15 @@ pub(crate) fn plan_skill(
     skill_id: &str,
     version: Option<&str>,
 ) -> Result<crate::app::skill_manager::SkillInstallPlan, Box<dyn Error>> {
+    plan_skill_bound(skill_id, version, None, None)
+}
+
+pub(crate) fn plan_skill_bound(
+    skill_id: &str,
+    version: Option<&str>,
+    expected_source_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<crate::app::skill_manager::SkillInstallPlan, Box<dyn Error>> {
     let snapshot = snapshot()?;
     let skill = snapshot
         .skill_versions
@@ -1668,17 +1955,25 @@ pub(crate) fn plan_skill(
                 && version
                     .map(|requested| requested == item.version)
                     .unwrap_or(true)
+                && expected_source_id
+                    .map(|source_id| item.source.ends_with(&format!(":{source_id}")))
+                    .unwrap_or(true)
         })
         .cloned()
         .ok_or_else(|| format!("扩展源中未找到 Skill: {skill_id}"))?;
+    if let Some(sha256) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+        if !skill.sha256.eq_ignore_ascii_case(sha256) {
+            return Err(format!("Skill {} 制品摘要与请求不一致", skill_id).into());
+        }
+    }
     let mut actions = Vec::new();
     let mut blocked_reasons = Vec::new();
     for dependency in &skill.plugin_dependencies {
         let local = crate::app::plugin_manager::local_status(&dependency.plugin_id);
         let source_item = snapshot
-            .plugins
+            .plugin_versions
             .iter()
-            .find(|item| item.plugin_id == dependency.plugin_id);
+            .find(|item| item.plugin_id == dependency.plugin_id && item.source == skill.source);
         let satisfied = !local.current_version.is_empty()
             && (dependency.min_version.is_empty()
                 || crate::skill::resolver::compare_versions(
@@ -1791,7 +2086,13 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
     let auto_sources = snapshot
         .sources
         .iter()
-        .filter(|status| status.source.enabled && status.source.auto_update)
+        // 自动更新只消费远端 Release；本地工作区即使被标记为可用，也
+        // 不能在后台覆盖开发者的 local_preview。
+        .filter(|status| {
+            status.source.enabled
+                && status.source.auto_update
+                && status.source.kind == ExtensionSourceKind::Github
+        })
         .map(|status| status.source.id.as_str())
         .collect::<HashSet<_>>();
     if auto_sources.is_empty() {
@@ -1833,6 +2134,26 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
                 let (_, record) = install_skill(&provenance.asset_key, Some(&item.version))?;
                 crate::skill::sync_record_to_supported_clients(&record, crate::VERSION, &[])?;
                 updated.push(format!("skill:{}@{}", item.skill_id, item.version));
+            }
+        } else if provenance.asset_kind == "workflow" {
+            let Some(item) = snapshot.workflow_versions.iter().find(|item| {
+                item.workflow_id == provenance.asset_key
+                    && item.source.ends_with(&format!(":{}", provenance.source_id))
+            }) else {
+                continue;
+            };
+            let store = crate::workflow::WorkflowStore::open_default()?;
+            let current = store
+                .list()?
+                .into_iter()
+                .find(|workflow| workflow.package.id == provenance.asset_key)
+                .map(|workflow| workflow.package.version)
+                .unwrap_or_default();
+            if crate::skill::resolver::compare_versions(&item.version, &current)
+                == std::cmp::Ordering::Greater
+            {
+                install_workflow(&provenance.asset_key, Some(&item.version))?;
+                updated.push(format!("workflow:{}@{}", item.workflow_id, item.version));
             }
         }
     }
@@ -2027,6 +2348,7 @@ fn resolve_plugin_order(
     catalog: &[PluginCatalogItem],
     plugin_id: &str,
     version: Option<&str>,
+    source: &str,
     visiting: &mut HashSet<String>,
     order: &mut Vec<PluginCatalogItem>,
 ) -> Result<(), Box<dyn Error>> {
@@ -2040,12 +2362,13 @@ fn resolve_plugin_order(
         .iter()
         .find(|item| {
             item.plugin_id == plugin_id
+                && item.source == source
                 && version
                     .map(|requested| requested == item.version)
                     .unwrap_or(true)
         })
         .cloned()
-        .ok_or_else(|| format!("扩展源中未找到插件: {plugin_id}"))?;
+        .ok_or_else(|| format!("来源 {source} 中未找到插件: {plugin_id}"))?;
     for dependency in item
         .plugin_dependencies
         .iter()
@@ -2059,7 +2382,14 @@ fn resolve_plugin_order(
                     &dependency.min_version,
                 ) != std::cmp::Ordering::Less);
         if !satisfied {
-            resolve_plugin_order(catalog, &dependency.plugin_id, None, visiting, order)?;
+            resolve_plugin_order(
+                catalog,
+                &dependency.plugin_id,
+                None,
+                source,
+                visiting,
+                order,
+            )?;
             let resolved = order
                 .iter()
                 .find(|candidate| candidate.plugin_id == dependency.plugin_id)
@@ -2408,6 +2738,10 @@ struct SourceCatalogAssets {
     plugins: Vec<(String, String, String)>,
     skills: Vec<(String, String, String)>,
     workflows: Vec<(String, String, String)>,
+    /// 完整制品元数据，键为 `kind:id`。旧的测试 fixture 只提供前三个
+    /// 三元组时，build_units 会回退到兼容字段并补齐来源信息。
+    #[allow(dead_code)]
+    asset_details: HashMap<String, ExtensionUnitAsset>,
 }
 
 fn build_units(
@@ -2440,17 +2774,12 @@ fn build_units(
             ExtensionSourceAcquisition::Local => local,
             ExtensionSourceAcquisition::Remote => remote,
         };
-        let fallback = match acquisition {
-            ExtensionSourceAcquisition::Local => remote,
-            ExtensionSourceAcquisition::Remote => local,
-        };
-        // 取用侧不可用时退回另一侧，避免单元内容在界面上凭空消失。
-        let primary = [preferred, fallback]
-            .into_iter()
-            .flatten()
-            .find(|source| catalogs.contains_key(&source_identity(source)))
-            .or(preferred)
-            .or(fallback);
+        // 发现阶段可以展示“首选来源不可用”，但不能把另一来源伪装成首选
+        // 来源。安装会携带 source_id，避免本地预览意外安装线上制品。
+        let primary = preferred;
+        let source_available = primary
+            .map(|source| catalogs.contains_key(&source_identity(source)))
+            .unwrap_or(false);
         let repository = remote
             .map(|source| source.repository.clone())
             .or_else(|| {
@@ -2473,10 +2802,31 @@ fn build_units(
                     repository.clone()
                 }
             });
+        let primary_identity = primary.map(source_identity);
         let assets = primary
             .and_then(|source| catalogs.get(&source_identity(source)))
             .cloned()
             .unwrap_or_default();
+        // 另一侧只用于提示，不参与单元内容；它没加载时 newer_count 保持 0，
+        // 界面据此只显示可用性，不显示虚假的“可更新”。
+        let other = match acquisition {
+            ExtensionSourceAcquisition::Local => remote,
+            ExtensionSourceAcquisition::Remote => local,
+        };
+        let other_side = other.map(|_| ExtensionUnitOtherSide {
+            side: match acquisition {
+                ExtensionSourceAcquisition::Local => "remote",
+                ExtensionSourceAcquisition::Remote => "local",
+            }
+            .to_string(),
+            available: other
+                .map(|source| catalogs.contains_key(&source_identity(source)))
+                .unwrap_or(false),
+            newer_count: other
+                .and_then(|source| catalogs.get(&source_identity(source)))
+                .map(|other| count_newer_assets(&assets, other))
+                .unwrap_or_default(),
+        });
         let mut plugin_ids = assets
             .plugins
             .iter()
@@ -2498,36 +2848,103 @@ fn build_units(
         let plugin_count = plugin_ids.len();
         let skill_count = skill_ids.len();
         let workflow_count = workflow_ids.len();
-        let mut catalog_assets =
-            assets
-                .plugins
-                .into_iter()
-                .map(|(asset_id, name, version)| ExtensionUnitAsset {
-                    asset_kind: "plugin".to_string(),
-                    asset_id,
-                    name,
-                    version,
-                })
-                .chain(assets.skills.into_iter().map(|(asset_id, name, version)| {
-                    ExtensionUnitAsset {
+        let mut catalog_assets = assets
+            .plugins
+            .iter()
+            .map(|(asset_id, name, version)| {
+                assets
+                    .asset_details
+                    .get(&format!("plugin:{asset_id}"))
+                    .cloned()
+                    .unwrap_or_else(|| ExtensionUnitAsset {
+                        asset_kind: "plugin".to_string(),
+                        asset_id: asset_id.clone(),
+                        name: name.clone(),
+                        version: version.clone(),
+                        source_id: primary_identity
+                            .as_deref()
+                            .map(source_id_of)
+                            .unwrap_or_default()
+                            .to_string(),
+                        source_kind: if primary
+                            .map(|s| s.kind == ExtensionSourceKind::Local)
+                            .unwrap_or(false)
+                        {
+                            "local"
+                        } else {
+                            "github"
+                        }
+                        .to_string(),
+                        artifact_url: String::new(),
+                        sha256: String::new(),
+                        signature_key_id: String::new(),
+                        signature_algorithm: String::new(),
+                        channel: String::new(),
+                    })
+            })
+            .chain(assets.skills.iter().map(|(asset_id, name, version)| {
+                assets
+                    .asset_details
+                    .get(&format!("skill:{asset_id}"))
+                    .cloned()
+                    .unwrap_or_else(|| ExtensionUnitAsset {
                         asset_kind: "skill".to_string(),
-                        asset_id,
-                        name,
-                        version,
-                    }
-                }))
-                .chain(
-                    assets
-                        .workflows
-                        .into_iter()
-                        .map(|(asset_id, name, version)| ExtensionUnitAsset {
-                            asset_kind: "workflow".to_string(),
-                            asset_id,
-                            name,
-                            version,
-                        }),
-                )
-                .collect::<Vec<_>>();
+                        asset_id: asset_id.clone(),
+                        name: name.clone(),
+                        version: version.clone(),
+                        source_id: primary_identity
+                            .as_deref()
+                            .map(source_id_of)
+                            .unwrap_or_default()
+                            .to_string(),
+                        source_kind: if primary
+                            .map(|s| s.kind == ExtensionSourceKind::Local)
+                            .unwrap_or(false)
+                        {
+                            "local"
+                        } else {
+                            "github"
+                        }
+                        .to_string(),
+                        artifact_url: String::new(),
+                        sha256: String::new(),
+                        signature_key_id: String::new(),
+                        signature_algorithm: String::new(),
+                        channel: String::new(),
+                    })
+            }))
+            .chain(assets.workflows.iter().map(|(asset_id, name, version)| {
+                assets
+                    .asset_details
+                    .get(&format!("workflow:{asset_id}"))
+                    .cloned()
+                    .unwrap_or_else(|| ExtensionUnitAsset {
+                        asset_kind: "workflow".to_string(),
+                        asset_id: asset_id.clone(),
+                        name: name.clone(),
+                        version: version.clone(),
+                        source_id: primary_identity
+                            .as_deref()
+                            .map(source_id_of)
+                            .unwrap_or_default()
+                            .to_string(),
+                        source_kind: if primary
+                            .map(|s| s.kind == ExtensionSourceKind::Local)
+                            .unwrap_or(false)
+                        {
+                            "local"
+                        } else {
+                            "github"
+                        }
+                        .to_string(),
+                        artifact_url: String::new(),
+                        sha256: String::new(),
+                        signature_key_id: String::new(),
+                        signature_algorithm: String::new(),
+                        channel: String::new(),
+                    })
+            }))
+            .collect::<Vec<_>>();
         catalog_assets.sort_by(|left, right| {
             (left.asset_kind.as_str(), left.asset_id.as_str())
                 .cmp(&(right.asset_kind.as_str(), right.asset_id.as_str()))
@@ -2543,7 +2960,9 @@ fn build_units(
             plugin_count,
             skill_count,
             workflow_count,
-            state: if plugin_count + skill_count + workflow_count == 0 {
+            state: if !source_available {
+                "unavailable".to_string()
+            } else if plugin_count + skill_count + workflow_count == 0 {
                 "empty".to_string()
             } else {
                 "ready".to_string()
@@ -2554,9 +2973,36 @@ fn build_units(
             project_ids: Vec::new(),
             installed: Vec::new(),
             assets: catalog_assets,
+            other_side,
         });
     }
     units
+}
+
+/// 统计另一侧目录里版本更高的制品数量。版本比较沿用安装解析的同一个比较器，
+/// 避免界面提示和实际解析出现两套“更高版本”的语义。
+fn count_newer_assets(current: &SourceCatalogAssets, other: &SourceCatalogAssets) -> usize {
+    let mut count = 0;
+    for (current_items, other_items) in [
+        (&current.plugins, &other.plugins),
+        (&current.skills, &other.skills),
+        (&current.workflows, &other.workflows),
+    ] {
+        let current_versions = current_items
+            .iter()
+            .map(|(id, _, version)| (id.as_str(), version.as_str()))
+            .collect::<HashMap<_, _>>();
+        for (id, _, version) in other_items {
+            let newer = current_versions.get(id.as_str()).is_some_and(|current| {
+                crate::skill::resolver::compare_versions(version, current)
+                    == std::cmp::Ordering::Greater
+            });
+            if newer {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn conflict_reason(winner: &str) -> &'static str {
@@ -2921,12 +3367,21 @@ fn build_local_plugin_item(
     let content = fs::read_to_string(dir.join("plugin.json"))?;
     let manifest =
         crate::capability::plugin::parse_plugin_manifest(content.trim_start_matches('\u{feff}'))?;
+    let capability_ids: Vec<String> = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.clone())
+        .collect();
+    let mut categories = manifest.categories.clone();
+    // plugin.json 声明了 categories，catalog 项必须原样保留；旧清单没有声明时
+    // 才按 Capability 命名空间兜底，否则扩展市场里插件只能落进「未分类」。
+    crate::extension_category::fill_missing_categories(&capability_ids, &mut categories);
     Ok(PluginCatalogItem {
         plugin_id: manifest.id.clone(),
         name: manifest.name.clone(),
         description: manifest.description.clone(),
         author_name: manifest.author.clone(),
-        categories: Vec::new(),
+        categories,
         review_status: "local".to_string(),
         governance: "optional".to_string(),
         version: manifest.version.clone(),
@@ -2950,11 +3405,7 @@ fn build_local_plugin_item(
         managed: false,
         allow_disable: true,
         allow_uninstall: true,
-        capability_ids: manifest
-            .capabilities
-            .iter()
-            .map(|capability| capability.id.clone())
-            .collect(),
+        capability_ids,
         permissions: manifest.permissions.clone(),
         view_count: manifest.contributes.views.len(),
         plugin_dependencies: manifest
@@ -2976,22 +3427,26 @@ fn build_local_skill_item(
     source: &ExtensionSourceConfig,
 ) -> Result<SkillCatalogItem, Box<dyn Error>> {
     let manifest = crate::skill::manifest::load_skill_manifest(dir)?;
+    let capability_ids: Vec<String> = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.clone())
+        .collect();
+    let mut categories = manifest.categories.clone();
+    // 同插件：显式分类优先，缺失时按 Capability 命名空间兜底。
+    crate::extension_category::fill_missing_categories(&capability_ids, &mut categories);
     Ok(SkillCatalogItem {
         skill_id: manifest.id.clone(),
         name: manifest.name.clone(),
         description: manifest.description.clone(),
         author_name: manifest.author.clone(),
-        categories: manifest.categories.clone(),
+        categories,
         version: manifest.version.clone(),
         release_notes: manifest.release_notes.clone(),
         published_at: String::new(),
         min_agent_version: manifest.min_agent_version.clone(),
         supported_clients: manifest.supported_clients.clone(),
-        capability_ids: manifest
-            .capabilities
-            .iter()
-            .map(|capability| capability.id.clone())
-            .collect(),
+        capability_ids,
         plugin_dependencies: manifest
             .plugin_dependencies
             .iter()
@@ -3029,10 +3484,15 @@ fn build_local_workflow_item(
     source: &ExtensionSourceConfig,
 ) -> Result<WorkflowCatalogItem, Box<dyn Error>> {
     let package = crate::workflow::load_from_directory(dir)?;
+    // Workflow Package 不声明分类，catalog 项按 Capability 命名空间补齐，
+    // 否则工作流在整个扩展市场里只能落进「未分类」。
+    let categories = crate::extension_category::infer_categories(&package.capabilities);
     Ok(WorkflowCatalogItem {
         workflow_id: package.id.clone(),
         name: package.name.clone(),
         description: package.description.clone(),
+        author_name: String::new(),
+        categories,
         version: package.version.clone(),
         release_notes: String::new(),
         published_at: String::new(),
@@ -3055,6 +3515,7 @@ fn build_local_workflow_item(
         managed: false,
         allow_disable: true,
         allow_uninstall: true,
+        extension_lock: None,
     })
 }
 
@@ -3188,17 +3649,11 @@ fn local_upstream_repository(root: &Path, declared: &str) -> String {
 }
 
 fn git_origin_repository(root: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::runtime::process::hidden_command("git");
     command
         .arg("-C")
         .arg(root)
         .args(["remote", "get-url", "origin"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
@@ -3317,6 +3772,8 @@ mod tests {
             workflow_id: "com.himind.workflow.test".to_string(),
             name: "Workflow Test".to_string(),
             description: String::new(),
+            author_name: String::new(),
+            categories: Vec::new(),
             version: "1.0.0".to_string(),
             release_notes: String::new(),
             published_at: String::new(),
@@ -3339,6 +3796,7 @@ mod tests {
             managed: true,
             allow_disable: false,
             allow_uninstall: false,
+            extension_lock: None,
         }
     }
 
@@ -3454,6 +3912,42 @@ mod tests {
         sort_plugin_versions(&mut versions);
         assert_eq!(versions[0].version, "2.0.0");
         assert_eq!(versions[1].version, "1.4.0");
+    }
+
+    #[test]
+    fn plugin_dependencies_stay_on_the_selected_source() {
+        let mut root = plugin_item("https://github.com/Owner/a/releases/download/v1/root.hmpkg");
+        root.plugin_id = "com.himind.root".to_string();
+        root.source = "github:source-a".to_string();
+        root.plugin_dependencies = vec![crate::api::distribution::SkillPluginDependency {
+            plugin_id: "com.himind.dependency".to_string(),
+            required: true,
+            min_version: "1.0.0".to_string(),
+        }];
+        let mut wrong_source =
+            plugin_item("https://github.com/Owner/b/releases/download/v2/dependency.hmpkg");
+        wrong_source.plugin_id = "com.himind.dependency".to_string();
+        wrong_source.version = "2.0.0".to_string();
+        wrong_source.source = "github:source-b".to_string();
+        let mut selected_source = wrong_source.clone();
+        selected_source.version = "1.0.0".to_string();
+        selected_source.source = "github:source-a".to_string();
+        let catalog = vec![wrong_source, root, selected_source];
+        let mut order = Vec::new();
+
+        resolve_plugin_order(
+            &catalog,
+            "com.himind.root",
+            Some("1.0.0"),
+            "github:source-a",
+            &mut HashSet::new(),
+            &mut order,
+        )
+        .unwrap();
+
+        assert_eq!(order.len(), 2);
+        assert!(order.iter().all(|item| item.source == "github:source-a"));
+        assert_eq!(order[0].plugin_id, "com.himind.dependency");
     }
 
     #[test]
@@ -3759,6 +4253,7 @@ mod tests {
                 )],
                 skills: Vec::new(),
                 workflows: Vec::new(),
+                asset_details: HashMap::new(),
             },
         );
         catalogs.insert(
@@ -3771,6 +4266,7 @@ mod tests {
                 )],
                 skills: Vec::new(),
                 workflows: Vec::new(),
+                asset_details: HashMap::new(),
             },
         );
 
@@ -3801,6 +4297,109 @@ mod tests {
         assert_eq!(units[0].plugin_ids, vec!["com.himind.shared".to_string()]);
     }
 
+    fn unit_other_side_fixture() -> (ExtensionSourceConfig, ExtensionSourceConfig) {
+        let local = ExtensionSourceConfig {
+            id: "local-1".to_string(),
+            name: "本地工作区".to_string(),
+            kind: ExtensionSourceKind::Local,
+            repository: r"F:\repo".to_string(),
+            reference: String::new(),
+            catalog_path: LOCAL_CATALOG_PATH.to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+            upstream_repository: "Owner/repo".to_string(),
+        };
+        let remote = ExtensionSourceConfig {
+            id: "github-1".to_string(),
+            name: "GitHub 分发源".to_string(),
+            kind: ExtensionSourceKind::Github,
+            repository: "Owner/repo".to_string(),
+            reference: "main".to_string(),
+            catalog_path: DEFAULT_CATALOG_PATH.to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Required,
+            upstream_repository: String::new(),
+        };
+        (local, remote)
+    }
+
+    fn catalog_assets(items: Vec<(&str, &str)>) -> SourceCatalogAssets {
+        SourceCatalogAssets {
+            plugins: items
+                .into_iter()
+                .map(|(id, version)| (id.to_string(), id.to_string(), version.to_string()))
+                .collect(),
+            skills: Vec::new(),
+            workflows: Vec::new(),
+            asset_details: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn unit_reports_newer_versions_only_from_the_other_side() {
+        let (local, remote) = unit_other_side_fixture();
+        let mut catalogs = HashMap::new();
+        catalogs.insert(
+            "local:local-1".to_string(),
+            catalog_assets(vec![
+                ("com.example.a", "1.0.0"),
+                ("com.example.b", "2.0.0"),
+            ]),
+        );
+        catalogs.insert(
+            "github:github-1".to_string(),
+            catalog_assets(vec![
+                // 远端更高，应计一次。
+                ("com.example.a", "1.2.0"),
+                // 远端更低，不能算成“可切换更新”。
+                ("com.example.b", "1.9.0"),
+            ]),
+        );
+
+        let units = build_units(
+            &[local.clone(), remote.clone()],
+            &BTreeMap::new(),
+            &catalogs,
+        );
+        assert_eq!(units.len(), 1);
+        let other = units[0]
+            .other_side
+            .as_ref()
+            .expect("两侧来源齐全时必须给出另一侧信息");
+        assert_eq!(other.side, "remote");
+        assert!(other.available);
+        assert_eq!(other.newer_count, 1);
+
+        // 切到远端后，“另一侧”变成本地。提示是双向的：此时本地目录里的
+        // com.example.b 2.0.0 高于线上的 1.9.0，所以同样提示“本地更新”。
+        let mut remote_first = BTreeMap::new();
+        remote_first.insert(units[0].unit_key.clone(), ExtensionSourceAcquisition::Remote);
+        let units = build_units(&[local, remote], &remote_first, &catalogs);
+        assert_eq!(units[0].acquisition, ExtensionSourceAcquisition::Remote);
+        let other = units[0].other_side.as_ref().unwrap();
+        assert_eq!(other.side, "local");
+        assert!(other.available);
+        assert_eq!(other.newer_count, 1);
+    }
+
+    #[test]
+    fn unit_reports_other_side_as_unavailable_when_it_is_not_loaded() {
+        let (local, remote) = unit_other_side_fixture();
+        let mut catalogs = HashMap::new();
+        catalogs.insert(
+            "local:local-1".to_string(),
+            catalog_assets(vec![("com.example.a", "1.0.0")]),
+        );
+        // GitHub 源被停用或读取失败时没有目录，此时不得提示“可更新”。
+        let units = build_units(&[local, remote], &BTreeMap::new(), &catalogs);
+        let other = units[0].other_side.as_ref().expect("单元仍有另一侧来源配置");
+        assert_eq!(other.side, "remote");
+        assert!(!other.available);
+        assert_eq!(other.newer_count, 0);
+    }
+
     #[test]
     fn distribution_units_keep_unrelated_sources_separate() {
         let first = ExtensionSourceConfig {
@@ -3829,7 +4428,7 @@ mod tests {
         };
         let units = build_units(&[first, second], &BTreeMap::new(), &HashMap::new());
         assert_eq!(units.len(), 2);
-        assert_eq!(units[0].state, "empty");
+        assert_eq!(units[0].state, "unavailable");
         assert_ne!(units[0].unit_key, units[1].unit_key);
     }
 

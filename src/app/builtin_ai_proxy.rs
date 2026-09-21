@@ -19,10 +19,11 @@ const OBSERVED_FRAME_LIMIT: u64 = 4 * 1024 * 1024;
 const MAX_PROXY_CONNECTIONS: usize = 64;
 const SESSION_QUERY: &str = "himind_session";
 const SESSION_COOKIE: &str = "himind_ai_session";
-// WebView2 treats Secure cookies on the `localhost` HTTP origin as a secure
-// local context. Using the numeric loopback host can cause the browser session
-// cookie to be rejected, leaving the embedded runtime on a permanent 403.
+const RUNTIME_TOKEN_QUERY: &str = "token";
+// Keep the iframe on a browser-visible loopback hostname. Authentication is
+// carried by the session token bridge rather than a cross-site cookie.
 const BROWSER_HOST: &str = "localhost";
+const RUNTIME_REFERRER_POLICY: &str = r#"<meta name="referrer" content="same-origin">"#;
 // DSH's model selector prefers the optional display name over the provider
 // and model id. Keep the user-facing label tied to the real catalog id so a
 // managed HiMind provider cannot turn `deepseek-v4-flash` into `HiMind-v4`.
@@ -92,12 +93,77 @@ button:has(> svg[viewBox="0 0 182 24"])::before {
 })();
 </script>"#;
 
+const RUNTIME_AUTH_BRIDGE: &str = r#"<script data-himind-runtime-auth>
+(() => {
+  const session = new URLSearchParams(location.search).get("himind_session");
+  if (!session) return;
+  const withSession = (value) => {
+    try {
+      const url = value instanceof URL ? new URL(value.href) : new URL(String(value), location.href);
+      if (url.origin === location.origin && !url.searchParams.has("himind_session")) {
+        url.searchParams.set("himind_session", session);
+      }
+      return url.toString();
+    } catch {
+      return value;
+    }
+  };
+  const sessionHeaders = (headers) => {
+    const next = new Headers(headers || {});
+    next.set("X-HiMind-Session", session);
+    return next;
+  };
+  const nativeFetch = window.fetch;
+  if (typeof nativeFetch === "function") {
+    window.fetch = (input, init = {}) => {
+      if (input instanceof Request) {
+        const request = new Request(withSession(input.url), input);
+        return nativeFetch(request, { ...init, headers: sessionHeaders(init.headers || request.headers) });
+      }
+      return nativeFetch(withSession(input), { ...init, headers: sessionHeaders(init.headers) });
+    };
+  }
+  const nativeOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    const opened = nativeOpen.call(this, method, withSession(url), ...rest);
+    this.setRequestHeader("X-HiMind-Session", session);
+    return opened;
+  };
+  if (typeof EventSource === "function") {
+    const NativeEventSource = EventSource;
+    window.EventSource = new Proxy(NativeEventSource, {
+      construct(target, args) {
+        args[0] = withSession(args[0]);
+        return Reflect.construct(target, args);
+      },
+    });
+  }
+  if (typeof WebSocket === "function") {
+    const NativeWebSocket = WebSocket;
+    const HimindWebSocket = function(url, protocols) {
+      return new NativeWebSocket(withSession(url), protocols);
+    };
+    HimindWebSocket.prototype = NativeWebSocket.prototype;
+    for (const key of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
+      Object.defineProperty(HimindWebSocket, key, { value: NativeWebSocket[key] });
+    }
+    window.WebSocket = HimindWebSocket;
+  }
+})();
+</script>"#;
+
 pub(crate) type EventObserver = Arc<dyn Fn(Value) + Send + Sync + 'static>;
 
 pub(crate) struct BuiltinAiProxy {
     url: String,
     shutdown: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct UpstreamSession {
+    authority: String,
+    cookie: String,
 }
 
 #[derive(Clone)]
@@ -110,7 +176,7 @@ impl BuiltinAiProxy {
         upstream_url: &str,
         observer: Option<EventObserver>,
     ) -> Result<Self, String> {
-        let upstream = parse_upstream(upstream_url)?;
+        let (upstream, upstream_session) = prepare_upstream(upstream_url)?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|error| format!("无法创建 HiMind AI 本机入口：{error}"))?;
         listener
@@ -146,6 +212,7 @@ impl BuiltinAiProxy {
                             }
                             let connection_shutdown = Arc::clone(&listener_shutdown);
                             let connection_token = listener_token.clone();
+                            let connection_upstream_session = upstream_session.clone();
                             let connection_observer = observer.clone();
                             let connection_active_connections =
                                 Arc::clone(&listener_active_connections);
@@ -156,6 +223,7 @@ impl BuiltinAiProxy {
                                         stream,
                                         upstream,
                                         &connection_token,
+                                        &connection_upstream_session,
                                         connection_shutdown,
                                         connection_observer,
                                     ) {
@@ -209,6 +277,51 @@ impl BuiltinAiProxy {
 }
 
 impl BuiltinAiProxyControl {
+    pub(crate) fn verify_browser_entry(&self) -> Result<(), String> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| format!("创建 HiMind AI 页面验证客户端失败: {error}"))?;
+        let mut endpoint =
+            url::Url::parse(&self.url).map_err(|_| "HiMind AI 本机地址无效".to_string())?;
+        let session = endpoint
+            .query_pairs()
+            .find(|(name, _)| name == SESSION_QUERY)
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "HiMind AI 本机会话令牌不可用".to_string())?;
+        endpoint.set_path("/");
+        endpoint.set_query(None);
+        endpoint
+            .set_host(Some("127.0.0.1"))
+            .map_err(|_| "HiMind AI 本机地址无效".to_string())?;
+        let response = client
+            .get(endpoint)
+            .header(
+                reqwest::header::COOKIE,
+                format!("{SESSION_COOKIE}={session}"),
+            )
+            .send()
+            .map_err(|error| format!("请求 HiMind AI 页面失败: {error}"))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let body = response
+            .text()
+            .map_err(|error| format!("读取 HiMind AI 页面失败: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("HiMind AI 页面返回 HTTP {status}"));
+        }
+        if !content_type.contains("text/html") || !body.contains("__ModuleLoader__") {
+            return Err("HiMind AI 页面没有返回可启动的 Web 入口".to_string());
+        }
+        Ok(())
+    }
+
     /// Register an Agent-selected project as a native DSH Workspace and create
     /// its blank session before the browser loads. DSH then applies its own
     /// recent-Workspace selection policy and opens the intended project.
@@ -510,7 +623,7 @@ impl Drop for BuiltinAiProxy {
     }
 }
 
-fn parse_upstream(value: &str) -> Result<SocketAddr, String> {
+fn parse_upstream(value: &str) -> Result<(SocketAddr, String, String), String> {
     let parsed = url::Url::parse(value).map_err(|_| "HiMind AI 地址无效".to_string())?;
     if parsed.scheme() != "http"
         || parsed.host_str() != Some("127.0.0.1")
@@ -520,10 +633,85 @@ fn parse_upstream(value: &str) -> Result<SocketAddr, String> {
     {
         return Err("HiMind AI 地址不是本机安全地址".to_string());
     }
-    Ok(SocketAddr::from((
-        [127, 0, 0, 1],
-        parsed.port().expect("validated port"),
-    )))
+    let port = parsed.port().expect("validated port");
+    let tokens = parsed
+        .query_pairs()
+        .filter(|(name, _)| name == RUNTIME_TOKEN_QUERY)
+        .map(|(_, value)| value.into_owned())
+        .collect::<Vec<_>>();
+    if tokens.len() != 1 || tokens[0].is_empty() {
+        return Err("HiMind AI 启动地址缺少唯一运行时令牌".to_string());
+    }
+    let target = match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_string(),
+    };
+    Ok((
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        format!("127.0.0.1:{port}"),
+        target,
+    ))
+}
+
+fn prepare_upstream(value: &str) -> Result<(SocketAddr, UpstreamSession), String> {
+    let (upstream, authority, target) = parse_upstream(value)?;
+    let cookie = establish_upstream_session(upstream, &authority, &target)
+        .map_err(|error| format!("无法建立 HiMind AI 浏览器会话：{error}"))?;
+    Ok((upstream, UpstreamSession { authority, cookie }))
+}
+
+fn establish_upstream_session(
+    upstream: SocketAddr,
+    authority: &str,
+    target: &str,
+) -> io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(&upstream, Duration::from_secs(5))?;
+    configure_stream(&stream)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: {authority}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    let response = read_complete_http_response(&mut stream)?;
+    let header_end = find_header_end(&response).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "upstream authentication response is incomplete",
+        )
+    })?;
+    let header = String::from_utf8_lossy(&response[..header_end]);
+    let status_ok = header
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .is_some_and(|status| status == "303");
+    if !status_ok {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "upstream rejected the launch token",
+        ));
+    }
+    header
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .find_map(|(_, value)| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "upstream authentication response did not issue a cookie",
+            )
+        })
+}
+
+fn cookie_name_from_pair(cookie: &str) -> &str {
+    cookie
+        .split_once('=')
+        .map(|(name, _)| name.trim())
+        .unwrap_or_default()
 }
 
 fn random_token() -> String {
@@ -536,6 +724,7 @@ fn handle_connection(
     mut client: TcpStream,
     upstream: SocketAddr,
     token: &str,
+    upstream_session: &UpstreamSession,
     shutdown: Arc<AtomicBool>,
     observer: Option<EventObserver>,
 ) -> io::Result<()> {
@@ -546,21 +735,20 @@ fn handle_connection(
     let header = &initial[..header_end];
     let remainder = &initial[header_end..];
     let request = String::from_utf8_lossy(header);
-    if query_token_matches(&request, token) {
-        return establish_browser_session(&mut client, token);
-    }
-    if !cookie_token_matches(&request, token) {
+    if !request_token_matches(&request, token) {
         return write_forbidden(&mut client);
     }
 
     let websocket = is_websocket_upgrade(&request);
-    let rewritten = rewrite_request_header(&request, websocket);
+    let runtime_entry_request = !websocket && is_runtime_entry_request(&request);
+    let rewritten =
+        rewrite_request_header(&request, websocket, runtime_entry_request, upstream_session);
     let mut server = TcpStream::connect_timeout(&upstream, Duration::from_secs(5))?;
     configure_stream(&server)?;
     server.write_all(rewritten.as_bytes())?;
     server.write_all(remainder)?;
 
-    if !websocket && is_runtime_entry_request(&request) {
+    if runtime_entry_request {
         return proxy_customized_runtime_entry(&mut server, &mut client);
     }
 
@@ -662,6 +850,37 @@ fn cookie_token_matches(request: &str, token: &str) -> bool {
     })
 }
 
+fn request_token_matches(request: &str, token: &str) -> bool {
+    query_token_matches(request, token)
+        || cookie_token_matches(request, token)
+        || header_token_matches(request, "x-himind-session", token)
+        || referer_token_matches(request, token)
+}
+
+fn header_token_matches(request: &str, header_name: &str, token: &str) -> bool {
+    request.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case(header_name) && value.trim() == token
+        })
+    })
+}
+
+fn referer_token_matches(request: &str, token: &str) -> bool {
+    request
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("referer").then_some(value.trim())
+        })
+        .is_some_and(|referer| {
+            url::Url::parse(referer).ok().is_some_and(|url| {
+                url.query_pairs()
+                    .any(|(name, value)| name == SESSION_QUERY && value == token)
+            })
+        })
+}
+
 fn is_websocket_upgrade(request: &str) -> bool {
     request.lines().skip(1).any(|line| {
         line.split_once(':').is_some_and(|(name, value)| {
@@ -670,12 +889,31 @@ fn is_websocket_upgrade(request: &str) -> bool {
     })
 }
 
-fn rewrite_request_header(request: &str, websocket: bool) -> String {
+fn rewrite_request_header(
+    request: &str,
+    websocket: bool,
+    runtime_entry_request: bool,
+    upstream_session: &UpstreamSession,
+) -> String {
     let mut lines = request.lines();
     let mut output = String::new();
+    let mut saw_cookie = false;
     if let Some(line) = lines.next() {
-        output.push_str(line);
-        output.push_str("\r\n");
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(method), Some(target), Some(version)) => {
+                output.push_str(method);
+                output.push(' ');
+                output.push_str(&strip_session_query(target));
+                output.push(' ');
+                output.push_str(version);
+                output.push_str("\r\n");
+            }
+            _ => {
+                output.push_str(line);
+                output.push_str("\r\n");
+            }
+        }
     }
     for line in lines {
         if line.is_empty() {
@@ -685,25 +923,44 @@ fn rewrite_request_header(request: &str, websocket: bool) -> String {
             continue;
         };
         if name.eq_ignore_ascii_case("sec-websocket-extensions")
-            || (!websocket && name.eq_ignore_ascii_case("accept-encoding"))
+            || name.eq_ignore_ascii_case("x-himind-session")
+            || (runtime_entry_request && name.eq_ignore_ascii_case("accept-encoding"))
             || (!websocket && name.eq_ignore_ascii_case("connection"))
         {
             continue;
         }
+        if name.eq_ignore_ascii_case("host") {
+            output.push_str("Host: ");
+            output.push_str(&upstream_session.authority);
+            output.push_str("\r\n");
+            continue;
+        }
+        if name.eq_ignore_ascii_case("origin") {
+            output.push_str("Origin: http://");
+            output.push_str(&upstream_session.authority);
+            output.push_str("\r\n");
+            continue;
+        }
         if name.eq_ignore_ascii_case("cookie") {
+            saw_cookie = true;
             let cookies = value
                 .split(';')
                 .map(str::trim)
                 .filter(|item| {
-                    item.split_once('=')
-                        .is_none_or(|(cookie_name, _)| cookie_name != SESSION_COOKIE)
+                    let item = item.trim();
+                    item.split_once('=').is_none_or(|(cookie_name, _)| {
+                        cookie_name != SESSION_COOKIE
+                            && item != upstream_session.cookie.as_str()
+                            && cookie_name != cookie_name_from_pair(&upstream_session.cookie)
+                    })
                 })
                 .collect::<Vec<_>>();
-            if cookies.is_empty() {
-                continue;
-            }
             output.push_str("Cookie: ");
-            output.push_str(&cookies.join("; "));
+            if !cookies.is_empty() {
+                output.push_str(&cookies.join("; "));
+                output.push_str("; ");
+            }
+            output.push_str(&upstream_session.cookie);
             output.push_str("\r\n");
             continue;
         }
@@ -712,12 +969,34 @@ fn rewrite_request_header(request: &str, websocket: bool) -> String {
         output.push_str(value);
         output.push_str("\r\n");
     }
+    if !saw_cookie {
+        output.push_str("Cookie: ");
+        output.push_str(&upstream_session.cookie);
+        output.push_str("\r\n");
+    }
     if !websocket {
-        output.push_str("Accept-Encoding: identity\r\n");
+        if runtime_entry_request {
+            output.push_str("Accept-Encoding: identity\r\n");
+        }
         output.push_str("Connection: close\r\n");
     }
     output.push_str("\r\n");
     output
+}
+
+fn strip_session_query(target: &str) -> String {
+    let Some((path, query)) = target.split_once('?') else {
+        return target.to_string();
+    };
+    let filtered = query
+        .split('&')
+        .filter(|part| part.split_once('=').map(|(name, _)| name).unwrap_or(part) != SESSION_QUERY)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", filtered.join("&"))
+    }
 }
 
 fn is_runtime_entry_request(request: &str) -> bool {
@@ -728,7 +1007,11 @@ fn is_runtime_entry_request(request: &str) -> bool {
             let mut parts = line.split_whitespace();
             Some((parts.next()?, parts.next()?))
         })
-        .is_some_and(|(method, target)| method == "GET" && target == "/")
+        .is_some_and(|(method, target)| {
+            method == "GET"
+                && url::Url::parse(&format!("http://127.0.0.1{target}"))
+                    .is_ok_and(|url| url.path() == "/")
+        })
 }
 
 fn proxy_customized_runtime_entry(
@@ -853,14 +1136,29 @@ fn customize_runtime_html_response(response: &[u8]) -> io::Result<Option<Vec<u8>
 }
 
 fn customize_runtime_html(html: &str) -> String {
-    let html = html.replace(
+    let mut html = html.replace(
         "<title>DeepSeek Harness</title>",
         "<title>HiMind AI</title>",
     );
-    if html.contains("data-himind-runtime-brand") {
-        return html;
+    if !html.contains("data-himind-runtime-auth") {
+        let bridge = format!("{RUNTIME_REFERRER_POLICY}{RUNTIME_AUTH_BRIDGE}");
+        let lowercase = html.to_ascii_lowercase();
+        let head_end = lowercase.find("</head>");
+        let insertion = lowercase
+            .find("<script")
+            .filter(|script| head_end.is_none_or(|head_end| *script < head_end))
+            .or(head_end)
+            .or_else(|| lowercase.find("<head>").map(|index| index + "<head>".len()));
+        if let Some(index) = insertion {
+            html.insert_str(index, &bridge);
+        } else {
+            html.insert_str(0, &bridge);
+        }
     }
-    html.replacen("</head>", &format!("{RUNTIME_BRAND_BRIDGE}\n</head>"), 1)
+    if !html.contains("data-himind-runtime-brand") {
+        html = html.replacen("</head>", &format!("{RUNTIME_BRAND_BRIDGE}\n</head>"), 1);
+    }
+    html
 }
 
 fn response_content_length(header: &str) -> io::Result<Option<usize>> {
@@ -931,16 +1229,6 @@ fn decode_chunked_body(body: &[u8]) -> io::Result<Option<Vec<u8>>> {
         decoded.extend_from_slice(&body[cursor..chunk_end]);
         cursor = chunk_end + 2;
     }
-}
-
-fn establish_browser_session(stream: &mut TcpStream, token: &str) -> io::Result<()> {
-    stream.write_all(browser_session_response(token).as_bytes())
-}
-
-fn browser_session_response(token: &str) -> String {
-    format!(
-        "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: {SESSION_COOKIE}={token}; HttpOnly; SameSite=None; Secure; Partitioned; Path=/\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    )
 }
 
 fn write_forbidden(stream: &mut TcpStream) -> io::Result<()> {
@@ -1126,16 +1414,21 @@ mod tests {
     #[test]
     fn upstream_must_be_a_numbered_loopback_http_url() {
         assert_eq!(
-            parse_upstream("http://127.0.0.1:3080").unwrap().port(),
+            parse_upstream("http://127.0.0.1:3080/?token=test-token")
+                .unwrap()
+                .0
+                .port(),
             3080
         );
-        assert!(parse_upstream("http://localhost:3080").is_err());
-        assert!(parse_upstream("https://127.0.0.1:3080").is_err());
+        assert!(parse_upstream("http://127.0.0.1:3080/?token=test-token").is_ok());
+        assert!(parse_upstream("http://127.0.0.1:3080").is_err());
+        assert!(parse_upstream("http://localhost:3080/?token=test-token").is_err());
+        assert!(parse_upstream("https://127.0.0.1:3080/?token=test-token").is_err());
         assert!(parse_upstream("http://127.0.0.1").is_err());
     }
 
     #[test]
-    fn session_token_is_accepted_only_from_query_or_cookie() {
+    fn session_token_is_accepted_from_the_browser_bridge() {
         let token = "test-token";
         assert!(query_token_matches(
             "GET /?himind_session=test-token HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
@@ -1147,6 +1440,15 @@ mod tests {
         ));
         assert!(!cookie_token_matches(
             "GET / HTTP/1.1\r\nCookie: himind_ai_session=wrong\r\n\r\n",
+            token
+        ));
+        assert!(header_token_matches(
+            "GET /api/events.mux HTTP/1.1\r\nX-HiMind-Session: test-token\r\n\r\n",
+            "x-himind-session",
+            token
+        ));
+        assert!(request_token_matches(
+            "GET /api/events.mux HTTP/1.1\r\nReferer: http://localhost:4567/?himind_session=test-token\r\n\r\n",
             token
         ));
     }
@@ -1168,21 +1470,188 @@ mod tests {
 
     #[test]
     fn proxy_cookie_is_not_forwarded_to_the_runtime() {
+        let upstream_session = UpstreamSession {
+            authority: "127.0.0.1:3080".to_string(),
+            cookie: "dsh-auth-test=runtime-secret".to_string(),
+        };
         let rewritten = rewrite_request_header(
-            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: himind_ai_session=secret; theme=dark\r\nConnection: keep-alive\r\n\r\n",
+            "GET /?himind_session=secret HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: himind_ai_session=secret; theme=dark\r\nX-HiMind-Session: secret\r\nConnection: keep-alive\r\n\r\n",
             false,
+            true,
+            &upstream_session,
         );
-        assert!(!rewritten.contains("secret"));
-        assert!(rewritten.contains("Cookie: theme=dark"));
+        assert!(rewritten.starts_with("GET / HTTP/1.1"));
+        assert!(!rewritten.contains("himind_ai_session=secret"));
+        assert!(!rewritten.contains("X-HiMind-Session"));
+        assert!(rewritten.contains("Host: 127.0.0.1:3080"));
+        assert!(rewritten.contains("Cookie: theme=dark; dsh-auth-test=runtime-secret"));
         assert!(rewritten.contains("Connection: close"));
     }
 
     #[test]
-    fn iframe_session_cookie_is_secure_and_partitioned() {
-        let response = browser_session_response("test-token");
+    fn upstream_authority_and_cookie_are_rewritten_for_websocket_requests() {
+        let upstream_session = UpstreamSession {
+            authority: "127.0.0.1:3080".to_string(),
+            cookie: "dsh-auth-test=runtime-secret".to_string(),
+        };
+        let rewritten = rewrite_request_header(
+            "GET /api/events.mux HTTP/1.1\r\nHost: localhost:4567\r\nOrigin: http://localhost:4567\r\nCookie: himind_ai_session=secret\r\nUpgrade: websocket\r\n\r\n",
+            true,
+            false,
+            &upstream_session,
+        );
 
-        assert!(response.contains("HttpOnly; SameSite=None; Secure; Partitioned; Path=/"));
-        assert!(!response.contains("SameSite=Strict"));
+        assert!(rewritten.contains("Host: 127.0.0.1:3080"));
+        assert!(rewritten.contains("Origin: http://127.0.0.1:3080"));
+        assert!(rewritten.contains("Cookie: dsh-auth-test=runtime-secret"));
+        assert!(!rewritten.contains("himind_ai_session"));
+    }
+
+    #[test]
+    fn non_entry_assets_keep_browser_compression_negotiation() {
+        let upstream_session = UpstreamSession {
+            authority: "127.0.0.1:3080".to_string(),
+            cookie: "dsh-auth-test=runtime-secret".to_string(),
+        };
+        let rewritten = rewrite_request_header(
+            "GET /plugins/??client.js HTTP/1.1\r\nHost: localhost:4567\r\nAccept-Encoding: gzip, br\r\nConnection: keep-alive\r\n\r\n",
+            false,
+            false,
+            &upstream_session,
+        );
+
+        assert!(rewritten.contains("Accept-Encoding: gzip, br"));
+        assert!(rewritten.contains("Connection: close"));
+    }
+
+    #[test]
+    fn internal_session_query_is_removed_without_rewriting_other_queries() {
+        assert_eq!(
+            strip_session_query("/api/events.mux?after=42&himind_session=secret"),
+            "/api/events.mux?after=42"
+        );
+        assert_eq!(
+            strip_session_query("/plugins/??client.js"),
+            "/plugins/??client.js"
+        );
+        assert_eq!(strip_session_query("/?himind_session=secret"), "/");
+    }
+
+    #[test]
+    fn launch_token_exchange_returns_the_upstream_runtime_cookie() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_header(&mut stream).unwrap();
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /?token=test-token HTTP/1.1"));
+            assert!(request.contains(&format!("Host: 127.0.0.1:{}", address.port())));
+            stream
+                .write_all(
+                    b"HTTP/1.1 303 See Other\r\nSet-Cookie: dsh-auth-test=runtime-secret; Path=/; HttpOnly\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let cookie = establish_upstream_session(
+            address,
+            &format!("127.0.0.1:{}", address.port()),
+            "/?token=test-token",
+        )
+        .unwrap();
+        assert_eq!(cookie, "dsh-auth-test=runtime-secret");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proxy_handshakes_with_the_runtime_before_serving_the_browser() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = upstream_listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut auth, _) = upstream_listener.accept().unwrap();
+            let request =
+                String::from_utf8_lossy(&read_http_header(&mut auth).unwrap()).to_string();
+            assert!(request.starts_with("GET /?token=test-token HTTP/1.1"));
+            auth.write_all(
+                b"HTTP/1.1 303 See Other\r\nSet-Cookie: dsh-auth-test=runtime-secret; Path=/; HttpOnly\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+
+            for _ in 0..2 {
+                let (mut entry, _) = upstream_listener.accept().unwrap();
+                let request =
+                    String::from_utf8_lossy(&read_http_header(&mut entry).unwrap()).to_string();
+                assert!(request.starts_with("GET / HTTP/1.1"));
+                assert!(!request.contains(SESSION_QUERY));
+                assert!(!request.to_ascii_lowercase().contains("x-himind-session"));
+                assert!(request.contains(&format!("Host: 127.0.0.1:{}", upstream.port())));
+                assert!(request.contains("Cookie: dsh-auth-test=runtime-secret"));
+                let body =
+                    "<html><head><script>window.__ModuleLoader__={}</script><title>DeepSeek Harness</title></head><body>ready</body></html>";
+                let (first, second) = body.split_at(body.len() / 2);
+                entry
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+                            first.len(),
+                            second.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+
+        let mut proxy = BuiltinAiProxy::start(
+            &format!("http://127.0.0.1:{}/?token=test-token", upstream.port()),
+            None,
+        )
+        .unwrap();
+        proxy.control().verify_browser_entry().unwrap();
+        let proxy_url = url::Url::parse(proxy.url()).unwrap();
+        let proxy_address = format!("127.0.0.1:{}", proxy_url.port().expect("proxy URL port"));
+        let proxy_token = proxy_url
+            .query_pairs()
+            .find(|(name, _)| name == SESSION_QUERY)
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+
+        let mut client = TcpStream::connect(&proxy_address).unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /?{SESSION_QUERY}={proxy_token} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+                    proxy_url.port().unwrap()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let exchange =
+            String::from_utf8_lossy(&read_complete_http_response(&mut client).unwrap()).to_string();
+        assert!(exchange.starts_with("HTTP/1.1 200 OK"));
+        assert!(exchange.contains("<title>HiMind AI</title>"));
+        assert!(exchange.contains("data-himind-runtime-auth"));
+        assert!(exchange.contains("name=\"referrer\" content=\"same-origin\""));
+        assert!(!exchange.to_ascii_lowercase().contains("set-cookie"));
+        proxy.stop();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_auth_bridge_is_injected_before_runtime_scripts() {
+        let html =
+            "<html><head><script>window.__ModuleLoader__={}</script></head><body></body></html>";
+        let customized = customize_runtime_html(html);
+
+        assert!(customized.contains("data-himind-runtime-auth"));
+        assert!(customized.contains(RUNTIME_REFERRER_POLICY));
+        assert!(
+            customized.find("data-himind-runtime-auth").unwrap()
+                < customized.find("window.__ModuleLoader__").unwrap()
+        );
+        assert!(customized.contains("X-HiMind-Session"));
+        assert!(customized.contains("NativeWebSocket"));
     }
 
     #[test]

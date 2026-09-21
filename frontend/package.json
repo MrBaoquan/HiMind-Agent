@@ -1,7 +1,12 @@
 {
   "scripts": {
     "build": "tsc --noEmit && vite build",
-    "dev": "vite --host 127.0.0.1"
+    "dev": "vite --host 127.0.0.1",
+    "check:start-form": "node --experimental-strip-types scripts/check-start-form.mts",
+    "check:run-view": "node --experimental-strip-types scripts/check-run-view.mts",
+    "check:workflow-graph": "node --experimental-strip-types scripts/check-workflow-graph.mts",
+    "check:market-catalog": "node --experimental-strip-types scripts/check-market-catalog.mts",
+    "check:ui": "npm run check:start-form && npm run check:run-view && npm run check:workflow-graph && npm run check:market-catalog"
   },
   "dependencies": {
     "react": "latest",

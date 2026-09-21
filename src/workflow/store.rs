@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{load_from_directory, WorkflowPackage};
+use crate::agent_core_contracts::InteractionEnvelope;
+use crate::extension_contracts::{ExtensionAssetKind, ExtensionLock};
 use crate::store::atomic_file;
 
 const INSTALLATION_FILE: &str = "installation.json";
@@ -23,8 +25,43 @@ struct WorkflowInstallation {
     package_digest: String,
     #[serde(default)]
     source: String,
+    #[serde(default)]
+    artifact_sha256: String,
+    #[serde(default)]
+    extension_lock: Option<ExtensionLock>,
+    #[serde(default)]
+    lock_required: bool,
+    #[serde(default)]
+    versions: BTreeMap<String, WorkflowVersionMetadata>,
     installed_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WorkflowVersionMetadata {
+    #[serde(default)]
+    artifact_sha256: String,
+    #[serde(default)]
+    extension_lock: Option<ExtensionLock>,
+    #[serde(default)]
+    lock_required: bool,
+}
+
+impl WorkflowInstallation {
+    fn metadata_for_version(&self, version: &str) -> WorkflowVersionMetadata {
+        if let Some(metadata) = self.versions.get(version) {
+            return metadata.clone();
+        }
+        if version == self.current_version {
+            return WorkflowVersionMetadata {
+                artifact_sha256: self.artifact_sha256.clone(),
+                extension_lock: self.extension_lock.clone(),
+                lock_required: self.lock_required,
+            };
+        }
+        WorkflowVersionMetadata::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -34,6 +71,9 @@ pub(crate) struct InstalledWorkflow {
     pub previous_version: String,
     pub package_digest: String,
     pub source: String,
+    pub artifact_sha256: String,
+    pub extension_lock: Option<ExtensionLock>,
+    pub lock_required: bool,
     pub installed_at: String,
     pub updated_at: String,
 }
@@ -65,6 +105,17 @@ impl WorkflowStore {
         &self,
         source: &Path,
         require_signature: bool,
+    ) -> Result<InstalledWorkflow, Box<dyn Error>> {
+        self.install_from_directory_with_metadata(source, require_signature, "", None, false)
+    }
+
+    pub(crate) fn install_from_directory_with_metadata(
+        &self,
+        source: &Path,
+        require_signature: bool,
+        artifact_sha256: &str,
+        extension_lock: Option<ExtensionLock>,
+        lock_required: bool,
     ) -> Result<InstalledWorkflow, Box<dyn Error>> {
         let source = source.canonicalize()?;
         validate_package_integrity(&source, require_signature)?;
@@ -115,6 +166,28 @@ impl WorkflowStore {
 
         let now = timestamp();
         let previous = self.load_installation(&package.id)?;
+        let previous_metadata = previous
+            .as_ref()
+            .map(|item| item.metadata_for_version(&package.version))
+            .unwrap_or_default();
+        let extension_lock = extension_lock.or(previous_metadata.extension_lock);
+        let artifact_sha256 = if artifact_sha256.trim().is_empty() {
+            previous_metadata.artifact_sha256
+        } else {
+            artifact_sha256.trim().to_string()
+        };
+        let lock_required = lock_required || previous_metadata.lock_required;
+        let mut versions = previous
+            .as_ref()
+            .map(|item| item.versions.clone())
+            .unwrap_or_default();
+        let version_metadata = WorkflowVersionMetadata {
+            artifact_sha256: artifact_sha256.clone(),
+            extension_lock: extension_lock.clone(),
+            lock_required,
+        };
+        validate_workflow_extension_lock(&package, &version_metadata)?;
+        versions.insert(package.version.clone(), version_metadata);
         let installation = WorkflowInstallation {
             package_id: package.id.clone(),
             current_version: package.version.clone(),
@@ -125,6 +198,10 @@ impl WorkflowStore {
             enabled: previous.as_ref().map(|item| item.enabled).unwrap_or(true),
             package_digest: digest,
             source: source.to_string_lossy().to_string(),
+            artifact_sha256,
+            extension_lock,
+            lock_required,
+            versions,
             installed_at: previous
                 .as_ref()
                 .map(|item| item.installed_at.clone())
@@ -152,6 +229,92 @@ impl WorkflowStore {
         }
         items.sort_by(|left, right| left.package.id.cmp(&right.package.id));
         Ok(items)
+    }
+
+    pub(crate) fn load_version(
+        &self,
+        package_id: &str,
+        version: &str,
+    ) -> Result<WorkflowPackage, Box<dyn Error>> {
+        if version.trim().is_empty() {
+            return Err("workflow package version is required".into());
+        }
+        let version_root = self
+            .product_root(package_id)?
+            .join("versions")
+            .join(safe_segment(version)?);
+        if !version_root.is_dir() {
+            return Err(format!(
+                "workflow package version is not installed: {package_id}@{version}"
+            )
+            .into());
+        }
+        validate_package_integrity(&version_root, false)?;
+        load_from_directory(&version_root)
+    }
+
+    pub(crate) fn load_enabled_for_run(
+        &self,
+        package_id: &str,
+    ) -> Result<InstalledWorkflow, Box<dyn Error>> {
+        let package = self
+            .list()?
+            .into_iter()
+            .find(|item| item.package.id == package_id && item.enabled)
+            .ok_or_else(|| format!("workflow package not found or disabled: {package_id}"))?;
+        let installation = self
+            .load_installation(package_id)?
+            .ok_or("workflow package installation metadata is missing")?;
+        let metadata = installation.metadata_for_version(&package.package.version);
+        validate_workflow_extension_lock(&package.package, &metadata)?;
+        Ok(self.installed_from(&installation)?)
+    }
+
+    pub(crate) fn load_for_run_interaction(
+        &self,
+        interaction: &InteractionEnvelope,
+    ) -> Result<WorkflowPackage, Box<dyn Error>> {
+        let workflow = interaction
+            .business_context
+            .get("workflow")
+            .ok_or("workflow run does not contain a package reference")?;
+        let package_id = workflow
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("workflow run does not contain a package id")?;
+        let version = workflow
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected_digest = workflow
+            .get("package_digest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let package = if !version.trim().is_empty() {
+            self.load_version(package_id, version)?
+        } else {
+            self.list()?
+                .into_iter()
+                .find(|item| item.package.id == package_id && item.enabled)
+                .map(|item| item.package)
+                .ok_or_else(|| format!("workflow package not found or disabled: {package_id}"))?
+        };
+        if !expected_digest.trim().is_empty() {
+            let actual_digest = package_digest(&package.source_root)?;
+            if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+                return Err(format!(
+                    "workflow package content changed after the run started: {package_id}@{version}"
+                )
+                .into());
+            }
+        }
+        let installation = self
+            .load_installation(package_id)?
+            .ok_or("workflow package installation metadata is missing")?;
+        let metadata = installation.metadata_for_version(&package.version);
+        validate_workflow_extension_lock(&package, &metadata)?;
+        Ok(package)
     }
 
     pub(crate) fn view_json(
@@ -225,12 +388,16 @@ impl WorkflowStore {
             .join(safe_segment(&installation.current_version)?);
         validate_package_integrity(&version_root, false)?;
         let package = load_from_directory(&version_root)?;
+        let metadata = installation.metadata_for_version(&installation.current_version);
         Ok(InstalledWorkflow {
             package,
             enabled: installation.enabled,
             previous_version: installation.previous_version.clone(),
             package_digest: installation.package_digest.clone(),
             source: installation.source.clone(),
+            artifact_sha256: metadata.artifact_sha256,
+            extension_lock: metadata.extension_lock,
+            lock_required: metadata.lock_required,
             installed_at: installation.installed_at.clone(),
             updated_at: installation.updated_at.clone(),
         })
@@ -248,7 +415,25 @@ impl WorkflowStore {
         if !path.is_file() {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+        let mut installation: WorkflowInstallation = serde_json::from_slice(&fs::read(path)?)?;
+        if !installation.current_version.trim().is_empty()
+            && (!installation.artifact_sha256.trim().is_empty()
+                || installation.extension_lock.is_some()
+                || installation.lock_required)
+            && !installation
+                .versions
+                .contains_key(&installation.current_version)
+        {
+            installation.versions.insert(
+                installation.current_version.clone(),
+                WorkflowVersionMetadata {
+                    artifact_sha256: installation.artifact_sha256.clone(),
+                    extension_lock: installation.extension_lock.clone(),
+                    lock_required: installation.lock_required,
+                },
+            );
+        }
+        Ok(Some(installation))
     }
 
     fn save_installation(&self, installation: &WorkflowInstallation) -> Result<(), Box<dyn Error>> {
@@ -262,12 +447,164 @@ impl WorkflowStore {
     }
 }
 
+fn validate_workflow_extension_lock(
+    package: &WorkflowPackage,
+    metadata: &WorkflowVersionMetadata,
+) -> Result<(), Box<dyn Error>> {
+    let Some(lock) = metadata.extension_lock.as_ref() else {
+        if metadata.lock_required {
+            return Err(format!(
+                "workflow release lock is required: {}@{}",
+                package.id, package.version
+            )
+            .into());
+        }
+        return Ok(());
+    };
+    lock.validate()?;
+    if lock.root.kind != ExtensionAssetKind::Workflow
+        || lock.root.id != package.id
+        || lock.root.version != package.version
+    {
+        return Err("workflow release lock identity does not match the installed package".into());
+    }
+    if metadata.artifact_sha256.trim().is_empty()
+        || !lock
+            .root
+            .sha256
+            .eq_ignore_ascii_case(&metadata.artifact_sha256)
+    {
+        return Err(
+            "workflow release lock artifact SHA-256 does not match the installed package".into(),
+        );
+    }
+
+    for dependency in lock
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.required)
+    {
+        match dependency.kind {
+            ExtensionAssetKind::Plugin => {
+                let plugin =
+                    crate::capability::plugin::find_plugin(&dependency.id)?.ok_or_else(|| {
+                        format!("workflow lock requires missing Plugin {}", dependency.id)
+                    })?;
+                if !plugin.enabled || plugin.error.is_some() {
+                    return Err(format!(
+                        "workflow lock requires unavailable Plugin {}: {}",
+                        dependency.id,
+                        plugin.error.unwrap_or_else(|| "disabled".to_string())
+                    )
+                    .into());
+                }
+                if plugin.version != dependency.version {
+                    return Err(format!(
+                        "workflow lock requires Plugin {}@{}, installed {}",
+                        dependency.id, dependency.version, plugin.version
+                    )
+                    .into());
+                }
+                let actual = super::authoring::directory_content_sha256(Path::new(&plugin.path))?;
+                if !actual.eq_ignore_ascii_case(&dependency.sha256) {
+                    return Err(
+                        format!("workflow lock Plugin {} content changed", dependency.id).into(),
+                    );
+                }
+            }
+            ExtensionAssetKind::Skill => {
+                let store = crate::skill::store::SkillStore::new();
+                let version_root = [
+                    crate::skill::types::SkillScope::Builtin,
+                    crate::skill::types::SkillScope::Organization,
+                    crate::skill::types::SkillScope::User,
+                ]
+                .into_iter()
+                .map(|scope| store.skill_version_dir(&scope, &dependency.id, &dependency.version))
+                .find(|path| path.is_dir())
+                .ok_or_else(|| {
+                    format!(
+                        "workflow lock requires missing Skill {}@{}",
+                        dependency.id, dependency.version
+                    )
+                })?;
+                let manifest = crate::skill::manifest::load_skill_manifest(&version_root)?;
+                if manifest.id != dependency.id || manifest.version != dependency.version {
+                    return Err(format!(
+                        "workflow lock Skill {} content identity is inconsistent",
+                        dependency.id
+                    )
+                    .into());
+                }
+                let actual = super::authoring::directory_content_sha256(&version_root)?;
+                if !actual.eq_ignore_ascii_case(&dependency.sha256) {
+                    return Err(
+                        format!("workflow lock Skill {} content changed", dependency.id).into(),
+                    );
+                }
+            }
+            ExtensionAssetKind::Workflow => {
+                return Err(format!(
+                    "workflow lock contains unsupported nested Workflow dependency {}",
+                    dependency.id
+                )
+                .into());
+            }
+        }
+    }
+    for capability in &lock.environment.capabilities {
+        if !package.capabilities.contains(&capability.id) {
+            return Err(format!(
+                "workflow environment lock contains undeclared Capability {}",
+                capability.id
+            )
+            .into());
+        }
+    }
+    for connector in &lock.environment.connectors {
+        if !package.dependencies.connectors.contains(&connector.id) {
+            return Err(format!(
+                "workflow environment lock contains undeclared Connector {}",
+                connector.id
+            )
+            .into());
+        }
+        crate::store::connector_state::ensure_available(&connector.id).map_err(|error| {
+            format!(
+                "workflow environment lock requires unavailable Connector {}: {error}",
+                connector.id
+            )
+        })?;
+    }
+    for runtime in &lock.environment.runtimes {
+        if !package.supported_runtimes.contains(&runtime.id) {
+            return Err(format!(
+                "workflow environment lock contains undeclared Runtime {}",
+                runtime.id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowSignatureMetadata {
     algorithm: String,
     key_id: String,
     signature: String,
+}
+
+pub(crate) fn package_signature_identity(
+    root: &Path,
+) -> Result<Option<(String, String)>, Box<dyn Error>> {
+    let path = root.join("manifest.sig");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata: WorkflowSignatureMetadata = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(Some((metadata.key_id, metadata.algorithm)))
 }
 
 fn validate_package_integrity(root: &Path, require_signature: bool) -> Result<(), Box<dyn Error>> {
@@ -362,7 +699,7 @@ fn copy_package(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn package_digest(root: &Path) -> Result<String, Box<dyn Error>> {
+pub(crate) fn package_digest(root: &Path) -> Result<String, Box<dyn Error>> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
     files.sort();
@@ -433,10 +770,6 @@ mod tests {
     use rand::rngs::OsRng;
     use rsa::pkcs8::{EncodePublicKey, LineEnding};
     use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    static SIGNING_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
     fn source_package() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
@@ -474,13 +807,6 @@ mod tests {
         fs::write(root.join("checksums.sha256"), rows.concat()).unwrap();
     }
 
-    fn signing_env_lock() -> MutexGuard<'static, ()> {
-        SIGNING_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap()
-    }
-
     #[test]
     fn install_list_disable_and_remove() {
         let store = store();
@@ -505,6 +831,242 @@ mod tests {
         let second = store.install_from_directory(&source_package()).unwrap();
         assert_eq!(first.package_digest, second.package_digest);
         assert_eq!(first.package.version, second.package.version);
+    }
+
+    #[test]
+    fn loads_an_exact_installed_version_after_upgrade() {
+        let store = store();
+        let first_source = package_copy();
+        let mut first_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(first_source.join("workflow.json")).unwrap()).unwrap();
+        first_manifest["version"] = serde_json::json!("1.0.0");
+        fs::write(
+            first_source.join("workflow.json"),
+            serde_json::to_vec_pretty(&first_manifest).unwrap(),
+        )
+        .unwrap();
+        store.install_from_directory(&first_source).unwrap();
+
+        let second_source = package_copy();
+        let second_version = crate::workflow::load_from_directory(&second_source)
+            .unwrap()
+            .version;
+        let installed = store.install_from_directory(&second_source).unwrap();
+        assert_eq!(installed.package.version, second_version);
+        assert_eq!(store.list().unwrap()[0].package.version, second_version);
+
+        let historical = store
+            .load_version("com.himind.workflow.wechat-miniprogram-delivery", "1.0.0")
+            .unwrap();
+        assert_eq!(historical.version, "1.0.0");
+        let _ = fs::remove_dir_all(first_source);
+        let _ = fs::remove_dir_all(second_source);
+    }
+
+    #[test]
+    fn rollback_restores_the_matching_release_lock_metadata() {
+        let store = store();
+        let first_source = package_copy();
+        let mut first_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(first_source.join("workflow.json")).unwrap()).unwrap();
+        first_manifest["version"] = serde_json::json!("1.0.0");
+        fs::write(
+            first_source.join("workflow.json"),
+            serde_json::to_vec_pretty(&first_manifest).unwrap(),
+        )
+        .unwrap();
+        let first_package = crate::workflow::load_from_directory(&first_source).unwrap();
+        let first_sha = "a".repeat(64);
+        let first_lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: first_package.id.clone(),
+                version: first_package.version.clone(),
+                sha256: first_sha.clone(),
+            },
+            dependencies: Vec::new(),
+            environment: crate::extension_contracts::ExtensionLockEnvironment::default(),
+            generated_at: "2026-09-17T00:00:00Z".to_string(),
+        };
+        store
+            .install_from_directory_with_metadata(
+                &first_source,
+                false,
+                &first_sha,
+                Some(first_lock),
+                true,
+            )
+            .unwrap();
+
+        let second_source = package_copy();
+        let second_package = crate::workflow::load_from_directory(&second_source).unwrap();
+        let second_sha = "b".repeat(64);
+        let second_lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: second_package.id.clone(),
+                version: second_package.version.clone(),
+                sha256: second_sha.clone(),
+            },
+            dependencies: Vec::new(),
+            environment: crate::extension_contracts::ExtensionLockEnvironment::default(),
+            generated_at: "2026-09-17T00:00:00Z".to_string(),
+        };
+        store
+            .install_from_directory_with_metadata(
+                &second_source,
+                false,
+                &second_sha,
+                Some(second_lock),
+                true,
+            )
+            .unwrap();
+
+        let rolled_back = store.rollback(&first_package.id).unwrap();
+        assert_eq!(rolled_back.package.version, "1.0.0");
+        assert_eq!(rolled_back.artifact_sha256, first_sha);
+        assert!(store.load_enabled_for_run(&first_package.id).is_ok());
+        let _ = fs::remove_dir_all(first_source);
+        let _ = fs::remove_dir_all(second_source);
+    }
+
+    #[test]
+    fn run_interaction_rejects_package_content_replacement() {
+        let store = store();
+        let package = store.install_from_directory(&source_package()).unwrap();
+        let expected_digest = package_digest(
+            &store
+                .load_version(&package.package.id, &package.package.version)
+                .unwrap()
+                .source_root,
+        )
+        .unwrap();
+        let interaction: InteractionEnvelope = serde_json::from_value(serde_json::json!({
+            "schema_version": "interaction_envelope.v1",
+            "interaction_id": "int-workflow",
+            "correlation_id": "corr-workflow",
+            "idempotency_key": "idem-workflow",
+            "source": "workflow",
+            "transport": "local",
+            "principal": {"local_principal_id": "local-user"},
+            "agent_id": "local-agent",
+            "business_context": {
+                "workflow": {
+                    "id": package.package.id,
+                    "version": package.package.version,
+                    "package_digest": expected_digest
+                }
+            },
+            "created_at": "2026-09-16T00:00:00Z"
+        }))
+        .unwrap();
+        store.load_for_run_interaction(&interaction).unwrap();
+
+        let version_root = store
+            .product_root(&package.package.id)
+            .unwrap()
+            .join("versions")
+            .join(&package.package.version);
+        let mut readme = fs::read_to_string(version_root.join("README.md")).unwrap();
+        readme.push_str("\ntampered\n");
+        fs::write(version_root.join("README.md"), readme).unwrap();
+        assert!(store
+            .load_for_run_interaction(&interaction)
+            .unwrap_err()
+            .to_string()
+            .contains("content changed after the run started"));
+    }
+
+    #[test]
+    fn install_requires_a_release_lock_from_a_managed_catalog() {
+        let store = store();
+        let error = store
+            .install_from_directory_with_metadata(
+                &source_package(),
+                false,
+                &"a".repeat(64),
+                None,
+                true,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("release lock is required"));
+    }
+
+    #[test]
+    fn install_rejects_a_missing_locked_dependency() {
+        let store = store();
+        let artifact_sha256 = "a".repeat(64);
+        let package = crate::workflow::load_from_directory(&source_package()).unwrap();
+        let lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: package.id.clone(),
+                version: package.version.clone(),
+                sha256: artifact_sha256.clone(),
+            },
+            dependencies: vec![crate::extension_contracts::ExtensionLockDependency {
+                kind: ExtensionAssetKind::Plugin,
+                id: "com.himind.plugin.missing-for-lock-test".to_string(),
+                version: "1.0.0".to_string(),
+                sha256: "b".repeat(64),
+                source_id: String::new(),
+                required: true,
+            }],
+            environment: crate::extension_contracts::ExtensionLockEnvironment::default(),
+            generated_at: "2026-09-17T00:00:00Z".to_string(),
+        };
+        let error = store
+            .install_from_directory_with_metadata(
+                &source_package(),
+                false,
+                &artifact_sha256,
+                Some(lock),
+                true,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("missing Plugin"));
+    }
+
+    #[test]
+    fn install_rejects_environment_lock_with_undeclared_capability() {
+        let store = store();
+        let source = source_package();
+        let package = load_from_directory(&source).unwrap();
+        let artifact_sha256 = "a".repeat(64);
+        let lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: package.id.clone(),
+                version: package.version.clone(),
+                sha256: artifact_sha256.clone(),
+            },
+            dependencies: Vec::new(),
+            environment: crate::extension_contracts::ExtensionLockEnvironment {
+                capabilities: vec![crate::extension_contracts::ExtensionLockCapability {
+                    id: "com.example.undeclared".to_string(),
+                    provider: "test".to_string(),
+                    availability: "local".to_string(),
+                    required: true,
+                }],
+                ..Default::default()
+            },
+            generated_at: "2026-09-17T00:00:00Z".to_string(),
+        };
+        let error = store
+            .install_from_directory_with_metadata(
+                &source,
+                false,
+                &artifact_sha256,
+                Some(lock),
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("undeclared Capability"));
     }
 
     #[test]
@@ -563,7 +1125,7 @@ mod tests {
 
     #[test]
     fn valid_signature_allows_required_install() {
-        let _guard = signing_env_lock();
+        let _guard = crate::app::system::signing_env_lock();
         let package = package_copy();
         write_checksums(&package);
 

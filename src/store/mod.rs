@@ -1,7 +1,10 @@
+pub(crate) mod acp_profiles;
+pub(crate) mod acp_sessions;
 pub(crate) mod ai_services;
 pub(crate) mod approval_outbox;
 pub(crate) mod atomic_file;
 pub(crate) mod connector_credentials;
+pub(crate) mod connector_state;
 pub mod credentials;
 #[allow(dead_code)]
 pub(crate) mod local_runs;

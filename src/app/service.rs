@@ -129,6 +129,12 @@ pub(crate) fn start_background_services(
     approval_mgr: Option<Arc<ApprovalManager>>,
     capability_gateway: CapabilityGateway,
 ) -> Result<(), Box<dyn Error>> {
+    let workflow_approval_manager = approval_mgr.clone().unwrap_or_else(ApprovalManager::global);
+    crate::app::workflow_approval::start_workflow_approval_bridge(
+        capability_gateway.clone(),
+        workflow_approval_manager,
+    );
+
     // A VS Code update replaces its versioned product.json. Repair an existing
     // HiMind enrollment before serving the Dashboard so ordinary Agent startup
     // restores the persistent provider allowlist automatically.
@@ -205,6 +211,21 @@ pub(crate) fn start_background_services(
     let _ = thread::Builder::new()
         .name("himind-extension-source-reconcile-loop".to_string())
         .spawn(move || loop {
+            if source_reconcile_options.mode().dashboard_enabled() {
+                if let Err(error) = crate::app::trust::sync(&source_reconcile_options) {
+                    eprintln!("distribution trust sync failed: {error}");
+                }
+                match crate::app::connector_policy::sync(&source_reconcile_options) {
+                    Ok(report) if report.revoked_count > 0 || report.restored_count > 0 => {
+                        eprintln!(
+                            "connector policy sync revoked={} restored={}",
+                            report.revoked_count, report.restored_count
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("connector policy sync failed: {error}"),
+                }
+            }
             match crate::app::extension_orchestrator::reconcile_local_sources() {
                 Ok(updated) => {
                     for item in updated {

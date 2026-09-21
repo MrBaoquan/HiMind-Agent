@@ -51,7 +51,13 @@
           "label": "小程序工程目录",
           "type": "text",
           "required": true,
-          "placeholder": "包含 project.config.json 的目录"
+          "placeholder": "编译产物目录，例如 source\\dist\\wx"
+        },
+        {
+          "id": "source_root",
+          "label": "源码根目录",
+          "type": "text",
+          "placeholder": "执行 npm 安装、测试和构建的仓库根目录；默认等于工作区目录"
         },
         {
           "id": "app_id",
@@ -111,6 +117,14 @@
           "type": "select",
           "default": "install",
           "options": ["install", "ci"]
+        },
+        {
+          "id": "build_script",
+          "label": "构建脚本",
+          "type": "text",
+          "required": true,
+          "default": "build:dev",
+          "placeholder": "例如 build:dev 或 build:szkjg"
         },
         {
           "id": "scripts",

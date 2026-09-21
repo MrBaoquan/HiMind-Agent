@@ -18,9 +18,12 @@ import {
   Unplug,
 } from 'lucide-react';
 import { PageHeader, Pill } from '../components/Common';
+import { AcpProfilesPanel } from './AcpProfilesPanel';
 import { AiServicesPanel } from './AiServicesPanel';
 import type {
   AIServiceListResult,
+  AcpRuntimeProfileInput,
+  AcpRuntimeProfileSnapshot,
   CustomAIService,
   DashboardIdentityStatus,
   McpConnectionTestResult,
@@ -28,13 +31,14 @@ import type {
 } from '../services/agentApi';
 
 type AiConnectionsPageProps = {
-  initialTab?: 'mcp' | 'services';
+  initialTab?: 'mcp' | 'services' | 'acp';
   identity: DashboardIdentityStatus | null;
   dashboardEnabled: boolean;
   targets: McpTargetDescriptor[];
   testResult: McpConnectionTestResult | null;
   busyAction: string | null;
   aiServices: AIServiceListResult | null;
+  acpProfiles: AcpRuntimeProfileSnapshot | null;
   onOpenAccount: () => void;
   onRefresh: () => void;
   onApplyTarget: (targetId: string, resetInvalid?: boolean) => void;
@@ -52,11 +56,15 @@ type AiConnectionsPageProps = {
     models: string[];
     api_key: string;
   }) => Promise<void>;
+  onSetActiveAIService: (id: string) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
   onImportAIClient: (target: string, service?: string) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
   onFetchModels: (input: { base_url: string; api_key: string }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
+  onSaveAcpProfile: (input: AcpRuntimeProfileInput) => Promise<void>;
+  onSetAcpProfileEnabled: (providerId: string, enabled: boolean) => Promise<void>;
+  onRemoveAcpProfile: (providerId: string) => Promise<void>;
 };
 
 export function AiConnectionsPage({
@@ -67,6 +75,7 @@ export function AiConnectionsPage({
   testResult,
   busyAction,
   aiServices,
+  acpProfiles,
   onOpenAccount,
   onRefresh,
   onApplyTarget,
@@ -76,13 +85,17 @@ export function AiConnectionsPage({
   onOpenDirectory,
   onTest,
   onSaveAIService,
+  onSetActiveAIService,
   onRemoveAIService,
   onImportAIClient,
   onRemoveAIClient,
   onFetchModels,
   onFetchSavedModels,
+  onSaveAcpProfile,
+  onSetAcpProfileEnabled,
+  onRemoveAcpProfile,
 }: AiConnectionsPageProps) {
-  const [activeTab, setActiveTab] = useState<'mcp' | 'services'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'mcp' | 'services' | 'acp'>(initialTab);
   const [copied, setCopied] = useState<string | null>(null);
 
   useEffect(() => {
@@ -109,10 +122,10 @@ export function AiConnectionsPage({
   const readyCount = groups.builtin.length + groups.connected.length;
   const discoveredCount = groups.builtin.length + groups.connected.length + groups.actionable.length + groups.manual.length;
   const attentionCount = groups.actionable.length + groups.manual.length;
-  const headline = attentionCount ? `${attentionCount} 个 MCP 注册待处理` : 'AI 工具已就绪';
+  const headline = attentionCount ? `${attentionCount} 个 AI 工具待连接` : 'AI 工具已就绪';
   const headlineDescription = attentionCount
-    ? '完成注册后，AI 工具即可使用 Agent 的统一能力。'
-    : '本机已注册的 AI 工具都可以使用 Agent 的统一能力。';
+    ? '连接后，这些 AI 工具即可使用 HiMind 提供的功能。'
+    : '已连接的 AI 工具可以使用 HiMind 提供的功能。';
 
   async function copyConfiguration(target: McpTargetDescriptor) {
     const content = target.config_preview || target.manual_snippet;
@@ -126,21 +139,32 @@ export function AiConnectionsPage({
     <div className="ai-page">
       <PageHeader
         title="AI 连接"
-        description="管理 AI 客户端与 HiMind Agent 之间的双向接入。"
+        description="管理工具连接、模型服务和本地 AI 客户端。"
         actions={<button className="btn btn-icon" title="刷新状态" aria-label="刷新状态" disabled={Boolean(busyAction)} onClick={onRefresh}><RefreshCw size={16} /></button>}
       />
 
       <div className="ai-tabs" role="tablist" aria-label="AI 连接分类">
-        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>MCP 注册</button>
+        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>工具连接</button>
         <button type="button" id="ai-tab-services" role="tab" aria-selected={activeTab === 'services'} aria-controls="ai-panel-services" className={`ai-tab${activeTab === 'services' ? ' active' : ''}`} onClick={() => setActiveTab('services')}>AI 服务</button>
+         <button type="button" id="ai-tab-acp" role="tab" aria-selected={activeTab === 'acp'} aria-controls="ai-panel-acp" className={`ai-tab${activeTab === 'acp' ? ' active' : ''}`} onClick={() => setActiveTab('acp')}>AI 客户端</button>
       </div>
 
-      {activeTab === 'services' ? (
+      {activeTab === 'acp' ? (
+        <AcpProfilesPanel
+          snapshot={acpProfiles}
+          busyAction={busyAction}
+          onRefresh={onRefresh}
+          onSave={onSaveAcpProfile}
+          onSetEnabled={onSetAcpProfileEnabled}
+          onRemove={onRemoveAcpProfile}
+        />
+      ) : activeTab === 'services' ? (
         <div id="ai-panel-services" role="tabpanel" aria-labelledby="ai-tab-services">
           <AiServicesPanel
             aiServices={aiServices}
             onRefresh={onRefresh}
             onSaveAIService={onSaveAIService}
+            onSetActiveAIService={onSetActiveAIService}
             onRemoveAIService={onRemoveAIService}
             onImportAIClient={onImportAIClient}
             onRemoveAIClient={onRemoveAIClient}
@@ -155,22 +179,22 @@ export function AiConnectionsPage({
             <div className="ai-overview-main">
               <div className="ai-overview-icon">{attentionCount ? <CircleAlert size={20} /> : <ShieldCheck size={20} />}</div>
               <div className="ai-overview-copy">
-                <span className="ai-overview-eyebrow">MCP 注册</span>
+                <span className="ai-overview-eyebrow">工具连接</span>
                 <strong>{headline}</strong>
                 <span>{headlineDescription}</span>
               </div>
             </div>
-            <div className="ai-overview-stats" aria-label="MCP 注册统计">
+            <div className="ai-overview-stats" aria-label="AI 工具连接统计">
               <div><span>已就绪</span><strong>{readyCount}</strong></div>
               <div><span>待处理</span><strong className={attentionCount ? 'warning-text' : ''}>{attentionCount}</strong></div>
-              <div><span>可管理</span><strong>{discoveredCount}</strong></div>
+              <div><span>已发现</span><strong>{discoveredCount}</strong></div>
             </div>
             <div className="ai-overview-actions">
               <button className="btn btn-primary" disabled={Boolean(busyAction) || !groups.actionable.length} onClick={onApplyAll}>
-                <PlugZap size={15} />{busyAction === 'apply-all' ? '正在注册' : groups.actionable.length ? '一键注册 MCP' : groups.manual.length ? '需要手动配置' : '注册已完成'}
+                <PlugZap size={15} />{busyAction === 'apply-all' ? '正在连接' : groups.actionable.length ? '连接全部' : groups.manual.length ? '需要手动配置' : '连接已完成'}
               </button>
-              <button className="btn btn-icon ai-overview-remove" title="取消全部注册" aria-label="取消全部注册" disabled={Boolean(busyAction) || !groups.connected.length} onClick={onRemoveAll}><Link2Off size={16} /></button>
-              <button className="btn btn-icon" title="检查 Agent MCP 服务" aria-label="检查 Agent MCP 服务" disabled={Boolean(busyAction)} onClick={onTest}>
+              <button className="btn btn-icon ai-overview-remove" title="断开全部连接" aria-label="断开全部连接" disabled={Boolean(busyAction) || !groups.connected.length} onClick={onRemoveAll}><Link2Off size={16} /></button>
+              <button className="btn btn-icon" title="检查本机连接" aria-label="检查本机连接" disabled={Boolean(busyAction)} onClick={onTest}>
                 <Activity size={16} />
               </button>
             </div>
@@ -180,8 +204,8 @@ export function AiConnectionsPage({
             <div className={`mcp-test-result ${testResult.ok ? 'success' : 'error'}`} role="status">
               <div className="mcp-test-icon">{testResult.ok ? <CircleCheck size={17} /> : <CircleAlert size={17} />}</div>
               <div className="mcp-test-copy">
-                <strong>{testResult.ok ? 'Agent MCP 服务正常' : 'Agent MCP 服务异常'}</strong>
-                <span>{testResult.server_name || 'himind-agent'} · 协议 {testResult.protocol_version || '--'}</span>
+                <strong>{testResult.ok ? '本机连接正常' : '本机连接异常'}</strong>
+                <span>{testResult.ok ? `已发现 ${testResult.capability_count} 项功能` : '请检查应用状态后重试'}</span>
               </div>
               <div className="mcp-test-metrics">
                 <div><span>工具</span><strong>{testResult.capability_count}</strong></div>
@@ -190,41 +214,41 @@ export function AiConnectionsPage({
             </div>
           ) : null}
 
-          {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>工作台账号未连接</strong><span>MCP 注册不受影响；需要访问工作台数据时再完成账号连接。</span></div><button className="btn" onClick={onOpenAccount}>连接账号</button></div> : null}
+          {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>工作台账号未连接</strong><span>AI 工具连接不受影响；需要访问工作台数据时再连接账号。</span></div><button className="btn" onClick={onOpenAccount}>连接账号</button></div> : null}
 
-          {groups.builtin.length ? <ConnectionSection title="Agent 内置" description="HiMind AI 会话自动加载本地 MCP、技能和插件能力。" count={groups.builtin.length}>
+          {groups.builtin.length ? <ConnectionSection title="HiMind 内置" description="HiMind AI 会话会自动加载本机插件和技能。" count={groups.builtin.length}>
             {groups.builtin.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
           </ConnectionSection> : null}
 
-          <ConnectionSection title="已注册 MCP" description="这些 AI 工具已经可以调用 HiMind Agent。" count={groups.connected.length}>
+          <ConnectionSection title="已连接" description="这些 AI 工具已经可以使用 HiMind。" count={groups.connected.length}>
             {groups.connected.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
-            {!groups.connected.length ? <EmptyConnectionRow text="还没有注册 MCP 的外部 AI 工具" /> : null}
+            {!groups.connected.length ? <EmptyConnectionRow text="还没有连接其他 AI 工具" /> : null}
           </ConnectionSection>
 
-          <ConnectionSection title="待注册" description="可一键写入 MCP 配置。" count={groups.actionable.length} tone={groups.actionable.length ? 'attention' : 'default'}>
+          <ConnectionSection title="待连接" description="可自动完成连接配置。" count={groups.actionable.length} tone={groups.actionable.length ? 'attention' : 'default'}>
             {groups.actionable.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
-            {!groups.actionable.length ? <EmptyConnectionRow text="可管理的 AI 工具均已注册" success /> : null}
+            {!groups.actionable.length ? <EmptyConnectionRow text="可自动连接的工具均已连接" success /> : null}
           </ConnectionSection>
 
-          {groups.manual.length ? <ConnectionSection title="手动注册" description="客户端配置格式需要保留，请在客户端设置中粘贴配置。" count={groups.manual.length} tone="attention">
+          {groups.manual.length ? <ConnectionSection title="手动连接" description="请在对应 AI 工具的设置中粘贴配置。" count={groups.manual.length} tone="attention">
             {groups.manual.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
           </ConnectionSection> : null}
 
           {groups.unavailable.length ? <details className="ai-unavailable">
-            <summary><div><CircleDashed size={16} /><span><strong>暂不可用的客户端</strong><small>未安装或暂不可用，不影响其他工具</small></span></div><Pill kind="neutral">{groups.unavailable.length}</Pill></summary>
+            <summary><div><CircleDashed size={16} /><span><strong>暂不可用的工具</strong><small>未安装或暂不可用，不影响其他工具</small></span></div><Pill kind="neutral">{groups.unavailable.length}</Pill></summary>
             <div className="ai-client-list">
               {groups.unavailable.map(target => <ConnectionRow key={target.id} target={target} unavailable busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
             </div>
           </details> : null}
 
           {targets.length ? <details className="ai-advanced">
-            <summary><Settings2 size={16} /><span><strong>注册诊断</strong><small>查看配置位置、格式和手动配置片段</small></span></summary>
+            <summary><Settings2 size={16} /><span><strong>连接诊断</strong><small>查看配置位置、格式和手动配置片段</small></span></summary>
             <div className="ai-diagnostic-list">
               {targets.map(target => {
                 const state = targetState(target);
                 return <div className="ai-diagnostic-item" key={target.id}>
                   <div className="ai-diagnostic-heading"><strong>{target.name}</strong><Pill kind={state.kind}>{state.label}</Pill></div>
-                  <div className="ai-diagnostic-path"><span>配置文件</span><code title={target.config_path}>{target.config_path || '由 Agent 会话管理'}</code></div>
+                  <div className="ai-diagnostic-path"><span>配置文件</span><code title={target.config_path}>{target.config_path || '由当前会话管理'}</code></div>
                   <div className="ai-diagnostic-path"><span>配置格式</span><code>{target.config_format || '--'}</code></div>
                   {target.error ? <div className="ai-diagnostic-error">{target.error}</div> : null}
                   {(target.config_preview || target.manual_snippet) ? <details className="ai-config-preview">
@@ -262,7 +286,7 @@ function ConnectionRow({ target, unavailable = false, busyAction, onApplyTarget,
     <div className="ai-client-copy"><strong>{target.name}</strong><span>{targetDescription(target)}</span></div>
     <Pill kind={state.kind}>{unavailable ? '暂不可用' : state.label}</Pill>
     <div className="ai-client-registration-actions">
-      {builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 内置</span> : unavailable ? <span className="ai-target-unavailable">暂不可用</span> : !target.supports_auto_configure ? <><button className="btn btn-icon" title={`复制 ${target.name} MCP 配置`} aria-label={`复制 ${target.name} MCP 配置`} onClick={() => onCopyTarget(target)}><Copy size={15} /></button>{target.config_directory ? <button className="btn btn-icon" title={`打开 ${target.name} 配置目录`} aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} /></button> : null}</> : target.state === 'configured' ? <button className="btn btn-icon ai-row-remove" title={`取消 ${target.name} 注册`} aria-label={`取消 ${target.name} 注册`} disabled={pending} onClick={() => onRemoveTarget(target.id)}><Unplug size={15} /></button> : <button className="btn btn-icon btn-primary" title={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '注册 MCP'} ${target.name}`} aria-label={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '注册 MCP'} ${target.name}`} disabled={pending} onClick={() => onApplyTarget(target.id, target.state === 'invalid_config')}><PlugZap size={15} /></button>}
+        {builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 内置</span> : unavailable ? <span className="ai-target-unavailable">暂不可用</span> : !target.supports_auto_configure ? <><button className="btn btn-icon" title={`复制 ${target.name} MCP 配置`} aria-label={`复制 ${target.name} MCP 配置`} onClick={() => onCopyTarget(target)}><Copy size={15} /></button>{target.config_directory ? <button className="btn btn-icon" title={`打开 ${target.name} 配置目录`} aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} /></button> : null}</> : target.state === 'configured' ? <button className="btn btn-icon ai-row-remove" title={`断开 ${target.name}`} aria-label={`断开 ${target.name}`} disabled={pending} onClick={() => onRemoveTarget(target.id)}><Unplug size={15} /></button> : <button className="btn btn-icon btn-primary" title={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '连接'} ${target.name}`} aria-label={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '连接'} ${target.name}`} disabled={pending} onClick={() => onApplyTarget(target.id, target.state === 'invalid_config')}><PlugZap size={15} /></button>}
     </div>
   </article>;
 }
@@ -284,19 +308,19 @@ function targetIconClass(id: string) {
 
 function targetState(target: McpTargetDescriptor): { label: string; kind: 'success' | 'warn' | 'danger' | 'neutral' } {
   if (target.id === 'himind-ai') return { label: '已就绪', kind: 'success' };
-  if (target.state === 'configured') return { label: '已注册', kind: 'success' };
+  if (target.state === 'configured') return { label: '已连接', kind: 'success' };
   if (target.state === 'needs_repair') return { label: '需要更新', kind: 'warn' };
   if (target.state === 'invalid_config') return { label: '配置异常', kind: 'danger' };
   if (!target.detected && target.state === 'not_configured') return { label: '暂不可用', kind: 'neutral' };
-  return { label: target.detected ? '可注册' : '暂不可用', kind: 'neutral' };
+  return { label: target.detected ? '可连接' : '暂不可用', kind: 'neutral' };
 }
 
 function targetDescription(target: McpTargetDescriptor) {
-  if (target.id === 'himind-ai') return '会话自动加载本地 MCP、技能和插件能力';
-  if (!target.supports_auto_configure && target.state !== 'configured') return '在客户端设置中粘贴 MCP 配置即可注册';
-  if (target.state === 'configured') return `MCP 已注册，重启 ${target.name} 后生效`;
-  if (!target.detected) return target.config_path ? '客户端未被识别，已有配置不会被修改' : '未在这台电脑上检测到客户端';
+  if (target.id === 'himind-ai') return '会话自动加载本机插件和技能';
+  if (!target.supports_auto_configure && target.state !== 'configured') return '在工具设置中粘贴 MCP 配置即可连接';
+  if (target.state === 'configured') return `已连接，重启 ${target.name} 后生效`;
+  if (!target.detected) return target.config_path ? '未识别到该工具，已有配置不会被修改' : '未在这台电脑上检测到该工具';
   if (target.state === 'invalid_config') return '配置文件格式异常，修复时会先保留备份';
-  if (target.state === 'needs_repair') return '当前注册内容与 Agent 配置不一致';
-  return '可以注册 HiMind Agent MCP 服务';
+  if (target.state === 'needs_repair') return '当前连接内容与 HiMind 配置不一致';
+  return '可以连接到 HiMind';
 }

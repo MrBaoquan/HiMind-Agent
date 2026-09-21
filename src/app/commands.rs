@@ -1,9 +1,12 @@
+use serde::Serialize;
 use serde_json::json;
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use crate::api::distribution::ExtensionDesiredState;
@@ -836,6 +839,16 @@ pub(crate) async fn get_builtin_ai_runtime_status(
 }
 
 #[tauri::command]
+pub(crate) fn pick_runtime_manifest() -> Result<serde_json::Value, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("选择 Runtime 发布清单")
+        .add_filter("Runtime Release Manifest", &["json"])
+        .pick_file()
+        .map(|value| value.to_string_lossy().to_string());
+    Ok(json!({ "path": path }))
+}
+
+#[tauri::command]
 pub(crate) async fn get_builtin_ai_runtime_installation_status(
     _state: State<'_, AgentState>,
 ) -> Result<BuiltinAIRuntimeInstallationStatus, String> {
@@ -867,6 +880,7 @@ pub(crate) async fn get_builtin_ai_runtime_installation_status(
 pub(crate) async fn start_builtin_ai_runtime_install(
     state: State<'_, AgentState>,
     operation: Option<String>,
+    manifest_path: Option<String>,
 ) -> Result<BuiltinAIRuntimeInstallationStatus, String> {
     let operation = operation
         .unwrap_or_else(|| "install".to_string())
@@ -874,10 +888,24 @@ pub(crate) async fn start_builtin_ai_runtime_install(
         .to_ascii_lowercase();
     if !matches!(
         operation.as_str(),
-        "install" | "update" | "repair" | "uninstall"
+        "install" | "update" | "repair" | "local" | "uninstall"
     ) {
         return Err("不支持的 HiMind AI 运行时操作".to_string());
     }
+    let local_manifest_guard = if operation == "local" {
+        let manifest_path = manifest_path
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("本地安装需要选择 Runtime 发布清单")?;
+        Some(
+            crate::runtime::distribution::use_local_manifest_scoped(manifest_path)
+                .map_err(|error| error.to_string())?,
+        )
+    } else if manifest_path.is_some() {
+        return Err("只有本地安装可以指定 Runtime 发布清单".to_string());
+    } else {
+        None
+    };
     let installation = builtin_ai_runtime_installation();
     {
         let mut current = installation
@@ -910,6 +938,7 @@ pub(crate) async fn start_builtin_ai_runtime_install(
         current.message = match operation.as_str() {
             "update" => "正在检查 HiMind AI 运行时更新".to_string(),
             "repair" => "正在准备修复 HiMind AI 运行时".to_string(),
+            "local" => "正在读取本地 Runtime 发布清单".to_string(),
             "uninstall" => "正在准备卸载 HiMind AI 运行时".to_string(),
             _ => "正在检查可用的 HiMind AI 运行时".to_string(),
         };
@@ -931,6 +960,7 @@ pub(crate) async fn start_builtin_ai_runtime_install(
     let logs = Arc::clone(&state.approval_manager);
     let operation_for_thread = operation.clone();
     thread::spawn(move || {
+        let _local_manifest_guard = local_manifest_guard;
         let mut report_progress = |stage: &str, progress_percent: u8, message: &str| {
             update_builtin_ai_runtime_installation(
                 &operation_for_thread,
@@ -974,6 +1004,7 @@ pub(crate) async fn start_builtin_ai_runtime_install(
                     current.message = match operation_for_thread.as_str() {
                         "update" => "HiMind AI 运行时已更新".to_string(),
                         "repair" => "HiMind AI 运行时已修复".to_string(),
+                        "local" => "HiMind AI 运行时本地安装完成".to_string(),
                         "uninstall" => "HiMind AI 运行时已卸载".to_string(),
                         _ => "HiMind AI 运行时已就绪".to_string(),
                     };
@@ -1007,6 +1038,7 @@ fn runtime_operation_label(operation: &str) -> &'static str {
     match operation {
         "update" => "更新",
         "repair" => "修复",
+        "local" => "本地安装",
         "uninstall" => "卸载",
         _ => "安装",
     }
@@ -1206,6 +1238,17 @@ pub(crate) async fn start_builtin_ai_session(
             Err(present_builtin_ai_start_error(&error))
         }
     }
+}
+
+#[tauri::command]
+pub(crate) async fn open_builtin_ai_web(
+    state: State<'_, AgentState>,
+    project_id: Option<String>,
+    extension_workspace: Option<bool>,
+) -> Result<String, String> {
+    let session_url = start_builtin_ai_session(state, project_id, extension_workspace).await?;
+    open_url(&session_url).map_err(|error| error.to_string())?;
+    Ok(session_url)
 }
 
 #[tauri::command]
@@ -1648,9 +1691,11 @@ pub(crate) async fn set_extension_unit_acquisition(
 pub(crate) async fn install_extension_unit(
     state: State<'_, AgentState>,
     unit_key: String,
+    source_id: String,
 ) -> Result<crate::app::extension_source::ExtensionUnitInstallReport, String> {
     let report = tauri::async_runtime::spawn_blocking(move || {
-        crate::app::extension_source::install_unit(&unit_key).map_err(|error| error.to_string())
+        crate::app::extension_source::install_unit_bound(&unit_key, Some(&source_id))
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())??;
@@ -1828,6 +1873,101 @@ pub(crate) async fn list_ai_services(
 }
 
 #[tauri::command]
+pub(crate) async fn list_acp_runtime_profiles() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(json!({
+            "profiles": crate::store::acp_profiles::list().map_err(|error| error.to_string())?,
+            "providers": crate::runtime::probe_installations(),
+        }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_projection_sync_status(
+    state: State<'_, AgentState>,
+) -> Result<crate::agent_core_projection::ProjectionSyncStatus, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::agent_core_projection::projection_sync_status(&options)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn save_acp_runtime_profile(
+    state: State<'_, AgentState>,
+    provider_id: String,
+    display_name: String,
+    executable: String,
+    args: Vec<String>,
+    version: String,
+    permission_policy: String,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let profile =
+        crate::store::acp_profiles::upsert(crate::store::acp_profiles::AcpRuntimeProfileRecord {
+            provider_id,
+            display_name,
+            executable,
+            args,
+            version,
+            permission_policy,
+            enabled,
+        })
+        .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!("已保存 ACP Runtime Profile: {}", profile.provider_id),
+    );
+    serde_json::to_value(profile).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_acp_runtime_profile_enabled(
+    state: State<'_, AgentState>,
+    provider_id: String,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let profile = crate::store::acp_profiles::set_enabled(&provider_id, enabled)
+        .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "{} ACP Runtime Profile: {}",
+            if enabled { "已启用" } else { "已停用" },
+            profile.provider_id
+        ),
+    );
+    serde_json::to_value(profile).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn remove_acp_runtime_profile(
+    state: State<'_, AgentState>,
+    provider_id: String,
+) -> Result<serde_json::Value, String> {
+    let removed =
+        crate::store::acp_profiles::remove(&provider_id).map_err(|error| error.to_string())?;
+    if removed {
+        state.approval_manager.add_log(
+            "info",
+            &format!(
+                "已删除 ACP Runtime Profile: {}",
+                crate::store::acp_profiles::normalize_provider_id(&provider_id)
+            ),
+        );
+    }
+    Ok(json!({
+        "provider_id": crate::store::acp_profiles::normalize_provider_id(&provider_id),
+        "removed": removed,
+    }))
+}
+
+#[tauri::command]
 pub(crate) fn save_ai_service(
     state: State<'_, AgentState>,
     id: String,
@@ -1854,6 +1994,13 @@ pub(crate) fn save_ai_service(
             api_key,
         })
         .map_err(|e| e.to_string())?;
+    if crate::store::ai_services::active_id()
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some(service.id.as_str())
+    {
+        crate::app::ui::stop_builtin_ai_process();
+    }
     state.approval_manager.add_log(
         "info",
         &format!("已保存自定义 AI 服务: {}", service.display_name),
@@ -1867,11 +2014,37 @@ pub(crate) fn remove_ai_service(state: State<'_, AgentState>, id: String) -> Res
         .map_err(|error| error.to_string())?;
     let removed = crate::store::ai_services::remove(&id).map_err(|e| e.to_string())?;
     if removed {
+        crate::app::ui::stop_builtin_ai_process();
         state
             .approval_manager
             .add_log("info", &format!("已删除自定义 AI 服务: {id}"));
     }
     Ok(removed)
+}
+
+#[tauri::command]
+pub(crate) fn set_active_ai_service(
+    state: State<'_, AgentState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let selected = crate::store::ai_services::set_active(&id).map_err(|e| e.to_string())?;
+    crate::app::ui::stop_builtin_ai_process();
+    if let Some(service) = selected.as_ref() {
+        state.approval_manager.add_log(
+            "info",
+            &format!(
+                "已将本机 AI 服务设为 HiMind AI 默认服务: {}",
+                service.display_name
+            ),
+        );
+    } else {
+        state
+            .approval_manager
+            .add_log("info", "已取消 HiMind AI 本机默认服务，恢复 DSH 原生设置");
+    }
+    Ok(json!({
+        "active_service_id": selected.map(|service| service.id).unwrap_or_default(),
+    }))
 }
 
 #[tauri::command]
@@ -2442,6 +2615,97 @@ pub(crate) fn confirm_plugin_draft(
 }
 
 #[tauri::command]
+pub(crate) fn list_workflow_drafts() -> Result<Vec<crate::workflow::WorkflowDraft>, String> {
+    crate::workflow::list_authoring_drafts().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn test_workflow_draft(
+    workflow_id: String,
+    version: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::workflow::WorkflowDraft, String> {
+    let capabilities = state
+        .capability_gateway
+        .list_capabilities(&InvocationContext::tauri())
+        .map_err(|error| error.to_string())?;
+    crate::workflow::test_authoring_candidate_with_capabilities(
+        &workflow_id,
+        &version,
+        &capabilities,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn confirm_workflow_draft(
+    workflow_id: String,
+    version: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::workflow::WorkflowDraft, String> {
+    let capabilities = state
+        .capability_gateway
+        .list_capabilities(&InvocationContext::tauri())
+        .map_err(|error| error.to_string())?;
+    crate::workflow::confirm_authoring_candidate_with_capabilities(
+        &workflow_id,
+        &version,
+        &capabilities,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn submit_workflow_draft(
+    workflow_id: String,
+    version: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::workflow::WorkflowDraft, String> {
+    require_dashboard(&state)?;
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if agent_id.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    crate::workflow::submit_authoring_candidate(&state.options, &agent_id, &workflow_id, &version)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_workflow_submissions(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    require_dashboard(&state)?;
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if agent_id.is_empty() {
+        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+    }
+    let access = crate::api::oauth::platform_access_token(
+        &state.options,
+        crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
+    )
+    .map_err(|error| error.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::api::distribution::workflow_submissions(
+        &client,
+        &state.dashboard_base,
+        &agent_id,
+        &access.token,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn list_plugin_submissions(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginSubmissionStatus>, String> {
@@ -2611,15 +2875,26 @@ pub(crate) fn install_organization_skill(
     skill_id: String,
     version: Option<String>,
     optional_plugin_ids: Option<Vec<String>>,
+    source: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
-    let source_item = merged_skill_catalog(&state)?
-        .into_iter()
-        .find(|item| item.skill_id == skill_id && item.source.starts_with("github:"));
-    if source_item.is_some() {
-        let (catalog_item, record) =
-            crate::app::extension_source::install_skill(&skill_id, version.as_deref())
-                .map_err(|error| error.to_string())?;
+    let public_source_id = public_extension_source_id(source.as_deref());
+    let use_public_source = public_source_id.is_some()
+        || (source.is_none()
+            && merged_skill_catalog(&state)?.into_iter().any(|item| {
+                item.skill_id == skill_id
+                    && (item.source.starts_with("local:") || item.source.starts_with("github:"))
+            }));
+    if use_public_source {
+        let (catalog_item, record) = crate::app::extension_source::install_skill_bound(
+            &skill_id,
+            version.as_deref(),
+            public_source_id,
+            sha256.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
         let capability_facts = skill_capability_facts(&state)?;
         let rendered =
             crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
@@ -2640,12 +2915,14 @@ pub(crate) fn install_organization_skill(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    let (catalog_item, record) = crate::app::skill_manager::install_with_dependencies(
+    let (catalog_item, record) = crate::app::skill_manager::install_with_dependencies_bound(
         &state.options,
         &agent_id,
         &skill_id,
         version.as_deref(),
         optional_plugin_ids.as_deref().unwrap_or_default(),
+        artifact_id.as_deref(),
+        sha256.as_deref(),
     )
     .map_err(|error| error.to_string())?;
     let capability_facts = skill_capability_facts(&state)?;
@@ -2666,14 +2943,26 @@ pub(crate) fn install_organization_skill(
 pub(crate) fn plan_organization_skill_install(
     skill_id: String,
     version: Option<String>,
+    source: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<crate::app::skill_manager::SkillInstallPlan, String> {
-    let source_item = merged_skill_catalog(&state)?
-        .into_iter()
-        .find(|item| item.skill_id == skill_id && item.source.starts_with("github:"));
-    if source_item.is_some() {
-        return crate::app::extension_source::plan_skill(&skill_id, version.as_deref())
-            .map_err(|error| error.to_string());
+    let public_source_id = public_extension_source_id(source.as_deref());
+    if public_source_id.is_some()
+        || (source.is_none()
+            && merged_skill_catalog(&state)?.into_iter().any(|item| {
+                item.skill_id == skill_id
+                    && (item.source.starts_with("local:") || item.source.starts_with("github:"))
+            }))
+    {
+        return crate::app::extension_source::plan_skill_bound(
+            &skill_id,
+            version.as_deref(),
+            public_source_id,
+            sha256.as_deref(),
+        )
+        .map_err(|error| error.to_string());
     }
     require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
@@ -2681,11 +2970,13 @@ pub(crate) fn plan_organization_skill_install(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::app::skill_manager::plan_install(
+    crate::app::skill_manager::plan_install_bound(
         &state.options,
         &agent_id,
         &skill_id,
         version.as_deref(),
+        artifact_id.as_deref(),
+        sha256.as_deref(),
     )
     .map_err(|error| error.to_string())
 }
@@ -2693,14 +2984,22 @@ pub(crate) fn plan_organization_skill_install(
 #[tauri::command]
 pub(crate) fn get_skill_versions(
     skill_id: String,
+    source: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
-    if merged_skill_catalog(&state)?
-        .into_iter()
-        .any(|item| item.skill_id == skill_id && item.source.starts_with("github:"))
+    if public_extension_source_id(source.as_deref()).is_some()
+        || (source.is_none()
+            && merged_skill_catalog(&state)?.into_iter().any(|item| {
+                item.skill_id == skill_id
+                    && (item.source.starts_with("local:") || item.source.starts_with("github:"))
+            }))
     {
-        return crate::app::extension_source::skill_versions(&skill_id)
-            .map_err(|error| error.to_string());
+        let mut versions = crate::app::extension_source::skill_versions(&skill_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(source) = source.as_deref() {
+            versions.retain(|item| item.source == source);
+        }
+        return Ok(versions);
     }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
@@ -3031,16 +3330,20 @@ fn primary_skill_client(
         .or_else(|| clients.values().next().cloned())
 }
 
+fn public_extension_source_id(source: Option<&str>) -> Option<&str> {
+    source.and_then(|value| {
+        value
+            .strip_prefix("local:")
+            .or_else(|| value.strip_prefix("github:"))
+    })
+}
+
 fn merged_plugin_catalog(
     state: &AgentState,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
     let source_snapshot =
         crate::app::extension_source::snapshot().map_err(|error| error.to_string())?;
-    let mut items = source_snapshot
-        .plugins
-        .into_iter()
-        .map(|item| (item.plugin_id.clone(), item))
-        .collect::<HashMap<_, _>>();
+    let mut items = source_snapshot.plugins;
     if state.options.mode().dashboard_enabled() {
         let worker = local_worker_snapshot(&state.worker_status);
         let agent_id = worker
@@ -3064,9 +3367,7 @@ fn merged_plugin_catalog(
             };
             match dashboard {
                 Ok(catalog) => {
-                    for item in catalog {
-                        items.insert(item.plugin_id.clone(), item);
-                    }
+                    items.extend(catalog);
                 }
                 Err(error) if items.is_empty() => return Err(error.to_string()),
                 Err(_) => {}
@@ -3075,8 +3376,30 @@ fn merged_plugin_catalog(
             return Err("Agent 尚未完成 Dashboard 配对".to_string());
         }
     }
-    let mut result = items.into_values().collect::<Vec<_>>();
-    result.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let mut seen = HashSet::new();
+    items.retain(|item| {
+        seen.insert((
+            item.plugin_id.clone(),
+            item.source.clone(),
+            item.version.clone(),
+            item.artifact_id.clone(),
+            item.sha256.clone(),
+        ))
+    });
+    let mut result = items;
+    result.sort_by(|left, right| {
+        left.plugin_id
+            .cmp(&right.plugin_id)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    // 发布元数据可能缺少分类（旧制品或未声明 categories 的清单），按
+    // Capability 命名空间兜底，与工作流保持同一套规则。
+    for item in result.iter_mut() {
+        crate::extension_category::fill_missing_categories(
+            &item.capability_ids,
+            &mut item.categories,
+        );
+    }
     Ok(result)
 }
 
@@ -3085,11 +3408,7 @@ fn merged_skill_catalog(
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
     let source_snapshot =
         crate::app::extension_source::snapshot().map_err(|error| error.to_string())?;
-    let mut items = source_snapshot
-        .skills
-        .into_iter()
-        .map(|item| (item.skill_id.clone(), item))
-        .collect::<HashMap<_, _>>();
+    let mut items = source_snapshot.skills;
     if state.options.mode().dashboard_enabled() {
         let worker = local_worker_snapshot(&state.worker_status);
         let agent_id = worker
@@ -3100,9 +3419,7 @@ fn merged_skill_catalog(
         if !agent_id.is_empty() && !credential.is_empty() {
             match crate::app::skill_manager::catalog(&state.options, agent_id) {
                 Ok(catalog) => {
-                    for item in catalog {
-                        items.insert(item.skill_id.clone(), item);
-                    }
+                    items.extend(catalog);
                 }
                 Err(error) if items.is_empty() => return Err(error.to_string()),
                 Err(_) => {}
@@ -3111,8 +3428,28 @@ fn merged_skill_catalog(
             return Err("Agent 尚未完成 Dashboard 配对".to_string());
         }
     }
-    let mut result = items.into_values().collect::<Vec<_>>();
-    result.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
+    let mut seen = HashSet::new();
+    items.retain(|item| {
+        seen.insert((
+            item.skill_id.clone(),
+            item.source.clone(),
+            item.version.clone(),
+            item.artifact_id.clone(),
+            item.sha256.clone(),
+        ))
+    });
+    let mut result = items;
+    result.sort_by(|left, right| {
+        left.skill_id
+            .cmp(&right.skill_id)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    for item in result.iter_mut() {
+        crate::extension_category::fill_missing_categories(
+            &item.capability_ids,
+            &mut item.categories,
+        );
+    }
     Ok(result)
 }
 
@@ -3149,6 +3486,98 @@ fn filter_skill_catalog(
                 || format!("{} {} {}", item.skill_id, item.name, item.description)
                     .to_ascii_lowercase()
                     .contains(&query))
+                && (category.is_empty()
+                    || category == "all"
+                    || item.categories.iter().any(|value| value == category))
+        })
+        .collect()
+}
+
+/// Resolve the Workflow catalog the same way `get_workflow_center` always has:
+/// local/GitHub extension sources first, then the organization catalog.
+///
+/// The error string is only meaningful when nothing could be resolved at all.
+/// A partially reachable catalog must not present itself as an empty one, so a
+/// non-empty result always reports an empty error.
+fn merged_workflow_catalog(
+    options: &crate::Options,
+) -> Result<(Vec<crate::api::distribution::WorkflowCatalogItem>, String), String> {
+    let mut catalog = Vec::new();
+    let mut errors = Vec::new();
+    match crate::app::extension_source::snapshot() {
+        Ok(snapshot) => catalog.extend(snapshot.workflows),
+        Err(error) => errors.push(error.to_string()),
+    }
+    if options.mode().dashboard_enabled() {
+        match crate::api::client::load_agent_state(&options.state_path) {
+            Ok(state) => match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => match crate::api::distribution::workflow_catalog(
+                    &client,
+                    &options.api_base,
+                    &state.agent_id,
+                    &state.credential,
+                ) {
+                    Ok(items) => catalog.extend(items),
+                    Err(error) => errors.push(error.to_string()),
+                },
+                Err(error) => errors.push(error.to_string()),
+            },
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    dedupe_workflow_catalog(&mut catalog);
+    // Dashboard 发布的工作流同样不带分类，这里统一按 Capability 命名空间补齐；
+    // 显式声明的分类不会被覆盖。与扩展源走同一条规则，避免两个来源分叉。
+    for item in catalog.iter_mut() {
+        crate::extension_category::fill_missing_categories(
+            &item.capability_ids,
+            &mut item.categories,
+        );
+    }
+    let error = if catalog.is_empty() {
+        errors.join("; ")
+    } else {
+        String::new()
+    };
+    Ok((catalog, error))
+}
+
+fn dedupe_workflow_catalog(items: &mut Vec<crate::api::distribution::WorkflowCatalogItem>) {
+    let mut seen = HashSet::new();
+    items.retain(|item| {
+        seen.insert((
+            item.workflow_id.clone(),
+            item.source.clone(),
+            item.version.clone(),
+            item.artifact_id.clone(),
+            item.sha256.clone(),
+        ))
+    });
+}
+
+fn filter_workflow_catalog(
+    items: Vec<crate::api::distribution::WorkflowCatalogItem>,
+    query: &str,
+    category: &str,
+) -> Vec<crate::api::distribution::WorkflowCatalogItem> {
+    let query = query.trim().to_ascii_lowercase();
+    items
+        .into_iter()
+        .filter(|item| {
+            (query.is_empty()
+                || format!(
+                    "{} {} {} {} {}",
+                    item.workflow_id,
+                    item.name,
+                    item.description,
+                    item.author_name,
+                    item.capability_ids.join(" ")
+                )
+                .to_ascii_lowercase()
+                .contains(&query))
                 && (category.is_empty()
                     || category == "all"
                     || item.categories.iter().any(|value| value == category))
@@ -3217,14 +3646,23 @@ pub(crate) async fn query_plugin_catalog(
 #[tauri::command]
 pub(crate) fn get_plugin_versions(
     plugin_id: String,
+    source: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
-    if merged_plugin_catalog(&state)?
-        .into_iter()
-        .any(|item| item.plugin_id == plugin_id && item.source.starts_with("github:"))
+    let public_source_id = public_extension_source_id(source.as_deref());
+    if public_source_id.is_some()
+        || (source.is_none()
+            && merged_plugin_catalog(&state)?.into_iter().any(|item| {
+                item.plugin_id == plugin_id
+                    && (item.source.starts_with("local:") || item.source.starts_with("github:"))
+            }))
     {
-        return crate::app::extension_source::plugin_versions(&plugin_id)
-            .map_err(|error| error.to_string());
+        let mut versions = crate::app::extension_source::plugin_versions(&plugin_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(source) = source.as_deref() {
+            versions.retain(|item| item.source == source);
+        }
+        return Ok(versions);
     }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
@@ -3255,13 +3693,25 @@ pub(crate) fn plan_plugin_install(
     state: State<'_, AgentState>,
     plugin_id: String,
     version: Option<String>,
+    source: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
 ) -> Result<crate::app::plugin_manager::PluginInstallPlan, String> {
-    if merged_plugin_catalog(&state)?
-        .iter()
-        .any(|item| item.plugin_id == plugin_id && item.source.starts_with("github:"))
+    let public_source_id = public_extension_source_id(source.as_deref());
+    if public_source_id.is_some()
+        || (source.is_none()
+            && merged_plugin_catalog(&state)?.iter().any(|item| {
+                item.plugin_id == plugin_id
+                    && (item.source.starts_with("local:") || item.source.starts_with("github:"))
+            }))
     {
-        return crate::app::extension_source::plan_plugin(&plugin_id, version.as_deref())
-            .map_err(|error| error.to_string());
+        return crate::app::extension_source::plan_plugin_bound(
+            &plugin_id,
+            version.as_deref(),
+            public_source_id,
+            sha256.as_deref(),
+        )
+        .map_err(|error| error.to_string());
     }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
@@ -3269,11 +3719,13 @@ pub(crate) fn plan_plugin_install(
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    crate::app::plugin_manager::plan_install(
+    crate::app::plugin_manager::plan_install_bound(
         &state.options,
         agent_id,
         &plugin_id,
         version.as_deref(),
+        artifact_id.as_deref(),
+        sha256.as_deref(),
     )
     .map_err(|error| error.to_string())
 }
@@ -3283,16 +3735,28 @@ pub(crate) fn install_plugin(
     state: State<'_, AgentState>,
     plugin_id: String,
     version: Option<String>,
+    source: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
 ) -> Result<(), String> {
-    if merged_plugin_catalog(&state)?
-        .iter()
-        .any(|item| item.plugin_id == plugin_id && item.source.starts_with("github:"))
+    let public_source_id = public_extension_source_id(source.as_deref());
+    if public_source_id.is_some()
+        || (source.is_none()
+            && merged_plugin_catalog(&state)?.iter().any(|item| {
+                item.plugin_id == plugin_id
+                    && (item.source.starts_with("local:") || item.source.starts_with("github:"))
+            }))
     {
-        return crate::app::extension_source::install_plugin(&plugin_id, version.as_deref())
-            .map(|_| {
-                let _ = crate::app::extension_source::reconcile_dsh_presets_now();
-            })
-            .map_err(|error| error.to_string());
+        return crate::app::extension_source::install_plugin_bound(
+            &plugin_id,
+            version.as_deref(),
+            public_source_id,
+            sha256.as_deref(),
+        )
+        .map(|_| {
+            let _ = crate::app::extension_source::reconcile_dsh_presets_now();
+        })
+        .map_err(|error| error.to_string());
     }
     require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
@@ -3301,11 +3765,13 @@ pub(crate) fn install_plugin(
         .unwrap_or_default()
         .to_string();
     let previous = crate::app::plugin_manager::local_status(&plugin_id).current_version;
-    let result = crate::app::plugin_manager::install(
+    let result = crate::app::plugin_manager::install_bound(
         &state.options,
         &agent_id,
         &plugin_id,
         version.as_deref(),
+        artifact_id.as_deref(),
+        sha256.as_deref(),
     );
     let report_error = result
         .as_ref()
@@ -3540,6 +4006,11 @@ pub(crate) fn get_plugin_view_context(window: WebviewWindow) -> Result<serde_jso
     Ok(serde_json::json!({
         "plugin_id": plugin_id,
         "view_id": view_id,
+        // The private data directory belongs to this extension only; the Agent
+        // derives it from the plugin id so a view cannot ask for another one.
+        "data_root": crate::capability::plugin::plugin_data_dir(&plugin_id)
+            .to_string_lossy()
+            .to_string(),
         "workspace_root": workspace_root,
         "workspace_source": workspace.get("source").cloned().unwrap_or(serde_json::Value::Null),
         "workspace_bound": workspace.get("bound").cloned().unwrap_or(serde_json::Value::Bool(false)),
@@ -3550,7 +4021,7 @@ pub(crate) fn get_plugin_view_context(window: WebviewWindow) -> Result<serde_jso
 #[tauri::command]
 pub(crate) fn pick_workspace_directory() -> Result<serde_json::Value, String> {
     let path = rfd::FileDialog::new()
-        .set_title("选择短视频项目工作区")
+        .set_title("选择本机目录")
         .pick_folder()
         .map(|value| value.to_string_lossy().to_string());
     Ok(json!({ "path": path }))
@@ -3635,13 +4106,438 @@ pub(crate) async fn invoke_plugin_view_capability(
 }
 
 #[tauri::command]
-pub(crate) fn get_workflow_center() -> Result<serde_json::Value, String> {
-    workflow_center_snapshot().map_err(|error| error.to_string())
+/// 定时任务的读/写入口。
+///
+/// UI 只做展示与编辑，调度语义完全落在 `crate::scheduler`：到点由 Agent
+/// 调度线程按 `kind` 派发目标，UI 不参与执行。
+pub(crate) fn list_schedules() -> Result<serde_json::Value, String> {
+    crate::scheduler::list(crate::scheduler::now_epoch()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_schedule(input: serde_json::Value) -> Result<serde_json::Value, String> {
+    crate::scheduler::set(&input, crate::scheduler::now_epoch()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn delete_schedule(id: String) -> Result<serde_json::Value, String> {
+    crate::scheduler::delete(&id).map_err(|error| error.to_string())
+}
+
+/// 启动预设：把一套启动参数存下来，跨工作区复用时只改工作区。
+#[tauri::command]
+pub(crate) fn list_workflow_presets(
+    workflow_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    crate::workflow::list_run_presets(workflow_id.as_deref().unwrap_or_default())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_workflow_preset(input: serde_json::Value) -> Result<serde_json::Value, String> {
+    crate::workflow::set_run_preset(&input, crate::scheduler::now_epoch())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn delete_workflow_preset(id: String) -> Result<serde_json::Value, String> {
+    crate::workflow::delete_run_preset(&id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_skill_runs(limit: Option<usize>) -> Result<serde_json::Value, String> {
+    crate::skill_run::list(limit.unwrap_or(20)).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn run_skill(
+    state: State<'_, AgentState>,
+    skillId: String,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let options = state.capability_gateway.options().clone();
+    crate::skill_run::start(&options, "", &skillId, &input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn reveal_skill_run(run_id: String) -> Result<(), String> {
+    let record = crate::skill_run::get(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("技能运行不存在：{run_id}"))?;
+    // 结果文件可能还没生成（运行中/失败），此时退回到运行目录，保证“定位”始终有落点。
+    let target = if record.output_path.is_empty() {
+        crate::skill_run::runs_root().join(&record.run_id)
+    } else {
+        std::path::PathBuf::from(&record.output_path)
+    };
+    open_system_folder(&target.to_string_lossy()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_workflow_center(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    workflow_center_snapshot(state.capability_gateway.options()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn query_workflow_catalog(
+    q: String,
+    category: String,
+    page: usize,
+    page_size: usize,
+    state: State<'_, AgentState>,
+) -> Result<crate::api::distribution::WorkflowCatalogPage, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (items, error) = merged_workflow_catalog(&state.options)?;
+        if items.is_empty() && !error.is_empty() {
+            return Err(error);
+        }
+        let items = filter_workflow_catalog(items, &q, &category);
+        Ok(catalog_page(items, page, page_size))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// List the versions a user can choose for one Workflow.
+///
+/// `source` is part of each item on purpose: the install command routes
+/// local/GitHub items through the extension source and everything else through
+/// the organization catalog, so the version picker has to keep that identity.
+#[tauri::command]
+pub(crate) fn get_workflow_versions(
+    workflow_id: String,
+    source: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::WorkflowCatalogItem>, String> {
+    let mut versions = Vec::new();
+    let mut errors = Vec::new();
+    if source
+        .as_deref()
+        .is_none_or(|value| value.starts_with("local:") || value.starts_with("github:"))
+    {
+        match crate::app::extension_source::workflow_versions(&workflow_id) {
+            Ok(mut items) => {
+                if let Some(source) = source.as_deref() {
+                    items.retain(|item| item.source == source);
+                }
+                versions.extend(items)
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if state.options.mode().dashboard_enabled()
+        && source
+            .as_deref()
+            .is_none_or(|value| !value.starts_with("local:") && !value.starts_with("github:"))
+    {
+        let snapshot = local_worker_snapshot(&state.worker_status);
+        let agent_id = snapshot
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let credential = state.options.agent_credential();
+        if !agent_id.is_empty() && !credential.is_empty() {
+            match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => match crate::api::distribution::workflow_versions(
+                    &client,
+                    &state.dashboard_base,
+                    agent_id,
+                    &credential,
+                    &workflow_id,
+                ) {
+                    Ok(items) => versions.extend(items),
+                    Err(error) => errors.push(error.to_string()),
+                },
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+    }
+    dedupe_workflow_catalog(&mut versions);
+    versions.sort_by(|left, right| {
+        crate::skill::resolver::compare_versions(&right.version, &left.version)
+    });
+    if versions.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(versions)
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ConnectorStateItem {
+    id: String,
+    name: String,
+    version: String,
+    availability: String,
+    credential_ownership: String,
+    enabled: bool,
+    revoked: bool,
+    source: String,
+    remote_revision: u64,
+    reason: String,
+    updated_at: String,
+    credential_count: usize,
+}
+
+fn connector_state_snapshot() -> Result<Vec<ConnectorStateItem>, Box<dyn Error>> {
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    let mut connectors = std::collections::BTreeMap::new();
+    for installed in store.list()? {
+        for connector in installed.package.connectors {
+            connectors.entry(connector.id.clone()).or_insert(connector);
+        }
+    }
+    let states = crate::store::connector_state::list()?
+        .into_iter()
+        .map(|state| (state.connector_id.clone(), state))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut credential_counts = std::collections::BTreeMap::<String, usize>::new();
+    for credential in crate::store::connector_credentials::list()? {
+        *credential_counts
+            .entry(credential.connector_id)
+            .or_default() += 1;
+    }
+    for connector_id in states.keys() {
+        connectors.entry(connector_id.clone()).or_insert_with(|| {
+            crate::workflow::WorkflowConnectorManifest {
+                schema_version: "connector_manifest.v1".to_string(),
+                id: connector_id.clone(),
+                version: "0.0.0".to_string(),
+                name: connector_id.clone(),
+                description: String::new(),
+                availability: "local".to_string(),
+                credential_ownership: "agent".to_string(),
+                auth: vec!["none".to_string()],
+                capabilities: Vec::new(),
+                scopes: Vec::new(),
+                supported_platforms: Vec::new(),
+                health_check: Value::Null,
+                credentials: Vec::new(),
+            }
+        });
+    }
+    Ok(connectors
+        .into_values()
+        .map(|connector| {
+            let state = states.get(&connector.id).cloned().unwrap_or_else(|| {
+                crate::store::connector_state::ConnectorState {
+                    connector_id: connector.id.clone(),
+                    enabled: true,
+                    revoked: false,
+                    source: "local".to_string(),
+                    remote_revision: 0,
+                    reason: String::new(),
+                    updated_at: String::new(),
+                }
+            });
+            ConnectorStateItem {
+                id: connector.id,
+                name: connector.name,
+                version: connector.version,
+                availability: connector.availability,
+                credential_ownership: connector.credential_ownership,
+                enabled: state.enabled,
+                revoked: state.revoked,
+                source: state.source,
+                remote_revision: state.remote_revision,
+                reason: state.reason,
+                updated_at: state.updated_at,
+                credential_count: credential_counts
+                    .get(&state.connector_id)
+                    .copied()
+                    .unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub(crate) async fn get_connector_states() -> Result<Vec<ConnectorStateItem>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        connector_state_snapshot().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn set_connector_enabled(
+    connector_id: String,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = crate::store::connector_state::set_enabled(&connector_id, enabled)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(state).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn revoke_connector(
+    connector_id: String,
+    reason: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = crate::store::connector_state::revoke(
+            &connector_id,
+            reason.as_deref().unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())?;
+        serde_json::to_value(state).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn restore_connector(connector_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = crate::store::connector_state::restore(&connector_id)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(state).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn set_connector_file_credential(
+    connector_id: String,
+    handle: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let credential_spec = declared_connector_credential(&connector_id, &handle)?;
+        if credential_spec.kind != "file_path" {
+            return Err(format!(
+                "connector credential {handle} is not a file_path credential"
+            ));
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("选择 Connector 凭据文件")
+            .pick_file()
+        else {
+            return Ok(json!({
+                "cancelled": true,
+                "credential": null,
+            }));
+        };
+        let credential =
+            crate::store::connector_credentials::set_file_path(&handle, &connector_id, &path)
+                .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "cancelled": false,
+            "credential": credential,
+        }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn set_connector_secret_credential(
+    connector_id: String,
+    handle: String,
+    secret: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let credential_spec = declared_connector_credential(&connector_id, &handle)?;
+        if credential_spec.kind != "secret" {
+            return Err(format!(
+                "connector credential {handle} is not a secret credential"
+            ));
+        }
+        let credential =
+            crate::store::connector_credentials::set_secret(&handle, &connector_id, &secret)
+                .map_err(|error| error.to_string())?;
+        serde_json::to_value(credential).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn declared_connector_credential(
+    connector_id: &str,
+    handle: &str,
+) -> Result<crate::workflow::WorkflowConnectorCredential, String> {
+    let store =
+        crate::workflow::WorkflowStore::open_default().map_err(|error| error.to_string())?;
+    for installed in store.list().map_err(|error| error.to_string())? {
+        for connector in installed.package.connectors {
+            if connector.id != connector_id {
+                continue;
+            }
+            if let Some(credential) = connector
+                .credentials
+                .into_iter()
+                .find(|credential| credential.handle == handle)
+            {
+                return Ok(credential);
+            }
+        }
+    }
+    Err(format!(
+        "connector credential {handle} is not declared by connector {connector_id}"
+    ))
+}
+
+#[tauri::command]
+pub(crate) async fn remove_connector_credential(handle: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::store::connector_credentials::remove(&handle).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 pub(crate) fn get_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
     workflow_run_snapshot(&run_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn verify_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
+    workflow_run_verification(&run_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn reveal_workflow_artifact(run_id: String, artifact_id: String) -> Result<(), String> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()
+        .map_err(|error| error.to_string())?;
+    let run = ledger
+        .get_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let interaction = ledger
+        .get_interaction(&run.interaction_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "workflow run interaction is missing".to_string())?;
+    let package = crate::workflow::WorkflowStore::open_default()
+        .and_then(|store| store.load_for_run_interaction(&interaction))
+        .map_err(|error| error.to_string())?;
+    let verification =
+        crate::workflow::verify_run(&package, &run).map_err(|error| error.to_string())?;
+    let artifact = verification
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_id == artifact_id)
+        .ok_or_else(|| format!("workflow artifact not found: {artifact_id}"))?;
+    if artifact.uri.trim().is_empty() {
+        return Err("workflow artifact has no local file location".to_string());
+    }
+    let path = PathBuf::from(artifact.uri.trim())
+        .canonicalize()
+        .map_err(|error| format!("workflow artifact file is unavailable: {error}"))?;
+    if !path.is_file() {
+        return Err("workflow artifact location is not a file".to_string());
+    }
+    open_system_folder(&path.to_string_lossy()).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -3670,9 +4566,17 @@ pub(crate) fn cancel_workflow_run(run_id: String) -> Result<serde_json::Value, S
         .get_run(&run_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let approval_id = if run.current_step_id.trim().is_empty() {
+        String::new()
+    } else {
+        crate::workflow::workflow_approval_id(&run.run_id, &run.current_step_id)
+    };
     let run = runner
         .cancel(run, "workflow canceled from Agent UI")
         .map_err(|error| error.to_string())?;
+    if !approval_id.is_empty() {
+        let _ = ApprovalManager::global().interrupt(&approval_id, "workflow_canceled");
+    }
     serde_json::to_value(run).map_err(|error| error.to_string())
 }
 
@@ -3680,10 +4584,12 @@ pub(crate) fn cancel_workflow_run(run_id: String) -> Result<serde_json::Value, S
 pub(crate) async fn resume_workflow_run(
     state: State<'_, AgentState>,
     run_id: String,
+    feedback: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let gateway = state.capability_gateway.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        resume_workflow_with_gateway(gateway, &run_id).map_err(|error| error.to_string())
+        resume_workflow_with_gateway(gateway, &run_id, feedback.as_deref())
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3703,27 +4609,178 @@ pub(crate) async fn start_workflow_run(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub(crate) async fn preflight_workflow_run(
+    state: State<'_, AgentState>,
+    package_id: String,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        preflight_workflow_with_gateway(gateway, &package_id, input)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn install_workflow_catalog_item(
+    state: State<'_, AgentState>,
+    workflow_id: String,
+    version: Option<String>,
+    source: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if source
+            .as_deref()
+            .is_some_and(|value| value.starts_with("local:") || value.starts_with("github:"))
+        {
+            let source_id = public_extension_source_id(source.as_deref());
+            let (_, installed) = crate::app::extension_source::install_workflow_bound(
+                &workflow_id,
+                version.as_deref(),
+                source_id,
+                sha256.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+            return serde_json::to_value(installed).map_err(|error| error.to_string());
+        }
+        let options = gateway.options().clone();
+        let installed = crate::app::workflow_manager::install_dashboard_catalog_workflow_bound(
+            &options,
+            &workflow_id,
+            version.as_deref(),
+            artifact_id.as_deref(),
+            sha256.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        serde_json::to_value(installed).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn pick_workflow_archive() -> Result<serde_json::Value, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("选择 Workflow Package")
+        .add_filter("HiMind Workflow", &["hmwf", "zip"])
+        .pick_file()
+        .map(|value| value.to_string_lossy().to_string());
+    Ok(json!({ "path": path }))
+}
+
+#[tauri::command]
+pub(crate) async fn install_local_workflow_archive(
+    archive_path: String,
+    require_signature: bool,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let installed = crate::app::workflow_manager::install_local_archive(
+            PathBuf::from(archive_path).as_path(),
+            require_signature,
+        )
+        .map_err(|error| error.to_string())?;
+        serde_json::to_value(installed).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn set_workflow_enabled(
+    package_id: String,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store =
+            crate::workflow::WorkflowStore::open_default().map_err(|error| error.to_string())?;
+        let installed = store
+            .set_enabled(&package_id, enabled)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(installed).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn rollback_workflow(package_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store =
+            crate::workflow::WorkflowStore::open_default().map_err(|error| error.to_string())?;
+        let installed = store
+            .rollback(&package_id)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(installed).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn remove_workflow(package_id: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::workflow::WorkflowStore::open_default()
+            .and_then(|store| store.remove(&package_id))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn decide_workflow_step(
     run_id: &str,
     step_id: &str,
     approved: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let runner = crate::workflow::WorkflowRunner::open_default()?;
+    let approval_id = crate::workflow::workflow_approval_id(run_id, step_id);
+    let approval_manager = ApprovalManager::global();
+    let mut decision_error = None;
+    for attempt in 0..20 {
+        match approval_manager.respond(&approval_id, approved) {
+            Ok(()) => {
+                decision_error = None;
+                break;
+            }
+            Err(error) => {
+                decision_error = Some(error);
+                if attempt < 19 {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+    if let Some(error) = decision_error {
+        return Err(error.into());
+    }
+
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
-    let run = ledger
-        .get_run(run_id)?
-        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
-    let run = if approved {
-        runner.approve_step(run, step_id)?
-    } else {
-        runner.reject_step(run, step_id)?
-    };
+    let mut last_run = None;
+    for _ in 0..40 {
+        let run = ledger
+            .get_run(run_id)?
+            .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+        if run.status != crate::agent_core_contracts::LocalRunStatus::Waiting
+            || run.current_step_id != step_id
+        {
+            return Ok(serde_json::to_value(run)?);
+        }
+        thread::sleep(Duration::from_millis(50));
+        last_run = Some(run);
+    }
+    let run = last_run.ok_or_else(|| format!("workflow run not found: {run_id}"))?;
     Ok(serde_json::to_value(run)?)
 }
 
-fn resume_workflow_with_gateway(
+pub(crate) fn resume_workflow_with_gateway(
     gateway: CapabilityGateway,
     run_id: &str,
+    feedback: Option<&str>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
     let run = ledger
@@ -3732,23 +4789,13 @@ fn resume_workflow_with_gateway(
     let interaction = ledger
         .get_interaction(&run.interaction_id)?
         .ok_or("workflow run interaction is missing")?;
-    let package_id = interaction
-        .business_context
-        .get("workflow")
-        .and_then(|workflow| workflow.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or("workflow run does not contain a package reference")?;
-    let input = interaction
+    let mut input = interaction
         .business_context
         .get("input")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let package = crate::workflow::WorkflowStore::open_default()?
-        .list()?
-        .into_iter()
-        .find(|item| item.package.id == package_id && item.enabled)
-        .map(|item| item.package)
-        .ok_or_else(|| format!("workflow package not found or disabled: {package_id}"))?;
+    let package =
+        crate::workflow::WorkflowStore::open_default()?.load_for_run_interaction(&interaction)?;
     let context = InvocationContext::new(
         crate::capability::types::InvocationSource::Workflow,
         "workflow-ui",
@@ -3769,10 +4816,69 @@ fn resume_workflow_with_gateway(
     if !report.ready {
         return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
     }
+    if let Some(feedback) = feedback
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+    {
+        if let Some(object) = input.as_object_mut() {
+            object.insert("feedback".to_string(), json!(feedback));
+        }
+    }
     let runner = crate::workflow::WorkflowRunner::open_default()?;
-    let executor = crate::workflow::WorkflowGatewayExecutor::new(gateway, context);
+    let run = if let Some(feedback) = feedback
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+    {
+        runner.record_loop_feedback(&package, run, feedback)?
+    } else {
+        run
+    };
+    let executor = crate::workflow::WorkflowGatewayExecutor::new(
+        gateway,
+        context,
+        ledger.clone(),
+        run.run_id.clone(),
+    );
     let outcome = runner.run_ready(&package, run, &input, &executor)?;
     Ok(serde_json::to_value(outcome)?)
+}
+
+/// 后台执行一个已经创建（Queued）的运行。
+///
+/// 「受理即返回」是这条链路的硬要求：界面必须立刻接手渲染实时过程，
+/// 而不是等执行结束。启动、定时、恢复（含 `workflow.run.start` 能力）共用这一个
+/// 实现，避免某条路径再退回同步执行——UI 启动此前正是这么退化的：
+/// 点一次启动，弹窗要挂到整条工作流跑完，期间界面拿不到任何过程反馈。
+pub(crate) fn dispatch_run_in_background(
+    gateway: CapabilityGateway,
+    context: InvocationContext,
+    package: crate::workflow::WorkflowPackage,
+    run_id: String,
+    input: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    thread::Builder::new()
+        .name(format!("workflow-run-{run_id}"))
+        .spawn(move || {
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+                let executor = crate::workflow::WorkflowGatewayExecutor::new(
+                    gateway,
+                    context,
+                    ledger,
+                    run_id.clone(),
+                );
+                let queued = crate::store::local_runs::LocalRunLedger::open_default()?
+                    .get_run(&run_id)?
+                    .ok_or("workflow run disappeared before execution")?;
+                crate::workflow::WorkflowRunner::open_default()?
+                    .run_ready(&package, queued, &input, &executor)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("workflow run {run_id} failed to start: {error}");
+            }
+        })?;
+    Ok(())
 }
 
 fn start_workflow_with_gateway(
@@ -3780,15 +4886,134 @@ fn start_workflow_with_gateway(
     package_id: &str,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let package = crate::workflow::WorkflowStore::open_default()?
-        .list()?
-        .into_iter()
-        .find(|item| item.package.id == package_id && item.enabled)
-        .map(|item| item.package)
-        .ok_or_else(|| format!("workflow package not found or disabled: {package_id}"))?;
     let context = InvocationContext::new(
         crate::capability::types::InvocationSource::Workflow,
         "workflow-ui",
+    );
+    let (package, run) =
+        prepare_workflow_run(gateway.clone(), package_id, input.clone(), &context)?;
+    dispatch_run_in_background(gateway, context, package, run.run_id.clone(), input)?;
+    Ok(json!({
+        "accepted": true,
+        "run": run,
+        "blocked_step_id": "",
+        "completed_steps": [],
+    }))
+}
+
+pub(crate) fn schedule_workflow_with_gateway(
+    gateway: CapabilityGateway,
+    package_id: &str,
+    mut input: serde_json::Value,
+    context: InvocationContext,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if let Some(object) = input.as_object_mut() {
+        object.insert(
+            "_origin".to_string(),
+            json!({
+                "source": context.source.as_str(),
+                "ai_client_id": &context.ai_client_id,
+                "session_id_hash": &context.session_id_hash,
+                "request_id": &context.request_id,
+            }),
+        );
+    }
+    let (package, run) =
+        prepare_workflow_run(gateway.clone(), package_id, input.clone(), &context)?;
+    dispatch_run_in_background(gateway, context, package, run.run_id.clone(), input)?;
+    Ok(json!({
+        "accepted": true,
+        "run": run,
+    }))
+}
+
+pub(crate) fn schedule_resume_workflow_with_gateway(
+    gateway: CapabilityGateway,
+    run_id: &str,
+    feedback: Option<&str>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let run = ledger
+        .get_run(run_id)?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    let thread_run_id = run_id.to_string();
+    let thread_feedback = feedback.map(str::to_string);
+    thread::Builder::new()
+        .name(format!("workflow-resume-{run_id}"))
+        .spawn(move || {
+            if let Err(error) =
+                resume_workflow_with_gateway(gateway, &thread_run_id, thread_feedback.as_deref())
+            {
+                eprintln!("workflow resume {thread_run_id} failed: {error}");
+            }
+        })?;
+    Ok(json!({
+        "accepted": true,
+        "run": run,
+    }))
+}
+
+fn prepare_workflow_run(
+    gateway: CapabilityGateway,
+    package_id: &str,
+    input: serde_json::Value,
+    context: &InvocationContext,
+) -> Result<
+    (
+        crate::workflow::WorkflowPackage,
+        crate::agent_core_contracts::LocalRun,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let installed =
+        crate::workflow::WorkflowStore::open_default()?.load_enabled_for_run(package_id)?;
+    let package = installed.package.clone();
+    let capabilities = gateway.list_capabilities(context)?;
+    let probe_context = context.clone().without_agent_core_run();
+    let report = crate::workflow::preflight_with_connector_probes(
+        &package,
+        VERSION,
+        &capabilities,
+        &input,
+        |capability_id, input| {
+            let mut context = probe_context.clone();
+            context.request_id = format!("{}:health:{capability_id}", context.request_id);
+            gateway.invoke(&context, capability_id, input)
+        },
+    );
+    let mut report = report;
+    if let Some(lock) = installed.extension_lock.as_ref() {
+        if let Err(error) = crate::workflow::validate_environment_lock(lock, &capabilities, &report)
+        {
+            report.push_blocker(
+                "environment.lock_mismatch",
+                "dependencies",
+                error.to_string(),
+                "恢复锁定的 Capability、Connector 和 Runtime 版本，或重新生成 Environment Lock。",
+                true,
+            );
+        }
+    }
+    if !report.ready {
+        return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
+    }
+    let runner = crate::workflow::WorkflowRunner::open_default()?;
+    let request_id = format!("{}:{}", context.request_id, crate::workflow_request_id());
+    let run = runner.start("local-agent", &package, &request_id, &input)?;
+    Ok((package, run))
+}
+
+fn preflight_workflow_with_gateway(
+    gateway: CapabilityGateway,
+    package_id: &str,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let installed =
+        crate::workflow::WorkflowStore::open_default()?.load_enabled_for_run(package_id)?;
+    let package = installed.package.clone();
+    let context = InvocationContext::new(
+        crate::capability::types::InvocationSource::Workflow,
+        "workflow-ui-preflight",
     );
     let capabilities = gateway.list_capabilities(&context)?;
     let probe_context = context.clone().without_agent_core_run();
@@ -3803,23 +5028,33 @@ fn start_workflow_with_gateway(
             gateway.invoke(&context, capability_id, input)
         },
     );
-    if !report.ready {
-        return Err(format!("workflow preflight failed: {}", report.blockers.join("; ")).into());
+    let mut report = report;
+    if let Some(lock) = installed.extension_lock.as_ref() {
+        if let Err(error) = crate::workflow::validate_environment_lock(lock, &capabilities, &report)
+        {
+            report.push_blocker(
+                "environment.lock_mismatch",
+                "dependencies",
+                error.to_string(),
+                "恢复锁定的 Capability、Connector 和 Runtime 版本，或重新生成 Environment Lock。",
+                true,
+            );
+        }
     }
-    let runner = crate::workflow::WorkflowRunner::open_default()?;
-    let request_id = format!("ui_{}", crate::workflow_request_id());
-    let run = runner.start("local-agent", &package, &request_id, &input)?;
-    let executor = crate::workflow::WorkflowGatewayExecutor::new(gateway, context);
-    let outcome = runner.run_ready(&package, run, &input, &executor)?;
-    Ok(serde_json::to_value(outcome)?)
+    Ok(serde_json::to_value(report)?)
 }
 
-fn workflow_center_snapshot() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn workflow_center_snapshot(
+    options: &crate::Options,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let store = crate::workflow::WorkflowStore::open_default()?;
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let metrics = crate::workflow::workflow_metrics_by_package(&ledger)?;
     let mut workflows = Vec::new();
+    let mut workflow_names = std::collections::HashMap::<String, String>::new();
     for item in store.list()? {
         let view = store.view_json(&item.package)?;
+        workflow_names.insert(item.package.id.clone(), item.package.name.clone());
         workflows.push(json!({
             "package": item.package,
             "enabled": item.enabled,
@@ -3829,6 +5064,7 @@ fn workflow_center_snapshot() -> Result<serde_json::Value, Box<dyn std::error::E
             "installed_at": item.installed_at,
             "updated_at": item.updated_at,
             "view": view,
+            "metrics": metrics.get(&item.package.id).cloned().unwrap_or_default(),
         }));
     }
     let mut runs = Vec::new();
@@ -3837,24 +5073,236 @@ fn workflow_center_snapshot() -> Result<serde_json::Value, Box<dyn std::error::E
         .into_iter()
         .filter(|run| run.source == crate::agent_core_contracts::InteractionSource::Workflow)
     {
+        let interaction = ledger.get_interaction(&run.interaction_id)?;
+        let workflow_ref = interaction
+            .as_ref()
+            .and_then(|interaction| interaction.business_context.get("workflow"));
+        let input = interaction
+            .as_ref()
+            .and_then(|interaction| interaction.business_context.get("input"));
+        let workflow_id = workflow_ref
+            .and_then(|workflow| workflow.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let workflow_version = workflow_ref
+            .and_then(|workflow| workflow.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let current_step = run
+            .steps
+            .iter()
+            .find(|step| step.step_id == run.current_step_id);
+        let interaction_request =
+            if run.status == crate::agent_core_contracts::LocalRunStatus::Waiting {
+                workflow_interaction_request(&run, &ledger.list_events(&run.run_id)?)
+            } else {
+                None
+            };
+        let waiting_kind = interaction_request
+            .as_ref()
+            .and_then(|request| request.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let waiting_reason = interaction_request
+            .as_ref()
+            .and_then(|request| request.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let required_action = interaction_request
+            .as_ref()
+            .and_then(|request| request.get("required_action"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let projections = ledger.projections_for_aggregate(&run.run_id, 100)?;
         let projection_status = projections
             .first()
             .map(|projection| projection.status.clone())
             .unwrap_or_else(|| "none".to_string());
         runs.push(json!({
+            "workflow_id": workflow_id,
+            "workflow_name": workflow_names.get(workflow_id).cloned().unwrap_or_default(),
+            "workflow_version": workflow_version,
+            "business_stage": workflow_business_stage(&run.current_step_id),
+            "current_step_title": current_step.map(|step| step.title.clone()).unwrap_or_default(),
+            "waiting_kind": waiting_kind,
+            "waiting_reason": waiting_reason,
+            "required_action": required_action,
+            "interaction_request": interaction_request,
+            "project_root": input.and_then(|input| input.get("project_root")).and_then(Value::as_str).unwrap_or_default(),
+            "workspace_root": input.and_then(|input| input.get("workspace_root")).and_then(Value::as_str).unwrap_or_default(),
+            "app_id": input.and_then(|input| input.get("app_id")).and_then(Value::as_str).unwrap_or_default(),
             "run": run,
             "projection_count": projections.len(),
             "projection_status": projection_status,
         }));
     }
+    let (catalog, catalog_error) = merged_workflow_catalog(options)?;
     Ok(json!({
         "workflows": workflows,
         "runs": runs,
+        "catalog": catalog,
+        "catalog_error": catalog_error,
     }))
 }
 
-fn workflow_run_snapshot(run_id: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn workflow_business_stage(step_id: &str) -> &'static str {
+    match step_id {
+        "" => "",
+        "WX-REQUIREMENTS" => "需求",
+        "WX-PREPARE" => "准备",
+        "DEV-LOOP" | "DEV-CODE" | "DEV-TEST" | "DEV-BUILD" | "DEV-REVIEW" => "开发",
+        "WX-CONTEXT" => "工程校验",
+        "WX-CANDIDATE" => "候选冻结",
+        "WX-PREVIEW" => "预览",
+        "WX-UPLOAD" => "体验版",
+        "WX-ACCEPTANCE" => "验收",
+        "WX-ORGANIZATION-APPROVAL" => "组织审批",
+        "WX-REVIEW-PREPARE" | "WX-REVIEW-SUBMIT" => "微信审核",
+        "WX-RELEASE" => "发布",
+        "WX-ROLLBACK" => "回滚",
+        value if value.starts_with("DEV-") => "开发",
+        _ => "执行",
+    }
+}
+
+/// 将 Runner 已经写入 Ledger 的等待事件投影为稳定的 UI 交互契约。
+///
+/// 这不是新的事实源：审批/反馈仍由 Runtime Event 决定，UI 只消费这个
+/// 可解释的 View Model。后续新增 form/evidence/external_wait 时只需扩展
+/// kind、schema 和 required_action，不再让每个页面猜 payload 字段。
+fn workflow_interaction_request(
+    run: &crate::agent_core_contracts::LocalRun,
+    events: &[crate::agent_core_contracts::RuntimeEvent],
+) -> Option<Value> {
+    if run.status != crate::agent_core_contracts::LocalRunStatus::Waiting
+        || run.current_step_id.trim().is_empty()
+    {
+        return None;
+    }
+    let step_title = run
+        .steps
+        .iter()
+        .find(|step| step.step_id == run.current_step_id)
+        .map(|step| step.title.as_str())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(run.current_step_id.as_str());
+    let mut pending_feedback: Option<&crate::agent_core_contracts::RuntimeEvent> = None;
+    let mut pending_approval: Option<&crate::agent_core_contracts::RuntimeEvent> = None;
+    for event in events
+        .iter()
+        .filter(|event| event.step_id == run.current_step_id)
+    {
+        match event.event_type {
+            crate::agent_core_contracts::RuntimeEventType::QuestionRequested => {
+                pending_feedback = Some(event);
+            }
+            crate::agent_core_contracts::RuntimeEventType::Progress
+                if event
+                    .payload
+                    .get("waiting_for_feedback")
+                    .and_then(Value::as_bool)
+                    == Some(true) =>
+            {
+                pending_feedback = Some(event);
+            }
+            crate::agent_core_contracts::RuntimeEventType::QuestionResolved => {
+                let question_event_id = event
+                    .payload
+                    .get("question_event_id")
+                    .and_then(Value::as_str);
+                if question_event_id.is_none()
+                    || pending_feedback
+                        .as_ref()
+                        .is_some_and(|pending| Some(pending.event_id.as_str()) == question_event_id)
+                {
+                    pending_feedback = None;
+                }
+            }
+            crate::agent_core_contracts::RuntimeEventType::ApprovalRequested => {
+                pending_approval = Some(event);
+            }
+            crate::agent_core_contracts::RuntimeEventType::ApprovalResolved => {
+                pending_approval = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(event) = pending_feedback {
+        let prompt = event
+            .payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("请提供下一轮开发需要处理的反馈");
+        return Some(json!({
+            "schema_version": "interaction_request.v1",
+            "id": event.event_id,
+            "run_id": run.run_id,
+            "step_id": run.current_step_id,
+            "kind": "feedback",
+            "title": format!("{}需要反馈", step_title),
+            "description": prompt,
+            "required_action": "submit_feedback",
+            "status": "pending",
+            "source_event_id": event.event_id,
+            "created_at": event.occurred_at,
+            "schema": {
+                "type": "object",
+                "required": ["feedback"],
+                "properties": {
+                    "feedback": {"type": "string", "minLength": 1, "maxLength": 8000}
+                }
+            },
+            "metadata": {
+                "iteration": event.payload.get("iteration").cloned().unwrap_or(Value::Null),
+                "loop_id": event.payload.get("loop_id").cloned().unwrap_or(Value::Null)
+            }
+        }));
+    }
+    if let Some(event) = pending_approval {
+        let risk_level = event
+            .payload
+            .get("risk_level")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return Some(json!({
+            "schema_version": "interaction_request.v1",
+            "id": format!("{}:{}:approval", run.run_id, run.current_step_id),
+            "run_id": run.run_id,
+            "step_id": run.current_step_id,
+            "kind": "approval",
+            "title": format!("{}等待审批", step_title),
+            "description": if risk_level.is_empty() { "确认后继续执行此步骤".to_string() } else { format!("风险等级 {}，确认后继续执行此步骤", risk_level) },
+            "required_action": "approve_or_reject",
+            "status": "pending",
+            "source_event_id": event.event_id,
+            "created_at": event.occurred_at,
+            "risk_level": risk_level,
+            "schema": {
+                "type": "object",
+                "required": ["decision"],
+                "properties": {
+                    "decision": {"type": "string", "enum": ["approve", "reject"]}
+                }
+            }
+        }));
+    }
+    Some(json!({
+        "schema_version": "interaction_request.v1",
+        "id": format!("{}:{}:waiting", run.run_id, run.current_step_id),
+        "run_id": run.run_id,
+        "step_id": run.current_step_id,
+        "kind": "external_wait",
+        "title": format!("{}等待处理", step_title),
+        "description": "运行正在等待外部状态或人工操作",
+        "required_action": "inspect_run",
+        "status": "pending"
+    }))
+}
+
+pub(crate) fn workflow_run_snapshot(
+    run_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
     let run = ledger
         .get_run(run_id)?
@@ -3887,13 +5335,155 @@ fn workflow_run_snapshot(run_id: &str) -> Result<serde_json::Value, Box<dyn std:
         "interaction": interaction,
         "events": events,
         "projections": projections,
+        "interaction_request": workflow_interaction_request(&run, &events),
         "workflow": workflow,
     }))
 }
 
+fn workflow_run_verification(
+    run_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let run = ledger
+        .get_run(run_id)?
+        .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+    if run.status != crate::agent_core_contracts::LocalRunStatus::Succeeded {
+        return Err(format!(
+            "workflow run is not succeeded: {} ({:?})",
+            run.run_id, run.status
+        )
+        .into());
+    }
+    let interaction = ledger
+        .get_interaction(&run.interaction_id)?
+        .ok_or("workflow run interaction is missing")?;
+    let package =
+        crate::workflow::WorkflowStore::open_default()?.load_for_run_interaction(&interaction)?;
+    Ok(serde_json::to_value(crate::workflow::verify_run(
+        &package, &run,
+    )?)?)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::present_builtin_ai_start_error;
+    use super::{dedupe_workflow_catalog, present_builtin_ai_start_error};
+    use crate::api::distribution::WorkflowCatalogItem;
+
+    fn catalog_item(
+        workflow_id: &str,
+        name: &str,
+        description: &str,
+        author_name: &str,
+        categories: &[&str],
+        capability_ids: &[&str],
+    ) -> WorkflowCatalogItem {
+        WorkflowCatalogItem {
+            workflow_id: workflow_id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            author_name: author_name.to_string(),
+            categories: categories.iter().map(|value| value.to_string()).collect(),
+            version: "1.0.0".to_string(),
+            release_notes: String::new(),
+            published_at: String::new(),
+            min_agent_version: "0.3.0".to_string(),
+            capability_ids: capability_ids
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            channel: "stable".to_string(),
+            artifact_id: String::new(),
+            file_name: "test.hmwf".to_string(),
+            file_size: 0,
+            sha256: String::new(),
+            signature: String::new(),
+            signature_key_id: String::new(),
+            signature_algorithm: String::new(),
+            download_url: String::new(),
+            source: "organization".to_string(),
+            assignment: "optional".to_string(),
+            management: "user_managed".to_string(),
+            install_mode: "prompt".to_string(),
+            organization_reason: String::new(),
+            managed: false,
+            allow_disable: true,
+            allow_uninstall: true,
+            extension_lock: None,
+        }
+    }
+
+    #[test]
+    fn workflow_catalog_search_matches_name_author_and_capability() {
+        let items = vec![
+            catalog_item(
+                "com.himind.workflow.wechat",
+                "微信小程序开发闭环",
+                "从需求到体验版",
+                "马宝全",
+                &["engineering"],
+                &["wechat.miniprogram.build"],
+            ),
+            catalog_item(
+                "com.himind.workflow.contract",
+                "合同评审",
+                "法务流程",
+                "李四",
+                &["legal"],
+                &["document.inspect"],
+            ),
+        ];
+        assert_eq!(
+            super::filter_workflow_catalog(items.clone(), "wechat.miniprogram.build", "").len(),
+            1
+        );
+        assert_eq!(
+            super::filter_workflow_catalog(items.clone(), "马宝全", "").len(),
+            1
+        );
+        assert_eq!(
+            super::filter_workflow_catalog(items.clone(), "", "legal").len(),
+            1
+        );
+        assert_eq!(
+            super::filter_workflow_catalog(items.clone(), "体验版", "").len(),
+            1
+        );
+        assert_eq!(
+            super::filter_workflow_catalog(items.clone(), "", "all").len(),
+            2
+        );
+        assert_eq!(
+            super::filter_workflow_catalog(items, "missing", "").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn workflow_catalog_keeps_distinct_source_and_artifact_candidates() {
+        let mut local = catalog_item("com.himind.workflow.same", "同一工作流", "", "", &[], &[]);
+        local.source = "local:workspace-a".to_string();
+        local.sha256 = "a".repeat(64);
+        let mut github = local.clone();
+        github.source = "github:release-a".to_string();
+        let mut dashboard = local.clone();
+        dashboard.source = "organization".to_string();
+        dashboard.artifact_id = "artifact-1".to_string();
+        let duplicate = dashboard.clone();
+        let mut candidates = vec![local, github, dashboard, duplicate];
+
+        dedupe_workflow_catalog(&mut candidates);
+
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates
+            .iter()
+            .any(|item| item.source.starts_with("local:")));
+        assert!(candidates
+            .iter()
+            .any(|item| item.source.starts_with("github:")));
+        assert!(candidates
+            .iter()
+            .any(|item| item.artifact_id == "artifact-1"));
+    }
 
     #[test]
     fn connected_ai_errors_keep_existing_login_guidance() {

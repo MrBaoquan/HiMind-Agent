@@ -33,6 +33,8 @@ pub(crate) struct ExtensionLockEntry {
     pub catalog_path: String,
     pub source_commit: String,
     pub artifact_url: String,
+    #[serde(default)]
+    pub artifact_id: String,
     pub sha256: String,
     pub dependencies: Vec<ExtensionLockDependency>,
     pub agent_profile: String,
@@ -49,6 +51,26 @@ pub(crate) struct ExtensionLockFile {
 
 fn lock_schema_version() -> u32 {
     LOCK_SCHEMA_VERSION
+}
+
+pub(crate) fn verify_catalog_artifact(
+    label: &str,
+    artifact_id: &str,
+    sha256: &str,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(expected) = expected_artifact_id.filter(|value| !value.trim().is_empty()) {
+        if artifact_id != expected {
+            return Err(format!("{label}目标制品已变化，请刷新市场后重试").into());
+        }
+    }
+    if let Some(expected) = expected_sha256.filter(|value| !value.trim().is_empty()) {
+        if !sha256.eq_ignore_ascii_case(expected) {
+            return Err(format!("{label}目标制品摘要已变化，请刷新市场后重试").into());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn path() -> PathBuf {
@@ -165,6 +187,7 @@ pub(crate) fn record_plugin(
         catalog_path: String::new(),
         source_commit: String::new(),
         artifact_url: item.download_url.clone(),
+        artifact_id: item.artifact_id.clone(),
         sha256: item.sha256.clone(),
         dependencies: item
             .plugin_dependencies
@@ -195,6 +218,7 @@ pub(crate) fn record_source_plugin(
         catalog_path: source.catalog_path.clone(),
         source_commit: source_commit(&source.reference),
         artifact_url: item.download_url.clone(),
+        artifact_id: item.artifact_id.clone(),
         sha256: item.sha256.clone(),
         dependencies: item
             .plugin_dependencies
@@ -224,6 +248,7 @@ pub(crate) fn record_skill(
         catalog_path: String::new(),
         source_commit: String::new(),
         artifact_url: item.download_url.clone(),
+        artifact_id: item.artifact_id.clone(),
         sha256: item.sha256.clone(),
         dependencies: item
             .plugin_dependencies
@@ -253,6 +278,7 @@ pub(crate) fn record_workflow(
         catalog_path: String::new(),
         source_commit: String::new(),
         artifact_url: item.download_url.clone(),
+        artifact_id: item.artifact_id.clone(),
         sha256: item.sha256.clone(),
         dependencies: Vec::new(),
         agent_profile: paths::profile_name(),
@@ -275,6 +301,7 @@ pub(crate) fn record_source_skill(
         catalog_path: source.catalog_path.clone(),
         source_commit: source_commit(&source.reference),
         artifact_url: item.download_url.clone(),
+        artifact_id: item.artifact_id.clone(),
         sha256: item.sha256.clone(),
         dependencies: item
             .plugin_dependencies
@@ -305,6 +332,7 @@ pub(crate) fn record_source_workflow(
         catalog_path: source.catalog_path.clone(),
         source_commit: source_commit(&source.reference),
         artifact_url: item.download_url.clone(),
+        artifact_id: item.artifact_id.clone(),
         sha256: item.sha256.clone(),
         dependencies: Vec::new(),
         agent_profile: paths::profile_name(),
@@ -337,6 +365,7 @@ pub(crate) fn record_local_skill_at(
             catalog_path: String::new(),
             source_commit: String::new(),
             artifact_url: String::new(),
+            artifact_id: String::new(),
             sha256: String::new(),
             dependencies: manifest
                 .plugin_dependencies
@@ -351,6 +380,44 @@ pub(crate) fn record_local_skill_at(
             updated_at: now_stamp(),
         },
     )
+}
+
+pub(crate) fn record_local_workflow(
+    package: &crate::workflow::WorkflowPackage,
+    source: &str,
+    sha256: &str,
+    extension_lock: &crate::extension_contracts::ExtensionLock,
+) -> Result<(), Box<dyn Error>> {
+    upsert(ExtensionLockEntry {
+        asset_kind: "workflow".to_string(),
+        asset_id: package.id.clone(),
+        version: package.version.clone(),
+        source_id: ADHOC_SOURCE.to_string(),
+        source: source.to_string(),
+        repository: String::new(),
+        reference: String::new(),
+        catalog_path: String::new(),
+        source_commit: String::new(),
+        artifact_url: source.to_string(),
+        artifact_id: String::new(),
+        sha256: sha256.to_string(),
+        dependencies: extension_lock
+            .dependencies
+            .iter()
+            .map(|dependency| ExtensionLockDependency {
+                asset_kind: match dependency.kind {
+                    crate::extension_contracts::ExtensionAssetKind::Plugin => "plugin",
+                    crate::extension_contracts::ExtensionAssetKind::Skill => "skill",
+                    crate::extension_contracts::ExtensionAssetKind::Workflow => "workflow",
+                }
+                .to_string(),
+                asset_id: dependency.id.clone(),
+                min_version: dependency.version.clone(),
+            })
+            .collect(),
+        agent_profile: paths::profile_name(),
+        updated_at: now_stamp(),
+    })
 }
 
 pub(crate) fn record_local_plugin_at(
@@ -371,6 +438,7 @@ pub(crate) fn record_local_plugin_at(
             catalog_path: String::new(),
             source_commit: String::new(),
             artifact_url: String::new(),
+            artifact_id: String::new(),
             sha256: String::new(),
             dependencies: manifest
                 .plugin_dependencies
@@ -562,6 +630,7 @@ mod tests {
             catalog_path: String::new(),
             source_commit: String::new(),
             artifact_url: String::new(),
+            artifact_id: "artifact-1".to_string(),
             sha256: "a".repeat(64),
             dependencies: Vec::new(),
             agent_profile: "test".to_string(),
@@ -577,6 +646,75 @@ mod tests {
         save_at(&lock_path, &lock).unwrap();
         assert!(load_at(&lock_path).unwrap().entries.is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_lock_without_artifact_id_remains_readable() {
+        let root =
+            std::env::temp_dir().join(format!("himind-extension-lock-legacy-{}", now_stamp()));
+        let lock_path = root.join("extension.lock.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &lock_path,
+            br#"{
+  "schema_version": 1,
+  "entries": {
+    "plugin:com.example.legacy": {
+      "asset_kind": "plugin",
+      "asset_id": "com.example.legacy",
+      "version": "1.0.0",
+      "source_id": "legacy",
+      "source": "organization",
+      "repository": "",
+      "reference": "",
+      "catalog_path": "",
+      "source_commit": "",
+      "artifact_url": "",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dependencies": [],
+      "agent_profile": "default",
+      "updated_at": "2026-09-21T00:00:00Z"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let lock = load_at(&lock_path).unwrap();
+        assert_eq!(lock.entries["plugin:com.example.legacy"].artifact_id, "");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requested_catalog_artifact_must_keep_id_and_digest() {
+        assert!(verify_catalog_artifact(
+            "插件",
+            "artifact-1",
+            &"a".repeat(64),
+            Some("artifact-1"),
+            Some(&"A".repeat(64)),
+        )
+        .is_ok());
+        assert!(verify_catalog_artifact(
+            "Skill",
+            "artifact-2",
+            &"b".repeat(64),
+            Some("artifact-changed"),
+            Some(&"b".repeat(64)),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("目标制品已变化"));
+        assert!(verify_catalog_artifact(
+            "Workflow",
+            "artifact-3",
+            &"c".repeat(64),
+            Some("artifact-3"),
+            Some(&"d".repeat(64)),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("摘要已变化"));
     }
 
     #[test]

@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { agentApi, type AgentModeSettings, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
-import { Bell, BellOff, Bot, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Globe2, Inbox, KeyRound, LoaderCircle, LockKeyhole, Monitor, MoreHorizontal, PencilLine, Power, RefreshCw, RotateCcw, Save, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
+import { agentApi, type AgentModeSettings, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
+import { Bell, BellOff, Bot, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Globe2, Inbox, KeyRound, LoaderCircle, LockKeyhole, Monitor, MoreHorizontal, PencilLine, PlugZap, Power, RefreshCw, RotateCcw, Save, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 
-type SettingsSection = 'remote' | 'approval' | 'remote-tools' | 'accounts' | 'tools' | 'general';
+type SettingsSection = 'remote' | 'approval' | 'remote-tools' | 'accounts' | 'connectors' | 'tools' | 'general';
 
 const SETTINGS_SECTIONS = [
   { key: 'remote', label: '远程任务', description: '接收与执行', icon: ShieldCheck },
   { key: 'approval', label: '审批策略', description: '确认与授权', icon: ShieldAlert },
-  { key: 'remote-tools', label: '远控工具', description: '路径配置', icon: Monitor },
-  { key: 'accounts', label: '账号', description: '内网和 SVN', icon: KeyRound },
+  { key: 'remote-tools', label: '远程控制', description: '客户端路径', icon: Monitor },
+  { key: 'accounts', label: '账号', description: '内网与代码仓库', icon: KeyRound },
+  { key: 'connectors', label: '工作流连接器', description: '工作流服务', icon: PlugZap },
   { key: 'tools', label: '工具', description: '本机编辑器', icon: Wrench },
   { key: 'general', label: '通用', description: '启动与更新', icon: Power },
 ] satisfies { key: SettingsSection; label: string; description: string; icon: typeof ShieldCheck }[];
@@ -21,8 +22,15 @@ type ApprovalRuleMode = 'inherit' | 'manual' | 'auto_approve' | 'auto_deny';
 
 function agentModeLabel(mode?: string) {
   if (mode === 'independent') return '独立模式';
-  if (mode === 'connected') return '组织模式';
+  if (mode === 'connected') return '工作台模式';
   return '未确定';
+}
+
+function connectorAvailabilityLabel(availability: string) {
+  if (availability === 'local') return '本机连接';
+  if (availability === 'network_service') return '网络服务';
+  if (availability === 'control_plane') return '工作台服务';
+  return '自定义连接';
 }
 
 const APPROVAL_PROFILE_OPTIONS = [
@@ -30,7 +38,7 @@ const APPROVAL_PROFILE_OPTIONS = [
   { value: 'balanced', label: '推荐', description: '查询预览自动执行，修改操作先确认', icon: ShieldCheck },
   { value: 'relaxed', label: '少打扰', description: '查询和普通修改自动执行', icon: BellOff },
   { value: 'trusted', label: '完全信任', description: '常规及高风险操作自动执行，最高风险仍确认', icon: KeyRound },
-  { value: 'full_access', label: '完全放行', description: '跳过 Agent 审批弹窗，含最高风险操作', icon: UnlockKeyhole },
+  { value: 'full_access', label: '完全放行', description: '所有受控操作自动执行，包括最高风险操作', icon: UnlockKeyhole },
   { value: 'silent_deny', label: '只执行已授权项', description: '其他受控请求直接拒绝，不弹审批', icon: ShieldX },
 ] satisfies ChoiceOption[];
 
@@ -139,6 +147,9 @@ export function SettingsPage({
   const [builtinAIRuntimeBusy, setBuiltinAIRuntimeBusy] = useState(false);
   const [builtinAIRuntimeCheckBusy, setBuiltinAIRuntimeCheckBusy] = useState(false);
   const [builtinAIRuntimeFeedback, setBuiltinAIRuntimeFeedback] = useState('');
+  const [connectorStates, setConnectorStates] = useState<ConnectorStateItem[]>([]);
+  const [connectorBusy, setConnectorBusy] = useState('');
+  const [connectorFeedback, setConnectorFeedback] = useState('');
   const [pendingRuntimeUninstall, setPendingRuntimeUninstall] = useState(false);
   const [approvalCapabilityId, setApprovalCapabilityId] = useState('');
   const [approvalCapabilityMode, setApprovalCapabilityMode] = useState<Exclude<ApprovalRuleMode, 'inherit'>>('manual');
@@ -167,8 +178,8 @@ export function SettingsPage({
         const next = await agentApi.builtinAiRuntimeInstallationStatus();
         setBuiltinAIRuntimeInstallation(next);
         setBuiltinAIRuntimeStatus(next.runtime);
-        if (next.state === 'ready' || next.state === 'idle') setBuiltinAIRuntimeFeedback(next.message);
-        if (next.state === 'failed') setBuiltinAIRuntimeFeedback(next.error || 'HiMind AI 运行时安装失败，请重试');
+        if (next.state === 'ready' || next.state === 'idle') setBuiltinAIRuntimeFeedback(presentRuntimeMessage(next.message));
+        if (next.state === 'failed') setBuiltinAIRuntimeFeedback(next.error || 'HiMind AI 安装失败，请重试');
       } catch {
         setBuiltinAIRuntimeFeedback('暂时无法读取安装进度，请稍后重试');
       }
@@ -183,41 +194,75 @@ export function SettingsPage({
       setBuiltinAIRuntimeStatus(installation.runtime);
       if (installation.runtime.status === 'ready') await checkBuiltinAIRuntimeUpdate();
     } catch {
-      setBuiltinAIRuntimeFeedback('暂时无法检查 HiMind AI 运行时，请稍后重试');
+      setBuiltinAIRuntimeFeedback('暂时无法检查 HiMind AI，请稍后重试');
     }
   };
   const checkBuiltinAIRuntimeUpdate = async () => {
     if (builtinAIRuntimeCheckBusy || runtimeWorking) return;
     setBuiltinAIRuntimeCheckBusy(true);
-    setBuiltinAIRuntimeFeedback('正在检查 HiMind AI 运行时更新');
+      setBuiltinAIRuntimeFeedback('正在检查 HiMind AI 更新');
     try {
       const installation = await agentApi.checkBuiltinAiRuntimeUpdate();
       setBuiltinAIRuntimeInstallation(installation);
       setBuiltinAIRuntimeStatus(installation.runtime);
-      setBuiltinAIRuntimeFeedback(installation.message);
+      setBuiltinAIRuntimeFeedback(presentRuntimeMessage(installation.message));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error || '');
-      setBuiltinAIRuntimeFeedback(message.includes('尚未安装') ? '请先安装 HiMind AI 运行时' : '暂时无法检查更新，请稍后重试');
+      setBuiltinAIRuntimeFeedback(message.includes('尚未安装') ? '请先安装 HiMind AI' : '暂时无法检查更新，请稍后重试');
     } finally {
       setBuiltinAIRuntimeCheckBusy(false);
     }
   };
-  const startBuiltinAIRuntimeOperation = async (operation: BuiltinAIRuntimeInstallationStatus['operation']) => {
+  const startBuiltinAIRuntimeOperation = async (operation: BuiltinAIRuntimeInstallationStatus['operation'], manifestPath?: string) => {
     if (builtinAIRuntimeBusy || runtimeWorking) return;
     setBuiltinAIRuntimeBusy(true);
     setBuiltinAIRuntimeFeedback('');
     try {
-      const installation = await agentApi.startBuiltinAiRuntimeInstall(operation);
+      const installation = await agentApi.startBuiltinAiRuntimeInstall(operation, manifestPath);
       setBuiltinAIRuntimeInstallation(installation);
       setBuiltinAIRuntimeStatus(installation.runtime);
-      setBuiltinAIRuntimeFeedback(installation.message);
+      setBuiltinAIRuntimeFeedback(presentRuntimeMessage(installation.message));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error || '');
       setBuiltinAIRuntimeFeedback(message.includes('没有可用') || message.includes('发布')
-        ? '当前没有可用的 HiMind AI 运行时安装包'
-        : `HiMind AI 运行时${runtimeActionLabel(operation)}失败，请稍后重试`);
+        ? '当前没有可用的 HiMind AI 安装包'
+        : `HiMind AI${runtimeActionLabel(operation)}失败，请稍后重试`);
     } finally {
       setBuiltinAIRuntimeBusy(false);
+    }
+  };
+  const installLocalBuiltinAIRuntime = async () => {
+    if (builtinAIRuntimeBusy || runtimeWorking) return;
+    try {
+      const picked = await agentApi.pickRuntimeManifest();
+      if (!picked.path) return;
+      await startBuiltinAIRuntimeOperation('local', picked.path);
+    } catch {
+      setBuiltinAIRuntimeFeedback('未选择或无法读取本地安装包');
+    }
+  };
+  const refreshConnectors = async () => {
+    setConnectorFeedback('');
+    try {
+      setConnectorStates(await agentApi.connectorStates());
+    } catch {
+      setConnectorFeedback('暂时无法读取连接器状态');
+    }
+  };
+  const updateConnector = async (connectorId: string, action: 'enable' | 'disable' | 'revoke' | 'restore') => {
+    setConnectorBusy(`${connectorId}:${action}`);
+    setConnectorFeedback('');
+    try {
+      if (action === 'enable') await agentApi.setConnectorEnabled(connectorId, true);
+      else if (action === 'disable') await agentApi.setConnectorEnabled(connectorId, false);
+      else if (action === 'revoke') await agentApi.revokeConnector(connectorId, 'revoked from Agent settings');
+      else await agentApi.restoreConnector(connectorId);
+      await refreshConnectors();
+      setConnectorFeedback(action === 'revoke' ? '连接器已撤销，相关本地凭据已清理' : '连接器状态已更新');
+    } catch (error) {
+      setConnectorFeedback(error instanceof Error ? error.message : '连接器操作失败');
+    } finally {
+      setConnectorBusy('');
     }
   };
   const primaryRuntimeAction = async () => {
@@ -260,6 +305,9 @@ export function SettingsPage({
     });
   }, [remoteClients]);
   useEffect(() => {
+    if (section === 'connectors') void refreshConnectors();
+  }, [section]);
+  useEffect(() => {
     let active = true;
     void agentApi.agentMode().then(value => { if (active) setAgentMode(value); }).catch(error => {
       if (active) setAgentModeFeedback(error instanceof Error ? error.message : '运行模式读取失败');
@@ -269,17 +317,17 @@ export function SettingsPage({
 
   async function changeAgentMode(mode: 'connected' | 'independent') {
     if (!agentMode || agentMode.mode === mode || agentModeBusy) return;
-    const title = mode === 'independent' ? '切换到独立模式？' : '切换到组织模式？';
+    const title = mode === 'independent' ? '切换到独立模式？' : '切换到工作台模式？';
     const message = mode === 'independent'
-      ? '保留本机 AI、技能、插件、MCP 和工程能力，不参与组织调度。保存后需重启 Agent。'
-      : '接入 HiMind 工作台，启用组织调度、共享服务和审计。保存后需重启 Agent。';
+      ? '保留本机 AI、技能、插件和工具连接，不再接收工作台任务。保存后需重启应用。'
+      : '连接 HiMind 工作台，启用团队任务、共享服务和审计。保存后需重启应用。';
     if (!window.confirm(`${title}\n\n${message}`)) return;
     setAgentModeBusy(true);
     setAgentModeFeedback('');
     try {
       const next = await agentApi.setAgentMode(mode);
       setAgentMode(next);
-      setAgentModeFeedback('已保存，重启 Agent 后生效');
+      setAgentModeFeedback('已保存，重启应用后生效');
     } catch (error) {
       setAgentModeFeedback(error instanceof Error ? error.message : '运行模式保存失败');
     } finally {
@@ -355,7 +403,7 @@ export function SettingsPage({
     }
   }
 
-  if (!settings || !remoteExecutionSettings || !loginState) return <div className="page-loading"><span className="spinner" />正在读取 Agent 配置</div>;
+  if (!settings || !remoteExecutionSettings || !loginState) return <div className="page-loading"><span className="spinner" />正在读取应用设置</div>;
   const configured = loginState.status === 'credentials_configured';
   const editorState = unityEditorSettings || settings.editors;
   const editorDirty = unityEditorPath.trim() !== (editorState?.unity_editor_path || '');
@@ -381,7 +429,7 @@ export function SettingsPage({
   };
   return (
     <>
-      <PageHeader title="设置" description="管理任务权限、账号、工具与启动设置。" />
+      <PageHeader title="设置" description="配置权限、账号、工具和应用设置。" />
       <div className="settings-workspace">
         <label className="settings-section-select">
           <span>设置分类</span>
@@ -402,11 +450,11 @@ export function SettingsPage({
             <section className="card settings-section">
               <div className="card-header"><span>远程任务</span><Pill kind={remoteExecutionSettings.enabled ? 'success' : 'neutral'}>{remoteExecutionSettings.enabled ? '已启用' : '已关闭'}</Pill></div>
               <div className="card-body setting-list">
-                <SettingRow title="接受远程任务" description="只接收当前工作台账号发给本机 Agent 的任务"><label className="toggle"><input type="checkbox" checked={remoteExecutionSettings.enabled} onChange={event => updateRemoteExecution({ enabled: event.target.checked })} /><span className="slider"></span></label></SettingRow>
-                <SettingRow title="远程运行时范围" description={remoteExecutionSettings.enabled ? '决定远程 AI 是否受展项目录工作区限制；不改变操作审批策略' : '启用远程任务后生效'}>
+                <SettingRow title="接受远程任务" description="只接收当前 HiMind 账号发给这台电脑的任务"><label className="toggle"><input type="checkbox" checked={remoteExecutionSettings.enabled} onChange={event => updateRemoteExecution({ enabled: event.target.checked })} /><span className="slider"></span></label></SettingRow>
+                <SettingRow title="远程任务访问范围" description={remoteExecutionSettings.enabled ? '限制远程任务可以访问的文件范围；不改变审批设置' : '启用远程任务后生效'}>
                   <select aria-label="远程任务访问范围" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.access_mode} onChange={event => updateRemoteExecution({ access_mode: event.target.value as RemoteExecutionSettings['access_mode'] })}>
-                    <option value="exhibit_linked">仅限展项关联目录（推荐）</option>
-                    <option value="full_access">解除工作区限制，使用本机资源（高风险）</option>
+                    <option value="exhibit_linked">仅限项目目录（推荐）</option>
+                    <option value="full_access">允许访问本机全部文件（高风险）</option>
                   </select>
                 </SettingRow>
                 <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '自动模式会选择本机可用的 AI 工具' : '启用远程任务后生效'}>
@@ -426,19 +474,20 @@ export function SettingsPage({
               <div className="runtime-summary">
                 <div className="runtime-summary-main">
                   <div>
-                    <strong>HiMind AI 运行时</strong>
-                    <span>{builtinAIRuntimeInstallation?.message || builtinAIRuntimeStatus?.message || '正在检查运行时状态。'}</span>
+                    <strong>HiMind AI</strong>
+                   <span>{presentRuntimeMessage(builtinAIRuntimeInstallation?.message || builtinAIRuntimeStatus?.message) || '正在检查 HiMind AI 状态。'}</span>
                   </div>
                   <div className="actions-row runtime-actions">
                     <button className="btn btn-primary" disabled={builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking} onClick={() => void primaryRuntimeAction()}>
                       {builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking ? <LoaderCircle className="spin" size={15} /> : runtimeReady && builtinAIRuntimeInstallation?.update_available ? <Download size={15} /> : runtimeReady ? <RefreshCw size={15} /> : <Download size={15} />}
-                      {runtimeWorking ? `${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}中 ${builtinAIRuntimeInstallation?.progress_percent || 0}%` : !runtimeReady ? '安装运行时' : builtinAIRuntimeInstallation?.update_available ? `更新到 v${builtinAIRuntimeInstallation.available_version}` : builtinAIRuntimeCheckBusy ? '检查中' : '检查更新'}
+                      {runtimeWorking ? `${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}中 ${builtinAIRuntimeInstallation?.progress_percent || 0}%` : !runtimeReady ? '安装 HiMind AI' : builtinAIRuntimeInstallation?.update_available ? `更新到 v${builtinAIRuntimeInstallation.available_version}` : builtinAIRuntimeCheckBusy ? '检查中' : '检查更新'}
                     </button>
                     <details className="runtime-more-actions">
                       <summary title="更多操作" aria-label="更多操作"><MoreHorizontal size={17} /></summary>
                       <div>
-                        {runtimeReady ? <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void startBuiltinAIRuntimeOperation('repair')}><Wrench size={14} />修复运行时</button> : null}
-                        {runtimeReady ? <button type="button" className="danger-text" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => setPendingRuntimeUninstall(true)}><Trash2 size={14} />卸载运行时</button> : <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void refreshBuiltinAIRuntime()}><RefreshCw size={14} />重新检测</button>}
+                        <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void installLocalBuiltinAIRuntime()}><FolderOpen size={14} />从本地安装包安装</button>
+                         {runtimeReady ? <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void startBuiltinAIRuntimeOperation('repair')}><Wrench size={14} />修复 HiMind AI</button> : null}
+                         {runtimeReady ? <button type="button" className="danger-text" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => setPendingRuntimeUninstall(true)}><Trash2 size={14} />卸载 HiMind AI</button> : <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void refreshBuiltinAIRuntime()}><RefreshCw size={14} />重新检测</button>}
                       </div>
                     </details>
                   </div>
@@ -463,11 +512,11 @@ export function SettingsPage({
               <div className="card-header"><span>操作审批</span><Pill kind={approvalProfile === 'trusted' || approvalProfile === 'full_access' ? 'warn' : approvalProfile === 'silent_deny' ? 'neutral' : 'success'}>{profileOption.label}</Pill></div>
               <div className="approval-settings-body">
                 <div className="approval-identity-row">
-                  <div><strong>授权归属</strong><span>{independentMode ? '独立模式：策略保存在本机，仅约束经过 HiMind Agent 能力层的调用' : settings.owner_user_id ? '宽松授权与当前 Dashboard 账号和本机 Agent 绑定' : '当前审批设置仅保存在本机'}</span></div>
-                  <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '独立模式' : settings.owner_user_id ? `已绑定 ${settings.owner_user_id}` : '本机模式'}</Pill>
+                  <div><strong>授权归属</strong><span>{independentMode ? '审批设置只保存在本机' : settings.owner_user_id ? '审批设置与当前工作台账号和这台电脑绑定' : '当前审批设置仅保存在本机'}</span></div>
+                  <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '独立模式' : settings.owner_user_id ? '已绑定账号' : '本机模式'}</Pill>
                 </div>
-                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>独立模式下 Dashboard Worker 不参与审批；本机审批队列、审批历史和右下角提醒仍可用。DSH 或外部 AI 工具直接执行且未经过 HiMind Agent 能力层的操作不受此策略拦截。</span></div> : null}
-                <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>完全放行只跳过经 HiMind Agent 能力层的审批弹窗，不会让远程 AI 运行时解除工作区限制。</span></div>
+                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>独立模式下，审批记录和提醒只保存在本机。由其他工具直接执行的操作不经过这里。</span></div> : null}
+                <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>完全放行只跳过普通操作的确认。工作流中的人工审批仍需确认，也不会解除远程任务的目录限制。</span></div>
 
                 <div className="approval-settings-group">
                   <div className="approval-group-heading"><strong>什么时候需要我确认</strong><span>单项例外会优先于整体设置</span></div>
@@ -495,21 +544,21 @@ export function SettingsPage({
                 </div>
 
                 <details className="approval-advanced">
-                  <summary><span><strong>高级设置与单项例外</strong><small>按操作类别或 Capability 精确调整</small></span><ChevronDown size={16} /></summary>
+                  <summary><span><strong>高级设置与单项例外</strong><small>按操作类别或功能 ID 精确调整</small></span><ChevronDown size={16} /></summary>
                   <div className="approval-advanced-body setting-list">
-                    <SettingRow title="远程协助" description="从运维工作台主动发起的一键直连"><Pill kind="success">自动允许</Pill></SettingRow>
+                    <SettingRow title="远程协助" description="由运维工作台发起的远程连接"><Pill kind="success">自动允许</Pill></SettingRow>
                     <SettingRow title="文件上传" description="代码、清单表和制品上传到本机"><ApprovalRuleChoice label="文件上传" value={approvalRuleValue(settings, 'upload_code')} onChange={mode => onRuleChange('upload_code', mode)} /></SettingRow>
                     <SettingRow title="查询与预览" description="只读取信息，不修改文件或业务数据"><ApprovalRuleChoice label="查询与预览" value={approvalRuleValue(settings, 'risk:R1')} onChange={mode => onRuleChange('risk:R1', mode)} /></SettingRow>
-                    <SettingRow title="新增与普通修改" description="新增人员、更新展项或写入普通文件"><ApprovalRuleChoice label="新增与普通修改" value={approvalRuleValue(settings, 'risk:R2')} onChange={mode => onRuleChange('risk:R2', mode)} /></SettingRow>
+                    <SettingRow title="新增与普通修改" description="新增记录、更新项目或写入普通文件"><ApprovalRuleChoice label="新增与普通修改" value={approvalRuleValue(settings, 'risk:R2')} onChange={mode => onRuleChange('risk:R2', mode)} /></SettingRow>
                     <SettingRow title="删除、发布与权限变更" description="高风险操作；自动允许仅在完全信任或完全放行下可用"><ApprovalRuleChoice label="删除、发布与权限变更" value={approvalRuleValue(settings, 'risk:R3')} autoApproveDisabled={!['trusted', 'full_access'].includes(approvalProfile)} onChange={mode => onRuleChange('risk:R3', mode)} /></SettingRow>
-                    <SettingRow title="最高风险受控操作" description="可执行的 R4 能力；自动允许仅在完全放行下可用"><ApprovalRuleChoice label="最高风险受控操作" value={approvalRuleValue(settings, 'risk:R4')} autoApproveDisabled={approvalProfile !== 'full_access'} onChange={mode => onRuleChange('risk:R4', mode)} /></SettingRow>
-                    <SettingRow title="系统保护边界" description="系统目录、Agent 数据和安装目录、磁盘根、越界路径及超限批量操作"><Pill kind="danger">始终阻止</Pill></SettingRow>
-                    <SettingRow title="其他受控操作" description="没有单独分类、但能力声明需要审批的操作"><ApprovalRuleChoice label="其他受控操作" value={approvalRuleValue(settings, 'controlled_operation')} onChange={mode => onRuleChange('controlled_operation', mode)} /></SettingRow>
-                    <SettingRow title="未分类普通操作" description="兼容尚未声明操作类别的非高风险能力"><ApprovalRuleChoice label="未分类普通操作" value={approvalRuleValue(settings, '*')} onChange={mode => onRuleChange('*', mode)} /></SettingRow>
-                    {exactApprovalRules.map(([requestType, mode]) => <SettingRow key={requestType} title={requestType} description="Capability 单项例外"><ApprovalRuleChoice label={requestType} value={mode as ApprovalRuleMode} autoApproveDisabled={(requestType === 'risk:R4' && approvalProfile !== 'full_access') || (isHighRiskRuleKey(requestType) && !['trusted', 'full_access'].includes(approvalProfile))} onChange={next => onRuleChange(requestType, next)} /></SettingRow>)}
-                    <SettingRow title="新增 Capability 例外" description="仅供插件或集成能力的精确授权">
+                    <SettingRow title="系统级操作" description="仅在完全放行时可设为自动允许"><ApprovalRuleChoice label="系统级操作" value={approvalRuleValue(settings, 'risk:R4')} autoApproveDisabled={approvalProfile !== 'full_access'} onChange={mode => onRuleChange('risk:R4', mode)} /></SettingRow>
+                    <SettingRow title="系统保护边界" description="系统目录、应用数据、安装目录、磁盘根、越界路径及超限批量操作"><Pill kind="danger">始终阻止</Pill></SettingRow>
+                    <SettingRow title="其他受控操作" description="没有单独分类但仍需审批的操作"><ApprovalRuleChoice label="其他受控操作" value={approvalRuleValue(settings, 'controlled_operation')} onChange={mode => onRuleChange('controlled_operation', mode)} /></SettingRow>
+                    <SettingRow title="未分类普通操作" description="尚未分类的非高风险操作"><ApprovalRuleChoice label="未分类普通操作" value={approvalRuleValue(settings, '*')} onChange={mode => onRuleChange('*', mode)} /></SettingRow>
+                    {exactApprovalRules.map(([requestType, mode]) => <SettingRow key={requestType} title={requestType} description="功能单项例外"><ApprovalRuleChoice label={requestType} value={mode as ApprovalRuleMode} autoApproveDisabled={(requestType === 'risk:R4' && approvalProfile !== 'full_access') || (isHighRiskRuleKey(requestType) && !['trusted', 'full_access'].includes(approvalProfile))} onChange={next => onRuleChange(requestType, next)} /></SettingRow>)}
+                    <SettingRow title="新增功能例外" description="按功能 ID 设置精确授权">
                       <div className="approval-rule-editor">
-                        <input aria-label="Capability ID" placeholder="例如 ai.client.import" value={approvalCapabilityId} onChange={event => setApprovalCapabilityId(event.target.value)} />
+                        <input aria-label="功能 ID" placeholder="例如 ai.client.import" value={approvalCapabilityId} onChange={event => setApprovalCapabilityId(event.target.value)} />
                         <ChoiceGroup className="approval-create-rule-options" label="新规则处理方式" value={approvalCapabilityMode} options={APPROVAL_CREATE_RULE_OPTIONS} onChange={value => setApprovalCapabilityMode(value as Exclude<ApprovalRuleMode, 'inherit'>)} />
                         <button type="button" className="btn" disabled={!approvalCapabilityId.trim()} onClick={() => { onRuleChange(approvalCapabilityId.trim(), approvalCapabilityMode); setApprovalCapabilityId(''); }}>保存</button>
                       </div>
@@ -523,7 +572,7 @@ export function SettingsPage({
             </section> : null}
 
           {section === 'remote-tools' ? <section className="card settings-section remote-client-settings">
-              <div className="card-header"><span>远控工具</span><div className="card-header-actions"><button type="button" className="btn btn-icon" title="重新检测" aria-label="重新检测远控工具" disabled={remoteClientBusy !== null} onClick={() => void detectRemoteClients()}>{remoteClientBusy === 'detect' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button></div></div>
+              <div className="card-header"><span>远程控制</span><div className="card-header-actions"><button type="button" className="btn btn-icon" title="重新检测" aria-label="重新检测远程控制客户端" disabled={remoteClientBusy !== null} onClick={() => void detectRemoteClients()}>{remoteClientBusy === 'detect' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button></div></div>
             <div className="remote-client-body">
               <div className="remote-client-list">
                 {REMOTE_CLIENT_OPTIONS.map(option => <RemoteClientCard key={option.vendor} option={option} status={remoteClients?.items.find(item => item.vendor === option.vendor)} path={remoteClientDrafts[option.vendor]} busy={remoteClientBusy === option.vendor} feedback={remoteClientFeedback[option.vendor]} onPathChange={path => { setRemoteClientDrafts(current => ({ ...current, [option.vendor]: path })); setRemoteClientFeedback(current => ({ ...current, [option.vendor]: '' })); }} onPick={() => void chooseRemoteClient(option.vendor)} onSave={() => void saveRemoteClient(option.vendor)} onClear={() => void saveRemoteClient(option.vendor, '')} />)}
@@ -550,6 +599,31 @@ export function SettingsPage({
                 <div className="actions-row svn-connection-actions"><button className="btn" disabled={svnTesting} onClick={onTestSvnConnection}>{svnTesting ? <><LoaderCircle size={14} className="spin" />测试中</> : '测试'}</button><button className="btn" disabled={svnTesting} onClick={onOpenSvnModal}>更新账号</button><button className="btn btn-danger-quiet" disabled={svnTesting} onClick={onRemoveSvnConnection}>清除</button></div>
               </div> : <div className="account-row"><div className="account-icon"><Database size={17} /></div><div><span>公司 SVN</span><strong>尚未配置个人账号</strong></div><button className="btn btn-primary" onClick={onOpenSvnModal}>配置账号</button></div>}
               <div className="security-note compact"><ShieldCheck size={16} /><span>密码只保存在当前 Windows 用户的本地加密存储中。</span></div>
+            </div>
+          </section> : null}
+
+          {section === 'connectors' ? <section className="card settings-section">
+            <div className="card-header">
+              <span>工作流连接器</span>
+              <Pill kind={connectorStates.some(item => item.revoked || !item.enabled) ? 'warn' : connectorStates.length ? 'success' : 'neutral'}>{connectorStates.length}</Pill>
+            </div>
+            <div className="card-body setting-list">
+              {connectorStates.length ? connectorStates.map(connector => (
+                <div key={connector.id} className="account-row">
+                  <div className="account-icon"><PlugZap size={17} /></div>
+                  <div>
+                    <span>{connector.name}</span>
+                    <strong>{connectorAvailabilityLabel(connector.availability)}</strong>
+                    <small>v{connector.version} · {connector.credential_count} 个本地凭据 · {connector.source === 'dashboard' ? '组织管理' : '本机管理'}</small>
+                  </div>
+                  <Pill kind={connector.revoked ? 'danger' : connector.enabled ? 'success' : 'warn'}>{connector.revoked ? '已撤销' : connector.enabled ? '已启用' : '已停用'}</Pill>
+                  <div className="actions-row">
+                    {!connector.revoked ? <button className="btn btn-icon" title={connector.enabled ? '停用连接器' : '启用连接器'} aria-label={connector.enabled ? '停用连接器' : '启用连接器'} disabled={Boolean(connectorBusy)} onClick={() => void updateConnector(connector.id, connector.enabled ? 'disable' : 'enable')}><Power size={15} /></button> : null}
+                    {connector.revoked ? <button className="btn" disabled={Boolean(connectorBusy)} onClick={() => void updateConnector(connector.id, 'restore')}>恢复</button> : <button className="btn btn-danger-quiet" disabled={Boolean(connectorBusy)} onClick={() => { if (window.confirm(`确认撤销连接器“${connector.name}”？本地凭据将被删除。`)) void updateConnector(connector.id, 'revoke'); }}>撤销</button>}
+                  </div>
+                </div>
+              )) : <div className="unity-editor-source"><div><span>工作流连接器</span><strong>暂无已安装工作流连接器</strong></div><small>安装带有连接器的工作流后会显示在这里。</small></div>}
+              {connectorFeedback ? <div className="inline-feedback visible" role="status">{connectorFeedback}</div> : null}
             </div>
           </section> : null}
 
@@ -581,16 +655,16 @@ export function SettingsPage({
             <section className="card settings-section">
               <div className="card-header"><span>运行模式</span><Pill kind={agentMode?.mode === 'independent' ? 'success' : 'neutral'}>{agentModeLabel(agentMode?.mode)}</Pill></div>
               <div className="card-body setting-list">
-                <SettingRow title="Agent 运行模式" description="独立模式适合个人使用；组织模式适合接入 HiMind 工作台。">
-                  <div className="mode-options" role="radiogroup" aria-label="Agent 运行模式">
-                    <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>组织模式</span></label>
+                <SettingRow title="运行模式" description="独立模式适合个人使用；工作台模式适合团队使用。">
+                  <div className="mode-options" role="radiogroup" aria-label="运行模式">
+                    <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>工作台模式</span></label>
                     <label className={agentMode?.mode === 'independent' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'independent'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('independent')} /><span>独立模式</span></label>
                   </div>
                 </SettingRow>
                 {agentMode ? <div className="mode-state-summary" role="status">
                   <span>当前生效：{agentModeLabel(agentMode.effective_mode)}</span>
                   <span>重启后：{agentModeLabel(agentMode.pending_mode)}</span>
-                  {agentMode.requires_restart ? <strong>重启 Agent 后切换</strong> : null}
+                  {agentMode.requires_restart ? <strong>重启应用后切换</strong> : null}
                 </div> : null}
                 {agentModeFeedback ? <div className="inline-feedback visible" role="status">{agentModeFeedback}</div> : null}
               </div>
@@ -620,7 +694,7 @@ export function SettingsPage({
               </div>
             </section>
             <section className="card settings-section">
-              <div className="card-header">Agent 启动</div>
+              <div className="card-header">启动设置</div>
               <div className="card-body setting-list">
                 <SettingRow title="开机自启" description="登录 Windows 后自动启动 HiMind Agent"><label className="toggle"><input type="checkbox" checked={settings.auto_start} onChange={event => onAutoStartChange(event.target.checked)} /><span className="slider"></span></label></SettingRow>
               </div>
@@ -640,8 +714,19 @@ export function SettingsPage({
 function runtimeActionLabel(operation: string) {
   if (operation === 'update') return '更新';
   if (operation === 'repair') return '修复';
+  if (operation === 'local') return '本地安装';
   if (operation === 'uninstall') return '卸载';
   return '安装';
+}
+
+function presentRuntimeMessage(message?: string) {
+  const value = (message || '').trim();
+  if (!value) return '';
+  return value
+    .replace(/HiMind AI\s*运行时/g, 'HiMind AI')
+    .replace(/本机\s*组件/g, 'HiMind AI')
+    .replace(/运行时/g, 'HiMind AI')
+    .replace(/组件/g, 'HiMind AI');
 }
 
 function runtimeReleaseSummary(releaseNotes: string) {
@@ -681,7 +766,7 @@ function RuntimeUninstallConfirmation({ onClose, onConfirm }: { onClose: () => v
   return (
     <div className="modal-backdrop" role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="runtime-uninstall-title">
-        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI 运行时？</h3><p>HiMind AI 将暂时不可用，个人 AI 服务、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI？</h3><p>HiMind AI 将暂时不可用，个人 AI 服务、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body"><div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Trash2 size={15} />确认卸载</button></div></div></div>
       </div>
     </div>
@@ -692,9 +777,9 @@ function RemoteRuntimeUnrestrictedConfirmation({ onClose, onConfirm }: { onClose
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="remote-runtime-unrestricted-title" onClick={event => event.stopPropagation()}>
-        <div className="modal-header"><div><h3 id="remote-runtime-unrestricted-title">解除远程 AI 的工作区限制？</h3><p>仅在远程任务确实需要展项目录以外的本机资源时开启。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-header"><div><h3 id="remote-runtime-unrestricted-title">允许远程任务访问全部文件？</h3><p>仅在任务确实需要访问项目目录以外的文件时开启。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程 AI 运行时会在当前 Windows 账户允许范围内使用本机资源</strong><span>这会解除工作区沙箱，任务可能访问展项目录以外的文件、工具或网络资源。运行时直接执行的动作不会逐条进入操作审批；经 HiMind Agent 能力层的调用仍按审批策略处理，且不会突破 Windows 权限。</span></div></div>
+          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程任务将能访问当前 Windows 账户允许的本机资源</strong><span>任务可能访问项目目录以外的文件、工具和网络资源。仍会受到审批设置和 Windows 权限限制。</span></div></div>
           <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Bot size={15} />确认启用</button></div></div>
         </div>
       </div>
@@ -734,13 +819,13 @@ function ApprovalTrustConfirmation({ profile, onClose, onConfirm }: { profile: '
           <IconButton icon={X} label="关闭" onClick={onClose} />
         </div>
         <div className="modal-body approval-trust-body">
-          <div className="approval-trust-intro"><strong>{fullAccess ? '你将跳过 Agent 对所有可执行受控操作的审批弹窗' : '你将把高风险审批交给当前 Agent 自主判断'}</strong><span>风险由当前用户自行承担；授权仅作用于当前 Agent，可随时在审批中心或设置中恢复严格审批。</span></div>
+          <div className="approval-trust-intro"><strong>{fullAccess ? '受控操作将不再弹出确认' : '常规及高风险操作将自动执行'}</strong><span>工作流中的人工审批仍会保留。授权仅适用于当前应用，可随时在审批中心或设置中恢复。</span></div>
           <div className="approval-trust-scope">
             <div className="approval-trust-scope-item"><FolderOpen size={17} /><div><strong>本地文件</strong><span>删除、批量清理或覆盖工作区文件。</span></div></div>
-            <div className="approval-trust-scope-item"><Database size={17} /><div><strong>Dashboard 业务数据</strong><span>删除项目/展项、解除关联、替换人员、发布变更。</span></div></div>
-            <div className="approval-trust-scope-item"><Globe2 size={17} /><div><strong>第三方与 MCP</strong><span>{fullAccess ? '所有经 Agent 能力层的受控集成调用。' : '符合 R3 契约的外部写操作和集成调用。'}</span></div></div>
+            <div className="approval-trust-scope-item"><Database size={17} /><div><strong>工作台数据</strong><span>删除项目或记录、解除关联、替换人员、发布变更。</span></div></div>
+            <div className="approval-trust-scope-item"><Globe2 size={17} /><div><strong>第三方工具</strong><span>{fullAccess ? '所有受控的第三方操作。' : '高风险的外部写入和集成操作。'}</span></div></div>
           </div>
-          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '完全放行只跳过 Agent 审批弹窗；已设置的单项“每次确认”或“自动拒绝”、系统保护目录、Dashboard ACL 和服务端硬拒绝仍然有效，也不会让远程 AI 运行时解除工作区限制。' : '完全信任自动放行查询、修改和高风险操作，最高风险操作仍会请求确认。'}</span></div></div>
+          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '工作流中的人工审批、单项规则、系统保护目录和工作台权限仍然有效，也不会解除远程任务的目录限制。' : '普通查询、修改和高风险操作将自动放行；工作流中的人工审批与最高风险操作仍会请求确认。'}</span></div></div>
           <div className="field-group approval-trust-duration">
             <label className="field-label" htmlFor="approval-trust-duration">授权有效期</label>
             <select id="approval-trust-duration" value={durationSeconds} onChange={event => setDurationSeconds(Number(event.target.value))}>
@@ -915,7 +1000,7 @@ function LoginModal({ configured, username, password, onClose, onUsernameChange,
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="login-modal-title" onClick={event => event.stopPropagation()}>
-        <div className="modal-header"><div><h3 id="login-modal-title">配置内网账号</h3><p>凭据仅保存在当前 Windows Agent。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-header"><div><h3 id="login-modal-title">配置内网账号</h3><p>凭据仅保存在这台电脑。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
           <div className="field-group"><label className="field-label" htmlFor="login-username">内网账号</label><input id="login-username" autoComplete="username" value={username} onChange={event => onUsernameChange(event.target.value)} placeholder="输入内网平台用户名" /></div>
           <div className="field-group"><label className="field-label" htmlFor="login-password">内网密码</label><input id="login-password" autoComplete="current-password" type="password" value={password} onChange={event => onPasswordChange(event.target.value)} placeholder={configured ? '输入新密码以更新凭据' : '输入内网平台密码'} /></div>

@@ -230,6 +230,17 @@ pub(crate) fn plan_install(
     skill_id: &str,
     version: Option<&str>,
 ) -> Result<SkillInstallPlan, Box<dyn Error>> {
+    plan_install_bound(options, agent_id, skill_id, version, None, None)
+}
+
+pub(crate) fn plan_install_bound(
+    options: &Options,
+    agent_id: &str,
+    skill_id: &str,
+    version: Option<&str>,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<SkillInstallPlan, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
         return Err("Agent 尚未完成 Dashboard 配对".into());
@@ -237,7 +248,15 @@ pub(crate) fn plan_install(
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let item = catalog_item(&client, options, agent_id, skill_id, version)?;
+    let item = catalog_item(
+        &client,
+        options,
+        agent_id,
+        skill_id,
+        version,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
     ensure_supported(&item)?;
     let (plugin_actions, blocked_reasons) = plugin_manager::plan_dependency_set(
         options,
@@ -260,7 +279,34 @@ pub(crate) fn install_with_dependencies(
     version: Option<&str>,
     selected_optional_plugins: &[String],
 ) -> Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> {
-    let plan = plan_install(options, agent_id, skill_id, version)?;
+    install_with_dependencies_bound(
+        options,
+        agent_id,
+        skill_id,
+        version,
+        selected_optional_plugins,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn install_with_dependencies_bound(
+    options: &Options,
+    agent_id: &str,
+    skill_id: &str,
+    version: Option<&str>,
+    selected_optional_plugins: &[String],
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<(SkillCatalogItem, SkillRecord), Box<dyn Error>> {
+    let plan = plan_install_bound(
+        options,
+        agent_id,
+        skill_id,
+        version,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
     if !plan.ready {
         return Err(format!("Skill 安装计划被阻止: {}", plan.blocked_reasons.join(", ")).into());
     }
@@ -349,6 +395,8 @@ fn catalog_item(
     agent_id: &str,
     skill_id: &str,
     version: Option<&str>,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
 ) -> Result<SkillCatalogItem, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
@@ -358,19 +406,27 @@ fn catalog_item(
         .into_iter()
         .find(|item| item.skill_id == skill_id)
         .ok_or_else(|| "Skill 未上架或当前不可用".to_string())?;
-    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(latest);
+    let item = match version.map(str::trim).filter(|value| !value.is_empty()) {
+        None => latest,
+        Some(version) if latest.version == version => latest,
+        Some(version) => {
+            if latest.management != "user_managed" || latest.managed {
+                return Err("该 Skill 由组织管理，不能切换版本".into());
+            }
+            skill_versions(client, &options.api_base, agent_id, &credential, skill_id)?
+                .into_iter()
+                .find(|item| item.version == version)
+                .ok_or_else(|| format!("Skill 版本 v{version} 不可用"))?
+        }
     };
-    if latest.version == version {
-        return Ok(latest);
-    }
-    if latest.management != "user_managed" || latest.managed {
-        return Err("该 Skill 由组织管理，不能切换版本".into());
-    }
-    skill_versions(client, &options.api_base, agent_id, &credential, skill_id)?
-        .into_iter()
-        .find(|item| item.version == version)
-        .ok_or_else(|| format!("Skill 版本 v{version} 不可用").into())
+    crate::app::extension_lock::verify_catalog_artifact(
+        "Skill",
+        &item.artifact_id,
+        &item.sha256,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
+    Ok(item)
 }
 
 fn ensure_supported(item: &SkillCatalogItem) -> Result<(), Box<dyn Error>> {

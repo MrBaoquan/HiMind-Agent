@@ -180,6 +180,23 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 &command[3],
             )?)?)?
         }
+        Some("run") if command.len() == 2 => {
+            // 同步执行一次技能，便于验收与脚本化；Agent 内的定时派发走后台线程。
+            let input = crate::workflow_cli_input(Some(&command[1]))?;
+            let skill_id = input
+                .get("skill_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("skill run 需要 skill_id")?
+                .to_string();
+            print_json(crate::skill_run::run_blocking(
+                options,
+                "",
+                &skill_id,
+                &input,
+            )?)?
+        }
         Some("uninstall") if command.len() == 2 => {
             print_json(uninstall_supported_clients_json(&command[1])?)?
         }
@@ -224,7 +241,7 @@ pub(crate) fn run(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         }
         _ => {
             return Err(
-                "usage: himind-agent skill [--workspace <project-root>|--global] <catalog|import-local path|install-local path|import-github github-url [ref] [subpath]|install-github github-url [ref] [subpath]|market|status|sync|plan <skill-id>|install <skill-id>|register <skill-id> <client-id>|unregister <skill-id> <client-id>|unregister-all <skill-id>|uninstall <skill-id>|update-workspace <skill-id>|set-workspace-enabled <skill-id> <true|false>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
+                "usage: himind-agent skill [--workspace <project-root>|--global] <catalog|import-local path|install-local path|import-github github-url [ref] [subpath]|install-github github-url [ref] [subpath]|market|status|sync|run @json|plan <skill-id>|install <skill-id>|register <skill-id> <client-id>|unregister <skill-id> <client-id>|unregister-all <skill-id>|uninstall <skill-id>|update-workspace <skill-id>|set-workspace-enabled <skill-id> <true|false>|author <list|save @json|test id version|confirm id version|submit id version>>".into(),
             )
         }
     }

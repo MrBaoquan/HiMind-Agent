@@ -23,7 +23,7 @@ const MAX_MCP_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MCP_INPUT_QUEUE_CAPACITY: usize = 128;
 const MAX_ACTIVATED_CAPABILITIES: usize = 128;
 const MAX_ACTIVATED_SCHEMA_BYTES: usize = 512 * 1024;
-const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 capability.catalog.search 搜索目录，再用 capability.catalog.describe 获取具体 Schema，最后调用 capability.catalog.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 capability.catalog.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
+const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。工程开发入口应优先调用 engineering.project.resolve 解析 workspace_root、target 和 environment，再启动或继续 Workflow；不要猜测展馆、AppID、构建目录或交付 Workflow。需要编辑工作区时必须先调用 engineering.workspace.lease.acquire 获取 write Lease，编辑完成后 release；开发阶段结束时调用 engineering.checkpoint.create 生成 DevelopmentCheckpoint，再把它作为交付 Workflow 的 Seed。Workflow 生命周期统一使用 workflow.catalog.list、workflow.catalog.describe、workflow.run.start、workflow.run.get、workflow.run.feedback 和 workflow.run.cancel；审批仍由全局审批中心完成，模型不得代替用户批准。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 capability.catalog.search 搜索目录，再用 capability.catalog.describe 获取具体 Schema，最后调用 capability.catalog.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 capability.catalog.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
 
 const BOOTSTRAP_TOOL_IDS: &[&str] = &[
     "capability.catalog.search",
@@ -47,6 +47,10 @@ struct McpSessionState {
     /// Internal callers historically received the complete tool list. Keep
     /// that behavior in the direct helper while stdio uses the bounded view.
     legacy_compatibility: bool,
+    /// Stable, non-secret attribution captured from the MCP initialize
+    /// handshake or HIMIND_AI_CLIENT_ID.
+    ai_client_id: String,
+    device_id: String,
 }
 
 impl McpSessionState {
@@ -105,6 +109,7 @@ fn parse_default_activation_ids(raw: &str, known: &BTreeSet<String>) -> BTreeSet
 }
 
 pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
+    let device_id = crate::agent_core_service::current_device_id(&options.state_path);
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
         dashboard_agent_id: String::new(),
@@ -150,6 +155,7 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let mut registry_updates = None::<Receiver<String>>;
     let mut session = McpSessionState {
         default_activated: default_activation_ids(&gateway),
+        device_id,
         ..McpSessionState::default()
     };
 
@@ -364,6 +370,8 @@ fn handle_request(
         activation_generation: None,
         projection_changed: false,
         legacy_compatibility: true,
+        ai_client_id: mcp_configured_client_id(),
+        device_id: String::new(),
     };
     handle_request_with_session(gateway, method, params, &mut session)
 }
@@ -375,20 +383,23 @@ fn handle_request_with_session(
     session: &mut McpSessionState,
 ) -> Result<Value, Box<dyn Error>> {
     match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": negotiate_protocol_version(&params),
-            "instructions": MCP_INSTRUCTIONS,
-            "capabilities": {
-                "tools": { "listChanged": true },
-                "prompts": { "listChanged": true },
-                "resources": { "listChanged": true }
-            },
-            "serverInfo": { "name": "himind-agent", "version": VERSION },
-            "_meta": { "himind": {
-                "registryGeneration": mcp_registry_generation(gateway)?,
-                "runtime": gateway.mcp_runtime_metadata()
-            } }
-        })),
+        "initialize" => {
+            session.ai_client_id = mcp_client_id_from_initialize(&params);
+            Ok(json!({
+                "protocolVersion": negotiate_protocol_version(&params),
+                "instructions": MCP_INSTRUCTIONS,
+                "capabilities": {
+                    "tools": { "listChanged": true },
+                    "prompts": { "listChanged": true },
+                    "resources": { "listChanged": true }
+                },
+                "serverInfo": { "name": "himind-agent", "version": VERSION },
+                "_meta": { "himind": {
+                    "registryGeneration": mcp_registry_generation(gateway)?,
+                    "runtime": gateway.mcp_runtime_metadata()
+                } }
+            }))
+        }
         "ping" => Ok(json!({})),
         "shutdown" => Ok(Value::Null),
         "resources/list" => {
@@ -434,7 +445,7 @@ fn handle_request_with_session(
             crate::skill::mcp_prompt_get(name, VERSION, &facts)
         }
         "tools/list" => {
-            let context = mcp_invocation_context();
+            let context = mcp_invocation_context_for_session(session);
             let generation = mcp_registry_generation(gateway)?;
             session.synchronize_generation(&generation);
             let mut all_tools = gateway
@@ -520,7 +531,7 @@ fn handle_request_with_session(
                     format!("capability is not active in this MCP session: {name}"),
                 )));
             }
-            let context = mcp_invocation_context();
+            let context = mcp_invocation_context_for_session(session);
             match gateway.invoke(&context, name, arguments) {
                 Ok(result) => Ok(mcp_tool_call_result(result)?),
                 Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
@@ -578,7 +589,7 @@ fn activate_capabilities(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let available = gateway.list_capabilities(&mcp_invocation_context())?;
+    let available = gateway.list_capabilities(&mcp_invocation_context_for_session(session))?;
     let generation = mcp_registry_generation(gateway)?;
     session.synchronize_generation(&generation);
     let mut matched = available
@@ -756,7 +767,11 @@ fn invoke_activated_capability(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    gateway.invoke(&mcp_invocation_context(), capability_id, arguments)
+    gateway.invoke(
+        &mcp_invocation_context_for_session(session),
+        capability_id,
+        arguments,
+    )
 }
 
 fn mcp_tool_call_error(error: &dyn Error) -> Value {
@@ -1039,11 +1054,72 @@ fn negotiate_protocol_version(params: &Value) -> &'static str {
 }
 
 fn mcp_invocation_context() -> InvocationContext {
-    let client_id = std::env::var("HIMIND_AI_CLIENT_ID")
+    mcp_invocation_context_for_client(mcp_configured_client_id(), "")
+}
+
+fn mcp_invocation_context_for_session(session: &McpSessionState) -> InvocationContext {
+    let client_id = if session.ai_client_id.trim().is_empty() {
+        mcp_configured_client_id()
+    } else {
+        session.ai_client_id.clone()
+    };
+    mcp_invocation_context_for_client(client_id, &session.device_id)
+}
+
+fn mcp_invocation_context_for_client(client_id: String, device_id: &str) -> InvocationContext {
+    let principal_client_id = client_id
+        .strip_prefix("mcp:")
+        .unwrap_or(client_id.as_str())
+        .to_string();
+    InvocationContext::new(
+        InvocationSource::Mcp,
+        format!("ai-client:{principal_client_id}"),
+    )
+    .with_ai_client_id(if client_id.starts_with("mcp:") {
+        client_id
+    } else {
+        format!("mcp:{client_id}")
+    })
+    .with_device_id(device_id.to_string())
+}
+
+fn mcp_configured_client_id() -> String {
+    std::env::var("HIMIND_AI_CLIENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "mcp-client".to_string());
-    InvocationContext::new(InvocationSource::Mcp, format!("ai-client:{client_id}"))
+        .map(|value| {
+            crate::agent_core_contracts::external_ai_client_id("mcp", &value, "")
+                .strip_prefix("mcp:")
+                .unwrap_or("mcp-client")
+                .to_string()
+        })
+        .unwrap_or_else(|| "mcp-client".to_string())
+}
+
+fn mcp_client_id_from_initialize(params: &Value) -> String {
+    let configured = mcp_configured_client_id();
+    if configured != "mcp-client" {
+        return configured;
+    }
+    mcp_client_id_from_client_info(params)
+}
+
+fn mcp_client_id_from_client_info(params: &Value) -> String {
+    let client_info = params.get("clientInfo").unwrap_or(&Value::Null);
+    let name = client_info
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let version = client_info
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let id = crate::agent_core_contracts::external_ai_client_id("mcp", name, version);
+    if id.is_empty() {
+        "mcp-client".to_string()
+    } else {
+        id.strip_prefix("mcp:").unwrap_or(&id).to_string()
+    }
 }
 
 fn write_message(writer: &mut impl Write, value: &Value) -> Result<(), Box<dyn Error>> {
@@ -1067,7 +1143,8 @@ fn write_notification(
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_registry_notifications, handle_request, handle_request_with_session, mcp_error_code,
+        emit_registry_notifications, handle_request, handle_request_with_session,
+        mcp_client_id_from_client_info, mcp_error_code, mcp_invocation_context_for_session,
         mcp_registry_generation, mcp_tool_call_error, mcp_tool_call_result,
         negotiate_protocol_version, parse_default_activation_ids, parse_tool_cursor,
         spawn_registry_watcher_with_interval, McpSessionState, MCP_INSTRUCTIONS,
@@ -1142,6 +1219,21 @@ mod tests {
             negotiate_protocol_version(&json!({ "protocolVersion": "future-version" })),
             "2025-11-25"
         );
+    }
+
+    #[test]
+    fn initialize_client_info_is_retained_for_run_attribution() {
+        let session = McpSessionState {
+            ai_client_id: mcp_client_id_from_client_info(&json!({
+                "clientInfo": {"name": "Visual Studio Code", "version": "1.100.0"}
+            })),
+            device_id: "dev-mcp-test".to_string(),
+            ..McpSessionState::default()
+        };
+        let context = mcp_invocation_context_for_session(&session);
+        assert_eq!(context.principal, "ai-client:visual-studio-code@1.100.0");
+        assert_eq!(context.ai_client_id, "mcp:visual-studio-code@1.100.0");
+        assert_eq!(context.device_id, "dev-mcp-test");
     }
 
     #[test]
@@ -1394,6 +1486,7 @@ mod tests {
             activation_generation: Some("sha256:one".to_string()),
             projection_changed: false,
             legacy_compatibility: false,
+            ..McpSessionState::default()
         };
         session.synchronize_generation("sha256:two");
         assert!(session.activated_capabilities.is_empty());
@@ -1893,6 +1986,15 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "extension.skill.candidate.test"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.workflow.candidate.save"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.workflow.candidate.test"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "extension.workflow.candidate.confirm"));
         assert!(tools.iter().any(|tool| tool["name"] == "extension.test"));
         assert!(tools
             .iter()
@@ -1925,5 +2027,22 @@ mod tests {
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "business.project.create"));
+    }
+
+    #[test]
+    fn connected_mcp_exposes_workflow_submission_control_plane() {
+        let gateway = test_gateway_for_mode(crate::app::runtime_mode::AgentMode::Connected);
+        let result = handle_request(&gateway, "tools/list", json!({})).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        for name in [
+            "extension.workflow.submission.submit",
+            "extension.workflow.submission.status",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(tool["annotations"]["availability"], "control_plane");
+        }
     }
 }

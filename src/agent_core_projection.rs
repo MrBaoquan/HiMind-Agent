@@ -14,10 +14,51 @@ const PROJECTION_TIMEOUT_SECONDS: u64 = 20;
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ProjectionFlushReport {
+    pub recovered: usize,
     pub projected: usize,
     pub retried: usize,
     pub dead_letter: usize,
     pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProjectionSyncStatus {
+    pub dashboard_enabled: bool,
+    pub state: String,
+    pub total: u64,
+    pub pending: u64,
+    pub retrying: u64,
+    pub projected: u64,
+    pub dead_letter: u64,
+    pub oldest_pending_at: String,
+    pub last_error: String,
+}
+
+pub(crate) fn projection_sync_status(
+    options: &Options,
+) -> Result<ProjectionSyncStatus, Box<dyn Error>> {
+    let summary = LocalRunLedger::open_default()?.projection_outbox_summary()?;
+    let dashboard_enabled = options.mode().dashboard_enabled();
+    let state = if !dashboard_enabled {
+        "local_only"
+    } else if summary.dead_letter > 0 {
+        "attention"
+    } else if summary.pending > 0 {
+        "pending"
+    } else {
+        "synced"
+    };
+    Ok(ProjectionSyncStatus {
+        dashboard_enabled,
+        state: state.to_string(),
+        total: summary.total,
+        pending: summary.pending,
+        retrying: summary.retrying,
+        projected: summary.projected,
+        dead_letter: summary.dead_letter,
+        oldest_pending_at: summary.oldest_pending_at,
+        last_error: summary.last_error,
+    })
 }
 
 pub(crate) fn flush_pending_projections(
@@ -27,16 +68,24 @@ pub(crate) fn flush_pending_projections(
         return Ok(ProjectionFlushReport::default());
     }
     let ledger = LocalRunLedger::open_default()?;
+    let recovered =
+        ledger.requeue_dead_letter_projections_with_error_fragment("HTTP 401 Unauthorized")?;
     let records = ledger.pending_projections(PROJECTION_BATCH_LIMIT)?;
     if records.is_empty() {
-        return Ok(ProjectionFlushReport::default());
+        return Ok(ProjectionFlushReport {
+            recovered,
+            ..ProjectionFlushReport::default()
+        });
     }
     let access = platform_access_token(options, AI_CONVERSATION_SCOPE)?;
     let state = load_agent_state(&options.state_path)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(PROJECTION_TIMEOUT_SECONDS))
         .build()?;
-    let mut report = ProjectionFlushReport::default();
+    let mut report = ProjectionFlushReport {
+        recovered,
+        ..ProjectionFlushReport::default()
+    };
     for record in records {
         if record.projection_type != "run_projection" {
             ledger.mark_projection_dead_letter(
@@ -120,7 +169,8 @@ fn deliver_projection(
 }
 
 fn is_transient_status(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
+    status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
 }
@@ -155,6 +205,7 @@ mod tests {
 
     #[test]
     fn transient_status_classification_is_explicit() {
+        assert!(is_transient_status(StatusCode::UNAUTHORIZED));
         assert!(is_transient_status(StatusCode::REQUEST_TIMEOUT));
         assert!(is_transient_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(is_transient_status(StatusCode::BAD_GATEWAY));

@@ -20,6 +20,8 @@ use crate::Options;
 const OUTPUT_CAPTURE_LIMIT: usize = 256 * 1024;
 const OUTPUT_HEAD_LIMIT: usize = 64 * 1024;
 const ERROR_DETAIL_LIMIT: usize = 4_000;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub(crate) struct RunLeaseRenewal {
     stop: Arc<AtomicBool>,
@@ -56,7 +58,7 @@ pub(crate) fn verify_command(
     executable: &OsStr,
     arguments: &[&str],
 ) -> Result<String, Box<dyn Error>> {
-    let mut command = Command::new(executable);
+    let mut command = hidden_command(executable);
     command
         .args(arguments)
         .stdin(Stdio::null())
@@ -106,11 +108,7 @@ pub(crate) fn wait_for_child(
     default_timeout_seconds: u64,
     runtime_name: &str,
 ) -> Result<ExitStatus, Box<dyn Error>> {
-    let timeout = env::var(timeout_environment)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value >= 60)
-        .unwrap_or(default_timeout_seconds);
+    let timeout = configured_timeout(timeout_environment, default_timeout_seconds, 60);
     let started = Instant::now();
     let mut cancel_guard = TaskCancelGuard::new();
     loop {
@@ -124,15 +122,82 @@ pub(crate) fn wait_for_child(
             }
             eprintln!("Agent Run task {task_id} cancellation check failed: {error}");
         }
-        if started.elapsed() >= Duration::from_secs(timeout) {
+        if started.elapsed() >= timeout {
             terminate_process_tree(child);
             return Err(format!(
-                "{runtime_name} execution exceeded {timeout} seconds and was terminated"
+                "{runtime_name} execution exceeded {} seconds and was terminated",
+                timeout.as_secs()
             )
             .into());
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+pub(crate) fn wait_for_child_with_timeout_and_cancel<F>(
+    child: &mut Child,
+    timeout_environment: &str,
+    default_timeout_seconds: u64,
+    runtime_name: &str,
+    mut is_canceled: F,
+) -> Result<ExitStatus, Box<dyn Error>>
+where
+    F: FnMut() -> Result<bool, Box<dyn Error>>,
+{
+    let timeout = configured_timeout(timeout_environment, default_timeout_seconds, 1);
+    wait_for_child_until_with_cancel(child, timeout, runtime_name, &mut is_canceled)
+}
+
+#[cfg(test)]
+fn wait_for_child_until(
+    child: &mut Child,
+    timeout: Duration,
+    runtime_name: &str,
+) -> Result<ExitStatus, Box<dyn Error>> {
+    wait_for_child_until_with_cancel(child, timeout, runtime_name, &mut || Ok(false))
+}
+
+fn wait_for_child_until_with_cancel<F>(
+    child: &mut Child,
+    timeout: Duration,
+    runtime_name: &str,
+    is_canceled: &mut F,
+) -> Result<ExitStatus, Box<dyn Error>>
+where
+    F: FnMut() -> Result<bool, Box<dyn Error>>,
+{
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if is_canceled()? {
+            terminate_process_tree(child);
+            return Err(format!("{runtime_name} execution was canceled").into());
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_tree(child);
+            return Err(format!(
+                "{runtime_name} execution exceeded {} seconds and was terminated",
+                timeout.as_secs()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn configured_timeout(
+    timeout_environment: &str,
+    default_timeout_seconds: u64,
+    minimum_seconds: u64,
+) -> Duration {
+    let seconds = env::var(timeout_environment)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= minimum_seconds)
+        .unwrap_or(default_timeout_seconds);
+    Duration::from_secs(seconds)
 }
 
 pub(crate) fn start_run_lease_renewal(
@@ -274,7 +339,7 @@ pub(crate) fn remove_file_if_present(path: &Path) {
 pub(crate) fn terminate_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
-        let mut command = Command::new("taskkill");
+        let mut command = hidden_command("taskkill");
         command
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdin(Stdio::null())
@@ -289,15 +354,24 @@ pub(crate) fn terminate_process_tree(child: &mut Child) {
 
 #[cfg(windows)]
 pub(crate) fn configure_hidden_process(command: &mut Command) {
-    command.creation_flags(0x08000000);
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
 pub(crate) fn configure_hidden_process(_command: &mut Command) {}
 
+pub(crate) fn hidden_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    configure_hidden_process(&mut command);
+    command
+}
+
 #[cfg(test)]
 mod tests {
-    use super::summarize_output;
+    use super::{summarize_output, wait_for_child_until, wait_for_child_until_with_cancel};
+    use std::error::Error;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     #[test]
     fn output_summary_keeps_context_and_tail() {
@@ -306,5 +380,62 @@ mod tests {
         assert_eq!(summary.chars().count(), 200);
         assert!(summary.starts_with("header"));
         assert!(summary.ends_with("ROOT_CAUSE"));
+    }
+
+    #[test]
+    fn process_timeout_terminates_the_child() {
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new("cmd");
+            command.args(["/C", "ping 127.0.0.1 -n 6 >NUL"]);
+        }
+        #[cfg(not(windows))]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let error =
+            wait_for_child_until(&mut child, Duration::from_secs(1), "timeout contract test")
+                .unwrap_err();
+        assert!(error.to_string().contains("exceeded 1 seconds"));
+    }
+
+    #[test]
+    fn process_cancellation_terminates_the_child() {
+        let mut command;
+        #[cfg(windows)]
+        {
+            command = Command::new("cmd");
+            command.args(["/C", "ping 127.0.0.1 -n 6 >NUL"]);
+        }
+        #[cfg(not(windows))]
+        {
+            command = Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        let mut canceled = false;
+        let mut is_canceled = || -> Result<bool, Box<dyn Error>> {
+            canceled = true;
+            Ok(canceled)
+        };
+        let error = wait_for_child_until_with_cancel(
+            &mut child,
+            Duration::from_secs(10),
+            "cancel contract test",
+            &mut is_canceled,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("was canceled"));
     }
 }

@@ -118,9 +118,27 @@ pub struct TaskCancelStatus {
 #[derive(Debug, Deserialize)]
 pub struct AgentRun {
     pub id: String,
+    #[serde(default)]
+    pub work_item_id: String,
+    #[serde(default)]
+    pub parent_run_id: String,
+    #[serde(default)]
+    pub root_run_id: String,
+    #[serde(default)]
+    pub parent_work_item_id: String,
+    #[serde(default)]
+    pub root_work_item_id: String,
+    #[serde(default)]
+    pub attempt_no: u32,
     pub instruction: String,
     pub status: String,
     pub created_by_user_id: String,
+    #[serde(default)]
+    pub requested_agent_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub exhibit_pid: String,
     pub runtime_provider: String,
     #[serde(default)]
     pub access_mode: String,
@@ -134,6 +152,8 @@ pub struct AgentRunClaim {
     pub claim_token: String,
     pub workspace_path: String,
     pub ai_model: String,
+    #[serde(default)]
+    pub resume_provider_session_id: String,
     #[serde(default)]
     pub access_mode: String,
 }

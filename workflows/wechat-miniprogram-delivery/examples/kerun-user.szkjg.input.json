@@ -1,0 +1,27 @@
+{
+  "requirement": "说明本次小程序需求、页面、业务规则和交付范围。",
+  "acceptance_criteria": [
+    "核心页面和业务流程可用",
+    "测试、构建和预览通过",
+    "体验版与候选 Commit 一致"
+  ],
+  "constraints": [
+    "不得提交上传私钥、AppSecret 或平台 Token",
+    "构建目标必须与 AppID 和展馆一致"
+  ],
+  "workspace_root": "F:\\WebProjects\\kerun_user",
+  "source_root": "F:\\WebProjects\\kerun_user",
+  "project_root": "F:\\WebProjects\\kerun_user\\dist\\wx",
+  "app_id": "wx534ac49f5db83057",
+  "credential_handles": {
+    "private_key_path": "wechat-upload-private-key"
+  },
+  "package_manager": "npm",
+  "install_mode": "install",
+  "build_script": "build:szkjg",
+  "scripts": [
+    "lint"
+  ],
+  "version": "1.26.0917",
+  "environment": "development"
+}

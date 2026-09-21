@@ -6,17 +6,34 @@ use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+mod authoring;
 mod candidate;
 mod condition;
 mod connector;
+mod contract;
 mod executor;
+mod metrics;
 mod preflight;
+mod presets;
 mod runner;
 mod runtime;
 mod store;
 
 #[allow(unused_imports)]
+pub(crate) use authoring::{
+    confirm as confirm_authoring_candidate,
+    confirm_with_capabilities as confirm_authoring_candidate_with_capabilities,
+    list as list_authoring_drafts, mark_submitted as mark_workflow_candidate_submitted,
+    read as read_authoring_draft, save_from_source as save_authoring_candidate,
+    submit as submit_authoring_candidate, test as test_authoring_candidate,
+    test_with_capabilities as test_authoring_candidate_with_capabilities, WorkflowDraft,
+};
+#[allow(unused_imports)]
 pub(crate) use candidate::{freeze_candidate, read_candidate};
+#[allow(unused_imports)]
+pub(crate) use presets::{
+    delete as delete_run_preset, list as list_run_presets, set as set_run_preset,
+};
 #[allow(unused_imports)]
 pub(crate) use condition::evaluate_condition;
 #[allow(unused_imports)]
@@ -25,21 +42,30 @@ pub(crate) use connector::{
     WorkflowConnectorManifest, WorkflowHttpHealthCheck,
 };
 #[allow(unused_imports)]
+pub(crate) use contract::contract_dry_run_report;
+#[allow(unused_imports)]
 pub(crate) use executor::WorkflowGatewayExecutor;
+pub(crate) use metrics::workflow_metrics_by_package;
 #[allow(unused_imports)]
 pub(crate) use preflight::{
-    preflight, preflight_with_connector_probes, probe_connectors, WorkflowCapabilityPreflight,
-    WorkflowConnectorPreflight, WorkflowConnectorProbe, WorkflowPreflight, WorkflowToolPreflight,
+    preflight, preflight_with_connector_probes, probe_connectors, validate_environment_lock,
+    WorkflowCapabilityPreflight, WorkflowConnectorCredentialPreflight, WorkflowConnectorPreflight,
+    WorkflowConnectorProbe, WorkflowDiagnostic, WorkflowPreflight, WorkflowRuntimePreflight,
+    WorkflowSkillPreflight, WorkflowToolPreflight,
 };
 #[allow(unused_imports)]
 pub(crate) use runner::{
-    WorkflowArtifactOutput, WorkflowRunOutcome, WorkflowRunner, WorkflowStepExecution,
-    WorkflowStepExecutor,
+    verify_run, WorkflowArtifactOutput, WorkflowArtifactVerification, WorkflowRunOutcome,
+    WorkflowRunVerification, WorkflowRunner, WorkflowStepExecution, WorkflowStepExecutor,
 };
 pub(crate) use runtime::execute_runtime_step;
 pub(crate) use store::{InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
+
+pub(crate) fn workflow_approval_id(run_id: &str, step_id: &str) -> String {
+    format!("workflow:{}:{}", run_id.trim(), step_id.trim())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -51,7 +77,7 @@ pub(crate) struct WorkflowPackage {
     #[serde(default)]
     pub description: String,
     pub min_agent_version: String,
-    #[serde(default)]
+    #[serde(default = "default_object")]
     pub local_requirements: Value,
     #[serde(default)]
     pub optional_providers: Vec<String>,
@@ -61,6 +87,18 @@ pub(crate) struct WorkflowPackage {
     pub dependencies: WorkflowDependencies,
     #[serde(default)]
     pub candidate: Option<WorkflowCandidatePolicy>,
+    #[serde(default = "default_execution_policy")]
+    pub execution_policy: String,
+    #[serde(default)]
+    pub entrypoints: Vec<WorkflowEndpoint>,
+    /// 调用方不指定入口时使用的默认入口（减少启动参数）。
+    #[serde(default)]
+    pub default_entrypoint: String,
+    #[serde(default)]
+    pub exits: Vec<WorkflowEndpoint>,
+    /// 调用方不指定出口时使用的默认出口（减少启动参数）。
+    #[serde(default)]
+    pub default_exitpoint: String,
     pub steps: Vec<WorkflowStep>,
     #[serde(default)]
     pub artifacts: Vec<WorkflowArtifact>,
@@ -88,6 +126,19 @@ pub(crate) struct WorkflowDependencies {
     pub runtimes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowEndpoint {
+    pub id: String,
+    pub at_step: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub produces: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowStep {
@@ -104,6 +155,8 @@ pub(crate) struct WorkflowStep {
     #[serde(default)]
     pub when: Option<WorkflowCondition>,
     #[serde(default)]
+    pub fail_when: Option<WorkflowCondition>,
+    #[serde(default)]
     pub candidate_action: String,
     #[serde(default = "default_object")]
     pub input: Value,
@@ -112,6 +165,14 @@ pub(crate) struct WorkflowStep {
     pub risk_level: String,
     #[serde(default)]
     pub approval_required: bool,
+    /// How the runner treats a failing step.
+    ///
+    /// `fail` (default) stops the run, `continue` degrades the step to a
+    /// tolerated failure so downstream steps still run with the step's output
+    /// missing. The failure stays visible: the step records the error and the
+    /// run keeps the `error` event.
+    #[serde(default)]
+    pub on_failure: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
 }
@@ -127,6 +188,19 @@ pub(crate) struct WorkflowRuntimeStep {
     pub result_schema: String,
     #[serde(default)]
     pub allow_network: bool,
+    /// 该步骤需要的上游 Artifact（按 package 里声明的 id）。
+    ///
+    /// 平台把 Artifact 以**文件路径**注入 `input.input_artifacts`，并把上游步骤输出
+    /// 从提示词里移除：数据走文件，提示词只描述任务。这样提示词长度与 Artifact
+    /// 体量无关，也不再把命令行当数据通道。
+    #[serde(default)]
+    pub input_artifacts: Vec<String>,
+    /// 允许该步骤使用哪些工具：`default`（沿用 Runtime 默认）或 `none`（不挂载任何
+    /// 模型可见工具）。`none` 由 Runtime Provider 强制，无法保证时预检失败。
+    #[serde(default)]
+    pub tool_policy: String,
+    #[serde(default)]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -239,6 +313,16 @@ struct WorkflowViewFieldDefinition {
     placeholder: String,
     #[serde(default)]
     target: String,
+    // picker 让字段声明自己要什么输入控件（当前支持 directory），
+    // 这样「哪些字段是目录」由包自己说清楚，而不是前端靠字段名猜。
+    #[serde(default, rename = "picker")]
+    picker: String,
+    // hint 是字段级说明，用来解释默认值的行为；缺省值不写就不占版面。
+    #[serde(default)]
+    hint: String,
+    // span 控制栅格占位：full 表示整行，其它值按单列处理。
+    #[serde(default)]
+    span: String,
 }
 
 impl WorkflowPackage {
@@ -269,6 +353,15 @@ impl WorkflowPackage {
         }
         let mut step_ids = HashSet::new();
         validate_step_scope(&self.steps, &mut step_ids, 0)?;
+        validate_execution_contract(self, &step_ids)?;
+        validate_runtime_declarations(&self.steps, &self.supported_runtimes)?;
+        for runtime in &self.dependencies.runtimes {
+            if !self.supported_runtimes.contains(runtime) {
+                return Err(format!(
+                    "workflow runtime dependency is not declared in supported_runtimes: {runtime}"
+                ));
+            }
+        }
 
         let mut artifact_ids = HashSet::new();
         for artifact in &self.artifacts {
@@ -307,6 +400,20 @@ impl WorkflowPackage {
             }
         }
         validate_candidate_actions(&self.steps, self.candidate.as_ref())?;
+        // Runtime 步骤引用上游 Artifact 时，id 必须在包里有声明。
+        for step in &self.steps {
+            let Some(runtime) = step.runtime.as_ref() else {
+                continue;
+            };
+            for artifact_id in &runtime.input_artifacts {
+                if !artifact_ids.contains(artifact_id.trim()) {
+                    return Err(format!(
+                        "workflow runtime step {} input_artifacts is not declared by the package: {}",
+                        step.id, artifact_id
+                    ));
+                }
+            }
+        }
 
         if !matches!(self.ui.mode.as_str(), "standard" | "declarative" | "custom") {
             return Err("workflow ui mode is invalid".to_string());
@@ -368,8 +475,86 @@ fn default_git_source() -> String {
     "git".to_string()
 }
 
+fn default_execution_policy() -> String {
+    "strict".to_string()
+}
+
 fn default_artifact_max_bytes() -> u64 {
     16 * 1024 * 1024
+}
+
+fn validate_execution_contract(
+    package: &WorkflowPackage,
+    step_ids: &HashSet<String>,
+) -> Result<(), String> {
+    let policy = package.execution_policy.trim();
+    if !matches!(policy, "strict" | "segmented" | "flexible") {
+        return Err(format!(
+            "workflow execution_policy is invalid: {}",
+            package.execution_policy
+        ));
+    }
+    if policy == "strict" {
+        if !package.entrypoints.is_empty() || !package.exits.is_empty() {
+            return Err("strict workflow cannot declare custom entrypoints or exits".to_string());
+        }
+        return Ok(());
+    }
+    if package.entrypoints.is_empty() {
+        return Err(format!(
+            "{policy} workflow requires at least one entrypoint"
+        ));
+    }
+    if package.exits.is_empty() {
+        return Err(format!("{policy} workflow requires at least one exit"));
+    }
+    validate_endpoint_scope("entrypoint", &package.entrypoints, step_ids)?;
+    validate_endpoint_scope("exit", &package.exits, step_ids)?;
+    // 默认入口/出口必须指向真实声明的端点，否则等于给调用方埋了一个必失败路径。
+    for (label, value, endpoints) in [
+        ("default_entrypoint", package.default_entrypoint.trim(), &package.entrypoints),
+        ("default_exitpoint", package.default_exitpoint.trim(), &package.exits),
+    ] {
+        if value.is_empty() {
+            continue;
+        }
+        if !endpoints.iter().any(|endpoint| endpoint.id == value) {
+            return Err(format!(
+                "workflow {label} is not a declared endpoint: {value}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_endpoint_scope(
+    name: &str,
+    endpoints: &[WorkflowEndpoint],
+    step_ids: &HashSet<String>,
+) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    let mut steps = HashSet::new();
+    for endpoint in endpoints {
+        validate_workflow_id(&endpoint.id)?;
+        if !ids.insert(endpoint.id.as_str()) {
+            return Err(format!("duplicate workflow {name} id: {}", endpoint.id));
+        }
+        if endpoint.at_step.trim().is_empty() || !step_ids.contains(endpoint.at_step.as_str()) {
+            return Err(format!(
+                "workflow {name} {} references unknown step: {}",
+                endpoint.id, endpoint.at_step
+            ));
+        }
+        if !steps.insert(endpoint.at_step.as_str()) {
+            return Err(format!(
+                "workflow {name} step cannot be declared twice: {}",
+                endpoint.at_step
+            ));
+        }
+        validate_unique_text(&format!("{name} requirement"), &endpoint.requires)?;
+        validate_unique_text(&format!("{name} output"), &endpoint.produces)?;
+    }
+    Ok(())
 }
 
 fn validate_unique_text(name: &str, values: &[String]) -> Result<(), String> {
@@ -489,6 +674,20 @@ fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>
                 )
                 .into());
             }
+            if !matches!(definition.picker.as_str(), "" | "directory") {
+                return Err(format!(
+                    "workflow view field {} picker is invalid",
+                    definition.id
+                )
+                .into());
+            }
+            if !matches!(definition.span.as_str(), "" | "full") {
+                return Err(format!(
+                    "workflow view field {} span is invalid",
+                    definition.id
+                )
+                .into());
+            }
         }
     }
     let mut actions = HashSet::new();
@@ -544,6 +743,12 @@ fn validate_step_scope(
         ) {
             return Err(format!(
                 "workflow step {} execution_mode is invalid",
+                step.id
+            ));
+        }
+        if !matches!(step.on_failure.as_str(), "" | "fail" | "continue") {
+            return Err(format!(
+                "workflow step {} on_failure must be fail or continue",
                 step.id
             ));
         }
@@ -613,6 +818,9 @@ fn validate_step_scope(
             _ => unreachable!(),
         }
         if let Some(condition) = step.when.as_ref() {
+            validate_condition(condition, 0)?;
+        }
+        if let Some(condition) = step.fail_when.as_ref() {
             validate_condition(condition, 0)?;
         }
         if !matches!(step.candidate_action.as_str(), "" | "freeze" | "require") {
@@ -692,7 +900,66 @@ fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
     if !runtime.result_schema.trim().is_empty() {
         validate_relative_asset_path(&runtime.result_schema)?;
     }
+    if !matches!(runtime.tool_policy.as_str(), "" | "default" | "none") {
+        return Err(format!(
+            "workflow runtime step {} tool_policy must be default or none",
+            step.id
+        ));
+    }
+    let mut seen_artifacts = HashSet::new();
+    for artifact_id in &runtime.input_artifacts {
+        let artifact_id = artifact_id.trim();
+        if artifact_id.is_empty() {
+            return Err(format!(
+                "workflow runtime step {} input_artifacts contains an empty id",
+                step.id
+            ));
+        }
+        if !seen_artifacts.insert(artifact_id.to_string()) {
+            return Err(format!(
+                "workflow runtime step {} input_artifacts contains duplicate id: {}",
+                step.id, artifact_id
+            ));
+        }
+    }
+    if !runtime.input_artifacts.is_empty() && runtime.tool_policy.trim() == "none" {
+        // 读文件需要工具；声明矛盾时直接拒绝，避免运行时必然失败。
+        return Err(format!(
+            "workflow runtime step {} cannot combine input_artifacts with tool_policy=none",
+            step.id
+        ));
+    }
+    if runtime.timeout_seconds > 86_400 {
+        return Err(format!(
+            "workflow runtime step {} timeout_seconds must not exceed 86400",
+            step.id
+        ));
+    }
     Ok(())
+}
+
+fn validate_runtime_declarations(
+    steps: &[WorkflowStep],
+    supported_runtimes: &[String],
+) -> Result<(), String> {
+    fn walk(steps: &[WorkflowStep], supported_runtimes: &[String]) -> Result<(), String> {
+        for step in steps {
+            if let Some(runtime) = step.runtime.as_ref() {
+                let provider = runtime.provider.trim();
+                if provider != "auto" && !supported_runtimes.iter().any(|item| item == provider) {
+                    return Err(format!(
+                        "workflow runtime step {} uses undeclared provider {}",
+                        step.id, provider
+                    ));
+                }
+            }
+            if let Some(loop_config) = step.loop_config.as_ref() {
+                walk(&loop_config.steps, supported_runtimes)?;
+            }
+        }
+        Ok(())
+    }
+    walk(steps, supported_runtimes)
 }
 
 fn validate_loop_step(
@@ -896,6 +1163,108 @@ mod tests {
     }
 
     #[test]
+    fn workflow_package_v1_legacy_fixture_remains_compatible() {
+        let package: WorkflowPackage = serde_json::from_str(include_str!(
+            "../../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"
+        ))
+        .unwrap();
+        package.validate().unwrap();
+        assert_eq!(package.steps[0].kind, "provider_defined");
+        assert_eq!(package.steps[0].execution_mode, "provider_defined");
+        assert_eq!(package.ui.mode, "standard");
+    }
+
+    #[test]
+    fn workflow_package_v1_current_product_remains_compatible() {
+        let package: WorkflowPackage = serde_json::from_str(include_str!(
+            "../../workflows/wechat-miniprogram-delivery/workflow.json"
+        ))
+        .unwrap();
+        package.validate().unwrap();
+        assert!(package.steps.iter().any(|step| step.kind == "loop"));
+        assert!(package
+            .steps
+            .iter()
+            .any(|step| step.candidate_action == "freeze"));
+    }
+
+    #[test]
+    fn segmented_workflow_requires_declared_entry_and_exit_steps() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        package.execution_policy = "segmented".to_string();
+        package.entrypoints = vec![WorkflowEndpoint {
+            id: "develop".to_string(),
+            at_step: "DEV-LOOP".to_string(),
+            label: "开发".to_string(),
+            requires: vec!["project".to_string()],
+            produces: Vec::new(),
+        }];
+        package.exits = vec![WorkflowEndpoint {
+            id: "checkpoint".to_string(),
+            at_step: "WX-CANDIDATE".to_string(),
+            label: "候选冻结".to_string(),
+            requires: Vec::new(),
+            produces: vec!["candidate".to_string()],
+        }];
+        package.validate().unwrap();
+
+        package.entrypoints[0].at_step = "UNKNOWN".to_string();
+        assert!(package
+            .validate()
+            .unwrap_err()
+            .contains("references unknown step"));
+    }
+
+    #[test]
+    fn strict_workflow_rejects_custom_entrypoints_and_exits() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        package.entrypoints = vec![WorkflowEndpoint {
+            id: "develop".to_string(),
+            at_step: "DEV-LOOP".to_string(),
+            label: String::new(),
+            requires: Vec::new(),
+            produces: Vec::new(),
+        }];
+        assert!(package
+            .validate()
+            .unwrap_err()
+            .contains("strict workflow cannot declare"));
+    }
+
+    #[test]
+    fn workflow_package_future_schema_version_fails_closed() {
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"
+        ))
+        .unwrap();
+        value["schema_version"] = Value::String("workflow_package.v2".to_string());
+        let package: WorkflowPackage = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            package.validate().unwrap_err(),
+            "workflow package schema_version is invalid"
+        );
+    }
+
+    #[test]
+    fn workflow_package_unknown_fields_fail_closed() {
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"
+        ))
+        .unwrap();
+        value["future_extension"] = Value::Bool(true);
+        let error = serde_json::from_value::<WorkflowPackage>(value).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unknown field `future_extension`"));
+    }
+
+    #[test]
     fn rejects_step_dependency_cycles() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
@@ -981,6 +1350,9 @@ mod tests {
             workspace_path: "input.project_root".to_string(),
             result_schema: String::new(),
             allow_network: false,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            timeout_seconds: 1_800,
         });
         step.when = Some(WorkflowCondition {
             operator: "all".to_string(),
@@ -994,6 +1366,35 @@ mod tests {
             }],
         });
         package.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_runtime_step_timeout_above_one_day() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-miniprogram-delivery");
+        let mut package = load_from_directory(&root).unwrap();
+        let loop_step = package
+            .steps
+            .iter_mut()
+            .find(|step| step.id == "DEV-LOOP")
+            .unwrap();
+        loop_step
+            .loop_config
+            .as_mut()
+            .unwrap()
+            .steps
+            .iter_mut()
+            .find(|step| step.id == "DEV-CODE")
+            .unwrap()
+            .runtime
+            .as_mut()
+            .unwrap()
+            .timeout_seconds = 86_401;
+        assert!(package
+            .validate()
+            .unwrap_err()
+            .contains("timeout_seconds must not exceed 86400"));
     }
 
     #[test]
@@ -1028,11 +1429,13 @@ mod tests {
                 runtime: None,
                 loop_config: None,
                 when: None,
+                fail_when: None,
                 candidate_action: String::new(),
                 input: default_object(),
                 execution_mode: "provider_defined".to_string(),
                 risk_level: "local_write".to_string(),
                 approval_required: false,
+                on_failure: String::new(),
                 depends_on: Vec::new(),
             }],
         }));
@@ -1061,11 +1464,13 @@ mod tests {
                 runtime: None,
                 loop_config: None,
                 when: None,
+                fail_when: None,
                 candidate_action: String::new(),
                 input: default_object(),
                 execution_mode: "sync".to_string(),
                 risk_level: "read_only".to_string(),
                 approval_required: false,
+                on_failure: String::new(),
                 depends_on: Vec::new(),
             }],
         }));

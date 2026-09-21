@@ -50,7 +50,7 @@ impl ApprovalManager {
         let log_path = agent_home.join("logs").join("agent-events.jsonl");
         let settings_path = agent_home.join("approval-settings.json");
         let facts_path = agent_home.join("approval-requests.json");
-        let identity_path = agent_home.join("agent-user-authorization.json");
+        let identity_path = authorization_identity_path(&agent_home);
         let instance_id = generate_instance_id();
         let instance_lock = acquire_instance_lock(&agent_home, &instance_id);
         let log_entries = load_persisted_logs(&log_path);
@@ -121,6 +121,99 @@ impl ApprovalManager {
         )
     }
 
+    pub fn request_capability_approval_with_cancel<F>(
+        &self,
+        capability_id: &str,
+        risk_level: &str,
+        title: String,
+        description: String,
+        mut is_canceled: F,
+    ) -> Result<Option<bool>, String>
+    where
+        F: FnMut() -> Result<bool, String>,
+    {
+        let capability_id = capability_id.trim();
+        if capability_id.is_empty() || capability_id.len() > 240 {
+            return Err("Capability ID 不能为空且长度不能超过 240 个字符".to_string());
+        }
+        let risk_level = risk_level.trim().to_ascii_uppercase();
+        let manual_only = super::policy::risk_rank(&risk_level) >= super::policy::risk_rank("R3");
+        self.request_with_policy_cancel(
+            capability_id,
+            ApprovalMode::Manual,
+            manual_only,
+            Some(&risk_level),
+            title,
+            description,
+            &mut is_canceled,
+        )
+    }
+
+    /// Workflow approvals use a stable, run-scoped ID so every local surface
+    /// observes and resolves the same durable request. They remain pending
+    /// until a user decides or the owning workflow run is canceled.
+    pub fn request_workflow_approval_with_cancel<F>(
+        &self,
+        approval_id: &str,
+        capability_id: &str,
+        risk_level: &str,
+        title: String,
+        description: String,
+        mut is_canceled: F,
+    ) -> Result<Option<bool>, String>
+    where
+        F: FnMut() -> Result<bool, String>,
+    {
+        let approval_id = approval_id.trim();
+        if approval_id.is_empty() || approval_id.len() > 512 {
+            return Err("Workflow 审批 ID 不能为空且长度不能超过 512 个字符".to_string());
+        }
+        let capability_id = capability_id.trim();
+        if capability_id.is_empty() || capability_id.len() > 240 {
+            return Err("Capability ID 不能为空且长度不能超过 240 个字符".to_string());
+        }
+        let risk_level = risk_level.trim().to_ascii_uppercase();
+
+        if let Some(fact) = self.latest_fact(approval_id) {
+            match fact.status {
+                ApprovalFactStatus::Approved => return Ok(Some(true)),
+                ApprovalFactStatus::Rejected => return Ok(Some(false)),
+                ApprovalFactStatus::Pending => {
+                    let agent_home = self
+                        .facts_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    if approval_owner_is_alive(agent_home, &fact.owner_instance_id) {
+                        return self.wait_for_existing_decision_with_cancel(
+                            approval_id,
+                            &title,
+                            &mut is_canceled,
+                        );
+                    }
+                    let _ = self.resolve_fact(
+                        approval_id,
+                        ApprovalFactStatus::Interrupted,
+                        "agent_restarted",
+                    );
+                }
+                ApprovalFactStatus::Expired | ApprovalFactStatus::Interrupted => {}
+            }
+        }
+
+        self.request_with_policy_cancel_using_id(
+            Some(approval_id),
+            Some(0),
+            capability_id,
+            ApprovalMode::Manual,
+            true,
+            true,
+            Some(&risk_level),
+            title,
+            description,
+            &mut is_canceled,
+        )
+    }
+
     fn request_with_policy(
         &self,
         request_key: &str,
@@ -130,6 +223,57 @@ impl ApprovalManager {
         title: String,
         description: String,
     ) -> Result<bool, String> {
+        match self.request_with_policy_cancel(
+            request_key,
+            default_mode,
+            manual_only,
+            risk_level,
+            title,
+            description,
+            &mut || Ok(false),
+        )? {
+            Some(approved) => Ok(approved),
+            None => Err("审批已取消".to_string()),
+        }
+    }
+
+    fn request_with_policy_cancel(
+        &self,
+        request_key: &str,
+        default_mode: ApprovalMode,
+        manual_only: bool,
+        risk_level: Option<&str>,
+        title: String,
+        description: String,
+        is_canceled: &mut dyn FnMut() -> Result<bool, String>,
+    ) -> Result<Option<bool>, String> {
+        self.request_with_policy_cancel_using_id(
+            None,
+            None,
+            request_key,
+            default_mode,
+            manual_only,
+            false,
+            risk_level,
+            title,
+            description,
+            is_canceled,
+        )
+    }
+
+    fn request_with_policy_cancel_using_id(
+        &self,
+        request_id: Option<&str>,
+        timeout_override: Option<u64>,
+        request_key: &str,
+        default_mode: ApprovalMode,
+        manual_only: bool,
+        force_manual: bool,
+        risk_level: Option<&str>,
+        title: String,
+        description: String,
+        is_canceled: &mut dyn FnMut() -> Result<bool, String>,
+    ) -> Result<Option<bool>, String> {
         if title.len() > 512 {
             return Err("审批标题长度不能超过 512 字节".to_string());
         }
@@ -138,8 +282,14 @@ impl ApprovalManager {
                 "审批说明长度不能超过 {MAX_APPROVAL_TEXT_BYTES} 字节"
             ));
         }
-        let (mode, full_access_profile_auto_approved) =
-            self.get_mode_for_key_with_source(request_key, default_mode, manual_only, risk_level);
+        if is_canceled()? {
+            return Ok(None);
+        }
+        let (mode, full_access_profile_auto_approved) = if force_manual {
+            (ApprovalMode::Manual, false)
+        } else {
+            self.get_mode_for_key_with_source(request_key, default_mode, manual_only, risk_level)
+        };
 
         match mode {
             ApprovalMode::AutoApprove => {
@@ -148,7 +298,9 @@ impl ApprovalManager {
                 } else {
                     "local_rule_auto_approved"
                 };
+                let id = request_id.map(str::to_string).unwrap_or_else(generate_id);
                 self.record_immediate_fact(
+                    &id,
                     request_key,
                     &title,
                     &description,
@@ -161,10 +313,12 @@ impl ApprovalManager {
                     format!("自动批准: {title}")
                 };
                 self.add_log("info", &log_message);
-                return Ok(true);
+                return Ok(Some(true));
             }
             ApprovalMode::AutoDeny => {
+                let id = request_id.map(str::to_string).unwrap_or_else(generate_id);
                 self.record_immediate_fact(
+                    &id,
                     request_key,
                     &title,
                     &description,
@@ -172,7 +326,7 @@ impl ApprovalManager {
                     "local_rule_auto_denied",
                 )?;
                 self.add_log("warn", &format!("自动拒绝: {title}"));
-                return Ok(false);
+                return Ok(Some(false));
             }
             ApprovalMode::Manual => {}
         }
@@ -182,8 +336,9 @@ impl ApprovalManager {
             .lock()
             .map(|s| s.timeout_seconds)
             .unwrap_or(30);
+        let timeout = timeout_override.unwrap_or(timeout);
 
-        let id = generate_id();
+        let id = request_id.map(str::to_string).unwrap_or_else(generate_id);
         let (tx, rx) = mpsc::channel();
 
         let request = ApprovalRequest {
@@ -210,7 +365,9 @@ impl ApprovalManager {
             .pending
             .lock()
             .map_err(|_| "审批队列锁已损坏".to_string())?;
-        list.retain(|item| item.created.elapsed().as_secs() < item.timeout_seconds);
+        list.retain(|item| {
+            item.timeout_seconds == 0 || item.created.elapsed().as_secs() < item.timeout_seconds
+        });
         if list.len() >= MAX_PENDING_APPROVALS {
             drop(list);
             let _ = self.resolve_fact(
@@ -224,9 +381,14 @@ impl ApprovalManager {
         list.push(pending);
         drop(list);
 
-        self.add_log("info", &format!("等待审批: {title} (超时 {timeout}s)"));
+        let timeout_label = if timeout == 0 {
+            "等待人工决定".to_string()
+        } else {
+            format!("超时 {timeout}s")
+        };
+        self.add_log("info", &format!("等待审批: {title} ({timeout_label})"));
 
-        self.wait_for_decision(&id, &title, timeout, rx)
+        self.wait_for_decision_with_cancel(&id, &title, timeout, rx, is_canceled)
     }
 
     pub fn respond(&self, id: &str, approved: bool) -> Result<(), String> {
@@ -260,12 +422,23 @@ impl ApprovalManager {
         Ok(())
     }
 
+    pub fn interrupt(&self, id: &str, reason: &str) -> Result<bool, String> {
+        let interrupted = self.resolve_fact(id, ApprovalFactStatus::Interrupted, reason.trim())?;
+        let mut list = self.pending.lock().map_err(|error| error.to_string())?;
+        if let Some(index) = list.iter().position(|pending| pending.request.id == id) {
+            let pending = list.remove(index);
+            let _ = pending.respond_tx.send(false);
+        }
+        Ok(interrupted)
+    }
+
     pub fn list_pending(&self) -> Vec<ApprovalRequest> {
         let mut result = Vec::new();
         let mut expired_ids = Vec::new();
         if let Ok(mut list) = self.pending.lock() {
             list.retain(|pending| {
-                let active = pending.created.elapsed().as_secs() < pending.timeout_seconds;
+                let active = pending.timeout_seconds == 0
+                    || pending.created.elapsed().as_secs() < pending.timeout_seconds;
                 if !active {
                     expired_ids.push(pending.request.id.clone());
                 }
@@ -275,9 +448,13 @@ impl ApprovalManager {
                 .iter()
                 .map(|pending| {
                     let mut request = pending.request.clone();
-                    request.remaining_seconds = pending
-                        .timeout_seconds
-                        .saturating_sub(pending.created.elapsed().as_secs());
+                    request.remaining_seconds = if pending.timeout_seconds == 0 {
+                        0
+                    } else {
+                        pending
+                            .timeout_seconds
+                            .saturating_sub(pending.created.elapsed().as_secs())
+                    };
                     request
                 })
                 .collect();
@@ -289,7 +466,7 @@ impl ApprovalManager {
                 self.add_log("error", &format!("审批过期事实保存失败: {error}"));
             }
         }
-        let known = result
+        let mut known = result
             .iter()
             .map(|request| request.id.clone())
             .collect::<HashSet<_>>();
@@ -310,18 +487,28 @@ impl ApprovalManager {
                 );
                 continue;
             }
-            if fact.expires_at_unix <= now {
+            if fact.expires_at_unix != 0 && fact.expires_at_unix <= now {
                 let _ =
                     self.resolve_fact(&fact.id, ApprovalFactStatus::Expired, "approval_timeout");
                 continue;
             }
+            let timeout_seconds = if fact.expires_at_unix == 0 {
+                0
+            } else {
+                fact.expires_at_unix.saturating_sub(fact.created_at_unix)
+            };
+            known.insert(fact.id.clone());
             result.push(ApprovalRequest {
                 id: fact.id,
                 request_type: fact.request_type,
                 title: fact.title,
                 description: fact.description,
-                timeout_seconds: fact.expires_at_unix.saturating_sub(fact.created_at_unix),
-                remaining_seconds: fact.expires_at_unix.saturating_sub(now),
+                timeout_seconds,
+                remaining_seconds: if timeout_seconds == 0 {
+                    0
+                } else {
+                    fact.expires_at_unix.saturating_sub(now)
+                },
                 created_at: format_unix_time(fact.created_at_unix),
                 created_at_unix: fact.created_at_unix,
             });
@@ -698,9 +885,13 @@ impl ApprovalManager {
             description: request.description.clone(),
             status: ApprovalFactStatus::Pending,
             created_at_unix: request.created_at_unix,
-            expires_at_unix: request
-                .created_at_unix
-                .saturating_add(request.timeout_seconds),
+            expires_at_unix: if request.timeout_seconds == 0 {
+                0
+            } else {
+                request
+                    .created_at_unix
+                    .saturating_add(request.timeout_seconds)
+            },
             resolved_at_unix: 0,
             resolution_reason: String::new(),
             owner_instance_id: self.instance_id.clone(),
@@ -718,6 +909,7 @@ impl ApprovalManager {
 
     fn record_immediate_fact(
         &self,
+        id: &str,
         request_type: &str,
         title: &str,
         description: &str,
@@ -730,7 +922,7 @@ impl ApprovalManager {
         let now = unix_now();
         facts.push(ApprovalFact {
             schema_version: 1,
-            id: generate_id(),
+            id: id.to_string(),
             request_type: request_type.to_string(),
             title: title.to_string(),
             description: description.to_string(),
@@ -761,7 +953,7 @@ impl ApprovalManager {
         let _file_lock = crate::store::atomic_file::lock(&self.facts_path)
             .map_err(|error| format!("锁定审批事实失败: {error}"))?;
         let mut facts = load_persisted_facts(&self.facts_path);
-        let Some(index) = facts.iter().position(|fact| fact.id == id) else {
+        let Some(index) = facts.iter().rposition(|fact| fact.id == id) else {
             return Ok(false);
         };
         if facts[index].status != ApprovalFactStatus::Pending {
@@ -785,7 +977,7 @@ impl ApprovalManager {
         let _file_lock = crate::store::atomic_file::lock(&self.facts_path)
             .map_err(|error| format!("锁定审批事实失败: {error}"))?;
         let mut facts = load_persisted_facts(&self.facts_path);
-        let Some(index) = facts.iter().position(|fact| fact.id == id) else {
+        let Some(index) = facts.iter().rposition(|fact| fact.id == id) else {
             return Ok(false);
         };
         if facts[index].status == ApprovalFactStatus::Interrupted {
@@ -809,25 +1001,86 @@ impl ApprovalManager {
         facts
     }
 
-    fn wait_for_decision(
+    fn latest_fact(&self, id: &str) -> Option<ApprovalFact> {
+        self.load_latest_facts()
+            .into_iter()
+            .rev()
+            .find(|fact| fact.id == id)
+    }
+
+    fn wait_for_existing_decision_with_cancel(
+        &self,
+        id: &str,
+        title: &str,
+        is_canceled: &mut dyn FnMut() -> Result<bool, String>,
+    ) -> Result<Option<bool>, String> {
+        loop {
+            match is_canceled() {
+                Ok(true) => return Ok(None),
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(fact) = self.latest_fact(id) {
+                match fact.status {
+                    ApprovalFactStatus::Approved => {
+                        self.add_log("info", &format!("审批结果: {title} → 批准"));
+                        return Ok(Some(true));
+                    }
+                    ApprovalFactStatus::Rejected
+                    | ApprovalFactStatus::Expired
+                    | ApprovalFactStatus::Interrupted => {
+                        self.add_log("warn", &format!("审批结果: {title} → 拒绝"));
+                        return Ok(Some(false));
+                    }
+                    ApprovalFactStatus::Pending => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    fn wait_for_decision_with_cancel(
         &self,
         id: &str,
         title: &str,
         timeout: u64,
         rx: mpsc::Receiver<bool>,
-    ) -> Result<bool, String> {
+        is_canceled: &mut dyn FnMut() -> Result<bool, String>,
+    ) -> Result<Option<bool>, String> {
         let started = Instant::now();
         let mut last_fact_poll = Instant::now();
         loop {
+            match is_canceled() {
+                Ok(true) => {
+                    self.remove_pending(id);
+                    let _ =
+                        self.resolve_fact(id, ApprovalFactStatus::Interrupted, "owner_canceled");
+                    self.add_log("warn", &format!("审批取消: {title}"));
+                    return Ok(None);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.remove_pending(id);
+                    let _ = self.resolve_fact(
+                        id,
+                        ApprovalFactStatus::Interrupted,
+                        "cancel_check_failed",
+                    );
+                    return Err(error);
+                }
+            }
             let elapsed = started.elapsed().as_secs();
-            if elapsed >= timeout {
+            if timeout != 0 && elapsed >= timeout {
                 self.remove_pending(id);
                 let _ = self.resolve_fact(id, ApprovalFactStatus::Expired, "approval_timeout");
                 self.add_log("warn", &format!("审批超时: {title} → 自动拒绝"));
-                return Ok(false);
+                return Ok(Some(false));
             }
-            let remaining = Duration::from_secs(timeout.saturating_sub(elapsed));
-            let wait = remaining.min(Duration::from_millis(250));
+            let wait = if timeout == 0 {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(timeout.saturating_sub(elapsed)).min(Duration::from_millis(250))
+            };
             match rx.recv_timeout(wait) {
                 Ok(approved) => {
                     self.remove_pending(id);
@@ -839,7 +1092,7 @@ impl ApprovalManager {
                             if approved { "批准" } else { "拒绝" }
                         ),
                     );
-                    return Ok(approved);
+                    return Ok(Some(approved));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.remove_pending(id);
@@ -859,20 +1112,21 @@ impl ApprovalManager {
             if let Some(fact) = self
                 .load_latest_facts()
                 .into_iter()
+                .rev()
                 .find(|fact| fact.id == id)
             {
                 match fact.status {
                     ApprovalFactStatus::Approved => {
                         self.remove_pending(id);
                         self.add_log("info", &format!("审批结果: {title} → 批准"));
-                        return Ok(true);
+                        return Ok(Some(true));
                     }
                     ApprovalFactStatus::Rejected
                     | ApprovalFactStatus::Expired
                     | ApprovalFactStatus::Interrupted => {
                         self.remove_pending(id);
                         self.add_log("warn", &format!("审批结果: {title} → 拒绝"));
-                        return Ok(false);
+                        return Ok(Some(false));
                     }
                     ApprovalFactStatus::Pending => {}
                 }
@@ -885,6 +1139,20 @@ impl ApprovalManager {
             list.retain(|p| p.request.id != id);
         }
     }
+}
+
+fn authorization_identity_path(agent_home: &std::path::Path) -> PathBuf {
+    let data_path = agent_home
+        .join("data")
+        .join("agent-user-authorization.json");
+    if data_path.is_file() {
+        return data_path;
+    }
+    let legacy_path = agent_home.join("agent-user-authorization.json");
+    if legacy_path.is_file() {
+        return legacy_path;
+    }
+    data_path
 }
 
 fn load_persisted_logs(path: &std::path::Path) -> Vec<LogEntry> {
@@ -1433,6 +1701,32 @@ mod destructive_tests {
     }
 
     #[test]
+    fn cancel_aware_approval_interrupts_the_pending_fact() {
+        let home = test_home("cancel-aware");
+        let manager = ApprovalManager::new_in(home.clone());
+        let mut checks = 0;
+        let result = manager
+            .request_capability_approval_with_cancel(
+                "acp.permission",
+                "R3",
+                "ACP permission".to_string(),
+                "provider=acp.test run_id=run-1".to_string(),
+                || {
+                    checks += 1;
+                    Ok(checks >= 2)
+                },
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        let facts = manager.list_recent_facts();
+        assert_eq!(facts[0].request_type, "acp.permission");
+        assert_eq!(facts[0].status, ApprovalFactStatus::Interrupted);
+        assert_eq!(facts[0].resolution_reason, "owner_canceled");
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn dashboard_binding_downgrades_on_identity_change_and_logout() {
         let home = test_home("identity-binding");
         fs::create_dir_all(&home).unwrap();
@@ -1487,6 +1781,36 @@ mod destructive_tests {
             .contains_key("ai.client.import"));
         manager.clear_identity().unwrap();
         assert!(manager.get_settings().owner_user_id.is_empty());
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn profile_data_authorization_drives_full_access_identity_matching() {
+        let home = test_home("profile-data-identity");
+        fs::create_dir_all(home.join("data")).unwrap();
+        fs::write(
+            home.join("data").join("agent-user-authorization.json"),
+            serde_json::json!({
+                "version": 1,
+                "agent_id": "agent-a",
+                "user_id": "user-a",
+                "scope": "agent.profile",
+                "refresh_token_protected": "test",
+                "refresh_expires_at": 4_000_000_000u64,
+                "updated_at": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let manager = ApprovalManager::new_in(home.clone());
+        manager.bind_identity("user-a", "agent-a").unwrap();
+        manager.update_profile("full_access", true).unwrap();
+
+        assert!(matches!(
+            manager.get_mode_for_key("filesystem.delete", ApprovalMode::Manual, true, Some("R4")),
+            ApprovalMode::AutoApprove
+        ));
         drop(manager);
         let _ = fs::remove_dir_all(home);
     }
@@ -1608,6 +1932,121 @@ mod destructive_tests {
         );
         drop(desktop);
         drop(requester);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn workflow_approval_uses_stable_id_without_timeout() {
+        let home = test_home("workflow-stable-id");
+        let manager = Arc::new(ApprovalManager::new_in(home.clone()));
+        manager.update_profile("full_access", true).unwrap();
+        let approval_id = "workflow:run-1:WX-UPLOAD".to_string();
+        let worker_manager = Arc::clone(&manager);
+        let worker_approval_id = approval_id.clone();
+        let worker = thread::spawn(move || {
+            worker_manager.request_workflow_approval_with_cancel(
+                &worker_approval_id,
+                "wechat.miniprogram.upload",
+                "R3",
+                "Workflow: 上传体验版".to_string(),
+                "run_id=run-1 step_id=WX-UPLOAD".to_string(),
+                || Ok(false),
+            )
+        });
+
+        let request = (0..50).find_map(|_| {
+            let request = manager
+                .list_pending()
+                .into_iter()
+                .find(|request| request.id == approval_id);
+            if request.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            request
+        });
+        let request = request.expect("workflow approval must enter the global queue");
+        assert_eq!(request.timeout_seconds, 0);
+        assert_eq!(request.remaining_seconds, 0);
+
+        manager.respond(&approval_id, true).unwrap();
+        assert_eq!(
+            worker.join().expect("approval worker panicked").unwrap(),
+            Some(true)
+        );
+        assert_eq!(manager.list_recent_facts()[0].id, approval_id);
+        assert_eq!(
+            manager.list_recent_facts()[0].status,
+            ApprovalFactStatus::Approved
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn interrupted_workflow_approval_can_be_recreated_with_same_id() {
+        let home = test_home("workflow-recreate");
+        let manager = Arc::new(ApprovalManager::new_in(home.clone()));
+        let approval_id = "workflow:run-recover:WX-UPLOAD".to_string();
+        let worker_manager = Arc::clone(&manager);
+        let first_id = approval_id.clone();
+        let first = thread::spawn(move || {
+            worker_manager.request_workflow_approval_with_cancel(
+                &first_id,
+                "wechat.miniprogram.upload",
+                "R3",
+                "Workflow: 上传体验版".to_string(),
+                "first".to_string(),
+                || Ok(false),
+            )
+        });
+        for _ in 0..50 {
+            if manager
+                .list_pending()
+                .iter()
+                .any(|request| request.id == approval_id)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        manager.interrupt(&approval_id, "test_restart").unwrap();
+        assert_eq!(
+            first.join().expect("approval worker panicked").unwrap(),
+            Some(false)
+        );
+
+        let worker_manager = Arc::clone(&manager);
+        let second_id = approval_id.clone();
+        let second = thread::spawn(move || {
+            worker_manager.request_workflow_approval_with_cancel(
+                &second_id,
+                "wechat.miniprogram.upload",
+                "R3",
+                "Workflow: 上传体验版".to_string(),
+                "second".to_string(),
+                || Ok(false),
+            )
+        });
+        let request = (0..50).find_map(|_| {
+            let request = manager
+                .list_pending()
+                .into_iter()
+                .find(|request| request.id == approval_id);
+            if request.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            request
+        });
+        assert!(
+            request.is_some(),
+            "same workflow approval must be recreated"
+        );
+        manager.respond(&approval_id, true).unwrap();
+        assert_eq!(
+            second.join().expect("approval worker panicked").unwrap(),
+            Some(true)
+        );
+        drop(manager);
         let _ = fs::remove_dir_all(home);
     }
 

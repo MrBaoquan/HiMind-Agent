@@ -115,8 +115,10 @@ pub(crate) fn select_declared(
 
 pub(crate) fn archive_directory(root: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     let mut archive = zip::ZipWriter::new(File::create(target)?);
-    let options =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default());
+    let mut entries = Vec::new();
     for entry in walkdir::WalkDir::new(root).min_depth(1) {
         let entry = entry?;
         if !entry.file_type().is_file() {
@@ -127,8 +129,12 @@ pub(crate) fn archive_directory(root: &Path, target: &Path) -> Result<(), Box<dy
             .strip_prefix(root)?
             .to_string_lossy()
             .replace('\\', "/");
+        entries.push((relative, entry.path().to_path_buf()));
+    }
+    entries.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+    for (relative, path) in entries {
         archive.start_file(relative, options)?;
-        std::io::copy(&mut File::open(entry.path())?, &mut archive)?;
+        std::io::copy(&mut File::open(path)?, &mut archive)?;
     }
     archive.finish()?;
     Ok(())
@@ -253,6 +259,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("agents/openai.yaml"));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn archive_directory_is_deterministic() {
+        let fixture = Fixture::new("archive-deterministic");
+        fixture.write("workflow.json", "{}");
+        fixture.write("schemas/result.json", "{}");
+        let first = fixture.source.parent().unwrap().join("first.hmwf");
+        let second = fixture.source.parent().unwrap().join("second.hmwf");
+        archive_directory(&fixture.source, &first).unwrap();
+        archive_directory(&fixture.source, &second).unwrap();
+        assert_eq!(
+            Sha256::digest(fs::read(first).unwrap()),
+            Sha256::digest(fs::read(second).unwrap())
+        );
         fixture.cleanup();
     }
 

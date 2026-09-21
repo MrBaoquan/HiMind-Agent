@@ -14,10 +14,18 @@ use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::client::update_agent_run_status;
-use crate::api::distribution::{resolve_runtime_component, RuntimeComponentUpdate};
+use crate::api::distribution::RuntimeComponentUpdate;
 use crate::api::types::{AgentRunClaim, RuntimeInstallationReport, Task};
-use crate::app::system::{validate_update_download_url, verify_runtime_component_signature};
+use crate::app::system::{
+    validate_update_download_url, validate_update_download_url_for_source,
+    verify_runtime_component_signature,
+};
 use crate::runtime::builtin::BuiltinAIRuntimeEvent;
+use crate::runtime::distribution::{
+    resolve_configured_runtime_component, ResolvedRuntimeComponent, RuntimeDistributionSource,
+    RUNTIME_CHANNEL, RUNTIME_CONTRACT, RUNTIME_ENGINE_ID, RUNTIME_MAX_PACKAGE_BYTES,
+    RUNTIME_PRODUCT_ID,
+};
 use crate::runtime::process;
 use crate::runtime::{execute_managed, AgentRunEnvelope, PROVIDER_BUILTIN};
 use crate::skill::store::SkillStore;
@@ -28,13 +36,6 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
 const OUTPUT_CAPTURE_LIMIT: usize = 256 * 1024;
 const DSH_HOME_ENV: &str = "DSH_HOME";
 const DSH_HOME_ROOT_ENV: &str = "HIMIND_DSH_HOME_ROOT";
-const RUNTIME_PRODUCT_ID: &str = "com.himind.runtime.deepseek-harness";
-const RUNTIME_CONTRACT: &str = PROVIDER_BUILTIN;
-const RUNTIME_ENGINE_ID: &str = "deepseek-harness";
-const RUNTIME_CHANNEL: &str = "stable";
-const RUNTIME_PLATFORM: &str = "windows";
-const RUNTIME_ARCHITECTURE: &str = "x64";
-const RUNTIME_MAX_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const INSTALL_TIMEOUT_SECONDS: u64 = 30 * 60;
 const UPDATE_CHECK_TIMEOUT_SECONDS: u64 = 30;
@@ -52,6 +53,8 @@ const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
 const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
 const HIMIND_AGENT_PATCH_MARKER: &str =
     "# Agent-owned context. This layer is regenerated for each new HiMind AI session.";
+const INDEPENDENT_ACTIVE_PROVIDER_ID: &str = "himind-local-ai";
+const INDEPENDENT_ACTIVE_API_KEY_ENV: &str = "HIMIND_LOCAL_AI_API_KEY";
 const DSH_SETTINGS_MIGRATION_MARKER: &str = ".himind-dsh-settings-v2";
 const INTERACTIVE_HOME_DIRECTORY: &str = "interactive";
 const INTERACTIVE_HOME_MIGRATION_MARKER: &str = ".himind-interactive-home-v1.json";
@@ -65,6 +68,12 @@ struct InstalledRuntimeState {
     provider: String,
     version: String,
     executable_path: String,
+    #[serde(default)]
+    min_agent_version: String,
+    #[serde(default)]
+    max_agent_version: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Default)]
@@ -83,6 +92,10 @@ pub(crate) struct DeepSeekHarnessRuntimeStatus {
     pub install_command: String,
     pub message: String,
     pub candidate: bool,
+    pub compatible_with_agent: bool,
+    pub min_agent_version: String,
+    pub max_agent_version: String,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -109,6 +122,8 @@ pub(crate) struct InteractiveLaunch {
     pub credential_fingerprint: String,
     pub catalog_fingerprint: String,
     pub permission_mode: &'static str,
+    /// 这次运行实际用到的 AI 服务来源：`managed`（平台托管）/ `custom`（本机自定义服务）/ `native`（Runtime 自身配置）。
+    pub service_source: &'static str,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -441,6 +456,12 @@ struct RuntimePackageManifest {
     engine_id: String,
     version: String,
     executable: String,
+    #[serde(default)]
+    min_agent_version: String,
+    #[serde(default)]
+    max_agent_version: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -483,24 +504,24 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
     let cli_compatible = executable.as_ref().is_some_and(|path| {
         process::verify_command(path, &["--profile", "headless", "--help"]).is_ok()
     });
+    let runtime_state = load_runtime_state().ok().flatten();
+    let compatibility_error = runtime_state.as_ref().and_then(|state| {
+        validate_runtime_agent_compatibility(&state.min_agent_version, &state.max_agent_version)
+            .err()
+    });
+    let compatible_with_agent = compatibility_error.is_none();
+    let ready = cli_compatible && compatible_with_agent;
     RuntimeInstallationReport {
         provider: PROVIDER_BUILTIN.to_string(),
         version: if version.is_empty() {
-            resolved
+            runtime_state
                 .as_ref()
-                .ok()
-                .and_then(|_| load_runtime_state().ok().flatten())
-                .map(|state| state.version)
+                .map(|state| state.version.clone())
                 .unwrap_or_default()
         } else {
             version
         },
-        status: if cli_compatible {
-            "ready"
-        } else {
-            "unavailable"
-        }
-        .to_string(),
+        status: if ready { "ready" } else { "unavailable" }.to_string(),
         capabilities: json!({
             "managed_execution": true,
             "billing_owner": "himind",
@@ -508,6 +529,22 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
             "runtime_contract": 1,
             "engine_id": RUNTIME_ENGINE_ID,
             "cli_compatible": cli_compatible,
+            "compatible_with_agent": compatible_with_agent,
+            "min_agent_version": runtime_state
+                .as_ref()
+                .map(|state| state.min_agent_version.clone())
+                .unwrap_or_default(),
+            "max_agent_version": runtime_state
+                .as_ref()
+                .map(|state| state.max_agent_version.clone())
+                .unwrap_or_default(),
+            "runtime_capabilities": runtime_state
+                .as_ref()
+                .map(|state| state.capabilities.clone())
+                .unwrap_or_default(),
+            "network_isolated": false,
+            "tool_access": "windows-restricted-token",
+            "compatibility_error": compatibility_error.unwrap_or_default(),
             "sandbox": "windows-restricted-token"
         }),
     }
@@ -523,19 +560,26 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
     let cli_compatible = executable.as_ref().is_some_and(|path| {
         process::verify_command(path, &["--profile", "headless", "--help"]).is_ok()
     });
-    let installed_version = load_runtime_state()
-        .ok()
-        .flatten()
-        .map(|state| state.version)
+    let runtime_state = load_runtime_state().ok().flatten();
+    let compatibility_error = runtime_state.as_ref().and_then(|state| {
+        validate_runtime_agent_compatibility(&state.min_agent_version, &state.max_agent_version)
+            .err()
+    });
+    let compatible_with_agent = compatibility_error.is_none();
+    let installed_version = runtime_state
+        .as_ref()
+        .map(|state| state.version.clone())
         .unwrap_or_default();
+    let status = if cli_compatible && compatible_with_agent {
+        "ready"
+    } else if cli_compatible {
+        "incompatible"
+    } else {
+        "unavailable"
+    };
     DeepSeekHarnessRuntimeStatus {
         provider: PROVIDER_BUILTIN.to_string(),
-        status: if cli_compatible {
-            "ready"
-        } else {
-            "unavailable"
-        }
-        .to_string(),
+        status: status.to_string(),
         version: if version.is_empty() {
             installed_version
         } else {
@@ -545,13 +589,30 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
         executable_path: executable
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
-        install_command: "Dashboard Runtime Resolve + SHA-256/RSA-PSS 校验 + 隔离安装".to_string(),
-        message: if cli_compatible {
-            "Runtime engine is ready.".to_string()
-        } else {
-            "Runtime engine is unavailable.".to_string()
-        },
+        install_command:
+            "Runtime Distribution Provider (auto/local/github/dashboard) + SHA-256/RSA-PSS 校验 + 隔离安装"
+                .to_string(),
+        message: compatibility_error
+            .unwrap_or_else(|| {
+                if cli_compatible {
+                    "Runtime engine is ready.".to_string()
+                } else {
+                    "Runtime engine is unavailable.".to_string()
+                }
+            }),
         candidate: false,
+        compatible_with_agent,
+        min_agent_version: runtime_state
+            .as_ref()
+            .map(|state| state.min_agent_version.clone())
+            .unwrap_or_default(),
+        max_agent_version: runtime_state
+            .as_ref()
+            .map(|state| state.max_agent_version.clone())
+            .unwrap_or_default(),
+        capabilities: runtime_state
+            .map(|state| state.capabilities)
+            .unwrap_or_default(),
     }
 }
 
@@ -563,23 +624,16 @@ pub(crate) fn check_update(
     if !runtime.cli_compatible || runtime.version.trim().is_empty() {
         return Err("HiMind AI 运行时尚未安装".to_string());
     }
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECONDS))
-        .build()
-        .map_err(|error| format!("创建 Dashboard 客户端失败: {error}"))?;
-    let update = resolve_runtime_component(
-        &client,
-        &options.api_base,
-        RUNTIME_PRODUCT_ID,
+    let update = resolve_configured_runtime_component(
+        options,
         &runtime.version,
-        RUNTIME_CHANNEL,
-        RUNTIME_PLATFORM,
-        RUNTIME_ARCHITECTURE,
         client_instance_id,
+        std::time::Duration::from_secs(UPDATE_CHECK_TIMEOUT_SECONDS),
     )
     .map_err(|error| format!("检查 HiMind AI 运行时更新失败: {error}"))?;
-    if let Some(update) = update {
-        validate_update(&options.api_base, &update)?;
+    if let Some(resolved) = update {
+        validate_update(&options.api_base, &resolved)?;
+        let update = resolved.update;
         return Ok(DeepSeekHarnessRuntimeUpdateStatus {
             update_available: true,
             current_version: runtime.version,
@@ -637,33 +691,29 @@ fn install_resolved_with_progress(
     report_progress: &mut dyn FnMut(&str, u8, &str),
 ) -> Result<DeepSeekHarnessRuntimeStatus, String> {
     report_progress("resolving", 5, "正在检查可用的 HiMind AI 运行时");
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(INSTALL_TIMEOUT_SECONDS))
-        .build()
-        .map_err(|error| format!("创建 Dashboard 客户端失败: {error}"))?;
-    let update = resolve_runtime_component(
-        &client,
-        &options.api_base,
-        RUNTIME_PRODUCT_ID,
+    let update = resolve_configured_runtime_component(
+        options,
         current_version,
-        RUNTIME_CHANNEL,
-        RUNTIME_PLATFORM,
-        RUNTIME_ARCHITECTURE,
         client_instance_id,
+        std::time::Duration::from_secs(INSTALL_TIMEOUT_SECONDS),
     )
     .map_err(|error| format!("解析 HiMind AI 运行时发布失败: {error}"))?;
-    let Some(update) = update else {
+    let Some(resolved) = update else {
         if current_version == "0.0.0" {
             return Err("当前没有可用的 HiMind AI 运行时安装包".to_string());
         }
         report_progress("ready", 100, "HiMind AI 运行时已是最新版本");
         return Ok(status());
     };
-    validate_update(&options.api_base, &update)?;
+    validate_update(&options.api_base, &resolved)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(INSTALL_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| format!("创建 Runtime Distribution 客户端失败: {error}"))?;
     report_progress("downloading", 12, "正在下载 HiMind AI 运行时");
-    let archive = download_runtime_archive(&client, &update, report_progress)?;
+    let archive = download_runtime_archive(&client, &resolved, report_progress)?;
     report_progress("verifying", 78, "正在校验下载的运行时");
-    let result = install_runtime_archive(&archive, &update, report_progress);
+    let result = install_runtime_archive(&archive, &resolved.update, report_progress);
     if result.is_ok() {
         let _ = fs::remove_file(&archive);
     }
@@ -694,6 +744,18 @@ pub(crate) fn prepare_interactive_launch(
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     let workspace = interactive_workspace(workspace)?;
+    if options.mode().dashboard_enabled()
+        && crate::store::ai_services::active_service()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return prepare_independent_interactive_launch(
+            options,
+            executable.to_string_lossy().to_string(),
+            version,
+            workspace,
+        );
+    }
     if !options.mode().dashboard_enabled() {
         return prepare_independent_interactive_launch(
             options,
@@ -741,14 +803,31 @@ pub(crate) fn prepare_interactive_launch(
         credential_fingerprint: sync_snapshot.credential_fingerprint,
         catalog_fingerprint: sync_snapshot.catalog_fingerprint,
         permission_mode: INTERACTIVE_PERMISSION_MODE,
+        service_source: "managed",
     })
+}
+
+/// 一次 Runtime 执行的产出与它实际用到的模型/服务。
+///
+/// “用了哪个模型”是执行事实的一部分：不记下来，事后只能去猜 Runtime 的当前配置。
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowRuntimeOutcome {
+    pub text: String,
+    pub model: String,
+    /// `managed` / `custom` / `native`
+    pub service_source: &'static str,
+    /// 只保留 scheme://host，避免把凭据或路径带进运行记录。
+    pub endpoint: String,
 }
 
 pub(crate) fn execute_workflow(
     options: &Options,
     workspace: &str,
     prompt: &str,
-) -> Result<String, Box<dyn Error>> {
+    timeout_seconds: u64,
+    disable_tools: bool,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     let workspace = process::canonical_workspace(workspace)?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -756,13 +835,21 @@ pub(crate) fn execute_workflow(
     }
     let launch =
         prepare_interactive_launch(options, Some(&workspace)).map_err(std::io::Error::other)?;
-    let mut command = Command::new(&launch.executable);
+    // `tool_policy=none` 的步骤用一份把工具行全部禁用的 overlay：模型看不到任何
+    // 工具 schema，也就不可能“去工作区找文件”。这和 prompt 里的约定不同，是
+    // 平台强制的事实。
+    let patch = if disable_tools {
+        write_no_tools_overlay(&launch.home)?
+    } else {
+        launch.agent_patch.clone()
+    };
+    let mut command = dsh_command(launch.executable.as_os_str());
     command
         .args([
             OsString::from("--profile"),
             OsString::from(HIMIND_HEADLESS_PROFILE),
             OsString::from("--patch"),
-            launch.agent_patch.as_os_str().to_os_string(),
+            patch.as_os_str().to_os_string(),
             OsString::from(prompt),
         ])
         .current_dir(&launch.workspace)
@@ -786,21 +873,47 @@ pub(crate) fn execute_workflow(
     command.env("DEEPSEEK_API_KEY", &launch.api_key);
     command.env("DEEPSEEK_BASE_URL", &launch.base_url);
     process::configure_hidden_process(&mut command);
-    let output = command.output()?;
-    if !output.status.success() {
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().map(process::capture_output);
+    let stderr = child.stderr.take().map(process::capture_output);
+    let status = process::wait_for_child_with_timeout_and_cancel(
+        &mut child,
+        "HIMIND_DSH_TIMEOUT_SECONDS",
+        timeout_seconds,
+        "DeepSeek Harness workflow runtime",
+        || is_canceled(),
+    )?;
+    let stdout = process::join_output(stdout);
+    let stderr = process::join_output(stderr);
+    if !status.success() {
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
         return Err(format!(
             "DSH workflow runtime failed: {}",
-            process::summarize_output(
-                String::from_utf8_lossy(&output.stderr).trim(),
-                OUTPUT_CAPTURE_LIMIT
-            )
+            process::summarize_output(detail.trim(), OUTPUT_CAPTURE_LIMIT)
         )
         .into());
     }
-    Ok(process::summarize_output(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        OUTPUT_CAPTURE_LIMIT,
-    ))
+    Ok(WorkflowRuntimeOutcome {
+        text: process::summarize_output(stdout.trim(), OUTPUT_CAPTURE_LIMIT),
+        model: launch.default_model.clone(),
+        service_source: launch.service_source,
+        endpoint: endpoint_host(&launch.base_url),
+    })
+}
+
+/// 只保留协议与主机，去掉路径与查询串。
+pub(crate) fn endpoint_host(base_url: &str) -> String {
+    match url::Url::parse(base_url.trim()) {
+        Ok(parsed) => match (parsed.scheme(), parsed.host_str()) {
+            (scheme, Some(host)) => format!("{scheme}://{host}"),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    }
 }
 
 fn prepare_independent_interactive_launch(
@@ -810,20 +923,31 @@ fn prepare_independent_interactive_launch(
     workspace: PathBuf,
 ) -> Result<InteractiveLaunch, String> {
     let home = native_dsh_home(&version)?;
-    let provider_config = native_dsh_provider_config(&home);
-    let api_key = match provider_config.api_key_env.as_deref() {
-        Some(api_key_env) => env::var(api_key_env).unwrap_or_default(),
-        None => String::new(),
-    };
+    let (provider_config, api_key, service_source) =
+        match active_independent_provider_config().map_err(|error| error.to_string())? {
+            Some(projection) => (projection.0, projection.1, "custom"),
+            None => {
+                let provider_config = native_dsh_provider_config(&home);
+                let api_key = match provider_config.api_key_env.as_deref() {
+                    Some(api_key_env) => env::var(api_key_env).unwrap_or_default(),
+                    None => String::new(),
+                };
+                (provider_config, api_key, "native")
+            }
+        };
+    let api_key_env = provider_config.api_key_env.clone();
+    let base_url = provider_config.base_url.clone();
+    let model = provider_config.model.clone();
+    let models = provider_config.models.clone();
     let invocation = Invocation {
         executable: executable.clone().into(),
         args: Vec::new(),
         workspace: workspace.clone(),
         home: home.clone(),
         api_key: api_key.clone(),
-        base_url: provider_config.base_url.clone(),
-        model: provider_config.model.clone(),
-        models: provider_config.models.clone(),
+        base_url: base_url.clone(),
+        model: model.clone(),
+        models: models.clone(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         run_id: "interactive".to_string(),
     };
@@ -835,15 +959,37 @@ fn prepare_independent_interactive_launch(
         workspace,
         user_id: "local".to_string(),
         api_key,
-        api_key_env: provider_config.api_key_env,
-        base_url: provider_config.base_url,
+        api_key_env,
+        base_url,
         agent_patch,
-        default_model: provider_config.model,
-        models: provider_config.models,
+        default_model: model,
+        models,
         credential_fingerprint: String::new(),
         catalog_fingerprint: String::new(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
+        service_source,
     })
+}
+
+fn active_independent_provider_config(
+) -> Result<Option<(NativeDshProviderConfig, String)>, Box<dyn Error>> {
+    let Some((service, api_key)) = crate::store::ai_services::active_service_with_secret()? else {
+        return Ok(None);
+    };
+    let mut models = vec![service.model.clone()];
+    models.extend(service.models.iter().cloned());
+    let mut seen = HashSet::new();
+    models.retain(|value| !value.trim().is_empty() && seen.insert(value.clone()));
+    Ok(Some((
+        NativeDshProviderConfig {
+            provider: INDEPENDENT_ACTIVE_PROVIDER_ID.to_string(),
+            model: service.model,
+            api_key_env: Some(INDEPENDENT_ACTIVE_API_KEY_ENV.to_string()),
+            base_url: service.base_url,
+            models,
+        },
+        api_key,
+    )))
 }
 
 fn native_dsh_provider_config(home: &Path) -> NativeDshProviderConfig {
@@ -980,7 +1126,8 @@ fn managed_model_catalog(
     Ok(models)
 }
 
-fn validate_update(api_base: &str, update: &RuntimeComponentUpdate) -> Result<(), String> {
+fn validate_update(api_base: &str, resolved: &ResolvedRuntimeComponent) -> Result<(), String> {
+    let update = &resolved.update;
     if update.product_id != RUNTIME_PRODUCT_ID
         || update.channel != RUNTIME_CHANNEL
         || update.package_type != "directory-zip"
@@ -990,66 +1137,152 @@ fn validate_update(api_base: &str, update: &RuntimeComponentUpdate) -> Result<()
             "Dashboard Runtime manifest 不符合 DeepSeek Harness directory-zip 契约。".to_string(),
         );
     }
-    validate_update_download_url(api_base, &update.artifact_url)
-        .map_err(|error| format!("Runtime 下载地址校验失败: {error}"))?;
+    validate_runtime_agent_compatibility(&update.min_agent_version, &update.max_agent_version)?;
+    match resolved.source {
+        RuntimeDistributionSource::Dashboard => {
+            validate_update_download_url(api_base, &update.artifact_url)
+                .map_err(|error| format!("Runtime Dashboard 下载地址校验失败: {error}"))?;
+        }
+        RuntimeDistributionSource::Github => {
+            validate_update_download_url_for_source("", &update.artifact_url, "github")
+                .map_err(|error| format!("Runtime GitHub 下载地址校验失败: {error}"))?;
+        }
+        RuntimeDistributionSource::Local => {
+            let artifact = PathBuf::from(update.artifact_url.trim());
+            let metadata = fs::metadata(&artifact)
+                .map_err(|error| format!("本地 Runtime 制品不可读取: {error}"))?;
+            if !metadata.is_file() || metadata.len() != update.size {
+                return Err("本地 Runtime 制品不是文件或大小与发布清单不一致。".to_string());
+            }
+        }
+    }
     if update.size == 0 || update.size > RUNTIME_MAX_PACKAGE_BYTES {
         return Err("Runtime 包大小超出 Agent 安全限制。".to_string());
     }
     Ok(())
 }
 
+fn validate_runtime_agent_compatibility(
+    min_agent_version: &str,
+    max_agent_version: &str,
+) -> Result<(), String> {
+    let current = semver::Version::parse(crate::VERSION)
+        .map_err(|error| format!("当前 Agent 版本号无效: {error}"))?;
+    let min_agent_version = min_agent_version.trim();
+    if !min_agent_version.is_empty() {
+        let min = semver::Version::parse(min_agent_version)
+            .map_err(|error| format!("Runtime 最低 Agent 版本号无效: {error}"))?;
+        if current < min {
+            return Err(format!(
+                "当前 Agent {current} 低于 Runtime 要求的 {min_agent_version}"
+            ));
+        }
+    }
+    let max_agent_version = max_agent_version.trim();
+    if !max_agent_version.is_empty() {
+        let max = semver::Version::parse(max_agent_version)
+            .map_err(|error| format!("Runtime 最高 Agent 版本号无效: {error}"))?;
+        if current > max {
+            return Err(format!(
+                "当前 Agent {current} 高于 Runtime 支持的 {max_agent_version}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn runtime_capabilities_match(left: &[String], right: &[String]) -> bool {
+    let left = left.iter().map(String::as_str).collect::<HashSet<_>>();
+    let right = right.iter().map(String::as_str).collect::<HashSet<_>>();
+    left == right
+}
+
 fn download_runtime_archive(
     client: &Client,
-    update: &RuntimeComponentUpdate,
+    resolved: &ResolvedRuntimeComponent,
     report_progress: &mut dyn FnMut(&str, u8, &str),
 ) -> Result<PathBuf, String> {
+    let update = &resolved.update;
     let directory = runtime_root().join("downloads");
     fs::create_dir_all(&directory)
         .map_err(|error| format!("创建 Runtime 下载目录失败: {error}"))?;
     let target = directory.join(format!("{}.zip", update.sha256.to_ascii_lowercase()));
     let partial = target.with_extension("zip.part");
-    let mut response = client
-        .get(&update.artifact_url)
-        .send()
-        .map_err(|error| format!("下载 Runtime 失败: {error}"))?;
-    response
-        .error_for_status_ref()
-        .map_err(|error| format!("Runtime 下载响应失败: {error}"))?;
-    let mut file =
-        File::create(&partial).map_err(|error| format!("创建 Runtime 临时文件失败: {error}"))?;
-    let mut hasher = Sha256::new();
-    let mut downloaded = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut last_reported_percent = 12_u8;
-    loop {
-        let count = response
-            .read(&mut buffer)
-            .map_err(|error| format!("读取 Runtime 下载失败: {error}"))?;
-        if count == 0 {
-            break;
+    let downloaded = match resolved.source {
+        RuntimeDistributionSource::Local => {
+            let source = PathBuf::from(update.artifact_url.trim());
+            fs::copy(&source, &partial)
+                .map_err(|error| format!("复制本地 Runtime 制品失败: {error}"))?;
+            let mut file = File::open(&partial)
+                .map_err(|error| format!("读取本地 Runtime 制品失败: {error}"))?;
+            let mut hasher = Sha256::new();
+            let mut downloaded = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = file
+                    .read(&mut buffer)
+                    .map_err(|error| format!("读取本地 Runtime 制品失败: {error}"))?;
+                if count == 0 {
+                    break;
+                }
+                downloaded = downloaded.saturating_add(count as u64);
+                hasher.update(&buffer[..count]);
+            }
+            if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(&update.sha256) {
+                let _ = fs::remove_file(&partial);
+                return Err("Runtime SHA-256 校验失败。".to_string());
+            }
+            downloaded
         }
-        downloaded = downloaded.saturating_add(count as u64);
-        if downloaded > update.size || downloaded > RUNTIME_MAX_PACKAGE_BYTES {
-            let _ = fs::remove_file(&partial);
-            return Err("Runtime 下载大小超出 manifest。".to_string());
+        RuntimeDistributionSource::Github | RuntimeDistributionSource::Dashboard => {
+            let mut response = client
+                .get(&update.artifact_url)
+                .send()
+                .map_err(|error| format!("下载 Runtime 失败: {error}"))?;
+            response
+                .error_for_status_ref()
+                .map_err(|error| format!("Runtime 下载响应失败: {error}"))?;
+            let mut file = File::create(&partial)
+                .map_err(|error| format!("创建 Runtime 临时文件失败: {error}"))?;
+            let mut hasher = Sha256::new();
+            let mut downloaded = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut last_reported_percent = 12_u8;
+            loop {
+                let count = response
+                    .read(&mut buffer)
+                    .map_err(|error| format!("读取 Runtime 下载失败: {error}"))?;
+                if count == 0 {
+                    break;
+                }
+                downloaded = downloaded.saturating_add(count as u64);
+                if downloaded > update.size || downloaded > RUNTIME_MAX_PACKAGE_BYTES {
+                    let _ = fs::remove_file(&partial);
+                    return Err("Runtime 下载大小超出 manifest。".to_string());
+                }
+                file.write_all(&buffer[..count])
+                    .map_err(|error| format!("写入 Runtime 下载失败: {error}"))?;
+                hasher.update(&buffer[..count]);
+                let percent = 12_u8.saturating_add(
+                    ((downloaded.saturating_mul(64) / update.size.max(1)).min(64)) as u8,
+                );
+                if percent >= last_reported_percent.saturating_add(2) {
+                    report_progress("downloading", percent, "正在下载 HiMind AI 运行时");
+                    last_reported_percent = percent;
+                }
+            }
+            file.flush()
+                .map_err(|error| format!("刷新 Runtime 下载失败: {error}"))?;
+            if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(&update.sha256) {
+                let _ = fs::remove_file(&partial);
+                return Err("Runtime SHA-256 校验失败。".to_string());
+            }
+            downloaded
         }
-        file.write_all(&buffer[..count])
-            .map_err(|error| format!("写入 Runtime 下载失败: {error}"))?;
-        hasher.update(&buffer[..count]);
-        let percent = 12_u8
-            .saturating_add(((downloaded.saturating_mul(64) / update.size.max(1)).min(64)) as u8);
-        if percent >= last_reported_percent.saturating_add(2) {
-            report_progress("downloading", percent, "正在下载 HiMind AI 运行时");
-            last_reported_percent = percent;
-        }
-    }
-    file.flush()
-        .map_err(|error| format!("刷新 Runtime 下载失败: {error}"))?;
-    if downloaded != update.size
-        || !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(&update.sha256)
-    {
+    };
+    if downloaded != update.size || downloaded > RUNTIME_MAX_PACKAGE_BYTES {
         let _ = fs::remove_file(&partial);
-        return Err("Runtime SHA-256 或文件大小校验失败。".to_string());
+        return Err("Runtime 文件大小校验失败。".to_string());
     }
     verify_runtime_component_signature(
         &partial,
@@ -1087,6 +1320,17 @@ fn install_runtime_archive(
     )
     .map_err(|error| format!("runtime.json 无效: {error}"))?;
     let executable = safe_relative_path(&manifest.executable)?;
+    validate_runtime_agent_compatibility(&manifest.min_agent_version, &manifest.max_agent_version)?;
+    if (!update.min_agent_version.trim().is_empty()
+        && manifest.min_agent_version != update.min_agent_version)
+        || (!update.max_agent_version.trim().is_empty()
+            && manifest.max_agent_version != update.max_agent_version)
+        || (!update.capabilities.is_empty()
+            && !runtime_capabilities_match(&manifest.capabilities, &update.capabilities))
+    {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err("Runtime manifest 与 Runtime Distribution 兼容声明不一致。".to_string());
+    }
     if manifest.schema_version != 2
         || manifest.product_id != RUNTIME_PRODUCT_ID
         || manifest.runtime_contract != RUNTIME_CONTRACT
@@ -1095,7 +1339,7 @@ fn install_runtime_archive(
         || !temporary.join(&executable).is_file()
     {
         let _ = fs::remove_dir_all(&temporary);
-        return Err("Runtime manifest 与 Dashboard 发布信息不一致。".to_string());
+        return Err("Runtime manifest 与 Runtime Distribution 发布信息不一致。".to_string());
     }
     if let Err(error) =
         verify_staged_runtime(&temporary.join(&executable), &temporary, &manifest.version)
@@ -1124,6 +1368,9 @@ fn install_runtime_archive(
         provider: RUNTIME_CONTRACT.to_string(),
         version: manifest.version,
         executable_path: target.join(executable).to_string_lossy().to_string(),
+        min_agent_version: manifest.min_agent_version,
+        max_agent_version: manifest.max_agent_version,
+        capabilities: manifest.capabilities,
     };
     if let Err(error) = write_runtime_state(&state) {
         let _ = fs::remove_dir_all(&target);
@@ -1485,7 +1732,7 @@ fn effective_access_mode(claim: &AgentRunClaim) -> Result<&str, Box<dyn Error>> 
 }
 
 fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
-    let mut command = Command::new(&invocation.executable);
+    let mut command = dsh_command(&invocation.executable);
     process::remove_himind_secret_environment(&mut command);
     command
         .args(&invocation.args)
@@ -1506,6 +1753,37 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
     command.env_remove("GEMINI_API_KEY");
     process::configure_hidden_process(&mut command);
     Ok(command.spawn()?)
+}
+
+fn dsh_command(executable: &std::ffi::OsStr) -> Command {
+    #[cfg(target_os = "windows")]
+    if let Some(command) = windows_node_command(executable) {
+        return command;
+    }
+    process::hidden_command(executable)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_node_command(executable: &std::ffi::OsStr) -> Option<Command> {
+    let path = PathBuf::from(executable);
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    if extension != "cmd" && extension != "bat" {
+        return None;
+    }
+    let runtime_root = path.parent()?.parent()?;
+    let node = runtime_root.join("node.exe");
+    let script = runtime_root
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js");
+    if !node.is_file() || !script.is_file() {
+        return None;
+    }
+    let mut command = process::hidden_command(node);
+    command.arg(script);
+    Some(command)
 }
 
 fn ensure_home_config(invocation: &Invocation, options: &Options) -> Result<(), Box<dyn Error>> {
@@ -1649,6 +1927,61 @@ fn strip_managed_patch_row(row: &YamlValue) -> Option<YamlValue> {
 fn agent_overlay_path(home: &Path) -> PathBuf {
     home.join(HIMIND_AGENT_OVERLAY_DIR)
         .join(HIMIND_AGENT_OVERLAY_FILE)
+}
+
+/// 无工具 overlay 的文件名：与交互 overlay 并存，互不覆盖。
+const HIMIND_AGENT_NO_TOOLS_OVERLAY_FILE: &str = "agent-no-tools.patch.yml";
+
+/// 每一步都要禁用的工具行。
+///
+/// 这些是 DSH base/headless 组合里会向模型暴露工具的行：文件、Shell、网络、
+/// 技能、待办、目标、Workflow、子代理，以及 HiMind 自己的 MCP 客户端。
+/// 计划模式、提问和展示行也一并关掉——它们同样是“模型可见的工具”，
+/// 在无审批面的 headless 运行里只会让步骤卡住。
+const NO_TOOLS_DISABLED_ROWS: &[&str] = &[
+    "tool-fs",
+    "tool-fs-search",
+    "tool-pwsh",
+    "tool-bash",
+    "tool-web",
+    "tool-skill",
+    "tool-todo",
+    "tool-goal",
+    "tool-jobs",
+    "tool-workflow",
+    "tool-ralph",
+    "tool-subagent",
+    "tool-subagent-fork",
+    "tool-subagent-control",
+    "tool-subagent-list-agents",
+    "tool-present",
+    "plan-mode",
+    "user-questions",
+    "himind-agent-mcp",
+];
+
+/// 生成（或刷新）禁用全部工具行的 overlay，返回可传给 `--patch` 的路径。
+fn write_no_tools_overlay(home: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let base = fs::read_to_string(agent_overlay_path(home))?;
+    let overlay = no_tools_overlay_text(&base);
+    let path = home
+        .join(HIMIND_AGENT_OVERLAY_DIR)
+        .join(HIMIND_AGENT_NO_TOOLS_OVERLAY_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, overlay)?;
+    Ok(path)
+}
+
+/// 在已有 overlay 之上追加“禁用工具行”。保持纯函数便于测试。
+fn no_tools_overlay_text(base: &str) -> String {
+    let mut overlay = base.trim_end().to_string();
+    overlay.push_str("\n\n# HiMind workflow step with tool_policy=none: no model-facing tool stays mounted.\n");
+    for row in NO_TOOLS_DISABLED_ROWS {
+        overlay.push_str(&format!("- id: {row}\n  disabled: true\n"));
+    }
+    overlay
 }
 
 fn ensure_agent_overlay(
@@ -1795,7 +2128,7 @@ fn render_himind_agent_overlay(
     models: &[String],
     workspace: &Path,
 ) -> Result<String, Box<dyn Error>> {
-    render_himind_profile_patch_from_base(
+    let mut patch = render_himind_profile_patch_from_base(
         home,
         options,
         default_model,
@@ -1803,7 +2136,11 @@ fn render_himind_agent_overlay(
         models,
         "",
         Some(workspace),
-    )
+    )?;
+    patch.push_str(
+        "\n\n# The interactive DSH surface is embedded by HiMind Agent and must never hand off to the default browser.\n- id: web-runtime\n  config:\n    openBrowser: false\n",
+    );
+    Ok(patch)
 }
 
 fn render_himind_profile_patch_from_base(
@@ -1818,8 +2155,15 @@ fn render_himind_profile_patch_from_base(
     let executable = himind_mcp_executable()?;
     let args = himind_mcp_arguments(options);
     let mut patch = base_patch.trim_end().to_string();
+    if base_patch.contains("- id: web-runtime") {
+        patch.push_str(
+            "\n\n# Managed sessions are embedded by HiMind Agent and must never open the DSH URL in the default browser.\n- id: web-runtime\n  config:\n    openBrowser: false\n",
+        );
+    }
     if options.mode().dashboard_enabled() {
         append_managed_model_profile(&mut patch, home, default_model, base_url, models)?;
+    } else if let Some(service) = crate::store::ai_services::active_service()? {
+        append_independent_service_profile(&mut patch, &service)?;
     } else {
         patch.push_str(
             "\n\n# Independent Mode: provider and model selection remain owned by DSH settings.yaml.\n",
@@ -1904,6 +2248,57 @@ fn append_managed_model_profile(
     patch.push_str(
         "- id: llm-pi-ai\n  config:\n    providers:\n      himind-proxy:\n        displayName: HiMind AI\n        apiKeyEnv: DEEPSEEK_API_KEY\n        api: openai-completions\n",
     );
+    patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(base_url)));
+    patch.push_str("        models:\n");
+    for model in catalog {
+        let model = yaml_scalar(&model);
+        patch.push_str(&format!(
+            "          - id: {model}\n            name: {model}\n"
+        ));
+    }
+    Ok(())
+}
+
+fn append_independent_service_profile(
+    patch: &mut String,
+    service: &crate::store::ai_services::CustomAIService,
+) -> Result<(), Box<dyn Error>> {
+    let model = service.model.trim();
+    let base_url = service.base_url.trim();
+    if model.is_empty() || base_url.is_empty() {
+        return Err("本机 AI 服务的模型或 Base URL 不完整".into());
+    }
+    let api = match &service.protocol {
+        crate::store::ai_services::AIServiceProtocol::OpenaiChat => "openai-completions",
+        crate::store::ai_services::AIServiceProtocol::OpenaiResponses => "openai-responses",
+    };
+    let mut catalog = vec![model.to_string()];
+    catalog.extend(
+        service
+            .models
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    );
+    let mut seen = HashSet::new();
+    catalog.retain(|value| seen.insert(value.clone()));
+
+    patch.push_str(
+        "\n\n# Agent-owned projection of the selected local AI service. DSH settings.yaml remains user-owned.\n",
+    );
+    patch.push_str(&format!(
+        "- id: agent-default-model\n  config:\n    provider: {}\n    model: {}\n",
+        yaml_scalar(INDEPENDENT_ACTIVE_PROVIDER_ID),
+        yaml_scalar(model),
+    ));
+    patch.push_str(&format!(
+        "- id: llm-pi-ai\n  config:\n    providers:\n      {}:\n        displayName: {}\n        apiKeyEnv: {}\n        api: {}\n",
+        yaml_scalar(INDEPENDENT_ACTIVE_PROVIDER_ID),
+        yaml_scalar(service.display_name.trim()),
+        yaml_scalar(INDEPENDENT_ACTIVE_API_KEY_ENV),
+        yaml_scalar(api),
+    ));
     patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(base_url)));
     patch.push_str("        models:\n");
     for model in catalog {
@@ -2267,7 +2662,7 @@ fn resolve_executable() -> Result<OsString, Box<dyn Error>> {
                     managed_executable_path(&path).then(|| path.into_os_string())
                 })
         })
-        .ok_or_else(|| "DeepSeek Harness Runtime is not installed; set HIMIND_DSH_EXECUTABLE or install the signed Dashboard Runtime".into())
+        .ok_or_else(|| "DeepSeek Harness Runtime is not installed; set HIMIND_DSH_EXECUTABLE or install a signed Runtime distribution package".into())
 }
 
 fn resolve_runtime_version(executable: &OsString) -> Result<String, Box<dyn Error>> {
@@ -2536,19 +2931,38 @@ fn first_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
-        himind_mcp_arguments, managed_model_catalog, merge_profile_package,
-        migrate_legacy_managed_settings, native_dsh_provider_config,
-        parse_native_dsh_provider_config, parse_runtime_version, remove_managed_runtime,
+        active_independent_provider_config, dsh_run_home, dsh_skill_name, ensure_interactive_home,
+        ensure_profile_patch, first_line, himind_mcp_arguments, managed_model_catalog,
+        merge_profile_package, migrate_legacy_managed_settings, native_dsh_provider_config,
+        no_tools_overlay_text, parse_native_dsh_provider_config, parse_runtime_version,
+        remove_managed_runtime,
         render_himind_agent_overlay, render_himind_profile_patch,
         render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
-        skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter, versioned_home,
-        InteractiveEventProjector,
+        skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
+        validate_runtime_agent_compatibility, versioned_home, InteractiveEventProjector,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn no_tools_overlay_disables_every_model_facing_tool_row() {
+        let base = "- id: agent-default-model\n  config:\n    model: demo\n";
+        let overlay = no_tools_overlay_text(base);
+        // 原始内容保留，工具行追加在后面（patch 顺序即覆盖顺序）。
+        assert!(overlay.starts_with("- id: agent-default-model"));
+        for row in super::NO_TOOLS_DISABLED_ROWS {
+            assert!(
+                overlay.contains(&format!("- id: {row}\n  disabled: true\n")),
+                "overlay 必须禁用 {row}"
+            );
+        }
+        // 关键工具行一个都不能漏：文件、Shell、网络、子代理与 HiMind MCP。
+        for row in ["tool-fs", "tool-pwsh", "tool-web", "tool-subagent", "himind-agent-mcp"] {
+            assert!(super::NO_TOOLS_DISABLED_ROWS.contains(&row));
+        }
+    }
 
     #[test]
     fn extracts_first_non_empty_version_line() {
@@ -2895,6 +3309,77 @@ mod tests {
     }
 
     #[test]
+    fn selected_local_service_projects_to_independent_profile_without_editing_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-independent-local-service-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let result = (|| {
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "local-gateway".to_string(),
+                display_name: "Local Gateway".to_string(),
+                base_url: "https://local.example/v1".to_string(),
+                protocol: crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+                model: "local-model".to_string(),
+                models: vec!["local-model".to_string(), "local-fast".to_string()],
+                api_key: "sk-local-secret".to_string(),
+            })
+            .unwrap();
+            crate::store::ai_services::set_active("local-gateway").unwrap();
+            let (projection, api_key) = active_independent_provider_config()
+                .unwrap()
+                .expect("active local provider");
+            assert_eq!(projection.provider, "himind-local-ai");
+            assert_eq!(
+                projection.api_key_env.as_deref(),
+                Some("HIMIND_LOCAL_AI_API_KEY")
+            );
+            assert_eq!(projection.base_url, "https://local.example/v1");
+            assert_eq!(projection.model, "local-model");
+            assert_eq!(api_key, "sk-local-secret");
+
+            let dsh_home = root.join("dsh-home");
+            std::fs::create_dir_all(&dsh_home).unwrap();
+            let settings_path = dsh_home.join("settings.yaml");
+            let original_settings = "theme:\n  mode: dark\n";
+            std::fs::write(&settings_path, original_settings).unwrap();
+            let mut options = crate::Options::from_env();
+            options.state_path = root.join("agent-state.json");
+            options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+            let profile = render_himind_profile_patch(
+                &dsh_home,
+                &options,
+                "native-model",
+                "https://native.example/v1",
+                &["native-model".to_string()],
+            )
+            .unwrap();
+            assert!(profile.contains("himind-local-ai"));
+            assert!(profile.contains("HIMIND_LOCAL_AI_API_KEY"));
+            assert!(profile.contains("openai-responses"));
+            assert!(profile.contains("https://local.example/v1"));
+            assert!(profile.contains("local-fast"));
+            assert!(!profile.contains("sk-local-secret"));
+            assert_eq!(
+                std::fs::read_to_string(settings_path).unwrap(),
+                original_settings
+            );
+        })();
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
+    #[test]
     fn dsh_mcp_launch_uses_the_active_mode_and_omits_dashboard_api_when_independent() {
         let mut options = crate::Options::from_env();
         options.api_base = "https://dashboard.example".to_string();
@@ -3166,6 +3651,25 @@ mod tests {
     }
 
     #[test]
+    fn runtime_agent_compatibility_is_fail_closed() {
+        assert!(validate_runtime_agent_compatibility("", "").is_ok());
+        assert!(validate_runtime_agent_compatibility(crate::VERSION, crate::VERSION).is_ok());
+        assert!(
+            validate_runtime_agent_compatibility("99.0.0", "").is_err(),
+            "future minimum Agent version must block"
+        );
+        assert!(
+            validate_runtime_agent_compatibility("", "0.1.0").is_err(),
+            "expired maximum Agent version must block"
+        );
+        assert!(validate_runtime_agent_compatibility("not-semver", "").is_err());
+        assert!(super::runtime_capabilities_match(
+            &["interactive".to_string(), "workflow".to_string()],
+            &["workflow".to_string(), "interactive".to_string()]
+        ));
+    }
+
+    #[test]
     fn legacy_generated_settings_are_preserved_without_rewriting_user_preferences() {
         let root = std::env::temp_dir().join(format!(
             "himind-settings-migration-{}-{}",
@@ -3268,6 +3772,37 @@ mod tests {
         assert!(profile.contains("id: agent-default-model"));
         assert!(profile.contains("id: llm-pi-ai"));
         assert!(!profile.contains("id: web-runtime"));
+    }
+
+    #[test]
+    fn managed_web_profile_disables_dsh_browser_handoff() {
+        let mut options = crate::Options::from_env();
+        options.api_base = "https://dashboard.example".to_string();
+        options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
+        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        let profile = render_himind_profile_patch_from_base(
+            std::path::Path::new("C:/HiMind/runtime-home"),
+            &options,
+            "model-default",
+            "https://gateway.example/v1",
+            &["model-default".to_string()],
+            include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
+            None,
+        )
+        .unwrap();
+
+        assert!(profile.contains("- id: web-runtime\n  config:\n    openBrowser: false"));
+
+        let overlay = render_himind_agent_overlay(
+            std::path::Path::new("C:/HiMind/runtime-home"),
+            &options,
+            "model-default",
+            "https://gateway.example/v1",
+            &["model-default".to_string()],
+            std::path::Path::new("C:/HiMind/runtime-home/workspace"),
+        )
+        .unwrap();
+        assert!(overlay.contains("- id: web-runtime\n  config:\n    openBrowser: false"));
     }
 
     #[test]

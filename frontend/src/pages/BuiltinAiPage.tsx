@@ -41,6 +41,7 @@ export function BuiltinAiPage({
 }: BuiltinAiPageProps) {
   const [sessionUrl, setSessionUrl] = useState('');
   const [connecting, setConnecting] = useState(false);
+  const [browserOpening, setBrowserOpening] = useState(false);
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [connectionError, setConnectionError] = useState('');
   const [extensionsOpen, setExtensionsOpen] = useState(false);
@@ -76,7 +77,7 @@ export function BuiltinAiPage({
         operation: 'none',
         stage: 'failed',
         progress_percent: 0,
-        message: '无法检查 HiMind AI 运行时',
+        message: '无法检查 HiMind AI',
         error: errorDetail(error),
         runtime: { provider: 'himind.builtin', status: 'unavailable', version: '', compatible: false, message: '', diagnostics: { engine_id: '', executable_path: '', contract_version: 1, update_mode: '' } },
         update_available: false,
@@ -91,7 +92,7 @@ export function BuiltinAiPage({
     try {
       setRuntimeInstallation(await agentApi.startBuiltinAiRuntimeInstall());
     } catch (error) {
-      setRuntimeInstallation(current => current ? { ...current, state: 'failed', stage: 'failed', message: 'HiMind AI 运行时安装失败', error: errorDetail(error) } : current);
+      setRuntimeInstallation(current => current ? { ...current, state: 'failed', stage: 'failed', message: 'HiMind AI 安装失败', error: errorDetail(error) } : current);
     }
   }, []);
 
@@ -118,11 +119,7 @@ export function BuiltinAiPage({
     setConnectionError('');
     setFrameLoaded(false);
     try {
-      const request = workspaceTarget?.kind === 'project'
-        ? { projectId: workspaceTarget.projectId }
-        : workspaceTarget?.kind === 'extension-workspace'
-          ? { extensionWorkspace: true }
-          : undefined;
+      const request = builtinAiSessionTarget(workspaceTarget);
       setSessionUrl(await agentApi.startBuiltinAiSession(request));
     } catch (error) {
       setSessionUrl('');
@@ -132,12 +129,28 @@ export function BuiltinAiPage({
     }
   }, [connecting, workspaceTarget]);
 
+  const openInBrowser = useCallback(async () => {
+    if (browserOpening || connecting || !runtimeReady || !canStartSession) return;
+    setBrowserOpening(true);
+    setConnectionError('');
+    try {
+      const url = await agentApi.openBuiltinAiWeb(builtinAiSessionTarget(workspaceTarget));
+      if (url && url !== sessionUrl) {
+        setSessionUrl(url);
+        setFrameLoaded(false);
+      }
+    } catch (error) {
+      setConnectionError(presentConnectionError(error));
+    } finally {
+      setBrowserOpening(false);
+    }
+  }, [browserOpening, canStartSession, connecting, runtimeReady, sessionUrl, workspaceTarget]);
+
   useEffect(() => {
     if (!workspaceRequestRevision || connecting || handledWorkspaceRequest.current === workspaceRequestRevision) return;
     handledWorkspaceRequest.current = workspaceRequestRevision;
     setSessionUrl('');
     setConnectionError('');
-    setFrameLoaded(false);
     void connect();
   }, [connect, connecting, workspaceRequestRevision]);
 
@@ -153,7 +166,7 @@ export function BuiltinAiPage({
     try {
       const result = await agentApi.syncBuiltinAiModels();
       if (result.session_url && result.session_url !== sessionUrl) {
-        setSessionUrl(result.session_url);
+        setSessionUrl(await agentApi.startBuiltinAiSession(builtinAiSessionTarget(workspaceTarget)));
         setFrameLoaded(false);
       }
       setModelSyncMessage(result.status === 'updated' || result.status === 'restarted'
@@ -164,16 +177,19 @@ export function BuiltinAiPage({
     } finally {
       setSyncingModels(false);
     }
-  }, [sessionUrl, syncingModels]);
+  }, [sessionUrl, syncingModels, workspaceTarget]);
 
   return (
     <section className="builtin-ai-page" aria-label="HiMind AI">
       <header className="builtin-ai-toolbar">
         <div className="builtin-ai-title">
           <span className="builtin-ai-mark"><MessageCircle size={17} /></span>
-          <div><h2>HiMind AI</h2><span>{workspaceTarget ? `正在开发：${workspaceTarget.name}` : '智能工作助手'}</span></div>
+          <div><h2>HiMind AI</h2><span>{workspaceTarget ? `当前项目：${workspaceTarget.name}` : 'AI 助手'}</span></div>
         </div>
         <div className="builtin-ai-toolbar-actions">
+          <button type="button" className="builtin-ai-tools-button" onClick={() => void openInBrowser()} disabled={!runtimeReady || !canStartSession || connecting || browserOpening} title="在系统浏览器中打开 HiMind AI">
+            {browserOpening ? <LoaderCircle className="spin" size={15} /> : <ArrowUpRight size={15} />}{browserOpening ? '正在打开' : '网页版'}
+          </button>
           {!independentMode ? <button type="button" className="builtin-ai-tools-button" onClick={() => void syncModels()} disabled={!sessionUrl || syncingModels} title="同步可用模型">
             <RefreshCw className={syncingModels ? 'spin' : ''} size={15} />{syncingModels ? '同步中' : '同步模型'}
           </button> : null}
@@ -187,14 +203,13 @@ export function BuiltinAiPage({
       <div className="builtin-ai-workspace">
         {sessionUrl ? (
           <>
-            {!frameLoaded ? <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在打开会话" description="马上就好" /> : null}
+            {!frameLoaded ? <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在打开会话" description="正在加载 HiMind AI 工作台" /> : null}
             <div className="builtin-ai-session-shell">
               <iframe
                 className={frameLoaded ? 'loaded' : ''}
                 title="HiMind AI 会话"
                 src={sessionUrl}
                 onLoad={() => setFrameLoaded(true)}
-                referrerPolicy="no-referrer"
               />
               {activityOpen ? <RuntimeActivityPanel sessions={runtimeSessions} error={activityError} onRefresh={() => void refreshActivity()} /> : null}
             </div>
@@ -219,17 +234,17 @@ export function BuiltinAiPage({
             actions={<button type="button" className="btn btn-primary" disabled={authorizationBusy} onClick={onStartAuthorization}>{authorizationBusy ? <LoaderCircle className="spin" size={15} /> : <LogIn size={15} />}{authorizationBusy ? '正在连接' : '登录 HiMind'}</button>}
           />
         ) : !runtimeInstallation ? (
-          <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在检查 HiMind AI 运行时" description="正在确认本机是否已准备好 HiMind AI。" />
+          <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在检查 HiMind AI" description="正在确认 HiMind AI 是否可用。" />
         ) : runtimeInstallation.state === 'working' ? (
           <RuntimeInstallationStatus installation={runtimeInstallation} />
         ) : !runtimeReady ? (
           <WorkspaceStatus
             tone={runtimeInstallation.state === 'failed' ? 'error' : 'default'}
             icon={runtimeInstallation.state === 'failed' ? <CircleAlert size={22} /> : <Download size={22} />}
-            title="安装 HiMind AI 运行时"
-            description={runtimeInstallation.state === 'failed' ? (runtimeInstallation.error || '安装没有完成，请重试。') : '首次使用 HiMind AI 需要安装运行时，安装完成后即可开始对话。'}
+            title="安装 HiMind AI"
+            description={runtimeInstallation.state === 'failed' ? (runtimeInstallation.error || '安装没有完成，请重试。') : '首次使用需要安装 HiMind AI。'}
             actions={<>
-              <button type="button" className="btn btn-primary" onClick={() => void installRuntime()}><Download size={15} />{runtimeInstallation.state === 'failed' ? '重试安装' : '安装运行时'}</button>
+              <button type="button" className="btn btn-primary" onClick={() => void installRuntime()}><Download size={15} />{runtimeInstallation.state === 'failed' ? '重试安装' : '安装 HiMind AI'}</button>
               <button type="button" className="btn" onClick={onOpenSettings}><Settings size={15} />打开设置</button>
             </>}
           />
@@ -243,11 +258,12 @@ export function BuiltinAiPage({
             description={connectionError}
             actions={<>
               <button type="button" className="btn btn-primary" onClick={() => void connect()}><RefreshCw size={15} />重新连接</button>
+              <button type="button" className="btn" onClick={() => void openInBrowser()}><ArrowUpRight size={15} />打开网页版</button>
               {connectionError.includes('运行时') ? <button type="button" className="btn" onClick={onOpenSettings}><Settings size={15} />打开设置</button> : null}
             </>}
           />
         ) : (
-          <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在准备 HiMind AI" description="马上就好" />
+          <WorkspaceStatus icon={<LoaderCircle className="spin" size={21} />} title="正在准备 HiMind AI" description="正在连接服务" />
         )}
       </div>
       <BuiltinAiExtensionsDialog
@@ -270,13 +286,12 @@ export function BuiltinAiPage({
 
 function RuntimeActivityPanel({ sessions, error, onRefresh }: { sessions: BuiltinAIRuntimeActivity[]; error: string; onRefresh: () => void }) {
   return <aside className="builtin-ai-activity-panel" aria-label="协同活动">
-    <header><div><strong>协同活动</strong><span>Dashboard、钉钉与本机运行状态</span></div><button type="button" className="btn btn-icon" title="刷新活动" aria-label="刷新活动" onClick={onRefresh}><RefreshCw size={14} /></button></header>
+    <header><div><strong>会话活动</strong><span>查看各入口的会话状态</span></div><button type="button" className="btn btn-icon" title="刷新活动" aria-label="刷新活动" onClick={onRefresh}><RefreshCw size={14} /></button></header>
     {error ? <div className="builtin-ai-activity-message error" role="alert">{error}</div> : null}
-    {!error && !sessions.length ? <div className="builtin-ai-activity-message">尚未发现可追踪的 DSH 会话</div> : null}
+    {!error && !sessions.length ? <div className="builtin-ai-activity-message">暂无活动会话</div> : null}
     <div className="builtin-ai-activity-list">{sessions.map(activity => <div className="builtin-ai-activity-item" key={activity.session.id}>
-      <div className="builtin-ai-activity-item-head"><span className={`builtin-ai-activity-dot ${activity.session.status}`} /><strong>{activity.conversation?.title || activity.session.provider}</strong><span>{runtimeSessionStatusLabel(activity.session.status)}</span></div>
-      <code>{activity.session.provider_session_id}</code>
-      <small>{activity.conversation ? `入口：${activity.endpoints?.map(endpoint => endpoint.channel).join('、') || '本机'}` : '等待首条活动关联会话'} · {formatActivityTime(activity.session.last_heartbeat_at)}</small>
+      <div className="builtin-ai-activity-item-head"><span className={`builtin-ai-activity-dot ${activity.session.status}`} /><strong>{activity.conversation?.title || '未命名会话'}</strong><span>{runtimeSessionStatusLabel(activity.session.status)}</span></div>
+      <small>{activity.conversation ? `入口：${activity.endpoints?.map(endpoint => endpoint.channel).join('、') || '本机'}` : '等待新消息'} · {formatActivityTime(activity.session.last_heartbeat_at)}</small>
       {activity.latest_turn ? <p className="builtin-ai-activity-preview">{activity.latest_turn.content}</p> : null}
     </div>)}</div>
   </aside>;
@@ -305,7 +320,7 @@ function RuntimeInstallationStatus({ installation }: { installation: BuiltinAIRu
   const action = runtimeActionLabel(installation.operation);
   return <div className="builtin-ai-state" role="status">
     <span className="builtin-ai-state-icon"><LoaderCircle className="spin" size={21} /></span>
-    <h3>{installation.message || `正在${action} HiMind AI 运行时`}</h3>
+    <h3>{presentRuntimeMessage(installation.message) || `正在${action} HiMind AI`}</h3>
     <p>{installation.operation === 'uninstall' ? '卸载期间 HiMind AI 暂不可用。' : '完成后会自动进入 HiMind AI。'}</p>
     <div className="builtin-ai-runtime-progress" aria-label={`${action}进度 ${installation.progress_percent}%`}>
       <div className="builtin-ai-runtime-progress-head"><span>{runtimeStageLabel(installation.stage)}</span><strong>{installation.progress_percent}%</strong></div>
@@ -316,11 +331,21 @@ function RuntimeInstallationStatus({ installation }: { installation: BuiltinAIRu
 
 function runtimeStageLabel(stage: string) {
   if (stage === 'resolving') return '检查安装包';
-  if (stage === 'downloading') return '下载运行时';
-  if (stage === 'verifying') return '校验运行时';
-  if (stage === 'installing') return '安装运行时';
-  if (stage === 'uninstalling') return '卸载运行时';
+  if (stage === 'downloading') return '下载';
+  if (stage === 'verifying') return '校验';
+  if (stage === 'installing') return '安装';
+  if (stage === 'uninstalling') return '卸载';
   return '正在准备';
+}
+
+function presentRuntimeMessage(message?: string) {
+  const value = (message || '').trim();
+  if (!value) return '';
+  return value
+    .replace(/HiMind AI\s*运行时/g, 'HiMind AI')
+    .replace(/本机\s*组件/g, 'HiMind AI')
+    .replace(/运行时/g, 'HiMind AI')
+    .replace(/组件/g, 'HiMind AI');
 }
 
 function runtimeActionLabel(operation: string) {
@@ -333,17 +358,28 @@ function runtimeActionLabel(operation: string) {
 function presentConnectionError(error: unknown) {
   const detail = errorDetail(error);
   const normalized = detail.toLowerCase();
+  if (normalized.includes('dsh web authentication required')
+    || normalized.includes('reopen the url printed by dsh web')) {
+    return '网页会话认证已失效，请使用“打开网页版”重新建立会话。';
+  }
   if (normalized.includes('independent mode')
     || normalized.includes('dsh 原生')
     || normalized.includes('settings.yaml')
     || (normalized.includes('provider') && normalized.includes('原生服务配置'))) {
-    return '请先完成 DSH 原生 Provider 配置（settings.yaml），再开始对话。';
+    return '本机 AI 服务尚未配置，请在设置中完成配置后重试。';
   }
   if (normalized.includes('登录 himind')) return '当前登录状态已失效，请重新登录。';
   if (normalized.includes('ai 服务')) return '当前账号暂未分配可用的 AI 服务，请联系管理员。';
-  if (normalized.includes('运行时') && normalized.includes('修复')) return 'HiMind AI 运行时需要修复，请在设置中处理。';
-  if ((normalized.includes('运行时') || normalized.includes('组件')) && normalized.includes('安装')) return '请先安装 HiMind AI 运行时，再开始对话。';
-  if (normalized.includes('项目工作区') || normalized.includes('workspace') || normalized.includes('dsh')) return detail;
+  if (normalized.includes('运行时') && normalized.includes('修复')) return 'HiMind AI 需要修复，请在设置中处理。';
+  if ((normalized.includes('运行时') || normalized.includes('组件')) && normalized.includes('安装')) return '请先安装 HiMind AI，再开始对话。';
+  if (normalized.includes('项目工作区') || normalized.includes('workspace')) return '当前项目目录不可用，请重新选择后再试。';
+  if (normalized.includes('dsh')) return '本机 AI 服务暂时不可用，请在设置中检查配置。';
   if (normalized.includes('正在启动')) return '会话仍在准备中，请稍后重新连接。';
   return '服务暂时不可用，请稍后重试。';
+}
+
+function builtinAiSessionTarget(workspaceTarget: BuiltinAiWorkspaceTarget) {
+  if (workspaceTarget?.kind === 'project') return { projectId: workspaceTarget.projectId };
+  if (workspaceTarget?.kind === 'extension-workspace') return { extensionWorkspace: true };
+  return undefined;
 }

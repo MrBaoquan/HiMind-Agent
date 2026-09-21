@@ -93,6 +93,7 @@
       const remaining = Math.max(0, Number(current.remaining_seconds ?? current.timeout_seconds ?? 30));
       const total = Math.max(1, Number(current.timeout_seconds || 30));
       const percent = Math.max(0, Math.min(100, (remaining / total) * 100));
+      const persistent = Number(current.timeout_seconds) === 0;
       const isRemote = current.request_type === 'remote_connect';
       root.innerHTML = `
         <section class="notice" aria-labelledby="approval-title">
@@ -109,9 +110,9 @@
               <p class="description">${escapeHtml(current.description || '请确认是否允许执行此操作。')}</p>
             </div>
           </div>
-          <div class="countdown ${remaining <= 8 ? 'urgent' : ''}">
-            <div class="countdown-meta"><span>超时后自动拒绝</span><strong>剩余 ${remaining} 秒</strong></div>
-            <div class="progress" aria-hidden="true"><span style="width:${percent}%"></span></div>
+          <div class="countdown ${!persistent && remaining <= 8 ? 'urgent' : ''}">
+            <div class="countdown-meta"><span>${persistent ? '审批会持续等待' : '超时后自动拒绝'}</span><strong>${persistent ? '等待人工决定' : `剩余 ${remaining} 秒`}</strong></div>
+            <div class="progress" aria-hidden="true"><span style="width:${persistent ? 100 : percent}%"></span></div>
           </div>
           ${errorMessage ? `<div class="error" role="alert">${escapeHtml(errorMessage)}</div>` : ''}
           <footer class="actions">
@@ -126,6 +127,7 @@
       if (type === 'remote_connect') return '远程连接请求';
       if (type === 'upload_code') return '代码上传请求';
       if (type === 'upload_placeholder') return '占位上传请求';
+      if (type.includes('wechat') || type.includes('miniprogram')) return '微信小程序操作';
       return '操作审批';
     }
 

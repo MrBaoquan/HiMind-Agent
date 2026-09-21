@@ -133,7 +133,10 @@ pub(crate) enum InvocationSource {
     DashboardWorker,
     Cli,
     Mcp,
+    Acp,
     Workflow,
+    /// Workflow 定时策略到点后由 Agent 自己发起的 Run。
+    Scheduler,
 }
 
 /// The protocol/client that reached the Gateway is independent from the
@@ -168,7 +171,9 @@ impl InvocationSource {
             Self::DashboardWorker => "dashboard_worker",
             Self::Cli => "cli",
             Self::Mcp => "mcp",
+            Self::Acp => "acp",
             Self::Workflow => "workflow",
+            Self::Scheduler => "scheduler",
         }
     }
 }
@@ -178,6 +183,11 @@ pub(crate) struct InvocationContext {
     pub source: InvocationSource,
     pub transport: InvocationTransport,
     pub principal: String,
+    pub delegated_user_id: String,
+    pub ai_client_id: String,
+    pub device_id: String,
+    pub workspace_ref: String,
+    pub business_context: Value,
     pub session_id_hash: String,
     pub request_id: String,
     pub record_agent_core_run: bool,
@@ -191,7 +201,9 @@ impl InvocationContext {
             InvocationSource::DashboardWorker => InvocationTransport::Internal,
             InvocationSource::Cli => InvocationTransport::Cli,
             InvocationSource::Mcp => InvocationTransport::Stdio,
+            InvocationSource::Acp => InvocationTransport::Stdio,
             InvocationSource::Workflow => InvocationTransport::Internal,
+            InvocationSource::Scheduler => InvocationTransport::Internal,
         };
         Self::with_transport(source, transport, principal)
     }
@@ -201,14 +213,48 @@ impl InvocationContext {
         transport: InvocationTransport,
         principal: impl Into<String>,
     ) -> Self {
+        let principal = principal.into();
+        let delegated_user_id = principal
+            .strip_prefix("dashboard-user:")
+            .unwrap_or_default()
+            .to_string();
+        let ai_client_id = principal
+            .strip_prefix("ai-client:")
+            .unwrap_or_default()
+            .to_string();
         Self {
             source,
             transport,
-            principal: principal.into(),
+            principal,
+            delegated_user_id,
+            ai_client_id,
+            device_id: String::new(),
+            workspace_ref: String::new(),
+            business_context: Value::Object(serde_json::Map::new()),
             session_id_hash: String::new(),
             request_id: next_request_id(),
             record_agent_core_run: true,
         }
+    }
+
+    pub(crate) fn with_ai_client_id(mut self, value: impl Into<String>) -> Self {
+        self.ai_client_id = value.into();
+        self
+    }
+
+    pub(crate) fn with_device_id(mut self, value: impl Into<String>) -> Self {
+        self.device_id = value.into();
+        self
+    }
+
+    pub(crate) fn with_workspace_ref(mut self, value: impl Into<String>) -> Self {
+        self.workspace_ref = value.into();
+        self
+    }
+
+    pub(crate) fn with_business_context(mut self, value: Value) -> Self {
+        self.business_context = value;
+        self
     }
 
     pub(crate) fn without_agent_core_run(mut self) -> Self {
@@ -275,15 +321,17 @@ mod tests {
         assert_eq!(context.source, InvocationSource::LocalHttp);
         assert_eq!(context.transport, InvocationTransport::LocalHttp);
         assert_eq!(context.principal, "dashboard-user:usr_123");
+        assert_eq!(context.delegated_user_id, "usr_123");
         assert_eq!(context.session_id_hash, "session_hash");
     }
 
     #[test]
     fn mcp_context_defaults_to_stdio_transport() {
-        let context = InvocationContext::new(InvocationSource::Mcp, "test-client");
+        let context = InvocationContext::new(InvocationSource::Mcp, "ai-client:test-client");
 
         assert_eq!(context.source, InvocationSource::Mcp);
         assert_eq!(context.transport, InvocationTransport::Stdio);
+        assert_eq!(context.ai_client_id, "test-client");
     }
 
     #[test]

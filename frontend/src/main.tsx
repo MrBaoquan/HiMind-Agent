@@ -12,10 +12,13 @@ import { LogsPage } from './pages/LogsPage';
 import { PluginsPage } from './pages/PluginsPage';
 import { SkillsWorkspacePage } from './pages/SkillsWorkspacePage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
+import { ExtensionsPage } from './pages/ExtensionsPage';
+import { InboxPage } from './pages/InboxPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
-import { agentApi, type AIServiceListResult, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkflowCenterSnapshot, type WorkflowRunSnapshot } from './services/agentApi';
-import { errorDetail, formatError, type PageKey, type UiMessage } from './types';
+import { SchedulesPage } from './pages/SchedulesPage';
+import { agentApi, type AIServiceListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
+import { errorDetail, formatError, type NavigationTarget, type PageKey, type UiMessage } from './types';
 
 let nextNotificationId = 1;
 
@@ -27,7 +30,7 @@ function friendlyConnectionError(error: unknown, fallback: string) {
   const detail = errorDetail(error).toLowerCase();
   if (detail.includes('备份并重建')) return '原连接文件格式有误，请选择“备份并重建”。';
   if (detail.includes('permission denied') || detail.includes('access is denied') || detail.includes('拒绝访问')) return '无法修改连接信息，请关闭对应 AI 工具后重试。';
-  if (detail.includes('toml') || detail.includes('json') || detail.includes('mcpservers')) return '客户端 MCP 配置文件内容有误，请备份后重建。';
+  if (detail.includes('toml') || detail.includes('json') || detail.includes('mcpservers')) return 'AI 工具的连接文件内容有误，请备份后重建。';
   return fallback;
 }
 
@@ -37,10 +40,22 @@ function authorizationFailure(progress: DashboardAuthorizationProgress) {
   return '未能完成工作台账号授权，请检查网络后重试。';
 }
 
+function initialPage(): PageKey {
+  try {
+    const saved = window.localStorage.getItem('himind.page');
+    const allowed: PageKey[] = ['dashboard', 'builtin-ai', 'ai', 'approvals', 'inbox', 'workflows', 'schedules', 'extensions', 'plugins', 'skills', 'development', 'settings', 'logs'];
+    if (saved && allowed.includes(saved as PageKey)) return saved as PageKey;
+  } catch {
+    // Webview storage can be unavailable; fall back to the overview.
+  }
+  return 'dashboard';
+}
+
 function App() {
-  const [page, setPage] = useState<PageKey>('dashboard');
+  const [page, setPage] = useState<PageKey>(initialPage);
   const [settingsSection, setSettingsSection] = useState<'remote' | 'approval' | 'remote-tools' | 'accounts' | 'tools' | 'general'>('remote');
   const [status, setStatus] = useState<AgentStatus | null>(null);
+  const [projectionSyncStatus, setProjectionSyncStatus] = useState<ProjectionSyncStatus | null>(null);
   const statusRef = useRef<AgentStatus | null>(null);
   const [updateStatus, setUpdateStatus] = useState<AgentUpdateStatus | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -52,7 +67,8 @@ function App() {
   const [mcpTestResult, setMcpTestResult] = useState<McpConnectionTestResult | null>(null);
   const [mcpTargets, setMcpTargets] = useState<McpTargetDescriptor[]>([]);
   const [aiServices, setAiServices] = useState<AIServiceListResult | null>(null);
-  const [aiConnectionsTab, setAiConnectionsTab] = useState<'mcp' | 'services'>('mcp');
+  const [acpRuntimeProfiles, setAcpRuntimeProfiles] = useState<AcpRuntimeProfileSnapshot | null>(null);
+  const [aiConnectionsTab, setAiConnectionsTab] = useState<'mcp' | 'services' | 'acp'>('mcp');
   const [aiOperation, setAiOperation] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [approvalHistory, setApprovalHistory] = useState<ApprovalFact[]>([]);
@@ -69,11 +85,17 @@ function App() {
   const [extensionDesiredLoading, setExtensionDesiredLoading] = useState(false);
   const [pluginsLoading, setPluginsLoading] = useState(true);
   const [workflowCenter, setWorkflowCenter] = useState<WorkflowCenterSnapshot | null>(null);
+  // 从工作流页“加定时计划”跳过来时预选的定时目标。
+  const [schedulePresetTarget, setSchedulePresetTarget] = useState('');
+  // 跨页面打开 Workflow Run 时保留目标，避免只能回到列表里手动查找。
+  const [workflowRunTarget, setWorkflowRunTarget] = useState('');
   const [workflowLoading, setWorkflowLoading] = useState(true);
   const [workflowError, setWorkflowError] = useState('');
   const [capabilities, setCapabilities] = useState<CapabilityItem[]>([]);
   const [pluginCatalog, setPluginCatalog] = useState<import('./services/agentApi').PluginCatalogItem[]>([]);
   const [pluginDrafts, setPluginDrafts] = useState<AuthoringPluginDraft[]>([]);
+  const [workflowDrafts, setWorkflowDrafts] = useState<AuthoringWorkflowDraft[]>([]);
+  const [workflowSubmissions, setWorkflowSubmissions] = useState<AuthoringWorkflowDraft[]>([]);
   const [pluginSubmissions, setPluginSubmissions] = useState<PluginSubmissionStatus[]>([]);
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogResponse | null>(null);
   const [skillStatus, setSkillStatus] = useState<CodexSkillStatusResponse | null>(null);
@@ -89,6 +111,7 @@ function App() {
   const [extensionSources, setExtensionSources] = useState<ExtensionSourceSettings>({ schema_version: 1, sources: [] });
   const [extensionSourceSnapshot, setExtensionSourceSnapshot] = useState<ExtensionSourceSnapshot | null>(null);
   const [extensionSourcesLoading, setExtensionSourcesLoading] = useState(false);
+  const [installingUnitKey, setInstallingUnitKey] = useState('');
   const [extensionSourcesError, setExtensionSourcesError] = useState('');
   const [extensionProjectsError, setExtensionProjectsError] = useState('');
   const [extensionRemoteProjects, setExtensionRemoteProjects] = useState<ExtensionRemoteProject[]>([]);
@@ -105,6 +128,9 @@ function App() {
   const [svnDraft, setSvnDraft] = useState<SvnConnectionInput>({ username: '', password: '' });
   const [svnTesting, setSvnTesting] = useState(false);
   const refreshInFlight = useRef(new Map<string, Promise<unknown>>());
+  const notifiedWorkflowApprovals = useRef(new Set<string>());
+  const notifiedWorkflowOutcomes = useRef(new Set<string>());
+  const workflowOutcomePrimed = useRef(false);
 
   function singleFlight<T>(key: string, operation: () => Promise<T>, options?: { force?: boolean }): Promise<T> {
     const existing = refreshInFlight.current.get(key) as Promise<T> | undefined;
@@ -153,11 +179,21 @@ function App() {
       }
     });
   }
+  async function refreshProjectionSyncStatus() {
+    return singleFlight('projection-sync-status', async () => {
+      setProjectionSyncStatus(await agentApi.projectionSyncStatus());
+    });
+  }
   async function refreshMcpTargets() {
     return singleFlight('mcp-targets', async () => { setMcpTargets(await agentApi.mcpTargets()); });
   }
   async function refreshAIServices() {
     return singleFlight('ai-services', async () => { setAiServices(await agentApi.listAIServices()); });
+  }
+  async function refreshAcpRuntimeProfiles() {
+    return singleFlight('acp-runtime-profiles', async () => {
+      setAcpRuntimeProfiles(await agentApi.acpRuntimeProfiles());
+    });
   }
   async function refreshBuiltinAiToolContext() {
     return singleFlight('builtin-ai-tool-context', async () => {
@@ -188,7 +224,7 @@ function App() {
           withTimeout(agentApi.settings(), '审批设置'),
           withTimeout(agentApi.remoteExecutionSettings(), '远程任务设置'),
           withTimeout(agentApi.login(), '本地登录状态'),
-          withTimeout(agentApi.remoteClients(), '远程运维客户端配置'),
+          withTimeout(agentApi.remoteClients(), '远控工具配置'),
         ] as const);
         const errors: string[] = [];
         if (settingsResult.status === 'fulfilled') setSettings(settingsResult.value);
@@ -220,7 +256,7 @@ function App() {
         setRemoteExecutionSettings(null);
         setRemoteClients(null);
         setLoginState(null);
-        setSettingsLoadError(formatError(error, 'Agent 配置读取失败'));
+        setSettingsLoadError(formatError(error, '应用设置读取失败'));
       } finally {
         setSettingsLoading(false);
       }
@@ -272,24 +308,32 @@ function App() {
     return singleFlight('plugins', async () => {
       setPluginsLoading(true);
       try {
-        const [registry, capabilityItems] = await Promise.all([
-          withTimeout(agentApi.plugins(), '本机插件注册表'),
+        // Registry, capability list and market catalog fail independently: a slow
+        // capabilities call must not leave the market catalog empty.
+        const [registryResult, capabilityResult, catalogResult] = await Promise.allSettled([
+          withTimeout(agentApi.plugins(), '本机插件'),
           withTimeout(agentApi.capabilities(), '本机能力清单'),
+          // 目录需要等待 Dashboard 侧返回，慢于常规本地读取；12s 会把它整体丢弃。
+          withTimeout(agentApi.pluginCatalog(), '插件市场', 30000),
         ]);
-        setPluginRegistry(registry);
-        setCapabilities(Array.isArray(capabilityItems) ? capabilityItems : []);
-        try {
-          const catalog = await withTimeout(agentApi.pluginCatalog(), '插件市场');
-          setPluginCatalog(Array.isArray(catalog) ? catalog : []);
-        } catch (error) {
-          setPluginCatalog([]);
-          console.error('Plugin catalog unavailable', error);
+        if (registryResult.status === 'fulfilled') {
+          setPluginRegistry(registryResult.value);
+        } else {
+          setPluginRegistry(null);
+          console.error('Plugin registry unavailable', registryResult.reason);
         }
-      } catch (error) {
-        setPluginRegistry(null);
-        setCapabilities([]);
-        setPluginCatalog([]);
-        console.error('Plugin registry unavailable', error);
+        if (capabilityResult.status === 'fulfilled') {
+          setCapabilities(Array.isArray(capabilityResult.value) ? capabilityResult.value : []);
+        } else {
+          setCapabilities([]);
+          console.error('Capability list unavailable', capabilityResult.reason);
+        }
+        if (catalogResult.status === 'fulfilled') {
+          setPluginCatalog(Array.isArray(catalogResult.value) ? catalogResult.value : []);
+        } else {
+          // Keep the last good catalog instead of blanking the market.
+          console.error('Plugin catalog unavailable', catalogResult.reason);
+        }
       } finally {
         setPluginsLoading(false);
       }
@@ -315,29 +359,66 @@ function App() {
     return withTimeout(agentApi.workflowRun(runId), '工作流运行详情');
   }
 
+  // One extension distribution unit can carry plugins, skills and workflows at
+  // once, so every surface that lists installed extensions has to refresh
+  // together. Refreshing only the kind that was "expected" is how the Workflow
+  // list silently went stale after a unit install.
+  async function refreshExtensionSurfaces() {
+    await Promise.all([refreshPlugins(), refreshSkills(), refreshWorkflowCenter()]);
+  }
+
+  async function verifyWorkflowRun(runId: string): Promise<WorkflowRunVerification> {
+    return withTimeout(agentApi.verifyWorkflowRun(runId), '工作流运行验证');
+  }
+
   async function approveWorkflowRun(runId: string, stepId: string) {
     await agentApi.approveWorkflowStep(runId, stepId);
-    const outcome = await agentApi.resumeWorkflowRun(runId);
-    notify('success', outcome.blocked_step_id ? `已继续执行，等待 ${outcome.blocked_step_id}` : '工作流已继续执行');
+    notify('success', '审批已批准，工作流将由统一审批流程自动继续');
+    await refreshApprovals();
     await refreshWorkflowCenter();
   }
 
   async function rejectWorkflowRun(runId: string, stepId: string) {
     await agentApi.rejectWorkflowStep(runId, stepId);
     notify('info', '工作流审批已拒绝');
+    await refreshApprovals();
     await refreshWorkflowCenter();
   }
 
-  async function resumeWorkflowRun(runId: string) {
-    const outcome = await agentApi.resumeWorkflowRun(runId);
-    notify('success', outcome.blocked_step_id ? `已继续执行，等待 ${outcome.blocked_step_id}` : '工作流已继续执行');
+  async function resumeWorkflowRun(runId: string, feedback: string) {
+    const outcome = await agentApi.resumeWorkflowRun(runId, feedback);
+    notify('success', outcome.blocked_step_id ? '已继续执行，正在等待下一步处理' : '工作流已继续执行');
     await refreshWorkflowCenter();
   }
 
   async function startWorkflowRun(packageId: string, input: Record<string, unknown>) {
     const outcome = await agentApi.startWorkflowRun(packageId, input);
-    notify('success', outcome.blocked_step_id ? `工作流已启动，等待 ${outcome.blocked_step_id}` : '工作流已启动');
     await refreshWorkflowCenter();
+    // 启动失败要当场说清楚：等一次必然失败的执行、再去运行详情里翻错误，
+    // 是上一版最难受的地方。
+    if (outcome.run.status === 'failed') {
+      notify('error', outcome.run.error || '工作流启动后立即失败');
+    } else if (outcome.blocked_step_id) {
+      notify('info', `工作流已启动，等待 ${outcome.blocked_step_id}`);
+    } else {
+      // 启动现在是「受理即返回」：这里只说受理，过程交给运行详情的实时面板。
+      notify('success', '已受理，正在执行');
+    }
+    return outcome.run;
+  }
+
+  async function installWorkflowCatalogItem(workflowId: string, version?: string, source?: string, artifactId?: string, sha256?: string) {
+    setWorkflowLoading(true);
+    try {
+      await agentApi.installWorkflowCatalogItem(workflowId, version, source, artifactId, sha256);
+      notify('success', version ? `工作流已更新到 v${version}` : '工作流已安装');
+      await refreshWorkflowCenter();
+    } catch (error) {
+      notify('error', formatError(error, '安装工作流失败'));
+      throw error;
+    } finally {
+      setWorkflowLoading(false);
+    }
   }
 
   async function cancelWorkflowRun(runId: string) {
@@ -354,7 +435,7 @@ function App() {
     return singleFlight('plugin-registry', async () => {
       try {
         const [registry, capabilityItems] = await Promise.all([
-          withTimeout(agentApi.plugins(), '本机插件注册表'),
+          withTimeout(agentApi.plugins(), '本机插件'),
           withTimeout(agentApi.capabilities(), '本机能力清单'),
         ]);
         setPluginRegistry(registry);
@@ -389,10 +470,10 @@ function App() {
   async function refreshSkills() {
     return singleFlight('skills', async () => {
       const [catalogResult, statusResult, marketResult, workspaceResult] = await Promise.allSettled([
-      withTimeout(agentApi.skillCatalog(), '本地 Skill 目录'),
+      withTimeout(agentApi.skillCatalog(), '本地技能目录'),
       withTimeout(agentApi.codexSkillStatus(), 'AI 工具技能状态'),
-      withTimeout(agentApi.organizationSkillCatalog(), '技能市场'),
-      withTimeout(agentApi.skillWorkspace(), '项目 Skill 工作区'),
+      withTimeout(agentApi.organizationSkillCatalog(), '技能市场', 30000),
+      withTimeout(agentApi.skillWorkspace(), '项目技能目录'),
     ]);
     const errors: string[] = [];
     if (catalogResult.status === 'fulfilled') {
@@ -415,17 +496,18 @@ function App() {
 	  setSkillMarketError(formatError(marketResult.reason, '技能市场暂不可用'));
 	}
 	if (workspaceResult.status === 'fulfilled') setSkillWorkspace(workspaceResult.value);
-	else setSkillWorkspace(current => ({ ...current, error: formatError(workspaceResult.reason, '项目 Skill 工作区读取失败') }));
+	else setSkillWorkspace(current => ({ ...current, error: formatError(workspaceResult.reason, '项目技能目录读取失败') }));
       setSkillError(errors.length ? errors.join('；') : null);
     });
   }
 
   async function refreshDevelopment(force = false) {
     return singleFlight('development', async () => {
-      const [projects, pluginDraftResult, skillDraftResult] = await Promise.allSettled([
+      const [projects, pluginDraftResult, skillDraftResult, workflowDraftResult] = await Promise.allSettled([
       withTimeout(agentApi.extensionProjects(), '扩展项目'),
       withTimeout(agentApi.pluginDrafts(), '插件草稿'),
       withTimeout(agentApi.skillDrafts(), '技能草稿'),
+      withTimeout(agentApi.workflowDrafts(), '工作流草稿'),
     ]);
     try { setExtensionWorkspace(await agentApi.extensionWorkspace()); }
     catch (error) { console.error('Extension workspace unavailable', error); }
@@ -442,22 +524,26 @@ function App() {
     }
     if (pluginDraftResult.status === 'fulfilled') setPluginDrafts(pluginDraftResult.value || []);
     if (skillDraftResult.status === 'fulfilled') setSkillDrafts(skillDraftResult.value || []);
+    if (workflowDraftResult.status === 'fulfilled') setWorkflowDrafts(workflowDraftResult.value || []);
     if (!dashboardEnabled()) {
       setExtensionRemoteProjects([]);
       setPluginSubmissions([]);
       setSkillSubmissions([]);
+      setWorkflowSubmissions([]);
       setExtensionInvitations([]);
         return;
     }
-    const [remoteProjects, pluginSubmissionResult, skillSubmissionResult, invitationResult] = await Promise.allSettled([
+    const [remoteProjects, pluginSubmissionResult, skillSubmissionResult, workflowSubmissionResult, invitationResult] = await Promise.allSettled([
       withTimeout(agentApi.extensionCollaborationProjects(), '协作项目'),
       withTimeout(agentApi.pluginSubmissions(), '插件审核状态'),
       withTimeout(agentApi.skillSubmissions(), '技能审核状态'),
+      withTimeout(agentApi.workflowSubmissions(), '工作流审核状态'),
       withTimeout(agentApi.extensionCollaborationInvitations(), '协作邀请'),
     ]);
     if (remoteProjects.status === 'fulfilled') setExtensionRemoteProjects(remoteProjects.value || []);
     if (pluginSubmissionResult.status === 'fulfilled') setPluginSubmissions(pluginSubmissionResult.value || []);
     if (skillSubmissionResult.status === 'fulfilled') setSkillSubmissions(skillSubmissionResult.value || []);
+    if (workflowSubmissionResult.status === 'fulfilled') setWorkflowSubmissions(workflowSubmissionResult.value.items || []);
       if (invitationResult.status === 'fulfilled') setExtensionInvitations(invitationResult.value || []);
     }, { force });
   }
@@ -474,7 +560,7 @@ function App() {
         setExtensionSourceSnapshot(await agentApi.extensionSourceSnapshot());
       } catch (error) {
         setExtensionSourceSnapshot(null);
-        setExtensionSourcesError(formatError(error, '扩展源刷新失败'));
+        setExtensionSourcesError(formatError(error, '来源刷新失败'));
       }
     } finally {
       setExtensionSourcesLoading(false);
@@ -485,7 +571,7 @@ function App() {
     try {
       setExtensionSources(await agentApi.addExtensionSource(name, repository, reference, catalogPath, verification));
       await refreshExtensionSources();
-      await Promise.all([refreshPlugins(), refreshSkills()]);
+      await refreshExtensionSurfaces();
     } finally {
       setExtensionSourcesLoading(false);
     }
@@ -495,7 +581,7 @@ function App() {
     try {
       setExtensionSources(await agentApi.addLocalExtensionSource(name, root, catalogPath));
       await refreshExtensionSources();
-      await Promise.all([refreshPlugins(), refreshSkills()]);
+      await refreshExtensionSurfaces();
     } finally {
       setExtensionSourcesLoading(false);
     }
@@ -505,7 +591,7 @@ function App() {
     try {
       setExtensionSources(await agentApi.updateExtensionSource(source.id, enabled, autoUpdate, verification));
       await refreshExtensionSources();
-      await Promise.all([refreshPlugins(), refreshSkills()]);
+      await refreshExtensionSurfaces();
     } finally {
       setExtensionSourcesLoading(false);
     }
@@ -515,7 +601,7 @@ function App() {
     try {
       setExtensionSources(await agentApi.removeExtensionSource(sourceId));
       await refreshExtensionSources();
-      await Promise.all([refreshPlugins(), refreshSkills()]);
+      await refreshExtensionSurfaces();
     } finally {
       setExtensionSourcesLoading(false);
     }
@@ -529,21 +615,29 @@ function App() {
       setExtensionSourcesLoading(false);
     }
   }
-  async function installExtensionUnit(unitKey: string) {
+  async function installExtensionUnit(unitKey: string, sourceId: string) {
     setExtensionSourcesLoading(true);
+    setInstallingUnitKey(unitKey);
     try {
-      const report = await agentApi.installExtensionUnit(unitKey);
+      const report = await agentApi.installExtensionUnit(unitKey, sourceId);
       await refreshExtensionSources();
-      await Promise.all([refreshPlugins(), refreshSkills()]);
-      const total = report.plugins.length + report.skills.length;
-      const origin = report.acquisition === 'remote' ? 'GitHub 分发源' : '本地开发工作区';
+      await refreshExtensionSurfaces();
+      const origin = report.acquisition === 'remote' ? '发布版本' : '本地开发';
       if (report.errors.length) {
         notify('error', `从${origin}安装失败：${report.errors.join('；')}`);
         return;
       }
-      notify('success', total ? `已从${origin}安装 ${total} 项扩展` : '该扩展单元没有可安装的扩展');
+      // A unit may carry any mix of the three extension kinds, so report each
+      // kind instead of summing only the ones this screen happened to expect.
+      const installed = [
+        report.plugins.length ? `${report.plugins.length} 插件` : '',
+        report.skills.length ? `${report.skills.length} 技能` : '',
+        report.workflows.length ? `${report.workflows.length} 工作流` : '',
+      ].filter(Boolean);
+      notify('success', installed.length ? `已从${origin}安装 ${installed.join(' · ')}` : '当前来源没有可安装的扩展');
     } finally {
       setExtensionSourcesLoading(false);
+      setInstallingUnitKey('');
     }
   }
   async function switchExtensionWorkspace(root: string) {
@@ -589,7 +683,7 @@ function App() {
   }
 
   useEffect(() => {
-    refreshInitialPage().catch(error => notify('error', formatError(error, 'Agent 面板初始化失败')));
+    refreshInitialPage().catch(error => notify('error', formatError(error, '应用初始化失败')));
     const timer = window.setInterval(() => {
       if (document.visibilityState !== 'hidden') Promise.all([refreshStatus(), refreshApprovals()]).catch(console.error);
     }, 10000);
@@ -601,10 +695,57 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!workflowCenter) return;
+    for (const item of workflowCenter.runs.filter(run => run.run.status === 'waiting')) {
+      const notificationKey = `${item.run.run_id}:${item.run.current_step_id}`;
+      if (notifiedWorkflowApprovals.current.has(notificationKey)) continue;
+      notifiedWorkflowApprovals.current.add(notificationKey);
+      notify('info', `工作流“${item.workflow_name || item.workflow_id}”正在等待${item.waiting_kind === 'feedback' ? '反馈' : '审批'}，请前往“待处理”处理。`);
+    }
+  }, [workflowCenter]);
+
+  // 运行结束时给一次收尾通知：任务在后台跑完（或失败）也该被看见。
+  // 首次加载只做登记，避免把历史运行一次性刷成通知。
+  useEffect(() => {
+    if (!workflowCenter) return;
+    const finished = workflowCenter.runs.filter(item => ['succeeded', 'failed', 'canceled'].includes(item.run.status));
+    if (!workflowOutcomePrimed.current) {
+      finished.forEach(item => notifiedWorkflowOutcomes.current.add(`${item.run.run_id}:${item.run.status}`));
+      workflowOutcomePrimed.current = true;
+      return;
+    }
+    for (const item of finished) {
+      const key = `${item.run.run_id}:${item.run.status}`;
+      if (notifiedWorkflowOutcomes.current.has(key)) continue;
+      notifiedWorkflowOutcomes.current.add(key);
+      const name = item.workflow_name || item.workflow_id;
+      if (item.run.status === 'succeeded') {
+        notify('success', `工作流“${name}”已完成`);
+      } else if (item.run.status === 'failed') {
+        notify('error', `工作流“${name}”运行失败：${item.run.error || '未提供原因'}`);
+      } else {
+        notify('info', `工作流“${name}”已取消`);
+      }
+    }
+  }, [workflowCenter]);
+
+  useEffect(() => {
+    const hasActiveRuns = workflowCenter?.runs.some(item => ['queued', 'running', 'waiting'].includes(item.run.status));
+    if (!hasActiveRuns) return;
+    // 有在跑的任务时收紧到 2.5 秒：本地调用开销很小，换来的是「能看见它在动」。
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'hidden') refreshWorkflowCenter().catch(console.error);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [workflowCenter]);
+
+  useEffect(() => {
     const operation = page === 'dashboard'
-      ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings()])
+      ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings(), refreshProjectionSyncStatus()])
       : page === 'ai'
-        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshBuiltinAiToolContext()])
+        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext()])
+        : page === 'inbox'
+          ? Promise.all([refreshApprovals(), refreshWorkflowCenter()])
         : page === 'approvals'
           ? refreshApprovals()
           : page === 'plugins'
@@ -619,6 +760,14 @@ function App() {
                   ? refreshSettingsPageData()
                   : Promise.resolve();
     operation.catch(console.error);
+  }, [page]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('himind.page', page);
+    } catch {
+      // Webview storage can be unavailable; navigation still works in memory.
+    }
   }, [page]);
 
   useEffect(() => {
@@ -717,7 +866,7 @@ function App() {
         await agentApi.prepareExtensionAuthoring();
         await Promise.all([refreshPlugins(), refreshSkills()]);
       } catch (error) {
-        notify('error', formatError(error, '扩展创作助手尚未就绪，请检查扩展源'));
+        notify('error', formatError(error, '开发工具尚未就绪，请检查来源设置'));
         return;
       }
     }
@@ -746,14 +895,14 @@ function App() {
   async function openExtensionWorkspaceAi(root: string) {
     const target = root.trim();
     if (!target) {
-      notify('error', '请先添加并选择本地开发工作区');
+      notify('error', '请先添加并选择本地开发目录');
       return;
     }
     try {
       await agentApi.prepareExtensionAuthoring();
       await Promise.all([refreshPlugins(), refreshSkills()]);
     } catch (error) {
-      notify('error', formatError(error, '扩展创作助手尚未就绪，请检查扩展源'));
+      notify('error', formatError(error, '开发工具尚未就绪，请检查来源设置'));
       return;
     }
     setBuiltinAiWorkspaceRequest(current => {
@@ -800,13 +949,14 @@ function App() {
       merged.set(item.id, {
         plugin_id: item.id,
         name: item.name || item.id,
-        description: item.description || (item.development ? '本机开发候选插件' : '本机插件'),
+        description: item.description || (item.development ? '本机开发插件' : '本机插件'),
         author_name: item.author_name,
         categories: [],
         governance: item.governance || 'optional',
         version: item.version || '0.0.0',
         release_notes: '',
         min_agent_version: item.min_agent_version || '',
+        artifact_id: '',
         file_size: item.entry_size || 0,
         sha256: '',
         source: item.development ? 'development' : 'system',
@@ -892,9 +1042,9 @@ function App() {
     try {
       const result = await agentApi.applyMcpRegistration(targetId, resetInvalid);
       await refreshMcpTargets();
-      notify('success', result.changed ? `${result.target.name} 的 MCP 注册已更新` : `${result.target.name} 的 MCP 注册已就绪`);
+      notify('success', result.changed ? `${result.target.name} 的连接已更新` : `${result.target.name} 已连接`);
     } catch (error) {
-      notify('error', friendlyConnectionError(error, 'MCP 注册失败，请关闭对应 AI 工具后重试。'));
+      notify('error', friendlyConnectionError(error, '连接失败，请关闭对应 AI 工具后重试。'));
     } finally {
       setAiOperation(null);
     }
@@ -906,9 +1056,9 @@ function App() {
     try {
       const result = await agentApi.removeMcpRegistration(targetId);
       await refreshMcpTargets();
-      notify('success', result.changed ? `${result.target.name} 的 MCP 注册已移除` : `${result.target.name} 当前没有 HiMind MCP 注册`);
+      notify('success', result.changed ? `已断开 ${result.target.name}` : `${result.target.name} 当前未连接`);
     } catch (error) {
-      notify('error', friendlyConnectionError(error, '取消注册失败，请关闭对应 AI 工具后重试。'));
+      notify('error', friendlyConnectionError(error, '断开连接失败，请关闭对应 AI 工具后重试。'));
     } finally {
       setAiOperation(null);
     }
@@ -921,12 +1071,12 @@ function App() {
       const result = await agentApi.applyAllMcpRegistrations(true, false);
       await refreshMcpTargets();
       if (result.failures.length) {
-        notify('error', `已注册 ${result.results.length} 个 AI 工具，${result.failures.length} 个需要单独处理`);
+        notify('error', `已连接 ${result.results.length} 个 AI 工具，${result.failures.length} 个需要单独处理`);
       } else {
-        notify('success', result.results.length ? `已完成 ${result.results.length} 个 AI 工具的 MCP 注册` : '已发现的 AI 工具均已注册');
+        notify('success', result.results.length ? `已连接 ${result.results.length} 个 AI 工具` : '已发现的 AI 工具均已连接');
       }
     } catch (error) {
-      notify('error', friendlyConnectionError(error, '批量注册 MCP 服务失败。'));
+      notify('error', friendlyConnectionError(error, '连接 AI 工具失败。'));
     } finally {
       setAiOperation(null);
     }
@@ -939,12 +1089,12 @@ function App() {
       const result = await agentApi.removeAllMcpRegistrations(true);
       await refreshMcpTargets();
       if (result.failures.length) {
-        notify('error', `已取消 ${result.results.length} 个注册，${result.failures.length} 个需处理`);
+        notify('error', `已断开 ${result.results.length} 个连接，${result.failures.length} 个需处理`);
       } else {
-        notify('success', result.results.length ? `已取消 ${result.results.length} 个注册` : '没有可取消的注册');
+        notify('success', result.results.length ? `已断开 ${result.results.length} 个连接` : '当前没有可断开的连接');
       }
     } catch (error) {
-      notify('error', friendlyConnectionError(error, '取消注册失败。'));
+      notify('error', friendlyConnectionError(error, '断开连接失败。'));
     } finally {
       setAiOperation(null);
     }
@@ -957,9 +1107,9 @@ function App() {
     try {
       const result = await agentApi.testMcpConnection();
       setMcpTestResult(result);
-      notify('success', 'MCP 服务正常');
+       notify('success', '本机连接正常');
     } catch (error) {
-      notify('error', friendlyConnectionError(error, '本机服务检查失败，请重新启动 HiMind Agent。'));
+       notify('error', friendlyConnectionError(error, '本机连接检查失败，请重新启动 HiMind Agent。'));
     } finally {
       setAiOperation(null);
     }
@@ -1020,10 +1170,23 @@ function App() {
       workspaceRequestRevision={builtinAiWorkspaceRequest.revision}
     />;
 
+  const workflowApprovalCount = workflowCenter?.runs.filter(item => item.run.status === 'waiting').length || 0;
+
+  function navigate(target: NavigationTarget) {
+    const nextPage = typeof target === 'string' ? target : target.page;
+    if (nextPage === 'ai') setAiConnectionsTab('mcp');
+    if (nextPage === 'settings') setSettingsSection('remote');
+    if (typeof target !== 'string' && target.runId) setWorkflowRunTarget(target.runId);
+    else if (nextPage === 'workflows') setWorkflowRunTarget('');
+    if (typeof target !== 'string' && target.workflowId) setSchedulePresetTarget(target.workflowId);
+    else if (nextPage !== 'schedules') setSchedulePresetTarget('');
+    setPage(nextPage);
+  }
   const content = (() => {
     if (page === 'builtin-ai') return null;
     if (page === 'dashboard') return <DashboardPage
       status={status}
+      projectionSyncStatus={projectionSyncStatus}
       approvals={approvals}
       remoteExecutionSettings={remoteExecutionSettings}
       mcpTargets={mcpTargets}
@@ -1038,6 +1201,7 @@ function App() {
       onOpenAuthorization={() => run(agentApi.openDashboardAuthorizationPage)}
       onRefreshIdentity={() => run(refreshDashboardIdentity)}
       onRevokeAuthorization={revokeDashboardAuthorization}
+      onRefreshProjection={() => run(refreshProjectionSyncStatus)}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}
       onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)}
       onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)}
@@ -1049,9 +1213,10 @@ function App() {
       testResult={mcpTestResult}
       busyAction={aiOperation}
       aiServices={aiServices}
+      acpProfiles={acpRuntimeProfiles}
       onOpenAccount={() => setPage('dashboard')}
       targets={mcpTargets}
-      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices()]); })}
+      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshAcpRuntimeProfiles()]); })}
       onApplyTarget={applyMcpTarget}
       onApplyAll={applyAllMcpTargets}
       onRemoveAll={removeAllMcpTargets}
@@ -1059,15 +1224,136 @@ function App() {
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
       onTest={testMcpConnection}
       onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', 'AI 服务已保存'); } catch (error) { notify('error', formatError(error, '保存 AI 服务失败')); throw error; } }}
+      onSetActiveAIService={(id) => run(async () => { await agentApi.setActiveAIService(id); await refreshAIServices(); }, id ? '已设为 HiMind AI 默认服务' : '已恢复系统默认设置', '设置 HiMind AI 默认服务失败')}
       onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, 'AI 服务已删除', '删除 AI 服务失败')}
       onFetchModels={(input) => agentApi.fetchAIServiceModels(input).then((result) => result.models)}
       onFetchSavedModels={(id, baseUrl) => agentApi.fetchSavedAIServiceModels(id, baseUrl).then((result) => result.models)}
-      onImportAIClient={(target, service) => run(async () => { await agentApi.importAIClient(target, service); await refreshAIServices(); await refreshMcpTargets(); }, `已注册到 ${target}`, '注册客户端失败')}
-      onRemoveAIClient={(target) => run(async () => { await agentApi.removeAIClient(target); await refreshAIServices(); }, `已取消 ${target} 注册`, '取消客户端注册失败')}
+      onImportAIClient={(target, service) => run(async () => { await agentApi.importAIClient(target, service); await refreshAIServices(); await refreshMcpTargets(); }, `已连接 ${target}`, '连接 AI 工具失败')}
+      onRemoveAIClient={(target) => run(async () => { await agentApi.removeAIClient(target); await refreshAIServices(); }, `已断开 ${target}`, '断开 AI 工具失败')}
+      onSaveAcpProfile={async (input) => { try { await agentApi.saveAcpRuntimeProfile(input); await refreshAcpRuntimeProfiles(); notify('success', 'AI 客户端已保存'); } catch (error) { notify('error', formatError(error, '保存 AI 客户端失败')); throw error; } }}
+      onSetAcpProfileEnabled={(providerId, enabled) => run(async () => { await agentApi.setAcpRuntimeProfileEnabled(providerId, enabled); await refreshAcpRuntimeProfiles(); }, enabled ? 'AI 客户端已启用' : 'AI 客户端已停用', '更新 AI 客户端状态失败')}
+      onRemoveAcpProfile={(providerId) => run(async () => { await agentApi.removeAcpRuntimeProfile(providerId); await refreshAcpRuntimeProfiles(); }, 'AI 客户端已删除', '删除 AI 客户端失败')}
+    />;
+    if (page === 'inbox') return <InboxPage
+      approvals={approvals}
+      workflowRuns={(workflowCenter?.runs || []).filter(item => item.run.status === 'waiting')}
+      onRefresh={() => { void run(async () => { await Promise.all([refreshApprovals(), refreshWorkflowCenter()]); }); }}
+      onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await Promise.all([refreshApprovals(), refreshWorkflowCenter(), refreshStatus()]); }, undefined, '审批处理失败')}
+      onOpenWorkflowRun={(runId) => navigate({ page: 'workflows', runId })}
+      onOpenApprovalHistory={() => navigate('approvals')}
     />;
     if (page === 'approvals') return <ApprovalsPage independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} approvals={approvals} history={approvalHistory} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} onOpenSettings={() => { setSettingsSection('approval'); setPage('settings'); }} />;
-    if (page === 'workflows') return <WorkflowsPage snapshot={workflowCenter} loading={workflowLoading} error={workflowError} onRefresh={() => { void refreshWorkflowCenter(); }} onLoadRun={loadWorkflowRun} onApprove={approveWorkflowRun} onReject={rejectWorkflowRun} onResume={resumeWorkflowRun} onCancel={cancelWorkflowRun} onStart={startWorkflowRun} />;
-    if (page === 'plugins') return <PluginsPage loading={pluginsLoading} registry={pluginRegistry} catalog={pluginCatalog} capabilities={capabilities} dashboardEnabled={dashboardEnabled()} marketEnabled={extensionMarketEnabled()} desired={extensionDesiredState} desiredLoading={extensionDesiredLoading} desiredError={extensionDesiredError} skillStatus={skillStatus} onQueryCatalog={agentApi.queryPluginCatalog} onRefresh={() => run(async () => { await Promise.all([refreshExtensionDesiredState(), refreshPlugins()]); })} onLoadVersions={agentApi.pluginVersions} onPlanInstall={agentApi.planPluginInstall} onImportLocal={() => run(async () => { const registry = await agentApi.importLocalPlugin(); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); }, '本地插件已导入', '导入本地插件失败')} onImportGithub={async (sourceUrl) => { const registry = await agentApi.importGithubPlugin(sourceUrl); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub 插件已导入'); }} onInstall={(pluginId, version) => run(async () => { await agentApi.installPlugin(pluginId, version); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, `已安装插件${version ? ` v${version}` : ''}`, '安装插件失败')} onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已卸载', '卸载插件失败')} onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已回滚', '插件回滚失败')} onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, enabled ? '插件已启用' : '插件已停用', '更新插件状态失败')} onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')} onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')} />;
+    if (page === 'extensions') return <ExtensionsPage
+      loading={pluginsLoading || workflowLoading || extensionSourcesLoading}
+      error={workflowError || skillError || extensionSourcesError}
+      plugins={pluginCatalog}
+      installedPlugins={pluginRegistry?.items || []}
+      skills={organizationSkills}
+      installedSkills={skillStatus?.items || []}
+      workflows={workflowCenter?.catalog || []}
+      installedWorkflows={workflowCenter?.workflows || []}
+      units={extensionSourceSnapshot?.units || []}
+      busyUnit={installingUnitKey}
+      workspace={extensionWorkspace}
+      extensionSources={extensionSources}
+      extensionSourceSnapshot={extensionSourceSnapshot}
+      extensionSourcesLoading={extensionSourcesLoading}
+      extensionSourcesError={extensionSourcesError}
+      onRefresh={() => run(async () => { await Promise.all([refreshPlugins(), refreshSkills(), refreshWorkflowCenter(), refreshExtensionSources()]); })}
+      onRefreshSources={refreshExtensionSources}
+      onAddSource={addExtensionSource}
+      onAddLocalSource={addLocalExtensionSource}
+      onUpdateSourceConfig={updateExtensionSource}
+      onRemoveSource={removeExtensionSource}
+      onSetUnitAcquisition={setExtensionUnitAcquisition}
+      onSetWorkspace={(root: string) => run(() => switchExtensionWorkspace(root), undefined, '切换扩展工作区失败')}
+      onDevelopWorkspace={(root: string) => { void switchExtensionWorkspace(root).then(() => setPage('development')).catch(error => notify('error', formatError(error, '打开扩展开发失败'))); }}
+      onInstallUnit={installExtensionUnit}
+      onOpenKind={(kind) => setPage(kind === 'plugin' ? 'plugins' : kind === 'skill' ? 'skills' : 'workflows')}
+      onPlanPlugin={agentApi.planPluginInstall}
+      onInstallPlugin={async (pluginId, version, source, artifactId, sha256) => { try { await agentApi.installPlugin(pluginId, version, source, artifactId, sha256); await refreshExtensionSurfaces(); await invalidateBuiltinAiToolContext(); notify('success', `已安装插件${version ? ` v${version}` : ''}`); } catch (error) { notify('error', formatError(error, '安装插件失败')); } }}
+      onPlanSkill={agentApi.planOrganizationSkillInstall}
+      onInstallSkill={async (skillId, version, optionalPluginIds, source, artifactId, sha256) => { try { const result = await agentApi.installOrganizationSkill(skillId, version, optionalPluginIds, source, artifactId, sha256); await refreshExtensionSurfaces(); await invalidateBuiltinAiToolContext(); notify('success', `已安装 ${result.record.manifest.name} v${result.record.manifest.version}`); } catch (error) { notify('error', formatError(error, '安装技能失败')); } }}
+      onLoadPluginVersions={agentApi.pluginVersions}
+      onLoadSkillVersions={agentApi.skillVersions}
+      onLoadWorkflowVersions={agentApi.workflowVersions}
+      onInstallWorkflow={async (workflowId, version, source, artifactId, sha256) => { try { await agentApi.installWorkflowCatalogItem(workflowId, version, source, artifactId, sha256); await refreshWorkflowCenter(); notify('success', `已安装工作流 v${version}`); } catch (error) { notify('error', formatError(error, '安装工作流失败')); } }}
+    />;
+    if (page === 'workflows') return <WorkflowsPage
+      snapshot={workflowCenter}
+      initialRunId={workflowRunTarget}
+      loading={workflowLoading}
+      error={workflowError}
+      onRefresh={() => { void refreshWorkflowCenter(); }}
+      onLoadRun={loadWorkflowRun}
+      onVerify={verifyWorkflowRun}
+      onRevealArtifact={(runId, artifactId) => run(() => agentApi.revealWorkflowArtifact(runId, artifactId), undefined, '无法打开输出文件位置')}
+      onApprove={approveWorkflowRun}
+      onReject={rejectWorkflowRun}
+      onResume={resumeWorkflowRun}
+      onCancel={cancelWorkflowRun}
+      onStart={startWorkflowRun}
+      onPreflight={agentApi.preflightWorkflowRun}
+      onSaveCredentialFile={async (connectorId, handle) => { try { const result = await agentApi.saveConnectorFileCredential(connectorId, handle); if (!result.cancelled) notify('success', '凭据文件已保存'); return !result.cancelled; } catch (error) { notify('error', formatError(error, '保存凭据文件失败')); throw error; } }}
+      onSaveCredentialSecret={async (connectorId, handle, secret) => { try { await agentApi.saveConnectorSecretCredential(connectorId, handle, secret); notify('success', '连接密钥已保存'); } catch (error) { notify('error', formatError(error, '保存连接密钥失败')); throw error; } }}
+      onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
+      onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
+      onRollback={(packageId) => run(async () => { await agentApi.rollbackWorkflow(packageId); await refreshWorkflowCenter(); }, '工作流已回滚', '工作流回滚失败')}
+      onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(); }, '工作流已移除', '移除工作流失败')}
+      onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
+      onOpenExtensions={() => setPage('extensions')}
+      onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
+      onLoadPresets={(workflowId) => agentApi.workflowPresets(workflowId)}
+      onSavePreset={(input) => run(async () => { await agentApi.setWorkflowPreset(input); }, '启动预设已保存', '保存启动预设失败')}
+      onDeletePreset={(id) => run(async () => { await agentApi.deleteWorkflowPreset(id); }, '启动预设已删除', '删除启动预设失败')}
+    />;
+    if (page === 'schedules') return <SchedulesPage
+      snapshot={workflowCenter}
+      skills={(skillCatalog?.items || []).map(item => ({ id: item.record.manifest.id, name: item.record.manifest.name, version: item.record.manifest.version }))}
+      onRefreshWorkflows={() => { void refreshWorkflowCenter(); }}
+      onLoadSchedules={agentApi.schedules}
+      onSaveSchedule={(input) => run(async () => { await agentApi.setSchedule(input); }, '定时任务已保存', '保存定时任务失败')}
+      onDeleteSchedule={(id) => run(async () => { await agentApi.deleteSchedule(id); }, '定时任务已删除', '删除定时任务失败')}
+      onRunTarget={async (kind, targetId, input) => {
+        if (kind !== 'workflow') throw new Error(`unsupported target kind: ${kind}`);
+        const preflight = await agentApi.preflightWorkflowRun(targetId, input);
+        if (!preflight.ready) throw new Error(preflight.blockers[0] || '启动前检查未通过');
+        const started = await startWorkflowRun(targetId, input);
+        setWorkflowRunTarget(started.run_id);
+        setPage('workflows');
+      }}
+      onRunSkill={(skillId, input) => run(async () => { await agentApi.runSkill(skillId, input); }, '技能已开始运行', '运行技能失败')}
+      onLoadWorkflowPresets={(workflowId) => agentApi.workflowPresets(workflowId)}
+      onPreflightWorkflow={agentApi.preflightWorkflowRun}
+      onLoadSkillRuns={(limit) => agentApi.skillRuns(limit)}
+      onRevealSkillRun={(runId) => run(() => agentApi.revealSkillRun(runId), undefined, '定位技能结果失败')}
+      presetTargetId={schedulePresetTarget}
+      onOpenExtensions={() => setPage('extensions')}
+    />;
+    if (page === 'plugins') return <PluginsPage
+      loading={pluginsLoading}
+      registry={pluginRegistry}
+      catalog={pluginCatalog}
+      capabilities={capabilities}
+      dashboardEnabled={dashboardEnabled()}
+      catalogEnabled={extensionMarketEnabled()}
+      desired={extensionDesiredState}
+      desiredLoading={extensionDesiredLoading}
+      desiredError={extensionDesiredError}
+      skillStatus={skillStatus}
+      onRefresh={() => run(async () => { await Promise.all([refreshExtensionDesiredState(), refreshPlugins()]); })}
+      onLoadVersions={agentApi.pluginVersions}
+      onPlanInstall={agentApi.planPluginInstall}
+      onImportLocal={() => run(async () => { const registry = await agentApi.importLocalPlugin(); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); }, '本地插件已导入', '导入本地插件失败')}
+      onImportGithub={async (sourceUrl) => { const registry = await agentApi.importGithubPlugin(sourceUrl); setPluginRegistry(registry); await invalidateBuiltinAiToolContext(); notify('success', 'GitHub 插件已导入'); }}
+      onInstall={(pluginId, version) => run(async () => { await agentApi.installPlugin(pluginId, version); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, `已安装插件${version ? ` v${version}` : ''}`, '安装插件失败')}
+      onUninstall={(pluginId) => run(async () => { await agentApi.uninstallPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已卸载', '卸载插件失败')}
+      onRollback={(pluginId) => run(async () => { await agentApi.rollbackPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已回滚', '插件回滚失败')}
+      onSetEnabled={(pluginId, enabled) => run(async () => { await agentApi.setPluginEnabled(pluginId, enabled); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, enabled ? '插件已启用' : '插件已停用', '更新插件状态失败')}
+      onOpenView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')}
+      onCreateShortcut={(pluginId, viewId, title) => run(() => agentApi.createPluginViewShortcut(pluginId, viewId, title), '桌面快捷方式已创建', '创建桌面快捷方式失败')}
+      onOpenExtensions={() => setPage('extensions')}
+    />;
     if (page === 'skills') return <SkillsWorkspacePage
       catalog={skillCatalog}
       status={skillStatus}
@@ -1075,14 +1361,12 @@ function App() {
       mcpTargets={mcpTargets}
       error={skillError}
       marketplace={organizationSkills}
-      marketplaceError={skillMarketError}
 	  dashboardEnabled={dashboardEnabled()}
-	  marketEnabled={extensionMarketEnabled()}
+	  catalogEnabled={extensionMarketEnabled()}
 	  desired={extensionDesiredState}
 	  desiredLoading={extensionDesiredLoading}
 	  desiredError={extensionDesiredError}
 	  pluginRegistry={pluginRegistry}
-	  onQueryMarketplace={agentApi.queryOrganizationSkillCatalog}
 	  availablePlugins={availablePlugins}
       busyAction={skillOperation}
       onRefresh={() => run(async () => { await Promise.all([refreshExtensionDesiredState(), refreshSkills()]); })}
@@ -1095,32 +1379,32 @@ function App() {
           : result.blocked.length;
         return blocked ? `技能同步完成，${blocked} 项需要处理` : '技能已同步';
       }, '技能同步失败')}
-      onPickWorkspace={() => runSkillOperation('workspace', async () => { const next = await agentApi.pickSkillWorkspace(); setSkillWorkspace(next); await refreshSkills(); return `已切换项目 Skill 工作区：${next.root}`; }, '选择项目 Skill 工作区失败')}
-      onClearWorkspace={() => runSkillOperation('workspace-clear', async () => { const next = await agentApi.setSkillWorkspace(); setSkillWorkspace(next); await refreshSkills(); return '已恢复全局 Skill 目标'; }, '清除项目 Skill 工作区失败')}
+      onPickWorkspace={() => runSkillOperation('workspace', async () => { const next = await agentApi.pickSkillWorkspace(); setSkillWorkspace(next); await refreshSkills(); return `已切换到项目：${next.root}`; }, '选择项目失败')}
+      onClearWorkspace={() => runSkillOperation('workspace-clear', async () => { const next = await agentApi.setSkillWorkspace(); setSkillWorkspace(next); await refreshSkills(); return '已改为全局技能'; }, '恢复全局技能失败')}
       onSyncSkill={(skillId) => runSkillOperation(`sync:${skillId}`, async () => {
         const result = await agentApi.syncCodexSkill(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        return result.rendered.state === 'skipped' ? '技能已注册' : '技能注册完成';
-      }, '注册技能失败')}
+        return result.rendered.state === 'skipped' ? '技能已同步' : '技能同步完成';
+      }, '同步技能失败')}
       onUpdateWorkspace={(skillId) => runSkillOperation(`workspace-update:${skillId}`, async () => {
         const result = await agentApi.updateSkillWorkspace(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        return result.rendered?.state === 'skipped' ? '当前项目已是最新版本' : '当前项目 Skill 已更新';
-      }, '更新当前项目 Skill 失败')}
+        return result.rendered?.state === 'skipped' ? '当前项目已是最新版本' : '当前项目技能已更新';
+      }, '更新当前项目技能失败')}
       onSetWorkspaceEnabled={(skillId, enabled) => runSkillOperation(`workspace-enabled:${skillId}`, async () => {
         await agentApi.setSkillWorkspaceEnabled(skillId, enabled);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        return enabled ? '当前项目 Skill 已启用' : '当前项目 Skill 已禁用';
-      }, '更新当前项目 Skill 状态失败')}
+        return enabled ? '当前项目技能已启用' : '当前项目技能已停用';
+      }, '更新当前项目技能状态失败')}
       onSyncSkillClient={(skillId, clientId) => runSkillOperation(`register:${clientId}:${skillId}`, async () => {
         const result = await agentApi.syncSkillClient(skillId, clientId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        return result.rendered?.state === 'skipped' ? '技能已是最新版本' : '技能已注册';
-      }, '注册技能失败')}
+        return result.rendered?.state === 'skipped' ? '技能已是最新版本' : '技能已同步';
+      }, '同步技能失败')}
       syncMode={skillStatus?.sync_mode || 'copy'}
       onSetSyncMode={(mode: SkillSyncSettings['mode']) => runSkillOperation('sync-mode', async () => {
         await agentApi.setSkillSyncMode(mode);
@@ -1147,34 +1431,30 @@ function App() {
         const result = await agentApi.unregisterSkillClient(skillId, clientId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        return result.removed.removed ? `${result.client_name || clientId} 已取消注册` : `${result.client_name || clientId} 当前未注册`;
-      }, '取消注册失败')}
+        return result.removed.removed ? `已停止同步到 ${result.client_name || clientId}` : `${result.client_name || clientId} 当前未同步`;
+      }, '停止同步失败')}
       onUnregisterClients={(skillId) => runSkillOperation(`unregister-all:${skillId}`, async () => {
         const result = await agentApi.unregisterSkillClients(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
         const failures = Object.keys(result.failures || {}).length;
-        return failures ? `已取消 ${result.removed_count} 个注册，${failures} 个需处理` : `已取消 ${result.removed_count} 个注册`;
-      }, '取消注册失败')}
+        return failures ? `已停止 ${result.removed_count} 个同步，${failures} 个需处理` : `已停止 ${result.removed_count} 个同步`;
+      }, '停止同步失败')}
       onUninstall={(skillId) => runSkillOperation(`uninstall:${skillId}`, async () => {
         const result = await agentApi.uninstallCodexSkill(skillId);
         await refreshSkills();
         await invalidateBuiltinAiToolContext();
-        if (result.target_kind === 'workspace') return result.removed.removed ? `已从当前项目移除 ${result.removed.skill_id}` : `${result.removed.skill_id} 未在当前项目注册`;
+        if (result.target_kind === 'workspace') return result.removed.removed ? `已从当前项目移除 ${result.removed.skill_id}` : `${result.removed.skill_id} 不在当前项目中`;
         return result.removed.removed ? `已卸载 ${result.removed.skill_id}` : `未卸载 ${result.removed.skill_id}`;
       }, '卸载技能失败')}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path), '目录已打开', '打开目录失败')}
-       onImportLocal={() => run(async () => { const result = await agentApi.importLocalSkill(); await refreshSkills(); await invalidateBuiltinAiToolContext(); return result.record; }, skillWorkspace.valid ? '本地 Skill 已导入并部署到当前项目' : '本地 Skill 已导入并部署到全局', '导入本地 Skill 失败')}
-       onImportGithub={async (sourceUrl) => { await agentApi.importGithubSkill(sourceUrl); await refreshSkills(); await invalidateBuiltinAiToolContext(); notify('success', skillWorkspace.valid ? 'GitHub Skill 已导入并部署到当前项目' : 'GitHub Skill 已导入并部署到全局'); }}
+       onImportLocal={() => run(async () => { const result = await agentApi.importLocalSkill(); await refreshSkills(); await invalidateBuiltinAiToolContext(); return result.record; }, skillWorkspace.valid ? '本地技能已导入到当前项目' : '本地技能已导入', '导入本地技能失败')}
+       onImportGithub={async (sourceUrl) => { await agentApi.importGithubSkill(sourceUrl); await refreshSkills(); await invalidateBuiltinAiToolContext(); notify('success', skillWorkspace.valid ? 'GitHub 技能已导入到当前项目' : 'GitHub 技能已导入'); }}
       onOpenAiConnections={() => { setAiConnectionsTab('mcp'); setPage('ai'); }}
+      onOpenExtensions={() => setPage('extensions')}
     />;
     if (page === 'development') return <ExtensionDevelopmentPage
       dashboardEnabled={dashboardEnabled()}
-      workspace={extensionWorkspace}
-      extensionSources={extensionSources}
-      extensionSourceSnapshot={extensionSourceSnapshot}
-      extensionSourcesLoading={extensionSourcesLoading}
-      extensionSourcesError={extensionSourcesError}
       projectsError={extensionProjectsError}
       projects={extensionProjects}
       remoteProjects={extensionRemoteProjects}
@@ -1182,26 +1462,20 @@ function App() {
       accountAuthorized={Boolean(dashboardIdentity?.authorized)}
       pluginDrafts={pluginDrafts}
       skillDrafts={skillDrafts}
+      workflowDrafts={workflowDrafts}
+      workflowSubmissions={workflowSubmissions}
       pluginSubmissions={pluginSubmissions}
       skillSubmissions={skillSubmissions}
       availablePlugins={availablePlugins}
       busyAction={developmentOperation}
       onRefresh={() => run(refreshDevelopment, undefined, '刷新扩展项目失败')}
-      onRefreshSources={refreshExtensionSources}
-      onAddSource={addExtensionSource}
-      onAddLocalSource={addLocalExtensionSource}
-      onUpdateSourceConfig={updateExtensionSource}
-      onRemoveSource={removeExtensionSource}
-      onSetUnitAcquisition={setExtensionUnitAcquisition}
-      onInstallUnit={installExtensionUnit}
-      onSetWorkspace={(root: string) => run(() => switchExtensionWorkspace(root), undefined, '切换开发工作区失败')}
       onCreate={async (input: CreateExtensionProjectInput) => {
         if (developmentOperation) throw new Error('已有扩展操作正在进行，请稍后重试');
         setDevelopmentOperation('create');
         try {
           const project = await agentApi.createExtensionProject(input);
           await refreshDevelopment(true);
-          notify('success', `已创建${project.kind === 'plugin' ? '插件' : '技能'}项目：${project.name}`);
+          notify('success', `已创建${project.kind === 'plugin' ? '插件' : project.kind === 'workflow' ? '工作流' : '技能'}项目：${project.name}`);
           return project;
         } catch (error) {
           notify('error', formatError(error, '新建扩展项目失败'));
@@ -1210,7 +1484,7 @@ function App() {
           setDevelopmentOperation(null);
         }
       }}
-      onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProjects(); await refreshDevelopment(); }, '项目或聚合仓库已加入工作台', '打开扩展项目失败')}
+      onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProjects(); await refreshDevelopment(); }, '已添加到扩展开发', '打开扩展项目失败')}
       onAssociateProject={(project: ExtensionRemoteProject) => runDevelopmentOperation(`associate:${project.product_key}`, async () => { await agentApi.associateExtensionProject(project); await refreshDevelopment(); }, '本地项目已关联', '关联本地项目失败')}
       onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, async () => {
         onProgress?.('building');
@@ -1218,17 +1492,20 @@ function App() {
         onProgress?.('activating');
         if (candidate.kind === 'plugin') {
           await agentApi.testPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-        } else {
+        } else if (candidate.kind === 'skill') {
           await agentApi.testSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+        } else {
+          await agentApi.testWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
+          await agentApi.confirmWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
         }
         onProgress?.('refreshing');
         await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
-      }, '构建完成，已启用到本机 AI 工具', '构建或启用失败')}
+      }, '构建完成，已在本机启用', '构建或启用失败')}
       onDevelopWithAi={(project) => { void openBuiltinAi(project); }}
       onDevelopWorkspace={(root: string) => { void openExtensionWorkspaceAi(root); }}
-      onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else await agentApi.submitSkillDraft(extensionId, version); await refreshDevelopment(); }, '已提交 HiMind 工作台审核', '提交审核失败')}
+       onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else if (kind === 'skill') await agentApi.submitSkillDraft(extensionId, version); else await agentApi.submitWorkflowDraft(extensionId, version); await refreshDevelopment(); }, '已提交审核', '提交审核失败')}
       onOpenFolder={(path) => run(() => agentApi.openFolder(path), '项目目录已打开', '打开项目目录失败')}
-      onRemove={(projectId) => runDevelopmentOperation(`remove:${projectId}`, async () => { await agentApi.removeExtensionProject(projectId); await refreshDevelopment(); }, '项目已移出工作台', '移出项目失败')}
+       onRemove={(projectId) => runDevelopmentOperation(`remove:${projectId}`, async () => { await agentApi.removeExtensionProject(projectId); await refreshDevelopment(); }, '项目已移除', '移除项目失败')}
       onUpdateSource={(projectId: string, input: ExtensionProjectSourceInput, syncRemote: boolean) => runDevelopmentOperation(`source:${projectId}`, async () => { await agentApi.updateExtensionProjectSource(projectId, input, syncRemote); await refreshDevelopment(); }, '代码仓库已保存', '保存代码仓库失败')}
       onLoadCollaboration={agentApi.extensionCollaboration}
       onSearchCollaborators={agentApi.extensionCollaboratorOptions}
@@ -1263,6 +1540,7 @@ function App() {
     <Shell
       currentPage={page}
       approvalCount={approvals.length}
+      workflowApprovalCount={workflowApprovalCount}
       identity={dashboardIdentity}
       dashboardEnabled={dashboardEnabled()}
       agentVersion={status?.version || '--'}
@@ -1270,12 +1548,12 @@ function App() {
       currentTask={status?.current_task || null}
       quickPluginViews={quickPluginViews}
       onLoadTaskHistory={agentApi.taskHistory}
-      onNavigate={(nextPage) => { if (nextPage === 'ai') setAiConnectionsTab('mcp'); if (nextPage === 'settings') setSettingsSection('remote'); setPage(nextPage); }}
+      onNavigate={navigate}
       onOpenPluginView={(pluginId, viewId) => run(() => agentApi.openPluginView(pluginId, viewId), '插件窗口已打开', '打开插件窗口失败')}
       onOpenDashboard={() => run(agentApi.openDashboard)}
       onOpenBuiltinAi={() => { void openBuiltinAi(); }}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}
-      onOpenAgentDirectory={() => run(agentApi.openAgentDirectory, 'Agent 文件夹已打开', '打开 Agent 文件夹失败')}
+      onOpenAgentDirectory={() => run(agentApi.openAgentDirectory, '数据目录已打开', '打开数据目录失败')}
       onQuit={() => { void agentApi.quitAgent(); }}
     >
       <NotificationCenter messages={messages} onClose={dismissNotification} />
@@ -1292,10 +1570,10 @@ function SettingsLoadState({ loading, error, onRetry }: { loading: boolean; erro
     <>
       <PageHeader title="设置" description="管理任务权限、账号、工具与启动设置。" />
       {loading
-        ? <div className="page-loading"><span className="spinner" />正在读取 Agent 配置</div>
+        ? <div className="page-loading"><span className="spinner" />正在读取应用设置</div>
         : <div className="blocker account-blocker" role="alert">
             <ShieldAlert size={18} />
-            <div><strong>Agent 配置读取失败</strong><span>{error || '部分配置暂时不可用，请重新读取。'}</span></div>
+            <div><strong>应用设置读取失败</strong><span>{error || '部分设置暂时不可用，请重新读取。'}</span></div>
             <button type="button" className="btn" onClick={onRetry}><RefreshCw size={15} />重新读取</button>
           </div>}
     </>

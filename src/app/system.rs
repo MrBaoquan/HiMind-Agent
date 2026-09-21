@@ -26,6 +26,15 @@ const EMBEDDED_UPDATE_PUBLIC_KEY_PEM: &str =
 const EMBEDDED_UPDATE_KEY_ID: &str =
     include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt"));
 
+#[cfg(test)]
+pub(crate) fn signing_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SIGNING_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SIGNING_ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
+}
+
 pub(crate) fn validate_update_download_url(
     api_base: &str,
     download_url: &str,
@@ -128,7 +137,11 @@ pub(crate) fn trusted_agent_update_key_ids() -> Vec<String> {
 
 pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn Error>> {
     if let Some(trusted_dir) = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR") {
-        let public_key_path = PathBuf::from(trusted_dir).join(format!("{key_id}.pem"));
+        let trusted_dir = PathBuf::from(trusted_dir);
+        if signing_key_is_revoked(&trusted_dir, key_id)? {
+            return Err(format!("签名公钥已被撤销：{key_id}").into());
+        }
+        let public_key_path = trusted_dir.join(format!("{key_id}.pem"));
         if public_key_path.is_file() {
             return Ok(std::fs::read_to_string(public_key_path)?);
         }
@@ -138,6 +151,39 @@ pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn
         return Ok(EMBEDDED_UPDATE_PUBLIC_KEY_PEM.to_string());
     }
     Err(format!("未找到受信的签名公钥：{key_id}").into())
+}
+
+fn signing_key_is_revoked(trusted_dir: &Path, key_id: &str) -> Result<bool, Box<dyn Error>> {
+    let path = trusted_dir.join("revoked-keys.json");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(&path)?)
+        .map_err(|error| format!("受信签名密钥撤销清单格式无效 {}: {error}", path.display()))?;
+    let items = match value {
+        Value::Array(items) => items,
+        Value::Object(object) => object
+            .get("revoked_key_ids")
+            .or_else(|| object.get("revoked"))
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "受信签名密钥撤销清单缺少 revoked_key_ids 数组 {}",
+                    path.display()
+                )
+            })?,
+        _ => return Err(format!("受信签名密钥撤销清单必须是数组或对象 {}", path.display()).into()),
+    };
+    for item in items {
+        let value = item
+            .as_str()
+            .ok_or_else(|| format!("受信签名密钥撤销清单包含非字符串 key ID {}", path.display()))?;
+        if value.trim() == key_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn verify_rsa_pss_sha256(
@@ -1920,6 +1966,65 @@ mod tests {
         assert!(
             validate_signature_metadata("c2ln", "release-2026", "rsa-v1_5-sha256", true).is_err()
         );
+    }
+
+    #[test]
+    fn revoked_signing_key_is_rejected_even_when_public_key_exists() {
+        let _guard = signing_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-revoked-signing-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("release-key.pem"), b"public key").unwrap();
+        std::fs::write(
+            root.join("revoked-keys.json"),
+            br#"{"revoked_key_ids":["release-key"]}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &root);
+        let error = trusted_signing_public_key("release-key").unwrap_err();
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+        assert!(error.to_string().contains("撤销"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_revoked_key_list_fails_closed() {
+        let _guard = signing_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-invalid-revoked-signing-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("release-key.pem"), b"public key").unwrap();
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &root);
+        for payload in [
+            b"{not-json".as_slice(),
+            br#"{"revoked":"release-key"}"#,
+            br#"{"revoked_key_ids":[1]}"#,
+        ] {
+            std::fs::write(root.join("revoked-keys.json"), payload).unwrap();
+            assert!(trusted_signing_public_key("release-key").is_err());
+        }
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

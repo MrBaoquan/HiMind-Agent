@@ -99,6 +99,10 @@ pub(crate) struct BuiltinAIRuntimeStatus {
     pub status: String,
     pub version: String,
     pub compatible: bool,
+    pub compatible_with_agent: bool,
+    pub min_agent_version: String,
+    pub max_agent_version: String,
+    pub capabilities: Vec<String>,
     pub message: String,
     pub diagnostics: BuiltinAIRuntimeDiagnostics,
 }
@@ -348,8 +352,14 @@ fn from_engine_status(
         status: if ready { "ready" } else { "unavailable" }.to_string(),
         version: engine.version,
         compatible: ready,
+        compatible_with_agent: engine.compatible_with_agent,
+        min_agent_version: engine.min_agent_version,
+        max_agent_version: engine.max_agent_version,
+        capabilities: engine.capabilities,
         message: if ready {
             "HiMind AI 已就绪。".to_string()
+        } else if !engine.compatible_with_agent {
+            "HiMind AI 运行时与当前 Agent 版本不兼容。".to_string()
         } else {
             "HiMind AI 运行时尚未安装或需要修复。".to_string()
         },
@@ -385,6 +395,10 @@ mod tests {
             install_command: String::new(),
             message: String::new(),
             candidate: false,
+            compatible_with_agent: true,
+            min_agent_version: "0.3.0".to_string(),
+            max_agent_version: String::new(),
+            capabilities: vec!["interactive".to_string(), "workflow".to_string()],
         });
         assert_eq!(status.provider, PROVIDER_BUILTIN);
         assert_eq!(status.status, "ready");
@@ -401,5 +415,25 @@ mod tests {
         assert!(!error.contains("Dashboard Runtime"));
         assert!(error.contains("HiMind AI 运行时"));
         assert!(error.contains("安装清单"));
+    }
+
+    #[test]
+    fn incompatible_runtime_is_not_projected_as_ready() {
+        let status = from_engine_status(deepseek_harness::DeepSeekHarnessRuntimeStatus {
+            provider: "internal-engine".to_string(),
+            status: "incompatible".to_string(),
+            version: "1.2.3".to_string(),
+            cli_compatible: true,
+            executable_path: "engine.cmd".to_string(),
+            install_command: String::new(),
+            message: "当前 Agent 低于运行时要求".to_string(),
+            candidate: false,
+            compatible_with_agent: false,
+            min_agent_version: "99.0.0".to_string(),
+            max_agent_version: String::new(),
+            capabilities: Vec::new(),
+        });
+        assert!(!status.compatible);
+        assert!(status.message.contains("不兼容"));
     }
 }

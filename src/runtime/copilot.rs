@@ -230,7 +230,13 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
 }
 
 fn copilot_capabilities() -> Value {
-    json!({"managed_execution":true,"billing_owner":"user","non_interactive":true,"tool_access":"allow_all"})
+    json!({
+        "managed_execution": true,
+        "billing_owner": "user",
+        "non_interactive": true,
+        "tool_access": "allow_all",
+        "network_isolated": false
+    })
 }
 
 fn verify_copilot_available(executable: &OsStr) -> Result<String, Box<dyn Error>> {
@@ -286,9 +292,18 @@ mod tests {
         AgentRunClaim {
             run: AgentRun {
                 id: "run-1".to_string(),
+                work_item_id: String::new(),
+                parent_run_id: String::new(),
+                root_run_id: String::new(),
+                parent_work_item_id: String::new(),
+                root_work_item_id: String::new(),
+                attempt_no: 0,
                 instruction: "Fix the failing tests".to_string(),
                 status: "claimed".to_string(),
                 created_by_user_id: "user-1".to_string(),
+                requested_agent_id: String::new(),
+                project_id: String::new(),
+                exhibit_pid: String::new(),
                 runtime_provider: PROVIDER_GITHUB_COPILOT.to_string(),
                 access_mode: crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED.to_string(),
                 input: json!({"suite":"unit"}),
@@ -296,6 +311,7 @@ mod tests {
             claim_token: "claim-secret".to_string(),
             workspace_path: workspace.to_string_lossy().to_string(),
             ai_model: String::new(),
+            resume_provider_session_id: String::new(),
             access_mode: crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED.to_string(),
         }
     }

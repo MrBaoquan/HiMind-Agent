@@ -1,9 +1,10 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::agent_core_contracts::{
     InteractionEnvelope, LocalRun, LocalRunStatus, RuntimeEvent, RuntimeEventType,
@@ -11,6 +12,10 @@ use crate::agent_core_contracts::{
 
 pub(crate) const LOCAL_RUN_DB_FILE: &str = "local-runs.sqlite3";
 const SCHEMA_VERSION: i64 = 1;
+// Schema creation is idempotent, but SQLite still takes a write lock for DDL
+// and migration inserts. Serialize initialization inside one Agent process so
+// concurrent readers/writers do not contend while opening the same ledger.
+static SCHEMA_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalRunLedger {
@@ -27,6 +32,17 @@ pub(crate) struct ProjectionOutboxRecord {
     pub status: String,
     pub attempts: u32,
     pub next_attempt_at: String,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProjectionOutboxSummary {
+    pub total: u64,
+    pub pending: u64,
+    pub retrying: u64,
+    pub projected: u64,
+    pub dead_letter: u64,
+    pub oldest_pending_at: String,
     pub last_error: String,
 }
 
@@ -367,6 +383,7 @@ impl LocalRunLedger {
             let Some(mut run) = self.get_run(&run_id)? else {
                 continue;
             };
+            // 这个函数负责“恢复到可重跑”的状态，只处理正在运行的运行。
             if run.status != LocalRunStatus::Running {
                 continue;
             }
@@ -402,6 +419,106 @@ impl LocalRunLedger {
             recovered.push(run);
         }
         Ok(recovered)
+    }
+
+    /// 把「进程已经消失」的运行收尾为 failed。
+    ///
+    /// 运行期间持有租约，进程活着会不断续租；租约过期就说明执行者已经不在了。
+    /// `recover_running_runs` 把这类运行改回 `queued`（等人工 dispatch），但没人
+    /// dispatch 时它同样是个不会结束的僵尸状态 —— 界面上会一直显示“排队中”。
+    /// 这里给出诚实的终态：失败 + 明确原因，需要重跑就重新发起。
+    ///
+    /// `grace_seconds` 用于避开刚启动、还没来得及取租约的运行。
+    pub(crate) fn abandon_stale_runs(
+        &self,
+        reason: &str,
+        grace_seconds: i64,
+        limit: usize,
+    ) -> Result<Vec<LocalRun>, Box<dyn Error>> {
+        let now = unix_now_i64();
+        let run_ids = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT local_runs.run_id
+                 FROM local_runs
+                 LEFT JOIN local_run_leases
+                   ON local_run_leases.run_id = local_runs.run_id
+                 WHERE local_runs.status IN ('running', 'queued')
+                   AND (
+                     local_run_leases.run_id IS NULL
+                     OR local_run_leases.expires_at <= ?2
+                   )
+                   -- queued 可能正等着被 dispatch：给更长的宽限期，避免误杀排队中的运行。
+                   AND (
+                     local_runs.status = 'running'
+                     OR CAST(local_runs.updated_at AS INTEGER) <= ?4
+                   )
+                   AND CAST(local_runs.updated_at AS INTEGER) <= ?3
+                 ORDER BY local_runs.updated_at ASC
+                 LIMIT ?1",
+            )?;
+            let run_ids = statement
+                .query_map(
+                    params![
+                        limit.clamp(1, 500) as i64,
+                        now,
+                        now.saturating_sub(grace_seconds.max(0)),
+                        now.saturating_sub(grace_seconds.max(0).saturating_mul(15)),
+                    ],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<String>, _>>()?;
+            run_ids
+        };
+        let mut abandoned = Vec::new();
+        for run_id in run_ids {
+            let Some(mut run) = self.get_run(&run_id)? else {
+                continue;
+            };
+            // queued 也在这里收尾：被 recover 过、又没人 dispatch 的运行同样是僵尸。
+            if !matches!(run.status, LocalRunStatus::Running | LocalRunStatus::Queued) {
+                continue;
+            }
+            for step in &mut run.steps {
+                if step.status == crate::agent_core_contracts::LocalStepStatus::Running {
+                    step.status = crate::agent_core_contracts::LocalStepStatus::Failed;
+                    step.finished_at = unix_now_string();
+                    step.error = reason.to_string();
+                } else if step.status == crate::agent_core_contracts::LocalStepStatus::Pending
+                    && run.status == LocalRunStatus::Queued
+                {
+                    // 排队中且长期没人调度的步骤：标成跳过，别让它看起来还会执行。
+                    step.status = crate::agent_core_contracts::LocalStepStatus::Skipped;
+                    step.finished_at = unix_now_string();
+                    step.error = reason.to_string();
+                }
+            }
+            run.status = LocalRunStatus::Failed;
+            run.error = reason.to_string();
+            run.current_step_id.clear();
+            run.updated_at = unix_now_string();
+            self.save_run(&run)?;
+            self.clear_run_lease(&run_id)?;
+            let sequence = self.next_runtime_sequence(&run_id)?;
+            self.append_event(&RuntimeEvent {
+                schema_version: crate::agent_core_contracts::RUNTIME_EVENT_SCHEMA_VERSION
+                    .to_string(),
+                event_id: format!("{run_id}:abandoned:{sequence}"),
+                run_id: run_id.clone(),
+                step_id: String::new(),
+                capability_id: String::new(),
+                sequence,
+                occurred_at: run.updated_at.clone(),
+                provider: run.runtime_provider.clone(),
+                event_type: RuntimeEventType::Error,
+                payload: serde_json::json!({
+                    "abandoned": true,
+                    "reason": reason,
+                }),
+            })?;
+            abandoned.push(run);
+        }
+        Ok(abandoned)
     }
 
     fn clear_run_lease(&self, run_id: &str) -> Result<(), Box<dyn Error>> {
@@ -509,15 +626,27 @@ impl LocalRunLedger {
     }
 
     pub(crate) fn next_runtime_sequence(&self, run_id: &str) -> Result<u64, Box<dyn Error>> {
-        let connection = self.connection()?;
-        let next: i64 = connection.query_row(
-            "SELECT COALESCE(MAX(sequence), -1) + 1
-             FROM runtime_events
-             WHERE run_id = ?1",
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_runs WHERE run_id = ?1)",
             params![run_id],
             |row| row.get(0),
         )?;
-        Ok(next.max(0) as u64)
+        if !run_exists {
+            return Err(std::io::Error::other("runtime event run does not exist").into());
+        }
+        let next: i64 = transaction.query_row(
+            "INSERT INTO runtime_sequence_allocations(run_id, next_sequence)
+             VALUES (?1, 1)
+             ON CONFLICT(run_id) DO UPDATE
+                SET next_sequence = runtime_sequence_allocations.next_sequence + 1
+             RETURNING next_sequence",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(u64::try_from(next).unwrap_or(u64::MAX))
     }
 
     pub(crate) fn enqueue_projection(
@@ -708,6 +837,66 @@ impl LocalRunLedger {
         Ok(records)
     }
 
+    pub(crate) fn projection_outbox_summary(
+        &self,
+    ) -> Result<ProjectionOutboxSummary, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let total = connection.query_row("SELECT COUNT(*) FROM projection_outbox", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let pending = connection.query_row(
+            "SELECT COUNT(*) FROM projection_outbox WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let retrying = connection.query_row(
+            "SELECT COUNT(*) FROM projection_outbox WHERE status = 'pending' AND attempts > 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let projected = connection.query_row(
+            "SELECT COUNT(*) FROM projection_outbox WHERE status = 'projected'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let dead_letter = connection.query_row(
+            "SELECT COUNT(*) FROM projection_outbox WHERE status = 'dead_letter'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let oldest_pending_at = connection
+            .query_row(
+                "SELECT updated_at FROM projection_outbox
+                 WHERE status = 'pending'
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let last_error = connection
+            .query_row(
+                "SELECT last_error FROM projection_outbox
+                 WHERE last_error <> ''
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(ProjectionOutboxSummary {
+            total: total.max(0) as u64,
+            pending: pending.max(0) as u64,
+            retrying: retrying.max(0) as u64,
+            projected: projected.max(0) as u64,
+            dead_letter: dead_letter.max(0) as u64,
+            oldest_pending_at,
+            last_error,
+        })
+    }
+
     pub(crate) fn mark_projection_projected(&self, id: i64) -> Result<(), Box<dyn Error>> {
         let connection = self.connection()?;
         connection.execute(
@@ -761,11 +950,52 @@ impl LocalRunLedger {
         Ok(())
     }
 
+    pub(crate) fn requeue_dead_letter_projections_with_error_fragment(
+        &self,
+        error_fragment: &str,
+    ) -> Result<usize, Box<dyn Error>> {
+        let error_fragment = error_fragment.trim();
+        if error_fragment.is_empty() {
+            return Ok(0);
+        }
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE projection_outbox
+             SET status = 'pending',
+                 attempts = 0,
+                 next_attempt_at = '',
+                 last_error = '',
+                 updated_at = ?2
+             WHERE status = 'dead_letter'
+               AND instr(last_error, ?1) > 0",
+            params![error_fragment, unix_now_string()],
+        )?;
+        Ok(changed)
+    }
+
     fn connection(&self) -> Result<Connection, Box<dyn Error>> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let database_exists = self.path.is_file();
         let connection = Connection::open(&self.path)?;
+        // Set the SQLite busy handler before schema initialization and before
+        // any transaction can contend with a concurrent Agent thread.
+        connection.busy_timeout(Duration::from_secs(30))?;
+        if !database_exists {
+            // Two Agent threads can open a brand-new ledger at the same time.
+            // The first connection wins the WAL transition; the loser must
+            // continue using the already-initialized database instead of
+            // surfacing a transient SQLITE_BUSY/LOCKED error.
+            if let Err(error) = connection.execute_batch("PRAGMA journal_mode = WAL;") {
+                if !is_sqlite_busy(&error) {
+                    return Err(error.into());
+                }
+            }
+        }
+        let _schema_guard = SCHEMA_INIT_LOCK
+            .lock()
+            .map_err(|_| std::io::Error::other("local ledger schema lock is poisoned"))?;
         initialize_schema(&connection)?;
         Ok(connection)
     }
@@ -773,8 +1003,7 @@ impl LocalRunLedger {
 
 fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
     connection.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA foreign_keys = ON;
+        "PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS local_schema_migrations(
             version INTEGER PRIMARY KEY
          );
@@ -822,6 +1051,14 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
             payload_json TEXT NOT NULL,
             UNIQUE(run_id, sequence)
          );
+         CREATE TABLE IF NOT EXISTS runtime_sequence_allocations(
+            run_id TEXT PRIMARY KEY,
+            next_sequence INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO runtime_sequence_allocations(run_id, next_sequence)
+            SELECT run_id, COALESCE(MAX(sequence), -1) + 1
+            FROM runtime_events
+            GROUP BY run_id;
          CREATE INDEX IF NOT EXISTS idx_runtime_events_run_sequence
             ON runtime_events(run_id, sequence);
          CREATE TABLE IF NOT EXISTS projection_outbox(
@@ -847,6 +1084,17 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn require_text(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
@@ -920,6 +1168,8 @@ mod tests {
             runtime_provider: "himind.builtin".to_string(),
             workspace_ref: "F:/workspace".to_string(),
             current_step_id: "step-1".to_string(),
+            completion_mode: "full".to_string(),
+            execution_plan: None,
             steps: vec![LocalRunStep {
                 step_id: "step-1".to_string(),
                 title: "Inspect".to_string(),
@@ -1010,6 +1260,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_sequence_allocations_are_atomic_across_threads() {
+        let ledger = ledger();
+        ledger.record_interaction(&interaction()).unwrap();
+        ledger.save_run(&run(LocalRunStatus::Running)).unwrap();
+        let handles = (0..4)
+            .map(|_| {
+                let ledger = ledger.clone();
+                std::thread::spawn(move || {
+                    (0..25)
+                        .map(|_| ledger.next_runtime_sequence("run-1").unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut sequences = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=100).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn projection_outbox_deduplicates_and_marks_projected() {
         let ledger = ledger();
         let payload = json!({"run_id": "run-1", "status": "running"});
@@ -1045,6 +1318,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "dead_letter");
+    }
+
+    #[test]
+    fn stale_queued_runs_are_abandoned_instead_of_waiting_forever() {
+        let ledger = ledger();
+        let mut queued = run(LocalRunStatus::Queued);
+        queued.steps[0].status = LocalStepStatus::Pending;
+        queued.current_step_id.clear();
+        // 一小时前恢复、从此没人调度的运行。
+        queued.updated_at = (unix_now_i64() - 3600).to_string();
+        ledger.save_run(&queued).unwrap();
+        ledger.clear_run_lease("run-1").unwrap();
+
+        let abandoned = ledger
+            .abandon_stale_runs("运行中断：执行进程已退出（租约过期，未续租）", 120, 10)
+            .unwrap();
+        assert_eq!(abandoned.len(), 1);
+        let stored = ledger.get_run("run-1").unwrap().unwrap();
+        assert_eq!(stored.status, LocalRunStatus::Failed);
+        assert!(stored.error.contains("运行中断"));
+        // 排队的步骤不能继续显示成“待执行”。
+        assert_eq!(stored.steps[0].status, LocalStepStatus::Skipped);
+    }
+
+    #[test]
+    fn fresh_queued_runs_are_left_alone() {
+        let ledger = ledger();
+        let mut queued = run(LocalRunStatus::Queued);
+        queued.steps[0].status = LocalStepStatus::Pending;
+        queued.updated_at = unix_now_string();
+        ledger.save_run(&queued).unwrap();
+        ledger.clear_run_lease("run-1").unwrap();
+        // 刚排队的运行可能正在等待 dispatch，不能立刻判死。
+        assert!(ledger
+            .abandon_stale_runs("stale", 120, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn recoverable_dead_letters_can_be_requeued_without_replaying_conflicts() {
+        let ledger = ledger();
+        let recoverable = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-recoverable",
+                "projection:run-recoverable",
+                &serde_json::json!({"run_id": "run-recoverable"}),
+            )
+            .unwrap();
+        let conflict = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-conflict",
+                "projection:run-conflict",
+                &serde_json::json!({"run_id": "run-conflict"}),
+            )
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(
+                recoverable,
+                "Dashboard projection returned HTTP 401 Unauthorized",
+            )
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(conflict, "projection payload conflict")
+            .unwrap();
+
+        let changed = ledger
+            .requeue_dead_letter_projections_with_error_fragment("HTTP 401 Unauthorized")
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(ledger.pending_projections(10).unwrap().len(), 1);
+        let summary = ledger.projection_outbox_summary().unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.dead_letter, 1);
+    }
+
+    #[test]
+    fn projection_summary_reports_pending_retry_and_dead_letter() {
+        let ledger = ledger();
+        let pending = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-pending",
+                "run:run-pending",
+                &json!({"run_id": "run-pending"}),
+            )
+            .unwrap();
+        let retry = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-retry",
+                "run:run-retry",
+                &json!({"run_id": "run-retry"}),
+            )
+            .unwrap();
+        let dead = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-dead",
+                "run:run-dead",
+                &json!({"run_id": "run-dead"}),
+            )
+            .unwrap();
+        let projected = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-projected",
+                "run:run-projected",
+                &json!({"run_id": "run-projected"}),
+            )
+            .unwrap();
+        ledger
+            .mark_projection_failed(retry, "dashboard unavailable", "9999999999")
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(dead, "payload conflict")
+            .unwrap();
+        ledger.mark_projection_projected(projected).unwrap();
+
+        let summary = ledger.projection_outbox_summary().unwrap();
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.pending, 2);
+        assert_eq!(summary.retrying, 1);
+        assert_eq!(summary.projected, 1);
+        assert_eq!(summary.dead_letter, 1);
+        assert!(!summary.oldest_pending_at.is_empty());
+        assert_eq!(summary.last_error, "payload conflict");
+        let _ = pending;
     }
 
     #[test]
@@ -1084,6 +1487,7 @@ mod tests {
             "local_runs",
             "local_run_leases",
             "runtime_events",
+            "runtime_sequence_allocations",
             "projection_outbox",
         ] {
             let exists: bool = connection

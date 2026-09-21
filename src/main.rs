@@ -3,16 +3,21 @@
     windows_subsystem = "windows"
 )]
 
+use rand::rngs::OsRng;
 use reqwest::blocking::Client;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::{Pss, RsaPrivateKey};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
+mod acp;
 #[allow(dead_code)]
 mod agent_core_contracts;
 #[allow(dead_code)]
@@ -24,7 +29,11 @@ mod app;
 mod approval;
 mod business_integration;
 mod capability;
+mod development_checkpoint;
+mod engineering_project;
 mod extension_authoring;
+mod extension_category;
+mod extension_contracts;
 mod extension_projects;
 mod extension_workspace;
 mod install_layout;
@@ -34,12 +43,17 @@ mod remote;
 mod runtime;
 mod scan;
 mod skill;
+mod skill_run;
+mod scheduler;
 mod store;
 mod svn;
 mod upload;
 mod worker;
 #[allow(dead_code)]
 mod workflow;
+mod workflow_handoff;
+mod workspace_lease;
+mod worktree_identity;
 
 use api::client::{is_task_canceled_error, TaskCancelGuard};
 use api::types::Task;
@@ -104,10 +118,11 @@ fn main() {
     let options = Options::from_env();
     let arguments = env::args().collect::<Vec<_>>();
     let mcp_mode = should_run_mcp(env!("CARGO_BIN_NAME"), &arguments);
+    let acp_mode = should_run_acp(&arguments);
     if let Err(error) = app::extension_lock::recover() {
         eprintln!("extension transaction recovery failed: {error}");
     }
-    if !mcp_mode {
+    if !mcp_mode && !acp_mode {
         let svn_credentials_from_environment = match svn::service::bootstrap_svn_credentials() {
             Ok(configured) => configured,
             Err(error) => {
@@ -131,9 +146,24 @@ fn main() {
             }
         }
     }
-    if let Some(arguments) = auth_cli_arguments() {
+    if acp_mode {
+        if let Err(error) = acp::run(&options) {
+            eprintln!("ACP session failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = auth_cli_arguments() {
         if let Err(error) = run_auth_cli(&options, &arguments) {
             eprintln!("auth command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = trust_cli_arguments() {
+        if let Err(error) = run_trust_cli(&options, &arguments) {
+            eprintln!("trust command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = engineering_cli_arguments() {
+        if let Err(error) = run_engineering_cli(&arguments) {
+            eprintln!("engineering command failed: {error}");
             std::process::exit(1);
         }
     } else if let Some(arguments) = extension_cli_arguments() {
@@ -156,9 +186,24 @@ fn main() {
             eprintln!("credential command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = connector_cli_arguments() {
+        if let Err(error) = run_connector_cli(&options, &arguments) {
+            eprintln!("connector command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = approval_cli_arguments() {
+        if let Err(error) = run_approval_cli(&arguments) {
+            eprintln!("approval command failed: {error}");
+            std::process::exit(1);
+        }
     } else if let Some(arguments) = workflow_cli_arguments() {
         if let Err(error) = run_workflow_cli(&options, &arguments) {
             eprintln!("workflow command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = schedule_cli_arguments() {
+        if let Err(error) = run_schedule_cli(&options, &arguments) {
+            eprintln!("schedule command failed: {error}");
             std::process::exit(1);
         }
     } else if let Some(arguments) = runtime_cli_arguments() {
@@ -210,6 +255,199 @@ fn configure_process_stacks() {
 fn should_run_mcp(binary_name: &str, arguments: &[String]) -> bool {
     binary_name.eq_ignore_ascii_case("himind-agent-mcp")
         || arguments.iter().any(|argument| argument == "--mcp")
+}
+
+fn should_run_acp(arguments: &[String]) -> bool {
+    arguments.get(1).is_some_and(|argument| argument == "acp")
+}
+
+fn trust_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "trust")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn engineering_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "engineering")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_engineering_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [project, action, workspace]
+            if project == "project" && (action == "validate" || action == "resolve") =>
+        {
+            let (manifest, workspace_root) =
+                engineering_project::load_from_workspace(Path::new(workspace))?;
+            if action == "validate" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "project_id": manifest.project_id,
+                        "workspace_root": workspace_root,
+                        "targets": manifest.targets.iter().map(|target| &target.id).collect::<Vec<_>>(),
+                    }))?
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &manifest.resolved_snapshot(&workspace_root, "", "")?
+                )?
+            );
+        }
+        [project, action, workspace, target] if project == "project" && action == "resolve" => {
+            let (manifest, workspace_root) =
+                engineering_project::load_from_workspace(Path::new(workspace))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &manifest.resolved_snapshot(&workspace_root, target, "")?
+                )?
+            );
+        }
+        [project, action, workspace, target, environment]
+            if project == "project" && action == "resolve" =>
+        {
+            let (manifest, workspace_root) =
+                engineering_project::load_from_workspace(Path::new(workspace))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &manifest.resolved_snapshot(&workspace_root, target, environment)?
+                )?
+            );
+        }
+        [checkpoint, action, workspace, project_id]
+            if checkpoint == "checkpoint" && action == "create" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&development_checkpoint::create(&json!({
+                    "workspace_root": workspace,
+                    "project_id": project_id,
+                }))?)?
+            );
+        }
+        [checkpoint, action, workspace, project_id, target]
+            if checkpoint == "checkpoint" && action == "create" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&development_checkpoint::create(&json!({
+                    "workspace_root": workspace,
+                    "project_id": project_id,
+                    "target_id": target,
+                }))?)?
+            );
+        }
+        [checkpoint, action, workspace, project_id, target, environment]
+            if checkpoint == "checkpoint" && action == "create" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&development_checkpoint::create(&json!({
+                    "workspace_root": workspace,
+                    "project_id": project_id,
+                    "target_id": target,
+                    "environment": environment,
+                }))?)?
+            );
+        }
+        [workspace, lease, action, workspace_root, owner_client]
+            if workspace == "workspace" && lease == "lease" && action == "acquire" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workspace_lease::acquire(&json!({
+                    "workspace_root": workspace_root,
+                    "owner_client": owner_client,
+                }))?)?
+            );
+        }
+        [workspace, lease, action, workspace_root, owner_client, owner_session]
+            if workspace == "workspace" && lease == "lease" && action == "acquire" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workspace_lease::acquire(&json!({
+                    "workspace_root": workspace_root,
+                    "owner_client": owner_client,
+                    "owner_session": owner_session,
+                }))?)?
+            );
+        }
+        [workspace, lease, action, workspace_root, owner_client, owner_session, mode]
+            if workspace == "workspace" && lease == "lease" && action == "acquire" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workspace_lease::acquire(&json!({
+                    "workspace_root": workspace_root,
+                    "owner_client": owner_client,
+                    "owner_session": owner_session,
+                    "mode": mode,
+                }))?)?
+            );
+        }
+        [workspace, lease, action, lease_id]
+            if workspace == "workspace" && lease == "lease" && action == "release" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workspace_lease::release(&json!({
+                    "lease_id": lease_id,
+                }))?)?
+            );
+        }
+        [workspace, lease, action]
+            if workspace == "workspace" && lease == "lease" && action == "list" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workspace_lease::list(&json!({}))?)?
+            );
+        }
+        [workspace, lease, action, workspace_root]
+            if workspace == "workspace" && lease == "lease" && action == "list" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workspace_lease::list(&json!({
+                    "workspace_root": workspace_root,
+                }))?)?
+            );
+        }
+        _ => {
+            return Err(
+                "usage: himind-agent engineering project <validate|resolve> <workspace> [target] [environment] | engineering checkpoint create <workspace> <project_id> [target] [environment] | engineering workspace lease <acquire workspace owner [session] [mode]|release lease-id|list [workspace]>"
+                    .into(),
+            )
+        }
+    }
+    Ok(())
+}
+
+fn run_trust_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action] if action == "sync" => {
+            let report = app::trust::sync(options)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        [action] if action == "status" => {
+            let report = app::trust::status()?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        [action] if action == "verify" => {
+            let report = app::trust::verify()?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        _ => return Err("usage: himind-agent trust <sync|status|verify>".into()),
+    }
+    Ok(())
 }
 
 fn auth_cli_arguments() -> Option<Vec<String>> {
@@ -311,10 +549,82 @@ fn workflow_cli_arguments() -> Option<Vec<String>> {
     Some(arguments[index + 1..].to_vec())
 }
 
+fn schedule_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "schedule")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+/// 平台级定时任务的命令行入口，便于验收与排障。
+///
+/// 与能力 `schedule.*` 共用同一实现，CLI 不引入第二套调度语义。
+fn run_schedule_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action] if action == "list" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&scheduler::list(scheduler::now_epoch())?)?
+            );
+        }
+        [action, input] if action == "set" => {
+            let payload = workflow_cli_input(Some(input))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&scheduler::set(&payload, scheduler::now_epoch())?)?
+            );
+        }
+        [action, id] if action == "delete" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&scheduler::delete(id)?)?
+            );
+        }
+        [action] if action == "tick" => {
+            let gateway = capability::service::CapabilityGateway::new(
+                options.clone(),
+                Arc::new(std::sync::Mutex::new(store::types::LocalWorkerStatus::default())),
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&scheduler::run_due(gateway, scheduler::now_epoch())?)?
+            );
+        }
+        _ => {
+            return Err("usage: himind-agent schedule <list|set json|delete id|tick>".into());
+        }
+    }
+    Ok(())
+}
+
 fn credential_cli_arguments() -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
     let index = arguments.iter().position(|value| value == "credential")?;
     Some(arguments[index + 1..].to_vec())
+}
+
+fn connector_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "connector")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn approval_cli_arguments() -> Option<Vec<String>> {
+    let arguments = env::args().collect::<Vec<_>>();
+    let index = arguments.iter().position(|value| value == "approval")?;
+    Some(arguments[index + 1..].to_vec())
+}
+
+fn run_approval_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action] if action == "ownership" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&approval::ownership::matrix())?
+            );
+            Ok(())
+        }
+        _ => Err("usage: himind-agent approval ownership".into()),
+    }
 }
 
 fn run_credential_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -357,8 +667,122 @@ fn run_credential_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_connector_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action] if action == "list" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::list()?)?
+            );
+        }
+        [action, connector_id] if action == "status" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::status(connector_id)?)?
+            );
+        }
+        [action, connector_id] if action == "enable" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::set_enabled(
+                    connector_id,
+                    true,
+                )?)?
+            );
+        }
+        [action, connector_id] if action == "disable" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::set_enabled(
+                    connector_id,
+                    false,
+                )?)?
+            );
+        }
+        [action, connector_id] if action == "restore" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::restore(connector_id)?)?
+            );
+        }
+        [action, connector_id] if action == "revoke" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::revoke(
+                    connector_id,
+                    "",
+                )?)?
+            );
+        }
+        [action, connector_id, reason] if action == "revoke" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::connector_state::revoke(
+                    connector_id,
+                    reason,
+                )?)?
+            );
+        }
+        [action] if action == "sync" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::app::connector_policy::sync(options)?)?
+            );
+        }
+        _ => {
+            return Err(
+                "usage: himind-agent connector <list|status <connector-id>|enable <connector-id>|disable <connector-id>|revoke <connector-id> [reason]|restore <connector-id>|sync>"
+                    .into(),
+            )
+        }
+    }
+    Ok(())
+}
+
 fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments {
+        [action, source] if action == "author-save" => {
+            let draft = workflow::save_authoring_candidate(PathBuf::from(source).as_path())?;
+            println!("{}", serde_json::to_string_pretty(&draft)?);
+        }
+        [action, package_id, version] if action == "author-test" => {
+            let gateway = CapabilityGateway::new(
+                options.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    store::types::LocalWorkerStatus::default(),
+                )),
+            );
+            let capabilities =
+                gateway.list_capabilities(&capability::types::InvocationContext::new(
+                    capability::types::InvocationSource::Cli,
+                    "workflow-author-test",
+                ))?;
+            let draft = workflow::test_authoring_candidate_with_capabilities(
+                package_id,
+                version,
+                &capabilities,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&draft)?);
+        }
+        [action, package_id, version] if action == "author-confirm" => {
+            let gateway = CapabilityGateway::new(
+                options.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    store::types::LocalWorkerStatus::default(),
+                )),
+            );
+            let capabilities =
+                gateway.list_capabilities(&capability::types::InvocationContext::new(
+                    capability::types::InvocationSource::Cli,
+                    "workflow-author-confirm",
+                ))?;
+            let draft = workflow::confirm_authoring_candidate_with_capabilities(
+                package_id,
+                version,
+                &capabilities,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&draft)?);
+        }
         [action, path] if action == "validate" => {
             let package = workflow::load_from_directory(PathBuf::from(path).as_path())?;
             println!(
@@ -405,7 +829,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                     },
                 )
             } else {
-                workflow::preflight(&package, VERSION, &capabilities)
+                workflow::preflight(&package, VERSION, &capabilities, &serde_json::json!({}))
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.ready {
@@ -414,9 +838,15 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         [action, reference] | [action, reference, _] if action == "run" => {
             let store = workflow::WorkflowStore::open_default()?;
-            let package = workflow_package_from_reference(&store, reference)?;
+            let package = if PathBuf::from(reference).join("workflow.json").is_file() {
+                store
+                    .install_from_directory(PathBuf::from(reference).as_path())?
+                    .package
+            } else {
+                workflow_package_from_reference(&store, reference)?
+            };
             let input = workflow_cli_input(arguments.get(2))?;
-            run_workflow_package(options, &package, input, "")?;
+            run_workflow_package(options, &package, input, "", None)?;
         }
         [action] if action == "remote-list" => {
             let state = api::client::load_agent_state(&options.state_path)?;
@@ -433,7 +863,11 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         [action, workflow_id] | [action, workflow_id, _] if action == "remote-install" => {
             let version = arguments.get(2).map(String::as_str);
-            let installed = install_dashboard_workflow(options, workflow_id, version)?;
+            let installed = app::workflow_manager::install_dashboard_catalog_workflow(
+                options,
+                workflow_id,
+                version,
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&workflow_installation_json(&installed))?
@@ -443,6 +877,27 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let runs = ledger.list_runs(100)?;
             println!("{}", serde_json::to_string_pretty(&runs)?);
+        }
+        [action] if action == "metrics" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let items = workflow::workflow_metrics_by_package(&ledger)?
+                .into_iter()
+                .map(|(workflow_id, metrics)| {
+                    json!({
+                        "workflow_id": workflow_id,
+                        "metrics": metrics,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        [action] if action == "projection-status" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&agent_core_projection::projection_sync_status(
+                    options
+                )?)?
+            );
         }
         [action] if action == "recover" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
@@ -454,32 +909,96 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             let recovered = ledger.recover_running_runs(true, 100)?;
             println!("{}", serde_json::to_string_pretty(&recovered)?);
         }
+        [action] if action == "abandon-stale" => {
+            // 与 Agent 启动时的自动收尾同一实现：租约过期的运行直接给终态。
+            let count = scheduler::abandon_stale_runs()?;
+            println!("{}", serde_json::to_string_pretty(&json!({ "abandoned": count }))?);
+        }
+        [action] | [action, _] if action == "dispatch" => {
+            let limit = workflow_dispatch_limit(arguments);
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let recovered = ledger.recover_running_runs(false, 100)?;
+            let dispatched = dispatch_pending_workflows(options, limit)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "recovered": recovered,
+                    "dispatched": dispatched,
+                }))?
+            );
+        }
         [action, run_id] if action == "show" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let run = ledger
                 .get_run(run_id)?
                 .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+            let interaction = ledger
+                .get_interaction(&run.interaction_id)?
+                .ok_or("workflow run interaction is missing")?;
             let events = ledger.list_events(run_id)?;
             let projections = ledger.projections_for_aggregate(run_id, 100)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
+                    "interaction": interaction,
                     "run": run,
                     "events": events,
                     "projections": projections,
                 }))?
             );
         }
-        [action, run_id, step_id] if action == "approve" || action == "reject" => {
-            let runner = workflow::WorkflowRunner::open_default()?;
+        [action, run_id] if action == "verify-run" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let run = ledger
                 .get_run(run_id)?
                 .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
-            let run = if action == "approve" {
-                runner.approve_step(run, step_id)?
+            if run.status != agent_core_contracts::LocalRunStatus::Succeeded {
+                return Err(format!(
+                    "workflow run is not succeeded: {} ({:?})",
+                    run.run_id, run.status
+                )
+                .into());
+            }
+            let interaction = ledger
+                .get_interaction(&run.interaction_id)?
+                .ok_or("workflow run interaction is missing")?;
+            let store = workflow::WorkflowStore::open_default()?;
+            let package = store.load_for_run_interaction(&interaction)?;
+            let verification = workflow::verify_run(&package, &run)?;
+            println!("{}", serde_json::to_string_pretty(&verification)?);
+        }
+        [action, run_id, step_id] if action == "approve" || action == "reject" => {
+            let ledger = store::local_runs::LocalRunLedger::open_default()?;
+            let approval_id = workflow::workflow_approval_id(run_id, step_id);
+            let run = if let Err(direct_error) =
+                ApprovalManager::global().respond(&approval_id, action == "approve")
+            {
+                // A short-lived CLI run can exit before the asynchronous
+                // Approval Bridge has published its pending fact. In that
+                // case the durable Run already contains the authoritative
+                // pending approval, so fall back to the Run state transition.
+                let run = ledger
+                    .get_run(run_id)?
+                    .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+                let runner = workflow::WorkflowRunner::open_default()?;
+                let transition = if action == "approve" {
+                    runner.approve_step(run, step_id)
+                } else {
+                    runner.reject_step(run, step_id)
+                };
+                match transition {
+                    Ok(run) => run,
+                    Err(fallback_error) => {
+                        return Err(format!(
+                            "approval command failed: {direct_error}; run fallback failed: {fallback_error}"
+                        )
+                        .into())
+                    }
+                }
             } else {
-                runner.reject_step(run, step_id)?
+                ledger
+                    .get_run(run_id)?
+                    .ok_or_else(|| format!("workflow run not found: {run_id}"))?
             };
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
@@ -489,10 +1008,18 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             let run = ledger
                 .get_run(run_id)?
                 .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+            let approval_id = if run.current_step_id.trim().is_empty() {
+                String::new()
+            } else {
+                workflow::workflow_approval_id(&run.run_id, &run.current_step_id)
+            };
             let run = runner.cancel(run, "workflow canceled by user")?;
+            if !approval_id.is_empty() {
+                let _ = ApprovalManager::global().interrupt(&approval_id, "workflow_canceled");
+            }
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
-        [action, run_id] | [action, run_id, _] if action == "resume" => {
+        [action, run_id] | [action, run_id, _] | [action, run_id, _, _] if action == "resume" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let run = ledger
                 .get_run(run_id)?
@@ -500,13 +1027,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             let interaction = ledger
                 .get_interaction(&run.interaction_id)?
                 .ok_or("workflow run interaction is missing")?;
-            let package_reference = interaction
-                .business_context
-                .get("workflow")
-                .and_then(|workflow| workflow.get("id"))
-                .and_then(Value::as_str)
-                .ok_or("workflow run does not contain a package reference")?;
-            let input = if let Some(value) = arguments.get(2) {
+            let mut input = if let Some(value) = arguments.get(2) {
                 workflow_cli_input(Some(value))?
             } else {
                 interaction
@@ -515,9 +1036,49 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                     .cloned()
                     .unwrap_or_else(|| json!({}))
             };
+            let feedback = arguments
+                .get(3)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty());
+            if let (Some(object), Some(feedback)) = (input.as_object_mut(), feedback) {
+                object.insert("feedback".to_string(), json!(feedback));
+            }
             let store = workflow::WorkflowStore::open_default()?;
-            let package = workflow_package_from_reference(&store, package_reference)?;
-            run_workflow_package(options, &package, input, run_id)?;
+            let package = store.load_for_run_interaction(&interaction)?;
+            run_workflow_package(options, &package, input, run_id, feedback)?;
+        }
+        [action, source] | [action, source, _] if action == "package" => {
+            let output = arguments.get(2).map(String::as_str);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&package_workflow_archive(source, output, false)?)?
+            );
+        }
+        [action, source] | [action, source, _] if action == "sign" => {
+            let output = arguments.get(2).map(String::as_str);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&package_workflow_archive(source, output, true)?)?
+            );
+        }
+        [action, path] if action == "install-archive" => {
+            let installed =
+                app::workflow_manager::install_local_archive(PathBuf::from(path).as_path(), false)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&installed))?
+            );
+        }
+        [action, path, policy]
+            if action == "install-archive" && policy == "--require-signature" =>
+        {
+            let installed =
+                app::workflow_manager::install_local_archive(PathBuf::from(path).as_path(), true)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&workflow_installation_json(&installed))?
+            );
         }
         [action, path] if action == "install" => {
             let store = workflow::WorkflowStore::open_default()?;
@@ -574,63 +1135,12 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <validate <dir>|doctor <dir|id> [input-json|@file]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file]|runs|recover [--force]|show <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <author-save <dir>|author-test <id> <version>|author-confirm <id> <version>|validate <dir>|doctor <dir|id> [input-json|@file]|package <dir> [output.hmwf]|sign <dir> [output.hmwf]|install-archive <path> [--require-signature]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file] [feedback]|dispatch [limit]|runs|metrics|projection-status|recover [--force]|show <run-id>|verify-run <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }
     }
     Ok(())
-}
-
-fn install_dashboard_workflow(
-    options: &Options,
-    workflow_id: &str,
-    version: Option<&str>,
-) -> Result<workflow::InstalledWorkflow, Box<dyn Error>> {
-    let state = api::client::load_agent_state(&options.state_path)?;
-    options.set_agent_credential(&state.credential);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let item = if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
-        api::distribution::workflow_versions(
-            &client,
-            &options.api_base,
-            &state.agent_id,
-            &state.credential,
-            workflow_id,
-        )?
-        .into_iter()
-        .find(|item| item.version == version)
-        .ok_or_else(|| format!("Workflow 版本 v{version} 不可用"))?
-    } else {
-        api::distribution::workflow_catalog(
-            &client,
-            &options.api_base,
-            &state.agent_id,
-            &state.credential,
-        )?
-        .into_iter()
-        .find(|item| item.workflow_id == workflow_id)
-        .ok_or_else(|| format!("Workflow 未上架或当前不可用: {workflow_id}"))?
-    };
-    let store = workflow::WorkflowStore::open_default()?;
-    let previous = store
-        .list()?
-        .into_iter()
-        .find(|installed| installed.package.id == item.workflow_id);
-    let installed =
-        app::workflow_manager::install_dashboard_catalog_item(&item, options, &state.agent_id)?;
-    if let Err(error) = app::extension_lock::record_workflow(&item) {
-        match (previous.as_ref(), store.rollback(&item.workflow_id)) {
-            (Some(previous), Ok(_)) if previous.package.version != item.version => {}
-            _ => {
-                let _ = store.remove(&item.workflow_id);
-            }
-        }
-        return Err(error);
-    }
-    Ok(installed)
 }
 
 fn workflow_package_from_reference(
@@ -641,12 +1151,137 @@ fn workflow_package_from_reference(
     if path.join("workflow.json").is_file() {
         return workflow::load_from_directory(&path);
     }
-    store
-        .list()?
-        .into_iter()
-        .find(|item| item.package.id == reference && item.enabled)
-        .map(|item| item.package)
-        .ok_or_else(|| format!("workflow package not found or disabled: {reference}").into())
+    Ok(store.load_enabled_for_run(reference)?.package)
+}
+
+fn package_workflow_archive(
+    source: &str,
+    output: Option<&str>,
+    sign: bool,
+) -> Result<Value, Box<dyn Error>> {
+    let source = PathBuf::from(source).canonicalize()?;
+    let package = workflow::load_from_directory(&source)?;
+    let output = output
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "{}-{}{}.hmwf",
+                package.id.replace('.', "-"),
+                package.version,
+                if sign { "-signed" } else { "" }
+            ))
+        });
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "hmwf" | "zip") {
+        return Err("Workflow 制品必须使用 .hmwf 或 .zip 扩展名".into());
+    }
+    let output = if output.is_absolute() {
+        output
+    } else {
+        env::current_dir()?.join(output)
+    };
+    if output.exists() {
+        return Err(format!(
+            "workflow package output already exists: {}",
+            output.display()
+        )
+        .into());
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    );
+    let staging = env::temp_dir().join(format!("himind-workflow-package-stage-{suffix}"));
+    let temporary_output = output.with_file_name(format!(
+        ".{}.{}.staging",
+        output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("workflow.hmwf"),
+        suffix
+    ));
+    let result = (|| {
+        app::local_package::stage_local_package(
+            &source,
+            &staging,
+            &app::local_package::PackageLimits {
+                max_files: 100_000,
+                max_bytes: 512 * 1024 * 1024,
+                label: "Workflow 制品",
+            },
+            |_| true,
+        )?;
+        let signature_metadata = if sign {
+            let key_path = env::var("HIMIND_SIGNING_PRIVATE_KEY_PATH")
+                .or_else(|_| env::var("HIMIND_WORKFLOW_SIGNING_KEY_PATH"))
+                .map_err(|_| "workflow signing requires HIMIND_SIGNING_PRIVATE_KEY_PATH")?;
+            let key_id = env::var("HIMIND_SIGNING_KEY_ID")
+                .or_else(|_| env::var("HIMIND_WORKFLOW_SIGNING_KEY_ID"))
+                .map_err(|_| "workflow signing requires HIMIND_SIGNING_KEY_ID")?;
+            let key_id = key_id.trim();
+            if key_id.is_empty()
+                || key_id.len() > 200
+                || !key_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(format!("invalid signing key id: {key_id}").into());
+            }
+            let key = RsaPrivateKey::from_pkcs8_pem(&std::fs::read_to_string(key_path)?).map_err(
+                |error| format!("workflow signing key is not valid PKCS#8 PEM: {error}"),
+            )?;
+            let checksums = std::fs::read(staging.join("checksums.sha256"))?;
+            let signature = key
+                .sign_with_rng(
+                    &mut OsRng,
+                    Pss::new::<Sha256>(),
+                    &Sha256::digest(&checksums),
+                )
+                .map_err(|error| format!("workflow signing failed: {error}"))?;
+            let metadata = json!({
+                "algorithm": "rsa-pss-sha256",
+                "key_id": key_id,
+                "signature": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    signature,
+                ),
+            });
+            std::fs::write(
+                staging.join("manifest.sig"),
+                serde_json::to_vec_pretty(&metadata)?,
+            )?;
+            Some(metadata)
+        } else {
+            None
+        };
+        app::local_package::archive_directory(&staging, &temporary_output)?;
+        std::fs::rename(&temporary_output, &output)?;
+        let bytes = std::fs::read(&output)?;
+        Ok(json!({
+            "workflow_id": package.id,
+            "version": package.version,
+            "output": output,
+            "file_size": bytes.len(),
+            "sha256": format!("{:x}", Sha256::digest(&bytes)),
+            "signed": signature_metadata.is_some(),
+            "signature": signature_metadata,
+        }))
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_file(&temporary_output);
+    result
 }
 
 fn workflow_cli_input(value: Option<&String>) -> Result<Value, Box<dyn Error>> {
@@ -671,6 +1306,7 @@ fn run_workflow_package(
     package: &workflow::WorkflowPackage,
     input: Value,
     resume_run_id: &str,
+    resume_feedback: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let gateway = CapabilityGateway::new(
         options.clone(),
@@ -708,10 +1344,86 @@ fn run_workflow_package(
             .get_run(resume_run_id)?
             .ok_or_else(|| format!("workflow run not found: {resume_run_id}"))?
     };
-    let executor = workflow::WorkflowGatewayExecutor::new(gateway, context);
+    let run = if let Some(feedback) = resume_feedback {
+        runner.record_loop_feedback(package, run, feedback)?
+    } else {
+        run
+    };
+    let executor = workflow::WorkflowGatewayExecutor::new(
+        gateway,
+        context,
+        ledger.clone(),
+        run.run_id.clone(),
+    );
     let outcome = runner.run_ready(package, run, &input, &executor)?;
     println!("{}", serde_json::to_string_pretty(&outcome)?);
     Ok(())
+}
+
+fn dispatch_pending_workflows(
+    options: &Options,
+    limit: usize,
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let ledger = store::local_runs::LocalRunLedger::open_default()?;
+    let store = workflow::WorkflowStore::open_default()?;
+    let runs = ledger.list_runs(limit)?;
+    let mut dispatched = Vec::new();
+    for run in runs
+        .into_iter()
+        .filter(|run| run.status == agent_core_contracts::LocalRunStatus::Queued)
+    {
+        let interaction = match ledger.get_interaction(&run.interaction_id)? {
+            Some(interaction) => interaction,
+            None => {
+                dispatched.push(json!({
+                    "run_id": run.run_id,
+                    "status": "blocked",
+                    "error": "workflow run interaction is missing",
+                }));
+                continue;
+            }
+        };
+        let package = match store.load_for_run_interaction(&interaction) {
+            Ok(package) => package,
+            Err(error) => {
+                dispatched.push(json!({
+                    "run_id": run.run_id,
+                    "status": "blocked",
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
+        };
+        let input = interaction
+            .business_context
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        match run_workflow_package(options, &package, input, &run.run_id, None) {
+            Ok(()) => dispatched.push(json!({"run_id": run.run_id, "status": "executed"})),
+            Err(error) if error.to_string().contains("leased by another process") => {
+                dispatched.push(json!({
+                    "run_id": run.run_id,
+                    "status": "skipped",
+                    "reason": "leased by another process",
+                }));
+            }
+            Err(error) => dispatched.push(json!({
+                "run_id": run.run_id,
+                "status": "failed",
+                "error": error.to_string(),
+            })),
+        }
+    }
+    Ok(dispatched)
+}
+
+fn workflow_dispatch_limit(arguments: &[String]) -> usize {
+    arguments
+        .get(1)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100)
 }
 
 fn workflow_request_id() -> String {
@@ -803,6 +1515,27 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&app::extension_source::remove_source(source_id)?)?
             );
         }
+        [source, action, source_id] if source == "source" && action == "enable" => {
+            let settings = app::extension_source::set_source_enabled(source_id, true)?;
+            let _ = app::extension_source::reconcile_dsh_presets_now();
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        [source, action, source_id] if source == "source" && action == "disable" => {
+            let settings = app::extension_source::set_source_enabled(source_id, false)?;
+            let _ = app::extension_source::reconcile_dsh_presets_now();
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        // 取用侧决定单元按哪一侧安装。默认 local，显式写 remote 才会落盘。
+        [source, action, unit_key, acquisition] if source == "source" && action == "acquisition" => {
+            let acquisition = match acquisition.as_str() {
+                "local" => app::extension_source::ExtensionSourceAcquisition::Local,
+                "remote" => app::extension_source::ExtensionSourceAcquisition::Remote,
+                other => return Err(format!("取用侧必须是 local 或 remote，收到: {other}").into()),
+            };
+            let settings =
+                app::extension_source::set_unit_acquisition(unit_key, acquisition)?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
         [source, action, kind, id] if source == "source" && action == "plan" => {
             let value = match kind.as_str() {
                 "plugin" => serde_json::to_value(app::extension_source::plan_plugin(id, None)?)?,
@@ -851,7 +1584,7 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             );
         }
         _ => {
-            return Err("usage: himind-agent extension source <list|refresh|add name github-url [ref] [catalog-path] [required|optional]|add-local name path [catalog-path]|remove source-id|plan plugin|skill|workflow id|install plugin|skill|workflow id [version]|provenance|update>".into());
+            return Err("usage: himind-agent extension source <list|refresh|add name github-url [ref] [catalog-path] [required|optional]|add-local name path [catalog-path]|remove source-id|enable source-id|disable source-id|acquisition unit-key local|remote|plan plugin|skill|workflow id|install plugin|skill|workflow id [version]|provenance|update>".into());
         }
     }
     Ok(())
@@ -963,13 +1696,29 @@ fn run_mcp_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Er
 
 fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments.first().map(String::as_str) {
+        Some("acp-profile") => {
+            run_acp_profile_cli(&arguments[1..])?;
+        }
+        Some("providers") => {
+            if arguments.len() != 1 {
+                return Err("usage: himind-agent runtime providers".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&runtime::probe_installations())?
+            );
+        }
         Some("status") => {
+            if arguments.len() != 1 {
+                return Err("usage: himind-agent runtime status".into());
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&runtime::builtin::status())?
             );
         }
         Some("install") => {
+            apply_runtime_manifest_argument(&arguments[1..])?;
             let client_instance_id =
                 format!("himind-agent-runtime-{}", store::paths::profile_name());
             let status = runtime::builtin::install(options, &client_instance_id)
@@ -977,6 +1726,7 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Some("check-update") => {
+            apply_runtime_manifest_argument(&arguments[1..])?;
             let client_instance_id =
                 format!("himind-agent-runtime-{}", store::paths::profile_name());
             let status = runtime::builtin::check_update(options, &client_instance_id)
@@ -984,6 +1734,7 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Some("update") => {
+            apply_runtime_manifest_argument(&arguments[1..])?;
             let client_instance_id =
                 format!("himind-agent-runtime-{}", store::paths::profile_name());
             let mut progress = |stage: &str, percent: u8, message: &str| {
@@ -995,6 +1746,9 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Some("uninstall") => {
+            if arguments.len() != 1 {
+                return Err("usage: himind-agent runtime uninstall".into());
+            }
             let mut progress = |stage: &str, percent: u8, message: &str| {
                 eprintln!("[{percent:>3}%] {stage}: {message}");
             };
@@ -1004,11 +1758,116 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
         }
         _ => {
             return Err(
-                "usage: himind-agent runtime <status|install|check-update|update|uninstall>".into(),
+                "usage: himind-agent runtime <acp-profile <list|set|enable|disable|remove>|providers|status|install|check-update|update|uninstall> [--manifest <runtime-release.json>]".into(),
             )
         }
     }
     Ok(())
+}
+
+fn run_acp_profile_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments.first().map(String::as_str) {
+        Some("list") if arguments.len() == 1 => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::acp_profiles::list()?)?
+            );
+        }
+        Some("set") if arguments.len() >= 3 => {
+            let mut provider_id = arguments[1].clone();
+            let executable = arguments[2].clone();
+            let mut args_json = None;
+            let mut display_name = String::new();
+            let mut version = String::new();
+            let mut permission_policy = "deny".to_string();
+            let mut enabled = true;
+            let mut index = 3;
+            if arguments
+                .get(index)
+                .is_some_and(|value| value.trim_start().starts_with('['))
+            {
+                args_json = Some(arguments[index].clone());
+                index += 1;
+            }
+            while index < arguments.len() {
+                match arguments[index].as_str() {
+                    "--name" if index + 1 < arguments.len() => {
+                        display_name = arguments[index + 1].clone();
+                        index += 2;
+                    }
+                    "--version" if index + 1 < arguments.len() => {
+                        version = arguments[index + 1].clone();
+                        index += 2;
+                    }
+                    "--permission" if index + 1 < arguments.len() => {
+                        permission_policy = arguments[index + 1].clone();
+                        index += 2;
+                    }
+                    "--disabled" => {
+                        enabled = false;
+                        index += 1;
+                    }
+                    value => return Err(format!("unknown ACP profile option: {value}").into()),
+                }
+            }
+            provider_id = store::acp_profiles::normalize_provider_id(&provider_id);
+            if display_name.trim().is_empty() {
+                display_name = provider_id.clone();
+            }
+            let args = args_json
+                .map(|value| serde_json::from_str::<Vec<String>>(&value))
+                .transpose()?
+                .unwrap_or_default();
+            let profile = store::acp_profiles::upsert(
+                store::acp_profiles::AcpRuntimeProfileRecord {
+                    provider_id,
+                    display_name,
+                    executable,
+                    args,
+                    version,
+                    permission_policy,
+                    enabled,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        Some("enable") | Some("disable") if arguments.len() == 2 => {
+            let enabled = arguments[0] == "enable";
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store::acp_profiles::set_enabled(
+                    &arguments[1],
+                    enabled,
+                )?)?
+            );
+        }
+        Some("remove") if arguments.len() == 2 => {
+            let removed = store::acp_profiles::remove(&arguments[1])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "provider_id": store::acp_profiles::normalize_provider_id(&arguments[1]),
+                    "removed": removed,
+                }))?
+            );
+        }
+        _ => {
+            return Err(
+                "usage: himind-agent runtime acp-profile <list|set provider executable [args-json] [--name name] [--version version] [--permission deny|allow_once|prompt] [--disabled]|enable provider|disable provider|remove provider>".into(),
+            )
+        }
+    }
+    Ok(())
+}
+
+fn apply_runtime_manifest_argument(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [] => Ok(()),
+        [flag, path] if flag == "--manifest" && !path.trim().is_empty() => {
+            runtime::distribution::use_local_manifest(path)
+        }
+        _ => Err("usage: himind-agent runtime <install|check-update|update> [--manifest <runtime-release.json>]".into()),
+    }
 }
 
 fn run_skill_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1072,17 +1931,16 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 options.clone(),
                 Arc::new(std::sync::Mutex::new(store::types::LocalWorkerStatus::default())),
             );
-            println!(
-                "{}",
-                gateway.invoke(
-                    &capability::types::InvocationContext::new(
-                        capability::types::InvocationSource::Cli,
-                        "local-cli",
-                    ),
-                    &arguments[1],
-                    input,
-                )?
-            );
+            let result = gateway.invoke(
+                &capability::types::InvocationContext::new(
+                    capability::types::InvocationSource::Cli,
+                    "local-cli",
+                ),
+                &arguments[1],
+                input,
+            )?;
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout().lock(), "{result}");
         }
         _ => {
             return Err("usage: himind-agent plugin <list|import-local path|import-github github-url [ref] [subpath]|install|uninstall|enable|disable|rollback|invoke> [plugin-id|capability-id json]".into())
@@ -1325,7 +2183,8 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 mod tests {
     use super::{
         default_dashboard_api_base, default_local_port, parse_plugin_view_launch,
-        protocol_open_requested, should_run_mcp, PluginViewLaunch,
+        protocol_open_requested, should_run_acp, should_run_mcp, workflow_dispatch_limit,
+        PluginViewLaunch,
     };
     use std::env;
 
@@ -1345,6 +2204,23 @@ mod tests {
     }
 
     #[test]
+    fn workflow_dispatch_limit_is_bounded() {
+        assert_eq!(workflow_dispatch_limit(&[]), 20);
+        assert_eq!(
+            workflow_dispatch_limit(&["dispatch".to_string(), "55".to_string()]),
+            55
+        );
+        assert_eq!(
+            workflow_dispatch_limit(&["dispatch".to_string(), "0".to_string()]),
+            1
+        );
+        assert_eq!(
+            workflow_dispatch_limit(&["dispatch".to_string(), "999".to_string()]),
+            100
+        );
+    }
+
+    #[test]
     fn selects_mcp_mode_by_binary_target_or_explicit_argument() {
         assert!(should_run_mcp("himind-agent-mcp", &[]));
         assert!(should_run_mcp(
@@ -1355,6 +2231,19 @@ mod tests {
             "himind-agent",
             &["himind-agent.exe".to_string(), "--local-app".to_string()]
         ));
+    }
+
+    #[test]
+    fn selects_acp_mode_only_from_the_first_command() {
+        assert!(should_run_acp(&[
+            "himind-agent.exe".to_string(),
+            "acp".to_string()
+        ]));
+        assert!(!should_run_acp(&[
+            "himind-agent.exe".to_string(),
+            "workflow".to_string(),
+            "acp".to_string()
+        ]));
     }
 
     #[test]

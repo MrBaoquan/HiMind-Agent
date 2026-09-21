@@ -6,7 +6,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -41,6 +41,8 @@ pub(crate) struct PluginCapabilityManifest {
     pub risk_level: String,
     #[serde(default)]
     pub availability: String,
+    #[serde(default = "default_plugin_capability_timeout")]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -60,6 +62,8 @@ pub(crate) struct PluginManifest {
     pub runtime: String,
     #[serde(default)]
     pub min_agent_version: String,
+    #[serde(default)]
+    pub categories: Vec<String>,
     #[serde(default = "default_plugin_governance")]
     pub governance: String,
     #[serde(default)]
@@ -584,6 +588,7 @@ fn builtin_plugin(
                 input_schema: Value::Null,
                 risk_level: "builtin_policy".to_string(),
                 availability: "local".to_string(),
+                timeout_seconds: default_plugin_capability_timeout(),
             })
             .collect(),
         permissions: permissions
@@ -1000,6 +1005,7 @@ fn invoke_plugin_capability_for_item(
         .find(|capability| capability.id == capability_id)
         .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
     validate_input_schema(&capability.input_schema, &input)?;
+    let timeout = plugin_invocation_timeout(capability, &input);
     let active = ACTIVE_INVOCATIONS.fetch_add(1, Ordering::AcqRel);
     if active >= MAX_PLUGIN_INVOCATIONS {
         ACTIVE_INVOCATIONS.fetch_sub(1, Ordering::Release);
@@ -1012,6 +1018,7 @@ fn invoke_plugin_capability_for_item(
         capability_id,
         input,
         trusted_dashboard_url,
+        timeout,
     );
     let health_root = plugin_health_root(
         std::path::Path::new(&plugin.path),
@@ -1033,6 +1040,7 @@ fn invoke_plugin_process(
     capability_id: &str,
     input: Value,
     trusted_dashboard_url: Option<&str>,
+    timeout: Duration,
 ) -> Result<Value, Box<dyn Error>> {
     if plugin.status != "installed" {
         return Err(format!("plugin is not installed: {}", plugin.id).into());
@@ -1049,7 +1057,7 @@ fn invoke_plugin_process(
         "params": input,
     });
 
-    let mut command = Command::new(entry);
+    let mut command = crate::runtime::process::hidden_command(entry);
     command
         .current_dir(plugin_execution_dir(&plugin))
         .stdin(Stdio::piped())
@@ -1065,6 +1073,18 @@ fn invoke_plugin_process(
             .env("HIMIND_CONTROL_PLANE_URL", url)
             .env("HIMIND_DASHBOARD_URL", url);
     }
+    // Extensions own their runtime state. The Agent only guarantees a stable,
+    // writable directory that survives upgrades, so an extension UI can read the
+    // same data the workflow produced without the workflow carrying storage policy.
+    let data_dir = plugin_data_dir(&plugin.id);
+    if let Err(error) = fs::create_dir_all(&data_dir) {
+        return Err(format!(
+            "failed to prepare plugin data directory for {}: {error}",
+            plugin.id
+        )
+        .into());
+    }
+    command.env("HIMIND_PLUGIN_DATA_ROOT", &data_dir);
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start plugin {}: {error}", plugin.id))?;
@@ -1108,14 +1128,14 @@ fn invoke_plugin_process(
         let _ = reader.read_to_end(&mut bytes);
     });
 
-    let response_bytes = match response_rx.recv_timeout(PLUGIN_TIMEOUT) {
+    let response_bytes = match response_rx.recv_timeout(timeout) {
         Ok(result) => result?,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
                 "plugin timed out after {} seconds: {}",
-                PLUGIN_TIMEOUT.as_secs(),
+                timeout.as_secs(),
                 plugin.id
             )
             .into());
@@ -1261,6 +1281,38 @@ pub(crate) fn plugin_execution_dir(plugin: &PluginRegistryItem) -> PathBuf {
     } else {
         root
     }
+}
+
+/// Returns the private, per-plugin data directory.
+///
+/// Extensions own their runtime state (archives, caches, indexes) and the Agent
+/// only guarantees a stable, writable location that survives plugin upgrades and
+/// rollbacks. The path is derived from the plugin id instead of the manifest, so
+/// a plugin can never declare itself into another extension's directory.
+pub(crate) fn plugin_data_dir(plugin_id: &str) -> PathBuf {
+    let safe_id = if is_safe_resource_segment(plugin_id) {
+        plugin_id.to_string()
+    } else {
+        plugin_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    if let Some(root) = env::var_os("HIMIND_PLUGIN_DATA_ROOT") {
+        let root = PathBuf::from(root);
+        if !root.as_os_str().is_empty() {
+            return root.join(&safe_id);
+        }
+    }
+    crate::store::paths::agent_home()
+        .join("plugin-data")
+        .join(safe_id)
 }
 
 pub(crate) fn validate_manifest_contributions(
@@ -1433,6 +1485,20 @@ fn default_risk_level() -> String {
     "read_only".to_string()
 }
 
+fn default_plugin_capability_timeout() -> u64 {
+    PLUGIN_TIMEOUT.as_secs()
+}
+
+fn plugin_invocation_timeout(capability: &PluginCapabilityManifest, input: &Value) -> Duration {
+    let maximum = capability.timeout_seconds.clamp(1, 60 * 60);
+    let requested = input
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(maximum)
+        .clamp(1, maximum);
+    Duration::from_secs(requested)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1457,6 +1523,54 @@ fn default_view_icon() -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn plugin_data_directory_is_derived_from_the_plugin_id() {
+        let root = std::env::temp_dir().join(format!("agent-plugin-data-{}", next_request_id()));
+        let previous = env::var_os("HIMIND_PLUGIN_DATA_ROOT");
+        env::set_var("HIMIND_PLUGIN_DATA_ROOT", &root);
+
+        let path = plugin_data_dir("com.himind.tech-radar");
+        assert_eq!(path, root.join("com.himind.tech-radar"));
+        // A hostile or legacy manifest id must not escape the plugin data root.
+        let escaped = plugin_data_dir("../../production");
+        assert!(escaped.starts_with(&root));
+        assert_eq!(
+            escaped.file_name().and_then(|value| value.to_str()),
+            Some(".._.._production")
+        );
+
+        match previous {
+            Some(value) => env::set_var("HIMIND_PLUGIN_DATA_ROOT", value),
+            None => env::remove_var("HIMIND_PLUGIN_DATA_ROOT"),
+        }
+    }
+
+    #[test]
+    fn capability_timeout_respects_the_declared_upper_bound() {
+        let capability = PluginCapabilityManifest {
+            id: "example.long".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            risk_level: "process".to_string(),
+            availability: "local".to_string(),
+            timeout_seconds: 1800,
+        };
+        assert_eq!(
+            plugin_invocation_timeout(&capability, &serde_json::json!({})).as_secs(),
+            1800
+        );
+        assert_eq!(
+            plugin_invocation_timeout(&capability, &serde_json::json!({"timeout_seconds": 600}))
+                .as_secs(),
+            600
+        );
+        assert_eq!(
+            plugin_invocation_timeout(&capability, &serde_json::json!({"timeout_seconds": 7200}))
+                .as_secs(),
+            1800
+        );
+    }
 
     #[test]
     fn ignores_registry_support_directories_without_plugin_manifest() {
@@ -1788,6 +1902,7 @@ mod tests {
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
             min_agent_version: String::new(),
+            categories: Vec::new(),
             governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
@@ -1827,6 +1942,7 @@ mod tests {
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
             min_agent_version: String::new(),
+            categories: Vec::new(),
             governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
@@ -1870,6 +1986,7 @@ mod tests {
             entry: "plugin.exe".to_string(),
             runtime: "process-jsonrpc-stdio".to_string(),
             min_agent_version: String::new(),
+            categories: Vec::new(),
             governance: "optional".to_string(),
             capabilities: Vec::new(),
             permissions: Vec::new(),

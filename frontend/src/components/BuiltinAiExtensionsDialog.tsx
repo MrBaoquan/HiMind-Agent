@@ -50,7 +50,7 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
     try {
       setServers(await agentApi.builtinAiMcpServers());
     } catch (loadError) {
-      setError(presentMcpError(loadError, '无法读取 MCP 连接。'));
+      setError(presentMcpError(loadError, '无法读取工具连接。'));
     } finally {
       setLoading(false);
     }
@@ -96,7 +96,7 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
       onToolContextChanged();
       onRuntimeChanged();
     } catch (saveError) {
-      setError(presentMcpError(saveError, 'MCP 连接保存失败。'));
+      setError(presentMcpError(saveError, '工具连接保存失败。'));
     } finally {
       setBusy('');
     }
@@ -110,11 +110,11 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
     try {
       await agentApi.saveBuiltinAiMcpServer({ ...server, enabled });
       await loadServers();
-      setNotice(enabled ? 'MCP 连接已启用。' : 'MCP 连接已停用。');
+      setNotice(enabled ? '工具连接已启用。' : '工具连接已停用。');
       onToolContextChanged();
       onRuntimeChanged();
     } catch (toggleError) {
-      setError(presentMcpError(toggleError, '无法更新 MCP 连接。'));
+      setError(presentMcpError(toggleError, '无法更新工具连接。'));
     } finally {
       setBusy('');
     }
@@ -133,11 +133,11 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
       }
       setConfirmDelete('');
       await loadServers();
-      setNotice('MCP 连接已删除。');
+      setNotice('工具连接已删除。');
       onToolContextChanged();
       onRuntimeChanged();
     } catch (removeError) {
-      setError(presentMcpError(removeError, '无法删除 MCP 连接。'));
+      setError(presentMcpError(removeError, '无法删除工具连接。'));
     } finally {
       setBusy('');
     }
@@ -147,23 +147,23 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
     <div className="modal-backdrop builtin-ai-extension-backdrop" role="presentation" onMouseDown={event => { if (event.currentTarget === event.target) onClose(); }}>
       <section className="builtin-ai-extension-dialog" role="dialog" aria-modal="true" aria-labelledby="builtin-ai-extension-title">
         <header className="builtin-ai-extension-header">
-          <div><span className="builtin-ai-extension-mark"><Blocks size={18} /></span><div><h3 id="builtin-ai-extension-title">扩展</h3><p>管理 HiMind AI 可用的连接与能力</p></div></div>
+          <div><span className="builtin-ai-extension-mark"><Blocks size={18} /></span><div><h3 id="builtin-ai-extension-title">扩展</h3><p>管理 HiMind AI 使用的连接、插件和技能</p></div></div>
           <button type="button" className="btn btn-icon" title="关闭" aria-label="关闭" onClick={onClose}><X size={16} /></button>
         </header>
         <div className="builtin-ai-extension-tabs" role="tablist" aria-label="扩展类型">
-          <button type="button" role="tab" aria-selected={tab === 'mcp'} className={tab === 'mcp' ? 'active' : ''} onClick={() => setTab('mcp')}><Network size={15} />MCP <span>{servers.length + 1}</span></button>
+          <button type="button" role="tab" aria-selected={tab === 'mcp'} className={tab === 'mcp' ? 'active' : ''} onClick={() => setTab('mcp')}><Network size={15} />工具连接 <span>{servers.length + 1}</span></button>
           <button type="button" role="tab" aria-selected={tab === 'plugins'} className={tab === 'plugins' ? 'active' : ''} onClick={() => setTab('plugins')}><Puzzle size={15} />插件</button>
           <button type="button" role="tab" aria-selected={tab === 'skills'} className={tab === 'skills' ? 'active' : ''} onClick={() => setTab('skills')}><Wrench size={15} />技能 <span>{toolSummary.skills}</span></button>
         </div>
 
         {tab === 'mcp' ? (
           <div className="builtin-ai-mcp-layout">
-            <section className="builtin-ai-mcp-list" aria-label="MCP 连接">
-              <div className="builtin-ai-mcp-list-head"><div><strong>MCP 连接</strong><span>为对话添加外部工具</span></div><button type="button" className="btn btn-icon" title="添加 MCP 连接" aria-label="添加 MCP 连接" onClick={beginAdd}><Plus size={16} /></button></div>
+            <section className="builtin-ai-mcp-list" aria-label="工具连接">
+              <div className="builtin-ai-mcp-list-head"><div><strong>工具连接</strong><span>为对话添加工具</span></div><button type="button" className="btn btn-icon" title="添加工具连接" aria-label="添加工具连接" onClick={beginAdd}><Plus size={16} /></button></div>
               <div className="builtin-ai-mcp-rows">
                 <div className="builtin-ai-mcp-row builtin-ai-mcp-managed"><span className="builtin-ai-mcp-icon"><ShieldCheck size={16} /></span><button type="button" disabled><strong>HiMind</strong><small>内置服务</small></button><span className="builtin-ai-mcp-state">常驻</span></div>
                 {loading ? <div className="builtin-ai-mcp-message"><LoaderCircle className="spin" size={16} />正在读取</div> : null}
-                {!loading && !servers.length ? <div className="builtin-ai-mcp-message">还没有个人 MCP 连接</div> : null}
+                {!loading && !servers.length ? <div className="builtin-ai-mcp-message">还没有自定义工具连接</div> : null}
                 {servers.map(server => (
                   <div className={`builtin-ai-mcp-row ${editingName === server.server_name ? 'selected' : ''}`} key={server.server_name}>
                     <span className="builtin-ai-mcp-icon"><Code2 size={16} /></span>
@@ -177,9 +177,9 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
               </div>
             </section>
 
-            <section className="builtin-ai-mcp-editor" aria-label="MCP 连接设置">
-              {!draft ? <div className="builtin-ai-mcp-empty"><Network size={24} /><strong>选择或添加 MCP 连接</strong><span>内置 HiMind 服务由系统维护，无需配置。</span><button type="button" className="btn btn-primary" onClick={beginAdd}><Plus size={15} />添加连接</button></div> : <>
-                <div className="builtin-ai-mcp-editor-head"><div><strong>{editingName ? '编辑 MCP 连接' : '添加 MCP 连接'}</strong><span>{editingName ? editingName : '填写连接信息后即可使用'}</span></div><label className="toggle"><input type="checkbox" checked={draft.enabled} onChange={event => setDraft({ ...draft, enabled: event.target.checked })} /><span className="slider" /></label></div>
+            <section className="builtin-ai-mcp-editor" aria-label="工具连接设置">
+              {!draft ? <div className="builtin-ai-mcp-empty"><Network size={24} /><strong>选择或添加工具连接</strong><span>内置 HiMind 服务由系统维护，无需配置。</span><button type="button" className="btn btn-primary" onClick={beginAdd}><Plus size={15} />添加连接</button></div> : <>
+                <div className="builtin-ai-mcp-editor-head"><div><strong>{editingName ? '编辑工具连接' : '添加工具连接'}</strong><span>{editingName ? editingName : '填写连接信息后即可使用'}</span></div><label className="toggle"><input type="checkbox" checked={draft.enabled} onChange={event => setDraft({ ...draft, enabled: event.target.checked })} /><span className="slider" /></label></div>
                 <div className="builtin-ai-mcp-form">
                   <div className="builtin-ai-mcp-two-columns">
                     <label><span>显示名称</span><input value={draft.display_name} placeholder="例如：项目知识库" onChange={event => setDraft({ ...draft, display_name: event.target.value })} /></label>
@@ -205,8 +205,8 @@ export function BuiltinAiExtensionsDialog({ open, dashboardEnabled, toolSummary,
           </div>
         ) : null}
 
-        {tab === 'plugins' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Puzzle size={22} /></span><div><h4>AI 对话插件</h4><p>内置对话插件可在会话左下角的“设置”中配置，插件清单会随 HiMind AI 运行时更新。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />保留原生插件设置</span>{dashboardEnabled ? <span><Check size={14} />个人扩展不受组织清单限制</span> : <span><Check size={14} />本机插件独立运行</span>}</div></div><div className="builtin-ai-extension-action"><strong>Agent 插件</strong><span>安装、停用或卸载本机能力插件</span><button type="button" className="btn" onClick={onOpenPlugins}><Puzzle size={15} />管理 Agent 插件</button></div></div> : null}
-        {tab === 'skills' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Bot size={22} /></span><div><h4>技能</h4><p>HiMind AI 会使用本机已安装的技能，也支持当前工作区提供的技能。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />已安装 {toolSummary.skills} 项</span><span><Check size={14} />{dashboardEnabled ? '组织能力在调用时校验权限' : '本机技能可直接使用'}</span></div></div><div className="builtin-ai-extension-action"><strong>技能管理</strong><span>浏览、安装或更新技能</span><button type="button" className="btn" onClick={onOpenSkills}><Wrench size={15} />打开技能</button></div></div> : null}
+        {tab === 'plugins' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Puzzle size={22} /></span><div><h4>AI 对话插件</h4><p>内置插件在会话设置中配置，会随 HiMind AI 更新。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />保留插件设置</span>{dashboardEnabled ? <span><Check size={14} />自定义扩展不受组织清单限制</span> : <span><Check size={14} />本机插件独立运行</span>}</div></div><div className="builtin-ai-extension-action"><strong>插件管理</strong><span>安装、停用或卸载插件</span><button type="button" className="btn" onClick={onOpenPlugins}><Puzzle size={15} />管理插件</button></div></div> : null}
+        {tab === 'skills' ? <div className="builtin-ai-extension-overview"><span className="builtin-ai-extension-overview-icon"><Bot size={22} /></span><div><h4>技能</h4><p>HiMind AI 会使用本机和当前工作区的技能。</p><div className="builtin-ai-extension-facts"><span><Check size={14} />已安装 {toolSummary.skills} 项</span><span><Check size={14} />{dashboardEnabled ? '组织技能会在使用时校验权限' : '本机技能可直接使用'}</span></div></div><div className="builtin-ai-extension-action"><strong>技能管理</strong><span>浏览、安装或更新技能</span><button type="button" className="btn" onClick={onOpenSkills}><Wrench size={15} />打开技能</button></div></div> : null}
 
         {error ? <div className="builtin-ai-extension-feedback error" role="alert"><CircleAlert size={15} /><span>{error}</span><button type="button" title="重新读取" aria-label="重新读取" onClick={() => void loadServers()}><RefreshCw size={14} /></button></div> : null}
         {notice ? <div className="builtin-ai-extension-feedback success" role="status"><Check size={15} /><span>{notice}</span></div> : null}

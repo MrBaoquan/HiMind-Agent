@@ -43,9 +43,9 @@ export function DashboardIdentityPanel({
   const ready = dashboardEnabled && workerOnline && identity?.authorized;
   const statusLabel = !dashboardEnabled ? '未启用' : ready ? '已就绪' : identity?.authorized ? workerStatusTitle : '需要登录';
   const statusDescription = ready
-    ? '账号已登录 · 本机 Agent 已就绪'
+    ? '账号已登录 · 桌面端已就绪'
     : !dashboardEnabled
-      ? '独立模式下 Dashboard 服务未启用。'
+      ? '独立模式下不连接 HiMind 工作台。'
       : identity?.authorized
       ? workerHealthDescription
       : identityDescription(identity);
@@ -65,7 +65,7 @@ export function DashboardIdentityPanel({
           {dashboardEnabled ? (identity?.authorized ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />退出登录</button> : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || identity?.state === 'not_enrolled' || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />登录 HiMind</button>) : null}
         </div>
       </div>
-      <div className="workspace-status-metrics" aria-label="Agent 运行状态">
+      <div className="workspace-status-metrics" aria-label="桌面端运行状态">
         <div><span>待审批</span><strong className={pendingApprovals ? 'warning-text' : ''}>{pendingApprovals}</strong></div>
         <div><span>远程任务</span><strong>{remoteExecutionEnabled ? '已开启' : '已关闭'}</strong></div>
         <div><span>AI 工具</span><strong>{aiToolSummary}</strong></div>

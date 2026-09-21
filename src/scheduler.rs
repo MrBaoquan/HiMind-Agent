@@ -1,0 +1,749 @@
+//! 平台级定时任务。
+//!
+//! 定时是底座原语，不是某个能力的附属功能：一条计划描述“什么时候、对什么目标做什么”，
+//! 目前支持的目标类型是 Workflow Run，后续新增目标类型只需扩展 `dispatch` 与校验，
+//! 不需要再长一套计划存储、调度线程和 UI。
+//!
+//! 平台只负责到点启动，不改变被执行者的语义：Workflow 目标走的是与手动启动完全相同的
+//! `schedule_workflow_with_gateway`，因此 Ledger、事件、Artifact、审批、`on_failure`
+//! 降级全部一致。
+
+use crate::capability::service::CapabilityGateway;
+use crate::capability::types::{InvocationContext, InvocationSource};
+use crate::store::atomic_file::atomic_write;
+use crate::store::paths::agent_home;
+use chrono::{Datelike, Local, TimeZone, Timelike};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::error::Error;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const STORE_FILE: &str = "schedules.json";
+/// 上一版把计划存在 workflow-schedules.json，且只支持 Workflow 目标；读到就迁移成通用结构。
+const LEGACY_STORE_FILE: &str = "workflow-schedules.json";
+/// 一条 cron 最多向前搜索一年，足够覆盖闰年和“每 4 年一次”这类表达式。
+const MAX_SEARCH_MINUTES: i64 = 366 * 24 * 60;
+/// 目前实现的定时目标类型。新增类型要同时补 `validate_target` 与 `dispatch`。
+const SUPPORTED_TARGET_KINDS: &[&str] = &["workflow", "skill"];
+/// 收尾僵尸运行前的宽限期：避开刚启动、还没取到租约的运行。
+const STALE_RUN_GRACE_SECONDS: i64 = 120;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ScheduleExecution {
+    #[serde(default)]
+    pub entrypoint: String,
+    #[serde(default)]
+    pub exitpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Schedule {
+    pub id: String,
+    /// 目标类型，例如 `workflow`。
+    #[serde(default = "default_target_kind")]
+    pub kind: String,
+    /// 目标标识：Workflow 目标是 workflow_id。
+    #[serde(default)]
+    pub target_id: String,
+    /// Workflow 启动预设的来源标识；input 仍保存不可变快照，运行时不依赖预设文件。
+    #[serde(default)]
+    pub preset_id: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub execution: ScheduleExecution,
+    pub cron: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_run_at: String,
+    #[serde(default)]
+    pub last_run_id: String,
+    /// `accepted` | `failed`
+    #[serde(default)]
+    pub last_status: String,
+    #[serde(default)]
+    pub last_error: String,
+    /// 下一次触发的 epoch 秒；为空表示还没算过。
+    #[serde(default)]
+    pub next_run_at: String,
+}
+
+fn default_target_kind() -> String {
+    "workflow".to_string()
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// 旧版（仅 Workflow）计划文件的形状，只用于迁移。
+#[derive(Debug, Clone, Deserialize)]
+struct LegacySchedule {
+    id: String,
+    workflow_id: String,
+    #[serde(default)]
+    input: Value,
+    #[serde(default)]
+    entrypoint: String,
+    #[serde(default)]
+    exitpoint: String,
+    cron: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    last_run_at: String,
+    #[serde(default)]
+    last_run_id: String,
+    #[serde(default)]
+    last_status: String,
+    #[serde(default)]
+    last_error: String,
+    #[serde(default)]
+    next_run_at: String,
+}
+
+pub(crate) fn store_path() -> PathBuf {
+    agent_home().join(STORE_FILE)
+}
+
+fn legacy_store_path() -> PathBuf {
+    agent_home().join(LEGACY_STORE_FILE)
+}
+
+pub(crate) fn load() -> Result<Vec<Schedule>, Box<dyn Error>> {
+    let path = store_path();
+    if path.is_file() {
+        let body = fs::read_to_string(&path)?;
+        // 计划文件损坏时宁可返回空列表也不要让 Agent 起不来；文件本身有 .bak 备份。
+        return Ok(serde_json::from_str(&body).unwrap_or_default());
+    }
+    let legacy = legacy_store_path();
+    if !legacy.is_file() {
+        return Ok(Vec::new());
+    }
+    let body = fs::read_to_string(&legacy)?;
+    let migrated = serde_json::from_str::<Vec<LegacySchedule>>(&body)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| Schedule {
+            id: item.id,
+            kind: "workflow".to_string(),
+            target_id: item.workflow_id,
+            preset_id: String::new(),
+            input: item.input,
+            execution: ScheduleExecution {
+                entrypoint: item.entrypoint,
+                exitpoint: item.exitpoint,
+            },
+            cron: item.cron,
+            enabled: item.enabled,
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+            last_run_at: item.last_run_at,
+            last_run_id: item.last_run_id,
+            last_status: item.last_status,
+            last_error: item.last_error,
+            next_run_at: item.next_run_at,
+        })
+        .collect::<Vec<_>>();
+    save(&migrated)?;
+    Ok(migrated)
+}
+
+pub(crate) fn save(items: &[Schedule]) -> Result<(), Box<dyn Error>> {
+    let body = serde_json::to_vec_pretty(items)?;
+    atomic_write(&store_path(), &body)?;
+    Ok(())
+}
+
+pub(crate) fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn is_valid_schedule_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+/// 5 字段 cron：分 时 日 月 周。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CronExpression {
+    minutes: Vec<u32>,
+    hours: Vec<u32>,
+    days_of_month: Vec<u32>,
+    months: Vec<u32>,
+    days_of_week: Vec<u32>,
+    day_of_month_restricted: bool,
+    day_of_week_restricted: bool,
+}
+
+impl CronExpression {
+    pub(crate) fn parse(expression: &str) -> Result<Self, String> {
+        let fields = expression.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 5 {
+            return Err(format!(
+                "cron 必须是 5 个字段（分 时 日 月 周），当前是 {} 个：{expression}",
+                fields.len()
+            ));
+        }
+        let minutes = parse_field(fields[0], 0, 59)?;
+        let hours = parse_field(fields[1], 0, 23)?;
+        let days_of_month = parse_field(fields[2], 1, 31)?;
+        let months = parse_field(fields[3], 1, 12)?;
+        // 周字段允许 0-7，7 与 0 都表示周日。
+        let mut days_of_week = parse_field(fields[4], 0, 7)?
+            .into_iter()
+            .map(|value| value % 7)
+            .collect::<Vec<_>>();
+        days_of_week.sort_unstable();
+        days_of_week.dedup();
+        Ok(Self {
+            minutes,
+            hours,
+            days_of_month,
+            months,
+            days_of_week,
+            day_of_month_restricted: fields[2].trim() != "*",
+            day_of_week_restricted: fields[4].trim() != "*",
+        })
+    }
+
+    fn matches(&self, moment: chrono::DateTime<Local>) -> bool {
+        if !self.minutes.contains(&moment.minute()) || !self.hours.contains(&moment.hour()) {
+            return false;
+        }
+        if !self.months.contains(&moment.month()) {
+            return false;
+        }
+        let day_of_month = self.days_of_month.contains(&moment.day());
+        let day_of_week = self
+            .days_of_week
+            .contains(&moment.weekday().num_days_from_sunday());
+        match (self.day_of_month_restricted, self.day_of_week_restricted) {
+            // 两个字段都限定时是“或”语义（与系统 cron 一致）。
+            (true, true) => day_of_month || day_of_week,
+            (true, false) => day_of_month,
+            (false, true) => day_of_week,
+            (false, false) => true,
+        }
+    }
+
+    /// 返回严格大于 `after_epoch` 的下一次触发时间（本地时区）。
+    pub(crate) fn next_after(&self, after_epoch: i64) -> Option<i64> {
+        let start = Local.timestamp_opt(after_epoch, 0).single()?;
+        let mut candidate =
+            start.with_second(0)?.with_nanosecond(0)? + chrono::Duration::minutes(1);
+        for _ in 0..MAX_SEARCH_MINUTES {
+            if self.matches(candidate) {
+                return Some(candidate.timestamp());
+            }
+            candidate += chrono::Duration::minutes(1);
+        }
+        None
+    }
+}
+
+fn parse_field(field: &str, minimum: u32, maximum: u32) -> Result<Vec<u32>, String> {
+    let mut values = Vec::new();
+    for part in field.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("cron 字段 {field} 含空片段"));
+        }
+        let (range, step) = match part.split_once('/') {
+            Some((range, step)) => {
+                let step = step
+                    .parse::<u32>()
+                    .map_err(|_| format!("cron 步长不合法：{part}"))?;
+                if step == 0 {
+                    return Err(format!("cron 步长必须大于 0：{part}"));
+                }
+                (range, step)
+            }
+            None => (part, 1),
+        };
+        let (low, high) = if range == "*" {
+            (minimum, maximum)
+        } else if let Some((low, high)) = range.split_once('-') {
+            let low = low
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("cron 取值不合法：{part}"))?;
+            let high = high
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("cron 取值不合法：{part}"))?;
+            (low, high)
+        } else {
+            let value = range
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("cron 取值不合法：{part}"))?;
+            (value, value)
+        };
+        if low < minimum || high > maximum || low > high {
+            return Err(format!("cron 取值超出范围 {minimum}-{maximum}：{part}"));
+        }
+        let mut value = low;
+        while value <= high {
+            values.push(value);
+            value += step;
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    if values.is_empty() {
+        return Err(format!("cron 字段 {field} 没有匹配值"));
+    }
+    Ok(values)
+}
+
+fn schedule_next_after(expression: &str, after_epoch: i64) -> Result<i64, String> {
+    CronExpression::parse(expression)?
+        .next_after(after_epoch)
+        .ok_or_else(|| format!("cron 表达式在一年内没有匹配时间：{expression}"))
+}
+
+/// 校验目标类型与参数。未知类型 fail closed，不做“猜一个目标”的兜底。
+fn validate_target(kind: &str, target_id: &str) -> Result<(), String> {
+    if !SUPPORTED_TARGET_KINDS.contains(&kind) {
+        return Err(format!(
+            "不支持的定时目标类型：{kind}（当前支持：{}）",
+            SUPPORTED_TARGET_KINDS.join(", ")
+        ));
+    }
+    if target_id.trim().is_empty() {
+        return Err(format!("定时目标 {kind} 需要 target_id"));
+    }
+    if kind == "workflow" {
+        let installed = crate::workflow::WorkflowStore::open_default()
+            .map_err(|error| error.to_string())?
+            .list()
+            .map_err(|error| error.to_string())?;
+        let Some(package) = installed.iter().find(|item| item.package.id == target_id) else {
+            return Err(format!("Workflow 尚未安装：{target_id}"));
+        };
+        if !package.enabled {
+            return Err(format!("Workflow 已被禁用，无法建立定时任务：{target_id}"));
+        }
+    }
+    if kind == "skill" {
+        // 技能必须在运行前就存在：定时任务不该等到触发那一刻才发现目标不存在。
+        let store = crate::skill::store::SkillStore::new();
+        let record = store
+            .installed_record(target_id)
+            .map_err(|error| error.to_string())?;
+        if record.is_none() {
+            return Err(format!("技能尚未安装：{target_id}"));
+        }
+    }
+    Ok(())
+}
+
+fn schedule_json(item: &Schedule) -> Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind,
+        "target_id": item.target_id,
+        "preset_id": item.preset_id,
+        "input": item.input,
+        "execution": {
+            "entrypoint": item.execution.entrypoint,
+            "exitpoint": item.execution.exitpoint,
+        },
+        "cron": item.cron,
+        "enabled": item.enabled,
+        "next_run_at": item.next_run_at,
+        "last_run_at": item.last_run_at,
+        "last_run_id": item.last_run_id,
+        "last_status": item.last_status,
+        "last_error": item.last_error,
+        "created_at": item.created_at,
+        "updated_at": item.updated_at,
+    })
+}
+
+/// 列出计划，并按需要补齐 `next_run_at`（例如计划写入后 Agent 重启过）。
+pub(crate) fn list(now: i64) -> Result<Value, Box<dyn Error>> {
+    let mut items = load()?;
+    let mut changed = false;
+    for item in items.iter_mut() {
+        if item.next_run_at.is_empty() {
+            if let Ok(next) = schedule_next_after(&item.cron, now) {
+                item.next_run_at = next.to_string();
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save(&items)?;
+    }
+    Ok(json!({
+        "now": now.to_string(),
+        "store_path": store_path().to_string_lossy().to_string(),
+        "timezone": Local::now().format("%z").to_string(),
+        "target_kinds": SUPPORTED_TARGET_KINDS,
+        "schedules": items.iter().map(schedule_json).collect::<Vec<_>>(),
+    }))
+}
+
+pub(crate) fn set(input: &Value, now: i64) -> Result<Value, Box<dyn Error>> {
+    let kind = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("workflow")
+        .to_string();
+    let target_id = input
+        .get("target_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("schedule.set 需要 target_id")?
+        .to_string();
+    let preset_id = input
+        .get("preset_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let cron = input
+        .get("cron")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("schedule.set 需要 cron（5 字段，本地时区）")?;
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("schedule-{target_id}").replace(['/', '\\', ':'], "-"));
+    if !is_valid_schedule_id(&id) {
+        return Err("计划 id 只能包含字母、数字、点、横线和下划线".into());
+    }
+    validate_target(&kind, &target_id).map_err(|error| -> Box<dyn Error> { error.into() })?;
+    if kind == "workflow" && !preset_id.is_empty() {
+        let presets = crate::workflow::list_run_presets(&target_id)?;
+        let found = presets
+            .get("presets")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("id").and_then(Value::as_str) == Some(preset_id.as_str())
+                        && item.get("workflow_id").and_then(Value::as_str)
+                            == Some(target_id.as_str())
+                })
+            });
+        if !found {
+            return Err(format!("Workflow 启动预设不存在或不属于目标：{preset_id}").into());
+        }
+    }
+    let next_run_at = schedule_next_after(cron, now)?;
+    let enabled = input
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let run_input = input
+        .get("input")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let execution = input
+        .get("execution")
+        .cloned()
+        .map(serde_json::from_value::<ScheduleExecution>)
+        .transpose()
+        .map_err(|_| "schedule.set 的 execution 结构不合法")?
+        .unwrap_or_default();
+
+    let mut items = load()?;
+    let mut record = items
+        .iter()
+        .find(|item| item.id == id)
+        .cloned()
+        .unwrap_or_else(|| Schedule {
+            id: id.clone(),
+            kind: kind.clone(),
+            target_id: target_id.clone(),
+            preset_id: preset_id.clone(),
+            input: json!({}),
+            execution: ScheduleExecution::default(),
+            cron: cron.to_string(),
+            enabled: true,
+            created_at: now.to_string(),
+            updated_at: String::new(),
+            last_run_at: String::new(),
+            last_run_id: String::new(),
+            last_status: String::new(),
+            last_error: String::new(),
+            next_run_at: String::new(),
+        });
+    record.kind = kind;
+    record.target_id = target_id;
+    record.preset_id = preset_id;
+    record.cron = cron.to_string();
+    record.enabled = enabled;
+    record.input = run_input;
+    record.execution = execution;
+    record.updated_at = now.to_string();
+    record.next_run_at = next_run_at.to_string();
+    record.last_error.clear();
+    items.retain(|item| item.id != record.id);
+    items.push(record.clone());
+    items.sort_by(|left, right| left.id.cmp(&right.id));
+    save(&items)?;
+    Ok(json!({
+        "saved": true,
+        "schedule": schedule_json(&record),
+        "store_path": store_path().to_string_lossy().to_string(),
+    }))
+}
+
+pub(crate) fn delete(id: &str) -> Result<Value, Box<dyn Error>> {
+    let id = id.trim();
+    if !is_valid_schedule_id(id) {
+        return Err("计划 id 不合法".into());
+    }
+    let mut items = load()?;
+    let before = items.len();
+    items.retain(|item| item.id != id);
+    let removed = before != items.len();
+    if removed {
+        save(&items)?;
+    }
+    Ok(json!({ "removed": removed, "id": id }))
+}
+
+fn due_at(item: &Schedule, now: i64) -> bool {
+    if !item.enabled {
+        return false;
+    }
+    match item.next_run_at.trim().parse::<i64>() {
+        // 没有 next_run_at（新写入或旧文件）时按“还没算过”处理，本次补算不触发，
+        // 避免 Agent 重启后把所有计划都当成“刚刚到点”。
+        Ok(next) => next <= now,
+        Err(_) => false,
+    }
+}
+
+/// 按目标类型派发。新增目标类型在这里扩展，定时语义（cron/next_run/记录）保持不变。
+fn dispatch(
+    gateway: CapabilityGateway,
+    item: &Schedule,
+    run_input: Value,
+    context: InvocationContext,
+) -> Result<Value, Box<dyn Error>> {
+    match item.kind.as_str() {
+        "workflow" => crate::app::commands::schedule_workflow_with_gateway(
+            gateway,
+            &item.target_id,
+            run_input,
+            context,
+        ),
+        // 技能目标：跑一次技能运行，结果写在 skill-runs/<run_id>/。
+        "skill" => {
+            crate::skill_run::start(gateway.options(), &item.id, &item.target_id, &run_input)
+        }
+        other => Err(format!("不支持的定时目标类型：{other}").into()),
+    }
+}
+
+/// 触发所有到点的计划：派发目标、记录结果、推进下一次时间。
+pub(crate) fn run_due(gateway: CapabilityGateway, now: i64) -> Result<Value, Box<dyn Error>> {
+    let mut items = load()?;
+    let mut fired = Vec::new();
+    let mut changed = false;
+    for item in items.iter_mut() {
+        if item.next_run_at.trim().is_empty() {
+            if let Ok(next) = schedule_next_after(&item.cron, now) {
+                item.next_run_at = next.to_string();
+                changed = true;
+            }
+            continue;
+        }
+        if !due_at(item, now) {
+            continue;
+        }
+        let mut run_input = item.input.clone();
+        if !run_input.is_object() {
+            run_input = json!({});
+        }
+        if !item.execution.entrypoint.is_empty() || !item.execution.exitpoint.is_empty() {
+            let execution = json!({
+                "entrypoint": item.execution.entrypoint,
+                "exitpoint": item.execution.exitpoint,
+            });
+            if let Some(object) = run_input.as_object_mut() {
+                object.insert("execution".to_string(), execution);
+            }
+        }
+        let context =
+            InvocationContext::new(InvocationSource::Scheduler, format!("schedule:{}", item.id));
+        let outcome = dispatch(gateway.clone(), item, run_input, context);
+        item.last_run_at = now.to_string();
+        match outcome {
+            Ok(value) => {
+                item.last_run_id = value
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.pointer("/run/run_id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                item.last_status = "accepted".to_string();
+                item.last_error.clear();
+            }
+            Err(error) => {
+                item.last_run_id.clear();
+                item.last_status = "failed".to_string();
+                item.last_error = error.to_string();
+            }
+        }
+        match schedule_next_after(&item.cron, now) {
+            Ok(next) => item.next_run_at = next.to_string(),
+            Err(error) => {
+                item.next_run_at.clear();
+                item.last_status = "failed".to_string();
+                item.last_error = error;
+            }
+        }
+        fired.push(schedule_json(item));
+        changed = true;
+    }
+    if changed {
+        save(&items)?;
+    }
+    Ok(json!({
+        "now": now.to_string(),
+        "fired": fired,
+        "store_path": store_path().to_string_lossy().to_string(),
+    }))
+}
+
+/// 启动 Agent 内置调度线程。
+///
+/// 每 30 秒检查一次计划文件；没有到点的计划时只做一次文件读取，开销可以忽略。
+/// 只有桌面 Agent 会启动它，MCP 伴生进程不重复调度。
+pub(crate) fn start_scheduler(gateway: CapabilityGateway) {
+    let _ = std::thread::Builder::new()
+        .name("himind-scheduler".to_string())
+        .spawn(move || loop {
+            let now = now_epoch();
+            if let Err(error) = run_due(gateway.clone(), now) {
+                eprintln!("scheduler tick failed: {error}");
+            }
+            // 顺手收尾被中断的运行：进程死了就没人续租，界面不该永远显示“执行中”。
+            if let Err(error) = abandon_stale_runs() {
+                eprintln!("scheduler stale-run sweep failed: {error}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+}
+
+/// 把租约已过期的运行标成失败。返回收尾数量，便于日志与验证。
+pub(crate) fn abandon_stale_runs() -> Result<usize, Box<dyn Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let abandoned = ledger.abandon_stale_runs(
+        "运行中断：执行进程已退出（租约过期，未续租）",
+        STALE_RUN_GRACE_SECONDS,
+        200,
+    )?;
+    for run in &abandoned {
+        eprintln!("abandoned stale workflow run {}: {}", run.run_id, run.error);
+    }
+    Ok(abandoned.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cron_accepts_standard_field_forms() {
+        let every_minute = CronExpression::parse("* * * * *").unwrap();
+        assert_eq!(every_minute.minutes.len(), 60);
+        let daily_morning = CronExpression::parse("30 9 * * *").unwrap();
+        assert_eq!(daily_morning.minutes, vec![30]);
+        assert_eq!(daily_morning.hours, vec![9]);
+        assert!(!daily_morning.day_of_month_restricted);
+        let step = CronExpression::parse("*/15 * * * *").unwrap();
+        assert_eq!(step.minutes, vec![0, 15, 30, 45]);
+        let range = CronExpression::parse("0 9-11 * * 1-5").unwrap();
+        assert_eq!(range.hours, vec![9, 10, 11]);
+        assert_eq!(range.days_of_week, vec![1, 2, 3, 4, 5]);
+        // 7 与 0 都是周日。
+        assert_eq!(
+            CronExpression::parse("0 0 * * 7").unwrap().days_of_week,
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn cron_rejects_invalid_fields() {
+        assert!(CronExpression::parse("* * * *").is_err());
+        assert!(CronExpression::parse("60 * * * *").is_err());
+        assert!(CronExpression::parse("* 24 * * *").is_err());
+        assert!(CronExpression::parse("* * 0 * *").is_err());
+        assert!(CronExpression::parse("* * * 13 *").is_err());
+        assert!(CronExpression::parse("*/0 * * * *").is_err());
+        assert!(CronExpression::parse("5-1 * * * *").is_err());
+        assert!(CronExpression::parse("a * * * *").is_err());
+    }
+
+    #[test]
+    fn next_after_finds_the_next_matching_minute_in_local_time() {
+        let expression = CronExpression::parse("30 9 * * *").unwrap();
+        let base = 1789812420; // 2026-09-19T10:07:00Z
+        let next = expression.next_after(base).unwrap();
+        assert!(next > base);
+        let moment = Local.timestamp_opt(next, 0).unwrap();
+        assert_eq!(moment.hour(), 9);
+        assert_eq!(moment.minute(), 30);
+        // 严格大于：连续两次调用不会得到同一个时间。
+        let following = expression.next_after(next).unwrap();
+        assert!(following > next);
+    }
+
+    #[test]
+    fn day_of_month_and_weekday_use_or_semantics_when_both_restricted() {
+        let expression = CronExpression::parse("0 12 1 * 1").unwrap();
+        assert!(expression.day_of_month_restricted);
+        assert!(expression.day_of_week_restricted);
+        let base = 1789812420;
+        let next = expression.next_after(base).unwrap();
+        let moment = Local.timestamp_opt(next, 0).unwrap();
+        assert_eq!(moment.hour(), 12);
+        assert!(
+            moment.day() == 1 || moment.weekday().num_days_from_sunday() == 1,
+            "expected the 1st or a Monday, got {moment}"
+        );
+    }
+
+    #[test]
+    fn unknown_target_kinds_are_rejected_instead_of_guessed() {
+        // 未实现的目标类型必须 fail closed，不做兜底猜测。
+        assert!(validate_target("http", "https://example.com").is_err());
+        assert!(validate_target("shell", "ls").is_err());
+        assert!(validate_target("", "anything").is_err());
+        assert_eq!(SUPPORTED_TARGET_KINDS, &["workflow", "skill"]);
+    }
+}

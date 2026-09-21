@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use super::credentials::{protect_secret_for_current_user, unprotect_secret_for_current_user};
 
 const STORE_FILE: &str = "ai-services.json";
+const SELECTION_FILE: &str = "ai-service-selection.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +52,12 @@ struct PersistedCustomAIService {
     encrypted_api_key: String,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedAIServiceSelection {
+    #[serde(default)]
+    active_service_id: String,
 }
 
 impl From<PersistedCustomAIService> for CustomAIService {
@@ -177,6 +184,7 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
     let services = list()?;
     Ok(serde_json::json!({
         "services": services.iter().map(|item| item.public_json()).collect::<Vec<_>>(),
+        "active_service_id": active_id()?.unwrap_or_default(),
     }))
 }
 
@@ -228,6 +236,9 @@ pub(crate) fn remove(id: &str) -> Result<bool, Box<dyn Error>> {
     let removed = services.remove(id).is_some();
     if removed {
         save_all(&services)?;
+        if active_id()?.as_deref() == Some(id) {
+            set_active("")?;
+        }
     }
     Ok(removed)
 }
@@ -239,6 +250,62 @@ pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn
         .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?;
     let api_key = unprotect_secret_for_current_user(&service.encrypted_api_key)?;
     Ok((service.clone(), api_key))
+}
+
+pub(crate) fn active_id() -> Result<Option<String>, Box<dyn Error>> {
+    let path = selection_path()?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let selection: PersistedAIServiceSelection = serde_json::from_slice(&fs::read(path)?)?;
+    let id = selection.active_service_id.trim();
+    Ok((!id.is_empty()).then(|| id.to_string()))
+}
+
+pub(crate) fn active_service() -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    let Some(id) = active_id()? else {
+        return Ok(None);
+    };
+    Ok(load_all()?.remove(&id))
+}
+
+pub(crate) fn active_service_with_secret(
+) -> Result<Option<(CustomAIService, String)>, Box<dyn Error>> {
+    let Some(id) = active_id()? else {
+        return Ok(None);
+    };
+    load_secret(&id).map(Some)
+}
+
+pub(crate) fn set_active(id: &str) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    let id = id.trim();
+    let selected = if id.is_empty() {
+        None
+    } else {
+        let id = normalize_id(id)?;
+        Some(
+            load_all()?
+                .remove(&id)
+                .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
+        )
+    };
+    let selection = PersistedAIServiceSelection {
+        active_service_id: selected
+            .as_ref()
+            .map(|service| service.id.clone())
+            .unwrap_or_default(),
+    };
+    crate::store::atomic_file::atomic_write(
+        &selection_path()?,
+        &serde_json::to_vec_pretty(&selection)?,
+    )?;
+    Ok(selected)
+}
+
+fn selection_path() -> Result<PathBuf, Box<dyn Error>> {
+    let dir = crate::store::paths::agent_home();
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(SELECTION_FILE))
 }
 
 /// 请求 OpenAI 兼容的 `GET {base_url}/models` 接口，返回可用模型 ID 列表。
@@ -381,6 +448,42 @@ mod tests {
             assert_eq!(service.display_name, "更新后的服务");
             assert_eq!(service.protocol, AIServiceProtocol::OpenaiResponses);
             assert_eq!(api_key, "sk-original");
+        });
+    }
+
+    #[test]
+    fn active_service_selection_is_explicit_and_clears_on_remove() {
+        with_isolated_home(|| {
+            for id in ["first", "second"] {
+                super::upsert(CustomAIServiceInput {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    base_url: format!("https://{id}.example/v1"),
+                    protocol: AIServiceProtocol::OpenaiChat,
+                    model: "model-a".to_string(),
+                    models: vec!["model-a".to_string()],
+                    api_key: format!("sk-{id}"),
+                })
+                .expect("create service");
+            }
+
+            assert_eq!(super::active_id().unwrap(), None);
+            let selected = super::set_active("first").unwrap().expect("selected");
+            assert_eq!(selected.id, "first");
+            assert_eq!(super::active_id().unwrap().as_deref(), Some("first"));
+
+            let (active, api_key) = super::active_service_with_secret()
+                .unwrap()
+                .expect("active service");
+            assert_eq!(active.id, "first");
+            assert_eq!(api_key, "sk-first");
+
+            assert!(super::remove("first").unwrap());
+            assert_eq!(super::active_id().unwrap(), None);
+
+            super::set_active("second").unwrap();
+            super::set_active("").unwrap();
+            assert_eq!(super::active_id().unwrap(), None);
         });
     }
 

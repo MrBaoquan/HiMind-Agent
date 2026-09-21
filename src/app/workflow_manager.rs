@@ -1,5 +1,6 @@
 use crate::api::distribution::WorkflowCatalogItem;
 use crate::app::system::verify_extension_artifact_signature;
+use crate::extension_contracts::{ExtensionAssetKind, ExtensionLock};
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -64,11 +65,80 @@ pub(crate) fn install_dashboard_catalog_item(
     let result = (|| {
         extract_archive(&archive, &staging)?;
         let root = package_root(&staging)?;
-        install_from_directory(item, &root, true)
+        let lock = catalog_lock(item)?.ok_or("组织 Workflow 缺少依赖锁 extension_lock")?;
+        install_from_directory_with_lock(item, &root, true, Some(lock))
     })();
     let _ = fs::remove_file(archive);
     let _ = fs::remove_dir_all(staging);
     result
+}
+
+pub(crate) fn install_dashboard_catalog_workflow(
+    options: &crate::Options,
+    workflow_id: &str,
+    version: Option<&str>,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    install_dashboard_catalog_workflow_bound(options, workflow_id, version, None, None)
+}
+
+pub(crate) fn install_dashboard_catalog_workflow_bound(
+    options: &crate::Options,
+    workflow_id: &str,
+    version: Option<&str>,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    let state = crate::api::client::load_agent_state(&options.state_path)?;
+    options.set_agent_credential(&state.credential);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let item = if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
+        crate::api::distribution::workflow_versions(
+            &client,
+            &options.api_base,
+            &state.agent_id,
+            &state.credential,
+            workflow_id,
+        )?
+        .into_iter()
+        .find(|item| item.version == version)
+        .ok_or_else(|| format!("Workflow 版本 v{version} 不可用"))?
+    } else {
+        crate::api::distribution::workflow_catalog(
+            &client,
+            &options.api_base,
+            &state.agent_id,
+            &state.credential,
+        )?
+        .into_iter()
+        .find(|item| item.workflow_id == workflow_id)
+        .ok_or_else(|| format!("Workflow 未上架或当前不可用: {workflow_id}"))?
+    };
+    crate::app::extension_lock::verify_catalog_artifact(
+        "Workflow",
+        &item.artifact_id,
+        &item.sha256,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    let previous = store
+        .list()?
+        .into_iter()
+        .find(|installed| installed.package.id == item.workflow_id);
+    let installed = install_dashboard_catalog_item(&item, options, &state.agent_id)?;
+    if let Err(error) = crate::app::extension_lock::record_workflow(&item) {
+        if let Some(previous) = previous {
+            if previous.package.version != item.version {
+                let _ = store.rollback(&item.workflow_id);
+            }
+        } else {
+            let _ = store.remove(&item.workflow_id);
+        }
+        return Err(error);
+    }
+    Ok(installed)
 }
 
 fn install_from_directory(
@@ -76,13 +146,139 @@ fn install_from_directory(
     root: &Path,
     require_signature: bool,
 ) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    let lock = catalog_lock(item)?;
+    install_from_directory_with_lock(item, root, require_signature, lock)
+}
+
+fn install_from_directory_with_lock(
+    item: &WorkflowCatalogItem,
+    root: &Path,
+    require_signature: bool,
+    lock: Option<ExtensionLock>,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
     let package = crate::workflow::load_from_directory(root)?;
     if package.id != item.workflow_id || package.version != item.version {
         return Err("Workflow Manifest ID 或版本与扩展源记录不一致".into());
     }
     ensure_agent_version_supported(&package.min_agent_version)?;
-    crate::workflow::WorkflowStore::open_default()?
-        .install_from_directory_with_policy(root, require_signature)
+    let lock_required = lock.is_some();
+    crate::workflow::WorkflowStore::open_default()?.install_from_directory_with_metadata(
+        root,
+        require_signature,
+        &item.sha256,
+        lock,
+        lock_required,
+    )
+}
+
+fn catalog_lock(item: &WorkflowCatalogItem) -> Result<Option<ExtensionLock>, Box<dyn Error>> {
+    item.extension_lock
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub(crate) fn install_local_archive(
+    archive_path: &Path,
+    require_signature: bool,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    let archive_path = archive_path.canonicalize()?;
+    let extension = archive_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "hmwf" | "zip") {
+        return Err("Workflow 制品必须使用 .hmwf 或 .zip 扩展名".into());
+    }
+    let metadata = fs::metadata(&archive_path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_WORKFLOW_ARCHIVE_BYTES {
+        return Err("Workflow 制品为空或超过 256 MiB 限制".into());
+    }
+    let artifact_sha256 = sha256_file(&archive_path)?;
+    let staging =
+        std::env::temp_dir().join(format!("himind-local-workflow-archive-{}", unique_suffix()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    let result = (|| {
+        extract_archive(&archive_path, &staging)?;
+        let root = package_root(&staging)?;
+        let package = crate::workflow::load_from_directory(&root)?;
+        ensure_agent_version_supported(&package.min_agent_version)?;
+        let store = crate::workflow::WorkflowStore::open_default()?;
+        let previous = store
+            .list()?
+            .into_iter()
+            .find(|installed| installed.package.id == package.id);
+        let extension_lock = load_local_archive_lock(&archive_path, &package, &artifact_sha256)?;
+        let lock_required = extension_lock.is_some();
+        let installed = store.install_from_directory_with_metadata(
+            &root,
+            require_signature,
+            &artifact_sha256,
+            extension_lock.clone(),
+            lock_required,
+        )?;
+        if let Some(extension_lock) = extension_lock.as_ref() {
+            if let Err(error) = crate::app::extension_lock::record_local_workflow(
+                &package,
+                &archive_path.to_string_lossy(),
+                &artifact_sha256,
+                extension_lock,
+            ) {
+                match previous {
+                    Some(previous) if previous.package.version != package.version => {
+                        let _ = store.rollback(&package.id);
+                    }
+                    Some(_) => {}
+                    None => {
+                        let _ = store.remove(&package.id);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(installed)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn load_local_archive_lock(
+    archive_path: &Path,
+    package: &crate::workflow::WorkflowPackage,
+    artifact_sha256: &str,
+) -> Result<Option<ExtensionLock>, Box<dyn Error>> {
+    let path = archive_path.with_extension("extension-lock.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let lock: ExtensionLock = serde_json::from_slice(&fs::read(&path)?)?;
+    lock.validate()?;
+    if lock.root.kind != ExtensionAssetKind::Workflow
+        || lock.root.id != package.id
+        || lock.root.version != package.version
+        || !lock.root.sha256.eq_ignore_ascii_case(artifact_sha256)
+    {
+        return Err(format!("Workflow 依赖锁与制品不一致: {}", path.display()).into());
+    }
+    Ok(Some(lock))
+}
+
+fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn download_public(
@@ -332,26 +528,18 @@ mod tests {
     use rsa::{Pss, RsaPrivateKey, RsaPublicKey};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread;
     use zip::write::FileOptions;
     use zip::CompressionMethod;
     use zip::ZipWriter;
-
-    static SIGNING_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn signing_env_lock() -> MutexGuard<'static, ()> {
-        SIGNING_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap()
-    }
 
     fn item(url: &str) -> WorkflowCatalogItem {
         WorkflowCatalogItem {
             workflow_id: "com.himind.workflow.test".to_string(),
             name: "Test Workflow".to_string(),
             description: String::new(),
+            author_name: String::new(),
+            categories: Vec::new(),
             version: "1.0.0".to_string(),
             release_notes: String::new(),
             published_at: String::new(),
@@ -374,6 +562,7 @@ mod tests {
             managed: false,
             allow_disable: true,
             allow_uninstall: true,
+            extension_lock: None,
         }
     }
 
@@ -432,8 +621,74 @@ mod tests {
     }
 
     #[test]
+    fn local_archive_accepts_matching_companion_extension_lock() {
+        let package_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-miniprogram-delivery");
+        let package = crate::workflow::load_from_directory(&package_root).unwrap();
+        let archive_path = std::env::temp_dir().join(format!(
+            "himind-workflow-lock-match-{}.hmwf",
+            unique_suffix()
+        ));
+        fs::write(&archive_path, b"immutable workflow archive").unwrap();
+        let artifact_sha256 = sha256_file(&archive_path).unwrap();
+        let lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: package.id.clone(),
+                version: package.version.clone(),
+                sha256: artifact_sha256.clone(),
+            },
+            dependencies: Vec::new(),
+            environment: crate::extension_contracts::ExtensionLockEnvironment::default(),
+            generated_at: "test".to_string(),
+        };
+        let lock_path = archive_path.with_extension("extension-lock.json");
+        fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+        let loaded = load_local_archive_lock(&archive_path, &package, &artifact_sha256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, lock);
+        let _ = fs::remove_file(lock_path);
+        let _ = fs::remove_file(archive_path);
+    }
+
+    #[test]
+    fn local_archive_rejects_companion_lock_for_different_artifact() {
+        let package_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-miniprogram-delivery");
+        let package = crate::workflow::load_from_directory(&package_root).unwrap();
+        let archive_path = std::env::temp_dir().join(format!(
+            "himind-workflow-lock-mismatch-{}.hmwf",
+            unique_suffix()
+        ));
+        fs::write(&archive_path, b"immutable workflow archive").unwrap();
+        let artifact_sha256 = sha256_file(&archive_path).unwrap();
+        let lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: package.id.clone(),
+                version: package.version.clone(),
+                sha256: "f".repeat(64),
+            },
+            dependencies: Vec::new(),
+            environment: crate::extension_contracts::ExtensionLockEnvironment::default(),
+            generated_at: "test".to_string(),
+        };
+        let lock_path = archive_path.with_extension("extension-lock.json");
+        fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+        let error = load_local_archive_lock(&archive_path, &package, &artifact_sha256).unwrap_err();
+        assert!(error.to_string().contains("依赖锁与制品不一致"));
+        let _ = fs::remove_file(lock_path);
+        let _ = fs::remove_file(archive_path);
+    }
+
+    #[test]
     fn dashboard_download_requires_same_origin_auth_and_signature() {
-        let _guard = signing_env_lock();
+        let _guard = crate::app::system::signing_env_lock();
         let payload = b"workflow archive";
         let sha256 = format!("{:x}", Sha256::digest(payload));
         let mut rng = OsRng;

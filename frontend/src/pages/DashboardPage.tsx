@@ -1,10 +1,11 @@
 import { ArrowUpRight, CheckCircle2, CircleAlert, Download, LoaderCircle, RefreshCw, Sparkles } from 'lucide-react';
 import { PageHeader, Pill } from '../components/Common';
 import { DashboardIdentityPanel } from '../components/DashboardIdentityPanel';
-import type { AgentStatus, AgentUpdateStatus, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, McpTargetDescriptor, RemoteExecutionSettings } from '../services/agentApi';
+import type { AgentStatus, AgentUpdateStatus, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, McpTargetDescriptor, ProjectionSyncStatus, RemoteExecutionSettings } from '../services/agentApi';
 
 type DashboardPageProps = {
   status: AgentStatus | null;
+  projectionSyncStatus: ProjectionSyncStatus | null;
   approvals: ApprovalItem[];
   remoteExecutionSettings: RemoteExecutionSettings | null;
   mcpTargets: McpTargetDescriptor[];
@@ -20,12 +21,14 @@ type DashboardPageProps = {
   onRefreshIdentity: () => void;
   onRevokeAuthorization: () => void;
   onCheckUpdate: () => void;
+  onRefreshProjection: () => void;
   onDownloadUpdate: () => void;
   onInstallUpdate: () => void;
 };
 
 export function DashboardPage({
   status,
+  projectionSyncStatus,
   approvals,
   remoteExecutionSettings,
   mcpTargets,
@@ -41,11 +44,12 @@ export function DashboardPage({
   onRefreshIdentity,
   onRevokeAuthorization,
   onCheckUpdate,
+  onRefreshProjection,
   onDownloadUpdate,
   onInstallUpdate,
 }: DashboardPageProps) {
   if (!status) {
-    return <div className="page-loading"><span className="spinner" />正在读取 Agent 状态</div>;
+    return <div className="page-loading"><span className="spinner" />正在读取应用状态</div>;
   }
 
   const independentMode = status.mode === 'independent' || status.dashboard_enabled === false;
@@ -54,15 +58,16 @@ export function DashboardPage({
   if (independentMode) {
     return (
       <div className="dashboard-page">
-        <PageHeader title="概览" description="HiMind Agent 当前状态" />
+        <PageHeader title="概览" description="查看连接、同步和更新状态。" />
         {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
+        <ProjectionStatusPanel status={projectionSyncStatus} onRefresh={onRefreshProjection} />
         <section className="workspace-status-panel ready independent-status-panel">
           <div className="workspace-status-body">
             <div className="workspace-status-icon ready" aria-hidden="true"><Sparkles size={25} /></div>
             <div className="workspace-status-copy">
               <div className="workspace-status-kicker"><span>HiMind Agent</span><span className="workspace-status-pill ready"><i />独立运行</span></div>
-              <strong>本机 AI 工作区已就绪</strong>
-              <span>HiMind AI、技能、插件、MCP 和本机执行能力均可直接使用。</span>
+              <strong>HiMind Agent 已就绪</strong>
+              <span>HiMind AI、技能、插件和已连接工具均可使用。</span>
             </div>
           </div>
           <div className="workspace-status-metrics" aria-label="本机运行状态">
@@ -73,8 +78,8 @@ export function DashboardPage({
         </section>
         <section className="overview-facts" aria-label="运行信息">
           <div><span>版本</span><strong>v{status.version}</strong></div>
-          <div><span>运行档</span><strong>{status.profile || 'production'}</strong></div>
-          <div><span>本地服务</span><strong>:{status.local_port || 18181}</strong></div>
+          <div><span>运行模式</span><strong>独立模式</strong></div>
+          <div><span>本机服务</span><strong>运行中</strong></div>
           <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
         </section>
       </div>
@@ -87,10 +92,11 @@ export function DashboardPage({
     <div className="dashboard-page">
       <PageHeader
         title="概览"
-        description="HiMind Agent 当前状态"
+        description="查看连接、同步和更新状态。"
         actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
+      <ProjectionStatusPanel status={projectionSyncStatus} onRefresh={onRefreshProjection} />
       {workerExpected && !workerOnline ? <div className="blocker"><CircleAlert size={18} /><div><strong>{workerIssue.title}</strong><span>{workerIssue.description}</span></div></div> : null}
       <DashboardIdentityPanel
         identity={identity}
@@ -101,7 +107,7 @@ export function DashboardPage({
         workerHealthDescription={workerIssue.healthDescription}
         pendingApprovals={approvals.length}
         remoteExecutionEnabled={Boolean(remoteExecutionSettings?.enabled)}
-        aiToolSummary={aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已注册` : '未安装'}
+        aiToolSummary={aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已连接` : '未安装'}
         busy={identityBusy}
         onStartAuthorization={onStartAuthorization}
         onCancelAuthorization={onCancelAuthorization}
@@ -112,11 +118,48 @@ export function DashboardPage({
       />
       <section className="overview-facts" aria-label="运行信息">
         <div><span>版本</span><strong>v{status.version}</strong></div>
-        <div><span>运行档</span><strong>{status.profile || 'production'}</strong></div>
-        <div><span>本地服务</span><strong>:{status.local_port || 18181}</strong></div>
+        <div><span>运行模式</span><strong>工作台模式</strong></div>
+        <div><span>本机服务</span><strong>运行中</strong></div>
         <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
       </section>
     </div>
+  );
+}
+
+function ProjectionStatusPanel({ status, onRefresh }: { status: ProjectionSyncStatus | null; onRefresh: () => void }) {
+  if (!status) return null;
+  const pending = status.pending ?? 0;
+  const retrying = status.retrying ?? 0;
+  const deadLetter = status.dead_letter ?? 0;
+  const projected = status.projected ?? 0;
+  const tone = status.state === 'attention' ? 'error' : status.state === 'pending' ? 'warning' : status.state === 'synced' ? 'success' : 'neutral';
+  const title = status.state === 'local_only'
+    ? '仅保存在本机'
+    : status.state === 'attention'
+      ? '同步需要处理'
+      : status.state === 'pending'
+        ? '等待同步'
+        : '已同步';
+  const description = status.state === 'local_only'
+    ? `当前模式仅在本机运行，已记录 ${status.total} 条任务`
+    : deadLetter
+      ? `${deadLetter} 条任务同步失败，本地运行不受影响`
+      : pending
+        ? `${pending} 条等待同步${retrying ? `，其中 ${retrying} 条正在重试` : ''}`
+        : `本地任务已同步 ${projected} 条`;
+  return (
+    <section className={`projection-sync-panel ${tone}`}>
+      <div className="projection-sync-main">
+        {tone === 'success' ? <CheckCircle2 size={18} /> : tone === 'error' ? <CircleAlert size={18} /> : <RefreshCw size={18} />}
+        <div><strong>{title}</strong><span>{description}</span></div>
+      </div>
+      <div className="projection-sync-metrics">
+        <div><span>待同步</span><strong>{pending}</strong></div>
+        <div><span>已同步</span><strong>{projected}</strong></div>
+        <div><span>同步失败</span><strong>{deadLetter}</strong></div>
+      </div>
+      <button className="btn btn-icon" title="刷新同步状态" aria-label="刷新同步状态" onClick={onRefresh}><RefreshCw size={15} /></button>
+    </section>
   );
 }
 
@@ -171,7 +214,7 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
   if (reasonCode === 'connected_agent_app_starting') {
     return {
       title: '正在连接工作台',
-      description: 'Agent 正在建立任务连接，请稍候刷新状态。',
+      description: '桌面端正在建立任务连接，请稍候刷新状态。',
       healthDescription: '本机服务正在建立工作台任务连接。',
       requiresEnrollment: false,
     };
@@ -179,7 +222,7 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
   if (reasonCode === 'connected_agent_app_worker_error' && !value) {
     return {
       title: '工作台连接需要处理',
-      description: '请刷新状态；若问题持续，请从工作台重新连接 Agent。',
+      description: '请刷新状态；若问题持续，请从工作台重新连接桌面端。',
       healthDescription: '本机服务仍在运行，但工作台任务连接尚未就绪。',
       requiresEnrollment: false,
     };
@@ -190,15 +233,15 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
     || normalized.includes('invalid agent credentials')
   ) {
     return {
-      title: 'Agent 需要重新连接工作台',
-      description: '这台电脑的设备凭证已失效。请回到 HiMind 工作台，在 Agent 状态中点击“重新绑定”。',
+      title: '桌面端需要重新连接工作台',
+      description: '这台电脑的设备凭证已失效。请回到 HiMind 工作台重新绑定设备。',
       healthDescription: '本机服务运行正常，但设备身份已失效，需要从工作台重新绑定。',
       requiresEnrollment: true,
     };
   }
   if (normalized.includes('missing scope') || normalized.includes('required scope')) {
     return {
-      title: 'Agent 授权范围需要更新',
+      title: '桌面端授权需要更新',
       description: '请在下方重新登录并授权工作台账号。',
       healthDescription: '本机服务运行正常，但当前账号授权范围不足。',
       requiresEnrollment: false,
@@ -219,7 +262,7 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
   }
   return {
     title: '工作台连接需要处理',
-    description: '请刷新状态；若问题持续，请从工作台重新连接 Agent。',
+    description: '请刷新状态；若问题持续，请从工作台重新连接桌面端。',
     healthDescription: '本机服务仍在运行，但工作台任务连接尚未就绪。',
     requiresEnrollment: false,
   };

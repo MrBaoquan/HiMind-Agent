@@ -212,12 +212,32 @@ pub(crate) fn install(
     plugin_id: &str,
     version: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
+    install_bound(options, agent_id, plugin_id, version, None, None)
+}
+
+pub(crate) fn install_bound(
+    options: &Options,
+    agent_id: &str,
+    plugin_id: &str,
+    version: Option<&str>,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
     let credential = options.agent_credential();
     let catalog = plugin_catalog(&client, &options.api_base, agent_id, &credential)?;
-    let plugin = requested_catalog_item(&client, options, agent_id, plugin_id, version, &catalog)?;
+    let plugin = requested_catalog_item(
+        &client,
+        options,
+        agent_id,
+        plugin_id,
+        version,
+        &catalog,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
     let plan = build_install_plan_for_item(&catalog, plugin)?;
     if !plan.ready {
         return Err(format!("插件安装计划被阻止：{}", plan.blocked_reasons.join("；")).into());
@@ -472,6 +492,17 @@ pub(crate) fn plan_install(
     plugin_id: &str,
     version: Option<&str>,
 ) -> Result<PluginInstallPlan, Box<dyn Error>> {
+    plan_install_bound(options, agent_id, plugin_id, version, None, None)
+}
+
+pub(crate) fn plan_install_bound(
+    options: &Options,
+    agent_id: &str,
+    plugin_id: &str,
+    version: Option<&str>,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<PluginInstallPlan, Box<dyn Error>> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -481,7 +512,16 @@ pub(crate) fn plan_install(
         agent_id,
         &options.agent_credential(),
     )?;
-    let plugin = requested_catalog_item(&client, options, agent_id, plugin_id, version, &catalog)?;
+    let plugin = requested_catalog_item(
+        &client,
+        options,
+        agent_id,
+        plugin_id,
+        version,
+        &catalog,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
     build_install_plan_for_item(&catalog, plugin)
 }
 
@@ -492,31 +532,41 @@ fn requested_catalog_item(
     plugin_id: &str,
     version: Option<&str>,
     catalog: &[PluginCatalogItem],
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
 ) -> Result<PluginCatalogItem, Box<dyn Error>> {
     let latest = catalog
         .iter()
         .find(|item| item.plugin_id == plugin_id)
         .cloned()
         .ok_or_else(|| "插件未上架或当前不可用".to_string())?;
-    let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(latest);
+    let item = match version.map(str::trim).filter(|value| !value.is_empty()) {
+        None => latest,
+        Some(version) if latest.version == version => latest,
+        Some(version) => {
+            if latest.management != "user_managed" || latest.managed {
+                return Err("该插件由组织管理，不能切换版本".into());
+            }
+            plugin_versions(
+                client,
+                &options.api_base,
+                agent_id,
+                &options.agent_credential(),
+                plugin_id,
+            )?
+            .into_iter()
+            .find(|item| item.version == version)
+            .ok_or_else(|| format!("插件版本 v{version} 不可用"))?
+        }
     };
-    if latest.version == version {
-        return Ok(latest);
-    }
-    if latest.management != "user_managed" || latest.managed {
-        return Err("该插件由组织管理，不能切换版本".into());
-    }
-    plugin_versions(
-        client,
-        &options.api_base,
-        agent_id,
-        &options.agent_credential(),
-        plugin_id,
-    )?
-    .into_iter()
-    .find(|item| item.version == version)
-    .ok_or_else(|| format!("插件版本 v{version} 不可用").into())
+    crate::app::extension_lock::verify_catalog_artifact(
+        "插件",
+        &item.artifact_id,
+        &item.sha256,
+        expected_artifact_id,
+        expected_sha256,
+    )?;
+    Ok(item)
 }
 
 pub(crate) fn plan_dependency_set(

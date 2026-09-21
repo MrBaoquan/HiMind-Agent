@@ -39,6 +39,18 @@ export type AgentModeSettings = {
     requires_restart: boolean;
 };
 
+export type ProjectionSyncStatus = {
+    dashboard_enabled: boolean;
+    state: 'local_only' | 'synced' | 'pending' | 'attention' | string;
+    total: number;
+    pending: number;
+    retrying: number;
+    projected: number;
+    dead_letter: number;
+    oldest_pending_at: string;
+    last_error: string;
+};
+
 export type CurrentTaskStatus = {
     task_id: string;
     task_type: string;
@@ -172,11 +184,37 @@ export type RemoteClientOverview = {
 export type WorkflowStep = {
     id: string;
     title: string;
+    /** capability | runtime | manual | loop | provider_defined */
+    kind?: string;
     capability_id: string;
     execution_mode: string;
     risk_level: string;
     approval_required: boolean;
     depends_on: string[];
+    runtime?: {
+        provider?: string;
+        prompt?: string;
+        input_artifacts?: string[];
+        tool_policy?: string;
+        timeout_seconds?: number;
+    } | null;
+    loop?: {
+        max_iterations: number;
+        pause_for_feedback?: boolean;
+        continue_when?: WorkflowCondition | null;
+        exit_when?: WorkflowCondition | null;
+        steps: WorkflowStep[];
+    } | null;
+    when?: WorkflowCondition | null;
+    fail_when?: WorkflowCondition | null;
+    on_failure?: string;
+};
+
+export type WorkflowCondition = {
+    operator: string;
+    path?: string;
+    value?: unknown;
+    conditions?: WorkflowCondition[];
 };
 
 export type WorkflowArtifact = {
@@ -185,6 +223,8 @@ export type WorkflowArtifact = {
     name: string;
     schema: string;
     required: boolean;
+    validation?: string;
+    max_bytes?: number;
 };
 
 export type WorkflowPackage = {
@@ -194,6 +234,7 @@ export type WorkflowPackage = {
     name: string;
     description: string;
     min_agent_version: string;
+    execution_policy?: 'strict' | 'segmented' | 'flexible' | string;
     capabilities: string[];
     dependencies: {
         skills: string[];
@@ -203,6 +244,10 @@ export type WorkflowPackage = {
     };
     steps: WorkflowStep[];
     artifacts: WorkflowArtifact[];
+    entrypoints?: Array<{ id: string; at_step: string; label?: string; requires?: string[]; produces?: string[] }>;
+    default_entrypoint?: string;
+    exits?: Array<{ id: string; at_step: string; label?: string; requires?: string[]; produces?: string[] }>;
+    default_exitpoint?: string;
     ui: { mode: 'standard' | 'declarative' | 'custom' | string; entry: string; surfaces: string[] };
     supported_runtimes: string[];
 };
@@ -223,6 +268,12 @@ export type WorkflowViewField = string | {
     options?: string[];
     placeholder?: string;
     target?: string;
+    /** 声明输入控件类型，当前支持 directory（带目录选择按钮）。 */
+    picker?: string;
+    /** 字段级说明，用来解释默认值行为。 */
+    hint?: string;
+    /** 栅格占位，full 表示整行。 */
+    span?: string;
 };
 
 export type WorkflowLocalRun = {
@@ -258,15 +309,182 @@ export type WorkflowCenterItem = {
     installed_at: string;
     updated_at: string;
     view: WorkflowView | null;
+    metrics: {
+        total_runs: number;
+        terminal_runs: number;
+        succeeded_runs: number;
+        failed_runs: number;
+        canceled_runs: number;
+        active_runs: number;
+        completion_rate: number;
+        average_duration_seconds: number;
+        total_input_tokens: number;
+        total_output_tokens: number;
+        estimated_cost: number;
+        rework_runs: number;
+        retry_count: number;
+        approval_count: number;
+        feedback_wait_count: number;
+        last_run_at: string;
+    };
+};
+
+/**
+ * 平台级定时任务：一条计划描述“什么时候、对什么目标做什么”。
+ * 目前 `kind` 只有 `workflow`，新增目标类型由平台侧扩展，前端按 kind 渲染。
+ */
+export type ScheduleExecution = {
+    entrypoint?: string;
+    exitpoint?: string;
+};
+
+export type Schedule = {
+    id: string;
+    kind: string;
+    target_id: string;
+    /** Workflow 启动预设来源；input 是保存时的不可变快照。 */
+    preset_id?: string;
+    input: Record<string, unknown>;
+    execution?: ScheduleExecution;
+    cron: string;
+    enabled: boolean;
+    next_run_at: string;
+    last_run_at: string;
+    last_run_id: string;
+    last_status: string;
+    last_error: string;
+    created_at: string;
+    updated_at: string;
+};
+
+export type ScheduleList = {
+    now: string;
+    store_path: string;
+    timezone: string;
+    target_kinds: string[];
+    schedules: Schedule[];
+};
+
+/** 一次技能运行：结果落在 Agent 的 skill-runs 记录里，可回看、可定位。 */
+export type SkillRun = {
+    run_id: string;
+    skill_id: string;
+    skill_name: string;
+    skill_version: string;
+    schedule_id: string;
+    task: string;
+    workspace: string;
+    status: 'running' | 'succeeded' | 'failed' | string;
+    started_at: string;
+    finished_at: string;
+    duration_seconds: number;
+    timeout_seconds: number;
+    output_path: string;
+    output_chars: number;
+    output_preview: string;
+    error: string;
+};
+
+export type SkillRunList = {
+    root: string;
+    total: number;
+    runs: SkillRun[];
+};
+
+/**
+ * 启动预设：一套可复用的启动参数。同一个工作流针对不同工作区启动时，
+ * 只需替换 workspace_root 这类字段，其余沿用预设。
+ */
+export type WorkflowRunPreset = {
+    id: string;
+    workflow_id: string;
+    label: string;
+    input: Record<string, unknown>;
+    entrypoint: string;
+    exitpoint: string;
+    created_at: string;
+    updated_at: string;
+};
+
+export type WorkflowRunPresetInput = {
+    id?: string;
+    workflow_id: string;
+    label?: string;
+    input?: Record<string, unknown>;
+    entrypoint?: string;
+    exitpoint?: string;
+};
+
+export type WorkflowInteractionKind = 'approval' | 'feedback' | 'form' | 'evidence' | 'external_wait' | string;
+
+/**
+ * Workflow Runner 等待态的稳定 UI View Model。
+ * 事实仍来自 Runtime Event；页面不再直接猜测 payload 字段。
+ */
+export type WorkflowInteractionRequest = {
+    schema_version: 'interaction_request.v1' | string;
+    id: string;
+    run_id: string;
+    step_id: string;
+    kind: WorkflowInteractionKind;
+    title: string;
+    description: string;
+    required_action: 'approve_or_reject' | 'submit_feedback' | 'submit_form' | 'submit_evidence' | 'inspect_run' | string;
+    status: 'pending' | 'resolved' | 'expired' | string;
+    source_event_id?: string;
+    created_at?: string;
+    risk_level?: string;
+    schema?: Record<string, unknown> | null;
+    metadata?: Record<string, unknown>;
+};
+
+export type ScheduleInput = {
+    id?: string;
+    kind?: string;
+    target_id: string;
+    preset_id?: string;
+    cron: string;
+    input?: Record<string, unknown>;
+    execution?: ScheduleExecution;
+    enabled?: boolean;
 };
 
 export type WorkflowCenterSnapshot = {
     workflows: WorkflowCenterItem[];
     runs: Array<{
+        workflow_id: string;
+        workflow_name: string;
+        workflow_version: string;
+        business_stage: string;
+        current_step_title: string;
+        waiting_kind: WorkflowInteractionKind | '';
+        waiting_reason?: string;
+        required_action?: string;
+        interaction_request?: WorkflowInteractionRequest | null;
+        project_root: string;
+        workspace_root: string;
+        app_id: string;
         run: WorkflowLocalRun;
         projection_count: number;
         projection_status: string;
     }>;
+    catalog?: WorkflowCatalogItem[];
+    catalog_error?: string;
+};
+
+export type ConnectorStateItem = {
+    id: string;
+    name: string;
+    version: string;
+    availability: string;
+    credential_ownership: string;
+    enabled: boolean;
+    revoked: boolean;
+    source: string;
+    remote_revision: number;
+    reason: string;
+    updated_at: string;
+    credential_count: number;
 };
 
 export type WorkflowRunSnapshot = {
@@ -283,7 +501,74 @@ export type WorkflowRunSnapshot = {
         payload: unknown;
     }>;
     projections: Array<{ id: number; status: string; attempts: number; last_error: string; payload: unknown }>;
+    interaction_request?: WorkflowInteractionRequest | null;
     workflow: { package: WorkflowPackage; enabled: boolean; view: WorkflowView | null } | null;
+};
+
+export type WorkflowRunVerification = {
+    workflow_id: string;
+    run_id: string;
+    package_digest: string;
+    signature_key_id: string;
+    signature_algorithm: string;
+    candidate_id: string;
+    commit_sha: string;
+    tree_digest: string;
+    artifacts: Array<{
+        artifact_id: string;
+        artifact_type: string;
+        uri: string;
+        sha256: string;
+        size_bytes: number;
+        schema_validation: string;
+        candidate_bound: boolean;
+    }>;
+};
+
+export type WorkflowPreflight = {
+    ready: boolean;
+    package_id: string;
+    package_version: string;
+    agent_version: string;
+    capabilities: Array<{ id: string; available: boolean; source: string; availability: string }>;
+    skills: Array<{ id: string; available: boolean; version: string; scope: string }>;
+    runtimes: Array<{ id: string; available: boolean; status: string; version: string; network_isolated: boolean; tool_access: string }>;
+    connectors: Array<{
+        id: string;
+        available: boolean;
+        availability: string;
+        credential_ownership: string;
+        health_check: string;
+        health_target: string;
+        health_status: string;
+        health_message: string;
+        credentials: Array<{
+            handle: string;
+            target: string;
+            kind: 'file_path' | 'secret' | string;
+            required: boolean;
+            configured: boolean;
+            configured_connector_id: string;
+        }>;
+    }>;
+    tools: Array<{ id: string; available: boolean; required: boolean; resolved_path: string }>;
+    diagnostics: Array<{
+        severity: 'blocker' | 'warning' | string;
+        code: string;
+        stage: string;
+        message: string;
+        remediation: string;
+        retryable: boolean;
+    }>;
+    blockers: string[];
+    warnings: string[];
+};
+
+export type ConnectorCredentialSummary = {
+    handle: string;
+    connector_id: string;
+    kind: 'file_path' | 'secret' | string;
+    updated_at: string;
 };
 
 export type BuiltinAIRuntimeStatus = {
@@ -291,6 +576,10 @@ export type BuiltinAIRuntimeStatus = {
     status: 'ready' | 'unavailable' | string;
     version: string;
     compatible: boolean;
+    compatible_with_agent?: boolean;
+    min_agent_version?: string;
+    max_agent_version?: string;
+    capabilities?: string[];
     message: string;
     diagnostics: {
         engine_id: string;
@@ -300,9 +589,39 @@ export type BuiltinAIRuntimeStatus = {
     };
 };
 
+export type AcpRuntimeProfile = {
+    provider_id: string;
+    display_name: string;
+    executable: string;
+    args: string[];
+    version: string;
+    permission_policy: 'deny' | 'allow_once' | 'prompt' | string;
+    enabled: boolean;
+};
+
+export type AcpRuntimeProfileSnapshot = {
+    profiles: AcpRuntimeProfile[];
+    providers: Array<{
+        provider: string;
+        version?: string;
+        status: 'ready' | 'unavailable' | 'unsupported' | string;
+        capabilities?: Record<string, unknown>;
+    }>;
+};
+
+export type AcpRuntimeProfileInput = {
+    providerId: string;
+    displayName: string;
+    executable: string;
+    args: string[];
+    version: string;
+    permissionPolicy: 'deny' | 'allow_once' | 'prompt';
+    enabled: boolean;
+};
+
 export type BuiltinAIRuntimeInstallationStatus = {
     state: 'idle' | 'working' | 'ready' | 'failed' | string;
-    operation: 'none' | 'install' | 'update' | 'repair' | 'uninstall' | string;
+    operation: 'none' | 'install' | 'update' | 'repair' | 'local' | 'uninstall' | string;
     stage: 'idle' | 'resolving' | 'downloading' | 'verifying' | 'installing' | 'uninstalling' | 'ready' | 'failed' | string;
     progress_percent: number;
     message: string;
@@ -466,6 +785,7 @@ export type ExtensionUnitInstallation = {
     asset_id: string;
     version: string;
     source_id: string;
+    sha256?: string;
     side: 'local' | 'remote' | 'development' | string;
 };
 
@@ -475,6 +795,13 @@ export type ExtensionUnitAsset = {
     asset_id: string;
     name: string;
     version: string;
+    source_id: string;
+    source_kind: 'local' | 'github' | string;
+    artifact_url: string;
+    sha256: string;
+    signature_key_id: string;
+    signature_algorithm: string;
+    channel: string;
 };
 
 /// 分发单元的取用侧：本地开发工作区是默认的最新权威，GitHub 分发源为兜底。
@@ -498,6 +825,18 @@ export type ExtensionDistributionUnit = {
     project_ids: string[];
     installed: ExtensionUnitInstallation[];
     assets: ExtensionUnitAsset[];
+    /** 非取用侧的情况；单元只有一侧来源时为 null。 */
+    other_side?: ExtensionUnitOtherSide | null;
+};
+
+/**
+ * 单元里另一侧的可用性与版本落差。取用侧决定市场和安装看到的内容，另一侧的更高
+ * 版本不会自动顶上来，界面据此提示「远端已有更新，可切换取用侧」。
+ */
+export type ExtensionUnitOtherSide = {
+    side: 'local' | 'remote' | string;
+    available: boolean;
+    newer_count: number;
 };
 
 export type ExtensionUnitInstallReport = {
@@ -537,12 +876,16 @@ export type WorkflowCatalogItem = {
     workflow_id: string;
     name: string;
     description: string;
+    author_name: string;
+    categories: string[];
     version: string;
     release_notes: string;
     published_at: string;
     min_agent_version: string;
     capability_ids: string[];
     channel: string;
+    product_id?: string;
+    release_id?: string;
     artifact_id: string;
     file_name: string;
     file_size: number;
@@ -559,6 +902,7 @@ export type WorkflowCatalogItem = {
     managed: boolean;
     allow_disable: boolean;
     allow_uninstall: boolean;
+    extension_lock?: Record<string, unknown> | null;
 };
 
 export type ExtensionSourceSnapshot = {
@@ -651,6 +995,10 @@ export type PluginCatalogItem = {
     release_notes: string;
     published_at?: string;
     min_agent_version: string;
+    channel?: string;
+    product_id?: string;
+    release_id?: string;
+    artifact_id: string;
     file_size: number;
     sha256: string;
     source?: 'marketplace' | 'organization' | 'system' | string;
@@ -924,6 +1272,8 @@ export type OrganizationSkillCatalogItem = {
     plugin_dependencies: Array<{ plugin_id: string; required: boolean; min_version?: string }>;
     risk_summary: string;
     channel: string;
+    product_id?: string;
+    release_id?: string;
     artifact_id: string;
     file_name: string;
     file_size: number;
@@ -1020,6 +1370,50 @@ export type AuthoringPluginDraft = {
     updated_at: string;
 };
 
+export type AuthoringWorkflowDraft = {
+    id?: string;
+    product_key?: string;
+    product_name?: string;
+    package_id: string;
+    version: string;
+    name: string;
+    manifest: {
+        id: string;
+        name: string;
+        description: string;
+        version: string;
+        release_notes?: string;
+        capabilities?: string[];
+        plugin_dependencies?: SkillPluginDependency[];
+    };
+    source_root: string;
+    candidate_path: string;
+    candidate_sha256: string;
+    state: 'draft' | 'candidate' | 'tested' | 'confirmed' | 'submitted';
+    status?: 'submitted' | 'approved' | 'changes_requested' | 'rejected' | 'superseded';
+    review_status?: string;
+    review_note?: string;
+    release_notes?: string;
+    release_status?: string;
+    role?: 'owner' | 'contributor';
+    sha256?: string;
+    test_report?: Record<string, unknown>;
+    created_at: string;
+    updated_at: string;
+    tested_at?: string | null;
+    confirmed_at?: string | null;
+    submitted_at?: string | null;
+    dashboard_submission_id?: string | null;
+    dashboard_draft_id?: string | null;
+    lock?: {
+        schema_version: string;
+        root: { kind: string; id: string; version: string; sha256: string };
+        dependencies: Array<{ kind: string; id: string; version: string; sha256: string; source_id?: string; required: boolean }>;
+        generated_at: string;
+    } | null;
+    lock_path?: string | null;
+};
+
 export type PluginSubmissionStatus = {
     id: string;
     product_key: string;
@@ -1072,7 +1466,7 @@ export type AuthoringSkillTestResult = {
     clients?: Record<string, CodexSkillActionResponse>;
 };
 
-export type ExtensionProjectKind = 'plugin' | 'skill';
+export type ExtensionProjectKind = 'plugin' | 'skill' | 'workflow';
 
 export type ExtensionWorkspaceSettings = {
     configured: boolean;
@@ -1116,7 +1510,7 @@ export type ExtensionRemoteProject = {
     product_key: string;
     name: string;
     description: string;
-    product_type: 'agent_plugin' | 'organization_skill' | string;
+    product_type: 'agent_plugin' | 'organization_skill' | 'workflow_package' | string;
     role: ExtensionCollaborationRole;
     can_manage: boolean;
     can_submit: boolean;
@@ -1133,10 +1527,10 @@ export type CreateExtensionProjectInput = {
     name: string;
     description: string;
     category: string;
-    template?: 'readonly-tool' | 'job-worker' | 'ui-tool';
+    template?: 'readonly-tool' | 'job-worker' | 'ui-tool' | 'strict' | 'segmented' | 'flexible' | 'development-loop' | 'capability-pipeline';
 };
 
-export type ExtensionCandidate = { kind: 'plugin'; draft: AuthoringPluginDraft } | { kind: 'skill'; draft: AuthoringSkillDraft };
+export type ExtensionCandidate = { kind: 'plugin'; draft: AuthoringPluginDraft } | { kind: 'skill'; draft: AuthoringSkillDraft } | { kind: 'workflow'; draft: AuthoringWorkflowDraft };
 
 export type ExtensionCollaborationRole = 'owner' | 'contributor';
 
@@ -1158,7 +1552,7 @@ export type ExtensionCollaboration = {
     registered: boolean;
     product_key: string;
     product_name?: string;
-    product_type?: 'agent_plugin' | 'organization_skill' | string;
+    product_type?: 'agent_plugin' | 'organization_skill' | 'workflow_package' | string;
     role?: ExtensionCollaborationRole | '';
     can_manage: boolean;
     can_submit: boolean;
@@ -1179,7 +1573,7 @@ export type ExtensionCollaborationInvitation = {
     product_id: string;
     product_key: string;
     product_name: string;
-    product_type: 'agent_plugin' | 'organization_skill' | string;
+    product_type: 'agent_plugin' | 'organization_skill' | 'workflow_package' | string;
     user_id: string;
     role: 'contributor';
     status: 'pending';
@@ -1378,7 +1772,7 @@ export type ManagedAIServiceSummary = {
 };
 
 export type AIServiceListResult = {
-    custom: { services: CustomAIService[] };
+    custom: { services: CustomAIService[]; active_service_id?: string };
     managed: ManagedAIServiceSummary;
     clients: AIProviderImportOverview;
 };
@@ -1394,6 +1788,7 @@ export function invoke<T>(command: string, args?: Record<string, unknown>): Prom
 export const agentApi = {
     status: () => invoke<AgentStatus>('get_agent_status'),
     agentMode: () => invoke<AgentModeSettings>('get_agent_mode'),
+    projectionSyncStatus: () => invoke<ProjectionSyncStatus>('get_projection_sync_status'),
     setAgentMode: (mode: AgentModeSettings['mode']) => invoke<AgentModeSettings>('set_agent_mode', { mode }),
     taskHistory: (limit = 50) => invoke<AgentTaskHistoryItem[]>('get_agent_task_history', { limit }),
     updateStatus: () => invoke<AgentUpdateStatus>('get_agent_update_status'),
@@ -1429,6 +1824,7 @@ export const agentApi = {
     configureRemoteClient: (vendor: RemoteClientVendor, path: string) => invoke<RemoteClientOverview>('configure_remote_client', { vendor, path }),
     pickRemoteClient: (vendor: RemoteClientVendor) => invoke<{ path?: string | null }>('pick_remote_client', { vendor }),
     builtinAiRuntimeStatus: () => invoke<BuiltinAIRuntimeStatus>('get_builtin_ai_runtime_status'),
+    pickRuntimeManifest: () => invoke<{ path?: string | null }>('pick_runtime_manifest'),
     builtinAiRuntimeInstallationStatus: () => invoke<BuiltinAIRuntimeInstallationStatus>('get_builtin_ai_runtime_installation_status'),
     checkBuiltinAiRuntimeUpdate: () => invoke<BuiltinAIRuntimeInstallationStatus>('check_builtin_ai_runtime_update'),
     builtinAiToolContextSummary: () => invoke<BuiltinAIToolContextSummary>('get_builtin_ai_tool_context_summary'),
@@ -1438,20 +1834,48 @@ export const agentApi = {
     validateBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<void>('validate_builtin_ai_mcp_server', { server }),
     reloadBuiltinAiToolContext: () => invoke<void>('reload_builtin_ai_tool_context'),
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
-    startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install') => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation }),
+    startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install', manifestPath?: string) => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation, manifestPath }),
     startBuiltinAiSession: (target?: { projectId?: string; extensionWorkspace?: boolean }) => invoke<string>('start_builtin_ai_session', target || {}),
+    openBuiltinAiWeb: (target?: { projectId?: string; extensionWorkspace?: boolean }) => invoke<string>('open_builtin_ai_web', target || {}),
     syncBuiltinAiModels: () => invoke<BuiltinAiModelSyncResult>('sync_builtin_ai_models'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),
     plugins: () => invoke<PluginRegistry>('get_plugin_registry'),
     workflowCenter: () => invoke<WorkflowCenterSnapshot>('get_workflow_center'),
+    schedules: () => invoke<ScheduleList>('list_schedules'),
+    workflowPresets: (workflowId?: string) => invoke<{ store_path: string; total: number; presets: WorkflowRunPreset[] }>('list_workflow_presets', { workflowId: workflowId ?? null }),
+    setWorkflowPreset: (input: WorkflowRunPresetInput) => invoke<{ saved: boolean; preset: WorkflowRunPreset }>('set_workflow_preset', { input }),
+    deleteWorkflowPreset: (id: string) => invoke<{ removed: boolean; id: string }>('delete_workflow_preset', { id }),
+    setSchedule: (input: ScheduleInput) => invoke<{ saved: boolean; schedule: Schedule; store_path: string }>('set_schedule', { input }),
+    deleteSchedule: (id: string) => invoke<{ removed: boolean; id: string }>('delete_schedule', { id }),
+    skillRuns: (limit = 20) => invoke<SkillRunList>('list_skill_runs', { limit }),
+    runSkill: (skillId: string, input: Record<string, unknown>) => invoke<{ accepted: boolean; run_id: string; run: SkillRun }>('run_skill', { skillId, input }),
+    revealSkillRun: (runId: string) => invoke<void>('reveal_skill_run', { runId }),
+    queryWorkflowCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<WorkflowCatalogItem>>('query_workflow_catalog', { q, category, page, pageSize }),
+    workflowVersions: (workflowId: string) => invoke<WorkflowCatalogItem[]>('get_workflow_versions', { workflowId }),
+    connectorStates: () => invoke<ConnectorStateItem[]>('get_connector_states'),
+    setConnectorEnabled: (connectorId: string, enabled: boolean) => invoke<Record<string, unknown>>('set_connector_enabled', { connectorId, enabled }),
+    revokeConnector: (connectorId: string, reason = '') => invoke<Record<string, unknown>>('revoke_connector', { connectorId, reason }),
+    restoreConnector: (connectorId: string) => invoke<Record<string, unknown>>('restore_connector', { connectorId }),
+    saveConnectorFileCredential: (connectorId: string, handle: string) => invoke<{ cancelled: boolean; credential: ConnectorCredentialSummary | null }>('set_connector_file_credential', { connectorId, handle }),
+    saveConnectorSecretCredential: (connectorId: string, handle: string, secret: string) => invoke<ConnectorCredentialSummary>('set_connector_secret_credential', { connectorId, handle, secret }),
+    removeConnectorCredential: (handle: string) => invoke<boolean>('remove_connector_credential', { handle }),
+    installWorkflowCatalogItem: (workflowId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke<Record<string, unknown>>('install_workflow_catalog_item', { workflowId, version, source, artifactId, sha256 }),
+    pickWorkflowArchive: () => invoke<{ path?: string | null }>('pick_workflow_archive'),
+    installLocalWorkflowArchive: (archivePath: string, requireSignature = false) => invoke<Record<string, unknown>>('install_local_workflow_archive', { archivePath, requireSignature }),
+    setWorkflowEnabled: (packageId: string, enabled: boolean) => invoke<Record<string, unknown>>('set_workflow_enabled', { packageId, enabled }),
+    rollbackWorkflow: (packageId: string) => invoke<Record<string, unknown>>('rollback_workflow', { packageId }),
+    removeWorkflow: (packageId: string) => invoke<boolean>('remove_workflow', { packageId }),
     workflowRun: (runId: string) => invoke<WorkflowRunSnapshot>('get_workflow_run', { runId }),
+    verifyWorkflowRun: (runId: string) => invoke<WorkflowRunVerification>('verify_workflow_run', { runId }),
+    revealWorkflowArtifact: (runId: string, artifactId: string) => invoke<void>('reveal_workflow_artifact', { runId, artifactId }),
     approveWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('approve_workflow_step', { runId, stepId }),
     rejectWorkflowStep: (runId: string, stepId: string) => invoke<WorkflowLocalRun>('reject_workflow_step', { runId, stepId }),
     cancelWorkflowRun: (runId: string) => invoke<WorkflowLocalRun>('cancel_workflow_run', { runId }),
-    resumeWorkflowRun: (runId: string) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('resume_workflow_run', { runId }),
+    resumeWorkflowRun: (runId: string, feedback?: string) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('resume_workflow_run', { runId, feedback }),
     startWorkflowRun: (packageId: string, input: Record<string, unknown>) => invoke<{ run: WorkflowLocalRun; blocked_step_id: string; completed_steps: string[] }>('start_workflow_run', { packageId, input }),
+    preflightWorkflowRun: (packageId: string, input: Record<string, unknown>) => invoke<WorkflowPreflight>('preflight_workflow_run', { packageId, input }),
     importLocalPlugin: () => invoke<PluginRegistry>('import_local_plugin'),
     importGithubPlugin: (sourceUrl: string) => invoke<PluginRegistry>('import_github_plugin_url', { sourceUrl }),
     extensionDesiredState: () => invoke<ExtensionDesiredState>('get_extension_desired_state'),
@@ -1467,7 +1891,7 @@ export const agentApi = {
     extensionSourceSnapshot: () => invoke<ExtensionSourceSnapshot>('get_extension_source_snapshot'),
     setExtensionUnitAcquisition: (unitKey: string, acquisition: ExtensionSourceAcquisition) =>
         invoke<ExtensionSourceSettings>('set_extension_unit_acquisition', { unitKey, acquisition }),
-    installExtensionUnit: (unitKey: string) => invoke<ExtensionUnitInstallReport>('install_extension_unit', { unitKey }),
+    installExtensionUnit: (unitKey: string, sourceId: string) => invoke<ExtensionUnitInstallReport>('install_extension_unit', { unitKey, sourceId }),
     extensionProvenance: () => invoke<ExtensionProvenance[]>('get_extension_provenance'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
     queryPluginCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<PluginCatalogItem>>('query_plugin_catalog', { q, category, page, pageSize }),
@@ -1479,9 +1903,13 @@ export const agentApi = {
     extensionCollaborationProjects: () => invoke<ExtensionRemoteProject[]>('list_extension_collaboration_projects'),
     openExtensionProjects: () => invoke<ExtensionProject[]>('open_extension_projects'),
     associateExtensionProject: (project: ExtensionRemoteProject) =>
-        invoke<ExtensionProject>('associate_extension_project', {
-            input: {
-                kind: project.product_type === 'agent_plugin' ? 'plugin' : 'skill',
+      invoke<ExtensionProject>('associate_extension_project', {
+        input: {
+          kind: project.product_type === 'agent_plugin'
+            ? 'plugin'
+            : project.product_type === 'workflow_package'
+              ? 'workflow'
+              : 'skill',
                 extension_id: project.product_key,
                 source_repository: project.source_repository,
                 source_default_branch: project.source_default_branch,
@@ -1504,17 +1932,22 @@ export const agentApi = {
     createPluginRevision: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('create_plugin_revision', { pluginId, version }),
     testPluginDraft: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('test_plugin_draft', { pluginId, version }),
     confirmPluginDraft: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('confirm_plugin_draft', { pluginId, version }),
+    workflowDrafts: () => invoke<AuthoringWorkflowDraft[]>('list_workflow_drafts'),
+    testWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('test_workflow_draft', { workflowId, version }),
+    confirmWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('confirm_workflow_draft', { workflowId, version }),
+    submitWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('submit_workflow_draft', { workflowId, version }),
+    workflowSubmissions: () => invoke<{ items?: AuthoringWorkflowDraft[] }>('list_workflow_submissions'),
     submitPluginDraft: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('submit_plugin_draft', { pluginId, version }),
-    pluginVersions: (pluginId: string) => invoke<PluginCatalogItem[]>('get_plugin_versions', { pluginId }),
-    planPluginInstall: (pluginId: string, version?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version }),
+    pluginVersions: (pluginId: string, source?: string) => invoke<PluginCatalogItem[]>('get_plugin_versions', { pluginId, source }),
+    planPluginInstall: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke<PluginInstallPlan>('plan_plugin_install', { pluginId, version, source, artifactId, sha256 }),
     skillCatalog: () => invoke<SkillCatalogResponse>('get_skill_catalog'),
     importLocalSkill: () => invoke<SkillImportResponse>('import_local_skill'),
     importGithubSkill: (sourceUrl: string) => invoke<SkillImportResponse>('import_github_skill_url', { sourceUrl }),
     organizationSkillCatalog: () => invoke<OrganizationSkillCatalogItem[]>('get_organization_skill_catalog'),
     queryOrganizationSkillCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<OrganizationSkillCatalogItem>>('query_organization_skill_catalog', { q, category, page, pageSize }),
-    skillVersions: (skillId: string) => invoke<OrganizationSkillCatalogItem[]>('get_skill_versions', { skillId }),
-    planOrganizationSkillInstall: (skillId: string, version?: string) => invoke<SkillInstallPlan>('plan_organization_skill_install', { skillId, version }),
-    installOrganizationSkill: (skillId: string, version?: string, optionalPluginIds: string[] = []) => invoke<OrganizationSkillInstallResponse>('install_organization_skill', { skillId, version, optionalPluginIds }),
+    skillVersions: (skillId: string, source?: string) => invoke<OrganizationSkillCatalogItem[]>('get_skill_versions', { skillId, source }),
+    planOrganizationSkillInstall: (skillId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke<SkillInstallPlan>('plan_organization_skill_install', { skillId, version, source, artifactId, sha256 }),
+    installOrganizationSkill: (skillId: string, version?: string, optionalPluginIds: string[] = [], source?: string, artifactId?: string, sha256?: string) => invoke<OrganizationSkillInstallResponse>('install_organization_skill', { skillId, version, optionalPluginIds, source, artifactId, sha256 }),
     skillDrafts: () => invoke<AuthoringSkillDraft[]>('list_skill_drafts'),
     skillSubmissions: () => invoke<SkillSubmissionStatus[]>('list_skill_submissions'),
     importSkillCandidate: (revisionOfVersion?: string, parentSubmissionId?: string) => invoke<AuthoringSkillDraft>('import_skill_candidate', { revisionOfVersion, parentSubmissionId }),
@@ -1539,7 +1972,8 @@ export const agentApi = {
     unregisterSkillClient: (skillId: string, clientId: string) => invoke<SkillClientUnregisterResponse>('unregister_skill_client', { skillId, clientId }),
     unregisterSkillClients: (skillId: string) => invoke<SkillClientsUnregisterResponse>('unregister_skill_clients', { skillId }),
     openFolder: (path: string) => invoke('open_folder', { path }),
-    installPlugin: (pluginId: string, version?: string) => invoke('install_plugin', { pluginId, version }),
+    pickWorkspaceDirectory: () => invoke<{ path?: string }>('pick_workspace_directory'),
+    installPlugin: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke('install_plugin', { pluginId, version, source, artifactId, sha256 }),
     uninstallPlugin: (pluginId: string) => invoke('uninstall_plugin', { pluginId }),
     rollbackPlugin: (pluginId: string) => invoke('rollback_plugin', { pluginId }),
     setPluginEnabled: (pluginId: string, enabled: boolean) => invoke('set_plugin_enabled', { pluginId, enabled }),
@@ -1547,6 +1981,10 @@ export const agentApi = {
     fetchAIServiceModels: (input: { base_url: string; api_key: string }) => invoke<AIServiceModelListResult>('fetch_ai_service_models', { baseUrl: input.base_url, apiKey: input.api_key }),
     fetchSavedAIServiceModels: (id: string, baseUrl: string) => invoke<AIServiceModelListResult>('fetch_saved_ai_service_models', { id, baseUrl }),
     listAIServices: () => invoke<AIServiceListResult>('list_ai_services'),
+    acpRuntimeProfiles: () => invoke<AcpRuntimeProfileSnapshot>('list_acp_runtime_profiles'),
+    saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
+    setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
+    removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
     saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: 'openai-chat' | 'openai-responses'; model: string; models: string[]; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
@@ -1557,6 +1995,7 @@ export const agentApi = {
             models: input.models,
             apiKey: input.api_key,
         }),
+    setActiveAIService: (id: string) => invoke<{ active_service_id: string }>('set_active_ai_service', { id }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
     importAIClient: (target: string, service?: string) => invoke<Record<string, unknown>>('import_ai_client', { target, service }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),

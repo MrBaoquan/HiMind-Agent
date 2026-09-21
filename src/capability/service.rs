@@ -85,6 +85,27 @@ struct RegistryCache {
 #[derive(Clone)]
 enum CapabilityHandler {
     SystemHealth,
+    EngineeringProjectResolve,
+    EngineeringCheckpointCreate,
+    EngineeringWorkspaceLeaseAcquire,
+    EngineeringWorkspaceLeaseRelease,
+    EngineeringWorkspaceLeaseList,
+    EngineeringHandoffCreate,
+    WorkflowCatalogList,
+    WorkflowCatalogDescribe,
+    WorkflowRunStart,
+    WorkflowRunGet,
+    ScheduleList,
+    ScheduleSet,
+    ScheduleDelete,
+    WorkflowPresetList,
+    WorkflowPresetSet,
+    WorkflowPresetDelete,
+    SkillRunStart,
+    SkillRunList,
+    SkillRunGet,
+    WorkflowRunFeedback,
+    WorkflowRunCancel,
     WorkflowCandidateFreeze,
     CapabilityCatalogSearch,
     CapabilityCatalogDescribe,
@@ -136,6 +157,11 @@ enum CapabilityHandler {
     SkillSubmissionStatus,
     PluginCandidateSave,
     PluginCandidateTest,
+    WorkflowCandidateSave,
+    WorkflowCandidateTest,
+    WorkflowCandidateConfirm,
+    WorkflowSubmissionSubmit,
+    WorkflowSubmissionStatus,
     PluginSubmissionSubmit,
     PluginSubmissionStatus,
     ExtensionReviewQueue,
@@ -847,7 +873,7 @@ impl CapabilityGateway {
                 json!({
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "enum": ["plugin", "skill"] },
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
                         "workspace_root": { "type": "string" }
                     },
                     "required": ["kind"],
@@ -918,6 +944,394 @@ impl CapabilityGateway {
                 CapabilityHandler::SystemHealth,
             ),
             registration(
+                "engineering.project.resolve",
+                "解析工程开发上下文",
+                "读取工作区 .himind/project.json，解析项目、目标展馆、环境和默认 Workflow，不修改工程文件。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string", "minLength": 1 },
+                        "target": { "type": "string" },
+                        "environment": { "type": "string" }
+                    },
+                    "required": ["workspace_root"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::EngineeringProjectResolve,
+            ),
+            registration(
+                "engineering.checkpoint.create",
+                "创建开发检查点",
+                "读取真实 Git HEAD、分支、工作区状态和可选测试结果，生成不可变 Development Checkpoint；不修改业务源码。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string", "minLength": 1 },
+                        "project_id": { "type": "string", "minLength": 1 },
+                        "target_id": { "type": "string" },
+                        "environment": { "type": "string" },
+                        "tests": {
+                            "type": "array",
+                            "items": { "type": "string", "minLength": 1 },
+                            "uniqueItems": true
+                        },
+                        "created_by": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "client": { "type": "string" },
+                                "session_id": { "type": "string" },
+                                "lease_id": { "type": "string" }
+                            }
+                        }
+                    },
+                    "required": ["workspace_root", "project_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::EngineeringCheckpointCreate,
+            ),
+            registration(
+                "engineering.workspace.lease.acquire",
+                "获取工作区租约",
+                "为 DSH、外部 AI 或 Workflow 获取工作区读写租约，避免同一工程被并发修改。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string", "minLength": 1 },
+                        "project_id": { "type": "string" },
+                        "target_id": { "type": "string" },
+                        "mode": { "enum": ["read", "write"] },
+                        "owner_client": { "type": "string", "minLength": 1 },
+                        "owner_session": { "type": "string" },
+                        "ttl_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 }
+                    },
+                    "required": ["workspace_root", "owner_client"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::EngineeringWorkspaceLeaseAcquire,
+            ),
+            registration(
+                "engineering.workspace.lease.release",
+                "释放工作区租约",
+                "释放指定工作区租约。未知或已经释放的租约按幂等成功处理。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "lease_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["lease_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::EngineeringWorkspaceLeaseRelease,
+            ),
+            registration(
+                "engineering.workspace.lease.list",
+                "工作区租约列表",
+                "列出当前有效的 DSH、外部 AI 和 Workflow 工作区租约。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::EngineeringWorkspaceLeaseList,
+            ),
+            registration(
+                "engineering.handoff.create",
+                "创建 Workflow 交接",
+                "把项目、DevelopmentCheckpoint、目标和 Workflow 选择固化为可审计 Handoff，供交付 Run 使用。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string", "minLength": 1 },
+                        "target_id": { "type": "string" },
+                        "environment": { "type": "string" },
+                        "workspace_root": { "type": "string" },
+                        "from_run_id": { "type": "string" },
+                        "workflow_id": { "type": "string", "minLength": 1 },
+                        "entrypoint": { "type": "string" },
+                        "exitpoint": { "type": "string" },
+                        "development_checkpoint": { "type": "object" },
+                        "candidate": { "type": "object" },
+                        "seed_artifacts": {
+                            "type": "array",
+                            "items": { "type": "string", "minLength": 1 },
+                            "uniqueItems": true
+                        },
+                        "next_actions": {
+                            "type": "array",
+                            "items": { "type": "string", "minLength": 1 },
+                            "uniqueItems": true
+                        },
+                        "notes": { "type": "string" }
+                    },
+                    "required": ["project_id", "workflow_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::EngineeringHandoffCreate,
+            ),
+            registration(
+                "workflow.catalog.list",
+                "Workflow 目录",
+                "列出本机已安装 Workflow，包含生命周期、入口、出口和可用状态。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::WorkflowCatalogList,
+            ),
+            registration(
+                "workflow.catalog.describe",
+                "Workflow 详情",
+                "按稳定 Workflow ID 返回版本、步骤、入口、出口、Artifact 和依赖摘要。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workflow_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["workflow_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowCatalogDescribe,
+            ),
+            registration(
+                "workflow.run.start",
+                "启动 Workflow Run",
+                "校验 Preflight 并创建 Workflow Run；执行在后台继续，返回 Run 快照供 DSH 或外部 AI 跟踪。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workflow_id": { "type": "string", "minLength": 1 },
+                        "input": { "type": "object" },
+                        "seed_checkpoint": { "type": "object" },
+                        "handoff": { "type": "object" },
+                        "execution": {
+                            "type": "object",
+                            "properties": {
+                                "entrypoint": { "type": "string" },
+                                "exitpoint": { "type": "string" },
+                                "seed_artifacts": {
+                                    "type": "array",
+                                    "items": { "type": "string", "minLength": 1 },
+                                    "uniqueItems": true
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["workflow_id", "input"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowRunStart,
+            ),
+            registration(
+                "schedule.list",
+                "定时任务列表",
+                "列出本机定时任务（5 字段 cron、本地时区），并补齐下一次触发时间。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ScheduleList,
+            ),
+            registration(
+                "schedule.set",
+                "设置定时任务",
+                "创建或更新一条定时任务；目前支持 workflow 目标，到点由 Agent 调度器启动同一条 Run 路径。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                        "kind": { "type": "string", "minLength": 1 },
+                        "target_id": { "type": "string", "minLength": 1 },
+                        "cron": { "type": "string", "minLength": 1 },
+                        "input": { "type": "object" },
+                        "execution": {
+                            "type": "object",
+                            "properties": {
+                                "entrypoint": { "type": "string" },
+                                "exitpoint": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        },
+                        "enabled": { "type": "boolean" }
+                    },
+                    "required": ["target_id", "cron"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ScheduleSet,
+            ),
+            registration(
+                "schedule.delete",
+                "删除定时任务",
+                "删除一条定时任务；已经启动的运行不受影响。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "minLength": 1, "maxLength": 64 }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ScheduleDelete,
+            ),
+            registration(
+                "workflow.preset.list",
+                "工作流启动预设",
+                "列出已保存的启动参数预设；同一个工作流针对多个工作区复用时只改工作区。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workflow_id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowPresetList,
+            ),
+            registration(
+                "workflow.preset.set",
+                "保存工作流启动预设",
+                "保存/更新一套启动参数（输入、入口出口），供后续一键启动复用。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                        "workflow_id": { "type": "string", "minLength": 1 },
+                        "label": { "type": "string" },
+                        "input": { "type": "object" },
+                        "entrypoint": { "type": "string" },
+                        "exitpoint": { "type": "string" }
+                    },
+                    "required": ["workflow_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowPresetSet,
+            ),
+            registration(
+                "workflow.preset.delete",
+                "删除工作流启动预设",
+                "删除一条启动参数预设；不影响已经启动的运行。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "minLength": 1, "maxLength": 64 }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowPresetDelete,
+            ),
+            registration(
+                "skill.run",
+                "运行技能",
+                "按技能说明（SKILL.md）与任务输入跑一次一次性 AI 运行，结果写入 Agent 的 skill-runs 记录。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "skill_id": { "type": "string", "minLength": 1 },
+                        "task": { "type": "string", "minLength": 1 },
+                        "workspace_root": { "type": "string" },
+                        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+                        "tools": { "enum": ["none", "default"] },
+                        "input": { "type": "object" }
+                    },
+                    "required": ["skill_id", "task"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillRunStart,
+            ),
+            registration(
+                "skill.run.list",
+                "技能运行记录",
+                "列出最近的技能运行及其结果文件位置。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillRunList,
+            ),
+            registration(
+                "skill.run.get",
+                "读取技能运行",
+                "读取一次技能运行的状态、结果预览与结果文件位置。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SkillRunGet,
+            ),
+            registration(
+                "workflow.run.get",
+                "读取 Workflow Run",
+                "读取 Workflow Run、步骤、审批、Artifact、Events 和 Projection 状态。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowRunGet,
+            ),
+            registration(
+                "workflow.run.feedback",
+                "提交 Workflow 反馈",
+                "向等待反馈的 Development Loop 提交用户反馈，并在后台继续执行。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 },
+                        "feedback": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["run_id", "feedback"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowRunFeedback,
+            ),
+            registration(
+                "workflow.run.cancel",
+                "取消 Workflow Run",
+                "取消仍在执行的 Workflow Run，并同步中断关联审批。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": { "type": "string", "minLength": 1 },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowRunCancel,
+            ),
+            registration(
                 "workflow.candidate.freeze",
                 "冻结交付候选",
                 "读取真实 Git HEAD、Tree Digest 和工作区状态，生成不可变 Candidate Artifact。",
@@ -927,8 +1341,11 @@ impl CapabilityGateway {
                     "properties": {
                         "project_root": { "type": "string" },
                         "repository_root": { "type": "string" },
+                        "workspace_root": { "type": "string" },
+                        "source_root": { "type": "string" },
                         "candidate_artifact_id": { "type": "string", "minLength": 1 },
                         "allow_dirty": { "type": "boolean" },
+                        "development_checkpoint": { "type": "object" },
                         "workflow_context": { "type": "object" }
                     },
                     "required": ["candidate_artifact_id"],
@@ -1270,12 +1687,12 @@ impl CapabilityGateway {
             registration(
                 "extension.test",
                 "测试扩展候选",
-                "按插件或 Skill 类型执行完整的候选测试闭环并返回结构化报告。",
+                "按插件、Skill 或 Workflow 类型执行候选测试并返回结构化报告。",
                 "local_write",
                 json!({
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "enum": ["plugin", "skill"] },
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
                         "id": { "type": "string" },
                         "version": { "type": "string" }
                     },
@@ -1371,6 +1788,54 @@ impl CapabilityGateway {
                 "local_write",
                 authoring_identity_schema(),
                 CapabilityHandler::PluginCandidateTest,
+            ),
+            registration(
+                "extension.workflow.candidate.save",
+                "保存 Workflow 候选",
+                "校验 Workflow 源码目录，生成不可变 .hmwf Candidate，并返回 Workflow 身份和 SHA-256。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "source_root": { "type": "string" }
+                    },
+                    "required": ["workspace_root"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkflowCandidateSave,
+            ),
+            registration(
+                "extension.workflow.candidate.test",
+                "测试 Workflow 候选",
+                "重新生成候选制品并比对 SHA-256，校验 Workflow Manifest、资产和 Step DAG。",
+                "local_write",
+                authoring_identity_schema(),
+                CapabilityHandler::WorkflowCandidateTest,
+            ),
+            registration(
+                "extension.workflow.candidate.confirm",
+                "确认 Workflow 候选",
+                "复验 Candidate 哈希后确认当前版本，后续提交审核只能引用该不可变 Candidate。",
+                "local_write",
+                authoring_identity_schema(),
+                CapabilityHandler::WorkflowCandidateConfirm,
+            ),
+            registration(
+                "extension.workflow.submission.submit",
+                "提交 Workflow 审核",
+                "将已确认的 Workflow Candidate、依赖锁和本地测试报告提交到组织审核。",
+                "network_write",
+                authoring_identity_schema(),
+                CapabilityHandler::WorkflowSubmissionSubmit,
+            ),
+            registration(
+                "extension.workflow.submission.status",
+                "Workflow 提审状态",
+                "读取当前绑定用户的 Workflow 提审状态和审核意见。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::WorkflowSubmissionStatus,
             ),
             registration(
                 "extension.plugin.submission.submit",
@@ -2030,6 +2495,253 @@ impl CapabilityGateway {
         };
         let result = match registration.handler {
             CapabilityHandler::SystemHealth => Ok(self.health(context)),
+            CapabilityHandler::EngineeringProjectResolve => {
+                let workspace = input
+                    .get("workspace_root")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("engineering.project.resolve requires workspace_root")?;
+                let target = input
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let environment = input
+                    .get("environment")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let (project, workspace_root) = crate::engineering_project::load_from_workspace(
+                    std::path::Path::new(workspace),
+                )?;
+                project.resolved_snapshot(&workspace_root, target, environment)
+            }
+            CapabilityHandler::EngineeringCheckpointCreate => {
+                crate::development_checkpoint::create(&input)
+            }
+            CapabilityHandler::EngineeringWorkspaceLeaseAcquire => {
+                crate::workspace_lease::acquire(&input)
+            }
+            CapabilityHandler::EngineeringWorkspaceLeaseRelease => {
+                crate::workspace_lease::release(&input)
+            }
+            CapabilityHandler::EngineeringWorkspaceLeaseList => {
+                crate::workspace_lease::list(&input)
+            }
+            CapabilityHandler::EngineeringHandoffCreate => crate::workflow_handoff::create(&input),
+            CapabilityHandler::WorkflowCatalogList => {
+                let store = crate::workflow::WorkflowStore::open_default()?;
+                let items = store
+                    .list()?
+                    .into_iter()
+                    .map(|item| {
+                        json!({
+                            "id": item.package.id,
+                            "name": item.package.name,
+                            "version": item.package.version,
+                            "description": item.package.description,
+                            "enabled": item.enabled,
+                            "execution_policy": item.package.execution_policy,
+                            "entrypoints": item.package.entrypoints,
+                            "exits": item.package.exits,
+                            "ui": item.package.ui,
+                            "supported_runtimes": item.package.supported_runtimes,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "ok": true, "workflows": items }))
+            }
+            CapabilityHandler::WorkflowCatalogDescribe => {
+                let workflow_id = input
+                    .get("workflow_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.catalog.describe requires workflow_id")?;
+                let item = crate::workflow::WorkflowStore::open_default()?
+                    .list()?
+                    .into_iter()
+                    .find(|item| item.package.id == workflow_id)
+                    .ok_or_else(|| format!("workflow not found: {workflow_id}"))?;
+                Ok(json!({
+                    "ok": true,
+                    "enabled": item.enabled,
+                    "previous_version": item.previous_version,
+                    "package": item.package,
+                }))
+            }
+            CapabilityHandler::WorkflowRunStart => {
+                let workflow_id = input
+                    .get("workflow_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.run.start requires workflow_id")?;
+                let mut workflow_input = input
+                    .get("input")
+                    .cloned()
+                    .filter(Value::is_object)
+                    .ok_or("workflow.run.start requires input object")?;
+                if let Some(execution) = input.get("execution") {
+                    if let Some(object) = workflow_input.as_object_mut() {
+                        object.insert("execution".to_string(), execution.clone());
+                    }
+                }
+                if let Some(checkpoint) = input.get("seed_checkpoint") {
+                    if let Some(object) = workflow_input.as_object_mut() {
+                        object.insert("development_checkpoint".to_string(), checkpoint.clone());
+                    }
+                }
+                if let Some(handoff) = input.get("handoff") {
+                    if let Some(object) = workflow_input.as_object_mut() {
+                        object.insert("handoff".to_string(), handoff.clone());
+                        if let Some(checkpoint) = handoff.get("development_checkpoint") {
+                            object.insert("development_checkpoint".to_string(), checkpoint.clone());
+                        }
+                    }
+                }
+                crate::app::commands::schedule_workflow_with_gateway(
+                    self.clone(),
+                    workflow_id,
+                    workflow_input,
+                    context.clone(),
+                )
+            }
+            CapabilityHandler::ScheduleList => crate::scheduler::list(crate::scheduler::now_epoch()),
+            CapabilityHandler::ScheduleSet => {
+                crate::scheduler::set(&input, crate::scheduler::now_epoch())
+            }
+            CapabilityHandler::ScheduleDelete => {
+                let id = input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("schedule.delete requires id")?;
+                crate::scheduler::delete(id)
+            }
+            CapabilityHandler::WorkflowPresetList => {
+                let workflow_id = input
+                    .get("workflow_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                crate::workflow::list_run_presets(workflow_id)
+            }
+            CapabilityHandler::WorkflowPresetSet => {
+                crate::workflow::set_run_preset(&input, crate::scheduler::now_epoch())
+            }
+            CapabilityHandler::WorkflowPresetDelete => {
+                let id = input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.preset.delete requires id")?;
+                crate::workflow::delete_run_preset(id)
+            }
+            CapabilityHandler::SkillRunStart => {
+                let skill_id = input
+                    .get("skill_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("skill.run requires skill_id")?;
+                let mut run_input = input
+                    .get("input")
+                    .cloned()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                if let Some(object) = run_input.as_object_mut() {
+                    for key in ["task", "workspace_root", "timeout_seconds"] {
+                        if let Some(value) = input.get(key) {
+                            object.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                crate::skill_run::start(
+                    self.options(),
+                    "",
+                    skill_id,
+                    &run_input,
+                )
+            }
+            CapabilityHandler::SkillRunList => {
+                let limit = input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(20);
+                crate::skill_run::list(limit)
+            }
+            CapabilityHandler::SkillRunGet => {
+                let run_id = input
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("skill.run.get requires run_id")?;
+                let record = crate::skill_run::get(run_id)?
+                    .ok_or_else(|| format!("技能运行不存在：{run_id}"))?;
+                Ok(serde_json::to_value(record)?)
+            }
+            CapabilityHandler::WorkflowRunGet => {
+                let run_id = input
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.run.get requires run_id")?;
+                crate::app::commands::workflow_run_snapshot(run_id)
+            }
+            CapabilityHandler::WorkflowRunFeedback => {
+                let run_id = input
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.run.feedback requires run_id")?;
+                let feedback = input
+                    .get("feedback")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.run.feedback requires feedback")?;
+                crate::app::commands::schedule_resume_workflow_with_gateway(
+                    self.clone(),
+                    run_id,
+                    Some(feedback),
+                )
+            }
+            CapabilityHandler::WorkflowRunCancel => {
+                let run_id = input
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("workflow.run.cancel requires run_id")?;
+                let reason = input
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("workflow canceled through MCP");
+                let runner = crate::workflow::WorkflowRunner::open_default()?;
+                let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+                let run = ledger
+                    .get_run(run_id)?
+                    .ok_or_else(|| format!("workflow run not found: {run_id}"))?;
+                let approval_id = if run.current_step_id.trim().is_empty() {
+                    String::new()
+                } else {
+                    crate::workflow::workflow_approval_id(&run.run_id, &run.current_step_id)
+                };
+                let run = runner.cancel(run, reason)?;
+                if !approval_id.is_empty() {
+                    let _ = self
+                        .approval_manager
+                        .interrupt(&approval_id, "workflow_canceled");
+                }
+                Ok(serde_json::to_value(run)?)
+            }
             CapabilityHandler::WorkflowCandidateFreeze => crate::workflow::freeze_candidate(&input),
             CapabilityHandler::CapabilityCatalogSearch => {
                 Ok(self.search_capabilities(context, &input)?)
@@ -2235,6 +2947,49 @@ impl CapabilityGateway {
                 )?)?)
             }
             CapabilityHandler::PluginCandidateTest => self.test_plugin_candidate(input),
+            CapabilityHandler::WorkflowCandidateSave => {
+                validate_mcp_capability_workspace(context, capability_id, &input)?;
+                let source_root = input
+                    .get("source_root")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        input
+                            .get("workspace_root")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .ok_or("workflow source_root or workspace_root is required")?;
+                Ok(serde_json::to_value(
+                    crate::workflow::save_authoring_candidate(Path::new(source_root))?,
+                )?)
+            }
+            CapabilityHandler::WorkflowCandidateTest => {
+                let (id, version) = authoring_identity(&input)?;
+                let capabilities = self.list_capabilities(&InvocationContext::local_http())?;
+                Ok(serde_json::to_value(
+                    crate::workflow::test_authoring_candidate_with_capabilities(
+                        &id,
+                        &version,
+                        &capabilities,
+                    )?,
+                )?)
+            }
+            CapabilityHandler::WorkflowCandidateConfirm => {
+                let (id, version) = authoring_identity(&input)?;
+                let capabilities = self.list_capabilities(&InvocationContext::local_http())?;
+                Ok(serde_json::to_value(
+                    crate::workflow::confirm_authoring_candidate_with_capabilities(
+                        &id,
+                        &version,
+                        &capabilities,
+                    )?,
+                )?)
+            }
+            CapabilityHandler::WorkflowSubmissionSubmit => self.submit_workflow_candidate(input),
+            CapabilityHandler::WorkflowSubmissionStatus => self.workflow_submission_status(),
             CapabilityHandler::PluginSubmissionSubmit => self.submit_plugin_candidate(input),
             CapabilityHandler::PluginSubmissionStatus => self.plugin_submission_status(),
             CapabilityHandler::ExtensionReviewQueue => self.extension_review_queue(input),
@@ -2774,14 +3529,14 @@ impl CapabilityGateway {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        if !matches!(kind.as_str(), "plugin" | "skill") {
+        if !matches!(kind.as_str(), "plugin" | "skill" | "workflow") {
             return Err(crate::extension_authoring::blocked_error(
                 "unknown",
                 vec![crate::extension_authoring::blocker(
                     "invalid_extension_kind",
                     "preflight",
-                    "kind 必须是 plugin 或 skill",
-                    "使用 kind=plugin 或 kind=skill 重新调用",
+                    "kind 必须是 plugin、skill 或 workflow",
+                    "使用 kind=plugin、kind=skill 或 kind=workflow 重新调用",
                     false,
                 )],
                 Vec::new(),
@@ -2875,11 +3630,21 @@ impl CapabilityGateway {
                 "extension.plugin.build",
                 "extension.plugin.package",
             ],
-            _ => vec![
+            "skill" => vec![
                 "extension.environment.preflight",
                 "extension.skill.scaffold",
                 "extension.skill.validate",
                 "extension.skill.package",
+            ],
+            _ => vec![
+                "extension.environment.preflight",
+                "extension.workflow.scaffold",
+                "extension.workflow.validate",
+                "extension.workflow.build",
+                "extension.workflow.package",
+                "extension.workflow.candidate.save",
+                "extension.workflow.candidate.test",
+                "extension.test",
             ],
         };
         let visible_capabilities = self.list_capabilities(&InvocationContext::local_http())?;
@@ -2908,7 +3673,7 @@ impl CapabilityGateway {
         }
         match crate::capability::plugin::find_plugin("com.himind.extension-development-tools") {
             Ok(Some(plugin)) if plugin.enabled && plugin.error.is_none() => {
-                let minimum = "1.3.1";
+                let minimum = "1.4.0";
                 if crate::skill::resolver::compare_versions(&plugin.version, minimum)
                     == std::cmp::Ordering::Less
                 {
@@ -2955,21 +3720,25 @@ impl CapabilityGateway {
         }
 
         let required_skill = match kind.as_str() {
-            "plugin" => (
+            "plugin" => Some((
                 "com.himind.skill.develop-himind-plugins",
                 "1.7.0",
                 "extension.plugin.scaffold",
-            ),
-            _ => (
+            )),
+            "skill" => Some((
                 "com.himind.skill.develop-himind-skills",
                 "1.8.0",
                 "extension.skill.scaffold",
-            ),
+            )),
+            _ => Some((
+                "com.himind.skill.develop-himind-workflows",
+                "1.0.0",
+                "extension.workflow.scaffold",
+            )),
         };
-        match crate::skill::store::SkillStore::new().list_records() {
-            Ok(records) => {
-                let (skill_id, minimum, required_capability) = required_skill;
-                match records.iter().find(|record| record.manifest.id == skill_id) {
+        if let Some((skill_id, minimum, required_capability)) = required_skill {
+            match crate::skill::store::SkillStore::new().list_records() {
+                Ok(records) => match records.iter().find(|record| record.manifest.id == skill_id) {
                     Some(record)
                         if crate::skill::resolver::compare_versions(
                             &record.manifest.version,
@@ -3016,18 +3785,18 @@ impl CapabilityGateway {
                         "authoring_skill_missing",
                         "toolchain",
                         format!("未安装 {skill_id}"),
-                        "安装对应的插件开发助手或技能开发助手后重试",
+                        "安装对应的插件开发助手、技能开发助手或工作流开发助手后重试",
                         true,
                     )),
-                }
+                },
+                Err(error) => blockers.push(crate::extension_authoring::blocker(
+                    "authoring_skill_lookup_failed",
+                    "toolchain",
+                    format!("读取三件套 Skill 失败: {error}"),
+                    "修复 Agent Skill Store 后重新执行预检",
+                    true,
+                )),
             }
-            Err(error) => blockers.push(crate::extension_authoring::blocker(
-                "authoring_skill_lookup_failed",
-                "toolchain",
-                format!("读取三件套 Skill 失败: {error}"),
-                "修复 Agent Skill Store 后重新执行预检",
-                true,
-            )),
         }
 
         let mut warnings = Vec::new();
@@ -3043,12 +3812,22 @@ impl CapabilityGateway {
                 "当前为组织模式，但 Agent 尚未完成工作台配对；本地创作不受影响，提审前需完成配对。",
             ));
         }
-        let next_steps = vec![
-            "调用 extension.authoring.identity 获取作者资料".to_string(),
-            format!("调用 extension.{kind}.scaffold 创建或更新工程"),
-            format!("调用 extension.{kind}.validate、构建/打包能力生成候选制品"),
-            "调用 extension.test 完成依赖、注册、运行时和清理闭环".to_string(),
-        ];
+        let next_steps = if kind == "workflow" {
+            vec![
+                "调用 extension.workflow.scaffold 创建标准 Workflow 工程".to_string(),
+                "调用 extension.workflow.validate、build、package 完成工程和制品检查".to_string(),
+                "调用 extension.workflow.candidate.save 生成不可变 .hmwf Candidate".to_string(),
+                "调用 extension.test 或 extension.workflow.candidate.test 完成 Candidate 验证"
+                    .to_string(),
+            ]
+        } else {
+            vec![
+                "调用 extension.authoring.identity 获取作者资料".to_string(),
+                format!("调用 extension.{kind}.scaffold 创建或更新工程"),
+                format!("调用 extension.{kind}.validate、构建/打包能力生成候选制品"),
+                "调用 extension.test 完成依赖、注册、运行时和清理闭环".to_string(),
+            ]
+        };
         if blockers.is_empty() {
             Ok(crate::extension_authoring::success(
                 &kind,
@@ -3626,13 +4405,30 @@ impl CapabilityGateway {
                     "report": report
                 }))
             }
+            "workflow" => {
+                let capabilities = self.list_capabilities(&InvocationContext::local_http())?;
+                let result = crate::workflow::test_authoring_candidate_with_capabilities(
+                    &id,
+                    &version,
+                    &capabilities,
+                )
+                .map_err(|error| authoring_operation_error("workflow", "test", error))?;
+                Ok(json!({
+                    "kind": "workflow",
+                    "id": id,
+                    "version": version,
+                    "state": "passed",
+                    "checks": result.test_report.get("checks").cloned().unwrap_or(Value::Null),
+                    "result": result
+                }))
+            }
             _ => Err(crate::extension_authoring::blocked_error(
                 "unknown",
                 vec![crate::extension_authoring::blocker(
                     "invalid_extension_kind",
                     "test",
-                    "kind must be plugin or skill",
-                    "使用 kind=plugin 或 kind=skill 重新调用 extension.test",
+                    "kind must be plugin, skill or workflow",
+                    "使用 kind=plugin、kind=skill 或 kind=workflow 重新调用 extension.test",
                     false,
                 )],
                 Vec::new(),
@@ -3702,6 +4498,31 @@ impl CapabilityGateway {
             &id,
             &version,
         )?)?)
+    }
+
+    fn submit_workflow_candidate(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let (id, version) = authoring_identity(&input)?;
+        let agent_id = self.load_paired_agent()?;
+        Ok(serde_json::to_value(
+            crate::workflow::submit_authoring_candidate(&self.options, &agent_id, &id, &version)?,
+        )?)
+    }
+
+    fn workflow_submission_status(&self) -> Result<Value, Box<dyn Error>> {
+        let agent_id = self.load_paired_agent()?;
+        let access = crate::api::oauth::platform_access_token(
+            &self.options,
+            crate::api::oauth::CREATIVE_SUBMIT_SCOPE,
+        )?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        crate::api::distribution::workflow_submissions(
+            &client,
+            &self.options.api_base,
+            &agent_id,
+            &access.token,
+        )
     }
 
     fn plugin_submission_status(&self) -> Result<Value, Box<dyn Error>> {
@@ -4069,7 +4890,9 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         "extension.skill.submission.submit"
         | "extension.skill.submission.status"
         | "extension.plugin.submission.submit"
-        | "extension.plugin.submission.status" => Some(crate::api::oauth::CREATIVE_SUBMIT_SCOPE),
+        | "extension.plugin.submission.status"
+        | "extension.workflow.submission.submit"
+        | "extension.workflow.submission.status" => Some(crate::api::oauth::CREATIVE_SUBMIT_SCOPE),
         "extension.review.queue" | "extension.review.get" | "extension.review.decide" => {
             Some(crate::api::oauth::RELEASE_MANAGE_SCOPE)
         }
@@ -4249,6 +5072,8 @@ fn is_dashboard_provider_handler(handler: &CapabilityHandler) -> bool {
             | CapabilityHandler::SkillSubmissionStatus
             | CapabilityHandler::PluginSubmissionSubmit
             | CapabilityHandler::PluginSubmissionStatus
+            | CapabilityHandler::WorkflowSubmissionSubmit
+            | CapabilityHandler::WorkflowSubmissionStatus
             | CapabilityHandler::ExtensionReviewQueue
             | CapabilityHandler::ExtensionReviewGet
             | CapabilityHandler::ExtensionReviewDecide
@@ -4303,7 +5128,10 @@ fn should_sync_remote_approval(
     mode: crate::app::runtime_mode::AgentMode,
     descriptor: &CapabilityDescriptor,
 ) -> bool {
-    mode.dashboard_enabled() && descriptor.dashboard_provider
+    crate::approval::ownership::requires_dashboard_fact(
+        mode.dashboard_enabled(),
+        descriptor.dashboard_provider,
+    )
 }
 
 fn is_business_integration_handler(handler: &CapabilityHandler) -> bool {
@@ -4429,7 +5257,10 @@ fn dashboard_route_for(capability_id: &str) -> Option<String> {
 // projections. Plugin invocations perform the same check inside the plugin
 // runtime, but validating here gives all MCP callers one deterministic error
 // contract before any network, process or filesystem side effect occurs.
-fn validate_capability_input_schema(schema: &Value, input: &Value) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_capability_input_schema(
+    schema: &Value,
+    input: &Value,
+) -> Result<(), Box<dyn Error>> {
     let Some(schema_object) = schema.as_object() else {
         return Ok(());
     };
@@ -4702,12 +5533,17 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::SkillClientUnregister
         | CapabilityHandler::SkillClientsUnregister
         | CapabilityHandler::PluginCandidateSave
-        | CapabilityHandler::PluginCandidateTest => CapabilityAvailability::Local,
-        CapabilityHandler::SkillSubmissionSubmit
-        | CapabilityHandler::SkillSubmissionStatus
+        | CapabilityHandler::PluginCandidateTest
+        | CapabilityHandler::WorkflowCandidateSave
+        | CapabilityHandler::WorkflowCandidateTest
+        | CapabilityHandler::WorkflowCandidateConfirm => CapabilityAvailability::Local,
+        CapabilityHandler::WorkflowSubmissionSubmit
+        | CapabilityHandler::WorkflowSubmissionStatus
         | CapabilityHandler::PluginSubmissionSubmit
         | CapabilityHandler::PluginSubmissionStatus
-        | CapabilityHandler::ExtensionReviewQueue
+        | CapabilityHandler::SkillSubmissionSubmit
+        | CapabilityHandler::SkillSubmissionStatus => CapabilityAvailability::ControlPlane,
+        CapabilityHandler::ExtensionReviewQueue
         | CapabilityHandler::ExtensionReviewGet
         | CapabilityHandler::ExtensionReviewDecide
         | CapabilityHandler::SoftwareDistributionPublish

@@ -2,20 +2,30 @@ use serde_json::Value;
 use std::error::Error;
 
 use super::{WorkflowPackage, WorkflowStep, WorkflowStepExecution, WorkflowStepExecutor};
-use crate::agent_core_contracts::LocalRunUsage;
+use crate::agent_core_contracts::{LocalRunStatus, LocalRunUsage};
 use crate::capability::service::CapabilityGateway;
 use crate::capability::types::InvocationContext;
+use crate::store::local_runs::LocalRunLedger;
 
 pub(crate) struct WorkflowGatewayExecutor {
     gateway: CapabilityGateway,
     context: InvocationContext,
+    ledger: LocalRunLedger,
+    run_id: String,
 }
 
 impl WorkflowGatewayExecutor {
-    pub(crate) fn new(gateway: CapabilityGateway, context: InvocationContext) -> Self {
+    pub(crate) fn new(
+        gateway: CapabilityGateway,
+        context: InvocationContext,
+        ledger: LocalRunLedger,
+        run_id: String,
+    ) -> Self {
         Self {
             gateway,
             context: context.without_agent_core_run(),
+            ledger,
+            run_id,
         }
     }
 }
@@ -28,7 +38,19 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
         input: &Value,
     ) -> Result<WorkflowStepExecution, Box<dyn Error>> {
         if step.runtime.is_some() {
-            return super::execute_runtime_step(package, step, input, Some(self.gateway.options()));
+            let is_canceled = || {
+                Ok(self
+                    .ledger
+                    .get_run(&self.run_id)?
+                    .is_some_and(|run| run.status == LocalRunStatus::Canceled))
+            };
+            return super::execute_runtime_step(
+                package,
+                step,
+                input,
+                Some(self.gateway.options()),
+                &is_canceled,
+            );
         }
         let capability_id = step.capability_id.trim();
         if capability_id.is_empty() {
@@ -46,13 +68,15 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
             .into_iter()
             .find(|capability| capability.id == capability_id)
             .ok_or_else(|| format!("capability not found: {capability_id}"))?;
-        let input = super::connector::resolve_connector_credentials_for_capability(
-            package,
-            &step.capability_id,
-            input,
-        )?;
-        let input = capability_input(&capability.input_schema, &input);
+        let resolved =
+            super::connector::resolve_connector_credentials_for_capability_with_redactions(
+                package,
+                &step.capability_id,
+                input,
+            )?;
+        let input = capability_input(&capability.input_schema, &resolved.input);
         let output = self.gateway.invoke(&context, capability_id, input)?;
+        let output = redact_connector_secret_values(output, &resolved.redactions);
         let (artifacts, usage) = workflow_result_metadata(&output)?;
         Ok(WorkflowStepExecution {
             output,
@@ -62,7 +86,36 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
     }
 }
 
-fn capability_input(schema: &Value, input: &Value) -> Value {
+fn redact_connector_secret_values(value: Value, secrets: &[String]) -> Value {
+    match value {
+        Value::String(text) => {
+            let mut redacted = text;
+            for secret in secrets {
+                if !secret.is_empty() {
+                    redacted = redacted.replace(secret, "[redacted]");
+                }
+            }
+            Value::String(redacted)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| redact_connector_secret_values(value, secrets))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (key, redact_connector_secret_values(value, secrets)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+// 启动前检查复用同一套过滤规则，避免「预检查的输入」和「真正发给能力的输入」
+// 不是同一个对象，导致预检查报的错和运行时报的错对不上。
+pub(crate) fn capability_input(schema: &Value, input: &Value) -> Value {
     let Some(input) = input.as_object() else {
         return input.clone();
     };
@@ -183,6 +236,11 @@ mod tests {
             capabilities: vec!["test.capability".to_string()],
             dependencies: Default::default(),
             candidate: None,
+            execution_policy: "strict".to_string(),
+            entrypoints: Vec::new(),
+            default_entrypoint: String::new(),
+            default_exitpoint: String::new(),
+            exits: Vec::new(),
             steps: Vec::new(),
             artifacts: Vec::new(),
             ui: super::super::WorkflowUi {
@@ -203,11 +261,13 @@ mod tests {
             runtime: None,
             loop_config: None,
             when: None,
+            fail_when: None,
             candidate_action: String::new(),
             input: serde_json::json!({}),
             execution_mode: "sync".to_string(),
             risk_level: "read_only".to_string(),
             approval_required: false,
+            on_failure: String::new(),
             depends_on: Vec::new(),
         };
         let input = serde_json::json!({
@@ -221,5 +281,27 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.get("credential_handles").is_none());
+    }
+
+    #[test]
+    fn redacts_resolved_connector_secret_values_from_output() {
+        let output = serde_json::json!({
+            "ok": true,
+            "path": "C:\\secrets\\upload.key",
+            "nested": {
+                "message": "using C:\\secrets\\upload.key",
+                "token": "token-123"
+            }
+        });
+        let redacted = redact_connector_secret_values(
+            output,
+            &[
+                "C:\\secrets\\upload.key".to_string(),
+                "token-123".to_string(),
+            ],
+        );
+        assert_eq!(redacted["path"], "[redacted]");
+        assert_eq!(redacted["nested"]["message"], "using [redacted]");
+        assert_eq!(redacted["nested"]["token"], "[redacted]");
     }
 }

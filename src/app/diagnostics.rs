@@ -84,6 +84,21 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
         Ok(None) => json!({ "readable": true, "present": false }),
         Err(error) => json!({ "readable": false, "error": error.to_string() }),
     };
+    let trust = match crate::app::trust::status() {
+        Ok(report) => json!({
+            "readable": true,
+            "healthy": report.healthy,
+            "issues": report.issues,
+            "local_key_ids": report.local_key_ids,
+            "active_key_id": report.state.active_key_id,
+            "key_ids": report.state.key_ids,
+            "revoked_key_ids": report.state.revoked_key_ids,
+            "bundle_digest": report.state.bundle_digest,
+            "generated_at": report.state.generated_at,
+            "synced_at": report.state.synced_at,
+        }),
+        Err(error) => json!({ "readable": false, "error": error.to_string() }),
+    };
     let state_file = &options.state_path;
     json!({
         "generated_at": unix_now(),
@@ -110,6 +125,7 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
         },
         "device_identity": state,
         "user_authorization": authorization,
+        "distribution_trust": trust,
     })
 }
 
@@ -196,6 +212,7 @@ mod tests {
             .read_to_string(&mut diagnostics)
             .unwrap();
         assert!(diagnostics.contains("agt-test"));
+        assert!(diagnostics.contains("distribution_trust"));
         assert!(!diagnostics.contains(credential));
         assert!(!diagnostics.contains("password"));
         assert!(!diagnostics.contains("token=secret"));

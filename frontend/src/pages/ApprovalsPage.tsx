@@ -85,7 +85,12 @@ function PendingApprovals({ approvals, onRespond }: { approvals: ApprovalItem[];
             {item.request_type === 'remote_connect' ? <MonitorUp size={18} /> : <Upload size={18} />}
           </div>
           <div className="info"><div className="title">{item.title}</div><div className="desc">{item.description}</div></div>
-          <span className="timer"><Clock3 size={14} />剩余 {item.remaining_seconds ?? item.timeout_seconds ?? 30} 秒</span>
+          <span className="timer">
+            <Clock3 size={14} />
+            {item.timeout_seconds === 0
+              ? '等待人工决定'
+              : `剩余 ${item.remaining_seconds ?? item.timeout_seconds ?? 30} 秒`}
+          </span>
           <div className="actions">
             <button type="button" className="btn" onClick={() => onRespond(item.id, false)}>拒绝</button>
             <button type="button" className="btn btn-primary" onClick={() => onRespond(item.id, true)}>允许</button>
@@ -126,8 +131,8 @@ export function ApprovalsPage({ approvals, history, independentMode = false, onR
 
   return (
     <>
-      <PageHeader title="审批" description={independentMode ? '处理本机 HiMind Agent 能力的确认请求；独立模式不依赖 Dashboard。' : '处理需要确认的敏感操作请求。'} actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenSettings}><Settings2 size={15} />审批策略</button><IconButton icon={RefreshCw} label="刷新审批" onClick={onRefresh} /></div>} />
-      {independentMode ? <div className="security-note compact approval-independent-note"><ShieldAlert size={16} /><span>当前为独立模式：本机审批队列、历史和提醒仍有效。未经过 HiMind Agent 能力层、由 DSH 或外部 AI 工具直接执行的操作不受这里的策略拦截。</span></div> : null}
+      <PageHeader title="审批" description="处理需要确认的敏感操作。" actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenSettings}><Settings2 size={15} />审批策略</button><IconButton icon={RefreshCw} label="刷新审批" onClick={onRefresh} /></div>} />
+      {independentMode ? <div className="security-note compact approval-independent-note"><ShieldAlert size={16} /><span>独立模式下，审批记录只保存在本机。由其他工具直接执行的操作不经过这里。</span></div> : null}
       <div className="card approval-workspace">
         <div className="approval-workspace-header">
           <ApprovalTabs activeTab={activeTab} pendingCount={approvals.length} historyCount={history.length} onChange={setActiveTab} />

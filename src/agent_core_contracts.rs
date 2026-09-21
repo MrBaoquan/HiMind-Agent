@@ -6,6 +6,42 @@ pub(crate) const INTERACTION_ENVELOPE_SCHEMA_VERSION: &str = "interaction_envelo
 pub(crate) const LOCAL_RUN_SCHEMA_VERSION: &str = "local_run.v1";
 pub(crate) const RUNTIME_EVENT_SCHEMA_VERSION: &str = "runtime_event.v1";
 pub(crate) const RUN_PROJECTION_SCHEMA_VERSION: &str = "run_projection.v1";
+const MAX_AI_CLIENT_ID_BYTES: usize = 160;
+
+/// Normalize protocol handshake metadata into a stable, non-secret audit ID.
+pub(crate) fn external_ai_client_id(protocol: &str, name: &str, version: &str) -> String {
+    let protocol = normalize_attribution_component(protocol, 24);
+    let name = normalize_attribution_component(name, 96);
+    if protocol.is_empty() || name.is_empty() {
+        return String::new();
+    }
+    let version = normalize_attribution_component(version, 32);
+    let value = if version.is_empty() {
+        format!("{protocol}:{name}")
+    } else {
+        format!("{protocol}:{name}@{version}")
+    };
+    value.chars().take(MAX_AI_CLIENT_ID_BYTES).collect()
+}
+
+fn normalize_attribution_component(value: &str, max_bytes: usize) -> String {
+    let mut normalized = String::new();
+    let mut previous_separator = false;
+    for character in value.trim().chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            normalized.push(character);
+            previous_separator = false;
+        } else if !normalized.is_empty() && !previous_separator {
+            normalized.push('-');
+            previous_separator = true;
+        }
+        if normalized.len() >= max_bytes {
+            break;
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +119,17 @@ impl InteractionEnvelope {
             "principal.local_principal_id",
             &self.principal.local_principal_id,
         )?;
+        validate_optional_attribution(
+            "principal.delegated_user_id",
+            &self.principal.delegated_user_id,
+            240,
+        )?;
+        validate_optional_attribution(
+            "principal.ai_client_id",
+            &self.principal.ai_client_id,
+            MAX_AI_CLIENT_ID_BYTES,
+        )?;
+        validate_optional_attribution("device_id", &self.device_id, 240)?;
         require_text("agent_id", &self.agent_id)?;
         require_text("created_at", &self.created_at)?;
         Ok(())
@@ -190,6 +237,34 @@ pub(crate) struct LocalRunUsage {
     pub billing_owner: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalRunExecutionPlan {
+    pub workflow_id: String,
+    pub execution_policy: String,
+    pub entrypoint: String,
+    pub exitpoint: String,
+    pub entry_step_id: String,
+    pub exit_step_id: String,
+    #[serde(default)]
+    pub active_step_ids: Vec<String>,
+    #[serde(default)]
+    pub seed_artifacts: Vec<String>,
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    pub plan_digest: String,
+}
+
+impl LocalRunExecutionPlan {
+    pub(crate) fn completion_mode(&self) -> String {
+        if self.entrypoint == "full" && self.exitpoint == "full" {
+            "full".to_string()
+        } else {
+            "partial".to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalRun {
@@ -207,6 +282,10 @@ pub(crate) struct LocalRun {
     pub workspace_ref: String,
     #[serde(default)]
     pub current_step_id: String,
+    #[serde(default = "default_full_completion_mode")]
+    pub completion_mode: String,
+    #[serde(default)]
+    pub execution_plan: Option<LocalRunExecutionPlan>,
     #[serde(default)]
     pub steps: Vec<LocalRunStep>,
     #[serde(default)]
@@ -228,6 +307,42 @@ impl LocalRun {
         require_text("interaction_id", &self.interaction_id)?;
         require_text("created_at", &self.created_at)?;
         require_text("updated_at", &self.updated_at)?;
+        if !matches!(self.completion_mode.as_str(), "full" | "partial") {
+            return Err(format!(
+                "local run completion_mode is invalid: {}",
+                self.completion_mode
+            ));
+        }
+        if let Some(plan) = self.execution_plan.as_ref() {
+            for (name, value) in [
+                ("execution_plan.workflow_id", plan.workflow_id.as_str()),
+                (
+                    "execution_plan.execution_policy",
+                    plan.execution_policy.as_str(),
+                ),
+                ("execution_plan.entrypoint", plan.entrypoint.as_str()),
+                ("execution_plan.exitpoint", plan.exitpoint.as_str()),
+                ("execution_plan.entry_step_id", plan.entry_step_id.as_str()),
+                ("execution_plan.exit_step_id", plan.exit_step_id.as_str()),
+                ("execution_plan.plan_digest", plan.plan_digest.as_str()),
+            ] {
+                require_text(name, value)?;
+            }
+            let mut active = HashSet::new();
+            for step_id in &plan.active_step_ids {
+                require_text("execution_plan.active_step_id", step_id)?;
+                if !active.insert(step_id.as_str()) {
+                    return Err(format!(
+                        "duplicate execution plan active step id: {step_id}"
+                    ));
+                }
+            }
+            if !active.contains(plan.entry_step_id.as_str())
+                || !active.contains(plan.exit_step_id.as_str())
+            {
+                return Err("execution plan entry and exit steps must be active steps".to_string());
+            }
+        }
 
         let mut step_ids = HashSet::new();
         for step in &self.steps {
@@ -271,6 +386,10 @@ impl LocalRun {
         }
         Ok(())
     }
+}
+
+fn default_full_completion_mode() -> String {
+    "full".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,6 +495,16 @@ fn require_text(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_optional_attribution(name: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!("{name} must not exceed {max_bytes} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{name} must not contain control characters"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +603,9 @@ mod tests {
             include_str!("../contracts/agent-core/v1/runtime-event.schema.json"),
             include_str!("../contracts/agent-core/v1/run-projection.schema.json"),
             include_str!("../contracts/agent-core/v1/connector-manifest.schema.json"),
+            include_str!("../contracts/agent-core/v1/connector-policy-bundle.schema.json"),
+            include_str!("../contracts/agent-core/v1/extension-candidate.schema.json"),
+            include_str!("../contracts/agent-core/v1/extension-lock.schema.json"),
             include_str!("../contracts/agent-core/v1/workflow-package.schema.json"),
         ] {
             let value: Value = serde_json::from_str(source).unwrap();
@@ -488,5 +620,60 @@ mod tests {
         ))
         .unwrap();
         projection.validate().unwrap();
+    }
+
+    #[test]
+    fn workflow_package_schema_accepts_v1_compatibility_fixtures() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../contracts/agent-core/v1/workflow-package.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for source in [
+            include_str!("../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"),
+            include_str!("../workflows/wechat-miniprogram-delivery/workflow.json"),
+        ] {
+            let fixture: Value = serde_json::from_str(source).unwrap();
+            assert!(
+                validator.is_valid(&fixture),
+                "workflow package fixture failed schema validation: {fixture:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_package_schema_rejects_future_versions_and_unknown_fields() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../contracts/agent-core/v1/workflow-package.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut future: Value = serde_json::from_str(include_str!(
+            "../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"
+        ))
+        .unwrap();
+        future["schema_version"] = Value::String("workflow_package.v2".to_string());
+        assert!(!validator.is_valid(&future));
+
+        let mut unknown: Value = serde_json::from_str(include_str!(
+            "../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"
+        ))
+        .unwrap();
+        unknown["future_extension"] = Value::Bool(true);
+        assert!(!validator.is_valid(&unknown));
+    }
+
+    #[test]
+    fn external_ai_client_ids_are_stable_and_audit_safe() {
+        assert_eq!(
+            external_ai_client_id("acp", "Claude Code", "1.2.3"),
+            "acp:claude-code@1.2.3"
+        );
+        assert_eq!(
+            external_ai_client_id("mcp", " Visual Studio Code ", ""),
+            "mcp:visual-studio-code"
+        );
+        assert!(external_ai_client_id("acp", " ", "1.0.0").is_empty());
+        assert!(external_ai_client_id("acp", &"x".repeat(500), "").len() <= MAX_AI_CLIENT_ID_BYTES);
     }
 }

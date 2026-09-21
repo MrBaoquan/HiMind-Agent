@@ -77,7 +77,9 @@ fn execute_claimed(
     let context = InvocationContext::new(
         InvocationSource::DashboardWorker,
         format!("dashboard-user:{}", claim.run.created_by_user_id),
-    );
+    )
+    .without_agent_core_run()
+    .with_workspace_ref(claim.workspace_path.clone());
     let result = gateway.invoke(&context, capability_id, capability_input.clone())?;
     let detail = process::summarize_output(&result.to_string(), 2_048);
     let final_message = json!({

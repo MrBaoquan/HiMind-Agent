@@ -1,17 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Blocks, BookOpen, CheckCircle2, CircleAlert, Clock3, FolderOpen, GitBranch, Hammer, Inbox, LoaderCircle, MessageCircle, Plus, RefreshCw, Save, Search, Send, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
-import { ExtensionSourcesDialog } from '../components/ExtensionSourcesDialog';
 import { FUNCTIONAL_CATEGORIES } from '../data/categoryCatalog';
-import type { AuthoringPluginDraft, AuthoringSkillDraft, CreateExtensionProjectInput, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, ExtensionSourceAcquisition, ExtensionSourceConfig, ExtensionSourceSettings, ExtensionSourceSnapshot, ExtensionWorkspaceSettings, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
+import type { AuthoringPluginDraft, AuthoringSkillDraft, AuthoringWorkflowDraft, CreateExtensionProjectInput, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
 
 type DraftRef =
   | { kind: 'plugin'; value: AuthoringPluginDraft }
-  | { kind: 'skill'; value: AuthoringSkillDraft };
+  | { kind: 'skill'; value: AuthoringSkillDraft }
+  | { kind: 'workflow'; value: AuthoringWorkflowDraft };
 
 type SubmissionRef =
   | { kind: 'plugin'; value: PluginSubmissionStatus }
-  | { kind: 'skill'; value: SkillSubmissionStatus };
+  | { kind: 'skill'; value: SkillSubmissionStatus }
+  | { kind: 'workflow'; value: AuthoringWorkflowDraft };
 
 type ProjectModel = {
   key: string;
@@ -29,31 +30,20 @@ type ExtensionBuildStage = 'building' | 'activating' | 'refreshing';
 
 type DevelopmentPageProps = {
   dashboardEnabled: boolean;
-  workspace: ExtensionWorkspaceSettings;
-  extensionSources: ExtensionSourceSettings;
-  extensionSourceSnapshot: ExtensionSourceSnapshot | null;
-  extensionSourcesLoading: boolean;
-  extensionSourcesError: string;
   projectsError: string;
   projects: ExtensionProject[];
   remoteProjects: ExtensionRemoteProject[];
   pluginDrafts: AuthoringPluginDraft[];
   skillDrafts: AuthoringSkillDraft[];
+  workflowDrafts: AuthoringWorkflowDraft[];
   pluginSubmissions: PluginSubmissionStatus[];
   skillSubmissions: SkillSubmissionStatus[];
+  workflowSubmissions: AuthoringWorkflowDraft[];
   availablePlugins: PluginCatalogItem[];
   invitations: ExtensionCollaborationInvitation[];
   accountAuthorized: boolean;
   busyAction: string | null;
   onRefresh: () => void;
-  onRefreshSources: () => Promise<void>;
-  onAddSource: (name: string, repository: string, reference: string, catalogPath: string, verification: ExtensionSourceConfig['verification']) => Promise<void>;
-  onAddLocalSource: (name: string, root: string, catalogPath?: string) => Promise<void>;
-  onUpdateSourceConfig: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
-  onRemoveSource: (sourceId: string) => Promise<void>;
-  onSetUnitAcquisition: (unitKey: string, acquisition: ExtensionSourceAcquisition) => Promise<void>;
-  onInstallUnit: (unitKey: string) => Promise<void>;
-  onSetWorkspace: (root: string) => Promise<void>;
   onCreate: (input: CreateExtensionProjectInput) => Promise<ExtensionProject>;
   onOpenProject: () => Promise<void>;
   onAssociateProject: (project: ExtensionRemoteProject) => Promise<void>;
@@ -77,9 +67,8 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   const [selectedKey, setSelectedKey] = useState('');
   const [detailOpen, setDetailOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
-  const [sourcesOpen, setSourcesOpen] = useState(false);
   const [removeProject, setRemoveProject] = useState<ExtensionProject | null>(null);
-  const models = useMemo(() => buildProjectModels(props), [props.projects, props.remoteProjects, props.pluginDrafts, props.skillDrafts, props.pluginSubmissions, props.skillSubmissions]);
+  const models = useMemo(() => buildProjectModels(props), [props.projects, props.remoteProjects, props.pluginDrafts, props.skillDrafts, props.workflowDrafts, props.pluginSubmissions, props.skillSubmissions, props.workflowSubmissions]);
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return models.filter(project => {
@@ -94,10 +83,9 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   }, [selected, selectedKey]);
 
   return <div className="development-page">
-    <PageHeader title="扩展" description={props.dashboardEnabled ? '本地项目与发布' : '本地项目与构建'} actions={<>
+    <PageHeader title="扩展开发" description={props.dashboardEnabled ? '管理本地项目、构建测试制品并提交 Dashboard 审核。' : '管理本地项目和测试制品。'} actions={<>
       <button className="btn btn-icon" title="打开项目" aria-label="打开项目" disabled={Boolean(props.busyAction)} onClick={() => void props.onOpenProject()}><FolderOpen size={16} /></button>
       <button className="btn btn-icon btn-primary" title="新建项目" aria-label="新建项目" disabled={Boolean(props.busyAction)} onClick={() => setCreateOpen(true)}><Plus size={16} /></button>
-      <button className="btn btn-icon" title="扩展源设置" aria-label="扩展源设置" disabled={Boolean(props.busyAction)} onClick={() => setSourcesOpen(true)}><GitBranch size={16} /></button>
       <button className="btn btn-icon" title="刷新项目" aria-label="刷新项目" disabled={Boolean(props.busyAction)} onClick={props.onRefresh}><RefreshCw size={16} /></button>
     </>} />
     {props.dashboardEnabled && props.invitations.length ? <InvitationInbox invitations={props.invitations} busyAction={props.busyAction} onRespond={props.onRespondInvitation} /> : null}
@@ -106,10 +94,11 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
         <button className={kindFilter === 'all' ? 'active' : ''} onClick={() => setKindFilter('all')}>全部 <span>{models.length}</span></button>
         <button className={kindFilter === 'skill' ? 'active' : ''} onClick={() => setKindFilter('skill')}>技能 <span>{models.filter(item => item.kind === 'skill').length}</span></button>
         <button className={kindFilter === 'plugin' ? 'active' : ''} onClick={() => setKindFilter('plugin')}>插件 <span>{models.filter(item => item.kind === 'plugin').length}</span></button>
+        <button className={kindFilter === 'workflow' ? 'active' : ''} onClick={() => setKindFilter('workflow')}>工作流 <span>{models.filter(item => item.kind === 'workflow').length}</span></button>
       </div>
       <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索项目" /></label>
     </div>
-    {props.projectsError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>工程列表读取失败</strong><span>{props.projectsError}</span></div><button className="btn" onClick={props.onRefresh}>重试</button></div> : null}
+    {props.projectsError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>项目列表读取失败</strong><span>{props.projectsError}</span></div><button className="btn" onClick={props.onRefresh}>重试</button></div> : null}
     <section className={`development-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
       <aside className="development-project-list">
         <div className="development-list-heading"><strong>项目</strong><span>{visible.length}</span></div>
@@ -120,12 +109,11 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
       </aside>
       <main className="development-project-detail">
         <button className="workspace-back development-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回项目列表</button>
-        {selected ? <ProjectDetail key={selected.key} project={selected} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={props.onSubmit} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个项目" text={props.dashboardEnabled ? '查看本地工程、构建和发布进度。' : '查看本地工程、构建和版本。'} />}
+        {selected ? <ProjectDetail key={selected.key} project={selected} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={props.onSubmit} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个项目" text={props.dashboardEnabled ? '查看本地项目、构建和发布进度。' : '查看本地项目、构建和版本。'} />}
       </main>
     </section>
     {createOpen ? <CreateProjectDialog busy={Boolean(props.busyAction)} onClose={() => setCreateOpen(false)} onCreate={async input => { try { const project = await props.onCreate(input); setQuery(''); setKindFilter('all'); setSelectedKey(`${project.kind}:${project.extension_id}`); setDetailOpen(true); setCreateOpen(false); return project; } catch (error) { /* The parent keeps the dialog open and shows the error. */ throw error; } }} /> : null}
     {removeProject ? <ConfirmRemoveDialog project={removeProject} dashboardEnabled={props.dashboardEnabled} busy={Boolean(props.busyAction)} onClose={() => setRemoveProject(null)} onConfirm={async () => { await props.onRemove(removeProject.id); setRemoveProject(null); }} /> : null}
-    <ExtensionSourcesDialog open={sourcesOpen} workspace={props.workspace} settings={props.extensionSources} snapshot={props.extensionSourceSnapshot} loading={props.extensionSourcesLoading || Boolean(props.busyAction)} error={props.extensionSourcesError} onClose={() => setSourcesOpen(false)} onSetWorkspace={props.onSetWorkspace} onDevelopWorkspace={props.onDevelopWorkspace} onRefresh={props.onRefreshSources} onAdd={props.onAddSource} onAddLocal={props.onAddLocalSource} onUpdate={props.onUpdateSourceConfig} onRemove={props.onRemoveSource} onSetAcquisition={props.onSetUnitAcquisition} onInstallUnit={props.onInstallUnit} />
   </div>;
 }
 
@@ -138,7 +126,7 @@ function InvitationInbox({ invitations, busyAction, onRespond }: { invitations: 
   return <section className="development-invitations" aria-label="协作邀请">
     <div className="development-invitations-head"><Inbox size={16} /><strong>协作邀请</strong><span>{invitations.length}</span></div>
     <div className="development-invitation-list">{invitations.map(item => <article key={item.id}>
-      <div><strong>{item.product_name}</strong><small>{item.product_type === 'agent_plugin' ? '插件' : '技能'} · {roleLabel(item.role)}{item.invited_by_name ? ` · ${item.invited_by_name}` : ''}</small></div>
+      <div><strong>{item.product_name}</strong><small>{extensionKindLabel(item.product_type)} · {roleLabel(item.role)}{item.invited_by_name ? ` · ${item.invited_by_name}` : ''}</small></div>
       <div><button className="btn" disabled={Boolean(busyAction)} onClick={() => void respond(item.id, 'decline')}>拒绝</button><button className="btn btn-primary" disabled={Boolean(busyAction)} onClick={() => void respond(item.id, 'accept')}>接受</button></div>
     </article>)}</div>
     {error ? <p className="development-inline-error">{error}</p> : null}
@@ -151,7 +139,7 @@ function ProjectListItem({ project, dashboardEnabled, busyAction, selected, onSe
   const state = projectState(project, dashboardEnabled, draft, active);
   const building = Boolean(project.local && busyAction === `build:${project.local.id}`);
   return <button className={`development-project-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(project.key)}>
-    <span className={`development-kind-mark ${project.kind}`}>{project.kind === 'plugin' ? 'P' : 'S'}</span>
+    <span className={`development-kind-mark ${project.kind}`}>{project.kind === 'plugin' ? 'P' : project.kind === 'workflow' ? 'W' : 'S'}</span>
     <span className="development-project-copy"><strong>{project.name}</strong><small>{kindLabel(project.kind)} · {project.local ? `本地 v${project.local.version}` : '未关联本地项目'}</small>{active ? <small>{submissionStatus(active).label} · v{active.value.version}</small> : null}</span>
     <span className={`skill-state-label ${building ? 'warn' : state.tone}`}>{building ? '构建中' : state.label}</span>
   </button>;
@@ -193,7 +181,7 @@ function ProjectDetail({ project, dashboardEnabled, accountAuthorized, available
 
   return <>
     <header className="development-detail-header">
-      <div className="development-detail-title"><span className={`development-kind-mark ${project.kind}`}>{project.kind === 'plugin' ? 'P' : 'S'}</span><div><div><h3>{project.name}</h3><Pill kind={state.tone}>{state.label}</Pill></div><small>{kindLabel(project.kind)} · v{version}</small></div></div>
+      <div className="development-detail-title"><span className={`development-kind-mark ${project.kind}`}>{project.kind === 'plugin' ? 'P' : project.kind === 'workflow' ? 'W' : 'S'}</span><div><div><h3>{project.name}</h3><Pill kind={state.tone}>{state.label}</Pill></div><small>{kindLabel(project.kind)} · v{version}</small></div></div>
       <div className="development-detail-actions">
         {project.local?.workspace_available ? <button className="btn btn-icon btn-primary" title="开发当前项目" aria-label="开发当前项目" disabled={busy} onClick={() => onDevelopWithAi(project.local!)}><MessageCircle size={15} /></button> : <button className="btn btn-icon btn-primary" title="关联本地项目" aria-label="关联本地项目" disabled={busy} onClick={() => void (project.remote ? onAssociateProject(project.remote) : onOpenProject())}><FolderOpen size={15} /></button>}
         {project.local?.workspace_available ? <button className="btn btn-icon" title="打开项目目录" aria-label="打开项目目录" onClick={() => onOpenFolder(project.local!.workspace_path)}><FolderOpen size={15} /></button> : null}
@@ -201,12 +189,12 @@ function ProjectDetail({ project, dashboardEnabled, accountAuthorized, available
       </div>
     </header>
     <div className="extension-detail-tabs development-detail-tabs" role="tablist">
-      {([['overview', '概览'], ['release', dashboardEnabled ? '发布' : '版本'], ...(dashboardEnabled ? [['collaboration', '协作者'] as const] : []), ['settings', '设置']] as const).map(item => <button key={item[0]} className={tab === item[0] ? 'active' : ''} onClick={() => setTab(item[0])}>{item[1]}{item[0] === 'release' && active && ['changes_requested', 'rejected'].includes(active.value.status) ? <span className="tab-alert" /> : null}</button>)}
+      {([['overview', '概览'], ['release', dashboardEnabled ? '发布' : '版本'], ...(dashboardEnabled ? [['collaboration', '协作者'] as const] : []), ['settings', '设置']] as const).map(item => <button key={item[0]} className={tab === item[0] ? 'active' : ''} onClick={() => setTab(item[0])}>{item[1]}{item[0] === 'release' && active && ['changes_requested', 'rejected'].includes(active.value.status || '') ? <span className="tab-alert" /> : null}</button>)}
     </div>
     {buildStage ? <BuildProgress kind={project.kind} stage={buildStage} /> : null}
     <div className="development-detail-body">
       {tab === 'overview' ? <>
-        {!project.local?.workspace_available ? <div className="development-notice"><CircleAlert size={16} /><div><strong>未关联本地项目</strong><span>选择包含 plugin.json 或 skill.json 的项目目录。</span></div></div> : null}
+        {!project.local?.workspace_available ? <div className="development-notice"><CircleAlert size={16} /><div><strong>未关联本地项目</strong><span>选择包含插件、技能或工作流清单的项目目录。</span></div></div> : null}
         <section className="development-section"><h4>项目说明</h4><p>{project.description || draft?.value.manifest.description || '未提供项目说明。'}</p></section>
         <section className="development-section"><h4>最近构建</h4>{draft ? <BuildSummary project={project} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} /> : <div className="development-empty-line"><span>尚未构建</span></div>}</section>
         <section className="development-section"><h4>依赖</h4>{dependencies.length ? <div className="development-dependency-list">{dependencies.map(item => <div key={item.id}><strong>{item.name}</strong><small>{item.required ? '必需' : '可选'}{item.version ? ` · ${item.version}` : ''}</small></div>)}</div> : <p className="muted">无依赖</p>}</section>
@@ -226,12 +214,12 @@ function BuildProgress({ kind, stage }: { kind: ExtensionProjectKind; stage: Ext
   ];
   const current = stages.findIndex(item => item.id === stage);
   const message = stage === 'building'
-    ? '正在校验项目并生成候选包'
+    ? '正在检查项目并生成版本'
     : stage === 'activating'
-      ? (kind === 'plugin' ? '正在注册插件能力' : '正在安装并同步技能')
-      : '正在刷新 HiMind AI 与客户端状态';
+      ? (kind === 'plugin' ? '正在启用插件' : kind === 'workflow' ? '正在检查工作流' : '正在同步技能')
+      : '正在更新可用状态';
   return <div className="development-build-progress" role="status" aria-live="polite">
-    <div className="development-build-progress-copy"><LoaderCircle className="spin" size={16} /><div><strong>{message}</strong><small>请保持 Agent 运行</small></div></div>
+    <div className="development-build-progress-copy"><LoaderCircle className="spin" size={16} /><div><strong>{message}</strong><small>请不要关闭应用</small></div></div>
     <ol>{stages.map((item, index) => <li key={item.id} className={index < current ? 'complete' : index === current ? 'active' : ''}><span>{index < current ? <CheckCircle2 size={12} /> : index + 1}</span>{item.label}</li>)}</ol>
   </div>;
 }
@@ -310,21 +298,21 @@ function BuildSummary({ project, dashboardEnabled, draft, active, busy, onSubmit
   const id = project.extensionId;
   const version = draft.value.manifest.version;
   if (!dashboardEnabled) {
-    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{draft.value.tested_at ? '构建完成 · 已启用' : '构建完成'} · v{version}</strong><small>{formatTime(draft.value.updated_at)} · {shortSha(draft.value.candidate_sha256)}</small></div></div><small>{draft.value.tested_at ? '已注册到本机能力，可直接在 HiMind AI 或其他 AI 工具中使用' : '本地候选包已生成，可继续测试'}</small></div>;
+    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{draft.value.tested_at ? '测试制品 · 已启用' : '测试制品已生成'} · v{version}</strong><small>{formatTime(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><small>{draft.value.tested_at ? '当前制品只在本机生效，可以继续调试或通过来源、安装包分发。' : '测试制品已生成，可以继续测试。'}</small></div>;
   }
   const published = active?.value.version === version && active.value.release_status === 'published';
-  const submitted = buildMatchesSubmission(draft, active);
+  const submitted = buildMatchesSubmission(draft, active) || (project.kind === 'workflow' && Boolean(draft.value.submitted_at));
   const canSubmit = projectCanSubmit(project);
   const sourceReady = projectSourceReady(project);
-  return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{dashboardEnabled ? '构建完成' : draft.value.tested_at ? '构建完成 · 已启用' : '构建完成'} · v{version}</strong><small>{formatTime(draft.value.updated_at)} · {shortSha(draft.value.candidate_sha256)}</small></div></div>{published ? <small>该版本已发布，请更新版本号后继续开发。</small> : submitted ? <Pill kind="warn">审核中</Pill> : canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, id, version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : <small>{dashboardEnabled ? (sourceReady ? '当前账号不能提交审核' : '未能读取代码版本，请确认项目位于 Git 仓库中') : draft.value.tested_at ? '已注册到本机能力，可直接在 AI 工具中使用' : '本地候选包已生成'}</small>}</div>;
+  return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '组织发布版' : submitted ? 'Dashboard 审核中' : '测试制品 · 待提交'} · v{version}</strong><small>{formatTime(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div>{published ? <small>该制品已发布并可供安装，请更新版本号后继续开发。</small> : submitted ? <Pill kind="warn">已提交，等待审核</Pill> : canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, id, version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : <small>{project.kind === 'workflow' ? (draft.kind === 'workflow' && draft.value.lock ? '测试制品已通过检查，等待提交审核' : '工作流还未完成检查') : sourceReady ? '当前账号不能提交审核' : '未能读取代码版本，请确认项目位于 Git 仓库中'}</small>}</div>;
 }
 
 function ReleasePanel({ project, dashboardEnabled, draft, active, busy, onSubmit }: { project: ProjectModel; dashboardEnabled: boolean; draft?: DraftRef; active?: SubmissionRef; busy: boolean; onSubmit: DevelopmentPageProps['onSubmit'] }) {
   const versions = projectVersions(project, dashboardEnabled);
   if (!dashboardEnabled) {
     return <>
-      {draft ? <section className="development-release-callout"><div><strong>本地候选已就绪</strong><span>可在 HiMind AI 中继续调试，也可安装到其他已配置的 AI 工具。</span></div></section> : <div className="development-notice"><CircleAlert size={16} /><div><strong>尚未构建</strong><span>完成构建后即可测试、安装或导出候选包。</span></div></div>}
-      <section className="development-section"><h4>版本历史</h4><div className="development-version-list">{versions.map(version => <article key={version.version}><div><strong>v{version.version}</strong><Pill kind={version.state.tone}>{version.state.label}</Pill></div><small>{version.updatedAt ? formatTime(version.updatedAt) : '本地版本'}</small><p>{version.notes || '未提供更新说明。'}</p></article>)}</div></section>
+      {draft ? <section className="development-release-callout"><div><strong>测试制品</strong><span>当前制品只在本机生效。需要给其他用户使用时，请通过来源或安装包分发。</span></div></section> : <div className="development-notice"><CircleAlert size={16} /><div><strong>尚未构建</strong><span>完成构建后即可生成测试制品。</span></div></div>}
+      <section className="development-section"><h4>版本历史</h4><div className="development-version-list">{versions.map(version => <article key={version.version}><div><strong>v{version.version}</strong><Pill kind={version.state.tone}>{version.state.label}</Pill></div><small>{version.updatedAt ? formatTime(version.updatedAt) : '测试制品'}</small><p>{version.notes || '未提供更新说明。'}</p></article>)}</div></section>
     </>;
   }
   const currentPublished = Boolean(draft && project.submissions.some(item => item.value.version === draft.value.manifest.version && item.value.release_status === 'published'));
@@ -334,9 +322,9 @@ function ReleasePanel({ project, dashboardEnabled, draft, active, busy, onSubmit
   const activeDraft = active ? project.drafts.find(item => item.value.manifest.version === active.value.version) : undefined;
   return <>
     {active ? <ActiveReview submission={active} draft={activeDraft} /> : null}
-    {draft && !currentPublished && !submittedBuild ? <section className="development-release-callout"><div><strong>{canSubmit && sourceReady ? (active ? '有新的构建' : '可以提交审核') : '有新的本地构建'}</strong><span>{!sourceReady ? '未能读取代码版本，请确认项目位于 Git 仓库中。' : canSubmit ? (active ? '提交后将替代当前等待审核的构建。' : '提交最近一次构建进入审核。') : '当前账号不能提交审核。'}</span></div>{canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, project.extensionId, draft.value.manifest.version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : null}</section> : null}
-    {!active && !draft ? <div className="development-notice"><CircleAlert size={16} /><div><strong>尚未构建</strong><span>{dashboardEnabled ? '完成构建后即可提交审核。' : '完成构建后即可测试、安装或导出候选包。'}</span></div></div> : null}
-    <section className="development-section"><h4>版本历史</h4><div className="development-version-list">{versions.map(version => <article key={version.version}><div><strong>v{version.version}</strong><Pill kind={version.state.tone}>{version.state.label}</Pill></div><small>{version.updatedAt ? formatTime(version.updatedAt) : '本地版本'}</small><p>{version.notes || '未提供更新说明。'}</p></article>)}</div></section>
+    {draft && !currentPublished && !submittedBuild ? <section className="development-release-callout"><div><strong>{canSubmit && sourceReady ? (active ? '有新的测试制品' : '测试制品已就绪') : '测试制品待处理'}</strong><span>{project.kind === 'workflow' ? '工作流检查已完成，提交后进入 Dashboard 审核。' : !sourceReady ? '未能读取代码版本，请确认项目位于 Git 仓库中。' : canSubmit ? (active ? '提交后将替代当前等待审核的制品。' : '提交最近一次测试制品进入 Dashboard 审核。') : '当前账号不能提交审核。'}</span></div>{canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, project.extensionId, draft.value.manifest.version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : null}</section> : null}
+    {!active && !draft ? <div className="development-notice"><CircleAlert size={16} /><div><strong>尚未构建</strong><span>{dashboardEnabled ? '完成构建后即可提交审核。' : '完成构建后即可测试，并通过来源或安装包分发。'}</span></div></div> : null}
+    <section className="development-section"><h4>版本历史</h4><div className="development-version-list">{versions.map(version => <article key={version.version}><div><strong>v{version.version}</strong><Pill kind={version.state.tone}>{version.state.label}</Pill></div><small>{version.updatedAt ? formatTime(version.updatedAt) : '测试制品'}</small><p>{version.notes || '未提供更新说明。'}</p></article>)}</div></section>
   </>;
 }
 
@@ -356,11 +344,11 @@ function SettingsPanel({ project, dashboardEnabled, busy, onOpenFolder, onReques
   const change = <K extends keyof ExtensionProjectSourceInput>(key: K, value: ExtensionProjectSourceInput[K]) => setSource(current => ({ ...current, [key]: value }));
   const canSave = Boolean(project.local && source.source_repository.trim() && source.source_default_branch.trim() && source.source_subdirectory.trim());
   return <>
-    <section className="development-section"><h4>项目信息</h4><dl className="development-settings-list"><div><dt>类型</dt><dd>{kindLabel(project.kind)}</dd></div><div><dt>扩展 ID</dt><dd><code>{project.extensionId}</code></dd></div><div><dt>项目目录</dt><dd><code>{project.local?.workspace_path || '未关联'}</code></dd></div></dl>{project.local ? <div className="development-settings-actions"><button className="btn" disabled={!project.local.workspace_available} onClick={() => onOpenFolder(project.local!.workspace_path)}><FolderOpen size={15} />打开目录</button><button className="btn btn-danger-quiet" onClick={() => onRequestRemove(project.local!)}><Trash2 size={15} />移出工作台</button></div> : null}</section>
+      <section className="development-section"><h4>项目信息</h4><dl className="development-settings-list"><div><dt>类型</dt><dd>{kindLabel(project.kind)}</dd></div><div><dt>扩展 ID</dt><dd><code>{project.extensionId}</code></dd></div><div><dt>项目目录</dt><dd><code>{project.local?.workspace_path || '未关联'}</code></dd></div></dl>{project.local ? <div className="development-settings-actions"><button className="btn" disabled={!project.local.workspace_available} onClick={() => onOpenFolder(project.local!.workspace_path)}><FolderOpen size={15} />打开目录</button><button className="btn btn-danger-quiet" onClick={() => onRequestRemove(project.local!)}><Trash2 size={15} />移除项目</button></div> : null}</section>
     <section className="development-section"><h4>代码仓库</h4><div className="development-source-form">
       <label className="wide"><span>仓库地址</span><input value={source.source_repository} disabled={!project.local || !canManageRepository} placeholder="https://git.example.com/team/extensions.git" onChange={event => change('source_repository', event.target.value)} /></label>
       <label><span>默认分支</span><input value={source.source_default_branch} disabled={!project.local || !canManageRepository} placeholder="main" onChange={event => change('source_default_branch', event.target.value)} /></label>
-      <label><span>仓库内目录</span><input value={source.source_subdirectory} disabled={!project.local || !canManageRepository} placeholder={project.kind === 'plugin' ? 'plugins/my-plugin' : 'skills/my-skill'} onChange={event => change('source_subdirectory', event.target.value)} /></label>
+      <label><span>仓库内目录</span><input value={source.source_subdirectory} disabled={!project.local || !canManageRepository} placeholder={project.kind === 'plugin' ? 'plugins/my-plugin' : project.kind === 'workflow' ? 'workflows/my-workflow' : 'skills/my-skill'} onChange={event => change('source_subdirectory', event.target.value)} /></label>
     </div>{project.local ? <div className="development-settings-actions"><button className="btn btn-primary" disabled={!canSave || busy} onClick={() => void onUpdateSource(project.local!.id, source, dashboardEnabled && canManageRepository)}><Save size={15} />保存</button></div> : null}</section>
   </>;
 }
@@ -371,22 +359,23 @@ function CreateProjectDialog({ busy, onClose, onCreate }: { busy: boolean; onClo
   const change = <K extends keyof CreateExtensionProjectInput>(key: K, value: CreateExtensionProjectInput[K]) => setInput(current => ({ ...current, [key]: value }));
   return <div className="skill-dialog-backdrop"><div className="skill-dialog development-create-dialog" role="dialog" aria-modal="true"><div className="skill-dialog-head"><strong>新建扩展项目</strong><button className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div>
     <div className="development-create-form">
-      <div className="segmented-control development-kind-control"><button type="button" className={input.kind === 'skill' ? 'active' : ''} onClick={() => change('kind', 'skill')}><BookOpen size={14} />技能</button><button type="button" className={input.kind === 'plugin' ? 'active' : ''} onClick={() => change('kind', 'plugin')}><Blocks size={14} />插件</button></div>
+      <div className="segmented-control development-kind-control"><button type="button" className={input.kind === 'skill' ? 'active' : ''} onClick={() => setInput(current => ({ ...current, kind: 'skill', template: undefined }))}><BookOpen size={14} />技能</button><button type="button" className={input.kind === 'plugin' ? 'active' : ''} onClick={() => setInput(current => ({ ...current, kind: 'plugin', template: 'readonly-tool' }))}><Blocks size={14} />插件</button><button type="button" className={input.kind === 'workflow' ? 'active' : ''} onClick={() => setInput(current => ({ ...current, kind: 'workflow', template: 'strict' }))}><Hammer size={14} />工作流</button></div>
       <label><span>名称</span><input autoFocus value={input.name} onChange={event => change('name', event.target.value)} /></label>
       <label><span>项目标识</span><input value={input.slug} placeholder="commit-summary" onChange={event => change('slug', event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-'))} /></label>
       <label className="wide"><span>功能说明</span><textarea rows={3} value={input.description} onChange={event => change('description', event.target.value)} /></label>
       <label><span>功能分类</span><select value={input.category} onChange={event => change('category', event.target.value)}>{FUNCTIONAL_CATEGORIES.map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></label>
       {input.kind === 'plugin' ? <label><span>项目模板</span><select value={input.template} onChange={event => change('template', event.target.value as CreateExtensionProjectInput['template'])}><option value="readonly-tool">AI 工具</option><option value="job-worker">后台任务</option><option value="ui-tool">桌面工具</option></select></label> : null}
+      {input.kind === 'workflow' ? <label><span>流程模板</span><select value={input.template} onChange={event => change('template', event.target.value as CreateExtensionProjectInput['template'])}><option value="strict">固定流程</option><option value="segmented">分阶段流程</option><option value="flexible">灵活入口出口</option><option value="development-loop">开发循环</option><option value="capability-pipeline">能力流水线</option></select></label> : null}
     </div>
     <div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" disabled={!valid || busy} onClick={() => { void onCreate(input).catch(() => undefined); }}><Plus size={15} />创建项目</button></div>
   </div></div>;
 }
 
 function ConfirmRemoveDialog({ project, dashboardEnabled, busy, onClose, onConfirm }: { project: ExtensionProject; dashboardEnabled: boolean; busy: boolean; onClose: () => void; onConfirm: () => Promise<void> }) {
-  return <div className="skill-dialog-backdrop"><div className="skill-dialog" role="dialog" aria-modal="true"><div className="skill-dialog-head"><strong>移出工作台</strong><button className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div><div className="development-remove-copy"><p>“{project.name}”将不再显示在扩展中。</p><span>{dashboardEnabled ? '本地源码、构建和已提交审核不会被删除。' : '本地源码和已生成的候选包不会被删除。'}</span></div><div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" disabled={busy} onClick={() => void onConfirm()}><Trash2 size={15} />移出</button></div></div></div>;
+  return <div className="skill-dialog-backdrop"><div className="skill-dialog" role="dialog" aria-modal="true"><div className="skill-dialog-head"><strong>移除项目</strong><button className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div><div className="development-remove-copy"><p>“{project.name}”将从扩展开发列表中移除。</p><span>{dashboardEnabled ? '不会删除本地源码、构建结果或已提交的审核。' : '不会删除本地源码或已生成的测试制品。'}</span></div><div className="skill-dialog-actions"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" disabled={busy} onClick={() => void onConfirm()}><Trash2 size={15} />移除项目</button></div></div></div>;
 }
 
-function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remoteProjects' | 'pluginDrafts' | 'skillDrafts' | 'pluginSubmissions' | 'skillSubmissions'>): ProjectModel[] {
+function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remoteProjects' | 'pluginDrafts' | 'skillDrafts' | 'workflowDrafts' | 'pluginSubmissions' | 'skillSubmissions' | 'workflowSubmissions'>): ProjectModel[] {
   const map = new Map<string, ProjectModel>();
   const ensure = (kind: ExtensionProjectKind, id: string, name = id, description = '') => {
     const key = `${kind}:${id}`;
@@ -396,12 +385,14 @@ function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remo
     if (description && !project.description) project.description = description;
     return project;
   };
-  props.remoteProjects.forEach(remote => { const kind = remote.product_type === 'agent_plugin' ? 'plugin' : 'skill'; const project = ensure(kind, remote.product_key, remote.name, remote.description); project.remote = remote; project.name = remote.name; project.description = remote.description; });
+  props.remoteProjects.forEach(remote => { const kind = remote.product_type === 'agent_plugin' ? 'plugin' : remote.product_type === 'workflow_package' ? 'workflow' : 'skill'; const project = ensure(kind, remote.product_key, remote.name, remote.description); project.remote = remote; project.name = remote.name; project.description = remote.description; });
   props.projects.forEach(local => { const project = ensure(local.kind, local.extension_id, local.name, local.description); project.local = local; project.name = local.name; project.description = local.description; });
   props.pluginDrafts.forEach(value => ensure('plugin', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'plugin', value }));
   props.skillDrafts.forEach(value => ensure('skill', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'skill', value }));
+  props.workflowDrafts.forEach(value => ensure('workflow', value.manifest.id, value.manifest.name, value.manifest.description).drafts.push({ kind: 'workflow', value }));
   props.pluginSubmissions.forEach(value => ensure('plugin', value.product_key, value.name).submissions.push({ kind: 'plugin', value }));
   props.skillSubmissions.forEach(value => ensure('skill', value.product_key, value.name || value.product_key).submissions.push({ kind: 'skill', value }));
+  props.workflowSubmissions.forEach(value => ensure('workflow', value.manifest.id, value.manifest.name).submissions.push({ kind: 'workflow', value }));
   for (const project of map.values()) {
     project.drafts.sort((left, right) => compareVersions(right.value.manifest.version, left.value.manifest.version) || right.value.updated_at.localeCompare(left.value.updated_at));
     project.submissions.sort((left, right) => right.value.updated_at.localeCompare(left.value.updated_at));
@@ -444,7 +435,7 @@ function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: 
     const currentRelease = project.submissions.find(item => item.value.version === draft.value.manifest.version && item.value.release_status === 'published');
     if (currentRelease) return submissionStatus(currentRelease);
   }
-  if (buildMatchesSubmission(draft, submission)) return submission ? submissionStatus(submission) : { label: '同步审核', tone: 'warn' };
+  if (buildMatchesSubmission(draft, submission)) return submission ? submissionStatus(submission) : { label: '正在同步审核状态', tone: 'warn' };
   return { label: '可提交', tone: 'success' };
 }
 
@@ -490,5 +481,10 @@ function shortSha(value: string) { return value ? value.slice(0, 8) : '--'; }
 
 function compareVersions(left: string, right: string) { const a = left.split(/[.+-]/).map(value => Number.parseInt(value, 10) || 0); const b = right.split(/[.+-]/).map(value => Number.parseInt(value, 10) || 0); for (let index = 0; index < Math.max(a.length, b.length); index += 1) { const diff = (a[index] || 0) - (b[index] || 0); if (diff) return diff; } return left.localeCompare(right); }
 function formatTime(value?: string | null) { if (!value) return '--'; const numeric = Number(value); const date = new Date(Number.isFinite(numeric) && numeric > 0 ? numeric : value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }
-function kindLabel(kind: ExtensionProjectKind) { return kind === 'plugin' ? '插件' : '技能'; }
+function kindLabel(kind: ExtensionProjectKind) { return kind === 'plugin' ? '插件' : kind === 'workflow' ? '工作流' : '技能'; }
+function extensionKindLabel(productType: string) {
+  if (productType === 'agent_plugin') return '插件';
+  if (productType === 'workflow_package') return '工作流';
+  return '技能';
+}
 function roleLabel(role: string) { return role === 'owner' ? '作者' : role === 'contributor' ? '贡献者' : '--'; }

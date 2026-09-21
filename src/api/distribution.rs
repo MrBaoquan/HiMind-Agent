@@ -132,6 +132,12 @@ pub struct RuntimeComponentUpdate {
     pub signature_key_id: String,
     #[serde(rename = "signatureAlgorithm", default)]
     pub signature_algorithm: String,
+    #[serde(rename = "minAgentVersion", default)]
+    pub min_agent_version: String,
+    #[serde(rename = "maxAgentVersion", default)]
+    pub max_agent_version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +280,10 @@ pub struct WorkflowCatalogItem {
     pub workflow_id: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub categories: Vec<String>,
     pub version: String,
     #[serde(default)]
     pub release_notes: String,
@@ -310,6 +320,8 @@ pub struct WorkflowCatalogItem {
     pub allow_disable: bool,
     #[serde(default = "default_true")]
     pub allow_uninstall: bool,
+    #[serde(default)]
+    pub extension_lock: Option<serde_json::Value>,
 }
 
 fn default_marketplace_source() -> String {
@@ -427,6 +439,7 @@ pub struct CatalogPage<T> {
 
 pub type PluginCatalogPage = CatalogPage<PluginCatalogItem>;
 pub type SkillCatalogPage = CatalogPage<SkillCatalogItem>;
+pub type WorkflowCatalogPage = CatalogPage<WorkflowCatalogItem>;
 
 #[derive(Debug, Deserialize)]
 struct SkillCatalogResponse {
@@ -438,6 +451,42 @@ struct SkillCatalogResponse {
 struct WorkflowCatalogResponse {
     #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<WorkflowCatalogItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DistributionTrustBundle {
+    pub schema_version: String,
+    pub active_key_id: String,
+    #[serde(default)]
+    pub revoked_key_ids: Vec<String>,
+    #[serde(default)]
+    pub keys: Vec<DistributionTrustKey>,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct DistributionTrustKey {
+    pub key_id: String,
+    pub public_key_pem: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct ConnectorPolicyBundle {
+    pub schema_version: String,
+    #[serde(default)]
+    pub policies: Vec<ConnectorPolicy>,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct ConnectorPolicy {
+    pub connector_id: String,
+    pub revoked: bool,
+    #[serde(default)]
+    pub reason: String,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -785,6 +834,34 @@ pub fn workflow_versions(
         .items)
 }
 
+pub fn distribution_trust_bundle(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<DistributionTrustBundle, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/distribution/trust-keys"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<DistributionTrustBundle>()?)
+}
+
+pub(crate) fn connector_policy_bundle(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<ConnectorPolicyBundle, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/connectors/policies"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<ConnectorPolicyBundle>()?)
+}
+
 pub fn extension_desired_state(
     client: &Client,
     api_base: &str,
@@ -864,6 +941,78 @@ pub fn submit_skill(
         .multipart(form)
         .send()?;
     parse_submission_response(response)
+}
+
+pub fn submit_workflow(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    package_path: &Path,
+    lock_path: &Path,
+    test_report: &serde_json::Value,
+    revision_of_version: Option<&str>,
+    source: &crate::extension_projects::ExtensionSubmissionSource,
+    release_notes: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let file_name = package_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("workflow.hmwf")
+        .to_string();
+    let package_size = fs::metadata(package_path)?.len();
+    if package_size == 0 || package_size > MAX_SUBMISSION_PACKAGE_BYTES {
+        return Err(format!(
+            "Workflow submission package must be between 1 byte and {MAX_SUBMISSION_PACKAGE_BYTES} bytes"
+        )
+        .into());
+    }
+    let lock = fs::read_to_string(lock_path)?;
+    let package = Part::file(package_path)?
+        .file_name(file_name)
+        .mime_str("application/vnd.himind.workflow+zip")?;
+    let source_type = if source.source_repository.trim().is_empty() {
+        "local"
+    } else {
+        "repository"
+    };
+    let mut form = Form::new()
+        .part("file", package)
+        .text("lock", lock)
+        .text("test_report", serde_json::to_string(test_report)?)
+        .text("release_notes", release_notes.to_string())
+        .text("source_type", source_type)
+        .text("source_repository", source.source_repository.clone())
+        .text("source_branch", source.source_default_branch.clone())
+        .text("source_subdirectory", source.source_subdirectory.clone())
+        .text("source_commit", source.source_commit.clone());
+    if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
+        form = form.text("revision_of_version", version.to_string());
+    }
+    let response = client
+        .post(format!("{api_base}/api/agent/workflows/submissions"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .multipart(form)
+        .send()?;
+    parse_submission_response(response)
+}
+
+pub fn workflow_submissions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/workflows/submissions"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .send()?
+        .error_for_status()?
+        .json::<serde_json::Value>()?)
 }
 
 pub fn skill_submissions(

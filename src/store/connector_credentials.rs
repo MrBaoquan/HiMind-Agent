@@ -128,6 +128,26 @@ pub(crate) fn remove(handle: &str) -> Result<bool, Box<dyn Error>> {
     Ok(true)
 }
 
+pub(crate) fn remove_by_connector(connector_id: &str) -> Result<usize, Box<dyn Error>> {
+    remove_by_connector_at(&store_path(), connector_id)
+}
+
+pub(crate) fn remove_by_connector_at(
+    path: &Path,
+    connector_id: &str,
+) -> Result<usize, Box<dyn Error>> {
+    validate_identifier("connector id", connector_id)?;
+    let _lock = atomic_file::lock(path)?;
+    let mut records = read_records(path)?;
+    let before = records.len();
+    records.retain(|record| record.connector_id != connector_id);
+    let removed = before.saturating_sub(records.len());
+    if removed > 0 {
+        atomic_file::atomic_write(path, &serde_json::to_vec_pretty(&records)?)?;
+    }
+    Ok(removed)
+}
+
 fn read_records(path: &Path) -> Result<Vec<ConnectorCredentialRecord>, Box<dyn Error>> {
     if !path.is_file() {
         return Ok(Vec::new());
@@ -136,6 +156,10 @@ fn read_records(path: &Path) -> Result<Vec<ConnectorCredentialRecord>, Box<dyn E
 }
 
 fn store_path() -> PathBuf {
+    credential_store_path()
+}
+
+pub(crate) fn credential_store_path() -> PathBuf {
     crate::store::paths::agent_home()
         .join("connectors")
         .join(STORE_FILE)

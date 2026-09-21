@@ -37,12 +37,12 @@ export function ManagedCapabilitiesPanel({ assetKind, desired, loading, error, r
   const requiredCount = items.filter(item => policyLabel(item) === '组织必装').length;
   const managedCount = items.filter(item => policyLabel(item) === '组织管理').length;
 
-  if (loading && !desired) return <div className="page-loading"><span className="spinner" />正在读取受管理{assetKind === 'plugin' ? '插件' : '技能'}</div>;
+  if (loading && !desired) return <div className="page-loading"><span className="spinner" />正在读取组织管理的{assetKind === 'plugin' ? '插件' : '技能'}</div>;
 
   return (
     <div className="managed-page managed-panel">
-      {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>受管理数据暂时不可用</strong><span>{error}</span></div></div> : null}
-      {items.length ? <section className="managed-summary" aria-label="受管理能力摘要">
+      {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>组织管理数据暂时不可用</strong><span>{error}</span></div></div> : null}
+      {items.length ? <section className="managed-summary" aria-label="组织管理能力摘要">
         <div><span>系统内置</span><strong>{builtinCount}</strong></div>
         <div><span>组织必装</span><strong>{requiredCount}</strong></div>
         <div><span>组织管理</span><strong>{managedCount}</strong></div>
@@ -51,10 +51,10 @@ export function ManagedCapabilitiesPanel({ assetKind, desired, loading, error, r
       </section> : null}
 
       {!items.length ? (
-        <div className="managed-empty"><EmptyState icon={Unplug} title={`当前没有受管理${assetKind === 'plugin' ? '插件' : '技能'}`} text={error ? '请完成 Agent 配对后重新刷新。' : '系统内置和组织管理的条目会显示在这里。'} /></div>
+        <div className="managed-empty"><EmptyState icon={Unplug} title={`当前没有组织管理的${assetKind === 'plugin' ? '插件' : '技能'}`} text={error ? '请完成 Agent 配对后重新刷新。' : '系统内置和组织管理的条目会显示在这里。'} /></div>
       ) : (
         <section className={`managed-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
-          <aside className="managed-list" aria-label="受管理条目列表">
+          <aside className="managed-list" aria-label="组织管理条目列表">
             <div className="managed-list-header"><strong>全部条目</strong><span className="section-count">{items.length}</span></div>
             <div className="managed-list-body">
               {items.map(item => <ManagedListItem key={`${item.asset_kind}:${item.asset_key}`} item={item} local={localFor(item)} selected={`${item.asset_kind}:${item.asset_key}` === selectedKey} onSelect={() => { setSelectedKey(`${item.asset_kind}:${item.asset_key}`); setDetailOpen(true); }} />)}

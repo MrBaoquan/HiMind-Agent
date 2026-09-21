@@ -1,6 +1,7 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -43,12 +44,35 @@ pub(crate) struct WorkflowConnectorCredential {
     pub required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WorkflowHttpHealthCheck {
     pub url: String,
     pub method: String,
     pub expected_status: Vec<u16>,
     pub timeout_seconds: u64,
+    pub credential_handle: String,
+    pub credential_header: String,
+    pub credential_value_prefix: String,
+    pub credential_secret: Option<String>,
+}
+
+impl fmt::Debug for WorkflowHttpHealthCheck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowHttpHealthCheck")
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("expected_status", &self.expected_status)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("credential_handle", &self.credential_handle)
+            .field("credential_header", &self.credential_header)
+            .field("credential_value_prefix", &self.credential_value_prefix)
+            .field(
+                "credential_secret",
+                &self.credential_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +87,12 @@ struct WorkflowHttpHealthCheckManifest {
     expected_status: Vec<u16>,
     #[serde(default = "default_http_health_timeout")]
     timeout_seconds: u64,
+    #[serde(default)]
+    credential_handle: String,
+    #[serde(default)]
+    credential_header: String,
+    #[serde(default)]
+    credential_value_prefix: String,
 }
 
 impl WorkflowConnectorManifest {
@@ -172,6 +202,18 @@ impl WorkflowConnectorManifest {
                 ));
             }
         }
+        if let Ok(check) = parse_http_health_check(&self.health_check) {
+            if !check.credential_handle.is_empty()
+                && !self.credentials.iter().any(|credential| {
+                    credential.handle == check.credential_handle && credential.kind == "secret"
+                })
+            {
+                return Err(format!(
+                    "connector {} HTTP health credential handle must reference a declared secret credential",
+                    self.id
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -211,7 +253,19 @@ pub(crate) fn execute_http_health_check(
         builder = builder.no_proxy();
     }
     let client = builder.build()?;
-    let status = client.request(method, &check.url).send()?.status().as_u16();
+    let mut request = client.request(method, &check.url);
+    if let Some(secret) = check.credential_secret.as_deref() {
+        let header_name =
+            reqwest::header::HeaderName::from_bytes(check.credential_header.as_bytes())
+                .map_err(|_| "HTTP health check credential header is invalid")?;
+        let header_value = reqwest::header::HeaderValue::from_str(&format!(
+            "{}{}",
+            check.credential_value_prefix, secret
+        ))
+        .map_err(|_| "HTTP health check credential value is invalid")?;
+        request = request.header(header_name, header_value);
+    }
+    let status = request.send()?.status().as_u16();
     if !check.expected_status.contains(&status) {
         return Err(format!("HTTP health check returned unexpected status: {status}").into());
     }
@@ -247,13 +301,77 @@ fn parse_http_health_check(value: &serde_json::Value) -> Result<WorkflowHttpHeal
     if !(1..=30).contains(&manifest.timeout_seconds) {
         return Err("HTTP health check timeout_seconds must be between 1 and 30".to_string());
     }
+    let credential_handle = manifest.credential_handle.trim().to_string();
+    let credential_header = manifest.credential_header.trim().to_string();
+    let credential_value_prefix = manifest.credential_value_prefix;
+    if credential_handle.is_empty() {
+        if !credential_header.is_empty() || !credential_value_prefix.trim().is_empty() {
+            return Err(
+                "HTTP health check credential handle is required when credential header is set"
+                    .to_string(),
+            );
+        }
+    } else {
+        validate_identifier("connector credential handle", &credential_handle)?;
+        if credential_header.is_empty() {
+            return Err("HTTP health check credential header is required".to_string());
+        }
+        if !credential_header.eq_ignore_ascii_case("authorization")
+            && !credential_header.to_ascii_lowercase().starts_with("x-")
+        {
+            return Err(
+                "HTTP health check credential header must be Authorization or X-*".to_string(),
+            );
+        }
+        reqwest::header::HeaderName::from_bytes(credential_header.as_bytes())
+            .map_err(|_| "HTTP health check credential header is invalid".to_string())?;
+        if credential_value_prefix.len() > 64
+            || credential_value_prefix
+                .chars()
+                .any(|value| !value.is_ascii_graphic() && value != ' ')
+        {
+            return Err("HTTP health check credential prefix is invalid".to_string());
+        }
+    }
     validate_http_health_url(&manifest.url)?;
     Ok(WorkflowHttpHealthCheck {
         url: manifest.url,
         method,
         expected_status: manifest.expected_status,
         timeout_seconds: manifest.timeout_seconds,
+        credential_handle,
+        credential_header,
+        credential_value_prefix,
+        credential_secret: None,
     })
+}
+
+pub(crate) fn resolve_http_health_credential(
+    connector: &WorkflowConnectorManifest,
+    check: &mut WorkflowHttpHealthCheck,
+) -> Result<(), Box<dyn Error>> {
+    if check.credential_handle.is_empty() {
+        return Ok(());
+    }
+    let resolved = crate::store::connector_credentials::resolve(&check.credential_handle)?
+        .ok_or_else(|| {
+            format!(
+                "connector {} HTTP health credential is missing: {}",
+                connector.id, check.credential_handle
+            )
+        })?;
+    if resolved.connector_id != connector.id {
+        return Err(format!(
+            "connector {} HTTP health credential {} belongs to {}",
+            connector.id, check.credential_handle, resolved.connector_id
+        )
+        .into());
+    }
+    if resolved.kind != "secret" {
+        return Err("HTTP health check credential must be a secret".into());
+    }
+    check.credential_secret = Some(resolved.value);
+    Ok(())
 }
 
 fn validate_http_health_url(value: &str) -> Result<(), String> {
@@ -322,15 +440,39 @@ pub(crate) fn load_connector_manifests(
     Ok(manifests)
 }
 
+pub(crate) struct ResolvedConnectorCredentials {
+    pub(crate) input: serde_json::Value,
+    pub(crate) redactions: Vec<String>,
+}
+
 pub(crate) fn resolve_connector_credentials_for_capability(
     package: &super::WorkflowPackage,
     capability_id: &str,
     input: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(
+        resolve_connector_credentials_for_capability_with_redactions(
+            package,
+            capability_id,
+            input,
+        )?
+        .input,
+    )
+}
+
+pub(crate) fn resolve_connector_credentials_for_capability_with_redactions(
+    package: &super::WorkflowPackage,
+    capability_id: &str,
+    input: &serde_json::Value,
+) -> Result<ResolvedConnectorCredentials, Box<dyn Error>> {
     let mut input = input
         .as_object()
         .cloned()
         .ok_or("workflow capability input must be an object")?;
+    let mut redactions = Vec::new();
+    for connector in &package.connectors {
+        crate::store::connector_state::ensure_available(&connector.id)?;
+    }
     let handles = input
         .get("credential_handles")
         .and_then(serde_json::Value::as_object)
@@ -346,7 +488,11 @@ pub(crate) fn resolve_connector_credentials_for_capability(
         }
         for credential in &connector.credentials {
             if input.contains_key(&credential.target) {
-                continue;
+                return Err(format!(
+                    "workflow connector credential target {} must be supplied through credential_handles",
+                    credential.target
+                )
+                .into());
             }
             let handle = handles
                 .get(&credential.target)
@@ -372,12 +518,18 @@ pub(crate) fn resolve_connector_credentials_for_capability(
             }
             input.insert(
                 credential.target.clone(),
-                serde_json::Value::String(resolved.value),
+                serde_json::Value::String(resolved.value.clone()),
             );
+            if !resolved.value.is_empty() && !redactions.contains(&resolved.value) {
+                redactions.push(resolved.value);
+            }
         }
     }
     input.remove("credential_handles");
-    Ok(serde_json::Value::Object(input))
+    Ok(ResolvedConnectorCredentials {
+        input: serde_json::Value::Object(input),
+        redactions,
+    })
 }
 
 fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
@@ -435,6 +587,72 @@ mod tests {
     }
 
     #[test]
+    fn rejects_direct_credential_target_input() {
+        let manifest = WorkflowConnectorManifest {
+            schema_version: CONNECTOR_MANIFEST_SCHEMA_VERSION.to_string(),
+            id: "wechat-miniprogram".to_string(),
+            version: "1.0.0".to_string(),
+            name: "WeChat".to_string(),
+            description: String::new(),
+            availability: "local".to_string(),
+            credential_ownership: "agent".to_string(),
+            auth: vec!["api_key".to_string()],
+            capabilities: vec!["wechat.miniprogram.preview".to_string()],
+            scopes: Vec::new(),
+            supported_platforms: vec!["windows".to_string()],
+            health_check: serde_json::json!({}),
+            credentials: vec![WorkflowConnectorCredential {
+                handle: "wechat-upload-key".to_string(),
+                target: "private_key_path".to_string(),
+                kind: "file_path".to_string(),
+                required: true,
+            }],
+        };
+        let package = super::super::WorkflowPackage {
+            schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
+            id: "com.himind.workflow.test".to_string(),
+            version: "1.0.0".to_string(),
+            name: "Test".to_string(),
+            description: String::new(),
+            min_agent_version: "0.3.47".to_string(),
+            local_requirements: serde_json::json!({}),
+            optional_providers: Vec::new(),
+            capabilities: vec!["wechat.miniprogram.preview".to_string()],
+            dependencies: Default::default(),
+            candidate: None,
+            execution_policy: "strict".to_string(),
+            entrypoints: Vec::new(),
+            default_entrypoint: String::new(),
+            default_exitpoint: String::new(),
+            exits: Vec::new(),
+            steps: Vec::new(),
+            artifacts: Vec::new(),
+            ui: super::super::WorkflowUi {
+                mode: "standard".to_string(),
+                entry: String::new(),
+                surfaces: Vec::new(),
+            },
+            supported_runtimes: Vec::new(),
+            created_at: String::new(),
+            source_root: std::path::PathBuf::new(),
+            connectors: vec![manifest],
+        };
+        let error = match resolve_connector_credentials_for_capability_with_redactions(
+            &package,
+            "wechat.miniprogram.preview",
+            &serde_json::json!({
+                "private_key_path": "C:\\secrets\\bypass.key"
+            }),
+        ) {
+            Ok(_) => panic!("direct credential target should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("must be supplied through credential_handles"));
+    }
+
+    #[test]
     fn validates_and_executes_restricted_http_health_checks() {
         let manifest = WorkflowConnectorManifest {
             schema_version: CONNECTOR_MANIFEST_SCHEMA_VERSION.to_string(),
@@ -463,6 +681,38 @@ mod tests {
         insecure.health_check["url"] = serde_json::json!("http://example.com/health");
         assert!(insecure.validate().unwrap_err().contains("must use HTTPS"));
 
+        let mut credential_without_handle = manifest.clone();
+        credential_without_handle.health_check["credential_header"] =
+            serde_json::json!("Authorization");
+        assert!(credential_without_handle
+            .validate()
+            .unwrap_err()
+            .contains("credential handle is required"));
+
+        let mut undeclared_credential = manifest.clone();
+        undeclared_credential.health_check["credential_handle"] =
+            serde_json::json!("network-api-key");
+        undeclared_credential.health_check["credential_header"] =
+            serde_json::json!("Authorization");
+        undeclared_credential.health_check["credential_value_prefix"] =
+            serde_json::json!("Bearer ");
+        assert!(undeclared_credential
+            .validate()
+            .unwrap_err()
+            .contains("declared secret credential"));
+
+        let mut authenticated = manifest.clone();
+        authenticated.health_check["credential_handle"] = serde_json::json!("network-api-key");
+        authenticated.health_check["credential_header"] = serde_json::json!("Authorization");
+        authenticated.health_check["credential_value_prefix"] = serde_json::json!("Bearer ");
+        authenticated.credentials = vec![WorkflowConnectorCredential {
+            handle: "network-api-key".to_string(),
+            target: "api_key".to_string(),
+            kind: "secret".to_string(),
+            required: true,
+        }];
+        authenticated.validate().unwrap();
+
         let mut invalid_method = manifest;
         invalid_method.health_check["method"] = serde_json::json!("POST");
         assert!(invalid_method
@@ -488,6 +738,10 @@ mod tests {
             method: "GET".to_string(),
             expected_status: vec![204],
             timeout_seconds: 3,
+            credential_handle: String::new(),
+            credential_header: String::new(),
+            credential_value_prefix: String::new(),
+            credential_secret: None,
         };
         assert_eq!(execute_http_health_check(&check).unwrap(), 204);
         server.join().unwrap();
@@ -507,8 +761,42 @@ mod tests {
             method: "GET".to_string(),
             expected_status: vec![200],
             timeout_seconds: 3,
+            credential_handle: String::new(),
+            credential_header: String::new(),
+            credential_value_prefix: String::new(),
+            credential_secret: None,
         };
         assert!(execute_http_health_check(&check).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_http_health_check_injects_credential_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).to_string();
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-secret"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let check = WorkflowHttpHealthCheck {
+            url: format!("http://{address}/health"),
+            method: "GET".to_string(),
+            expected_status: vec![200],
+            timeout_seconds: 3,
+            credential_handle: "network-api-key".to_string(),
+            credential_header: "Authorization".to_string(),
+            credential_value_prefix: "Bearer ".to_string(),
+            credential_secret: Some("test-secret".to_string()),
+        };
+        assert_eq!(execute_http_health_check(&check).unwrap(), 200);
         server.join().unwrap();
     }
 }

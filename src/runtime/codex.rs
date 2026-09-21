@@ -141,9 +141,9 @@ fn build_invocation(
     let prompt = build_prompt(claim)?;
     let sandbox = codex_sandbox_mode_for_claim(claim)?;
     let result_path = process::safe_temp_path(&claim.run.id, "codex-final.txt")?;
-    Ok(CodexInvocation {
-        executable,
-        args: vec![
+    let resume_session_id = claim.resume_provider_session_id.trim();
+    let args = if resume_session_id.is_empty() {
+        vec![
             OsString::from("-C"),
             workspace.as_os_str().to_os_string(),
             OsString::from("-s"),
@@ -158,11 +158,34 @@ fn build_invocation(
             OsString::from("-o"),
             result_path.as_os_str().to_os_string(),
             OsString::from("-"),
-        ],
+        ]
+    } else {
+        validate_resume_session_id(resume_session_id)?;
+        vec![
+            OsString::from("exec"),
+            OsString::from("resume"),
+            OsString::from("--json"),
+            OsString::from("--skip-git-repo-check"),
+            OsString::from("-o"),
+            result_path.as_os_str().to_os_string(),
+            OsString::from(resume_session_id),
+            OsString::from("-"),
+        ]
+    };
+    Ok(CodexInvocation {
+        executable,
+        args,
         workspace,
         prompt,
         result_path,
     })
+}
+
+fn validate_resume_session_id(value: &str) -> Result<(), Box<dyn Error>> {
+    if value.is_empty() || value.len() > 512 || value.chars().any(|char| char.is_control()) {
+        return Err("Codex resume session id is invalid".into());
+    }
+    Ok(())
 }
 
 fn codex_sandbox_mode_for_claim(claim: &AgentRunClaim) -> Result<String, Box<dyn Error>> {
@@ -222,7 +245,12 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
                 provider: PROVIDER_CODEX.to_string(),
                 version: String::new(),
                 status: "unsupported".to_string(),
-                capabilities: json!({"managed_execution":true,"billing_owner":"user"}),
+                capabilities: json!({
+                    "managed_execution": true,
+                    "billing_owner": "user",
+                    "network_isolated": false,
+                    "tool_access": "workspace-write"
+                }),
             }
         }
     };
@@ -231,13 +259,25 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
             provider: PROVIDER_CODEX.to_string(),
             version: process::summarize_output(version.trim(), 200),
             status: "ready".to_string(),
-            capabilities: json!({"managed_execution":true,"billing_owner":"user","sandbox":sandbox}),
+            capabilities: json!({
+                "managed_execution": true,
+                "billing_owner": "user",
+                "sandbox": sandbox,
+                "network_isolated": false,
+                "tool_access": "workspace-write"
+            }),
         },
         Err(_) => RuntimeInstallationReport {
             provider: PROVIDER_CODEX.to_string(),
             version: String::new(),
             status: "unavailable".to_string(),
-            capabilities: json!({"managed_execution":true,"billing_owner":"user","sandbox":sandbox}),
+            capabilities: json!({
+                "managed_execution": true,
+                "billing_owner": "user",
+                "sandbox": sandbox,
+                "network_isolated": false,
+                "tool_access": "workspace-write"
+            }),
         },
     }
 }
@@ -343,9 +383,18 @@ mod tests {
         AgentRunClaim {
             run: AgentRun {
                 id: "run-1".to_string(),
+                work_item_id: String::new(),
+                parent_run_id: String::new(),
+                root_run_id: String::new(),
+                parent_work_item_id: String::new(),
+                root_work_item_id: String::new(),
+                attempt_no: 0,
                 instruction: "Fix the failing tests".to_string(),
                 status: "claimed".to_string(),
                 created_by_user_id: "user-1".to_string(),
+                requested_agent_id: String::new(),
+                project_id: String::new(),
+                exhibit_pid: String::new(),
                 runtime_provider: PROVIDER_CODEX.to_string(),
                 access_mode: crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED.to_string(),
                 input: json!({"suite":"unit"}),
@@ -353,6 +402,7 @@ mod tests {
             claim_token: "claim-secret".to_string(),
             workspace_path: workspace.to_string_lossy().to_string(),
             ai_model: String::new(),
+            resume_provider_session_id: String::new(),
             access_mode: crate::app::remote_execution::ACCESS_MODE_EXHIBIT_LINKED.to_string(),
         }
     }
@@ -395,5 +445,39 @@ mod tests {
             parse_codex_session_id(output).as_deref(),
             Some("thread-123")
         );
+    }
+
+    #[test]
+    fn invocation_resumes_recorded_codex_session() {
+        let root = std::env::temp_dir().join(format!("himind-codex-resume-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut claim = claim(&root);
+        claim.resume_provider_session_id = "thread-prior".to_string();
+        let invocation = build_invocation(OsString::from("codex"), &claim).unwrap();
+        let args = invocation
+            .args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(args.contains("exec resume"));
+        assert!(args.contains("thread-prior"));
+        assert!(args.ends_with(" -"));
+        assert!(!args.contains("-C "));
+        process::remove_file_if_present(&invocation.result_path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invocation_rejects_unsafe_resume_session_id() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-codex-resume-invalid-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut claim = claim(&root);
+        claim.resume_provider_session_id = "thread\ninvalid".to_string();
+        assert!(build_invocation(OsString::from("codex"), &claim).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

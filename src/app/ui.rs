@@ -11,7 +11,7 @@ use std::{
 };
 use tauri::http::{Request, Response, StatusCode};
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
@@ -207,6 +207,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::configure_remote_client,
             super::commands::pick_remote_client,
             super::commands::get_builtin_ai_runtime_status,
+            super::commands::pick_runtime_manifest,
             super::commands::get_builtin_ai_runtime_installation_status,
             super::commands::check_builtin_ai_runtime_update,
             super::commands::get_builtin_ai_tool_context_summary,
@@ -218,6 +219,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::install_builtin_ai_runtime,
             super::commands::start_builtin_ai_runtime_install,
             super::commands::start_builtin_ai_session,
+            super::commands::open_builtin_ai_web,
             super::commands::sync_builtin_ai_models,
             super::commands::set_approval_rule,
             super::commands::set_approval_profile,
@@ -242,12 +244,39 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
             super::commands::get_workflow_center,
+            super::commands::list_schedules,
+            super::commands::set_schedule,
+            super::commands::delete_schedule,
+            super::commands::list_skill_runs,
+            super::commands::list_workflow_presets,
+            super::commands::set_workflow_preset,
+            super::commands::delete_workflow_preset,
+            super::commands::run_skill,
+            super::commands::reveal_skill_run,
+            super::commands::query_workflow_catalog,
+            super::commands::get_workflow_versions,
+            super::commands::get_connector_states,
+            super::commands::set_connector_enabled,
+            super::commands::revoke_connector,
+            super::commands::restore_connector,
+            super::commands::set_connector_file_credential,
+            super::commands::set_connector_secret_credential,
+            super::commands::remove_connector_credential,
             super::commands::get_workflow_run,
+            super::commands::verify_workflow_run,
+            super::commands::reveal_workflow_artifact,
             super::commands::approve_workflow_step,
             super::commands::reject_workflow_step,
             super::commands::cancel_workflow_run,
             super::commands::resume_workflow_run,
             super::commands::start_workflow_run,
+            super::commands::preflight_workflow_run,
+            super::commands::install_workflow_catalog_item,
+            super::commands::pick_workflow_archive,
+            super::commands::install_local_workflow_archive,
+            super::commands::set_workflow_enabled,
+            super::commands::rollback_workflow,
+            super::commands::remove_workflow,
             super::commands::get_extension_sources,
             super::commands::add_extension_source,
             super::commands::add_local_extension_source,
@@ -273,8 +302,14 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::rollback_plugin,
             super::commands::set_plugin_enabled,
             super::commands::get_agent_capabilities,
+            super::commands::get_projection_sync_status,
             super::commands::list_ai_services,
+            super::commands::list_acp_runtime_profiles,
+            super::commands::save_acp_runtime_profile,
+            super::commands::set_acp_runtime_profile_enabled,
+            super::commands::remove_acp_runtime_profile,
             super::commands::save_ai_service,
+            super::commands::set_active_ai_service,
             super::commands::remove_ai_service,
             super::commands::import_ai_client,
             super::commands::remove_ai_client,
@@ -314,6 +349,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::create_plugin_revision,
             super::commands::test_plugin_draft,
             super::commands::confirm_plugin_draft,
+            super::commands::list_workflow_drafts,
+            super::commands::test_workflow_draft,
+            super::commands::confirm_workflow_draft,
+            super::commands::submit_workflow_draft,
+            super::commands::list_workflow_submissions,
             super::commands::list_plugin_submissions,
             super::commands::submit_plugin_draft,
             super::commands::list_skill_submissions,
@@ -378,6 +418,15 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             setup_approval_popup(app)?;
             start_internal_window_filter();
             start_approval_popup_watcher(app.handle().clone(), Arc::clone(&popup_approval_manager));
+            // 平台级定时任务由桌面 Agent 自己的调度线程驱动；到点后按目标类型
+            // 派发（Workflow 目标走的仍是与手动启动完全相同的 Run 路径）。
+            crate::scheduler::start_scheduler(
+                app.state::<AgentState>().capability_gateway.clone(),
+            );
+            // 启动时先收尾上一次进程留下的僵尸运行，再开始调度。
+            if let Err(error) = crate::scheduler::abandon_stale_runs() {
+                eprintln!("stale workflow run sweep failed: {error}");
+            }
             if let Some(launch) = initial_plugin_view.as_ref() {
                 open_plugin_view(app.handle(), &launch.plugin_id, &launch.view_id)?;
             } else if initial_protocol_open {
@@ -420,14 +469,26 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
     let handle = app.handle();
 
     let open_item = MenuItem::with_id(handle, "open", "打开主窗口", true, None::<&str>)?;
+    // 托盘是"一眼看状态"的地方：先给运行模式，再给待办，最后才是动作与退出。
+    // 端口、版本这类诊断信息放进浮动提示，不占用菜单行。
+    let mode_label = app
+        .try_state::<AgentState>()
+        .map(|state| {
+            if state.options.mode().dashboard_enabled() {
+                "已连接工作台"
+            } else {
+                "独立运行"
+            }
+        })
+        .unwrap_or("运行中");
     let status_item = MenuItem::with_id(
         handle,
         "status",
-        format!("本地服务: 127.0.0.1:{port}"),
+        format!("状态：{mode_label} · 本地服务 127.0.0.1:{port}"),
         false,
         None::<&str>,
     )?;
-    let approval_item = MenuItem::with_id(handle, "approvals", "待审批：0", true, None::<&str>)?;
+    let approval_item = MenuItem::with_id(handle, "approvals", "待审批：无", false, None::<&str>)?;
     let check_update_item =
         MenuItem::with_id(handle, "check-update", "检查更新", true, None::<&str>)?;
     let update_status = handle
@@ -449,14 +510,21 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
     )?;
     let quit_item = MenuItem::with_id(handle, "quit", "退出 Agent", true, None::<&str>)?;
 
+    let state_separator = PredefinedMenuItem::separator(handle)?;
+    let action_separator = PredefinedMenuItem::separator(handle)?;
+    let quit_separator = PredefinedMenuItem::separator(handle)?;
+
     let menu = Menu::with_items(
         handle,
         &[
             &open_item,
             &status_item,
+            &state_separator,
             &approval_item,
+            &action_separator,
             &check_update_item,
             &install_update_item,
+            &quit_separator,
             &quit_item,
         ],
     )?;
@@ -468,7 +536,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
     let _tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
-        .tooltip("HiMind Agent")
+        .tooltip(format!("HiMind Agent · {mode_label}"))
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => {
                 show_main_window(app);
@@ -569,11 +637,13 @@ fn start_approval_tray_watcher(app: tauri::AppHandle, approval_item: MenuItem<ta
             let count = state.approval_manager.list_pending().len();
             if count != previous {
                 let text = if count == 0 {
-                    "待审批：0".to_string()
+                    "待审批：无".to_string()
                 } else {
                     format!("待审批：{count}")
                 };
                 let _ = approval_item.set_text(text);
+                // 没有待办时不给入口，避免点开空弹窗。
+                let _ = approval_item.set_enabled(count > 0);
                 previous = count;
             }
             thread::sleep(Duration::from_millis(700));
@@ -832,7 +902,7 @@ fn start_builtin_ai_session_inner(
     command
         .args(["--profile", "himind", "--patch"])
         .arg(&launch.agent_patch)
-        .args(["--host", "127.0.0.1", "--port", "0"])
+        .args(["--host", "127.0.0.1", "--port", "0", "--no-open"])
         .current_dir(&launch.workspace)
         .env("DSH_HOME", &launch.home)
         .env("DSH_TELEMETRY_MODE", "DISABLED")
@@ -907,6 +977,12 @@ fn start_builtin_ai_session_inner(
         let _ = child.wait();
         error
     })?;
+    if let Err(error) = proxy.control().verify_browser_entry() {
+        proxy.stop();
+        crate::runtime::process::terminate_process_tree(&mut child);
+        let _ = child.wait();
+        return Err(format!("HiMind AI 页面认证失败：{error}"));
+    }
     if focus_workspace {
         if let Err(error) = proxy.control().start_workspace_session(&launch.workspace) {
             proxy.stop();

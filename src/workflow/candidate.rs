@@ -2,17 +2,18 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
     let workspace = input
         .get("project_root")
         .or_else(|| input.get("repository_root"))
+        .or_else(|| input.get("workspace_root"))
+        .or_else(|| input.get("source_root"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("candidate freeze requires project_root or repository_root")?;
+        .ok_or("candidate freeze requires project_root, repository_root, workspace_root or source_root")?;
     let candidate_artifact_id = input
         .get("candidate_artifact_id")
         .and_then(Value::as_str)
@@ -38,15 +39,15 @@ pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
         .trim()
         .to_string();
     let status = git_output(
-        &workspace,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &repository_root,
+        &crate::worktree_identity::status_arguments(),
     )?;
     let dirty = !status.trim().is_empty();
     if dirty && !allow_dirty {
         return Err("candidate workspace has uncommitted changes".into());
     }
     let tree_digest = if dirty {
-        worktree_tree_digest(&workspace)?
+        worktree_tree_digest(&repository_root)?
     } else {
         head_tree_digest
     };
@@ -55,6 +56,30 @@ pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
     }
 
     let status_digest = format!("{:x}", Sha256::digest(status.as_bytes()));
+    if let Some(checkpoint) = input.get("development_checkpoint") {
+        let expected_commit = checkpoint
+            .get("commit_sha")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let expected_tree = checkpoint
+            .get("tree_digest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if !expected_commit.is_empty() && expected_commit != commit_sha {
+            return Err(format!(
+                "development checkpoint commit does not match frozen candidate: expected {expected_commit}, actual {commit_sha}"
+            )
+            .into());
+        }
+        if !expected_tree.is_empty() && expected_tree != tree_digest {
+            return Err(format!(
+                "development checkpoint tree does not match frozen candidate: expected {expected_tree}, actual {tree_digest}"
+            )
+            .into());
+        }
+    }
     let candidate_id = format!(
         "{:x}",
         Sha256::digest(format!("{commit_sha}:{tree_digest}:{status_digest}").as_bytes())
@@ -93,20 +118,30 @@ pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
 }
 
 fn worktree_tree_digest(workspace: &Path) -> Result<String, Box<dyn Error>> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
     let index_path = std::env::temp_dir().join(format!(
-        "himind-candidate-index-{}-{}",
+        "himind-candidate-index-{}-{unique}",
         std::process::id(),
-        unix_timestamp_string()
     ));
+    let lock_path = PathBuf::from(format!("{}.lock", index_path.to_string_lossy()));
     let _ = std::fs::remove_file(&index_path);
+    let _ = std::fs::remove_file(&lock_path);
     let result = (|| -> Result<String, Box<dyn Error>> {
         git_with_index(workspace, &index_path, &["read-tree", "HEAD"])?;
-        git_with_index(workspace, &index_path, &["add", "-A"])?;
+        git_with_index(
+            workspace,
+            &index_path,
+            &crate::worktree_identity::stage_arguments(),
+        )?;
         Ok(git_with_index(workspace, &index_path, &["write-tree"])?
             .trim()
             .to_string())
     })();
     let _ = std::fs::remove_file(index_path);
+    let _ = std::fs::remove_file(lock_path);
     result
 }
 
@@ -115,7 +150,7 @@ fn git_with_index(
     index_path: &Path,
     args: &[&str],
 ) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("git")
+    let output = crate::runtime::process::hidden_command("git")
         .current_dir(workspace)
         .env("GIT_INDEX_FILE", index_path)
         .args(args)
@@ -162,7 +197,7 @@ fn candidate_artifact_path(uri: &str) -> Option<PathBuf> {
 }
 
 fn git_output(workspace: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("git")
+    let output = crate::runtime::process::hidden_command("git")
         .args(["-C"])
         .arg(workspace)
         .args(args)
@@ -188,6 +223,7 @@ fn unix_timestamp_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -268,6 +304,55 @@ mod tests {
             .as_str()
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_metadata_does_not_change_candidate_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-candidate-metadata-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".himind")).unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("app.js"), "console.log('ok');\n").unwrap();
+        git(&root, &["add", "app.js"]);
+        git(&root, &["commit", "--quiet", "-m", "initial"]);
+        std::fs::write(root.join(".himind/project.json"), "{}\n").unwrap();
+
+        let first = freeze_candidate(&json!({
+            "project_root": root,
+            "candidate_artifact_id": "candidate",
+            "allow_dirty": true
+        }))
+        .unwrap();
+        std::fs::create_dir_all(root.join(".himind").join("handoffs")).unwrap();
+        std::fs::write(
+            root.join(".himind").join("handoffs").join("handoff.json"),
+            "{}\n",
+        )
+        .unwrap();
+        let second = freeze_candidate(&json!({
+            "project_root": root,
+            "candidate_artifact_id": "candidate",
+            "allow_dirty": true
+        }))
+        .unwrap();
+
+        assert_eq!(
+            first["candidate"]["tree_digest"],
+            second["candidate"]["tree_digest"]
+        );
+        assert_eq!(
+            first["candidate"]["status_digest"],
+            second["candidate"]["status_digest"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

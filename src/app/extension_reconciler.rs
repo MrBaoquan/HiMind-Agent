@@ -58,6 +58,15 @@ pub(crate) fn reconcile(
                 continue;
             }
         }
+        if item.desired_state == "optional" && item.asset_kind == "workflow" {
+            let installed = crate::workflow::WorkflowStore::open_default()?
+                .list()?
+                .into_iter()
+                .any(|workflow| workflow.package.id == item.asset_key);
+            if !installed {
+                continue;
+            }
+        }
         let result = reconcile_item(options, agent_id, item);
         if result.status != "not_applicable" {
             items.push(result);
@@ -123,7 +132,66 @@ fn reconcile_scope_exit(item: &ExtensionDesiredItem) -> ExtensionReconcileItem {
     match item.asset_kind.as_str() {
         "plugin" => reconcile_plugin_scope_exit(item),
         "skill" => reconcile_skill_scope_exit(item),
+        "workflow" => reconcile_workflow_scope_exit(item),
         _ => result(item, "not_applicable", "scope_exit", "", json!({}), ""),
+    }
+}
+
+fn reconcile_workflow_scope_exit(item: &ExtensionDesiredItem) -> ExtensionReconcileItem {
+    let store = match crate::workflow::WorkflowStore::open_default() {
+        Ok(store) => store,
+        Err(error) => {
+            return result(
+                item,
+                "failed",
+                "scope_exit",
+                "",
+                json!({}),
+                &error.to_string(),
+            )
+        }
+    };
+    let existing = match store.list() {
+        Ok(items) => items
+            .into_iter()
+            .find(|workflow| workflow.package.id == item.asset_key),
+        Err(error) => {
+            return result(
+                item,
+                "failed",
+                "scope_exit",
+                "",
+                json!({}),
+                &error.to_string(),
+            )
+        }
+    };
+    let Some(existing) = existing else {
+        return result(item, "uninstalled", "scope_exit", "", json!({}), "");
+    };
+    let version = existing.package.version;
+    let action = normalized_scope_exit(item);
+    let outcome = match action {
+        "disable" => store.set_enabled(&item.asset_key, false).map(|_| ()),
+        "remove_if_unused" => store.remove(&item.asset_key).map(|_| ()),
+        _ => Ok(()),
+    };
+    match outcome {
+        Ok(()) if action == "disable" => {
+            result(item, "disabled", "scope_exit", &version, json!({}), "")
+        }
+        Ok(()) if action == "remove_if_unused" => {
+            result(item, "uninstalled", "scope_exit", "", json!({}), "")
+        }
+        Ok(()) => result(item, "installed", "scope_exit", &version, json!({}), ""),
+        Err(error) => result(
+            item,
+            "failed",
+            "scope_exit",
+            &version,
+            json!({}),
+            &error.to_string(),
+        ),
     }
 }
 
@@ -388,6 +456,23 @@ fn extension_is_in_desired_state(item: &ExtensionDesiredItem) -> Result<bool, Bo
             _ => true,
         });
     }
+    if item.asset_kind == "workflow" {
+        let installed = crate::workflow::WorkflowStore::open_default()?
+            .list()?
+            .into_iter()
+            .find(|workflow| workflow.package.id == item.asset_key);
+        return Ok(match item.desired_state.as_str() {
+            "absent" => installed.is_none(),
+            "present" => installed
+                .map(|workflow| {
+                    (item.desired_version.is_empty()
+                        || workflow.package.version == item.desired_version)
+                        && (!item.desired_enabled || workflow.enabled)
+                })
+                .unwrap_or(false),
+            _ => true,
+        });
+    }
     Ok(true)
 }
 
@@ -399,6 +484,7 @@ fn reconcile_item(
     match item.asset_kind.as_str() {
         "plugin" => reconcile_plugin(options, agent_id, item),
         "skill" => reconcile_skill(options, agent_id, item),
+        "workflow" => reconcile_workflow(options, agent_id, item),
         _ => result(
             item,
             "not_applicable",
@@ -636,6 +722,106 @@ fn reconcile_skill(
         .map(|record| record.manifest.version)
         .unwrap_or_default();
     result(item, "installed", "health_check", &version, json!({}), "")
+}
+
+fn reconcile_workflow(
+    options: &Options,
+    _agent_id: &str,
+    item: &ExtensionDesiredItem,
+) -> ExtensionReconcileItem {
+    let store = match crate::workflow::WorkflowStore::open_default() {
+        Ok(store) => store,
+        Err(error) => {
+            return result(
+                item,
+                "failed",
+                "health_check",
+                "",
+                json!({}),
+                &error.to_string(),
+            )
+        }
+    };
+    let existing = match store.list() {
+        Ok(items) => items
+            .into_iter()
+            .find(|workflow| workflow.package.id == item.asset_key),
+        Err(error) => {
+            return result(
+                item,
+                "failed",
+                "health_check",
+                "",
+                json!({}),
+                &error.to_string(),
+            )
+        }
+    };
+    if item.desired_state == "absent" {
+        let Some(existing) = existing else {
+            return result(item, "uninstalled", "health_check", "", json!({}), "");
+        };
+        return match store.remove(&item.asset_key) {
+            Ok(_) => result(item, "uninstalled", "installing", "", json!({}), ""),
+            Err(error) => result(
+                item,
+                "failed",
+                "rollback",
+                &existing.package.version,
+                json!({}),
+                &error.to_string(),
+            ),
+        };
+    }
+    let needs_install = existing
+        .as_ref()
+        .map(|workflow| {
+            !item.desired_version.is_empty() && workflow.package.version != item.desired_version
+        })
+        .unwrap_or(true);
+    let installed = if needs_install {
+        match crate::app::workflow_manager::install_dashboard_catalog_workflow(
+            options,
+            &item.asset_key,
+            Some(item.desired_version.as_str()),
+        ) {
+            Ok(installed) => installed,
+            Err(error) => {
+                return result(
+                    item,
+                    "failed",
+                    "installing",
+                    existing
+                        .as_ref()
+                        .map(|workflow| workflow.package.version.as_str())
+                        .unwrap_or_default(),
+                    json!({}),
+                    &error.to_string(),
+                )
+            }
+        }
+    } else {
+        existing.expect("workflow installation must exist when no install is needed")
+    };
+    let enabled = item.desired_enabled;
+    if let Err(error) = store.set_enabled(&item.asset_key, enabled) {
+        return result(
+            item,
+            "failed",
+            "activating",
+            &installed.package.version,
+            json!({}),
+            &error.to_string(),
+        );
+    }
+    result(
+        item,
+        "installed",
+        "health_check",
+        &installed.package.version,
+        json!({}),
+        "",
+    )
 }
 
 fn result(

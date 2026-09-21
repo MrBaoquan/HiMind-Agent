@@ -7,7 +7,6 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEVELOPMENT_TOOLS_PLUGIN_ID: &str = "com.himind.extension-development-tools";
@@ -17,6 +16,7 @@ const DEVELOPMENT_TOOLS_PLUGIN_ID: &str = "com.himind.extension-development-tool
 pub(crate) enum ExtensionProjectKind {
     Plugin,
     Skill,
+    Workflow,
 }
 
 impl ExtensionProjectKind {
@@ -24,6 +24,7 @@ impl ExtensionProjectKind {
         match self {
             Self::Plugin => "plugin",
             Self::Skill => "skill",
+            Self::Workflow => "workflow",
         }
     }
 }
@@ -122,6 +123,7 @@ pub(crate) struct CreateExtensionProjectInput {
 pub(crate) enum ExtensionCandidate {
     Plugin(crate::plugin_authoring::PluginDraft),
     Skill(crate::skill::authoring::AuthoringDraft),
+    Workflow(crate::workflow::WorkflowDraft),
 }
 
 pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
@@ -364,12 +366,133 @@ pub(crate) fn create(
                 "supported_clients": ["agent-skills"],
             }),
         )?,
+        ExtensionProjectKind::Workflow => {
+            let output_dir = parent.join("workflows");
+            match invoke_development_tool(
+                "extension.workflow.scaffold",
+                json!({
+                    "workspace_root": parent,
+                    "output_dir": output_dir,
+                    "slug": slug,
+                    "id": input.extension_id.trim(),
+                    "name": input.name.trim(),
+                    "version": "0.1.0",
+                    "min_agent_version": crate::VERSION,
+                    "description": input.description.trim(),
+                    "author": author.trim(),
+                    "categories": [category],
+                    "release_notes": release_notes,
+                    "template": if input.template.trim().is_empty() { "strict" } else { input.template.trim() },
+                }),
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let message = error.to_string();
+                    let tool_unavailable = message.contains("请先安装 AI 扩展开发工具")
+                        || message.contains("AI 扩展开发工具当前不可用")
+                        || message.contains("缺少能力: extension.workflow.scaffold");
+                    if !tool_unavailable {
+                        return Err(error);
+                    }
+                    create_workflow_skeleton(parent.as_path(), &slug, &input)?
+                }
+            }
+        }
     };
     let root = result
         .get("root")
         .and_then(Value::as_str)
         .ok_or("扩展开发工具未返回项目目录")?;
     register(Path::new(root))
+}
+
+fn create_workflow_skeleton(
+    parent: &Path,
+    slug: &str,
+    input: &CreateExtensionProjectInput,
+) -> Result<Value, Box<dyn Error>> {
+    let root = parent.join("workflows").join(slug);
+    if root.exists() {
+        return Err(format!("Workflow 项目目录已存在: {}", root.display()).into());
+    }
+    let workflow_id = if input.extension_id.trim().is_empty() {
+        format!("com.himind.workflow.{slug}")
+    } else {
+        input.extension_id.trim().to_string()
+    };
+    let package = json!({
+        "schema_version": "workflow_package.v1",
+        "id": workflow_id,
+        "version": "0.1.0",
+        "name": input.name.trim(),
+        "description": input.description.trim(),
+        "min_agent_version": crate::VERSION,
+        "local_requirements": {},
+        "optional_providers": [],
+        "capabilities": [],
+        "dependencies": {
+            "skills": [],
+            "plugins": [],
+            "connectors": [],
+            "runtimes": []
+        },
+        "steps": [{
+            "id": "START",
+            "title": "开始",
+            "kind": "manual",
+            "execution_mode": "sync",
+            "risk_level": "read_only",
+            "depends_on": []
+        }],
+        "artifacts": [],
+        "ui": {
+            "mode": "declarative",
+            "entry": "ui/workflow-view.json",
+            "surfaces": ["agent"]
+        },
+        "supported_runtimes": []
+    });
+    for directory in [
+        "artifacts",
+        "connectors",
+        "examples",
+        "schemas",
+        "tests/contract",
+        "ui",
+    ] {
+        fs::create_dir_all(root.join(directory))?;
+    }
+    fs::write(
+        root.join("workflow.json"),
+        serde_json::to_vec_pretty(&package)?,
+    )?;
+    fs::write(
+        root.join("ui/workflow-view.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "workflow_view.v1",
+            "title": input.name.trim(),
+            "sections": [],
+            "actions": ["start"]
+        }))?,
+    )?;
+    fs::write(
+        root.join("README.md"),
+        format!(
+            "# {}\n\n{}\n\nWorkflow 源码使用 `workflow.json` 作为执行契约，`ui/workflow-view.json` 作为声明式 UI。\n",
+            input.name.trim(),
+            input.description.trim()
+        ),
+    )?;
+    fs::write(root.join("examples/input.json"), b"{}\n")?;
+    fs::write(
+        root.join("tests/contract/README.md"),
+        b"# Workflow Contract Tests\n\nPlace contract fixtures and negative cases here.\n",
+    )?;
+    Ok(json!({
+        "root": root.to_string_lossy(),
+        "workflow_id": workflow_id,
+        "version": "0.1.0"
+    }))
 }
 
 pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Error>> {
@@ -382,9 +505,15 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
         }
     }
     cleanup_temporary_candidates(&workspace);
+    if project.kind == ExtensionProjectKind::Workflow {
+        return Ok(ExtensionCandidate::Workflow(
+            crate::workflow::save_authoring_candidate(&workspace)?,
+        ));
+    }
     let extension = match project.kind {
         ExtensionProjectKind::Plugin => "hmpkg",
         ExtensionProjectKind::Skill => "hmskill",
+        ExtensionProjectKind::Workflow => unreachable!("workflow candidate returned above"),
     };
     let temporary = workspace.join(format!(".himind-candidate-{}.{}", now_stamp(), extension));
     let result = (|| -> Result<ExtensionCandidate, Box<dyn Error>> {
@@ -398,6 +527,7 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
             match project.kind {
                 ExtensionProjectKind::Plugin => "extension.plugin.package",
                 ExtensionProjectKind::Skill => "extension.skill.package",
+                ExtensionProjectKind::Workflow => unreachable!("workflow candidate returned above"),
             },
             json!({"workspace_root": workspace, "path": workspace, "output": temporary}),
         )?;
@@ -425,6 +555,9 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
                     crate::skill::authoring::associate_workspace(draft, &workspace)?,
                 ))
             }
+            ExtensionProjectKind::Workflow => {
+                unreachable!("workflow candidate returned above")
+            }
         }
     })();
     if temporary.exists() {
@@ -448,7 +581,7 @@ fn update_source_commit(project_id: &str, commit: &str) -> Result<(), Box<dyn Er
 }
 
 fn git_head(workspace: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::runtime::process::hidden_command("git")
         .arg("-C")
         .arg(workspace)
         .args(["rev-parse", "HEAD"])
@@ -525,8 +658,17 @@ fn friendly_tool_error(error: &str) -> String {
 fn project_record_from_path(path: &Path, source: &str) -> Result<ProjectRecord, Box<dyn Error>> {
     let plugin_path = path.join("plugin.json");
     let skill_path = path.join("skill.json");
-    if plugin_path.is_file() && skill_path.is_file() {
-        return Err("项目目录不能同时包含 plugin.json 和 skill.json".into());
+    let workflow_path = path.join("workflow.json");
+    let marker_count = [
+        plugin_path.is_file(),
+        skill_path.is_file() || path.join("SKILL.md").is_file(),
+        workflow_path.is_file(),
+    ]
+    .into_iter()
+    .filter(|value| *value)
+    .count();
+    if marker_count > 1 {
+        return Err("项目目录不能同时包含多种扩展 Manifest".into());
     }
     if plugin_path.is_file() {
         let manifest = parse_plugin_manifest(&fs::read_to_string(plugin_path)?)?;
@@ -545,7 +687,19 @@ fn project_record_from_path(path: &Path, source: &str) -> Result<ProjectRecord, 
         let manifest = load_skill_manifest(path)?;
         return Ok(skill_record(manifest, path, source));
     }
-    Err("所选目录不是 HiMind 插件或技能项目".into())
+    if workflow_path.is_file() {
+        let package = crate::workflow::load_from_directory(path)?;
+        return Ok(record(
+            ExtensionProjectKind::Workflow,
+            package.id,
+            package.name,
+            package.description,
+            package.version,
+            path,
+            source,
+        ));
+    }
+    Err("所选目录不是 HiMind 插件、Skill 或 Workflow 项目".into())
 }
 
 fn skill_record(manifest: SkillManifest, path: &Path, source: &str) -> ProjectRecord {
@@ -648,6 +802,22 @@ fn migrate_legacy_projects(
             ExtensionProjectKind::Skill,
             &draft.manifest.id,
             draft.workspace_path.as_deref(),
+            workspaces,
+        ) else {
+            continue;
+        };
+        records.push(record);
+        changed = true;
+    }
+    for draft in crate::workflow::list_authoring_drafts().unwrap_or_default() {
+        let id = format!("workflow:{}", draft.package_id);
+        if records.iter().any(|record| record.id == id) {
+            continue;
+        }
+        let Some(record) = draft_project_record(
+            ExtensionProjectKind::Workflow,
+            &draft.package_id,
+            Some(&draft.source_root),
             workspaces,
         ) else {
             continue;
@@ -807,12 +977,14 @@ mod tests {
     use crate::app::extension_source::LocalSourceWorkspace;
 
     #[test]
-    fn detects_plugin_and_skill_projects_with_stable_ids() {
+    fn detects_plugin_skill_and_workflow_projects_with_stable_ids() {
         let root = env::temp_dir().join(format!("himind-project-detect-{}", now_stamp()));
         let plugin = root.join("plugin");
         let skill = root.join("skill");
+        let workflow = root.join("workflow");
         fs::create_dir_all(&plugin).unwrap();
         fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(workflow.join("ui")).unwrap();
         fs::write(
             plugin.join("plugin.json"),
             r#"{"id":"com.himind.project-test","name":"项目测试插件","description":"测试插件项目识别","version":"0.1.0"}"#,
@@ -824,13 +996,72 @@ mod tests {
         )
         .unwrap();
         fs::write(skill.join("SKILL.md"), "# 项目测试技能\n").unwrap();
+        fs::write(
+            workflow.join("workflow.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "workflow_package.v1",
+                "id": "com.himind.workflow.project-test",
+                "version": "0.1.0",
+                "name": "项目测试工作流",
+                "description": "测试 Workflow 项目识别",
+                "min_agent_version": crate::VERSION,
+                "steps": [{
+                    "id": "START",
+                    "title": "开始",
+                    "kind": "manual",
+                    "execution_mode": "sync"
+                }],
+                "artifacts": [],
+                "ui": { "mode": "standard" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let plugin_record = project_record_from_path(&plugin, "test").unwrap();
         let skill_record = project_record_from_path(&skill, "test").unwrap();
+        let workflow_record = project_record_from_path(&workflow, "test").unwrap();
         assert_eq!(plugin_record.id, "plugin:com.himind.project-test");
         assert_eq!(skill_record.id, "skill:com.himind.skill.project-test");
+        assert_eq!(
+            workflow_record.id,
+            "workflow:com.himind.workflow.project-test"
+        );
         assert_eq!(plugin_record.kind, ExtensionProjectKind::Plugin);
         assert_eq!(skill_record.kind, ExtensionProjectKind::Skill);
+        assert_eq!(workflow_record.kind, ExtensionProjectKind::Workflow);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workflow_skeleton_uses_canonical_layout_and_declarative_ui() {
+        let root = env::temp_dir().join(format!("himind-workflow-skeleton-{}", now_stamp()));
+        fs::create_dir_all(&root).unwrap();
+        let input = CreateExtensionProjectInput {
+            kind: ExtensionProjectKind::Workflow,
+            slug: "canonical-workflow".to_string(),
+            extension_id: "com.example.workflow.canonical".to_string(),
+            name: "Canonical Workflow".to_string(),
+            description: "Canonical layout test.".to_string(),
+            category: "software-engineering".to_string(),
+            template: "strict".to_string(),
+        };
+        let result = create_workflow_skeleton(&root, &input.slug, &input).unwrap();
+        let workflow_root = Path::new(result["root"].as_str().unwrap());
+        assert_eq!(
+            workflow_root,
+            root.join("workflows").join("canonical-workflow")
+        );
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(workflow_root.join("workflow.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["ui"]["mode"], "declarative");
+        assert_eq!(manifest["ui"]["entry"], "ui/workflow-view.json");
+        assert!(workflow_root.join("ui/workflow-view.json").is_file());
+        assert!(workflow_root.join("schemas").is_dir());
+        assert!(workflow_root.join("artifacts").is_dir());
+        assert!(workflow_root.join("connectors").is_dir());
+        assert!(workflow_root.join("tests/contract").is_dir());
         let _ = fs::remove_dir_all(root);
     }
 

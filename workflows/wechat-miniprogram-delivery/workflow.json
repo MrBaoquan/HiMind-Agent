@@ -1,7 +1,7 @@
 {
   "schema_version": "workflow_package.v1",
   "id": "com.himind.workflow.wechat-miniprogram-delivery",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "name": "微信小程序开发闭环",
   "description": "外层交付状态机加内层多轮开发 Loop：修改、测试、构建、自我复核、冻结候选、预览、上传、验收、审核、发布和条件回滚。",
   "min_agent_version": "0.3.47",
@@ -25,7 +25,7 @@
     "required": true,
     "artifact_id": "candidate",
     "source": "git",
-    "allow_dirty": true
+    "allow_dirty": false
   },
   "capabilities": [
     "workflow.candidate.freeze",
@@ -68,22 +68,13 @@
       "risk_level": "local_write"
     },
     {
-      "id": "WX-CONTEXT",
-      "title": "应用与仓库检查",
-      "kind": "capability",
-      "capability_id": "wechat.miniprogram.project.inspect",
-      "execution_mode": "sync",
-      "risk_level": "read_only",
-      "depends_on": ["WX-REQUIREMENTS"]
-    },
-    {
       "id": "WX-PREPARE",
       "title": "依赖准备",
       "kind": "capability",
       "capability_id": "wechat.miniprogram.dependencies.prepare",
       "execution_mode": "long_running",
       "risk_level": "process",
-      "depends_on": ["WX-CONTEXT"]
+      "depends_on": ["WX-REQUIREMENTS"]
     },
     {
       "id": "DEV-LOOP",
@@ -115,9 +106,10 @@
             "runtime": {
               "provider": "auto",
               "prompt": "根据需求、验收标准、当前代码、最近测试和构建结果修改微信小程序工程。完成后返回 JSON，包含 summary、changes、verification，不得输出私钥或任何 Secret。",
-              "workspace_path": "input.project_root",
+              "workspace_path": "input.workspace_root",
               "result_schema": "schemas/development-result.schema.json",
-              "allow_network": false
+              "allow_network": false,
+              "timeout_seconds": 3600
             }
           },
           {
@@ -148,13 +140,23 @@
             "runtime": {
               "provider": "auto",
               "prompt": "独立检查需求、验收标准、代码变更、测试和构建结果。若仍有明确缺口，返回 rejected；若已满足条件，返回 accepted。必须返回 JSON：{\"feedback\":{\"decision\":\"accepted|rejected\",\"reason\":\"...\"}}。",
-              "workspace_path": "input.project_root",
+              "workspace_path": "input.workspace_root",
               "result_schema": "schemas/development-feedback.schema.json",
-              "allow_network": false
+              "allow_network": false,
+              "timeout_seconds": 900
             }
           }
         ]
       }
+    },
+    {
+      "id": "WX-CONTEXT",
+      "title": "应用与仓库检查",
+      "kind": "capability",
+      "capability_id": "wechat.miniprogram.project.inspect",
+      "execution_mode": "sync",
+      "risk_level": "read_only",
+      "depends_on": ["DEV-LOOP"]
     },
     {
       "id": "WX-CANDIDATE",
@@ -164,7 +166,7 @@
       "candidate_action": "freeze",
       "execution_mode": "sync",
       "risk_level": "local_write",
-      "depends_on": ["DEV-LOOP"]
+      "depends_on": ["WX-CONTEXT"]
     },
     {
       "id": "WX-PREVIEW",
@@ -194,6 +196,11 @@
       "kind": "capability",
       "capability_id": "wechat.miniprogram.acceptance.record",
       "candidate_action": "require",
+      "fail_when": {
+        "operator": "equals",
+        "path": "steps.WX-ACCEPTANCE.passed",
+        "value": false
+      },
       "execution_mode": "sync",
       "risk_level": "local_write",
       "depends_on": ["WX-UPLOAD"]

@@ -1,4 +1,12 @@
-export type PageKey = 'dashboard' | 'builtin-ai' | 'ai' | 'approvals' | 'workflows' | 'plugins' | 'skills' | 'development' | 'settings' | 'logs';
+export type PageKey = 'dashboard' | 'builtin-ai' | 'ai' | 'approvals' | 'inbox' | 'workflows' | 'schedules' | 'extensions' | 'plugins' | 'skills' | 'development' | 'settings' | 'logs';
+
+/**
+ * 页面级导航仍可直接传 PageKey；需要恢复任务上下文时传结构化目标。
+ * 当前由 Agent Shell 消费，后续可无缝映射到 URL/deep link。
+ */
+export type NavigationTarget =
+  | PageKey
+  | { page: PageKey; runId?: string; workflowId?: string };
 
 export type UiMessage = {
     id: number;

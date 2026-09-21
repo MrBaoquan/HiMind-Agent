@@ -736,7 +736,9 @@ fn running_agent_pids(current_executable: &Path) -> Vec<u32> {
 }
 
 fn process_exists(pid: u32) -> bool {
-    Command::new("tasklist")
+    let mut command = Command::new("tasklist");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
@@ -755,9 +757,9 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
 }
 
 fn terminate_single(pid: u32) -> Result<(), Box<dyn Error>> {
-    Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .output()?;
+    let mut command = Command::new("taskkill");
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.args(["/PID", &pid.to_string(), "/F"]).output()?;
     Ok(())
 }
 
