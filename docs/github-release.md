@@ -1,6 +1,6 @@
-# GitHub 独立发布
+# GitHub 发布
 
-HiMind Agent 的 Independent 模式不依赖 Dashboard。它从 GitHub Release 获取 Agent 自更新包，首次安装使用 GitHub Release 中的 Independent 安装器；运行时仍可访问 GitHub、第三方 AI 服务和已发布的首方 Runtime Release。
+不对接 AI 工作台时，Agent 从 GitHub Release 获取自更新包，首次安装使用 GitHub Release 中的独立安装器；运行时仍可访问 GitHub、第三方 AI 服务和已发布的首方 Runtime Release。
 
 ## Release 契约
 
@@ -23,7 +23,7 @@ himind-ai.vsix       # 可选
 
 Release 还必须发布 `himind-agent-update.json`，其 `product` 为 `himind-agent`、`package_type` 为 `directory-zip`、`file_name` 为 `himind-agent-update.zip`，并包含包大小、SHA-256、渠道和签名元数据。标签必须是 `v<version>`，且与索引中的版本一致。
 
-## Runtime 独立安装
+## Runtime 安装
 
 HiMind AI Runtime 与 Agent Release 解耦，使用独立标签和制品：
 
@@ -36,11 +36,11 @@ Runtime Release 标签为 `runtime-v<runtime-version>`。为了避免旧版 Agen
 
 Runtime 可被独立发现的前提是 Agent 自身包含产品资产扫描逻辑。已发布旧版 Agent 如果仍只读取 `/releases/latest`，不会自动获得该能力；需要先发布包含该逻辑的 Agent 版本。
 
-Independent 模式的安装路径：
+未对接 AI 工作台时的安装路径：
 
 1. 从 GitHub Release 安装 `himind-agent-<version>-setup.exe`，安装器默认写入 `independent`。
 2. 首次启动 Agent。设置页中 HiMind AI 显示“需要安装”时，点击“安装运行时”。
-3. `auto` 来源在 Independent 模式选择 GitHub Provider，下载 Runtime Release 的签名清单和 ZIP，校验大小、SHA-256、RSA-PSS-SHA256、Agent 兼容区间后执行隔离安装。
+3. `auto` 来源选择 GitHub Provider，下载 Runtime Release 的签名清单和 ZIP，校验大小、SHA-256、RSA-PSS-SHA256、Agent 兼容区间后执行隔离安装。
 4. 已安装 Runtime 后，同一入口显示“检查更新”或“更新到 vX”，无需 Dashboard。
 
 命令行等价入口：
@@ -96,11 +96,73 @@ $env:HIMIND_SIGNING_KEY_ID = "release-2026"
 
 ## 更新源选择
 
-- Independent：统一更新状态机使用 GitHub Release provider，下载地址必须是 `github.com/.../releases/download/...`。
-- Connected：继续使用 Dashboard software-distribution provider，并保留设备级进度上报。
+- 未对接 AI 工作台：统一更新状态机使用 GitHub Release provider，下载地址必须是 `github.com/.../releases/download/...`。
+- 已对接 AI 工作台：使用 Dashboard software-distribution provider，并保留设备级进度上报。
 
-两个 provider 共享版本状态、下载进度、SHA-256 校验、签名校验、暂存、原子替换和失败回滚。Independent 只是不启用 Dashboard 控制面，不是离线模式。
+两个 provider 共享版本状态、下载进度、SHA-256 校验、签名校验、暂存、原子替换和失败回滚。不对接 AI 工作台只是不启用 Dashboard 控制面，不是离线模式。
 
 ## 扩展源
 
 插件和 Skill 的 GitHub 源与 Agent Release 相互独立。用户可以在 Agent 中配置一个仓库链接，也可以直接导入带 `?path=/subdir#ref` 的 GitHub URL。仓库存在 `.himind/catalog.json` 时，导入会自动建立扩展源并保存 provenance；开启该源的自动更新后，Agent 会按目录清单更新插件和 Skill。没有目录清单的仓库仍支持一次性导入，但不会伪装成可自动更新源。
+
+## 扩展分发
+
+扩展的 GitHub 分发由 Agent 内置发布器完成，与 Agent 自身的 Release 互不影响（标签、资产名各自独立）。扩展清单里的 `distribution_targets`（`workbench` / `github`）是硬约束：发布器只能在该范围内收窄，不能越界补发。
+
+| 项目 | 取值 |
+| --- | --- |
+| Tag | `<kind>/<id>@<version>`，如 `plugin/com.himind.x@1.0.0` |
+| 主制品 | `<id>-<version>.<hmpkg\|hmskill\|hmwf>` |
+| 发布清单 | `<id>@<version>.json` |
+| 签名 | 内嵌在发布清单的 `signature` 字段，不作为独立资产上传 |
+
+一次发布只有两个资产：制品和发布清单（Workflow 多一个扩展锁 `<id>-<version>.extension-lock.json`）。签名放在发布清单里，安装侧读到的签名与它校验的制品是同一份事实，不会出现「清单和签名资产各说各话」。
+
+发布命令（UI 在扩展开发工作区，同一实现）：
+
+```powershell
+himind-agent extension distribution preview  <kind> <id> <version>   # 只读，看会发到哪里
+himind-agent extension distribution publish  <kind> <id> <version> --yes
+```
+
+制品签名使用与扩展仓脚本同一套环境变量：
+
+```powershell
+$env:HIMIND_EXTENSION_SIGNING_PRIVATE_KEY_PATH = "C:\keys\himind-extension-private.pem"
+$env:HIMIND_EXTENSION_SIGNING_KEY_ID = "himind-production-2026"
+```
+
+两者都配置时，发布的制品带 RSA-PSS/SHA-256 签名，签名写进发布清单的 `signature` 字段（`signature_key_id`、`signature_algorithm` 同处一行记录）；未配置时按未签名发布，`preview` 会显示 `未配置私钥，按未签名发布`。私钥只在本机读取，不写入状态、不上传、不记日志。
+
+安装侧的口径一致：发布清单里出现 `signature` 就必须验签通过，否则整个安装失败并回滚；没有 `signature` 时是否放行由 `HIMIND_REQUIRE_SIGNED_EXTENSIONS` 决定，默认与 Agent 更新一致——内嵌了生产公钥就要求签名，未内嵌（开发构建）只做「有签名就校验」。自建分发可显式设 `HIMIND_REQUIRE_SIGNED_EXTENSIONS=false` 关闭要求。受信公钥优先取 `HIMIND_TRUSTED_SIGNING_KEYS_DIR/<key-id>.pem`，其次取内嵌公钥。
+
+```powershell
+himind-agent extension distribution plan   <repository> <tag> <id> <version>            # 只读依赖与来源
+himind-agent extension distribution install <repository> <tag> <id> <version> --dry-run  # 下载 + 摘要 + 验签，不落盘
+himind-agent extension distribution install <repository> <tag> <id> <version> --yes      # 真正安装
+```
+
+发布清单本身有契约文件 `contracts/agent-core/v1/extension-release-manifest.schema.json`，发布侧写、消费侧读，字段漂移会在测试里暴露。
+
+## 本地存储与保留策略
+
+安装物落在 `%LOCALAPPDATA%\HiMindAgent`（`HIMIND_AGENT_HOME` 可整体覆盖，开发档位落在 `profiles/<name>`）：
+
+| 资产 | 目录 | 布局 |
+| --- | --- | --- |
+| 插件 | `plugins/<plugin-id>/` | `versions/<version>/` 原件，`current` / `previous` 是运行副本 |
+| 技能 | `skills/managed/<skill-id>/` | `versions/<version>/`，`current.json` / `previous.json` 是指针 |
+| 工作流 | `workflows/<workflow-id>/` | 同上，指针写在安装元数据里 |
+| 状态 | `data/` | 扩展锁 `extension.lock.json`、来源记录 `extension-provenance/`、工作区租约 `workspace-leases.json` |
+
+保留策略：
+
+- 插件与技能只保留 `current` + `previous` 两版：安装提交后立即收敛，之后不再更新的资产由启动巡检兜底（`sweep_plugin_versions`、`sweep_skill_versions`）。
+- 技能额外保留渲染收据引用的版本，避免删掉软链接的落点；读不出 `previous` 时整体跳过——宁可留着旧版本，也不动回退要用的那一份。
+- 工作流保留全部已装版本，历史版本目录就是版本列表，回滚按版本号直接切换，不做收敛。
+- 暂存目录分两种口径：安装期只清自己刚建的（`TransientPolicy::Remove`），后台巡检只清超过一小时的残留（`RemoveStale`），避免和并发安装抢文件。
+- 卸载同时清扩展锁、来源记录和本地目录；删除来源时按 `asset_kind` 反查，把该源装出来的资产记录一并清掉。
+
+插件为什么留原件和运行副本两份：`versions/<version>/` 是发布制品的不可变原件，`current` / `previous` 是插件自己的运行目录，插件会往里写状态。分开之后回滚、卸载、重装都不需要改动原件。代价是磁盘占用翻倍（实测软件分发插件 59.7 MB 原件对应 59.6 MB 运行副本），这是刻意取舍；换成目录联接需要重新处理运行中的可执行文件与联接清理顺序，属于该实现最容易踩坑的部分，暂不做。
+
+来源记录（`himind-agent source provenance`）不是审计留痕，而是自动更新的依据：`reconcile_auto_updates` 靠它判断某个资产由哪个源装出来、该不该跟着源更新。CLI 与 MCP 都可读取，卸载时会清理对应条目。

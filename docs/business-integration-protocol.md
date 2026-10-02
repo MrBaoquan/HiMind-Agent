@@ -42,6 +42,7 @@ fragments are not valid routes.
 `himind.dashboard` is the first trusted provider implementation. It is part of
 the Agent's business integration layer rather than a normal `.hmpkg` plugin,
 because it participates in device identity, OAuth, control-plane calls, and
-audit context. Independent mode does not initialize a business provider.
-Connected mode initializes the configured trusted provider and exposes only
-capabilities whose catalog passes local validation.
+audit context. An Agent that is not linked to the AI workbench does not
+initialize a business provider. A linked Agent initializes the configured
+trusted provider and exposes only capabilities whose catalog passes local
+validation.

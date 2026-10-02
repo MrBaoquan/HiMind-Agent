@@ -15,7 +15,7 @@
 }
 ```
 
-只有 Connected 模式的本地 Agent 应用服务才需要 Dashboard Worker。Worker 状态不影响 MCP 直接调用 Agent 本地能力，也不影响已授权的同步业务能力；需要组织控制面时，Agent 会单独报告 `control_plane_required` 或授权错误。
+只有对接了 AI 工作台的本地 Agent 应用服务才需要 Dashboard Worker。Worker 状态不影响 MCP 直接调用 Agent 本地能力，也不影响已授权的同步业务能力；需要组织控制面时，Agent 会单独报告 `control_plane_required` 或授权错误。
 
 外部工具应按 `dashboard_worker_expected` 判断是否需要诊断 Worker：`false` 表示当前进程不托管 Worker，直接忽略 `dashboard_worker_online`；只有 `true` 时才根据 `dashboard_worker_state`（`connecting`、`online`、`offline`）判断连接状态。`dashboard_worker_reason_code` 是机器可分支的原因码，避免依赖日志或产品名称猜测运行拓扑。
 
