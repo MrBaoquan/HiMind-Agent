@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::api::oauth::{platform_access_token, AgentAccessToken, AI_CONVERSATION_SCOPE};
-use crate::app::builtin_ai_proxy::BuiltinAiProxyControl;
+use crate::app::builtin_ai_proxy::{runtime_result_value, unix_millis, BuiltinAiProxyControl};
 use crate::Options;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -202,7 +202,7 @@ fn claim_commands(
     let response = client
         .post(format!(
             "{}/api/integrations/ai/runtime/commands/claim",
-            options.api_base.trim_end_matches('/')
+            options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(&access.token)
         .header("X-HiMind-Agent-ID", &access.agent_id)
@@ -242,7 +242,7 @@ fn complete_command(
     let response = client
         .post(format!(
             "{}/api/integrations/ai/runtime/commands/{}/complete",
-            options.api_base.trim_end_matches('/'),
+            options.api_base().trim_end_matches('/'),
             command.id
         ))
         .bearer_auth(&access.token)
@@ -280,10 +280,6 @@ fn execute_command(
             format!("本机 Agent 不承载 {} 运行时", command.provider),
         );
     }
-    let (method, payload) = match map_runtime_command(command) {
-        Ok(request) => request,
-        Err(error) => return ("unsupported", json!({}), error),
-    };
     if command.command_type == "approval.respond" || command.command_type == "question.respond" {
         let rpc_id = command
             .payload
@@ -309,7 +305,20 @@ fn execute_command(
             Err(error) => ("failed", json!({}), error),
         };
     }
-    match control.call_runtime_api(method, payload) {
+    if command.command_type == "session.snapshot" {
+        let (status, result, error) = match capture_runtime_snapshot(control, command) {
+            Ok(response) => ("succeeded", response, String::new()),
+            Err(error) if is_unsupported_error(&error) => ("unsupported", json!({}), error),
+            Err(error) if is_transient_runtime_error(&error) => ("defer", json!({}), error),
+            Err(error) => ("failed", json!({}), error),
+        };
+        return (status, result, error);
+    }
+    let (endpoint, args) = match map_runtime_command(command) {
+        Ok(request) => request,
+        Err(error) => return ("unsupported", json!({}), error),
+    };
+    match control.call_runtime_api(endpoint, args) {
         Ok(response) => {
             let result = response.get("result");
             if result
@@ -347,6 +356,8 @@ fn execute_command(
     }
 }
 
+/// Map a Dashboard runtime command onto its DSH Remote endpoint plus the named
+/// arguments that endpoint's descriptor declares.
 fn map_runtime_command(command: &RuntimeCommand) -> Result<(&'static str, Value), String> {
     match command.command_type.as_str() {
         "message.inject" => {
@@ -360,25 +371,70 @@ fn map_runtime_command(command: &RuntimeCommand) -> Result<(&'static str, Value)
                 return Err("message.inject payload requires content".to_string());
             };
             Ok((
-                "session.prompt",
+                "session/prompt",
                 json!({
-                    "sessionId": command.provider_session_id,
-                    "mode": "queue",
-                    "content": [{"type": "text", "text": content}]
+                    "request": {
+                        // DSH deduplicates queued prompts by requestId, so a
+                        // repeated command must not reuse one id.
+                        "requestId": next_runtime_request_id(),
+                        "sessionId": command.provider_session_id,
+                        "mode": "queue",
+                        "content": [{"type": "text", "text": content}]
+                    }
                 }),
             ))
         }
         "session.interrupt" => Ok((
-            "session.cancel",
-            json!({"sessionId": command.provider_session_id}),
+            "session/cancel",
+            json!({"request": {"sessionId": command.provider_session_id}}),
         )),
-        "session.snapshot" => Ok((
-            "session.history",
-            json!({"sessionId": command.provider_session_id, "maxMessages": 200}),
-        )),
-        "approval.respond" | "question.respond" => Ok(("client-response", Value::Null)),
+        "approval.respond" | "question.respond" => Ok(("respond", Value::Null)),
         _ => Err("unsupported runtime command type".to_string()),
     }
+}
+
+/// Read one Session transcript.
+///
+/// DSH publishes history as `session/page`, which is boundary-addressed: the
+/// caller must state the newest sequence it has seen. The list projection
+/// already carries that sequence per Session, so resolve it first and then page
+/// back from it instead of guessing a boundary.
+fn capture_runtime_snapshot(
+    control: &BuiltinAiProxyControl,
+    command: &RuntimeCommand,
+) -> Result<Value, String> {
+    let session_id = command.provider_session_id.as_str();
+    let listed = control.call_runtime_api("session/list", json!({"_request": {}}))?;
+    let list = runtime_result_value(&listed, "读取 DSH 会话列表")?;
+    let through_seq = list
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("sessionId").and_then(Value::as_str) == Some(session_id))
+        })
+        .and_then(|item| item.get("projections"))
+        .and_then(|projections| projections.get("asOfSeq"))
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("DSH 会话列表缺少 {session_id} 的序列位置"))?;
+    control.call_runtime_api(
+        "session/page",
+        json!({
+            "request": {
+                "address": {"kind": "session", "sessionId": session_id},
+                "throughSeq": through_seq,
+                "maxMessages": 200
+            }
+        }),
+    )
+}
+
+/// DSH accepts a queued prompt only with a client-issued request id.
+fn next_runtime_request_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("himind-agent-{}-{sequence}", unix_millis())
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,7 +495,7 @@ fn list_runtime_sessions(
     let response = client
         .get(format!(
             "{}/api/integrations/ai/runtime/sessions",
-            options.api_base.trim_end_matches('/')
+            options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(&access.token)
         .header("X-HiMind-Agent-ID", &access.agent_id)
@@ -551,7 +607,7 @@ fn heartbeat_runtime_capabilities(
     let response = client
         .post(format!(
             "{}/api/integrations/ai/runtime/sessions/{}/heartbeat",
-            options.api_base.trim_end_matches('/'),
+            options.api_base().trim_end_matches('/'),
             session.id
         ))
         .bearer_auth(&access.token)
@@ -680,19 +736,19 @@ mod tests {
             payload: json!({"content": "继续处理"}),
         };
         let (method, payload) = map_runtime_command(&command).unwrap();
-        assert_eq!(method, "session.prompt");
-        assert_eq!(payload["sessionId"], "session-1");
-        assert_eq!(payload["mode"], "queue");
-        assert_eq!(payload["content"][0]["type"], "text");
-        assert_eq!(payload["content"][0]["text"], "继续处理");
+        assert_eq!(method, "session/prompt");
+        assert_eq!(payload["request"]["sessionId"], "session-1");
+        assert_eq!(payload["request"]["mode"], "queue");
+        assert_eq!(payload["request"]["content"][0]["type"], "text");
+        assert_eq!(payload["request"]["content"][0]["text"], "继续处理");
 
         let interrupt = RuntimeCommand {
             command_type: "session.interrupt".to_string(),
             ..command
         };
         let (method, payload) = map_runtime_command(&interrupt).unwrap();
-        assert_eq!(method, "session.cancel");
-        assert_eq!(payload["sessionId"], "session-1");
+        assert_eq!(method, "session/cancel");
+        assert_eq!(payload["request"]["sessionId"], "session-1");
     }
 
     #[test]
@@ -706,7 +762,7 @@ mod tests {
             payload: json!({"rpc_id": "rpc-1", "approval_id": "approval-1", "outcome": "rejected"}),
         };
         let (method, payload) = map_runtime_command(&command).unwrap();
-        assert_eq!(method, "client-response");
+        assert_eq!(method, "respond");
         assert!(payload.is_null());
     }
 }

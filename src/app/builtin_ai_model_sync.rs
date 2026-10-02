@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn model_sync_rejects_independent_mode_before_remote_access() {
         let mut options = Options::from_env();
-        options.effective_mode = AgentMode::Independent;
+        options.set_mode(AgentMode::Independent);
         let error = require_dashboard_model_sync(&options).unwrap_err();
         assert!(error.contains("control_plane_required"));
     }

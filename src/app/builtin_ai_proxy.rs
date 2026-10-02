@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, RwLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -23,6 +23,15 @@ const RUNTIME_TOKEN_QUERY: &str = "token";
 // Keep the iframe on a browser-visible loopback hostname. Authentication is
 // carried by the session token bridge rather than a cross-site cookie.
 const BROWSER_HOST: &str = "localhost";
+// The browser entry keeps one loopback port per DSH home. DSH remembers the
+// rail view — which Workspace groups are open, and per-account ordering — in
+// browser storage keyed by page origin, so an entry that moves to a fresh
+// ephemeral port on every launch resets that memory: the user's Session
+// records come back folded away and look missing. A launch-stable port keeps
+// one origin per home; a port that is already taken falls back to an ephemeral
+// one, which the first-paint preset below repairs.
+const BROWSER_PORT_BASE: u16 = 21_600;
+const BROWSER_PORT_SPAN: u16 = 1_200;
 const RUNTIME_REFERRER_POLICY: &str = r#"<meta name="referrer" content="same-origin">"#;
 // DSH's model selector prefers the optional display name over the provider
 // and model id. Keep the user-facing label tied to the real catalog id so a
@@ -97,10 +106,18 @@ const RUNTIME_AUTH_BRIDGE: &str = r#"<script data-himind-runtime-auth>
 (() => {
   const session = new URLSearchParams(location.search).get("himind_session");
   if (!session) return;
+  // The runtime opens its Remote mux over `ws://` while the page itself is
+  // served over `http://`, so a plain `origin` comparison treats the socket
+  // that carries every Session record as cross-site and leaves it unauthorised.
+  // Compare the site instead, and keep the socket scheme untouched.
+  const sameSite = (url) => {
+    const scheme = url.protocol === "ws:" ? "http:" : url.protocol === "wss:" ? "https:" : url.protocol;
+    return scheme + "//" + url.host === location.origin;
+  };
   const withSession = (value) => {
     try {
       const url = value instanceof URL ? new URL(value.href) : new URL(String(value), location.href);
-      if (url.origin === location.origin && !url.searchParams.has("himind_session")) {
+      if (sameSite(url) && !url.searchParams.has("himind_session")) {
         url.searchParams.set("himind_session", session);
       }
       return url.toString();
@@ -152,12 +169,151 @@ const RUNTIME_AUTH_BRIDGE: &str = r#"<script data-himind-runtime-auth>
 })();
 </script>"#;
 
+/// Build the first-paint Workspace rail preset.
+///
+/// The rail is the only place DSH lists Sessions, and it remembers which
+/// Workspace groups are open per browser origin. HiMind Agent serves the
+/// runtime from a fresh loopback port on every launch, so that memory is
+/// always empty and every group starts collapsed; existing Sessions then look
+/// like missing records. Opening the known groups before the runtime scripts
+/// boot keeps real records visible on the first paint.
+///
+/// A stored choice is never overwritten: the preset only fills in groups the
+/// browser has not decided about yet, and every other field of the stored
+/// view — including fields written by a newer runtime — is carried over
+/// untouched.
+///
+/// The stored view is not optional: the runtime reads `groupBy` and `orderBy`
+/// out of it, and a view object that lacks them leaves the rail unpainted
+/// instead of falling back to defaults. The defaults below are the exact
+/// values the runtime itself persists for a fresh origin.
+///
+/// `session_id` is the Session this launch adopted for the entry's own
+/// Workspace. It is seeded into the runtime's current-Session slot only when
+/// that slot is still empty, so the entry opens on its own project instead of
+/// on whichever Workspace happens to have been touched last.
+fn rail_view_preset_script(workspace_ids: &[String], session_id: Option<&str>) -> String {
+    let keys = serde_json::to_string(workspace_ids).unwrap_or_else(|_| "[]".to_string());
+    let session = serde_json::to_string(&session_id).unwrap_or_else(|_| "null".to_string());
+    format!(
+        r#"<script data-himind-rail-view>
+(() => {{
+  const PREFIX = "dsh.workspace.view.v";
+  const KNOWN_KEY = "dsh.workspace.view.v5";
+  const CURRENT_KEY = "dsh.sessions.current";
+  const KEYS = {keys};
+  const SESSION_ID = {session};
+  const isObject = (value) => value !== null && typeof value === "object";
+  const asObject = (value) => isObject(value) ? value : {{}};
+  const opened = (previous) => {{
+    const expansion = asObject(previous.groupExpansion);
+    for (const key of KEYS) {{
+      if (!Object.prototype.hasOwnProperty.call(expansion, key)) expansion[key] = true;
+    }}
+    return expansion;
+  }};
+  // An entry opened for a project must land in that project. The runtime only
+  // guesses a Workspace (the most recently updated one) when the browser has
+  // not recorded a Session yet, and that guess is shared by every entry, so
+  // two entries opened for two projects would race for the same one. Seeding
+  // the Session this launch adopted pins the entry to its own Workspace.
+  // A browser that already chose is never overridden: the user's pick, however
+  // it was made, outranks the preset.
+  try {{
+    if (SESSION_ID !== null && localStorage.getItem(CURRENT_KEY) === null) {{
+      localStorage.setItem(CURRENT_KEY, JSON.stringify({{ sessionId: SESSION_ID }}));
+    }}
+  }} catch {{
+    // Storage can be blocked. The runtime then keeps its own defaults.
+  }}
+  try {{
+    const viewKeys = new Set();
+    for (let index = 0; index < localStorage.length; index += 1) {{
+      const name = localStorage.key(index);
+      if (typeof name === "string" && name.indexOf(PREFIX) === 0) viewKeys.add(name);
+    }}
+    viewKeys.add(KNOWN_KEY);
+    for (const viewKey of viewKeys) {{
+      const raw = localStorage.getItem(viewKey);
+      // Only the schema this build was verified against may be created from
+      // scratch. An unknown newer store is left alone unless it already
+      // exists, so the preset can never hand the runtime a shape it rejects.
+      if (raw === null && viewKey !== KNOWN_KEY) continue;
+      const previous = raw === null ? {{}} : asObject(JSON.parse(raw));
+      const next = Object.assign({{}}, previous);
+      if (typeof next.groupBy !== "string") next.groupBy = "workspace";
+      if (typeof next.orderBy !== "string") next.orderBy = "updated";
+      if (!isObject(next.sessionOrderByAccount)) next.sessionOrderByAccount = {{}};
+      if (!isObject(next.sessionUpdatedAtByAccount)) next.sessionUpdatedAtByAccount = {{}};
+      next.groupExpansion = opened(previous);
+      localStorage.setItem(viewKey, JSON.stringify(next));
+    }}
+  }} catch {{
+    // Storage can be blocked or hold a foreign value. The runtime then keeps
+    // its own defaults, so there is nothing to repair here.
+  }}
+}})();
+</script>"#
+    )
+}
+
+/// Collect every Workspace id the runtime has already recorded in one home.
+///
+/// The rail groups by Workspace membership, so these are exactly the group
+/// keys the browser must open for recorded Sessions to be visible.
+fn rail_workspace_ids(home: &Path) -> Vec<String> {
+    let path = home.join("storages").join("workspace.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("global")
+        .and_then(|global| global.get("workspaceIds"))
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) type EventObserver = Arc<dyn Fn(Value) + Send + Sync + 'static>;
+
+/// The loopback port this home's browser entry prefers, derived from the DSH
+/// home path so the same home keeps the same origin across launches and
+/// different homes on one machine stay apart.
+fn preferred_browser_port(origin_key: Option<&str>) -> Option<u16> {
+    let key = origin_key?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(BROWSER_PORT_BASE + (hash % u64::from(BROWSER_PORT_SPAN)) as u16)
+}
+
+/// Bind the browser entry, preferring the home's stable port and degrading to
+/// an ephemeral one when that port is already in use.
+fn bind_browser_listener(origin_key: Option<&str>) -> Result<TcpListener, String> {
+    if let Some(port) = preferred_browser_port(origin_key) {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            return Ok(listener);
+        }
+    }
+    TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("无法创建 HiMind AI 本机入口：{error}"))
+}
 
 pub(crate) struct BuiltinAiProxy {
     url: String,
     shutdown: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
+    rail_view_preset: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,16 +325,17 @@ struct UpstreamSession {
 #[derive(Clone)]
 pub(crate) struct BuiltinAiProxyControl {
     url: String,
+    rail_view_preset: Arc<RwLock<Option<String>>>,
 }
 
 impl BuiltinAiProxy {
     pub(crate) fn start(
         upstream_url: &str,
         observer: Option<EventObserver>,
+        origin_key: Option<&str>,
     ) -> Result<Self, String> {
         let (upstream, upstream_session) = prepare_upstream(upstream_url)?;
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|error| format!("无法创建 HiMind AI 本机入口：{error}"))?;
+        let listener = bind_browser_listener(origin_key)?;
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("无法配置 HiMind AI 本机入口：{error}"))?;
@@ -190,9 +347,11 @@ impl BuiltinAiProxy {
         let url = format!("http://{BROWSER_HOST}:{port}/?{SESSION_QUERY}={token}");
         let shutdown = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let rail_view_preset = Arc::new(RwLock::new(None::<String>));
         let listener_shutdown = Arc::clone(&shutdown);
         let listener_token = token.clone();
         let listener_active_connections = Arc::clone(&active_connections);
+        let listener_rail_view_preset = Arc::clone(&rail_view_preset);
         let listener_thread = thread::Builder::new()
             .name("himind-ai-proxy-listener".to_string())
             .spawn(move || {
@@ -214,6 +373,8 @@ impl BuiltinAiProxy {
                             let connection_token = listener_token.clone();
                             let connection_upstream_session = upstream_session.clone();
                             let connection_observer = observer.clone();
+                            let connection_rail_view_preset =
+                                Arc::clone(&listener_rail_view_preset);
                             let connection_active_connections =
                                 Arc::clone(&listener_active_connections);
                             let spawn_result = thread::Builder::new()
@@ -226,6 +387,7 @@ impl BuiltinAiProxy {
                                         &connection_upstream_session,
                                         connection_shutdown,
                                         connection_observer,
+                                        connection_rail_view_preset,
                                     ) {
                                         if error.kind() != io::ErrorKind::ConnectionReset
                                             && error.kind() != io::ErrorKind::BrokenPipe
@@ -255,6 +417,7 @@ impl BuiltinAiProxy {
             url,
             shutdown,
             listener: Some(listener_thread),
+            rail_view_preset,
         })
     }
 
@@ -265,6 +428,7 @@ impl BuiltinAiProxy {
     pub(crate) fn control(&self) -> BuiltinAiProxyControl {
         BuiltinAiProxyControl {
             url: self.url.clone(),
+            rail_view_preset: Arc::clone(&self.rail_view_preset),
         }
     }
 
@@ -322,23 +486,136 @@ impl BuiltinAiProxyControl {
         Ok(())
     }
 
-    /// Register an Agent-selected project as a native DSH Workspace and create
-    /// its blank session before the browser loads. DSH then applies its own
-    /// recent-Workspace selection policy and opens the intended project.
-    pub(crate) fn start_workspace_session(&self, workspace: &Path) -> Result<String, String> {
+    /// Open the recorded Workspace groups before the runtime boots, and claim a
+    /// Session row when this entry belongs to a project directory.
+    ///
+    /// The preset is published for every entry: it is the only thing that makes
+    /// recorded Sessions visible on the first paint, because the rail remembers
+    /// expansion per browser origin and DSH serves from a fresh loopback port
+    /// on every launch.
+    ///
+    /// Registering the directory as a named Workspace — and giving that group a
+    /// Session — is for the entries that were opened *for* a project, where the
+    /// user expects to land in that project. The plain HiMind AI entry leaves
+    /// the registry alone: its directory is only a launch default, and turning
+    /// it into a group would grow the rail with a row that holds no record.
+    ///
+    /// Grouping is presentation only — the Session itself already runs in the
+    /// requested directory — so a failure is reported as a degraded rail rather
+    /// than taken as a reason to refuse the entry.
+    pub(crate) fn prepare_rail(
+        &self,
+        home: &Path,
+        workspace: &Path,
+        adopt_session: bool,
+    ) -> Result<Vec<String>, String> {
+        let registered = match adopt_session {
+            true => self.register_workspace(workspace).map(Some),
+            false => Ok(None),
+        };
+        let mut opened = Vec::new();
+        if let Ok(Some(workspace_id)) = &registered {
+            opened.push(workspace_id.clone());
+        }
+        let adopted = match &registered {
+            Ok(Some(workspace_id)) => self.adopt_rail_session(workspace_id, workspace).map(Some),
+            _ => Ok(None),
+        };
+        self.set_rail_view_preset(
+            home,
+            &opened,
+            adopted.as_ref().ok().and_then(Option::as_deref),
+        );
+        match (registered, adopted) {
+            (Err(error), _) => Err(format!("HiMind AI 工作目录未进入分组：{error}")),
+            (_, Err(error)) => Err(format!("HiMind AI 项目会话未就绪：{error}")),
+            (Ok(_), Ok(_)) => Ok(opened),
+        }
+    }
+
+    /// Give one registered Workspace a current Session row.
+    ///
+    /// Reuse a recorded unused Session when the runtime reports one: adopting
+    /// it keeps the group current without growing the rail by one abandoned row
+    /// per launch. Any rejection (a Session that is live elsewhere, for
+    /// example) falls back to a fresh row instead of failing the launch.
+    ///
+    /// The adopted Session id is returned so the entry can also be pinned to
+    /// that row on its first paint.
+    fn adopt_rail_session(&self, workspace_id: &str, workspace: &Path) -> Result<String, String> {
+        if let Some(session_id) = self.idle_rail_session(workspace).unwrap_or_default() {
+            if let Ok(adopted) = self.create_workspace_session(workspace_id, Some(&session_id)) {
+                return Ok(adopted);
+            }
+        }
+        self.create_workspace_session(workspace_id, None)
+    }
+
+    /// Publish the Workspace groups that must be open on the next page load.
+    ///
+    /// Every recorded Workspace in `home` is included, plus `workspace_ids`
+    /// for groups this launch just created, plus the runtime's Ungrouped
+    /// bucket — Sessions whose directory was never registered only live there.
+    /// The rail itself remembers expansion per browser origin, and this
+    /// embedded runtime serves from a fresh loopback port on every launch, so
+    /// without this preset a returning user is greeted by closed groups and
+    /// their recorded Sessions look missing.
+    ///
+    /// `session_id` pins this entry to the Session adopted for its own
+    /// Workspace, which is what keeps concurrent entries from landing in each
+    /// other's project.
+    pub(crate) fn set_rail_view_preset(
+        &self,
+        home: &Path,
+        workspace_ids: &[String],
+        session_id: Option<&str>,
+    ) {
+        let mut keys: Vec<String> = vec![String::new()];
+        for workspace_id in rail_workspace_ids(home).iter().chain(workspace_ids.iter()) {
+            if !workspace_id.is_empty() && !keys.iter().any(|key| key == workspace_id) {
+                keys.push(workspace_id.clone());
+            }
+        }
+        if let Ok(mut preset) = self.rail_view_preset.write() {
+            *preset = Some(rail_view_preset_script(&keys, session_id));
+        }
+    }
+
+    /// Register (idempotently) one directory as a native DSH Workspace.
+    ///
+    /// `workspace/create` is the only way an external client can put a Session
+    /// into a named Workspace group: DSH groups the browser rail by Workspace
+    /// membership and files everything else under its collapsed Ungrouped
+    /// bucket, which is why an unregistered Session looks like a missing record.
+    pub(crate) fn register_workspace(&self, workspace: &Path) -> Result<String, String> {
         let workspace_path = crate::extension_workspace::display_path(workspace);
-        let response =
-            self.call_runtime_api("workspace.create", json!({ "path": workspace_path }))?;
+        let response = self.call_runtime_api(
+            "workspace/create",
+            json!({ "request": { "path": workspace_path } }),
+        )?;
         let workspace_value = runtime_result_value(&response, "注册 DSH 工作区")?;
-        let workspace_id = workspace_value
+        workspace_value
             .get("workspace")
             .and_then(|workspace| workspace.get("workspaceId"))
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "DSH 工作区响应缺少 workspaceId".to_string())?;
+            .map(str::to_string)
+            .ok_or_else(|| "DSH 工作区响应缺少 workspaceId".to_string())
+    }
 
-        let response =
-            self.call_runtime_api("session.create", json!({ "workspaceId": workspace_id }))?;
+    /// Create — or idempotently adopt — a Session inside a Workspace so DSH
+    /// selects that Workspace group on load instead of leaving the Session in
+    /// Ungrouped.
+    pub(crate) fn create_workspace_session(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
+        let mut request = json!({ "workspaceId": workspace_id });
+        if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+            request["sessionId"] = json!(session_id);
+        }
+        let response = self.call_runtime_api("session/create", json!({ "request": request }))?;
         let session_value = runtime_result_value(&response, "创建 DSH 项目会话")?;
         session_value
             .get("sessionId")
@@ -346,6 +623,43 @@ impl BuiltinAiProxyControl {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
             .ok_or_else(|| "DSH 项目会话响应缺少 sessionId".to_string())
+    }
+
+    /// Find the Session the rail should reuse for one directory: the newest
+    /// unused ("blank") Session DSH already recorded there, if any.
+    ///
+    /// Adopting it keeps the group current without growing the rail by one
+    /// abandoned row per launch.
+    fn idle_rail_session(&self, workspace: &Path) -> Result<Option<String>, String> {
+        let directory = crate::extension_workspace::display_path(workspace);
+        let response = self.call_runtime_api("session/list", json!({ "_request": {} }))?;
+        let value = runtime_result_value(&response, "读取 DSH 会话列表")?;
+        let items = value
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut newest: Option<(u64, String)> = None;
+        for item in items {
+            if item.get("blank").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let matches_directory = item
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|cwd| cwd.eq_ignore_ascii_case(&directory));
+            if !matches_directory {
+                continue;
+            }
+            let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            let updated_at = item.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
+            if newest.as_ref().is_none_or(|(best, _)| updated_at > *best) {
+                newest = Some((updated_at, session_id.to_string()));
+            }
+        }
+        Ok(newest.map(|(_, session_id)| session_id))
     }
 
     /// Synchronize the Agent-owned provider through DSH's public API carrier.
@@ -367,7 +681,7 @@ impl BuiltinAiProxyControl {
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|error| format!("创建 DSH 模型同步客户端失败: {error}"))?;
-        let described = self.call_api(&client, "settings.describe", json!({}))?;
+        let described = self.call_api(&client, "settings/describe", json!({}))?;
         let namespaces = described
             .get("result")
             .and_then(|result| result.get("ok").and_then(Value::as_bool).filter(|ok| *ok))
@@ -437,25 +751,31 @@ impl BuiltinAiProxyControl {
         Ok(())
     }
 
-    fn call_api(&self, client: &Client, method: &str, payload: Value) -> Result<Value, String> {
-        let mut endpoint =
+    /// Call one DSH Typert Remote method over the authenticated local carrier.
+    ///
+    /// DSH publishes a Remote method as the literal `/api/<namespace>/<method>`
+    /// endpoint and requires the wire payload to hold exactly one plain-object
+    /// `args` field whose keys match that method's descriptor. Callers therefore
+    /// pass the endpoint verbatim together with that method's named arguments.
+    fn call_api(&self, client: &Client, endpoint: &str, args: Value) -> Result<Value, String> {
+        let mut url =
             url::Url::parse(&self.url).map_err(|_| "HiMind AI 本机地址无效".to_string())?;
-        let session = endpoint
+        let session = url
             .query_pairs()
             .find(|(name, _)| name == SESSION_QUERY)
             .map(|(_, value)| value.into_owned())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "HiMind AI 本机会话令牌不可用".to_string())?;
-        endpoint.set_path(&format!("/api/{method}"));
-        endpoint.set_query(None);
+        url.set_path(&format!("/api/{endpoint}"));
+        url.set_query(None);
         let request = json!({
             "type": "client-request",
-            "rpcId": format!("himind-sync-{}", unix_millis()),
-            "method": method,
-            "payload": payload,
+            "rpcId": next_rpc_id("himind-sync"),
+            "method": endpoint,
+            "payload": { "args": args },
         });
         let response = client
-            .post(endpoint)
+            .post(url)
             // WebView2 accepts the Secure localhost cookie. Reqwest follows
             // standard HTTP cookie rules, so carry the short-lived local
             // session explicitly for the Agent-to-proxy control request.
@@ -465,26 +785,26 @@ impl BuiltinAiProxyControl {
             )
             .json(&request)
             .send()
-            .map_err(|error| format!("DSH {method} 请求失败: {error}"))?;
+            .map_err(|error| format!("DSH {endpoint} 请求失败: {error}"))?;
         let status = response.status();
         let body = response
             .json::<Value>()
-            .map_err(|error| format!("DSH {method} 响应无效: {error}"))?;
+            .map_err(|error| format!("DSH {endpoint} 响应无效: {error}"))?;
         if !status.is_success() {
-            return Err(format!("DSH {method} 返回 HTTP {status}"));
+            return Err(format!("DSH {endpoint} 返回 HTTP {status}"));
         }
         Ok(body)
     }
 
     /// Send a control request through the authenticated local DSH carrier.
-    /// Runtime command names are intentionally kept at the gateway boundary;
+    /// Runtime endpoint names are intentionally kept at the gateway boundary;
     /// this method only owns transport/session-cookie handling.
-    pub(crate) fn call_runtime_api(&self, method: &str, payload: Value) -> Result<Value, String> {
+    pub(crate) fn call_runtime_api(&self, endpoint: &str, args: Value) -> Result<Value, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| format!("创建 DSH 控制客户端失败: {error}"))?;
-        self.call_api(&client, method, payload)
+        self.call_api(&client, endpoint, args)
     }
 
     /// Answer a DSH server-request. Unlike ordinary runtime calls this is a
@@ -539,12 +859,12 @@ impl BuiltinAiProxyControl {
     /// Probe only the shape/availability of a DSH RPC. Probes use a shorter
     /// timeout so a degraded local runtime cannot delay Agent startup or the
     /// command claim loop.
-    pub(crate) fn probe_runtime_api(&self, method: &str, payload: Value) -> Result<Value, String> {
+    pub(crate) fn probe_runtime_api(&self, endpoint: &str, args: Value) -> Result<Value, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|error| format!("创建 DSH 能力探测客户端失败: {error}"))?;
-        self.call_api(&client, method, payload)
+        self.call_api(&client, endpoint, args)
     }
 
     fn mutate_settings(
@@ -554,11 +874,11 @@ impl BuiltinAiProxyControl {
         ops: Vec<Value>,
         revision: Option<i64>,
     ) -> Result<(), String> {
-        let mut payload = json!({ "ns": namespace, "ops": ops });
+        let mut args = json!({ "ns": namespace, "ops": ops });
         if let Some(revision) = revision {
-            payload["expectedRevision"] = json!(revision);
+            args["expectedRevision"] = json!(revision);
         }
-        let response = self.call_api(client, "settings.mutate", payload)?;
+        let response = self.call_api(client, "settings/mutate", args)?;
         let result = response
             .get("result")
             .ok_or_else(|| "DSH 设置同步响应缺少结果".to_string())?;
@@ -574,7 +894,10 @@ impl BuiltinAiProxyControl {
     }
 }
 
-fn runtime_result_value<'a>(response: &'a Value, operation: &str) -> Result<&'a Value, String> {
+pub(crate) fn runtime_result_value<'a>(
+    response: &'a Value,
+    operation: &str,
+) -> Result<&'a Value, String> {
     let result = response
         .get("result")
         .ok_or_else(|| format!("{operation}响应缺少结果"))?;
@@ -610,11 +933,19 @@ fn should_initialize_managed_model(provider: &str, model: &str) -> bool {
         || (provider == "himind-proxy" && model.trim().is_empty())
 }
 
-fn unix_millis() -> u128 {
+pub(crate) fn unix_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+/// DSH correlates each client-request by `rpcId`; two control requests issued
+/// in the same millisecond must not share one id.
+fn next_rpc_id(prefix: &str) -> String {
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{sequence}", unix_millis())
 }
 
 impl Drop for BuiltinAiProxy {
@@ -727,6 +1058,7 @@ fn handle_connection(
     upstream_session: &UpstreamSession,
     shutdown: Arc<AtomicBool>,
     observer: Option<EventObserver>,
+    rail_view_preset: Arc<RwLock<Option<String>>>,
 ) -> io::Result<()> {
     configure_stream(&client)?;
     let initial = read_http_header(&mut client)?;
@@ -749,7 +1081,16 @@ fn handle_connection(
     server.write_all(remainder)?;
 
     if runtime_entry_request {
-        return proxy_customized_runtime_entry(&mut server, &mut client);
+        let view_preset = rail_view_preset
+            .read()
+            .ok()
+            .and_then(|preset| preset.clone());
+        return proxy_customized_runtime_entry(
+            &mut server,
+            &mut client,
+            token,
+            view_preset.as_deref(),
+        );
     }
 
     let mut client_reader = client.try_clone()?;
@@ -1017,10 +1358,13 @@ fn is_runtime_entry_request(request: &str) -> bool {
 fn proxy_customized_runtime_entry(
     server: &mut TcpStream,
     client: &mut TcpStream,
+    token: &str,
+    rail_view_preset: Option<&str>,
 ) -> io::Result<()> {
     server.set_read_timeout(Some(Duration::from_secs(5)))?;
     let response = read_complete_http_response(server)?;
-    let Some(customized) = customize_runtime_html_response(&response)? else {
+    let Some(customized) = customize_runtime_html_response(&response, token, rail_view_preset)?
+    else {
         return client.write_all(&response);
     };
     client.write_all(&customized)
@@ -1075,7 +1419,11 @@ fn http_response_complete(response: &[u8]) -> io::Result<bool> {
     Ok(false)
 }
 
-fn customize_runtime_html_response(response: &[u8]) -> io::Result<Option<Vec<u8>>> {
+fn customize_runtime_html_response(
+    response: &[u8],
+    token: &str,
+    rail_view_preset: Option<&str>,
+) -> io::Result<Option<Vec<u8>>> {
     let Some(header_end) = find_header_end(response) else {
         return Ok(None);
     };
@@ -1110,7 +1458,7 @@ fn customize_runtime_html_response(response: &[u8]) -> io::Result<Option<Vec<u8>
     };
     let html = String::from_utf8(body)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTML response is not UTF-8"))?;
-    let customized = customize_runtime_html(&html);
+    let customized = customize_runtime_html(&html, rail_view_preset);
     let mut output = String::new();
     for (index, line) in header.lines().enumerate() {
         if index > 0
@@ -1129,36 +1477,53 @@ fn customize_runtime_html_response(response: &[u8]) -> io::Result<Option<Vec<u8>
         }
     }
     output.push_str(&format!("Content-Length: {}\r\n", customized.len()));
+    // Hand the browser the same short-lived carrier every later request needs.
+    // The injected bridge covers script-owned traffic; the cookie also covers
+    // what the bridge cannot reach, so the runtime stays authenticated even if
+    // a live view is created outside the page's own realm.
+    output.push_str(&format!(
+        "Set-Cookie: {SESSION_COOKIE}={token}; Path=/; SameSite=Strict; HttpOnly\r\n"
+    ));
     output.push_str("Cache-Control: no-store\r\nConnection: close\r\n\r\n");
     let mut bytes = output.into_bytes();
     bytes.extend_from_slice(customized.as_bytes());
     Ok(Some(bytes))
 }
 
-fn customize_runtime_html(html: &str) -> String {
+fn customize_runtime_html(html: &str, rail_view_preset: Option<&str>) -> String {
     let mut html = html.replace(
         "<title>DeepSeek Harness</title>",
         "<title>HiMind AI</title>",
     );
+    if let Some(preset) = rail_view_preset.filter(|preset| !preset.is_empty()) {
+        if !html.contains("data-himind-rail-view") {
+            inject_head_snippet(&mut html, preset);
+        }
+    }
     if !html.contains("data-himind-runtime-auth") {
         let bridge = format!("{RUNTIME_REFERRER_POLICY}{RUNTIME_AUTH_BRIDGE}");
-        let lowercase = html.to_ascii_lowercase();
-        let head_end = lowercase.find("</head>");
-        let insertion = lowercase
-            .find("<script")
-            .filter(|script| head_end.is_none_or(|head_end| *script < head_end))
-            .or(head_end)
-            .or_else(|| lowercase.find("<head>").map(|index| index + "<head>".len()));
-        if let Some(index) = insertion {
-            html.insert_str(index, &bridge);
-        } else {
-            html.insert_str(0, &bridge);
-        }
+        inject_head_snippet(&mut html, &bridge);
     }
     if !html.contains("data-himind-runtime-brand") {
         html = html.replacen("</head>", &format!("{RUNTIME_BRAND_BRIDGE}\n</head>"), 1);
     }
     html
+}
+
+/// Insert a bridge snippet ahead of the first runtime script so it runs before
+/// any module code, falling back to the start of `<head>` and then of the page.
+fn inject_head_snippet(html: &mut String, snippet: &str) {
+    let lowercase = html.to_ascii_lowercase();
+    let head_end = lowercase.find("</head>");
+    let insertion = lowercase
+        .find("<script")
+        .filter(|script| head_end.is_none_or(|head_end| *script < head_end))
+        .or(head_end)
+        .or_else(|| lowercase.find("<head>").map(|index| index + "<head>".len()));
+    match insertion {
+        Some(index) => html.insert_str(index, snippet),
+        None => html.insert_str(0, snippet),
+    }
 }
 
 fn response_content_length(header: &str) -> io::Result<Option<usize>> {
@@ -1606,6 +1971,7 @@ mod tests {
         let mut proxy = BuiltinAiProxy::start(
             &format!("http://127.0.0.1:{}/?token=test-token", upstream.port()),
             None,
+            None,
         )
         .unwrap();
         proxy.control().verify_browser_entry().unwrap();
@@ -1633,16 +1999,104 @@ mod tests {
         assert!(exchange.contains("<title>HiMind AI</title>"));
         assert!(exchange.contains("data-himind-runtime-auth"));
         assert!(exchange.contains("name=\"referrer\" content=\"same-origin\""));
-        assert!(!exchange.to_ascii_lowercase().contains("set-cookie"));
+        // The runtime's own cookie stays between the proxy and the runtime; the
+        // browser only ever receives the proxy's short-lived carrier.
+        assert!(!exchange.contains("dsh-auth-test"));
+        assert!(exchange.contains(&format!("Set-Cookie: {SESSION_COOKIE}={proxy_token}")));
         proxy.stop();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn rail_view_preset_reaches_the_browser_entry_before_the_runtime_boots() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = upstream_listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut auth, _) = upstream_listener.accept().unwrap();
+            let _ = read_http_header(&mut auth).unwrap();
+            auth.write_all(
+                b"HTTP/1.1 303 See Other\r\nSet-Cookie: dsh-auth-test=runtime-secret; Path=/; HttpOnly\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let (mut entry, _) = upstream_listener.accept().unwrap();
+                let _ = read_http_header(&mut entry).unwrap();
+                let body = "<html><head><script>window.__ModuleLoader__={}</script></head><body>ready</body></html>";
+                entry
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+
+        // The preset has to come from both sources: the Workspaces the runtime
+        // already recorded, and the one this launch just registered.
+        let home = std::env::temp_dir().join(format!("himind-rail-entry-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("storages")).unwrap();
+        std::fs::write(
+            home.join("storages").join("workspace.json"),
+            r#"{"global":{"workspaceIds":["recorded-alpha"]},"tables":{}}"#,
+        )
+        .unwrap();
+
+        let mut proxy = BuiltinAiProxy::start(
+            &format!("http://127.0.0.1:{}/?token=test-token", upstream.port()),
+            None,
+            None,
+        )
+        .unwrap();
+        proxy
+            .control()
+            .set_rail_view_preset(&home, &["launched-beta".to_string()], None);
+        proxy.control().verify_browser_entry().unwrap();
+        let proxy_url = url::Url::parse(proxy.url()).unwrap();
+        let proxy_address = format!("127.0.0.1:{}", proxy_url.port().expect("proxy URL port"));
+        let proxy_token = proxy_url
+            .query_pairs()
+            .find(|(name, _)| name == SESSION_QUERY)
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+
+        let mut client = TcpStream::connect(&proxy_address).unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /?{SESSION_QUERY}={proxy_token} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+                    proxy_url.port().unwrap()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let exchange =
+            String::from_utf8_lossy(&read_complete_http_response(&mut client).unwrap()).to_string();
+
+        assert!(exchange.starts_with("HTTP/1.1 200 OK"));
+        assert!(exchange.contains("data-himind-rail-view"));
+        assert!(exchange.contains("recorded-alpha"));
+        assert!(exchange.contains("launched-beta"));
+        // The Ungrouped bucket is an empty group key and must survive encoding.
+        assert!(exchange.contains("\"\""));
+        assert!(
+            exchange.find("data-himind-rail-view").unwrap()
+                < exchange.find("window.__ModuleLoader__").unwrap(),
+            "the rail preset must be in place before the runtime reads its view store"
+        );
+
+        proxy.stop();
+        server.join().unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
     fn runtime_auth_bridge_is_injected_before_runtime_scripts() {
         let html =
             "<html><head><script>window.__ModuleLoader__={}</script></head><body></body></html>";
-        let customized = customize_runtime_html(html);
+        let customized = customize_runtime_html(html, None);
 
         assert!(customized.contains("data-himind-runtime-auth"));
         assert!(customized.contains(RUNTIME_REFERRER_POLICY));
@@ -1655,14 +2109,215 @@ mod tests {
     }
 
     #[test]
+    fn runtime_auth_bridge_authorises_the_socket_the_page_already_owns() {
+        // The Remote mux — the stream that carries every Session record — is
+        // opened as `ws://` from an `http://` page. Comparing bare origins
+        // classifies that socket as cross-site and leaves it unauthorised, so
+        // the rail stays on "reconnecting" with no records behind it.
+        assert!(RUNTIME_AUTH_BRIDGE.contains(r#"url.protocol === "ws:" ? "http:""#));
+        assert!(RUNTIME_AUTH_BRIDGE
+            .contains("sameSite(url) && !url.searchParams.has(\"himind_session\")"));
+    }
+
+    #[test]
     fn runtime_entry_html_is_rebranded_without_changing_runtime_assets() {
         let html = "<html><head><title>DeepSeek Harness</title></head><body></body></html>";
-        let customized = customize_runtime_html(html);
+        let customized = customize_runtime_html(html, None);
 
         assert!(customized.contains("<title>HiMind AI</title>"));
         assert!(customized.contains("data-himind-runtime-brand"));
         assert!(customized.contains("svg[viewBox=\"0 0 182 24\"]"));
         assert!(customized.contains("MutationObserver"));
+    }
+
+    #[test]
+    fn the_browser_entry_keeps_one_origin_per_home() {
+        // DSH remembers the rail view per page origin, so the same home must
+        // land on the same loopback port on every launch; an entry that drifted
+        // to a fresh port each time would fold every recorded Session away.
+        let port = preferred_browser_port(Some("home-a")).expect("preferred port");
+        assert_eq!(preferred_browser_port(Some("home-a")), Some(port));
+        assert!(preferred_browser_port(None).is_none());
+        assert!((BROWSER_PORT_BASE..BROWSER_PORT_BASE + BROWSER_PORT_SPAN).contains(&port));
+
+        // A port already in use degrades to an ephemeral one instead of
+        // failing the entry.
+        let first = bind_browser_listener(Some("home-a")).unwrap();
+        let second = bind_browser_listener(Some("home-a")).unwrap();
+        assert_ne!(
+            first.local_addr().unwrap().port(),
+            second.local_addr().unwrap().port()
+        );
+    }
+
+    #[test]
+    fn rail_view_preset_opens_recorded_groups_before_runtime_scripts() {
+        let html =
+            "<html><head><script>window.__ModuleLoader__={}</script></head><body></body></html>";
+        let workspace_ids = [
+            String::new(),
+            "17d2afb0-14d1-484a-a150-89d69ea2ed06".to_string(),
+        ];
+        let preset = rail_view_preset_script(&workspace_ids, None);
+        let customized = customize_runtime_html(html, Some(&preset));
+
+        assert!(customized.contains("data-himind-rail-view"));
+        assert!(customized.contains("dsh.workspace.view.v5"));
+        assert!(
+            customized.find("data-himind-rail-view").unwrap()
+                < customized.find("window.__ModuleLoader__").unwrap(),
+            "the rail preset must run before the runtime boots"
+        );
+        // The Ungrouped bucket is an empty key, and it must survive encoding.
+        assert!(customized.contains("\"\""));
+        assert!(customized.contains("17d2afb0-14d1-484a-a150-89d69ea2ed06"));
+    }
+
+    #[test]
+    fn rail_preset_keeps_the_groups_a_user_already_decided_about() {
+        let keys = vec![
+            String::new(),
+            "workspace-a".to_string(),
+            "workspace-b".to_string(),
+        ];
+        let preset = rail_view_preset_script(&keys, None);
+
+        // Filling in only missing keys is what makes a stored collapse choice
+        // survive the next launch, so the preset must not assign unconditionally.
+        assert!(preset.contains("hasOwnProperty.call(expansion, key)"));
+    }
+
+    #[test]
+    fn rail_preset_carries_the_stored_view_forward_untouched() {
+        let preset = rail_view_preset_script(&[String::new(), "workspace-a".to_string()], None);
+
+        // The runtime needs groupBy/orderBy present, so the preset must supply
+        // the same defaults the runtime itself writes; everything else in a
+        // stored view — including a field a newer runtime added — is copied
+        // over rather than replaced.
+        assert!(preset.contains("Object.assign({}, previous)"));
+        assert!(preset.contains("next.orderBy = \"updated\""));
+        assert!(preset.contains("next.groupExpansion = opened(previous)"));
+        // A stored view from a newer runtime is repaired too, not only the
+        // version this build was verified against.
+        assert!(preset.contains("localStorage.key(index)"));
+        assert!(preset.contains("if (raw === null && viewKey !== KNOWN_KEY) continue"));
+    }
+
+    #[test]
+    fn rail_preset_pins_a_fresh_entry_to_its_own_session() {
+        let preset = rail_view_preset_script(
+            &[String::new(), "workspace-a".to_string()],
+            Some("session-own"),
+        );
+
+        // The runtime picks the most recently updated Workspace when the
+        // browser has no current Session, and every entry opened in a fresh
+        // origin would then race for the same one. Seeding this entry's own
+        // Session is what makes concurrent entries land in their own project.
+        assert!(preset.contains("const CURRENT_KEY = \"dsh.sessions.current\""));
+        assert!(preset.contains("const SESSION_ID = \"session-own\""));
+        assert!(preset.contains("localStorage.getItem(CURRENT_KEY) === null"));
+        assert!(preset.contains("JSON.stringify({ sessionId: SESSION_ID })"));
+    }
+
+    #[test]
+    fn rail_preset_leaves_a_browser_that_already_chose_alone() {
+        // No adopted Session (the plain HiMind AI entry) must not write the
+        // slot at all, and the guard has to be on the stored value rather than
+        // an unconditional write — a user who switched Sessions in this origin
+        // keeps that choice on the next launch.
+        let preset = rail_view_preset_script(&[String::new()], None);
+
+        assert!(preset.contains("const SESSION_ID = null"));
+        assert!(preset
+            .contains("if (SESSION_ID !== null && localStorage.getItem(CURRENT_KEY) === null)"));
+    }
+
+    #[test]
+    fn rail_workspace_ids_read_every_recorded_workspace() {
+        let home = std::env::temp_dir().join(format!("himind-rail-home-{}", std::process::id()));
+        let storages = home.join("storages");
+        std::fs::create_dir_all(&storages).unwrap();
+        std::fs::write(
+            storages.join("workspace.json"),
+            r#"{"global":{"workspaceIds":["alpha","beta"]},"tables":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rail_workspace_ids(&home),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        std::fs::write(storages.join("workspace.json"), "not json").unwrap();
+        assert!(rail_workspace_ids(&home).is_empty());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Serve one real browser entry and hold it open so a browser can be
+    /// pointed at it.
+    ///
+    /// Real runtime, real proxy, real first-paint preset — the only thing the
+    /// caller supplies is the upstream DeepSeek Harness the Agent itself would
+    /// have started. Not part of the suite: it exists so the fix can be checked
+    /// against an installed runtime instead of a stand-in.
+    #[test]
+    #[ignore = "manual browser verification"]
+    fn serve_rail_for_browser_verification() {
+        let upstream = std::env::var("HIMIND_RAIL_UPSTREAM")
+            .expect("set HIMIND_RAIL_UPSTREAM to the runtime URL including its launch token");
+        let home = std::env::var("HIMIND_RAIL_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| crate::runtime::builtin::interactive_home_path())
+            .expect("resolve the DSH home");
+        let workspace = std::env::var("HIMIND_RAIL_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .expect("set HIMIND_RAIL_WORKSPACE");
+        let hold = std::env::var("HIMIND_RAIL_HOLD_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(120);
+
+        let origin_key = home.to_string_lossy().to_string();
+        let proxy = BuiltinAiProxy::start(&upstream, None, Some(origin_key.as_str())).unwrap();
+        println!("workspace-rail-url={}", proxy.url());
+        println!(
+            "workspace-rail-prepare={:?}",
+            proxy.control().prepare_rail(&home, &workspace, false)
+        );
+        for second in 0..hold {
+            if second % 10 == 0 {
+                println!("workspace-rail-hold={second}");
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Print the exact first-paint preset this build injects so a real browser
+    /// can be pointed at the real runtime with the real artifact instead of a
+    /// hand-written approximation.
+    ///
+    /// Not part of the suite: it only exists for manual verification against an
+    /// installed DeepSeek Harness.
+    #[test]
+    #[ignore = "manual browser verification"]
+    fn dump_rail_view_preset_for_browser_verification() {
+        let home = std::env::var("HIMIND_RAIL_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(
+                    r"C:\Users\Administrator\AppData\Local\HiMindAgent\runtimes\deepseek-harness\homes\interactive",
+                )
+            });
+        let mut keys: Vec<String> = vec![String::new()];
+        for workspace_id in rail_workspace_ids(&home) {
+            if !workspace_id.is_empty() && !keys.iter().any(|key| *key == workspace_id) {
+                keys.push(workspace_id);
+            }
+        }
+        let session_id = std::env::var("HIMIND_RAIL_SESSION_ID").ok();
+        println!("{}", rail_view_preset_script(&keys, session_id.as_deref()));
     }
 
     #[test]
@@ -1743,7 +2398,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
             body.len()
         );
-        let rewritten = customize_runtime_html_response(response.as_bytes())
+        let rewritten = customize_runtime_html_response(response.as_bytes(), "test-token", None)
             .unwrap()
             .expect("HTML response should be customized");
         let rewritten = String::from_utf8(rewritten).unwrap();
@@ -1751,5 +2406,6 @@ mod tests {
         assert!(rewritten.contains("Content-Length:"));
         assert!(!rewritten.to_ascii_lowercase().contains("transfer-encoding"));
         assert!(rewritten.contains("data-himind-runtime-brand"));
+        assert!(rewritten.contains("Set-Cookie: himind_ai_session=test-token"));
     }
 }

@@ -250,6 +250,23 @@ fn is_legacy_agent_command(command: &str, installation_root: &Path, expected_ent
         && !paths_equal(command, expected_entry)
 }
 
+/// 运行期可用性：本机是否装了这个 MCP 客户端。
+///
+/// 静态能力表（`skill::clients`）不包含"装没装"，这份探测结果只作为
+/// 能力矩阵的 availability 覆盖层使用，避免各模块重复实现探测。
+pub(crate) fn detected_clients() -> Vec<(String, bool, String)> {
+    client_definitions()
+        .into_iter()
+        .map(|client| {
+            (
+                client.id.to_string(),
+                client.detected,
+                client.detection_message,
+            )
+        })
+        .collect()
+}
+
 fn client_definitions() -> Vec<ClientDefinition> {
     let home = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
@@ -580,7 +597,7 @@ fn remove_json_config(content: &str) -> Result<String, Box<dyn Error>> {
 fn mcp_arguments(options: &Options) -> Vec<String> {
     let mut arguments = vec!["--mcp".to_string()];
     if options.mode().dashboard_enabled() {
-        arguments.extend(["--api".to_string(), options.api_base.clone()]);
+        arguments.extend(["--api".to_string(), options.api_base().clone()]);
     }
     // The development launcher can use a process-local mode override.
     // Carry it into the stdio companion so external AI clients cannot
@@ -635,12 +652,49 @@ pub(crate) fn backup_and_write(
             unix_now_millis()
         ));
         fs::copy(path, &backup)?;
+        prune_backups(path, file_name, BACKUP_RETENTION);
         Some(backup)
     } else {
         None
     };
     atomic_write(path, content)?;
     Ok(backup)
+}
+
+/// 每次写入客户端配置都会留一份备份。长期使用同一个客户端时这些备份只在
+/// 目录里堆积，用户真正需要的通常只有最近几次，所以按客户端保留最近
+/// [`BACKUP_RETENTION`] 份，更早的删掉。文件名带毫秒时间戳，等长，直接按
+/// 名字倒序就是最新在前。
+const BACKUP_RETENTION: usize = 3;
+
+fn prune_backups(path: &Path, file_name: &str, keep: usize) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let prefix = format!("{file_name}.himind-backup-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut backups = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (name.starts_with(&prefix) && name.ends_with(".bak")).then_some((name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    if backups.len() <= keep {
+        return;
+    }
+    backups.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, stale) in backups.into_iter().skip(keep) {
+        let _ = fs::remove_file(stale);
+    }
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
@@ -1040,7 +1094,7 @@ mod tests {
     #[test]
     fn mcp_launch_carries_the_active_agent_mode() {
         let mut options = crate::Options::from_env();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let arguments = mcp_arguments(&options);
         let mode = arguments
             .windows(2)
@@ -1049,7 +1103,7 @@ mod tests {
         assert_eq!(mode, Some("independent"));
         assert!(!arguments.iter().any(|argument| argument == "--api"));
 
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let connected_arguments = mcp_arguments(&options);
         assert!(connected_arguments
             .iter()

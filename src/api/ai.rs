@@ -63,7 +63,65 @@ fn default_protocol() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::AIUserAccess;
+    use super::{fetch_ai_service_templates_with_token, AIUserAccess};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn catalog_request_carries_delegated_headers_and_parses_templates() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"国际厂商","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true}]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let templates = fetch_ai_service_templates_with_token(
+            &format!("http://{addr}/"),
+            "delegated-token",
+            "agent-1",
+            "himind-agent",
+        )
+        .expect("fetch templates");
+
+        let request = received.lock().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /api/integrations/ai/personal-connections/catalog "));
+        assert!(request.contains("authorization: bearer delegated-token"));
+        assert!(request.contains("x-himind-agent-id: agent-1"));
+        assert!(request.contains("x-himind-ai-client: himind-agent"));
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].protocol, "anthropic");
+        assert_eq!(templates[0].base_url, "https://api.anthropic.com");
+        assert_eq!(
+            templates[0].models[0].upstream_model,
+            "claude-sonnet-4-20250514"
+        );
+        assert!(templates[0].models[0].recommended);
+    }
+
+    #[test]
+    fn catalog_tolerates_missing_optional_fields() {
+        let catalog: super::AiProviderTemplateCatalog = serde_json::from_str(
+            r#"{"items":[{"id":"custom_openai_compatible","name":"自定义","models":null},{"id":"kimi"}]}"#,
+        )
+        .expect("catalog payload");
+        assert_eq!(catalog.items.len(), 2);
+        assert_eq!(catalog.items[0].name, "自定义");
+        assert!(catalog.items[0].models.is_empty());
+        assert_eq!(catalog.items[1].protocol, "");
+        assert!(catalog.items[1].base_url.is_empty());
+    }
 
     #[test]
     fn accepts_dashboard_optional_null_fields() {
@@ -102,9 +160,104 @@ struct RevealedCredential {
     api_key: String,
 }
 
+/// Dashboard 用户级 AI 服务模板（GCMP 供应商目录的用户可见投影）。
+///
+/// `protocol` / `base_url` 是模板自带的接入事实，Agent 据此预填本机服务表单，
+/// 不再维护第二份供应商清单；不含任何凭据。
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct AiProviderTemplate {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub vendor_name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub category: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub description: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub service_type: String,
+    /// GCMP 协议名：`openai_compatible` / `anthropic`（`async_http` 不可用于本机推理）。
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub protocol: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub base_url: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec_models")]
+    pub models: Vec<AiProviderTemplateModel>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AiProviderTemplateModel {
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub display_name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub model_alias: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub upstream_model: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiProviderTemplateCatalog {
+    #[serde(default)]
+    items: Vec<AiProviderTemplate>,
+}
+
+fn deserialize_nullable_vec_models<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AiProviderTemplateModel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<AiProviderTemplateModel>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 pub(crate) struct AIClientCredential {
     pub access: AIUserCredential,
     pub api_key: String,
+}
+
+/// 拉取 Dashboard 用户级 AI 服务模板目录（只读，不含凭据）。
+pub(crate) fn fetch_ai_service_templates(
+    options: &Options,
+    client_id: &str,
+) -> Result<Vec<AiProviderTemplate>, Box<dyn Error>> {
+    let delegated = platform_access_token(options, AI_CONVERSATION_SCOPE)?;
+    fetch_ai_service_templates_with_token(
+        &options.api_base(),
+        &delegated.token,
+        &delegated.agent_id,
+        client_id,
+    )
+}
+
+pub(crate) fn fetch_ai_service_templates_with_token(
+    api_base: &str,
+    token: &str,
+    agent_id: &str,
+    client_id: &str,
+) -> Result<Vec<AiProviderTemplate>, Box<dyn Error>> {
+    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let response = client
+        .get(format!(
+            "{}/api/integrations/ai/personal-connections/catalog",
+            api_base.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", client_id)
+        .send()?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "读取 AI 服务模板失败（HTTP {}）",
+            response.status().as_u16()
+        )
+        .into());
+    }
+    let catalog = response.json::<AiProviderTemplateCatalog>()?;
+    Ok(catalog.items)
 }
 
 pub(crate) fn fetch_client_credential(
@@ -125,7 +278,7 @@ pub(crate) fn fetch_client_credential(
     };
 
     let access_response =
-        common_headers(client.get(format!("{}/api/integrations/ai/access", options.api_base)))
+        common_headers(client.get(format!("{}/api/integrations/ai/access", options.api_base())))
             .send()?;
     if !access_response.status().is_success() {
         return Err(format!(
@@ -149,7 +302,7 @@ pub(crate) fn fetch_client_credential(
 
     let reveal_response = common_headers(client.post(format!(
         "{}/api/integrations/ai/access/credential/reveal",
-        options.api_base
+        options.api_base()
     )))
     .send()?;
     if !reveal_response.status().is_success() {
@@ -191,7 +344,7 @@ pub(crate) fn managed_ai_service_summary(
         Err(_) => return unavailable("client_error"),
     };
     let access_response = client
-        .get(format!("{}/api/integrations/ai/access", options.api_base))
+        .get(format!("{}/api/integrations/ai/access", options.api_base()))
         .bearer_auth(&delegated.token)
         .header("X-HiMind-Agent-ID", &delegated.agent_id)
         .header("X-HiMind-AI-Client", "ai-service-list")

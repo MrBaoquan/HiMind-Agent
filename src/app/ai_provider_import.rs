@@ -1,4 +1,4 @@
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distributions::Alphanumeric, Rng, RngCore};
 use rusqlite::{backup::Backup, params, Connection, TransactionBehavior};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,13 @@ const KIMI_CODE_HIMIND_PREFIX: &str = "himind/";
 const KIMI_CODE_DEFAULT_CONTEXT: u64 = 1_048_576;
 const QWEN_CODE_PROVIDER_ID: &str = "himind";
 const QWEN_CODE_ENV_KEY: &str = "HIMIND_API_KEY";
+// OpenCode 通过 provider.<id>.npm 指定 AI SDK 适配包：OpenAI Chat 兼容用
+// @ai-sdk/openai-compatible，/v1/responses 用 @ai-sdk/openai，Anthropic Messages
+// 用 @ai-sdk/anthropic（官方文档点名的包）。
+const OPENCODE_PROVIDER_ID: &str = "himind";
+const OPENCODE_NPM_OPENAI_COMPATIBLE: &str = "@ai-sdk/openai-compatible";
+const OPENCODE_NPM_OPENAI_RESPONSES: &str = "@ai-sdk/openai";
+const OPENCODE_NPM_ANTHROPIC: &str = "@ai-sdk/anthropic";
 // Claude Code / Claude Desktop 通过 settings env 块注入 Anthropic 协议端点。
 // Anthropic SDK 会在 base_url 后追加 /v1/messages，故 base_url 需剥掉网关路径末尾的 /v1。
 const CLAUDE_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
@@ -81,6 +88,12 @@ pub(crate) struct AIProviderImportRequest {
     /// 服务源：`managed`（默认，HiMind Dashboard 分发）或 `custom:<id>`（本机自定义服务）。
     #[serde(default)]
     pub service: String,
+    /// 目标客户端已注册其它来源时，先撤销旧注册再写入新来源。
+    ///
+    /// 默认 `false`：一个客户端同时只属于一个来源，冲突时先返回错误，
+    /// 让调用方明确表达"切换"意图，而不是被动覆盖用户已有的注册。
+    #[serde(default)]
+    pub replace: bool,
 }
 
 impl AIProviderImportRequest {
@@ -108,7 +121,22 @@ pub(crate) trait AIClientAdapter {
         user_id: &str,
         service: &str,
     ) -> Result<AIProviderImportResult, Box<dyn Error>>;
-    fn cancel(&self, options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>>;
+
+    /// 导入前，对「本次会被覆盖、且属于用户既有配置」的键做快照，随簿记一起落盘。
+    ///
+    /// 取消导入时按同一份快照精确还原用户原值；只做新增式合并、不会覆盖用户既有值
+    /// 的客户端返回 `None`（默认）。快照是适配器私有的不透明 JSON，其他层不解释。
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        None
+    }
+
+    /// 取消导入。`restore` 为导入时记录的快照，`None` 表示旧簿记或无快照，
+    /// 此时只移除 HiMind 自己写入、且仍带 HiMind 标记的键。
+    fn cancel(
+        &self,
+        options: &Options,
+        restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>>;
 }
 
 pub(crate) struct VSCodeAdapter;
@@ -137,7 +165,11 @@ impl AIClientAdapter for VSCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_vscode(options, user_id, service)
     }
-    fn cancel(&self, options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    fn cancel(
+        &self,
+        options: &Options,
+        _restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_vscode(options)
     }
 }
@@ -163,7 +195,11 @@ impl AIClientAdapter for CCSwitchAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_cc_switch(options, user_id, service)
     }
-    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    fn cancel(
+        &self,
+        _options: &Options,
+        _restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_cc_switch()
     }
 }
@@ -189,8 +225,15 @@ impl AIClientAdapter for CodexAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_codex(options, user_id, service)
     }
-    fn cancel(&self, options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-        cancel_codex(options)
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        codex_owned_snapshot()
+    }
+    fn cancel(
+        &self,
+        options: &Options,
+        restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_codex(options, restore)
     }
 }
 
@@ -215,7 +258,11 @@ impl AIClientAdapter for WorkBuddyAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_workbuddy(options, user_id, service)
     }
-    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    fn cancel(
+        &self,
+        _options: &Options,
+        _restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_workbuddy()
     }
 }
@@ -244,7 +291,11 @@ impl AIClientAdapter for KimiCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_kimi_code(options, user_id, service)
     }
-    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    fn cancel(
+        &self,
+        _options: &Options,
+        _restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_kimi_code()
     }
 }
@@ -270,13 +321,18 @@ impl AIClientAdapter for QwenCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_qwen_code(options, user_id, service)
     }
-    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    fn cancel(
+        &self,
+        _options: &Options,
+        _restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
         cancel_qwen_code()
     }
 }
 
 pub(crate) struct ClaudeCodeAdapter;
 pub(crate) struct ClaudeDesktopAdapter;
+pub(crate) struct OpenCodeAdapter;
 
 impl AIClientAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &'static str {
@@ -299,8 +355,15 @@ impl AIClientAdapter for ClaudeCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_claude_code(options, user_id, service)
     }
-    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-        cancel_claude_code()
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        claude_owned_snapshot(&claude_code_settings_path())
+    }
+    fn cancel(
+        &self,
+        _options: &Options,
+        restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_claude_code(restore)
     }
 }
 
@@ -325,13 +388,51 @@ impl AIClientAdapter for ClaudeDesktopAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_claude_desktop(options, user_id, service)
     }
-    fn cancel(&self, _options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-        cancel_claude_desktop()
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        claude_desktop_owned_snapshot()
+    }
+    fn cancel(
+        &self,
+        _options: &Options,
+        restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_claude_desktop(restore)
+    }
+}
+
+impl AIClientAdapter for OpenCodeAdapter {
+    fn id(&self) -> &'static str {
+        "opencode"
+    }
+    fn display_name(&self) -> &'static str {
+        "OpenCode"
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        opencode_import_status()
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for("opencode", action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_opencode(options, user_id, service)
+    }
+    fn cancel(
+        &self,
+        _options: &Options,
+        _restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_opencode()
     }
 }
 
 pub(crate) fn adapter_for(target: &str) -> Option<&'static dyn AIClientAdapter> {
-    match target.trim() {
+    let target = target.trim();
+    match target {
         "vscode" => Some(&VSCodeAdapter),
         "cc-switch" => Some(&CCSwitchAdapter),
         "codex" => Some(&CodexAdapter),
@@ -340,12 +441,16 @@ pub(crate) fn adapter_for(target: &str) -> Option<&'static dyn AIClientAdapter> 
         "qwen-code" => Some(&QwenCodeAdapter),
         "claude-code" => Some(&ClaudeCodeAdapter),
         "claude-desktop" => Some(&ClaudeDesktopAdapter),
-        _ => None,
+        "opencode" => Some(&OpenCodeAdapter),
+        // 声明式适配表：新增同类客户端只加一行数据。
+        _ => declarative_provider_adapters()
+            .into_iter()
+            .find(|adapter| adapter.id() == target),
     }
 }
 
 pub(crate) fn known_adapters() -> Vec<&'static dyn AIClientAdapter> {
-    vec![
+    let mut adapters: Vec<&'static dyn AIClientAdapter> = vec![
         &VSCodeAdapter,
         &CCSwitchAdapter,
         &CodexAdapter,
@@ -354,7 +459,10 @@ pub(crate) fn known_adapters() -> Vec<&'static dyn AIClientAdapter> {
         &QwenCodeAdapter,
         &ClaudeCodeAdapter,
         &ClaudeDesktopAdapter,
-    ]
+        &OpenCodeAdapter,
+    ];
+    adapters.extend(declarative_provider_adapters());
+    adapters
 }
 
 pub(crate) fn known_adapter_ids() -> Vec<&'static str> {
@@ -382,6 +490,14 @@ pub(crate) struct AIProviderImportResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AIProviderImportBinding {
     service: String,
+    /// 最近一次写入该客户端配置的时间（RFC 3339）。旧簿记没有这个字段，
+    /// 因此默认空串，UI 在没有时间可显示时就不显示这一行。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    updated_at: String,
+    /// 导入前被覆盖字段的原值快照（适配器私有格式）。取消导入时按它还原用户
+    /// 原有配置；旧簿记没有这个字段，退化为「只移除自己写入的键」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -493,12 +609,29 @@ fn plan_for(target: &str, action: &str, status: &AIProviderImportStatus) -> AIPr
     }
 }
 
+/// 计划里要展示的写入/备份文件：声明式客户端可能有多个文件（ZCode 是两份），
+/// 其余客户端沿用状态里的单一配置路径。
+fn planned_config_paths(target: &str, status: &AIProviderImportStatus) -> Vec<String> {
+    if let Some(definition) = provider_target_definition(target) {
+        return provider_config_file_paths(definition)
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+    }
+    if status.config_path.is_empty() {
+        Vec::new()
+    } else {
+        vec![status.config_path.clone()]
+    }
+}
+
 fn plan_import(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, Vec<String>) {
     let mut will_write = Vec::new();
     let mut will_backup = Vec::new();
-    if !status.config_path.is_empty() {
-        will_backup.push(status.config_path.clone());
-        will_write.push(status.config_path.clone());
+    let paths = planned_config_paths(target, status);
+    for path in paths {
+        will_backup.push(path.clone());
+        will_write.push(path);
     }
     match target {
         "codex" => {
@@ -530,11 +663,23 @@ fn plan_import(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, V
         }
         "claude-desktop" => {
             will_write.push(
-                "写入 Claude Desktop claude_desktop_config.json env 的 ANTHROPIC_* 配置"
+                "在 Claude Desktop 第三方档案（Claude-3p）的 configLibrary 写入 HiMind 网关条目"
                     .to_string(),
             );
+            will_write.push(
+                "把第三方档案设为当前档案（claude_desktop_config.json 的 deploymentMode）"
+                    .to_string(),
+            );
+            will_write.push("模型由网关 /v1/models 自动发现，无需在档案里声明".to_string());
+        }
+        "opencode" => {
+            will_write
+                .push("写入 OpenCode opencode.json 的 provider.himind 与模型目录".to_string());
         }
         _ => {}
+    }
+    if let Some(definition) = provider_target_definition(target) {
+        will_write.push(definition.import_summary.to_string());
     }
     (will_write, will_backup)
 }
@@ -542,9 +687,10 @@ fn plan_import(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, V
 fn plan_remove(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, Vec<String>) {
     let mut will_write = Vec::new();
     let mut will_backup = Vec::new();
-    if !status.config_path.is_empty() {
-        will_backup.push(status.config_path.clone());
-        will_write.push(status.config_path.clone());
+    let paths = planned_config_paths(target, status);
+    for path in paths {
+        will_backup.push(path.clone());
+        will_write.push(path);
     }
     match target {
         "codex" => {
@@ -578,11 +724,18 @@ fn plan_remove(target: &str, status: &AIProviderImportStatus) -> (Vec<String>, V
         }
         "claude-desktop" => {
             will_write.push(
-                "移除 Claude Desktop claude_desktop_config.json env 中的 HiMind ANTHROPIC_* 配置"
-                    .to_string(),
+                "从 Claude Desktop 第三方档案的 configLibrary 移除 HiMind 网关条目".to_string(),
             );
+            will_write
+                .push("保留 deploymentMode 与用户的其它档案条目、mcpServers 不变".to_string());
+        }
+        "opencode" => {
+            will_write.push("移除 OpenCode opencode.json 中的 provider.himind".to_string());
         }
         _ => {}
+    }
+    if let Some(definition) = provider_target_definition(target) {
+        will_write.push(definition.remove_summary.to_string());
     }
     (will_write, will_backup)
 }
@@ -594,45 +747,60 @@ pub(crate) fn import(
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let adapter = adapter_for(&request.target)
         .ok_or_else(|| format!("不支持的 AI 客户端：{}", request.target))?;
-    // 一个客户端只能绑定一个来源。相同来源再次执行即为同步，切换来源必须先取消注册。
+    let target = request.target.trim();
+    // 一个客户端只能绑定一个来源：相同来源再次执行即为同步；不同来源需要
+    // 显式请求切换（`replace`），否则先返回错误，由调用方决定是否切换。
     let service_source = request.service_source();
     let current = status(options)
         .targets
         .into_iter()
-        .find(|item| item.target == request.target.trim());
+        .find(|item| item.target == target);
     if current
         .as_ref()
         .is_some_and(|item| item.state == "imported")
     {
         let bindings = load_import_bindings(options);
-        match bindings.clients.get(request.target.trim()) {
-            Some(binding) if binding.service == service_source => {}
-            Some(_) => {
-                return Err(format!(
-                    "客户端 {} 已注册其他 AI 服务，请先取消注册后再切换",
-                    request.target
-                )
-                .into())
+        let existing_binding = bindings.clients.get(target);
+        let existing = existing_binding.map(|binding| binding.service.clone());
+        if existing.as_deref() != Some(service_source) {
+            if !request.replace {
+                return Err(match existing {
+                    Some(_) => {
+                        format!("客户端 {target} 已注册其他模型服务，请先取消分发后再切换").into()
+                    }
+                    None => {
+                        format!("客户端 {target} 的注册来源未知，请先取消注册后再重新注册").into()
+                    }
+                });
             }
-            None => {
-                return Err(format!(
-                    "客户端 {} 的注册来源未知，请先取消注册后再重新注册",
-                    request.target
-                )
-                .into())
-            }
+            // 切换来源：先按旧快照撤销旧注册（会写回客户端的原始配置并留下备份），
+            // 再按新来源写入。撤销后立刻落盘簿记，避免中途失败留下错误的归属。
+            let previous_restore = existing_binding.and_then(|binding| binding.restore.clone());
+            adapter.cancel(options, previous_restore.as_ref())?;
+            let mut bindings = load_import_bindings(options);
+            bindings.clients.remove(target);
+            save_import_bindings(options, &bindings)?;
         }
     }
+    // 快照在写入前采集，且排在「切换来源」的还原之后：此时客户端已是用户原始配置。
+    let snapshot = adapter.owned_snapshot(options);
     let result = adapter.import(options, expected_user_id, service_source)?;
     let mut bindings = load_import_bindings(options);
     bindings.clients.insert(
-        request.target.trim().to_string(),
+        target.to_string(),
         AIProviderImportBinding {
             service: service_source.to_string(),
+            updated_at: now_rfc3339(),
+            restore: snapshot,
         },
     );
     save_import_bindings(options, &bindings)?;
     Ok(result)
+}
+
+/// 簿记时间戳。用 UTC 秒级 RFC 3339，跨时区显示交给 UI。
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 fn import_bindings_path(options: &Options) -> PathBuf {
@@ -660,6 +828,14 @@ fn save_import_bindings(
     Ok(())
 }
 
+/// 删除自定义 AI 服务前的占用检查。
+///
+/// 只有**真正绑定了该服务**的客户端会阻止删除：簿记里 `service == custom:<id>` 时删掉
+/// 服务会留下悬空的归属，必须先断开。
+///
+/// **来源不明**的注册（旧版本或人工写入的 `provider.himind`，簿记里查不到归属）不阻止
+/// 删除，也不该阻止：它没有指向任何具体服务 id，删服务既不会改写客户端配置，也不会让
+/// 已有绑定悬空。这类注册在 UI 上单独标注、可单独断开，而不是把整个服务列表锁死。
 pub(crate) fn ensure_service_not_in_use(
     options: &Options,
     service_id: &str,
@@ -672,25 +848,11 @@ pub(crate) fn ensure_service_not_in_use(
         .filter(|(_, binding)| binding.service == source)
         .map(|(target, _)| target.clone())
         .collect::<Vec<_>>();
-    let unknown_imported = status(options)
-        .targets
-        .into_iter()
-        .filter(|item| item.state == "imported")
-        .filter(|item| !bindings.clients.contains_key(&item.target))
-        .map(|item| item.target)
-        .collect::<Vec<_>>();
-    if !unknown_imported.is_empty() {
-        return Err(format!(
-            "检测到来源未知的客户端注册（{}），请先取消注册后再删除 AI 服务",
-            unknown_imported.join("、")
-        )
-        .into());
-    }
     if clients.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "请先取消客户端注册（{}），再删除此 AI 服务",
+        "请先断开正在使用该服务的 AI 工具（{}），再删除此服务",
         clients.join("、")
     )
     .into())
@@ -706,6 +868,10 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                 if status.state == "imported" {
                     if let Some(binding) = bindings.clients.get(status.target.as_str()) {
                         status.service = binding.service.clone();
+                        // 客户端自己不记时间时，用簿记时间兜底，UI 才能显示「最近同步」。
+                        if status.synced_at.is_empty() {
+                            status.synced_at = binding.updated_at.clone();
+                        }
                     }
                 }
                 status
@@ -714,32 +880,17 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
     }
 }
 
-/// 删除自定义服务前必须先撤销客户端接入，避免 API Key 继续留在外部客户端配置中。
-/// 当前客户端配置格式不携带可靠的服务源 ID，因此采用保守阻断策略；
-/// UI 会提供逐个移除入口，完成后再允许删除服务。
-pub(crate) fn ensure_no_imported_clients(options: &Options) -> Result<(), Box<dyn Error>> {
-    let imported = status(options)
-        .targets
-        .into_iter()
-        .filter(|item| item.state == "imported")
-        .map(|item| item.target)
-        .collect::<Vec<_>>();
-    if imported.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "请先移除已接入客户端（{}），再删除 AI 服务；这样可以避免客户端继续保留旧凭据",
-        imported.join("、")
-    )
-    .into())
-}
-
 pub(crate) fn cancel(
     options: &Options,
     target: &str,
 ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
-    let result = adapter.cancel(options)?;
+    let bindings = load_import_bindings(options);
+    let restore = bindings
+        .clients
+        .get(target.trim())
+        .and_then(|binding| binding.restore.clone());
+    let result = adapter.cancel(options, restore.as_ref())?;
     let mut bindings = load_import_bindings(options);
     bindings.clients.remove(target.trim());
     save_import_bindings(options, &bindings)?;
@@ -759,7 +910,9 @@ fn resolve_credential(
     let service = service.trim();
     if service.is_empty() || service == "managed" {
         if !options.mode().dashboard_enabled() {
-            return Err("HiMind 分发服务需要组织模式；独立模式请从本机自定义 AI 服务导入".into());
+            return Err(
+                "HiMind 分发服务需要先对接 AI 工作台；未对接时请从本机自定义模型服务导入".into(),
+            );
         }
         return fetch_client_credential(options, expected_user_id, client_id);
     }
@@ -789,6 +942,7 @@ fn import_vscode(
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let vscode_cli = ensure_vscode_extension()?;
     let credential = resolve_credential(options, expected_user_id, "vscode-import", service)?;
+    ensure_openai_compatible(&credential, "VS Code 扩展")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let code = create_vscode_enrollment(
@@ -916,6 +1070,7 @@ fn import_cc_switch(
         });
     }
     let credential = resolve_credential(options, expected_user_id, "cc-switch-import", service)?;
+    ensure_openai_compatible(&credential, "CC Switch")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let existing = read_cc_switch_managed_settings(&path)?;
@@ -965,6 +1120,7 @@ fn import_codex(
     let client_detected = config_path.join("config.toml").is_file()
         || config_path.join(CODEX_HIMIND_MODELS_FILE).is_file();
     let credential = resolve_credential(options, expected_user_id, "codex-import", service)?;
+    ensure_openai_compatible(&credential, "Codex")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let catalog = build_codex_models_json(&models)?;
@@ -1163,7 +1319,19 @@ fn read_codex_managed_models(
     read_codex_model_catalog(models_path)
 }
 
-fn cancel_codex(_options: &Options) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+/// Codex 的导入会接管 `model`、`model_provider`、登录方式、推理档位、模型目录与
+/// `[model_providers.himind]`。其中前几项多半是用户自己的选择，取消导入必须还原，
+/// 而不是删掉 —— 否则用户自选的模型与推理档位会被永久改成 HiMind 的默认值。
+fn codex_owned_snapshot() -> Option<Value> {
+    let config_file = codex_config_path().join("config.toml");
+    let text = fs::read_to_string(&config_file).ok()?;
+    Some(json!({ "config": text }))
+}
+
+fn cancel_codex(
+    _options: &Options,
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let config_path = codex_config_path();
     let config_file = config_path.join("config.toml");
     let models_path = codex_himind_models_path();
@@ -1181,7 +1349,10 @@ fn cancel_codex(_options: &Options) -> Result<AIProviderImportCancelResult, Box<
     } else {
         0
     };
-    let (updated, changed) = strip_codex_himind(&original_config, &models_path)?;
+    let previous = restore
+        .and_then(|value| value.get("config"))
+        .and_then(Value::as_str);
+    let (updated, changed) = strip_codex_himind(&original_config, &models_path, previous)?;
     if changed {
         backup_and_write(&config_file, updated.as_bytes())?;
     }
@@ -1211,9 +1382,83 @@ fn cancel_codex(_options: &Options) -> Result<AIProviderImportCancelResult, Box<
     })
 }
 
-// 只移除 HiMind 明确写入的字段，保留用户其他配置；无法判定归属的字段不动。
-fn strip_codex_himind(config: &str, models_path: &Path) -> Result<(String, bool), Box<dyn Error>> {
+/// Codex 导入会覆盖的顶层键。
+const CODEX_OWNED_KEYS: [&str; 6] = [
+    "model",
+    "model_provider",
+    "preferred_auth_method",
+    "forced_login_method",
+    "model_reasoning_effort",
+    "model_catalog_json",
+];
+
+/// 移除 HiMind 写入的内容。
+///
+/// 有导入快照时按快照还原：导入前存在该键就写回原值，导入前不存在才删除；
+/// 没有快照（旧簿记）时退化为保守策略 —— 只移除仍带 HiMind 标记的字段，
+/// 用户其他配置一律不动。
+fn strip_codex_himind(
+    config: &str,
+    models_path: &Path,
+    previous: Option<&str>,
+) -> Result<(String, bool), Box<dyn Error>> {
     let mut document = config.parse::<DocumentMut>()?;
+    let previous_document = previous
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|text| text.parse::<DocumentMut>().ok());
+    let Some(previous_document) = previous_document else {
+        return strip_codex_himind_conservative(document, models_path);
+    };
+    let mut changed = false;
+    for key in CODEX_OWNED_KEYS {
+        changed |= restore_document_key(document.as_table_mut(), key, &previous_document);
+    }
+    if let Some(providers) = document
+        .as_table_mut()
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    {
+        let previous_provider = previous_document
+            .as_table()
+            .get("model_providers")
+            .and_then(|item| item.as_table())
+            .and_then(|table| table.get(CODEX_PROVIDER_ID))
+            .cloned();
+        match previous_provider {
+            Some(entry) => {
+                providers.insert(CODEX_PROVIDER_ID, entry);
+                changed = true;
+            }
+            None => {
+                if providers.remove(CODEX_PROVIDER_ID).is_some() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok((document.to_string(), changed))
+}
+
+/// 把 `key` 还原成快照里的值；快照没有该键时删除。返回是否有改动。
+fn restore_document_key(table: &mut Table, key: &str, previous: &DocumentMut) -> bool {
+    match previous.as_table().get(key) {
+        Some(item) => {
+            if table.get(key).map(|current| current.to_string()) == Some(item.to_string()) {
+                return false;
+            }
+            table.insert(key, item.clone());
+            true
+        }
+        None => table.remove(key).is_some(),
+    }
+}
+
+/// 无快照时的保守清理：只移除 HiMind 明确写入、且仍带 HiMind 标记的字段。
+fn strip_codex_himind_conservative(
+    mut document: DocumentMut,
+    models_path: &Path,
+) -> Result<(String, bool), Box<dyn Error>> {
     let mut changed = false;
     let catalog_target = models_path.to_string_lossy().replace('\\', "/");
     if document
@@ -1249,6 +1494,7 @@ fn import_workbuddy(
     service: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
     let credential = resolve_credential(options, expected_user_id, "workbuddy-import", service)?;
+    ensure_openai_compatible(&credential, "WorkBuddy")?;
     let path = workbuddy_models_path();
     let original = if path.exists() {
         fs::read_to_string(&path)?
@@ -1545,6 +1791,7 @@ fn import_kimi_code(
         || user_home().join(".kimi-code").is_dir()
         || env::var_os("KIMI_CODE_HOME").is_some();
     let credential = resolve_credential(options, expected_user_id, "kimi-code-import", service)?;
+    ensure_openai_compatible(&credential, "Kimi Code")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let original = if path.is_file() {
@@ -1789,6 +2036,7 @@ fn import_qwen_code(
         || user_home().join(".qwen").is_dir()
         || env::var_os("QWEN_CODE_HOME").is_some();
     let credential = resolve_credential(options, expected_user_id, "qwen-code-import", service)?;
+    ensure_openai_compatible(&credential, "Qwen Code")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let original = if path.is_file() {
@@ -2027,8 +2275,7 @@ fn strip_qwen_code_himind(original: &str) -> Result<(String, bool), Box<dyn Erro
 // 采用保留式合并，取消时只剥离 HiMind 写入的 ANTHROPIC_* 键。
 fn anthropic_base_url(value: &str) -> Result<String, Box<dyn Error>> {
     let base = normalized_base_url(value)?;
-    let stripped = base.strip_suffix("/v1").map(str::to_string).unwrap_or(base);
-    Ok(stripped)
+    Ok(crate::store::ai_services::anthropic_api_root(&base))
 }
 
 fn claude_code_settings_path() -> PathBuf {
@@ -2038,11 +2285,238 @@ fn claude_code_settings_path() -> PathBuf {
     user_home().join(".claude").join("settings.json")
 }
 
+// Claude Desktop 的推理接入走「第三方档案」（3P）配置库，而不是 1P 时代的 env 块：
+//
+// * 档案目录：`CLAUDE_USER_DATA_DIR` 优先；Windows 为 `%LOCALAPPDATA%\Claude-3p`
+//   （Electron 的 userData 在 Windows 上取自 LOCALAPPDATA；`%APPDATA%\Claude-3p`
+//   只是旧版迁移源，写在那里不会被读取）；macOS/Linux 是 1P 目录名追加 `-3p`。
+// * 目录里的 `claude_desktop_config.json` 用顶层 `deploymentMode: "3p"` 标记当前档案；
+// * `configLibrary/_meta.json` 记录 `appliedId` 与条目列表，真正生效的配置是
+//   `configLibrary/<appliedId>.json`；条目用扁平键（`inferenceProvider`、
+//   `inferenceGatewayBaseUrl`、`inferenceGatewayApiKey`、`inferenceGatewayAuthScheme`、
+//   `inferenceCredentialKind`）。
+// * 客户端启动判据：生效条目带 `inference`/`bootstrap`/`selfHosted` 且 `deploymentMode`
+//   不为 `1p` 时切到 3P（见 `claude_desktop_third_party_enabled`）。
+//
+// 3P 模式会把 Claude Desktop 的 userData 指向 3P 目录，`mcpServers` 也随之落在这个
+// 目录的 `claude_desktop_config.json`（见 `claude_desktop_app_config_path`），
+// 因此 MCP 注册不能只写 1P 的 `%APPDATA%\Claude`。
+const CLAUDE_DESKTOP_CONFIG_FILE: &str = "claude_desktop_config.json";
+const CLAUDE_DESKTOP_CONFIG_LIBRARY_DIR: &str = "configLibrary";
+const CLAUDE_DESKTOP_LIBRARY_META_FILE: &str = "_meta.json";
+const CLAUDE_DESKTOP_ENTRY_NAME: &str = "HiMind";
+// `note` 是 Claude Desktop 配置库条目的自由字段，用它标记归属，避免误删用户条目。
+const CLAUDE_DESKTOP_ENTRY_NOTE: &str = "himind-agent";
+const CLAUDE_DESKTOP_DEPLOYMENT_MODE_KEY: &str = "deploymentMode";
+const CLAUDE_DESKTOP_FIRST_PARTY_MODE: &str = "1p";
+const CLAUDE_DESKTOP_THIRD_PARTY_MODE: &str = "3p";
+const CLAUDE_DESKTOP_THIRD_PARTY_SUFFIX: &str = "-3p";
+// 3P 条目带的来源标记头（`inferenceCustomHeaders`）。网关据此只对 Claude Desktop
+// 表面返回 Anthropic 形态的路由名，其它客户端继续拿到规范模型名。
+const CLAUDE_DESKTOP_SURFACE_HEADER: &str = "X-Himind-Surface";
+const CLAUDE_DESKTOP_SURFACE_VALUE: &str = "claude-desktop";
+
+/// Electron 的 `appData` 根：Windows 是 `%APPDATA%`，macOS/Linux 是 1P 档案所在的根。
+fn claude_desktop_app_data_root() -> PathBuf {
+    if cfg!(windows) {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home().join("AppData").join("Roaming"))
+    } else if cfg!(target_os = "macos") {
+        user_home().join("Library").join("Application Support")
+    } else {
+        user_home().join(".config")
+    }
+}
+
+/// Electron 的 `appData`/本地根：Windows 上 3P 档案落在 `%LOCALAPPDATA%`，其余平台同根。
+fn claude_desktop_local_root() -> PathBuf {
+    if cfg!(windows) {
+        env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home().join("AppData").join("Local"))
+    } else {
+        claude_desktop_app_data_root()
+    }
+}
+
+fn claude_desktop_first_party_dir() -> PathBuf {
+    claude_desktop_app_data_root().join("Claude")
+}
+
+/// 3P 档案目录。导入本身就是「启用 3P」的动作，所以这里不判断当前是否已启用。
+///
+/// 路径必须与客户端 `Tu()` 一致：Windows 用 `%LOCALAPPDATA%\Claude-3p`（Electron 的
+/// `userData` 在 Windows 上取自 LOCALAPPDATA）；`%APPDATA%\Claude-3p` 只是旧版迁移源，
+/// 写在那里不会被读取。
+fn claude_desktop_third_party_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("CLAUDE_USER_DATA_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() {
+            return dir;
+        }
+    }
+    if cfg!(windows) {
+        return claude_desktop_local_root()
+            .join(format!("Claude{CLAUDE_DESKTOP_THIRD_PARTY_SUFFIX}"));
+    }
+    claude_desktop_first_party_dir()
+        .with_file_name(format!("Claude{CLAUDE_DESKTOP_THIRD_PARTY_SUFFIX}"))
+}
+
+/// Claude Desktop 当前真正使用的档案目录：3P 已启用时是 3P 目录，否则是 1P 默认目录。
+fn claude_desktop_active_dir() -> PathBuf {
+    let third_party = claude_desktop_third_party_dir();
+    if env::var_os("CLAUDE_USER_DATA_DIR").map_or(false, |dir| !dir.is_empty()) {
+        // 环境变量覆盖时，Electron 两种模式都用这个目录。
+        return third_party;
+    }
+    if claude_desktop_third_party_enabled() {
+        return third_party;
+    }
+    claude_desktop_first_party_dir()
+}
+
+/// 客户端启动时把「生效配置里带 `inference`/`bootstrap`/`selfHosted`」且
+/// 「已持久化 deploymentMode 不为 `1p`」判定为 3P（`claude_desktop_third_party_dir`
+/// 下的 `claude_desktop_config.json` 与 `configLibrary/`）。这里复刻同一条判据，
+/// 以免 MCP 注册写到客户端不会读取的目录。
+fn claude_desktop_third_party_enabled() -> bool {
+    let env_override = env::var_os("CLAUDE_USER_DATA_DIR").map_or(false, |dir| !dir.is_empty());
+    claude_desktop_third_party_enabled_in(&claude_desktop_third_party_dir(), env_override)
+}
+
+/// 判据本体。参数化目录与「是否被 `CLAUDE_USER_DATA_DIR` 覆盖」，便于单测直接构造档案，
+/// 不必改动进程级环境变量（`CLAUDE_USER_DATA_DIR` 一旦存在，Electron 两种模式都用它，
+/// 因此它本身就等价于「不是 1P」）。
+fn claude_desktop_third_party_enabled_in(dir: &Path, env_override: bool) -> bool {
+    let persisted = env_override
+        || !claude_desktop_persisted_deployment_mode(dir).is_some_and(|mode| {
+            mode.trim()
+                .eq_ignore_ascii_case(CLAUDE_DESKTOP_FIRST_PARTY_MODE)
+        });
+    if !persisted {
+        return false;
+    }
+    claude_desktop_applied_entry(dir)
+        .ok()
+        .flatten()
+        .is_some_and(|entry| claude_desktop_entry_enables_third_party(&entry))
+}
+
+fn claude_desktop_persisted_deployment_mode(dir: &Path) -> Option<String> {
+    read_json_object(&dir.join(CLAUDE_DESKTOP_CONFIG_FILE))
+        .ok()
+        .flatten()
+        .and_then(|root| {
+            root.get(CLAUDE_DESKTOP_DEPLOYMENT_MODE_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// 3P 目录里当前生效的配置库条目（`_meta.json` 的 `appliedId` 指向的文件）。
+fn claude_desktop_applied_entry(
+    dir: &Path,
+) -> Result<Option<serde_json::Map<String, Value>>, Box<dyn Error>> {
+    let meta_path = dir
+        .join(CLAUDE_DESKTOP_CONFIG_LIBRARY_DIR)
+        .join(CLAUDE_DESKTOP_LIBRARY_META_FILE);
+    let Some(meta) = read_json_object(&meta_path)? else {
+        return Ok(None);
+    };
+    // `hybridPointer` 等价于一条只带 `bootstrapUrl` 的条目，同样会启用 3P。
+    if meta
+        .get("hybridPointer")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        let mut entry = serde_json::Map::new();
+        entry.insert("bootstrapUrl".to_string(), json!("hybrid"));
+        return Ok(Some(entry));
+    }
+    let Some(applied_id) = meta.get("appliedId").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !is_claude_config_library_id(applied_id) {
+        return Ok(None);
+    }
+    read_json_object(
+        &dir.join(CLAUDE_DESKTOP_CONFIG_LIBRARY_DIR)
+            .join(format!("{applied_id}.json")),
+    )
+}
+
+/// 客户端只认 `inference`（网关/厂商自带）、`bootstrapUrl`、`selfHosted` 三类开关。
+fn claude_desktop_entry_enables_third_party(entry: &serde_json::Map<String, Value>) -> bool {
+    ["inferenceProvider", "bootstrapUrl", "selfHosted"]
+        .iter()
+        .any(|key| entry.contains_key(*key))
+}
+
 fn claude_desktop_config_path() -> PathBuf {
-    let app_data = env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| user_home().join("AppData").join("Roaming"));
-    app_data.join("Claude").join("claude_desktop_config.json")
+    claude_desktop_third_party_dir().join(CLAUDE_DESKTOP_CONFIG_FILE)
+}
+
+fn claude_desktop_library_dir() -> PathBuf {
+    claude_desktop_third_party_dir().join(CLAUDE_DESKTOP_CONFIG_LIBRARY_DIR)
+}
+
+fn claude_desktop_library_meta_path() -> PathBuf {
+    claude_desktop_library_dir().join(CLAUDE_DESKTOP_LIBRARY_META_FILE)
+}
+
+/// Claude Desktop 应用配置（含 `mcpServers`）的真实路径，供 MCP 注册复用。
+pub(crate) fn claude_desktop_app_config_path() -> PathBuf {
+    claude_desktop_active_dir().join(CLAUDE_DESKTOP_CONFIG_FILE)
+}
+
+/// MCP 目标的探测目录：1P 与 3P 都要认，避免只装了其中一种档案时漏检。
+pub(crate) fn claude_desktop_detect_dirs() -> Vec<PathBuf> {
+    vec![
+        claude_desktop_first_party_dir(),
+        claude_desktop_third_party_dir(),
+    ]
+}
+
+fn read_json_object(path: &Path) -> Result<Option<serde_json::Map<String, Value>>, Box<dyn Error>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if text.trim().is_empty() {
+        return Ok(Some(serde_json::Map::new()));
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{} 格式无效：{error}", path.display()))?;
+    match value.as_object().cloned() {
+        Some(object) => Ok(Some(object)),
+        None => Err(format!("{} 顶层必须是 JSON 对象", path.display()).into()),
+    }
+}
+
+/// Claude Desktop 配置库要求条目 id 是 uuid（`/^[a-f0-9-]{36}$/`）。
+fn is_claude_config_library_id(value: &str) -> bool {
+    value.len() == 36
+        && value
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
+}
+
+fn new_claude_config_library_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut id = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            id.push('-');
+        }
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
 }
 
 fn claude_env_keys() -> [&'static str; 4] {
@@ -2062,6 +2536,7 @@ fn import_claude_code(
     let path = claude_code_settings_path();
     let client_detected = path.is_file() || user_home().join(".claude").is_dir();
     let credential = resolve_credential(options, expected_user_id, "claude-code-import", service)?;
+    ensure_anthropic_compatible(&credential, "Claude Code")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let original = if path.is_file() {
@@ -2091,40 +2566,207 @@ fn import_claude_desktop(
     expected_user_id: &str,
     service: &str,
 ) -> Result<AIProviderImportResult, Box<dyn Error>> {
-    let path = claude_desktop_config_path();
-    let client_detected = path.is_file()
-        || env::var_os("APPDATA")
-            .map(|dir| PathBuf::from(dir).join("Claude").is_dir())
-            .unwrap_or(false);
     let credential =
         resolve_credential(options, expected_user_id, "claude-desktop-import", service)?;
+    ensure_anthropic_compatible(&credential, "Claude Desktop")?;
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
-    let original = if path.is_file() {
-        fs::read_to_string(&path)?
-    } else {
-        String::new()
-    };
-    let updated = build_claude_settings(
-        &original,
-        &credential,
-        &models,
-        &preferred,
-        "Claude Desktop",
+    let base = anthropic_base_url(&credential.access.base_url)?;
+    let user_data = claude_desktop_third_party_dir();
+    let config_path = claude_desktop_config_path();
+    let meta_path = claude_desktop_library_meta_path();
+    let client_detected =
+        config_path.is_file() || claude_desktop_first_party_dir().is_dir() || user_data.is_dir();
+
+    // 先写条目文件，再让 `_meta.json` 引用它：任何一步失败都不会留下指向空条目的档案。
+    let mut meta = claude_desktop_library_meta(&meta_path)?;
+    let entry_id =
+        claude_desktop_owned_entry_id(&meta).unwrap_or_else(new_claude_config_library_id);
+    let entry_path = claude_desktop_library_dir().join(format!("{entry_id}.json"));
+    let entry_backup = backup_and_write(
+        &entry_path,
+        claude_desktop_gateway_entry(&base, &credential, &models)?.as_bytes(),
     )?;
-    let backup = backup_and_write(&path, updated.as_bytes())?;
+
+    // 保留用户已有条目，只替换/新增 HiMind 那一条，并让它成为当前生效档案。
+    upsert_claude_desktop_entry(&mut meta, &entry_id);
+    let meta_backup = backup_and_write(
+        &meta_path,
+        format!("{}\n", serde_json::to_string_pretty(&Value::Object(meta))?).as_bytes(),
+    )?;
+
+    let config_backup = write_claude_desktop_deployment_mode()?;
     Ok(AIProviderImportResult {
         ok: true,
         target: "claude-desktop".to_string(),
         status: "configured".to_string(),
         model_count: models.len(),
         model: preferred,
-        config_path: path.to_string_lossy().to_string(),
-        backup_path: backup
+        config_path: config_path.to_string_lossy().to_string(),
+        backup_path: config_backup
+            .or(meta_backup)
+            .or(entry_backup)
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
     })
+}
+
+/// 读取（或初始化）Claude Desktop 配置库的 `_meta.json`。
+///
+/// 结构由 Claude Desktop 自己校验：`appliedId` 必须是已存在的条目 id，`entries`
+/// 里的每条都要有字符串 `id`/`name`。这里宁可报错也不写坏——写坏了 Claude Desktop
+/// 会认为整个本地配置不可用，用户此前的档案也会打不开。
+fn claude_desktop_library_meta(
+    meta_path: &Path,
+) -> Result<serde_json::Map<String, Value>, Box<dyn Error>> {
+    let mut meta = read_json_object(meta_path)?.unwrap_or_else(serde_json::Map::new);
+    match meta.get("entries") {
+        None => {
+            meta.insert("entries".to_string(), Value::Array(Vec::new()));
+        }
+        Some(Value::Array(entries)) => {
+            let valid = entries.iter().all(|entry| {
+                entry.as_object().is_some_and(|object| {
+                    object.get("id").and_then(Value::as_str).is_some()
+                        && object.get("name").and_then(Value::as_str).is_some()
+                })
+            });
+            if !valid {
+                return Err(format!(
+                    "{} 的 entries 结构异常，已停止写入；请在 Claude Desktop 中确认该档案正常后重试",
+                    meta_path.display()
+                )
+                .into());
+            }
+        }
+        Some(_) => {
+            return Err(format!(
+                "{} 的 entries 不是数组，已停止写入；请在 Claude Desktop 中确认该档案正常后重试",
+                meta_path.display()
+            )
+            .into())
+        }
+    }
+    if !meta.get("appliedId").is_some_and(Value::is_string) {
+        meta.insert("appliedId".to_string(), json!(""));
+    }
+    if !meta.get("isManaged").is_some_and(Value::is_boolean) {
+        meta.insert("isManaged".to_string(), json!(false));
+    }
+    let platform = meta
+        .get("platform")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if !platform.is_some_and(|value| matches!(value.as_str(), "win32" | "darwin" | "linux")) {
+        meta.insert("platform".to_string(), json!(claude_desktop_platform()));
+    }
+    Ok(meta)
+}
+
+fn claude_desktop_platform() -> &'static str {
+    if cfg!(windows) {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    }
+}
+
+fn claude_desktop_owned_entry_id(meta: &serde_json::Map<String, Value>) -> Option<String> {
+    meta.get("entries")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|entry| {
+            let object = entry.as_object()?;
+            if object.get("note").and_then(Value::as_str) != Some(CLAUDE_DESKTOP_ENTRY_NOTE) {
+                return None;
+            }
+            let id = object.get("id").and_then(Value::as_str)?.trim();
+            is_claude_config_library_id(id).then(|| id.to_string())
+        })
+}
+
+fn upsert_claude_desktop_entry(meta: &mut serde_json::Map<String, Value>, entry_id: &str) {
+    let mut entries = meta
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let ours = json!({
+        "id": entry_id,
+        "name": CLAUDE_DESKTOP_ENTRY_NAME,
+        "provider": "gateway",
+        "note": CLAUDE_DESKTOP_ENTRY_NOTE,
+    });
+    match entries
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(entry_id))
+    {
+        Some(slot) => *slot = ours,
+        None => entries.push(ours),
+    }
+    meta.insert("entries".to_string(), Value::Array(entries));
+    meta.insert("appliedId".to_string(), json!(entry_id));
+}
+
+/// 3P 条目的内容。模型列表交给 Claude Desktop 的自动发现（`GET /v1/models`）：
+/// 条目里的 `inferenceModels` 只接受 Anthropic 命名的条目，网关侧的
+/// `deepseek-*` / `glm-*` 之类会被丢弃，写进去等于声明了一堆用不了的模型。
+///
+/// `inferenceCustomHeaders` 带一个来源标记，网关据此只对 Claude Desktop 表面返回
+/// Anthropic 形态的路由名（`claude-<档位>-himind-<序号>`，展示名仍是真实模型名）：
+/// 客户端的选择器只保留「看起来像 Anthropic」的模型名，其它厂商名会被直接丢弃，
+/// 表现为「能发现但选择器为空」。标记让其它客户端继续拿到规范模型名。
+fn claude_desktop_gateway_entry(
+    base_url: &str,
+    credential: &AIClientCredential,
+    _models: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let entry = json!({
+        "inferenceProvider": "gateway",
+        "inferenceGatewayBaseUrl": base_url,
+        "inferenceGatewayApiKey": credential.api_key,
+        "inferenceGatewayAuthScheme": "bearer",
+        "inferenceCredentialKind": "static",
+        "inferenceCustomHeaders": { CLAUDE_DESKTOP_SURFACE_HEADER: CLAUDE_DESKTOP_SURFACE_VALUE },
+    });
+    Ok(format!("{}\n", serde_json::to_string_pretty(&entry)?))
+}
+
+/// 把 `deploymentMode` 标记为 3p，并顺手把 1P 档案里的 `mcpServers` 带过去。
+///
+/// 切换 3P 会让 Claude Desktop 换用 3P 档案目录，用户原有的 MCP 注册如果留在
+/// `%APPDATA%\Claude` 就会静默失效，所以这里做一次「只补不覆盖」的搬运。
+fn write_claude_desktop_deployment_mode() -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let config_path = claude_desktop_config_path();
+    let mut root = read_json_object(&config_path)?.unwrap_or_else(serde_json::Map::new);
+    root.insert(
+        CLAUDE_DESKTOP_DEPLOYMENT_MODE_KEY.to_string(),
+        json!(CLAUDE_DESKTOP_THIRD_PARTY_MODE),
+    );
+    let first_party_dir = claude_desktop_first_party_dir();
+    if first_party_dir != claude_desktop_third_party_dir() {
+        let first_party = read_json_object(&first_party_dir.join(CLAUDE_DESKTOP_CONFIG_FILE))?
+            .and_then(|object| object.get("mcpServers").cloned());
+        if let Some(mcp_servers) = first_party {
+            let third_party = root
+                .entry("mcpServers".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(target) = third_party.as_object_mut() {
+                if let Some(source) = mcp_servers.as_object() {
+                    for (name, value) in source {
+                        target.entry(name.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+        }
+    }
+    backup_and_write(
+        &config_path,
+        format!("{}\n", serde_json::to_string_pretty(&Value::Object(root))?).as_bytes(),
+    )
 }
 
 fn build_claude_settings(
@@ -2193,11 +2835,98 @@ fn claude_code_import_status() -> AIProviderImportStatus {
 }
 
 fn claude_desktop_import_status() -> AIProviderImportStatus {
-    claude_import_status(
-        &claude_desktop_config_path(),
-        "claude-desktop",
-        "Claude Desktop",
+    claude_desktop_status_in(
+        &claude_desktop_third_party_dir(),
+        &claude_desktop_first_party_dir(),
+        claude_desktop_third_party_enabled(),
     )
+}
+
+/// Claude Desktop 的导入状态以 3P 配置库为准：条目里有网关地址与凭据即视为已导入，
+/// 不再读 1P 时代的 `env.ANTHROPIC_*`（3P 档案下那些键根本不会被读取）。
+fn claude_desktop_status_in(
+    third_dir: &Path,
+    first_dir: &Path,
+    active: bool,
+) -> AIProviderImportStatus {
+    let config_path = third_dir.join(CLAUDE_DESKTOP_CONFIG_FILE);
+    let client_detected = first_dir.is_dir() || third_dir.is_dir() || config_path.is_file();
+    let library_dir = claude_desktop_library_dir_in(third_dir);
+    let entry = read_json_object(&library_dir.join(CLAUDE_DESKTOP_LIBRARY_META_FILE))
+        .ok()
+        .flatten()
+        .and_then(|meta| claude_desktop_owned_entry_id(&meta))
+        .and_then(|id| {
+            read_json_object(&library_dir.join(format!("{id}.json")))
+                .ok()
+                .flatten()
+        });
+    let imported = entry.as_ref().is_some_and(|entry| {
+        claude_desktop_entry_text(entry, "inferenceGatewayBaseUrl").is_some()
+            && claude_desktop_entry_text(entry, "inferenceGatewayApiKey").is_some()
+    });
+    let models = entry
+        .as_ref()
+        .map(claude_desktop_entry_models)
+        .unwrap_or_default();
+    AIProviderImportStatus {
+        target: "claude-desktop".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported && !active {
+            "已写入 HiMind 网关档案，但 Claude Desktop 尚未切换到第三方档案；\
+             请完全退出（含托盘）后重新启动 Claude Desktop"
+                .to_string()
+        } else if imported {
+            "已写入 HiMind 网关档案；模型由网关自动发现，改动需完全退出（含托盘）\
+             后重新启动 Claude Desktop 才生效"
+                .to_string()
+        } else if client_detected {
+            "已检测到 Claude Desktop，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 Claude Desktop 配置，请先安装并启动一次".to_string()
+        },
+        config_path: config_path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+        service: String::new(),
+    }
+}
+
+fn claude_desktop_library_dir_in(third_dir: &Path) -> PathBuf {
+    third_dir.join(CLAUDE_DESKTOP_CONFIG_LIBRARY_DIR)
+}
+
+fn claude_desktop_entry_text(entry: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 条目里的 `inferenceModels` 只接受 Anthropic 命名的条目，因此 HiMind 条目通常不带它，
+/// 模型交给网关的 `GET /v1/models` 自动发现；这里只做只读回显。
+fn claude_desktop_entry_models(entry: &serde_json::Map<String, Value>) -> Vec<String> {
+    entry
+        .get("inferenceModels")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(name) => Some(name.trim().to_string()),
+                    Value::Object(object) => object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|name| name.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn claude_himind_env_present(path: &Path) -> bool {
@@ -2233,22 +2962,177 @@ fn read_claude_himind_models(path: &Path, _target: &str) -> Result<Vec<String>, 
     Ok(models)
 }
 
-fn cancel_claude_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-    cancel_claude_settings(&claude_code_settings_path(), "claude-code", "Claude Code")
+/// Claude Code 的导入会接管 env 下的 4 个 ANTHROPIC_* 键。用户原本就配过这些键时，
+/// 取消导入必须还原原值，而不是直接删除。
+fn claude_owned_snapshot(path: &Path) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    Some(json!({ "settings": text }))
 }
 
-fn cancel_claude_desktop() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+/// Claude Desktop 的导入只改配置库里的 HiMind 条目与 `_meta.json`，快照留给取消时
+/// 原样还原；`deploymentMode` 与用户的其它条目、`mcpServers` 都不在快照范围内，
+/// 因为它们本就不该被导入动作改写。
+fn claude_desktop_owned_snapshot() -> Option<Value> {
+    let meta_path = claude_desktop_library_meta_path();
+    let meta_text = fs::read_to_string(&meta_path).ok()?;
+    let entry_id = read_json_object(&meta_path)
+        .ok()
+        .flatten()
+        .and_then(|meta| claude_desktop_owned_entry_id(&meta));
+    let entry_text = entry_id.as_ref().and_then(|id| {
+        fs::read_to_string(claude_desktop_library_dir().join(format!("{id}.json"))).ok()
+    });
+    Some(json!({
+        "meta": meta_text,
+        "entry_id": entry_id,
+        "entry": entry_text,
+    }))
+}
+
+fn cancel_claude_code(
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     cancel_claude_settings(
-        &claude_desktop_config_path(),
-        "claude-desktop",
-        "Claude Desktop",
+        &claude_code_settings_path(),
+        "claude-code",
+        "Claude Code",
+        restore,
     )
+}
+
+/// 取消 Claude Desktop 导入：只做减法，移除 HiMind 自己的配置库条目并修正 `appliedId`，
+/// 其余条目、`deploymentMode` 与 `mcpServers` 保持用户原样。
+fn cancel_claude_desktop(
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    cancel_claude_desktop_in(
+        &claude_desktop_third_party_dir(),
+        &claude_desktop_first_party_dir(),
+        restore,
+    )
+}
+
+fn cancel_claude_desktop_in(
+    third_dir: &Path,
+    first_dir: &Path,
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let meta_path = third_dir
+        .join(CLAUDE_DESKTOP_CONFIG_LIBRARY_DIR)
+        .join(CLAUDE_DESKTOP_LIBRARY_META_FILE);
+    let library_dir = claude_desktop_library_dir_in(third_dir);
+    let config_path = third_dir.join(CLAUDE_DESKTOP_CONFIG_FILE);
+    let client_detected = config_path.is_file() || third_dir.is_dir() || first_dir.is_dir();
+    let not_imported = |client_detected: bool| AIProviderImportCancelResult {
+        ok: true,
+        target: "claude-desktop".to_string(),
+        status: "not_imported".to_string(),
+        changed: false,
+        client_detected,
+        detail: "Claude Desktop 当前没有 HiMind 导入记录".to_string(),
+        backup_path: String::new(),
+    };
+
+    let Some(mut meta) = read_json_object(&meta_path)? else {
+        return Ok(not_imported(client_detected));
+    };
+    let owned_id = claude_desktop_owned_entry_id(&meta);
+    let snapshot_meta = restore
+        .and_then(|value| value.get("meta"))
+        .and_then(Value::as_str);
+    let mut backup: Option<PathBuf> = None;
+    let mut changed = false;
+
+    if let Some(original) = snapshot_meta {
+        // 有快照：还原 `_meta.json`，并还原（或删除）快照记录的那条条目文件。
+        let restored_id = restore
+            .and_then(|value| value.get("entry_id"))
+            .and_then(Value::as_str)
+            .filter(|id| is_claude_config_library_id(id));
+        if let Some(id) = restored_id {
+            let entry_path = library_dir.join(format!("{id}.json"));
+            match restore
+                .and_then(|value| value.get("entry"))
+                .and_then(Value::as_str)
+            {
+                Some(text) => {
+                    backup = backup_and_write(&entry_path, text.as_bytes())?;
+                    changed = true;
+                }
+                None if entry_path.is_file() => {
+                    fs::remove_file(&entry_path)?;
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        if fs::read_to_string(&meta_path).ok().as_deref() != Some(original) {
+            backup = backup_and_write(&meta_path, original.as_bytes())?;
+            changed = true;
+        }
+    } else if let Some(id) = owned_id {
+        let entries = meta
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let remaining: Vec<Value> = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("note").and_then(Value::as_str) != Some(CLAUDE_DESKTOP_ENTRY_NOTE)
+            })
+            .cloned()
+            .collect();
+        let applied_points_to_us =
+            meta.get("appliedId").and_then(Value::as_str) == Some(id.as_str());
+        if remaining.len() != entries.len() || applied_points_to_us {
+            if applied_points_to_us {
+                let next = remaining
+                    .first()
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                meta.insert("appliedId".to_string(), json!(next));
+            }
+            meta.insert("entries".to_string(), Value::Array(remaining));
+            backup = backup_and_write(
+                &meta_path,
+                format!("{}\n", serde_json::to_string_pretty(&Value::Object(meta))?).as_bytes(),
+            )?;
+            changed = true;
+        }
+        let entry_path = library_dir.join(format!("{id}.json"));
+        if entry_path.is_file() {
+            fs::remove_file(&entry_path)?;
+            changed = true;
+        }
+    } else {
+        return Ok(not_imported(client_detected));
+    }
+
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "claude-desktop".to_string(),
+        status: if changed { "cancelled" } else { "not_imported" }.to_string(),
+        changed,
+        client_detected,
+        detail: if changed {
+            "已从 Claude Desktop 移除 HiMind 网关档案；完全退出（含托盘）后重新启动生效".to_string()
+        } else {
+            "Claude Desktop 当前没有 HiMind 导入记录".to_string()
+        },
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
 }
 
 fn cancel_claude_settings(
     path: &Path,
     target: &str,
     client_name: &str,
+    restore: Option<&Value>,
 ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let client_detected = path.is_file();
     let original = if path.is_file() {
@@ -2256,7 +3140,10 @@ fn cancel_claude_settings(
     } else {
         String::new()
     };
-    let (updated, removed) = strip_claude_himind(&original, client_name)?;
+    let previous = restore
+        .and_then(|value| value.get("settings"))
+        .and_then(Value::as_str);
+    let (updated, removed) = strip_claude_himind(&original, client_name, previous)?;
     let backup = if removed {
         backup_and_write(path, updated.as_bytes())?
     } else {
@@ -2279,10 +3166,12 @@ fn cancel_claude_settings(
     })
 }
 
-// 只移除 HiMind 写入的 ANTHROPIC_* 键，用户其他配置原样保留。
+// 移除 HiMind 写入的 ANTHROPIC_* 键：有快照时还原用户原值，没有快照（旧簿记）
+// 时按原行为删除；用户其他配置原样保留。
 fn strip_claude_himind(
     original: &str,
     client_name: &str,
+    previous: Option<&str>,
 ) -> Result<(String, bool), Box<dyn Error>> {
     if original.trim().is_empty() {
         return Ok((String::new(), false));
@@ -2290,14 +3179,33 @@ fn strip_claude_himind(
     let mut root = serde_json::from_str::<Value>(original).map_err(|_| {
         format!("{client_name} settings.json 格式无效，已停止取消导入且未覆盖原文件")
     })?;
+    let previous_root = previous
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
     let object = root
         .as_object_mut()
         .ok_or(format!("{client_name} settings.json 顶层必须是 JSON 对象"))?;
     let mut changed = false;
     if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+        let previous_env = previous_root
+            .as_ref()
+            .and_then(|root| root.get("env"))
+            .and_then(Value::as_object);
         for key in claude_env_keys() {
-            if env.remove(key).is_some() {
-                changed = true;
+            match previous_env.and_then(|env| env.get(key)) {
+                Some(original_value) => {
+                    if env.get(key) == Some(original_value) {
+                        continue;
+                    }
+                    env.insert(key.to_string(), original_value.clone());
+                    changed = true;
+                }
+                None => {
+                    if env.remove(key).is_some() {
+                        changed = true;
+                    }
+                }
             }
         }
         if env.is_empty() {
@@ -2308,6 +3216,1759 @@ fn strip_claude_himind(
         format!("{}\n", serde_json::to_string_pretty(&root)?),
         changed,
     ))
+}
+
+// ---- OpenCode ----
+// OpenCode 全局配置为 ~/.config/opencode/opencode.json（OPENCODE_CONFIG 可指定自定义
+// 配置文件）。自定义供应商写在 provider.<id>：npm 指定 AI SDK 适配包、options 携带
+// apiKey/baseURL、models 声明模型目录。配置分层合并（全局 + 项目），因此这里只接管
+// provider.himind，mcp、permission、theme 等用户配置原样保留。OpenCode 官方支持
+// JSON 与 JSONC，读取时容忍注释与尾随逗号，写回为等价的标准 JSON（写入前必有备份）。
+fn opencode_config_path() -> PathBuf {
+    if let Some(path) = env::var_os("OPENCODE_CONFIG") {
+        return PathBuf::from(path);
+    }
+    opencode_config_dir().join("opencode.json")
+}
+
+fn opencode_config_dir() -> PathBuf {
+    user_home().join(".config").join("opencode")
+}
+
+fn opencode_client_detected(path: &Path) -> bool {
+    path.is_file() || opencode_config_dir().is_dir() || env::var_os("OPENCODE_CONFIG").is_some()
+}
+
+fn opencode_npm_for_protocol(protocol: &str) -> Result<&'static str, Box<dyn Error>> {
+    match protocol.trim() {
+        "openai-chat" => Ok(OPENCODE_NPM_OPENAI_COMPATIBLE),
+        "anthropic" => Ok(OPENCODE_NPM_ANTHROPIC),
+        // 与 resolve_credential 的默认协议保持一致：空值与未知值按 Responses 处理。
+        _ => Ok(OPENCODE_NPM_OPENAI_RESPONSES),
+    }
+}
+
+/// AI SDK 的 Anthropic Provider 默认 `baseURL` 是 `https://api.anthropic.com/v1`，
+/// 请求路径为 `{baseURL}/messages`；而 Claude Code / DSH 用的是 Anthropic SDK 约定
+/// （`baseURL` 后自动追加 `/v1/messages`）。同一份服务地址写入 OpenCode 前必须补上
+/// `/v1`，否则请求会落到 `/messages`。
+fn opencode_anthropic_base_url(value: &str) -> Result<String, Box<dyn Error>> {
+    let base = normalized_base_url(value)?;
+    let base = base
+        .strip_suffix("/messages")
+        .map(str::to_string)
+        .unwrap_or(base);
+    let root = crate::store::ai_services::anthropic_api_root(&base);
+    Ok(format!("{root}/v1"))
+}
+
+fn import_opencode(
+    options: &Options,
+    expected_user_id: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let path = opencode_config_path();
+    let client_detected = opencode_client_detected(&path);
+    let credential = resolve_credential(options, expected_user_id, "opencode-import", service)?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let updated = build_opencode_config(&original, &credential, &models)?;
+    let backup = backup_and_write(&path, updated.as_bytes())?;
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: "opencode".to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: path.to_string_lossy().to_string(),
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        client_detected,
+    })
+}
+
+fn build_opencode_config(
+    original: &str,
+    credential: &AIClientCredential,
+    models: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let protocol = credential.access.protocol.trim();
+    let npm = opencode_npm_for_protocol(protocol)?;
+    let endpoint = if protocol == "anthropic" {
+        opencode_anthropic_base_url(&credential.access.base_url)?
+    } else {
+        normalized_base_url(&credential.access.base_url)?
+    };
+    let mut root = if original.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str::<Value>(&crate::app::mcp_targets::strip_jsonc_comments(original))
+            .map_err(|error| format!("OpenCode opencode.json 格式无效：{error}"))?
+            .as_object()
+            .cloned()
+            .ok_or("OpenCode opencode.json 顶层必须是 JSON 对象")?
+    };
+    let mut providers = match root.remove("provider") {
+        Some(value) => value
+            .as_object()
+            .cloned()
+            .ok_or("OpenCode opencode.json 的 provider 必须是对象")?,
+        None => serde_json::Map::new(),
+    };
+    let catalog = models
+        .iter()
+        .map(|model| (model.clone(), json!({ "name": model })))
+        .collect::<serde_json::Map<String, Value>>();
+    providers.insert(
+        OPENCODE_PROVIDER_ID.to_string(),
+        json!({
+            "name": MANAGED_VENDOR,
+            "npm": npm,
+            "options": {
+                "baseURL": endpoint,
+                "apiKey": credential.api_key,
+            },
+            "models": Value::Object(catalog),
+        }),
+    );
+    root.insert("provider".to_string(), Value::Object(providers));
+    Ok(format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(root))?
+    ))
+}
+
+fn read_opencode_config(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(&crate::app::mcp_targets::strip_jsonc_comments(&content)).ok()
+}
+
+fn opencode_himind_provider_present(path: &Path) -> bool {
+    read_opencode_config(path).is_some_and(|root| {
+        root.get("provider")
+            .and_then(|value| value.get(OPENCODE_PROVIDER_ID))
+            .is_some()
+    })
+}
+
+fn read_opencode_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let root = read_opencode_config(path).ok_or("OpenCode opencode.json 无法解析")?;
+    Ok(root
+        .get("provider")
+        .and_then(|value| value.get(OPENCODE_PROVIDER_ID))
+        .and_then(|value| value.get("models"))
+        .and_then(Value::as_object)
+        .map(|models| models.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
+fn opencode_import_status() -> AIProviderImportStatus {
+    let path = opencode_config_path();
+    let client_detected = opencode_client_detected(&path);
+    let models = read_opencode_himind_models(&path).unwrap_or_default();
+    let imported = !models.is_empty() || opencode_himind_provider_present(&path);
+    AIProviderImportStatus {
+        target: "opencode".to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported && models.is_empty() {
+            "检测到 OpenCode 已配置 HiMind 供应商，但缺少模型条目，请重新导入".to_string()
+        } else if imported {
+            format!(
+                "已写入 {} 个 HiMind 模型；重启 OpenCode 后可在 /models 选择",
+                models.len()
+            )
+        } else if client_detected {
+            "已检测到 OpenCode，尚未导入 HiMind AI".to_string()
+        } else {
+            "未检测到 OpenCode 配置目录，请先运行一次 opencode".to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+        service: String::new(),
+    }
+}
+
+fn cancel_opencode() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let path = opencode_config_path();
+    let client_detected = opencode_client_detected(&path);
+    let original = if path.is_file() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let (updated, removed) = strip_opencode_himind(&original)?;
+    let backup = if removed {
+        backup_and_write(&path, updated.as_bytes())?
+    } else {
+        None
+    };
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: "opencode".to_string(),
+        status: if removed { "cancelled" } else { "not_imported" }.to_string(),
+        changed: removed,
+        client_detected,
+        detail: if removed {
+            "已从 OpenCode 移除 HiMind 供应商配置".to_string()
+        } else {
+            "OpenCode 当前没有 HiMind 导入记录".to_string()
+        },
+        backup_path: backup
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+// 只移除 HiMind 明确写入的 provider.himind，其他供应商与用户配置原样保留。
+fn strip_opencode_himind(original: &str) -> Result<(String, bool), Box<dyn Error>> {
+    if original.trim().is_empty() {
+        return Ok((String::new(), false));
+    }
+    let mut root =
+        serde_json::from_str::<Value>(&crate::app::mcp_targets::strip_jsonc_comments(original))
+            .map_err(|_| "OpenCode opencode.json 格式无效，已停止取消导入且未覆盖原文件")?;
+    let object = root
+        .as_object_mut()
+        .ok_or("OpenCode opencode.json 顶层必须是 JSON 对象")?;
+    let mut changed = false;
+    if let Some(providers) = object.get_mut("provider").and_then(Value::as_object_mut) {
+        if providers.remove(OPENCODE_PROVIDER_ID).is_some() {
+            changed = true;
+        }
+        if providers.is_empty() {
+            object.remove("provider");
+        }
+    }
+    Ok((
+        format!("{}\n", serde_json::to_string_pretty(&root)?),
+        changed,
+    ))
+}
+
+// ---- 声明式适配表：JSON/YAML 文本配置文件 ----
+//
+// 与 MCP 侧的 mcp_targets::json_target_definitions() 同构：只要客户端把
+// 「端点 + 令牌 + 模型列表」放在自己的文本配置里，接入就只是数据行，
+// 检测、保留式合并、备份、状态与卸载复用同一套实现。
+//
+// 边界（不在本表内，继续保留手写适配器）：
+// - 配置不是 JSON/YAML 文本（Codex 的 TOML、CC Switch 的 SQLite）；
+// - 密钥不进配置文件，只能走系统钥匙串或环境变量：Goose 的 config.yaml
+//   明确忽略 provider key（官方文档：a key placed there is ignored），声明式
+//   provider 也只有 api_key_env / auth.command 两种取钥方式；Zed 的
+//   language_models 里没有密钥字段；
+// - 客户端把 provider / model / 密钥存在自己的状态快照里，且优先级高于配置文件
+//   （Cline 的 VS Code 扩展读 globalState.json 与 secrets.json，配置文件只在
+//   CLI 与首次启动时被读）。
+const CONTINUE_GLOBAL_DIR_ENV: &str = "CONTINUE_GLOBAL_DIR";
+const CONTINUE_CONFIG_OVERRIDE_ENV: &str = "HIMIND_CONTINUE_CONFIG";
+const CONTINUE_HIMIND_PREFIX: &str = "himind/";
+const AIDER_CONFIG_OVERRIDE_ENV: &str = "HIMIND_AIDER_CONFIG";
+const AIDER_HIMIND_PREFIX: &str = "himind/";
+const AIDER_OPENAI_BASE_KEY: &str = "openai-api-base";
+const AIDER_OPENAI_KEY_KEY: &str = "openai-api-key";
+const AIDER_MODEL_KEY: &str = "model";
+const AIDER_ALIAS_KEY: &str = "alias";
+const CRUSH_CONFIG_OVERRIDE_ENV: &str = "HIMIND_CRUSH_CONFIG";
+const QODER_CONFIG_OVERRIDE_ENV: &str = "HIMIND_QODER_CONFIG";
+const QODER_CN_CONFIG_OVERRIDE_ENV: &str = "HIMIND_QODERCN_CONFIG";
+const ZCODE_CONFIG_OVERRIDE_ENV: &str = "HIMIND_ZCODE_CONFIG";
+const ZCODE_PROVIDER_CONFIG_OVERRIDE_ENV: &str = "HIMIND_ZCODE_PROVIDER_CONFIG";
+/// 声明式客户端统一以 `himind` 作为 provider id / 目录名，卸载按它判定归属。
+const DECLARATIVE_PROVIDER_ID: &str = "himind";
+/// Qoder 选择自定义模型用 `<provider>/<model>` 形式，与 Continue / Aider 共用前缀。
+const DECLARATIVE_MODEL_PREFIX: &str = "himind/";
+/// Crush 的模型条目要填上下文窗口，HiMind 凭据只下发模型 id，没有元数据可查；
+/// 缺省值取 200000，与 magpie 对未标注模型的兜底一致。窗口偏大只会推迟客户端
+/// 的自动压缩，偏小会提前截断上下文，因此宁可取客户端常见上限。
+const DECLARATIVE_MODEL_CONTEXT_WINDOW: u64 = 200_000;
+/// Crush 的 `default_max_tokens` 是每次回复的默认上限，magpie 固定写 16384。
+const CRUSH_DEFAULT_MAX_TOKENS: u64 = 16_384;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderConfigFormat {
+    Json,
+    Yaml,
+}
+
+/// 一个目标要写的配置文件。
+///
+/// 列表顺序即写入顺序，**第 0 项是主配置**：状态、模型列表与卸载判定只认它，
+/// 其余文件随主配置同步写入与清理（例如 ZCode 的 provider 规则文件）。
+#[derive(Clone)]
+struct ProviderConfigFile {
+    path: PathBuf,
+    layout: ProviderConfigLayout,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderConfigLayout {
+    /// Continue：models[] 数组，条目为 {name, provider, model, apiBase, apiKey, roles}。
+    ContinueModels,
+    /// Aider：顶层 openai-api-base / openai-api-key / model 标量，加 alias[] 列表。
+    AiderConf,
+    /// Crush：providers.<id> 的 provider 对象，加 models.large / models.small 槽位。
+    CrushConfig,
+    /// Qoder：providers.<id> 的 provider 对象，加 model.name 的 `<id>/<model>` 选择。
+    QoderSettings,
+    /// ZCode 主配置：provider.<id> 的 provider 对象（kind 为 anthropic）。
+    ZCodeConfig,
+    /// ZCode 规则文件：providerConfigRules / modelConfigRules 里的按 id 归组规则。
+    ZCodeProviderRules,
+}
+
+/// 客户端配置面能吃下的线格式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderProtocolSupport {
+    /// 只有 chat / responses 两种线格式，导入 Anthropic 服务前必须拦下。
+    OpenAiOnly,
+    /// 只有 Anthropic Messages（ZCode 的 provider kind 固定为 anthropic）。
+    AnthropicOnly,
+    /// 两种都吃得下（Continue 按协议切 provider）。
+    Both,
+}
+
+struct AiProviderTargetDefinition {
+    id: &'static str,
+    display_name: &'static str,
+    /// 该目标要写的全部配置文件；第 0 项是主配置，不存在时返回将要创建的路径。
+    config_files: fn() -> Vec<ProviderConfigFile>,
+    /// 客户端自身的安装/初始化探测，用于 client_detected。
+    detected: fn() -> bool,
+    /// 该客户端配置面支持的线格式。
+    protocol_support: ProviderProtocolSupport,
+    not_detected_hint: &'static str,
+    import_summary: &'static str,
+    remove_summary: &'static str,
+}
+
+static CONTINUE_TARGET: AiProviderTargetDefinition = AiProviderTargetDefinition {
+    id: "continue",
+    display_name: "Continue",
+    config_files: continue_config_files,
+    detected: continue_client_detected,
+    protocol_support: ProviderProtocolSupport::Both,
+    not_detected_hint: "未检测到 Continue 配置目录，请先安装 Continue 扩展并运行一次",
+    import_summary: "写入 Continue config 的 models 中 himind/* 模型",
+    remove_summary: "移除 Continue config 中的 himind/* 模型",
+};
+
+static AIDER_TARGET: AiProviderTargetDefinition = AiProviderTargetDefinition {
+    id: "aider",
+    display_name: "Aider",
+    config_files: aider_config_files,
+    detected: aider_client_detected,
+    protocol_support: ProviderProtocolSupport::OpenAiOnly,
+    // Aider 的 Anthropic 端点只能走环境变量，配置文件里没有对应的基址键。
+    not_detected_hint: "未检测到 Aider，请先安装 aider 并运行一次",
+    import_summary: "写入 Aider .aider.conf.yml 的端点、密钥与 himind/* 别名",
+    remove_summary: "移除 Aider .aider.conf.yml 的端点、密钥与 himind/* 别名",
+};
+
+static CRUSH_TARGET: AiProviderTargetDefinition = AiProviderTargetDefinition {
+    id: "crush",
+    display_name: "Crush",
+    config_files: crush_config_files,
+    detected: crush_client_detected,
+    protocol_support: ProviderProtocolSupport::OpenAiOnly,
+    not_detected_hint: "未检测到 Crush 配置目录，请先安装 Crush 并运行一次",
+    import_summary: "写入 Crush crush.json 的 providers.himind 与 large/small 模型槽位",
+    remove_summary: "移除 Crush crush.json 的 providers.himind 与 large/small 槽位",
+};
+
+static QODER_TARGET: AiProviderTargetDefinition = AiProviderTargetDefinition {
+    id: "qoder",
+    display_name: "Qoder",
+    config_files: qoder_config_files,
+    detected: qoder_client_detected,
+    protocol_support: ProviderProtocolSupport::OpenAiOnly,
+    not_detected_hint: "未检测到 Qoder 配置目录，请先安装 Qoder CLI 并运行一次",
+    import_summary: "写入 Qoder settings.json 的 providers.himind 与默认模型",
+    remove_summary: "移除 Qoder settings.json 的 providers.himind 与 himind/* 默认模型",
+};
+
+static QODER_CN_TARGET: AiProviderTargetDefinition = AiProviderTargetDefinition {
+    id: "qoder-cn",
+    display_name: "Qoder CN",
+    config_files: qoder_cn_config_files,
+    detected: qoder_cn_client_detected,
+    protocol_support: ProviderProtocolSupport::OpenAiOnly,
+    not_detected_hint: "未检测到 Qoder CN 配置目录，请先安装 Qoder CN CLI 并运行一次",
+    import_summary: "写入 Qoder CN settings.json 的 providers.himind 与默认模型",
+    remove_summary: "移除 Qoder CN settings.json 的 providers.himind 与 himind/* 默认模型",
+};
+
+static ZCODE_TARGET: AiProviderTargetDefinition = AiProviderTargetDefinition {
+    id: "zcode",
+    display_name: "ZCode",
+    config_files: zcode_config_files,
+    detected: zcode_client_detected,
+    // ZCode 自定义 provider 的 kind 只有 anthropic 一种，端点按 /v1/messages 请求。
+    protocol_support: ProviderProtocolSupport::AnthropicOnly,
+    not_detected_hint: "未检测到 ZCode 配置目录，请先安装 ZCode 并运行一次",
+    import_summary: "写入 ZCode config.json 与 provider_config.json 的 himind provider",
+    remove_summary: "移除 ZCode config.json 与 provider_config.json 中的 himind provider",
+};
+
+static PROVIDER_TARGETS: &[&AiProviderTargetDefinition] = &[
+    &CONTINUE_TARGET,
+    &AIDER_TARGET,
+    &CRUSH_TARGET,
+    &QODER_TARGET,
+    &QODER_CN_TARGET,
+    &ZCODE_TARGET,
+];
+
+static CONTINUE_ADAPTER: ProviderConfigAdapter = ProviderConfigAdapter(&CONTINUE_TARGET);
+static AIDER_ADAPTER: ProviderConfigAdapter = ProviderConfigAdapter(&AIDER_TARGET);
+static CRUSH_ADAPTER: ProviderConfigAdapter = ProviderConfigAdapter(&CRUSH_TARGET);
+static QODER_ADAPTER: ProviderConfigAdapter = ProviderConfigAdapter(&QODER_TARGET);
+static QODER_CN_ADAPTER: ProviderConfigAdapter = ProviderConfigAdapter(&QODER_CN_TARGET);
+static ZCODE_ADAPTER: ProviderConfigAdapter = ProviderConfigAdapter(&ZCODE_TARGET);
+
+/// 声明式适配表的适配器：定义即行为，不承载客户端专有逻辑。
+struct ProviderConfigAdapter(&'static AiProviderTargetDefinition);
+
+fn declarative_provider_adapters() -> Vec<&'static dyn AIClientAdapter> {
+    vec![
+        &CONTINUE_ADAPTER,
+        &AIDER_ADAPTER,
+        &CRUSH_ADAPTER,
+        &QODER_ADAPTER,
+        &QODER_CN_ADAPTER,
+        &ZCODE_ADAPTER,
+    ]
+}
+
+fn provider_target_definition(id: &str) -> Option<&'static AiProviderTargetDefinition> {
+    PROVIDER_TARGETS
+        .iter()
+        .copied()
+        .find(|definition| definition.id == id.trim())
+}
+
+// Continue 1.0 以 ~/.continue/config.yaml 为主配置；config.json 仍在读取范围内，
+// 只有 config.yaml 不存在时才会回落到它，因此两份都在时写 config.yaml 会顶掉旧配置。
+fn continue_config_dir() -> PathBuf {
+    if let Some(dir) = env::var_os(CONTINUE_GLOBAL_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    user_home().join(".continue")
+}
+
+fn continue_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(CONTINUE_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    let dir = continue_config_dir();
+    let yaml = dir.join("config.yaml");
+    if yaml.is_file() {
+        return yaml;
+    }
+    let json = dir.join("config.json");
+    if json.is_file() {
+        return json;
+    }
+    yaml
+}
+
+fn continue_client_detected() -> bool {
+    continue_config_path().is_file()
+        || continue_config_dir().is_dir()
+        || env::var_os(CONTINUE_CONFIG_OVERRIDE_ENV).is_some()
+}
+
+fn continue_config_files() -> Vec<ProviderConfigFile> {
+    vec![ProviderConfigFile {
+        path: continue_config_path(),
+        layout: ProviderConfigLayout::ContinueModels,
+    }]
+}
+
+fn aider_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(AIDER_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    user_home().join(".aider.conf.yml")
+}
+
+fn aider_config_files() -> Vec<ProviderConfigFile> {
+    vec![ProviderConfigFile {
+        path: aider_config_path(),
+        layout: ProviderConfigLayout::AiderConf,
+    }]
+}
+
+// Aider 不会自动生成配置文件，只装了 CLI、还没导入过的机器上只能靠 PATH 判断。
+fn aider_client_detected() -> bool {
+    aider_config_path().is_file() || aider_executable_on_path()
+}
+
+fn aider_executable_on_path() -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        ["aider", "aider.exe", "aider.cmd", "aider.bat"]
+            .iter()
+            .any(|name| dir.join(name).is_file())
+    })
+}
+
+// ---- Crush ----
+// Charm 的 Crush 在 Windows 用 %LOCALAPPDATA%\crush\crush.json，其它平台是
+// $XDG_CONFIG_HOME/crush/crush.json（缺省 ~/.config）。provider 是 OpenCode
+// 系的形状，多出 models.large / models.small 两个用途槽位。
+fn crush_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(CRUSH_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    if cfg!(windows) {
+        if let Some(app_data) = env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(app_data).join("crush").join("crush.json");
+        }
+    }
+    user_home().join(".config").join("crush").join("crush.json")
+}
+
+fn crush_config_files() -> Vec<ProviderConfigFile> {
+    vec![ProviderConfigFile {
+        path: crush_config_path(),
+        layout: ProviderConfigLayout::CrushConfig,
+    }]
+}
+
+fn crush_client_detected() -> bool {
+    let path = crush_config_path();
+    path.is_file() || path.parent().is_some_and(|dir| dir.is_dir())
+}
+
+// ---- Qoder / Qoder CN ----
+// Qoder CLI 的 settings.json 在 $QODER_CONFIG_DIR（缺省 ~/.qoder）；Qoder CN 是
+// 同一份 CLI 的中国站点版本，目录 $QODERCN_CONFIG_DIR（缺省 ~/.qoder-cn）。
+fn qoder_settings_dir(env_name: &str, home_dir: &str) -> PathBuf {
+    if let Some(dir) = env::var_os(env_name) {
+        return PathBuf::from(dir);
+    }
+    user_home().join(home_dir)
+}
+
+fn qoder_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(QODER_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    qoder_settings_dir("QODER_CONFIG_DIR", ".qoder").join("settings.json")
+}
+
+fn qoder_cn_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(QODER_CN_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    qoder_settings_dir("QODERCN_CONFIG_DIR", ".qoder-cn").join("settings.json")
+}
+
+fn qoder_config_files() -> Vec<ProviderConfigFile> {
+    vec![ProviderConfigFile {
+        path: qoder_config_path(),
+        layout: ProviderConfigLayout::QoderSettings,
+    }]
+}
+
+fn qoder_cn_config_files() -> Vec<ProviderConfigFile> {
+    vec![ProviderConfigFile {
+        path: qoder_cn_config_path(),
+        layout: ProviderConfigLayout::QoderSettings,
+    }]
+}
+
+fn qoder_client_detected() -> bool {
+    qoder_config_path().is_file() || qoder_settings_dir("QODER_CONFIG_DIR", ".qoder").is_dir()
+}
+
+fn qoder_cn_client_detected() -> bool {
+    qoder_cn_config_path().is_file()
+        || qoder_settings_dir("QODERCN_CONFIG_DIR", ".qoder-cn").is_dir()
+}
+
+// ---- ZCode ----
+// ZCode 3.14 起 provider 的事实源是 ~/.zcode/v2/provider_config.json，config.json
+// 只在启动时被读一次做导入，因此两份都写：旧版 ZCode 读 config.json，新版读规则。
+fn zcode_dir() -> PathBuf {
+    user_home().join(".zcode").join("v2")
+}
+
+fn zcode_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(ZCODE_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    zcode_dir().join("config.json")
+}
+
+fn zcode_provider_config_path() -> PathBuf {
+    if let Some(path) = env::var_os(ZCODE_PROVIDER_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(path);
+    }
+    // 两份配置同目录，主配置被重定位时规则文件跟着走，避免写进真实用户目录。
+    if let Some(main) = env::var_os(ZCODE_CONFIG_OVERRIDE_ENV) {
+        return PathBuf::from(main).with_file_name("provider_config.json");
+    }
+    zcode_dir().join("provider_config.json")
+}
+
+fn zcode_config_files() -> Vec<ProviderConfigFile> {
+    vec![
+        ProviderConfigFile {
+            path: zcode_config_path(),
+            layout: ProviderConfigLayout::ZCodeConfig,
+        },
+        ProviderConfigFile {
+            path: zcode_provider_config_path(),
+            layout: ProviderConfigLayout::ZCodeProviderRules,
+        },
+    ]
+}
+
+fn zcode_client_detected() -> bool {
+    zcode_config_path().is_file() || zcode_dir().is_dir()
+}
+
+fn provider_config_file_primary(definition: &AiProviderTargetDefinition) -> ProviderConfigFile {
+    let mut files = (definition.config_files)();
+    files.remove(0)
+}
+
+/// 目标要写的文件路径列表；will_write / will_backup 与写入编排共用一份来源。
+fn provider_config_file_paths(definition: &AiProviderTargetDefinition) -> Vec<PathBuf> {
+    (definition.config_files)()
+        .into_iter()
+        .map(|file| file.path)
+        .collect()
+}
+
+fn provider_config_format(path: &Path) -> ProviderConfigFormat {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("json") => ProviderConfigFormat::Json,
+        // Continue 与 Aider 主配置都是 YAML，按扩展名兜底即可。
+        _ => ProviderConfigFormat::Yaml,
+    }
+}
+
+fn parse_provider_config(
+    original: &str,
+    format: ProviderConfigFormat,
+    label: &str,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    if original.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = match format {
+        ProviderConfigFormat::Json => {
+            serde_json::from_str::<Value>(&crate::app::mcp_targets::strip_jsonc_comments(original))
+                .map_err(|error| format!("{label} 格式无效：{error}"))?
+        }
+        ProviderConfigFormat::Yaml => serde_yaml::from_str::<Value>(original)
+            .map_err(|error| format!("{label} 格式无效：{error}"))?,
+    };
+    Ok(Some(value))
+}
+
+fn provider_config_object(
+    original: &str,
+    format: ProviderConfigFormat,
+    label: &str,
+) -> Result<serde_json::Map<String, Value>, Box<dyn Error>> {
+    match parse_provider_config(original, format, label)? {
+        None => Ok(serde_json::Map::new()),
+        Some(Value::Object(map)) => Ok(map),
+        Some(_) => Err(format!("{label} 顶层必须是键值映射").into()),
+    }
+}
+
+/// 取（必要时建）`key` 下的子对象；客户端配置里这些段必须是对象，
+/// 是标量或数组时说明文件已被改成别的形状，报错比覆盖更安全。
+fn json_object_at<'a>(
+    owner: &'a mut serde_json::Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>, Box<dyn Error>> {
+    owner
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| format!("{label} 的 {key} 必须是对象").into())
+}
+
+fn render_provider_config(
+    root: &Value,
+    format: ProviderConfigFormat,
+    label: &str,
+) -> Result<String, Box<dyn Error>> {
+    match format {
+        ProviderConfigFormat::Json => Ok(format!("{}\n", serde_json::to_string_pretty(root)?)),
+        ProviderConfigFormat::Yaml => serde_yaml::to_string(root)
+            .map_err(|error| Box::<dyn Error>::from(format!("{label} 序列化失败：{error}"))),
+    }
+}
+
+fn continue_himind_entry_model(entry: &Value) -> Option<String> {
+    let name = entry.get("name")?.as_str()?;
+    name.strip_prefix(CONTINUE_HIMIND_PREFIX)?;
+    Some(
+        entry
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string(),
+    )
+}
+
+fn continue_himind_models(root: &Value) -> Vec<String> {
+    root.get("models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(continue_himind_entry_model)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Continue 条目结构对齐 config-yaml 的 modelSchema：name/provider/model/apiBase/apiKey。
+/// apiBase 直接写服务地址，openai provider 会自行追加 /chat/completions 或 /responses；
+/// Anthropic 协议改用 anthropic provider，基址需要不带 /v1（Anthropic SDK 自己追加）。
+fn build_continue_config(
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let label = "Continue config";
+    let anthropic = credential.access.protocol.trim() == "anthropic";
+    let endpoint = if anthropic {
+        anthropic_base_url(&credential.access.base_url)?
+    } else {
+        normalized_base_url(&credential.access.base_url)?
+    };
+    let mut root = provider_config_object(original, format, label)?;
+    if original.trim().is_empty() {
+        // name/version 是 config.yaml 的必填字段，缺省会让 Continue 判定配置无效。
+        root.insert("name".to_string(), json!("Main Config"));
+        root.insert("version".to_string(), json!("0.0.1"));
+        root.insert("schema".to_string(), json!("v1"));
+    }
+    let mut entries = match root.remove("models") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(format!("{label} 的 models 必须是列表").into()),
+    };
+    entries.retain(|entry| continue_himind_entry_model(entry).is_none());
+    let default_index = models
+        .iter()
+        .position(|model| model == preferred)
+        .unwrap_or(0);
+    let use_responses_api = !anthropic && credential.access.protocol.trim() != "openai-chat";
+    for (index, model) in models.iter().enumerate() {
+        let mut entry = json!({
+            "name": format!("{CONTINUE_HIMIND_PREFIX}{model}"),
+            "provider": if anthropic { "anthropic" } else { "openai" },
+            "model": model,
+            "apiBase": endpoint,
+            "apiKey": credential.api_key,
+            "capabilities": ["tool_use"],
+            "roles": if index == default_index {
+                json!(["chat", "edit", "apply"])
+            } else {
+                json!(["chat"])
+            },
+        });
+        if use_responses_api {
+            entry["useResponsesApi"] = json!(true);
+        }
+        entries.push(entry);
+    }
+    root.insert("models".to_string(), Value::Array(entries));
+    render_provider_config(&Value::Object(root), format, label)
+}
+
+/// Aider 只认顶层标量：端点、密钥、默认模型与 himind/<model> 别名。
+/// 别名用 `name:model` 形式（aider --alias 的格式），卸载时按 himind/ 前缀判定归属。
+fn build_aider_config(
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let label = "Aider .aider.conf.yml";
+    let endpoint = normalized_base_url(&credential.access.base_url)?;
+    let mut root = provider_config_object(original, format, label)?;
+    let mut aliases = match root.remove(AIDER_ALIAS_KEY) {
+        None => Vec::new(),
+        // aider 允许单个标量，也允许列表。
+        Some(Value::String(single)) => vec![Value::String(single)],
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(format!("{label} 的 alias 必须是列表").into()),
+    };
+    aliases.retain(|alias| {
+        !alias
+            .as_str()
+            .is_some_and(|value| value.starts_with(AIDER_HIMIND_PREFIX))
+    });
+    for model in models {
+        aliases.push(json!(format!(
+            "{AIDER_HIMIND_PREFIX}{model}:openai/{model}"
+        )));
+    }
+    root.insert(AIDER_OPENAI_BASE_KEY.to_string(), json!(endpoint));
+    root.insert(AIDER_OPENAI_KEY_KEY.to_string(), json!(credential.api_key));
+    root.insert(
+        AIDER_MODEL_KEY.to_string(),
+        json!(format!("{AIDER_HIMIND_PREFIX}{preferred}")),
+    );
+    root.insert(AIDER_ALIAS_KEY.to_string(), Value::Array(aliases));
+    render_provider_config(&Value::Object(root), format, label)
+}
+
+// ---- Crush ----
+// providers.<id> 是 OpenCode 系的 provider 形状（type/name/base_url/api_key/models），
+// 外加 models.large / models.small 两个用途槽位。导入即让 Crush 用上 HiMind：
+// 两个槽位都指向 himind/<首选模型>，与 Aider 写默认模型的取舍一致。
+// 推理档位（models.large.reasoning_effort）留在用户侧，导入不覆盖也不清理。
+fn build_crush_config(
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let label = "Crush crush.json";
+    let endpoint = normalized_base_url(&credential.access.base_url)?;
+    let mut root = provider_config_object(original, format, label)?;
+    let entries = models
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model,
+                "name": model,
+                "context_window": DECLARATIVE_MODEL_CONTEXT_WINDOW,
+                "default_max_tokens": CRUSH_DEFAULT_MAX_TOKENS,
+            })
+        })
+        .collect::<Vec<_>>();
+    json_object_at(&mut root, "providers", label)?.insert(
+        DECLARATIVE_PROVIDER_ID.to_string(),
+        json!({
+            "type": "openai",
+            "name": DECLARATIVE_PROVIDER_ID,
+            "base_url": endpoint,
+            "api_key": credential.api_key,
+            "models": entries,
+        }),
+    );
+    let slots = json_object_at(&mut root, "models", label)?;
+    for slot in ["large", "small"] {
+        slots.insert(
+            slot.to_string(),
+            json!({ "provider": DECLARATIVE_PROVIDER_ID, "model": preferred }),
+        );
+    }
+    render_provider_config(&Value::Object(root), format, label)
+}
+
+// ---- Qoder / Qoder CN ----
+// providers.<id> 写端点、密钥与模型清单，model.name 用 `<id>/<model>` 选中它。
+// Qoder 的模型推理档位是每个模型自己的 model.preferences，导入不触碰用户既有档位，
+// 只把默认模型切到 himind。
+fn build_qoder_config(
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    let label = "Qoder settings.json";
+    let endpoint = normalized_base_url(&credential.access.base_url)?;
+    let mut root = provider_config_object(original, format, label)?;
+    let entries = models
+        .iter()
+        .map(|model| {
+            json!({
+                "model": model,
+                "displayName": model,
+                "capabilities": { "tools": true },
+            })
+        })
+        .collect::<Vec<_>>();
+    json_object_at(&mut root, "providers", label)?.insert(
+        DECLARATIVE_PROVIDER_ID.to_string(),
+        json!({
+            "displayName": DECLARATIVE_PROVIDER_ID,
+            "protocol": "openai",
+            "baseUrl": endpoint,
+            "apiKey": credential.api_key,
+            "model": preferred,
+            "models": entries,
+        }),
+    );
+    json_object_at(&mut root, "model", label)?.insert(
+        "name".to_string(),
+        json!(format!("{DECLARATIVE_MODEL_PREFIX}{preferred}")),
+    );
+    render_provider_config(&Value::Object(root), format, label)
+}
+
+// ---- ZCode ----
+// config.json 的 provider.<id> 是 OpenCode 形状加自定义 kind：kind 固定 anthropic，
+// 端点按 baseURL + /v1/messages 请求，故 baseURL 不带 /v1。
+// 模型条目的 limit.output 留空：HiMind 凭据没有各模型的输出上限，写死一个上限
+// （ZCode 自身缺省是 32000）一旦超过上游限制会让请求直接报错，宁可交给客户端缺省。
+// 用户在 ZCode 里关掉的 provider 保持关闭，不因重新导入被打开。
+fn build_zcode_config(
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let label = "ZCode config.json";
+    let endpoint = anthropic_base_url(&credential.access.base_url)?;
+    let mut root = provider_config_object(original, format, label)?;
+    let enabled = zcode_provider_enabled(&root, DECLARATIVE_PROVIDER_ID).unwrap_or(true);
+    let mut entries = serde_json::Map::new();
+    for model in models {
+        entries.insert(
+            model.clone(),
+            json!({
+                "name": model,
+                "limit": { "context": DECLARATIVE_MODEL_CONTEXT_WINDOW },
+                "modalities": { "input": ["text"], "output": ["text"] },
+            }),
+        );
+    }
+    json_object_at(&mut root, "provider", label)?.insert(
+        DECLARATIVE_PROVIDER_ID.to_string(),
+        json!({
+            "name": DECLARATIVE_PROVIDER_ID,
+            "kind": "anthropic",
+            "enabled": enabled,
+            "source": "custom",
+            "options": { "apiKey": credential.api_key, "baseURL": endpoint },
+            "models": Value::Object(entries),
+        }),
+    );
+    render_provider_config(&Value::Object(root), format, label)
+}
+
+// ZCode 3.14 起 provider 的事实源是这份规则文件：providerRule 声明 provider 与
+// 访问方式，providerModelRules 声明每个模型的窗口与输入形态。旧版 ZCode 读的
+// config.json 由 build_zcode_config 一并写。这里按 providerId 归组，其他规则与
+// 用户的 manualProviderModelRules 原样保留；用户手工设过的模型（manual 规则）
+// 不覆盖，也不因重新导入被重置。
+fn build_zcode_provider_rules(
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let label = "ZCode provider_config.json";
+    let endpoint = anthropic_base_url(&credential.access.base_url)?;
+    let mut root = provider_config_object(original, format, label)?;
+    root.entry("schemaVersion".to_string()).or_insert(json!(1));
+    let config = json_object_at(&mut root, "config", label)?;
+    let provider_rules = json_object_at(config, "providerConfigRules", label)?;
+    let mut rule = json!({
+        "providerId": DECLARATIVE_PROVIDER_ID,
+        "providerName": DECLARATIVE_PROVIDER_ID,
+        "enabled": true,
+        "config": {
+            "group": "standard-personal",
+            "access": { "type": "api-key", "apiKey": credential.api_key },
+            "api": { "type": "anthropic-messages", "baseUrl": endpoint },
+            "personalModelIds": models,
+            "modelOrder": models,
+        },
+    });
+    if let Some(enabled) = provider_rules
+        .get("providerRules")
+        .and_then(Value::as_array)
+        .and_then(|rules| zcode_rule_enabled(rules, DECLARATIVE_PROVIDER_ID))
+    {
+        rule["enabled"] = json!(enabled);
+    }
+    zcode_rules_replace(
+        provider_rules,
+        "providerRules",
+        DECLARATIVE_PROVIDER_ID,
+        vec![rule],
+    );
+    let model_rules = json_object_at(config, "modelConfigRules", label)?;
+    let entries = models
+        .iter()
+        .map(|model| {
+            json!({
+                "providerId": DECLARATIVE_PROVIDER_ID,
+                "modelId": model,
+                "config": {
+                    "properties": {
+                        "contextWindow": DECLARATIVE_MODEL_CONTEXT_WINDOW,
+                        "inputFormat": { "supportsImage": false },
+                    },
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    zcode_rules_replace(
+        model_rules,
+        "providerModelRules",
+        DECLARATIVE_PROVIDER_ID,
+        entries,
+    );
+    // 用户手工设过的模型规则不覆盖，但 HiMind 自己的残留要清掉。
+    zcode_rules_replace(
+        model_rules,
+        "manualProviderModelRules",
+        DECLARATIVE_PROVIDER_ID,
+        Vec::new(),
+    );
+    render_provider_config(&Value::Object(root), format, label)
+}
+
+/// 读 config.json 里 HiMind provider 的启用开关；没有记录时返回 None（按启用处理）。
+fn zcode_provider_enabled(
+    root: &serde_json::Map<String, Value>,
+    provider_id: &str,
+) -> Option<bool> {
+    root.get("provider")?
+        .get(provider_id)?
+        .get("enabled")?
+        .as_bool()
+}
+
+/// 读 providerRules 里 HiMind 那条规则的 enabled；没有记录时返回 None。
+fn zcode_rule_enabled(rules: &[Value], provider_id: &str) -> Option<bool> {
+    rules
+        .iter()
+        .find(|rule| rule.get("providerId").and_then(Value::as_str) == Some(provider_id))?
+        .get("enabled")?
+        .as_bool()
+}
+
+/// 把规则数组里的 HiMind 条目换成 `entries`，其他条目按原顺序保留。
+fn zcode_rules_replace(
+    owner: &mut serde_json::Map<String, Value>,
+    key: &str,
+    provider_id: &str,
+    entries: Vec<Value>,
+) {
+    let existing = match owner.get_mut(key) {
+        Some(Value::Array(items)) => std::mem::take(items),
+        _ => Vec::new(),
+    };
+    let mut merged = existing
+        .into_iter()
+        .filter(|rule| rule.get("providerId").and_then(Value::as_str) != Some(provider_id))
+        .collect::<Vec<_>>();
+    merged.extend(entries);
+    owner.insert(key.to_string(), Value::Array(merged));
+}
+
+/// 按文件自己的布局渲染写入内容；文件列表由目标定义给出，主配置与附属文件各写各的形状。
+fn build_provider_config_file(
+    file: &ProviderConfigFile,
+    original: &str,
+    format: ProviderConfigFormat,
+    credential: &AIClientCredential,
+    models: &[String],
+    preferred: &str,
+) -> Result<String, Box<dyn Error>> {
+    match file.layout {
+        ProviderConfigLayout::ContinueModels => {
+            build_continue_config(original, format, credential, models, preferred)
+        }
+        ProviderConfigLayout::AiderConf => {
+            build_aider_config(original, format, credential, models, preferred)
+        }
+        ProviderConfigLayout::CrushConfig => {
+            build_crush_config(original, format, credential, models, preferred)
+        }
+        ProviderConfigLayout::QoderSettings => {
+            build_qoder_config(original, format, credential, models, preferred)
+        }
+        ProviderConfigLayout::ZCodeConfig => {
+            build_zcode_config(original, format, credential, models)
+        }
+        ProviderConfigLayout::ZCodeProviderRules => {
+            build_zcode_provider_rules(original, format, credential, models)
+        }
+    }
+}
+
+/// aider 的 alias 既可能是单标量，也可能是列表；这里只取 HiMind 写进去的部分。
+fn himind_aliases(value: Option<&Value>) -> Vec<String> {
+    let mut aliases = match value {
+        Some(Value::String(single)) => vec![single.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    aliases.retain(|alias| alias.starts_with(AIDER_HIMIND_PREFIX));
+    aliases
+}
+
+fn aider_himind_models(root: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    if let Some(model) = root
+        .get(AIDER_MODEL_KEY)
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix(AIDER_HIMIND_PREFIX))
+    {
+        models.push(model.to_string());
+    }
+    for alias in himind_aliases(root.get(AIDER_ALIAS_KEY)) {
+        let Some((name, _)) = alias.split_once(':') else {
+            continue;
+        };
+        let Some(model) = name.strip_prefix(AIDER_HIMIND_PREFIX) else {
+            continue;
+        };
+        if !models.iter().any(|existing| existing == model) {
+            models.push(model.to_string());
+        }
+    }
+    models
+}
+
+fn read_provider_config_models(
+    definition: &AiProviderTargetDefinition,
+    path: &Path,
+    format: ProviderConfigFormat,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    let Some(root) = parse_provider_config(&content, format, definition.id)? else {
+        return Ok(Vec::new());
+    };
+    Ok(himind_models_in(
+        provider_config_file_primary(definition).layout,
+        &root,
+    ))
+}
+
+/// 按主配置布局读出 HiMind 写进去的模型列表；列表非空即视为已导入。
+fn himind_models_in(layout: ProviderConfigLayout, root: &Value) -> Vec<String> {
+    match layout {
+        ProviderConfigLayout::ContinueModels => continue_himind_models(root),
+        ProviderConfigLayout::AiderConf => aider_himind_models(root),
+        ProviderConfigLayout::CrushConfig => crush_himind_models(root),
+        ProviderConfigLayout::QoderSettings => qoder_himind_models(root),
+        ProviderConfigLayout::ZCodeConfig => zcode_himind_models(root),
+        ProviderConfigLayout::ZCodeProviderRules => zcode_rule_himind_models(root),
+    }
+}
+
+/// Crush：providers.himind.models[].id。
+fn crush_himind_models(root: &Value) -> Vec<String> {
+    root.get("providers")
+        .and_then(|providers| providers.get(DECLARATIVE_PROVIDER_ID))
+        .and_then(|provider| provider.get("models"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Qoder：providers.himind.models[].model；模型清单缺失时回落到默认模型。
+fn qoder_himind_models(root: &Value) -> Vec<String> {
+    let listed = root
+        .get("providers")
+        .and_then(|providers| providers.get(DECLARATIVE_PROVIDER_ID))
+        .and_then(|provider| provider.get("models"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.get("model").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !listed.is_empty() {
+        return listed;
+    }
+    qoder_selected_model(root).into_iter().collect()
+}
+
+/// Qoder 当前选中的 HiMind 模型（model.name 去掉 `<id>/` 前缀）。
+fn qoder_selected_model(root: &Value) -> Option<String> {
+    root.get("model")?
+        .get("name")?
+        .as_str()?
+        .strip_prefix(DECLARATIVE_MODEL_PREFIX)
+        .map(str::to_string)
+}
+
+/// ZCode config.json：provider.himind.models 的键就是模型 id。
+fn zcode_himind_models(root: &Value) -> Vec<String> {
+    root.get("provider")
+        .and_then(|provider| provider.get(DECLARATIVE_PROVIDER_ID))
+        .and_then(|entry| entry.get("models"))
+        .and_then(Value::as_object)
+        .map(|models| models.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// ZCode provider_config.json：模型来自 HiMind 的 providerModelRules。
+fn zcode_rule_himind_models(root: &Value) -> Vec<String> {
+    root.get("config")
+        .and_then(|config| config.get("modelConfigRules"))
+        .and_then(|rules| rules.get("providerModelRules"))
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter(|rule| {
+                    rule.get("providerId").and_then(Value::as_str) == Some(DECLARATIVE_PROVIDER_ID)
+                })
+                .filter_map(|rule| rule.get("modelId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn strip_continue_himind(
+    original: &str,
+    format: ProviderConfigFormat,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let label = "Continue config";
+    let mut root = provider_config_object(original, format, label)?;
+    let Some(Value::Array(entries)) = root.get_mut("models") else {
+        return Ok((original.to_string(), false));
+    };
+    let before = entries.len();
+    entries.retain(|entry| continue_himind_entry_model(entry).is_none());
+    if entries.len() == before {
+        return Ok((original.to_string(), false));
+    }
+    Ok((
+        render_provider_config(&Value::Object(root), format, label)?,
+        true,
+    ))
+}
+
+// 该文件不支持多来源并存：只要还存在 himind/* 标记，端点、密钥与默认模型就是本次写入的。
+// 有导入快照时以快照为准：导入前存在的键写回原值，导入前不存在才删除。
+fn strip_aider_himind(
+    original: &str,
+    format: ProviderConfigFormat,
+    previous: Option<&str>,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let label = "Aider .aider.conf.yml";
+    let mut root = provider_config_object(original, format, label)?;
+    let previous_root = previous
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| provider_config_object(text, format, label))
+        .transpose()
+        .ok()
+        .flatten();
+    let has_marker = root
+        .get(AIDER_MODEL_KEY)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with(AIDER_HIMIND_PREFIX))
+        || !himind_aliases(root.get(AIDER_ALIAS_KEY)).is_empty();
+    if previous_root.is_none() && !has_marker {
+        return Ok((original.to_string(), false));
+    }
+    let mut changed = false;
+    for key in [AIDER_OPENAI_BASE_KEY, AIDER_OPENAI_KEY_KEY] {
+        match previous_root
+            .as_ref()
+            .and_then(|root| root.get(key))
+            .cloned()
+        {
+            Some(original_value) => {
+                if root.get(key) != Some(&original_value) {
+                    root.insert(key.to_string(), original_value);
+                    changed = true;
+                }
+            }
+            None => {
+                if root.remove(key).is_some() {
+                    changed = true;
+                }
+            }
+        }
+    }
+    let had_himind_model = root
+        .get(AIDER_MODEL_KEY)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with(AIDER_HIMIND_PREFIX));
+    match previous_root
+        .as_ref()
+        .and_then(|root| root.get(AIDER_MODEL_KEY))
+        .cloned()
+    {
+        Some(original_value) => {
+            if root.get(AIDER_MODEL_KEY) != Some(&original_value) {
+                root.insert(AIDER_MODEL_KEY.to_string(), original_value);
+                changed = true;
+            }
+        }
+        None => {
+            if had_himind_model {
+                root.remove(AIDER_MODEL_KEY);
+                changed = true;
+            }
+        }
+    }
+    let mut aliases = match root.remove(AIDER_ALIAS_KEY) {
+        Some(Value::String(single)) => vec![Value::String(single)],
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
+    let aliases_before = aliases.len();
+    aliases.retain(|alias| {
+        !alias
+            .as_str()
+            .is_some_and(|value| value.starts_with(AIDER_HIMIND_PREFIX))
+    });
+    changed |= aliases.len() != aliases_before;
+    if !aliases.is_empty() {
+        root.insert(AIDER_ALIAS_KEY.to_string(), Value::Array(aliases));
+    }
+    if !changed {
+        return Ok((original.to_string(), false));
+    }
+    Ok((
+        render_provider_config(&Value::Object(root), format, label)?,
+        true,
+    ))
+}
+
+/// 按文件布局剥离 HiMind 写入的内容；返回 (内容, 是否有改动)。
+/// `previous` 为该文件的导入前快照，仅有需要的布局会用到（目前是 Aider）。
+fn strip_provider_config_file(
+    layout: ProviderConfigLayout,
+    original: &str,
+    format: ProviderConfigFormat,
+    previous: Option<&str>,
+) -> Result<(String, bool), Box<dyn Error>> {
+    if original.trim().is_empty() {
+        return Ok((String::new(), false));
+    }
+    match layout {
+        ProviderConfigLayout::ContinueModels => strip_continue_himind(original, format),
+        ProviderConfigLayout::AiderConf => strip_aider_himind(original, format, previous),
+        ProviderConfigLayout::CrushConfig => strip_crush_himind(original, format),
+        ProviderConfigLayout::QoderSettings => strip_qoder_himind(original, format),
+        ProviderConfigLayout::ZCodeConfig => strip_zcode_himind(original, format),
+        ProviderConfigLayout::ZCodeProviderRules => strip_zcode_rules_himind(original, format),
+    }
+}
+
+/// Crush：移除 providers.himind；large/small 槽位只在仍指向 HiMind 时清掉，
+/// 用户后来自己选的模型保持不动。
+fn strip_crush_himind(
+    original: &str,
+    format: ProviderConfigFormat,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let label = "Crush crush.json";
+    let mut root = provider_config_object(original, format, label)?;
+    let mut changed = root
+        .get_mut("providers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|providers| providers.remove(DECLARATIVE_PROVIDER_ID).is_some());
+    let mut drop_slots = false;
+    if let Some(slots) = root.get_mut("models").and_then(Value::as_object_mut) {
+        for slot in ["large", "small"] {
+            let points_at_himind = slots
+                .get(slot)
+                .is_some_and(|entry| is_crush_himind_slot(entry));
+            if points_at_himind {
+                slots.remove(slot);
+                changed = true;
+            }
+        }
+        drop_slots = slots.is_empty();
+    }
+    if drop_slots {
+        root.remove("models");
+    }
+    if !changed {
+        return Ok((original.to_string(), false));
+    }
+    Ok((
+        render_provider_config(&Value::Object(root), format, label)?,
+        true,
+    ))
+}
+
+fn is_crush_himind_slot(entry: &Value) -> bool {
+    entry.get("provider").and_then(Value::as_str) == Some(DECLARATIVE_PROVIDER_ID)
+}
+
+/// Qoder：移除 providers.himind；model.name 只在仍指向 HiMind 时清掉。
+fn strip_qoder_himind(
+    original: &str,
+    format: ProviderConfigFormat,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let label = "Qoder settings.json";
+    let mut root = provider_config_object(original, format, label)?;
+    let mut changed = root
+        .get_mut("providers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|providers| providers.remove(DECLARATIVE_PROVIDER_ID).is_some());
+    let mut drop_model = false;
+    if let Some(model) = root.get_mut("model").and_then(Value::as_object_mut) {
+        if model
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with(DECLARATIVE_MODEL_PREFIX))
+        {
+            model.remove("name");
+            changed = true;
+        }
+        drop_model = model.is_empty();
+    }
+    if drop_model {
+        root.remove("model");
+    }
+    if !changed {
+        return Ok((original.to_string(), false));
+    }
+    Ok((
+        render_provider_config(&Value::Object(root), format, label)?,
+        true,
+    ))
+}
+
+/// ZCode config.json：移除 provider.himind。
+fn strip_zcode_himind(
+    original: &str,
+    format: ProviderConfigFormat,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let label = "ZCode config.json";
+    let mut root = provider_config_object(original, format, label)?;
+    let changed = root
+        .get_mut("provider")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|providers| providers.remove(DECLARATIVE_PROVIDER_ID).is_some());
+    if changed && root.get("provider").is_some_and(Value::is_object) {
+        // 只剩空对象时一并移除，避免留下一个空壳段。
+        if root
+            .get("provider")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            root.remove("provider");
+        }
+    }
+    if !changed {
+        return Ok((original.to_string(), false));
+    }
+    Ok((
+        render_provider_config(&Value::Object(root), format, label)?,
+        true,
+    ))
+}
+
+/// ZCode provider_config.json：按 providerId 过滤掉 HiMind 的 provider 规则与模型规则，
+/// 其他 provider 的规则与用户手工规则原样保留。
+fn strip_zcode_rules_himind(
+    original: &str,
+    format: ProviderConfigFormat,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let label = "ZCode provider_config.json";
+    let mut root = provider_config_object(original, format, label)?;
+    let mut changed = false;
+    if let Some(config) = root.get_mut("config").and_then(Value::as_object_mut) {
+        for (section, list) in [
+            ("providerConfigRules", "providerRules"),
+            ("modelConfigRules", "providerModelRules"),
+            ("modelConfigRules", "manualProviderModelRules"),
+        ] {
+            let Some(entries) = config
+                .get_mut(section)
+                .and_then(Value::as_object_mut)
+                .and_then(|owner| owner.get_mut(list))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let before = entries.len();
+            entries.retain(|rule| {
+                rule.get("providerId").and_then(Value::as_str) != Some(DECLARATIVE_PROVIDER_ID)
+            });
+            changed |= entries.len() != before;
+        }
+    }
+    if !changed {
+        return Ok((original.to_string(), false));
+    }
+    Ok((
+        render_provider_config(&Value::Object(root), format, label)?,
+        true,
+    ))
+}
+
+fn aider_imported_detail(path: &Path, format: ProviderConfigFormat, models: &[String]) -> String {
+    let default_model = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| {
+            parse_provider_config(&content, format, "Aider .aider.conf.yml")
+                .ok()
+                .flatten()
+        })
+        .and_then(|root| {
+            root.get(AIDER_MODEL_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    match default_model {
+        Some(model) if model.starts_with(AIDER_HIMIND_PREFIX) => {
+            format!(
+                "已写入 {} 个 HiMind 模型；aider 默认使用 {model}",
+                models.len()
+            )
+        }
+        _ => format!(
+            "已写入 {} 个 HiMind 模型；用 aider --model himind/{} 调用",
+            models.len(),
+            models.first().cloned().unwrap_or_default()
+        ),
+    }
+}
+
+fn provider_config_status(definition: &AiProviderTargetDefinition) -> AIProviderImportStatus {
+    let path = provider_config_file_primary(definition).path;
+    let format = provider_config_format(&path);
+    let client_detected = (definition.detected)();
+    let models = read_provider_config_models(definition, &path, format).unwrap_or_default();
+    let imported = !models.is_empty();
+    AIProviderImportStatus {
+        target: definition.id.to_string(),
+        state: if imported { "imported" } else { "not_imported" }.to_string(),
+        client_detected,
+        detail: if imported {
+            match provider_config_file_primary(definition).layout {
+                ProviderConfigLayout::ContinueModels => format!(
+                    "已写入 {} 个 HiMind 模型；在 Continue 模型列表中选择",
+                    models.len()
+                ),
+                ProviderConfigLayout::AiderConf => aider_imported_detail(&path, format, &models),
+                ProviderConfigLayout::CrushConfig => format!(
+                    "已写入 {} 个 HiMind 模型；Crush 的 large/small 已切到 himind",
+                    models.len()
+                ),
+                ProviderConfigLayout::QoderSettings => format!(
+                    "已写入 {} 个 HiMind 模型；Qoder 默认模型为 himind/{}",
+                    models.len(),
+                    models.first().cloned().unwrap_or_default()
+                ),
+                ProviderConfigLayout::ZCodeConfig => format!(
+                    "已写入 {} 个 HiMind 模型；重启 ZCode 后可在模型选择器中看到",
+                    models.len()
+                ),
+                ProviderConfigLayout::ZCodeProviderRules => {
+                    format!("已写入 {} 个 HiMind 模型规则", models.len())
+                }
+            }
+        } else if client_detected {
+            format!("已检测到 {}，尚未导入 HiMind AI", definition.display_name)
+        } else {
+            definition.not_detected_hint.to_string()
+        },
+        config_path: path.to_string_lossy().to_string(),
+        models,
+        synced_at: String::new(),
+        service: String::new(),
+    }
+}
+
+fn import_provider_config(
+    definition: &AiProviderTargetDefinition,
+    options: &Options,
+    expected_user_id: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let files = (definition.config_files)();
+    let primary = provider_config_file_primary(definition);
+    let client_detected = (definition.detected)();
+    let client_id = format!("{}-import", definition.id);
+    let credential = resolve_credential(options, expected_user_id, &client_id, service)?;
+    match definition.protocol_support {
+        ProviderProtocolSupport::OpenAiOnly => {
+            ensure_openai_compatible(&credential, definition.display_name)?
+        }
+        ProviderProtocolSupport::AnthropicOnly => {
+            ensure_anthropic_compatible(&credential, definition.display_name)?
+        }
+        ProviderProtocolSupport::Both => {}
+    }
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    // 主配置与附属文件逐个读写：为每个文件单独写备份，避免一个文件失败后
+    // 其他文件停在半写状态（失败会直接向上抛出，已写的文件保持可回滚）。
+    let mut backup_path = String::new();
+    for file in &files {
+        let format = provider_config_format(&file.path);
+        let original = if file.path.is_file() {
+            fs::read_to_string(&file.path)?
+        } else {
+            String::new()
+        };
+        let updated =
+            build_provider_config_file(file, &original, format, &credential, &models, &preferred)?;
+        let backup = backup_and_write(&file.path, updated.as_bytes())?;
+        if file.path == primary.path {
+            backup_path = backup
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+        }
+    }
+    Ok(AIProviderImportResult {
+        ok: true,
+        target: definition.id.to_string(),
+        status: "configured".to_string(),
+        model_count: models.len(),
+        model: preferred,
+        config_path: primary.path.to_string_lossy().to_string(),
+        backup_path,
+        client_detected,
+    })
+}
+
+fn cancel_provider_config(
+    definition: &AiProviderTargetDefinition,
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+    let files = (definition.config_files)();
+    let primary = provider_config_file_primary(definition);
+    let client_detected = (definition.detected)();
+    let mut removed = false;
+    let mut backup_path = String::new();
+    let previous_files = restore
+        .and_then(|value| value.get("files"))
+        .and_then(Value::as_object);
+    for file in &files {
+        let format = provider_config_format(&file.path);
+        let original = if file.path.is_file() {
+            fs::read_to_string(&file.path)?
+        } else {
+            String::new()
+        };
+        let previous = previous_files
+            .and_then(|files| files.get(&file.path.to_string_lossy().to_string()))
+            .and_then(Value::as_str);
+        let (updated, changed) =
+            strip_provider_config_file(file.layout, &original, format, previous)?;
+        if !changed {
+            continue;
+        }
+        removed = true;
+        let backup = backup_and_write(&file.path, updated.as_bytes())?;
+        if file.path == primary.path {
+            backup_path = backup
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+        }
+    }
+    Ok(AIProviderImportCancelResult {
+        ok: true,
+        target: definition.id.to_string(),
+        status: if removed { "cancelled" } else { "not_imported" }.to_string(),
+        changed: removed,
+        client_detected,
+        detail: if removed {
+            format!("已移除 {} 中的 HiMind 配置", definition.display_name)
+        } else {
+            format!("{} 当前没有 HiMind 导入记录", definition.display_name)
+        },
+        backup_path,
+    })
+}
+
+impl AIClientAdapter for ProviderConfigAdapter {
+    fn id(&self) -> &'static str {
+        self.0.id
+    }
+    fn display_name(&self) -> &'static str {
+        self.0.display_name
+    }
+    fn status(&self, _options: &Options) -> AIProviderImportStatus {
+        provider_config_status(self.0)
+    }
+    fn plan(&self, action: &str, status: &AIProviderImportStatus) -> AIProviderImportPlan {
+        plan_for(self.0.id, action, status)
+    }
+    fn import(
+        &self,
+        options: &Options,
+        user_id: &str,
+        service: &str,
+    ) -> Result<AIProviderImportResult, Box<dyn Error>> {
+        import_provider_config(self.0, options, user_id, service)
+    }
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        provider_config_owned_snapshot(self.0)
+    }
+    fn cancel(
+        &self,
+        _options: &Options,
+        restore: Option<&Value>,
+    ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+        cancel_provider_config(self.0, restore)
+    }
+}
+
+/// 只有 Aider 的 `.aider.conf.yml` 会把用户原有的 `openai-api-base` /
+/// `openai-api-key` / `model` 改写成 HiMind 的值，因此导入前留存原文件用于还原。
+/// 其他布局只新增自己的 provider 条目或 `himind/*` 前缀项，取消时按标记删除即可。
+fn provider_config_owned_snapshot(definition: &AiProviderTargetDefinition) -> Option<Value> {
+    let files = (definition.config_files)();
+    if !files
+        .iter()
+        .any(|file| matches!(file.layout, ProviderConfigLayout::AiderConf))
+    {
+        return None;
+    }
+    let mut snapshot = serde_json::Map::new();
+    for file in files {
+        if let Ok(text) = fs::read_to_string(&file.path) {
+            snapshot.insert(file.path.to_string_lossy().to_string(), Value::String(text));
+        }
+    }
+    if snapshot.is_empty() {
+        None
+    } else {
+        Some(json!({ "files": Value::Object(snapshot) }))
+    }
 }
 
 // cc-switch v3.16+ 以供应商 settings_config.modelCatalog 为模型列表唯一事实源：
@@ -2758,6 +5419,42 @@ fn openai_provider_type(credential: &AIClientCredential) -> &'static str {
     } else {
         "openai_responses"
     }
+}
+
+/// 只支持 OpenAI 兼容协议的客户端必须显式拒绝 Anthropic 服务。
+///
+/// 这些客户端的配置里只有 `chat`/`responses` 两种线格式，把 Anthropic 端点按
+/// Responses 写进去会得到一个能保存、但一发请求就失败的配置。这里提前报错并给出
+/// 可用去处，比让用户在客户端里排查一个 404 更清楚。
+fn ensure_openai_compatible(
+    credential: &AIClientCredential,
+    client_label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if credential.access.protocol.trim() == "anthropic" {
+        return Err(format!(
+            "{client_label} 只支持 OpenAI 兼容的 AI 服务，当前服务使用 Anthropic 协议。\
+             请改用 HiMind AI 或选择 OpenAI Chat / OpenAI Responses 的服务；\
+             Anthropic 服务可以导入到 Claude Code、OpenCode 等支持该协议的客户端。"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// 只吃 Anthropic Messages 的客户端（ZCode 的自定义 provider 固定 kind=anthropic）
+/// 遇到 OpenAI 兼容服务时同样提前拦下：写进去只能保存、一发请求就失败。
+fn ensure_anthropic_compatible(
+    credential: &AIClientCredential,
+    client_label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if credential.access.protocol.trim() != "anthropic" {
+        return Err(format!(
+            "{client_label} 的自定义 AI 服务只支持 Anthropic 协议，当前服务使用 OpenAI 兼容协议。\
+             请改用 Anthropic 协议的服务；OpenAI 兼容服务可以导入到 Continue、Crush、Qoder 等客户端。"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn workbuddy_models_path() -> PathBuf {
@@ -3668,19 +6365,26 @@ fn cc_switch_protocol_registered() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_for, anthropic_base_url, build_cc_switch_provider_settings, build_claude_settings,
-        build_codex_config_toml, build_codex_models_json, build_kimi_code_config,
-        build_qwen_code_settings, build_vscode_enrollment_url, bundled_vscode_vsix_candidates,
-        chat_completions_url, compare_extension_versions, consume_vscode_enrollment,
-        create_vscode_enrollment, ensure_vscode_chat_provider_allowlist,
-        find_vscode_extension_version, known_adapters, legacy_workbuddy_model_id,
-        managed_workbuddy_model_ids, merge_workbuddy_models, migrate_workbuddy_sessions,
+        adapter_for, aider_himind_models, anthropic_base_url, build_aider_config,
+        build_cc_switch_provider_settings, build_claude_settings, build_codex_config_toml,
+        build_codex_models_json, build_continue_config, build_crush_config, build_kimi_code_config,
+        build_opencode_config, build_qoder_config, build_qwen_code_settings,
+        build_vscode_enrollment_url, build_zcode_config, build_zcode_provider_rules,
+        bundled_vscode_vsix_candidates, chat_completions_url, compare_extension_versions,
+        consume_vscode_enrollment, continue_himind_models, create_vscode_enrollment,
+        crush_himind_models, ensure_anthropic_compatible, ensure_openai_compatible,
+        ensure_vscode_chat_provider_allowlist, find_vscode_extension_version, known_adapters,
+        legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
+        migrate_workbuddy_sessions, opencode_anthropic_base_url, opencode_npm_for_protocol,
         parse_vscode_cli_version, parse_vscode_extension_version, parse_vscode_import_status,
-        push_vscode_registry_value, read_cc_switch_managed_models, read_cc_switch_managed_settings,
-        read_codex_model_catalog, remove_workbuddy_models, strip_claude_himind, strip_codex_himind,
-        strip_kimi_code_himind, strip_qwen_code_himind, vscode_extension_install_required,
-        workbuddy_model_id, workbuddy_models_path_in, write_cc_switch_provider, AIClientCredential,
-        AIProviderImportRequest, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION,
+        push_vscode_registry_value, qoder_himind_models, read_cc_switch_managed_models,
+        read_cc_switch_managed_settings, read_codex_model_catalog, remove_workbuddy_models,
+        strip_aider_himind, strip_claude_himind, strip_codex_himind, strip_continue_himind,
+        strip_crush_himind, strip_kimi_code_himind, strip_opencode_himind, strip_qoder_himind,
+        strip_qwen_code_himind, strip_zcode_himind, strip_zcode_rules_himind,
+        vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
+        write_cc_switch_provider, zcode_himind_models, AIClientCredential, AIProviderImportRequest,
+        ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION, PROVIDER_TARGETS,
         VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
@@ -3699,7 +6403,7 @@ mod tests {
             assert!(ids.insert(id), "duplicate adapter id: {id}");
             assert!(!adapter.display_name().trim().is_empty());
         }
-        assert_eq!(adapters.len(), 8);
+        assert_eq!(adapters.len(), 15);
         for target in [
             "vscode",
             "cc-switch",
@@ -3709,6 +6413,13 @@ mod tests {
             "qwen-code",
             "claude-code",
             "claude-desktop",
+            "opencode",
+            "continue",
+            "aider",
+            "crush",
+            "qoder",
+            "qoder-cn",
+            "zcode",
         ] {
             assert!(adapter_for(target).is_some(), "missing adapter: {target}");
         }
@@ -3732,6 +6443,55 @@ mod tests {
         }
     }
 
+    /// 删除守卫只拦「簿记里绑定到该服务」的客户端。
+    ///
+    /// 回归用例：曾经只要机器上存在任意一个来源不明的注册，所有自定义服务都删不掉；
+    /// 来源不明的注册没有归属，不该阻止删除无关服务。
+    #[test]
+    fn service_removal_guard_only_blocks_bound_services() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-ai-binding-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+
+        let options = crate::Options::from_env();
+        assert!(super::ensure_service_not_in_use(&options, "free").is_ok());
+
+        let mut bindings = super::AIProviderImportBindings::default();
+        bindings.clients.insert(
+            "opencode".to_string(),
+            super::AIProviderImportBinding {
+                service: "custom:taken".to_string(),
+                updated_at: String::new(),
+                restore: None,
+            },
+        );
+        super::save_import_bindings(&options, &bindings).unwrap();
+
+        let error = super::ensure_service_not_in_use(&options, "taken")
+            .expect_err("bound service must not be removable");
+        assert!(
+            error.to_string().contains("opencode"),
+            "blocking reason must name the bound client: {error}"
+        );
+        // 注册来源不明的客户端没有指向这个服务，不阻止删除。
+        assert!(super::ensure_service_not_in_use(&options, "free").is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+    }
+
     fn credential(models: &[&str]) -> AIClientCredential {
         AIClientCredential {
             access: AIUserCredential {
@@ -3748,6 +6508,218 @@ mod tests {
             },
             api_key: "test-secret-key".to_string(),
         }
+    }
+
+    /// 3P 档案目录里 `_meta.json` 指向的 HiMind 条目就是导入状态的唯一来源。
+    /// 模型列表默认留空（交给网关 `/v1/models` 自动发现），因此这里断言为空。
+    #[test]
+    fn claude_desktop_status_reads_third_party_profile_entry() {
+        let root = claude_temp_root("status");
+        let third = root.join("Claude-3p");
+        let first = root.join("Claude");
+        std::fs::create_dir_all(third.join("configLibrary")).unwrap();
+        let entry_id = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(
+            third.join("configLibrary/_meta.json"),
+            format!(
+                r#"{{"appliedId":"{entry_id}","entries":[{{"id":"{entry_id}","name":"HiMind","provider":"gateway","note":"himind-agent"}}],"isManaged":false,"platform":"win32"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            third.join("configLibrary").join(format!("{entry_id}.json")),
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer","inferenceCredentialKind":"static"}"#,
+        )
+        .unwrap();
+
+        let active = super::claude_desktop_status_in(&third, &first, true);
+        assert_eq!(active.state, "imported");
+        assert!(active.client_detected);
+        assert!(
+            active.models.is_empty(),
+            "models come from /v1/models discovery"
+        );
+        assert!(active.detail.contains("自动发现"), "{}", active.detail);
+        assert!(active.config_path.ends_with("claude_desktop_config.json"));
+
+        // 已写入但客户端未切到 3P：仍算已导入，只是提示需要完整重启。
+        let inactive = super::claude_desktop_status_in(&third, &first, false);
+        assert_eq!(inactive.state, "imported");
+        assert!(inactive.detail.contains("尚未切换"), "{}", inactive.detail);
+
+        // 没有归属条目时不是「已导入」，但目录存在仍算检测到客户端。
+        std::fs::write(
+            third.join("configLibrary/_meta.json"),
+            r#"{"appliedId":"","entries":[],"platform":"win32"}"#,
+        )
+        .unwrap();
+        let empty = super::claude_desktop_status_in(&third, &first, false);
+        assert_eq!(empty.state, "not_imported");
+        assert!(empty.client_detected);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 3P 条目必须带来源标记头。客户端的选择器只保留「看起来像 Anthropic」的模型名，
+    /// 网关靠这个头才把规范模型名换成 Anthropic 形态的路由名；漏掉就会「能发现但选择器为空」。
+    #[test]
+    fn claude_desktop_gateway_entry_marks_its_surface() {
+        let body = super::claude_desktop_gateway_entry(
+            "http://127.0.0.1:18090/gateway",
+            &credential(&["deepseek-v4-pro"]),
+            &["deepseek-v4-pro".to_string()],
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["inferenceProvider"], "gateway");
+        assert_eq!(parsed["inferenceGatewayAuthScheme"], "bearer");
+        assert_eq!(parsed["inferenceCredentialKind"], "static");
+        assert_eq!(
+            parsed["inferenceCustomHeaders"][super::CLAUDE_DESKTOP_SURFACE_HEADER],
+            super::CLAUDE_DESKTOP_SURFACE_VALUE
+        );
+        assert!(
+            parsed.get("inferenceModels").is_none(),
+            "模型列表交给 /v1/models 自动发现"
+        );
+    }
+
+    /// 复刻客户端判据：生效条目要带 `inference`/`bootstrap`/`selfHosted` 开关，
+    /// 且持久化的 `deploymentMode` 不是 `1p`。
+    #[test]
+    fn claude_desktop_third_party_enabled_requires_gateway_entry_outside_1p_mode() {
+        let root = claude_temp_root("enabled");
+        let third = root.join("Claude-3p");
+        std::fs::create_dir_all(third.join("configLibrary")).unwrap();
+        let entry_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        std::fs::write(
+            third.join("configLibrary/_meta.json"),
+            format!(
+                r#"{{"appliedId":"{entry_id}","entries":[{{"id":"{entry_id}","name":"HiMind","note":"himind-agent"}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            third.join("configLibrary").join(format!("{entry_id}.json")),
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal"}"#,
+        )
+        .unwrap();
+
+        // 没有 config / 没有 deploymentMode 等价于 `!== "1p"`，3P 生效。
+        assert!(super::claude_desktop_third_party_enabled_in(&third, false));
+
+        // 用户把手动档案切回 1P：客户端按 1P 启动，判据为否。
+        std::fs::write(
+            third.join("claude_desktop_config.json"),
+            r#"{"deploymentMode":"1p"}"#,
+        )
+        .unwrap();
+        assert!(!super::claude_desktop_third_party_enabled_in(&third, false));
+
+        // `CLAUDE_USER_DATA_DIR` 覆盖时 Electron 两个模式都用该目录，等价于非 1P。
+        assert!(super::claude_desktop_third_party_enabled_in(&third, true));
+
+        // 条目里没有三类开关时不算 3P，即使档案目录与条目都存在。
+        std::fs::write(third.join("claude_desktop_config.json"), "{}").unwrap();
+        std::fs::write(
+            third.join("configLibrary").join(format!("{entry_id}.json")),
+            r#"{"inferenceGatewayBaseUrl":"https://ai.internal"}"#,
+        )
+        .unwrap();
+        assert!(!super::claude_desktop_third_party_enabled_in(&third, false));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 无快照的取消只做减法：删掉自己的条目、`appliedId` 回退到剩余条目，
+    /// 用户自己的档案、`deploymentMode` 与 `mcpServers` 一律不动。
+    #[test]
+    fn cancelling_claude_desktop_without_snapshot_keeps_user_entries() {
+        let root = claude_temp_root("cancel");
+        let third = root.join("Claude-3p");
+        let first = root.join("Claude");
+        std::fs::create_dir_all(third.join("configLibrary")).unwrap();
+        let ours = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let theirs = "99999999-8888-7777-6666-555555555555";
+        std::fs::write(
+            third.join("configLibrary/_meta.json"),
+            format!(
+                r#"{{"appliedId":"{ours}","entries":[{{"id":"{ours}","name":"HiMind","provider":"gateway","note":"himind-agent"}},{{"id":"{theirs}","name":"用户自有","provider":"bedrock"}}],"platform":"win32"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            third.join("configLibrary").join(format!("{ours}.json")),
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            third.join("configLibrary").join(format!("{theirs}.json")),
+            r#"{"bootstrapUrl":"https://user.example"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            third.join("claude_desktop_config.json"),
+            r#"{"deploymentMode":"3p","mcpServers":{"himind-agent":{"command":"himind-agent"}}}"#,
+        )
+        .unwrap();
+
+        let result = super::cancel_claude_desktop_in(&third, &first, None).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.status, "cancelled");
+
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(third.join("configLibrary/_meta.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = meta.get("entries").and_then(Value::as_array).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].get("id").and_then(Value::as_str), Some(theirs));
+        assert_eq!(
+            meta.get("appliedId").and_then(Value::as_str),
+            Some(theirs),
+            "appliedId 必须回退到剩余条目"
+        );
+        assert!(!third
+            .join("configLibrary")
+            .join(format!("{ours}.json"))
+            .exists());
+        assert!(third
+            .join("configLibrary")
+            .join(format!("{theirs}.json"))
+            .exists());
+
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(third.join("claude_desktop_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.get("deploymentMode").and_then(Value::as_str),
+            Some("3p")
+        );
+        assert!(config
+            .get("mcpServers")
+            .and_then(|value| value.get("himind-agent"))
+            .is_some());
+
+        // 再取消一次：已无归属条目，应报 not_imported 且不报错。
+        let again = super::cancel_claude_desktop_in(&third, &first, None).unwrap();
+        assert!(!again.changed);
+        assert_eq!(again.status, "not_imported");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 测试用临时目录：名字带进程 id 与毫秒，避免并行用例互相踩。
+    fn claude_temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "himind-claude3p-{label}-{}-{}",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[test]
@@ -3884,6 +6856,7 @@ command = "uvx.exe"
         let (updated, changed) = strip_codex_himind(
             original,
             Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            None,
         )
         .unwrap();
         assert!(changed);
@@ -3895,6 +6868,62 @@ command = "uvx.exe"
         assert!(updated.contains("preferred_auth_method = \"apikey\""));
         assert!(updated.contains("notify = [\"codex-notify.exe\"]"));
         assert!(updated.contains("[mcp_servers.unityMCP]"));
+    }
+
+    /// 有导入快照时，取消导入必须把用户原有的模型与推理档位写回，并补回被覆盖的
+    /// model_provider（这里是 cc-switch 的 custom），而不是留下 HiMind 的默认值。
+    #[test]
+    fn codex_strip_restores_user_values_from_snapshot() {
+        let previous = r#"model_provider = "custom"
+model = "deepseek-v4.1-flash"
+model_catalog_json = "cc-switch-model-catalog.json"
+model_reasoning_effort = "medium"
+
+notify = ["codex-notify.exe"]
+
+[mcp_servers.unityMCP]
+command = "uvx.exe"
+"#;
+        let imported = r#"model = "himind-model"
+model_provider = "himind"
+preferred_auth_method = "apikey"
+forced_login_method = "api"
+model_reasoning_effort = "high"
+model_catalog_json = "C:/Users/Admin/.codex/himind-models.json"
+
+notify = ["codex-notify.exe"]
+
+[model_providers.himind]
+name = "HiMind"
+base_url = "https://himind.andcrane.com/gateway/v1"
+wire_api = "responses"
+
+[mcp_servers.unityMCP]
+command = "uvx.exe"
+"#;
+        let (updated, changed) = strip_codex_himind(
+            imported,
+            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            Some(previous),
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(updated.contains("model = \"deepseek-v4.1-flash\""));
+        assert!(updated.contains("model_provider = \"custom\""));
+        assert!(updated.contains("model_reasoning_effort = \"medium\""));
+        assert!(updated.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
+        assert!(!updated.contains("preferred_auth_method"));
+        assert!(!updated.contains("forced_login_method"));
+        assert!(!updated.contains("[model_providers.himind]"));
+        assert!(updated.contains("[mcp_servers.unityMCP]"));
+        // 还原后再次清理应幂等：没有任何改动。
+        let (_, again) = strip_codex_himind(
+            &updated,
+            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            Some(previous),
+        )
+        .unwrap();
+        assert!(!again);
     }
 
     #[test]
@@ -4448,18 +7477,21 @@ command = "uvx.exe"
         let managed = AIProviderImportRequest {
             target: "codex".to_string(),
             service: String::new(),
+            replace: false,
         };
         assert_eq!(managed.service_source(), "managed");
 
         let explicit_managed = AIProviderImportRequest {
             target: "codex".to_string(),
             service: "managed".to_string(),
+            replace: false,
         };
         assert_eq!(explicit_managed.service_source(), "managed");
 
         let custom = AIProviderImportRequest {
             target: "codex".to_string(),
             service: "custom:my-gateway".to_string(),
+            replace: false,
         };
         assert_eq!(custom.service_source(), "custom:my-gateway");
     }
@@ -4557,6 +7589,163 @@ command = "uvx.exe"
     }
 
     #[test]
+    fn builds_opencode_config_with_provider_endpoint_and_models() {
+        let credential = credential(&["deepseek-v4-flash", "deepseek-v4-pro"]);
+        let models = [
+            "deepseek-v4-flash".to_string(),
+            "deepseek-v4-pro".to_string(),
+        ];
+        let updated = build_opencode_config("", &credential, &models).unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        let provider = &root["provider"]["himind"];
+        assert_eq!(provider["name"], "HiMind");
+        assert_eq!(provider["npm"], "@ai-sdk/openai");
+        assert_eq!(provider["options"]["baseURL"], "https://ai.example.com/v1");
+        assert_eq!(provider["options"]["apiKey"], "test-secret-key");
+        assert_eq!(
+            provider["models"]["deepseek-v4-flash"]["name"],
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            provider["models"]["deepseek-v4-pro"]["name"],
+            "deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn opencode_config_merge_preserves_existing_providers_and_mcp() {
+        let original = r#"{
+  // 用户自己的 OpenCode 配置
+  "mcp": { "pencil": { "type": "local", "command": ["pencil", "mcp"] } },
+  "provider": {
+    "ark-codingplan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "apiKey": "ark-key", "baseURL": "https://ark.example/api/coding" },
+      "models": { "glm-5.2": { "name": "glm-5.2" } }
+    }
+  },
+}"#;
+        let credential = credential(&["himind/kimi-k3"]);
+        let models = ["himind/kimi-k3".to_string()];
+        let updated = build_opencode_config(original, &credential, &models).unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            root["provider"]["ark-codingplan"]["options"]["apiKey"],
+            "ark-key"
+        );
+        assert_eq!(root["mcp"]["pencil"]["type"], "local");
+        assert_eq!(
+            root["provider"]["himind"]["models"]["himind/kimi-k3"]["name"],
+            "himind/kimi-k3"
+        );
+    }
+
+    #[test]
+    fn opencode_config_rejects_invalid_json_and_non_object_root() {
+        let credential = credential(&["deepseek-v4-flash"]);
+        let models = ["deepseek-v4-flash".to_string()];
+        let error = build_opencode_config("{ not json", &credential, &models).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("OpenCode opencode.json 格式无效"));
+        let error = build_opencode_config("[1,2,3]", &credential, &models).unwrap_err();
+        assert!(error.to_string().contains("顶层必须是 JSON 对象"));
+        // 既有 provider 的同级供应商配置可被正常合并。
+        assert!(
+            build_opencode_config(r#"{"provider":{"ark":{"npm":"x"}}}"#, &credential, &models)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn opencode_npm_follows_protocols() {
+        assert_eq!(
+            opencode_npm_for_protocol("openai-chat").unwrap(),
+            "@ai-sdk/openai-compatible"
+        );
+        assert_eq!(
+            opencode_npm_for_protocol("openai-responses").unwrap(),
+            "@ai-sdk/openai"
+        );
+        assert_eq!(
+            opencode_npm_for_protocol("anthropic").unwrap(),
+            "@ai-sdk/anthropic"
+        );
+        assert_eq!(opencode_npm_for_protocol("").unwrap(), "@ai-sdk/openai");
+    }
+
+    #[test]
+    fn opencode_anthropic_provider_keeps_v1_suffix() {
+        let mut credential = credential(&["claude-sonnet-4-5"]);
+        credential.access.protocol = "anthropic".to_string();
+        credential.access.base_url = "https://api.moonshot.cn/anthropic".to_string();
+        let models = ["claude-sonnet-4-5".to_string()];
+        let updated = build_opencode_config("", &credential, &models).unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        let provider = &root["provider"]["himind"];
+        assert_eq!(provider["npm"], "@ai-sdk/anthropic");
+        assert_eq!(
+            provider["options"]["baseURL"],
+            "https://api.moonshot.cn/anthropic/v1"
+        );
+
+        // 网关已给出带 /v1 的地址时不再叠加；带 /messages 的地址回到根地址。
+        assert_eq!(
+            opencode_anthropic_base_url("https://gateway.example/anthropic/v1").unwrap(),
+            "https://gateway.example/anthropic/v1"
+        );
+        assert_eq!(
+            opencode_anthropic_base_url("https://gateway.example/anthropic/v1/messages").unwrap(),
+            "https://gateway.example/anthropic/v1"
+        );
+    }
+
+    #[test]
+    fn strip_opencode_only_removes_himind_provider() {
+        let original =
+            r#"{"provider":{"himind":{"npm":"@ai-sdk/openai"},"ark":{"npm":"x"}},"mcp":{"s":{}}}"#;
+        let (updated, changed) = strip_opencode_himind(original).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["provider"].get("himind").is_none());
+        assert_eq!(root["provider"]["ark"]["npm"], "x");
+        assert!(root["mcp"]["s"].is_object());
+        // 二次调用无 HiMind 条目，保持幂等且不再改写文件。
+        let (_, changed_again) = strip_opencode_himind(&updated).unwrap();
+        assert!(!changed_again);
+        // provider 只含 HiMind 时整体移除空对象。
+        let (emptied, removed) =
+            strip_opencode_himind(r#"{"provider":{"himind":{"npm":"@ai-sdk/openai"}}}"#).unwrap();
+        assert!(removed);
+        assert!(serde_json::from_str::<Value>(&emptied)
+            .unwrap()
+            .get("provider")
+            .is_none());
+    }
+
+    #[test]
+    fn opencode_status_reads_himind_model_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "himind-opencode-status-test-{}-{}.json",
+            std::process::id(),
+            super::unix_now_millis()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"provider":{"himind":{"npm":"@ai-sdk/openai","models":{"deepseek-v4-flash":{"name":"deepseek-v4-flash"},"kimi-k3":{"name":"kimi-k3"}}}}}"#,
+        )
+        .unwrap();
+        let mut models = super::read_opencode_himind_models(&path).unwrap();
+        models.sort();
+        assert_eq!(
+            models.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["deepseek-v4-flash", "kimi-k3"]
+        );
+        assert!(super::opencode_himind_provider_present(&path));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn strips_gateway_v1_suffix_for_anthropic_base_url() {
         assert_eq!(
             anthropic_base_url("https://himind.example.com/gateway/v1").unwrap(),
@@ -4608,7 +7797,7 @@ command = "uvx.exe"
     #[test]
     fn strip_claude_only_removes_himind_env_keys() {
         let original = r#"{"env":{"ANTHROPIC_BASE_URL":"https://himind.example.com/gateway","ANTHROPIC_AUTH_TOKEN":"sk-1","ANTHROPIC_MODEL":"claude-sonnet-5","OTHER":"v"},"permissions":{"allow":["Bash(npm test *)"]}}"#;
-        let (updated, changed) = strip_claude_himind(original, "Claude Code").unwrap();
+        let (updated, changed) = strip_claude_himind(original, "Claude Code", None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert!(root["env"].get(CLAUDE_BASE_URL_ENV).is_none());
@@ -4616,5 +7805,453 @@ command = "uvx.exe"
         assert!(root["env"].get("ANTHROPIC_MODEL").is_none());
         assert_eq!(root["env"]["OTHER"], "v");
         assert_eq!(root["permissions"]["allow"][0], "Bash(npm test *)");
+    }
+
+    /// 用户本来就配过 ANTHROPIC_* 时，取消导入必须还原原值，未配过的键才删除。
+    #[test]
+    fn strip_claude_restores_user_env_from_snapshot() {
+        let previous = r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"user-token","OTHER":"v"}}"#;
+        let imported = r#"{"env":{"ANTHROPIC_BASE_URL":"https://himind.example.com/gateway","ANTHROPIC_AUTH_TOKEN":"sk-1","ANTHROPIC_MODEL":"claude-sonnet-5","ANTHROPIC_CUSTOM_MODEL_OPTION":"claude-sonnet-5","OTHER":"v"}}"#;
+        let (updated, changed) =
+            strip_claude_himind(imported, "Claude Code", Some(previous)).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(root["env"]["ANTHROPIC_AUTH_TOKEN"], "user-token");
+        assert_eq!(root["env"]["OTHER"], "v");
+        assert!(root["env"].get(CLAUDE_BASE_URL_ENV).is_none());
+        assert!(root["env"].get("ANTHROPIC_MODEL").is_none());
+        let (_, again) = strip_claude_himind(&updated, "Claude Code", Some(previous)).unwrap();
+        assert!(!again);
+    }
+
+    // Continue：首次在空文件上生成 config.yaml 时，name/version/schema 是必填字段，
+    // 且 models 条目要对齐 config-yaml 的 modelSchema 形状。
+    #[test]
+    fn builds_continue_config_from_empty_file() {
+        let cred = credential(&["model-a", "model-b"]);
+        let content = build_continue_config(
+            "",
+            ProviderConfigFormat::Yaml,
+            &cred,
+            &["model-a".to_string(), "model-b".to_string()],
+            "model-a",
+        )
+        .unwrap();
+        let root: Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(root["name"], "Main Config");
+        assert_eq!(root["schema"], "v1");
+        let models = root["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["name"], "himind/model-a");
+        assert_eq!(models[0]["provider"], "openai");
+        assert_eq!(models[0]["model"], "model-a");
+        assert_eq!(models[0]["apiBase"], "https://ai.example.com/v1");
+        assert_eq!(models[0]["apiKey"], "test-secret-key");
+        assert_eq!(models[0]["useResponsesApi"], true);
+        assert_eq!(models[0]["roles"], json!(["chat", "edit", "apply"]));
+        // 非首选模型只挂 chat 角色，避免多个模型同时被选为默认编辑器。
+        assert_eq!(models[1]["roles"], json!(["chat"]));
+    }
+
+    // anthropic 协议走 anthropic provider，基址剥掉 /v1 且不带 responses 开关。
+    #[test]
+    fn continue_anthropic_protocol_uses_anthropic_provider() {
+        let mut cred = credential(&["claude-x"]);
+        cred.access.protocol = "anthropic".to_string();
+        let content = build_continue_config(
+            "",
+            ProviderConfigFormat::Yaml,
+            &cred,
+            &["claude-x".to_string()],
+            "claude-x",
+        )
+        .unwrap();
+        let root: Value = serde_yaml::from_str(&content).unwrap();
+        let entry = &root["models"][0];
+        assert_eq!(entry["provider"], "anthropic");
+        assert_eq!(entry["apiBase"], "https://ai.example.com");
+        assert!(entry.get("useResponsesApi").is_none());
+    }
+
+    // 保留式合并：既有非 himind 模型与其它顶层键必须原样保留，重复导入不产生重复条目。
+    #[test]
+    fn continue_build_preserves_existing_models_and_is_idempotent() {
+        let original = "name: Main Config\nversion: 0.0.1\nschema: v1\nextras:\n  keep: true\nmodels:\n  - name: gpt-4o\n    provider: openai\n    model: gpt-4o\n";
+        let cred = credential(&["model-a"]);
+        let updated = build_continue_config(
+            original,
+            ProviderConfigFormat::Yaml,
+            &cred,
+            &["model-a".to_string()],
+            "model-a",
+        )
+        .unwrap();
+        let root: Value = serde_yaml::from_str(&updated).unwrap();
+        assert_eq!(root["extras"]["keep"], true);
+        let models = root["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|entry| entry["name"] == "gpt-4o"));
+        assert!(models.iter().any(|entry| entry["name"] == "himind/model-a"));
+
+        let rerun = build_continue_config(
+            &updated,
+            ProviderConfigFormat::Yaml,
+            &cred,
+            &["model-a".to_string()],
+            "model-a",
+        )
+        .unwrap();
+        let again: Value = serde_yaml::from_str(&rerun).unwrap();
+        assert_eq!(again["models"].as_array().unwrap().len(), 2);
+        assert_eq!(continue_himind_models(&again), vec!["model-a".to_string()]);
+    }
+
+    #[test]
+    fn strips_only_himind_entries_from_continue_config() {
+        let original = "name: Main Config\nversion: 0.0.1\nschema: v1\nmodels:\n  - name: gpt-4o\n    provider: openai\n    model: gpt-4o\n  - name: himind/model-a\n    provider: openai\n    model: model-a\n";
+        let (updated, changed) =
+            strip_continue_himind(original, ProviderConfigFormat::Yaml).unwrap();
+        assert!(changed);
+        let root: Value = serde_yaml::from_str(&updated).unwrap();
+        let models = root["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["name"], "gpt-4o");
+        // 幂等：没有 himind 条目时不改写文件。
+        let (_, again) = strip_continue_himind(&updated, ProviderConfigFormat::Yaml).unwrap();
+        assert!(!again);
+    }
+
+    // Aider：顶层标量端点/密钥/默认模型，加 himind/<model>:openai/<model> 别名。
+    #[test]
+    fn builds_aider_conf_with_endpoint_and_alias() {
+        let cred = credential(&["model-a", "model-b"]);
+        let content = build_aider_config(
+            "",
+            ProviderConfigFormat::Yaml,
+            &cred,
+            &["model-a".to_string(), "model-b".to_string()],
+            "model-b",
+        )
+        .unwrap();
+        let root: Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(root["openai-api-base"], "https://ai.example.com/v1");
+        assert_eq!(root["openai-api-key"], "test-secret-key");
+        assert_eq!(root["model"], "himind/model-b");
+        let aliases = root["alias"].as_array().unwrap();
+        assert!(aliases
+            .iter()
+            .any(|item| item.as_str() == Some("himind/model-a:openai/model-a")));
+        assert!(aliases
+            .iter()
+            .any(|item| item.as_str() == Some("himind/model-b:openai/model-b")));
+        // 默认模型来自 model 标量，别名补齐其余模型。
+        assert_eq!(
+            aider_himind_models(&root),
+            vec!["model-b".to_string(), "model-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn strips_aider_himind_entries_and_preserves_user_keys() {
+        let original = "openai-api-base: https://ai.example.com/v1\nopenai-api-key: test-secret-key\nmodel: himind/model-a\nalias:\n  - himind/model-a:openai/model-a\n  - fast:gpt-4o\nweak-model: gpt-4o\n";
+        let (updated, changed) =
+            strip_aider_himind(original, ProviderConfigFormat::Yaml, None).unwrap();
+        assert!(changed);
+        let root: Value = serde_yaml::from_str(&updated).unwrap();
+        assert!(root.get("openai-api-base").is_none());
+        assert!(root.get("openai-api-key").is_none());
+        assert!(root.get("model").is_none());
+        assert_eq!(root["weak-model"], "gpt-4o");
+        let aliases = root["alias"].as_array().unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0], "fast:gpt-4o");
+        let (_, again) = strip_aider_himind(&updated, ProviderConfigFormat::Yaml, None).unwrap();
+        assert!(!again);
+    }
+
+    /// Aider 只支持单来源：有快照时取消导入应把用户原来的端点、密钥与默认模型
+    /// 写回，而不是删除。
+    #[test]
+    fn strips_aider_restores_user_values_from_snapshot() {
+        let previous =
+            "openai-api-base: https://user.example/v1\nopenai-api-key: user-key\nmodel: gpt-4o\n";
+        let imported = "openai-api-base: https://ai.example.com/v1\nopenai-api-key: test-secret-key\nmodel: himind/model-a\nalias:\n  - himind/model-a:openai/model-a\nweak-model: gpt-4o\n";
+        let (updated, changed) =
+            strip_aider_himind(imported, ProviderConfigFormat::Yaml, Some(previous)).unwrap();
+        assert!(changed);
+        let root: Value = serde_yaml::from_str(&updated).unwrap();
+        assert_eq!(root["openai-api-base"], "https://user.example/v1");
+        assert_eq!(root["openai-api-key"], "user-key");
+        assert_eq!(root["model"], "gpt-4o");
+        assert_eq!(root["weak-model"], "gpt-4o");
+        assert!(root.get("alias").is_none());
+        let (_, again) =
+            strip_aider_himind(&updated, ProviderConfigFormat::Yaml, Some(previous)).unwrap();
+        assert!(!again);
+    }
+
+    // 每个声明式目标都必须给出主配置，状态与卸载判定都按第 0 项走。
+    #[test]
+    fn declarative_targets_declare_a_primary_config_file() {
+        for definition in PROVIDER_TARGETS {
+            assert!(
+                !(definition.config_files)().is_empty(),
+                "{} 未声明配置文件",
+                definition.id
+            );
+        }
+        // ZCode 是唯一写两份配置的目标：config.json 给旧版，规则文件给 3.14+。
+        assert_eq!((PROVIDER_TARGETS[5].config_files)().len(), 2);
+    }
+
+    // Crush：providers.himind 带端点与密钥，模型清单填 id 与窗口兜底，
+    // large/small 两个用途槽位都指向 himind 的首选模型。
+    #[test]
+    fn builds_crush_config_with_provider_and_model_slots() {
+        let cred = credential(&["model-a", "model-b"]);
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let content =
+            build_crush_config("", ProviderConfigFormat::Json, &cred, &models, "model-b").unwrap();
+        let root: Value = serde_json::from_str(&content).unwrap();
+        let provider = &root["providers"]["himind"];
+        assert_eq!(provider["type"], "openai");
+        assert_eq!(provider["base_url"], "https://ai.example.com/v1");
+        assert_eq!(provider["api_key"], "test-secret-key");
+        assert_eq!(provider["models"][0]["id"], "model-a");
+        assert_eq!(provider["models"][0]["name"], "model-a");
+        assert_eq!(provider["models"][0]["context_window"], 200000);
+        assert_eq!(provider["models"][0]["default_max_tokens"], 16384);
+        assert_eq!(root["models"]["large"]["provider"], "himind");
+        assert_eq!(root["models"]["large"]["model"], "model-b");
+        assert_eq!(root["models"]["small"]["provider"], "himind");
+        assert_eq!(
+            crush_himind_models(&root),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+    }
+
+    // Crush 的取消：只清 HiMind 的 provider 与仍指向它的槽位，别人的模型不动。
+    // 导入前被槽位占用的模型不还原，回到导入前的状态要看备份文件。
+    #[test]
+    fn strips_crush_himind_and_keeps_other_providers() {
+        let original = r#"{"providers":{"anthropic":{"type":"anthropic","name":"anthropic"}},"models":{"large":{"provider":"anthropic","model":"claude"}}}"#;
+        let cred = credential(&["model-a"]);
+        let content = build_crush_config(
+            original,
+            ProviderConfigFormat::Json,
+            &cred,
+            &["model-a".to_string()],
+            "model-a",
+        )
+        .unwrap();
+        let root: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(root["providers"]["anthropic"]["name"], "anthropic");
+        let (updated, changed) = strip_crush_himind(&content, ProviderConfigFormat::Json).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["providers"].get("himind").is_none());
+        assert_eq!(root["providers"]["anthropic"]["name"], "anthropic");
+        assert!(root["models"].get("large").is_none());
+    }
+
+    #[test]
+    fn strips_crush_himind_keeps_slots_pointing_elsewhere() {
+        let original = r#"{"providers":{"himind":{"type":"openai"}},"models":{"large":{"provider":"anthropic","model":"claude"},"small":{"provider":"himind","model":"model-a"}}}"#;
+        let (updated, changed) = strip_crush_himind(original, ProviderConfigFormat::Json).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(root["models"]["large"]["provider"], "anthropic");
+        assert!(root["models"].get("small").is_none());
+        let (_, again) = strip_crush_himind(&updated, ProviderConfigFormat::Json).unwrap();
+        assert!(!again);
+    }
+
+    // Qoder：providers.himind 走 openai 协议，默认模型写成 `<id>/<model>`。
+    #[test]
+    fn builds_qoder_config_with_default_model() {
+        let cred = credential(&["model-a", "model-b"]);
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let content =
+            build_qoder_config("", ProviderConfigFormat::Json, &cred, &models, "model-b").unwrap();
+        let root: Value = serde_json::from_str(&content).unwrap();
+        let provider = &root["providers"]["himind"];
+        assert_eq!(provider["protocol"], "openai");
+        assert_eq!(provider["baseUrl"], "https://ai.example.com/v1");
+        assert_eq!(provider["apiKey"], "test-secret-key");
+        assert_eq!(provider["model"], "model-b");
+        assert_eq!(provider["models"][0]["model"], "model-a");
+        assert_eq!(provider["models"][0]["capabilities"]["tools"], true);
+        assert_eq!(root["model"]["name"], "himind/model-b");
+        assert_eq!(
+            qoder_himind_models(&root),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+    }
+
+    // Qoder 的取消：清 HiMind 的 provider 与默认模型，用户自己的推理档位保持原样。
+    #[test]
+    fn strips_qoder_himind_and_keeps_reasoning_effort() {
+        let original = r#"{"model":{"name":"himind/model-a","reasoningEffort":"high"},"providers":{"himind":{"protocol":"openai"},"other":{"protocol":"openai"}}}"#;
+        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["providers"].get("himind").is_none());
+        assert_eq!(root["providers"]["other"]["protocol"], "openai");
+        assert!(root["model"].get("name").is_none());
+        assert_eq!(root["model"]["reasoningEffort"], "high");
+    }
+
+    #[test]
+    fn strips_qoder_himind_keeps_foreign_default_model() {
+        let original = r#"{"model":{"name":"other/model"},"providers":{"himind":{}}}"#;
+        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(root["model"]["name"], "other/model");
+        assert!(root["providers"].get("himind").is_none());
+    }
+
+    // ZCode：config.json 的 provider kind 固定 anthropic，baseURL 不带 /v1；
+    // provider_config.json 里的 provider 规则与模型规则按 providerId 归组。
+    #[test]
+    fn builds_zcode_provider_and_rules() {
+        let mut cred = credential(&["claude-x"]);
+        cred.access.protocol = "anthropic".to_string();
+        let models = vec!["claude-x".to_string()];
+        let config = build_zcode_config("", ProviderConfigFormat::Json, &cred, &models).unwrap();
+        let root: Value = serde_json::from_str(&config).unwrap();
+        let provider = &root["provider"]["himind"];
+        assert_eq!(provider["kind"], "anthropic");
+        assert_eq!(provider["enabled"], true);
+        assert_eq!(provider["source"], "custom");
+        assert_eq!(provider["options"]["baseURL"], "https://ai.example.com");
+        assert_eq!(provider["options"]["apiKey"], "test-secret-key");
+        assert_eq!(provider["models"]["claude-x"]["limit"]["context"], 200000);
+        // 输出上限没有可信来源，留空由 ZCode 按缺省处理。
+        assert!(provider["models"]["claude-x"]["limit"]
+            .get("output")
+            .is_none());
+        assert_eq!(zcode_himind_models(&root), models);
+
+        let rules =
+            build_zcode_provider_rules("", ProviderConfigFormat::Json, &cred, &models).unwrap();
+        let root: Value = serde_json::from_str(&rules).unwrap();
+        assert_eq!(root["schemaVersion"], 1);
+        let rule = &root["config"]["providerConfigRules"]["providerRules"][0];
+        assert_eq!(rule["providerId"], "himind");
+        assert_eq!(rule["providerName"], "himind");
+        assert_eq!(rule["enabled"], true);
+        assert_eq!(rule["config"]["group"], "standard-personal");
+        assert_eq!(rule["config"]["access"]["type"], "api-key");
+        assert_eq!(rule["config"]["access"]["apiKey"], "test-secret-key");
+        assert_eq!(rule["config"]["api"]["type"], "anthropic-messages");
+        assert_eq!(rule["config"]["api"]["baseUrl"], "https://ai.example.com");
+        assert_eq!(rule["config"]["personalModelIds"], json!(["claude-x"]));
+        assert_eq!(rule["config"]["modelOrder"], json!(["claude-x"]));
+        let model_rule = &root["config"]["modelConfigRules"]["providerModelRules"][0];
+        assert_eq!(model_rule["providerId"], "himind");
+        assert_eq!(model_rule["modelId"], "claude-x");
+        assert_eq!(model_rule["config"]["properties"]["contextWindow"], 200000);
+        assert_eq!(
+            model_rule["config"]["properties"]["inputFormat"]["supportsImage"],
+            false
+        );
+    }
+
+    // 重新导入要保留其他 provider 的规则，也不覆盖用户在 ZCode 里手工设过的模型；
+    // 用户在 ZCode 里关掉的 provider 不被重新打开。
+    #[test]
+    fn zcode_rules_preserve_other_providers_and_manual_models() {
+        let original = r#"{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[{"providerId":"other"},{"providerId":"himind","enabled":false}]},"modelConfigRules":{"providerModelRules":[{"providerId":"other","modelId":"x"}],"manualProviderModelRules":[{"providerId":"other","modelId":"y"}]}}}"#;
+        let mut cred = credential(&["claude-x"]);
+        cred.access.protocol = "anthropic".to_string();
+        let content = build_zcode_provider_rules(
+            original,
+            ProviderConfigFormat::Json,
+            &cred,
+            &["claude-x".to_string()],
+        )
+        .unwrap();
+        let root: Value = serde_json::from_str(&content).unwrap();
+        let rules = root["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["providerId"], "other");
+        assert_eq!(rules[1]["providerId"], "himind");
+        assert_eq!(rules[1]["enabled"], false);
+        let model_rules = root["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(model_rules.len(), 2);
+        assert_eq!(model_rules[0]["providerId"], "other");
+        assert_eq!(model_rules[1]["modelId"], "claude-x");
+        let manual = root["config"]["modelConfigRules"]["manualProviderModelRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0]["providerId"], "other");
+    }
+
+    #[test]
+    fn strips_zcode_rules_and_keeps_other_providers() {
+        let original = r#"{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[{"providerId":"himind"},{"providerId":"other"}]},"modelConfigRules":{"providerModelRules":[{"providerId":"himind","modelId":"claude-x"},{"providerId":"other","modelId":"x"}],"manualProviderModelRules":[]}}}"#;
+        let (updated, changed) =
+            strip_zcode_rules_himind(original, ProviderConfigFormat::Json).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        let rules = root["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["providerId"], "other");
+        let model_rules = root["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(model_rules.len(), 1);
+        assert_eq!(model_rules[0]["providerId"], "other");
+        let (_, again) = strip_zcode_rules_himind(&updated, ProviderConfigFormat::Json).unwrap();
+        assert!(!again);
+    }
+
+    #[test]
+    fn strips_zcode_provider_from_config_json() {
+        let original = r#"{"provider":{"himind":{"kind":"anthropic"},"other":{"kind":"openai"}},"theme":"dark"}"#;
+        let (updated, changed) = strip_zcode_himind(original, ProviderConfigFormat::Json).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["provider"].get("himind").is_none());
+        assert_eq!(root["provider"]["other"]["kind"], "openai");
+        assert_eq!(root["theme"], "dark");
+        let (_, again) = strip_zcode_himind(&updated, ProviderConfigFormat::Json).unwrap();
+        assert!(!again);
+    }
+
+    // 线格式守卫：ZCode 只吃 Anthropic，Continue/Aider/Crush/Qoder 只吃 OpenAI 兼容。
+    #[test]
+    fn protocol_guards_match_each_client_wire_format() {
+        let openai = credential(&["model-a"]);
+        let mut anthropic = credential(&["claude-x"]);
+        anthropic.access.protocol = "anthropic".to_string();
+        assert!(ensure_anthropic_compatible(&openai, "ZCode").is_err());
+        assert!(ensure_anthropic_compatible(&anthropic, "ZCode").is_ok());
+        assert!(ensure_openai_compatible(&anthropic, "Crush").is_err());
+        assert!(ensure_openai_compatible(&openai, "Crush").is_ok());
+    }
+
+    #[test]
+    fn provider_config_format_follows_extension() {
+        assert!(matches!(
+            super::provider_config_format(Path::new("/tmp/config.json")),
+            ProviderConfigFormat::Json
+        ));
+        assert!(matches!(
+            super::provider_config_format(Path::new("/tmp/config.yaml")),
+            ProviderConfigFormat::Yaml
+        ));
+        assert!(matches!(
+            super::provider_config_format(Path::new("/tmp/.aider.conf.yml")),
+            ProviderConfigFormat::Yaml
+        ));
     }
 }

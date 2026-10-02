@@ -9,6 +9,9 @@ use super::credentials::{protect_secret_for_current_user, unprotect_secret_for_c
 const STORE_FILE: &str = "ai-services.json";
 const SELECTION_FILE: &str = "ai-service-selection.json";
 
+/// Anthropic Messages 协议要求的版本头；`/v1/models` 与 `/v1/messages` 共用。
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AIServiceProtocol {
@@ -16,6 +19,14 @@ pub(crate) enum AIServiceProtocol {
     OpenaiChat,
     #[serde(rename = "openai-responses", alias = "openai_responses")]
     OpenaiResponses,
+    /// Anthropic Messages 协议。网关的 `/v1/messages` 端点、GCMP Anthropic 类模板
+    /// 与 Claude 系客户端都使用该协议名。
+    #[serde(
+        rename = "anthropic",
+        alias = "anthropic-messages",
+        alias = "anthropic_messages"
+    )]
+    Anthropic,
 }
 
 impl AIServiceProtocol {
@@ -23,6 +34,24 @@ impl AIServiceProtocol {
         match self {
             Self::OpenaiChat => "openai-chat",
             Self::OpenaiResponses => "openai-responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    /// 该协议的密钥与端点写法是否走 Anthropic 原生约定（`x-api-key`、`/v1/messages`）。
+    pub(crate) fn is_anthropic(&self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
+
+    /// 解析 Tauri/MCP 入参里的协议字符串；未知值一次性给出完整可选值，避免各处重复文案。
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "openai-chat" => Ok(Self::OpenaiChat),
+            "openai-responses" => Ok(Self::OpenaiResponses),
+            "anthropic" => Ok(Self::Anthropic),
+            other => Err(format!(
+                "protocol 只支持 openai-chat、openai-responses 或 anthropic，收到：{other}"
+            )),
         }
     }
 }
@@ -308,17 +337,49 @@ fn selection_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(dir.join(SELECTION_FILE))
 }
 
-/// 请求 OpenAI 兼容的 `GET {base_url}/models` 接口，返回可用模型 ID 列表。
-pub(crate) fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    validate_base_url(base_url)?;
+/// Anthropic 协议里的 API 根地址：去掉末尾斜杠，并剥掉可选的末尾 `/v1`。
+///
+/// GCMP Anthropic 类模板给出的是 API 根地址（如 `https://api.moonshot.cn/anthropic`），
+/// 手工填写时用户常按 OpenAI 习惯带上 `/v1`，两种写法指向同一根。Anthropic SDK
+/// 系客户端（Claude Code、DSH）会在根地址后自行追加 `/v1/messages`，因此写入这些
+/// 客户端前必须回到根地址；只有需要显式带 `/v1` 的客户端（OpenCode/AI SDK）才补回去。
+pub(crate) fn anthropic_api_root(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
-    let url = format!("{base}/models");
+    base.strip_suffix("/v1").unwrap_or(base).to_string()
+}
+
+/// Anthropic 原生模型列表地址 `{api_root}/v1/models`。
+fn anthropic_models_url(base_url: &str) -> String {
+    format!("{}/v1/models", anthropic_api_root(base_url))
+}
+
+/// 拉取服务可用模型列表。
+///
+/// `openai-chat`/`openai-responses` 走 OpenAI 兼容 `GET {base_url}/models`（Bearer 认证）；
+/// `anthropic` 走 Anthropic 原生 `GET {base_url}/v1/models`（`x-api-key` + `anthropic-version`）。
+/// 两者响应都是 `data[].id`，因此共用同一份解析逻辑。
+pub(crate) fn fetch_models(
+    base_url: &str,
+    api_key: &str,
+    protocol: AIServiceProtocol,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    validate_base_url(base_url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
-    let response = client
-        .get(&url)
-        .bearer_auth(api_key.trim())
+    let request = match protocol {
+        AIServiceProtocol::Anthropic => client
+            .get(anthropic_models_url(base_url))
+            .header("x-api-key", api_key.trim())
+            .header("anthropic-version", ANTHROPIC_API_VERSION),
+        AIServiceProtocol::OpenaiChat | AIServiceProtocol::OpenaiResponses => {
+            let base = base_url.trim().trim_end_matches('/');
+            client
+                .get(format!("{base}/models"))
+                .bearer_auth(api_key.trim())
+        }
+    };
+    let response = request
         .send()
         .map_err(|error| format!("拉取模型列表失败：{error}"))?;
     if !response.status().is_success() {
@@ -349,7 +410,7 @@ pub(crate) fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>,
 /// 读取已保存自定义服务并拉取其 `/models` 模型列表。
 pub(crate) fn list_models(id: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let (service, api_key) = load_secret(id)?;
-    fetch_models(&service.base_url, &api_key)
+    fetch_models(&service.base_url, &api_key, service.protocol)
 }
 
 #[cfg(test)]
@@ -357,17 +418,11 @@ mod tests {
     use super::{validate_base_url, AIServiceProtocol, CustomAIServiceInput};
     use std::io::{Read, Write};
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
-    /// `HIMIND_AGENT_HOME` 是进程级环境变量，切换它会影响所有并行测试。
-    /// 串行化所有依赖它的用例，避免测试之间互相污染。
-    fn home_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn with_isolated_home(run: impl FnOnce()) {
-        let _guard = home_test_lock().lock().unwrap();
+        // `HIMIND_AGENT_HOME` 是进程级环境变量，切换它会影响所有并行测试。
+        // 与其它会改它的用例共用一把全局锁，避免测试之间互相污染。
+        let _guard = crate::store::paths::test_env_lock();
         let previous = std::env::var("HIMIND_AGENT_HOME").ok();
         let root = std::env::temp_dir().join(format!(
             "himind-ai-services-test-{}-{}",
@@ -518,6 +573,37 @@ mod tests {
         }))
         .expect("public capability payload should parse");
         assert_eq!(input.protocol, AIServiceProtocol::OpenaiChat);
+
+        let anthropic: CustomAIServiceInput = serde_json::from_value(serde_json::json!({
+            "id": "anthropic-gateway",
+            "display_name": "Anthropic Gateway",
+            "base_url": "https://api.anthropic.com",
+            "protocol": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "models": ["claude-sonnet-4-5"],
+            "api_key": "secret"
+        }))
+        .expect("anthropic protocol payload should parse");
+        assert_eq!(anthropic.protocol, AIServiceProtocol::Anthropic);
+        assert_eq!(anthropic.protocol.as_str(), "anthropic");
+    }
+
+    #[test]
+    fn parses_known_protocols_and_rejects_unknown_ones() {
+        assert_eq!(
+            AIServiceProtocol::parse("openai-chat").unwrap(),
+            AIServiceProtocol::OpenaiChat
+        );
+        assert_eq!(
+            AIServiceProtocol::parse(" openai-responses ").unwrap(),
+            AIServiceProtocol::OpenaiResponses
+        );
+        assert_eq!(
+            AIServiceProtocol::parse("anthropic").unwrap(),
+            AIServiceProtocol::Anthropic
+        );
+        let error = AIServiceProtocol::parse("gemini").unwrap_err();
+        assert!(error.contains("anthropic"));
     }
 
     #[test]
@@ -544,9 +630,61 @@ mod tests {
             );
             let _ = stream.write_all(response.as_bytes());
         });
-        let models =
-            super::fetch_models(&format!("http://{addr}/v1"), "sk-test").expect("fetch models");
+        let models = super::fetch_models(
+            &format!("http://{addr}/v1"),
+            "sk-test",
+            AIServiceProtocol::OpenaiResponses,
+        )
+        .expect("fetch models");
         assert_eq!(models, vec!["model-a".to_string(), "model-b".to_string()]);
+    }
+
+    #[test]
+    fn fetch_models_uses_anthropic_headers_and_v1_path() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = received.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let body = r#"{"data":[{"id":"claude-sonnet-4-5"}],"has_more":false}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        // 不带 `/v1` 的 API 根地址也要落到同一端点。
+        let models = super::fetch_models(
+            &format!("http://{addr}/anthropic"),
+            "sk-anthropic",
+            AIServiceProtocol::Anthropic,
+        )
+        .expect("fetch anthropic models");
+        assert_eq!(models, vec!["claude-sonnet-4-5".to_string()]);
+        let request = received.lock().unwrap().clone();
+        // 头字段名大小写由 HTTP 客户端决定（reqwest 发 Title-Case），断言只看语义。
+        let normalized = request.to_ascii_lowercase();
+        assert!(
+            request.starts_with("GET /anthropic/v1/models "),
+            "unexpected request line: {request}"
+        );
+        assert!(
+            normalized.contains("x-api-key: sk-anthropic"),
+            "unexpected headers: {request}"
+        );
+        assert!(
+            normalized.contains("anthropic-version: 2023-06-01"),
+            "unexpected headers: {request}"
+        );
+        assert!(
+            !normalized.contains("authorization:"),
+            "anthropic 端点不应带 bearer 鉴权: {request}"
+        );
     }
 
     #[test]
@@ -565,9 +703,13 @@ mod tests {
             );
             let _ = stream.write_all(response.as_bytes());
         });
-        let err = super::fetch_models(&format!("http://{addr}/v1"), "sk-bad")
-            .err()
-            .expect("must reject");
+        let err = super::fetch_models(
+            &format!("http://{addr}/v1"),
+            "sk-bad",
+            AIServiceProtocol::OpenaiChat,
+        )
+        .err()
+        .expect("must reject");
         assert!(err.to_string().contains("401"));
     }
 }

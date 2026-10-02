@@ -326,7 +326,7 @@ fn upload_event(
     let response = client
         .post(format!(
             "{}/api/integrations/ai/runtime/events",
-            options.api_base.trim_end_matches('/')
+            options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(&access.token)
         .header("X-HiMind-Agent-ID", &access.agent_id)
@@ -357,7 +357,7 @@ fn register_runtime_session(
     let response = client
         .post(format!(
             "{}/api/integrations/ai/runtime/sessions/register",
-            options.api_base.trim_end_matches('/')
+            options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(&access.token)
         .header("X-HiMind-Agent-ID", &access.agent_id)
@@ -429,7 +429,7 @@ fn heartbeat_runtime_session(
     let response = client
         .post(format!(
             "{}/api/integrations/ai/runtime/sessions/{}/heartbeat",
-            options.api_base.trim_end_matches('/'),
+            options.api_base().trim_end_matches('/'),
             target.binding_id
         ))
         .bearer_auth(&access.token)
