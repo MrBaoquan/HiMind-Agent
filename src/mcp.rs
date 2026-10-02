@@ -25,11 +25,24 @@ const MAX_ACTIVATED_CAPABILITIES: usize = 128;
 const MAX_ACTIVATED_SCHEMA_BYTES: usize = 512 * 1024;
 const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。工程开发入口应优先调用 engineering.project.resolve 解析 workspace_root、target 和 environment，再启动或继续 Workflow；不要猜测展馆、AppID、构建目录或交付 Workflow。需要编辑工作区时必须先调用 engineering.workspace.lease.acquire 获取 write Lease，编辑完成后 release；开发阶段结束时调用 engineering.checkpoint.create 生成 DevelopmentCheckpoint，再把它作为交付 Workflow 的 Seed。Workflow 生命周期统一使用 workflow.catalog.list、workflow.catalog.describe、workflow.run.start、workflow.run.get、workflow.run.feedback 和 workflow.run.cancel；审批仍由全局审批中心完成，模型不得代替用户批准。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 capability.catalog.search 搜索目录，再用 capability.catalog.describe 获取具体 Schema，最后调用 capability.catalog.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 capability.catalog.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
 
+/// 市场使用引导单独成段：它回答的是"缺能力时怎么办"，与上面的 stdio/授权说明
+/// 不是同一件事，拆开也方便单独演进。
+const MCP_MARKET_INSTRUCTIONS: &str = "缺能力时不要直接说做不到：先看 market.installed 盘点本机已有什么，再用 market.search 在市场里按关键字找技能、插件或工作流，然后用 market.install.plan 看清版本、来源、依赖和安装落点，最后才用 market.install 安装。market.install 会写入本机，属于需要用户确认的操作，模型不得代替用户批准；安装完成后能力才会出现在后续 tools/list 里。技能可装到全局或指定项目目录，并可指定投放到哪些 AI 客户端。";
+
+/// MCP initialize 返回的引导语：stdio/授权说明 + 市场使用引导。
+fn mcp_instructions() -> String {
+    format!("{MCP_INSTRUCTIONS}{MCP_MARKET_INSTRUCTIONS}")
+}
+
 const BOOTSTRAP_TOOL_IDS: &[&str] = &[
     "capability.catalog.search",
     "capability.catalog.describe",
     "capability.catalog.activate",
     "capability.catalog.invoke",
+    "market.search",
+    "market.installed",
+    "market.install.plan",
+    "market.install",
     "system.health",
 ];
 
@@ -387,7 +400,7 @@ fn handle_request_with_session(
             session.ai_client_id = mcp_client_id_from_initialize(&params);
             Ok(json!({
                 "protocolVersion": negotiate_protocol_version(&params),
-                "instructions": MCP_INSTRUCTIONS,
+                "instructions": mcp_instructions(),
                 "capabilities": {
                     "tools": { "listChanged": true },
                     "prompts": { "listChanged": true },
@@ -1148,6 +1161,7 @@ mod tests {
         mcp_registry_generation, mcp_tool_call_error, mcp_tool_call_result,
         negotiate_protocol_version, parse_default_activation_ids, parse_tool_cursor,
         spawn_registry_watcher_with_interval, McpSessionState, MCP_INSTRUCTIONS,
+        MCP_MARKET_INSTRUCTIONS,
     };
     use crate::api::oauth::AgentAccessToken;
     use crate::business_integration::{BusinessCapabilityContract, BusinessCatalogSnapshot};
@@ -1172,7 +1186,7 @@ mod tests {
 
     fn test_gateway_for_mode(mode: crate::app::runtime_mode::AgentMode) -> CapabilityGateway {
         let mut options = Options::from_env();
-        options.api_base = "http://127.0.0.1:9".to_string();
+        options.set_api_base("http://127.0.0.1:9");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
@@ -1182,7 +1196,7 @@ mod tests {
             "himind-agent-mcp-test-{}-{nonce}-{sequence}.json",
             std::process::id()
         ));
-        options.effective_mode = mode;
+        options.set_mode(mode);
         CapabilityGateway::new(
             options,
             Arc::new(Mutex::new(LocalWorkerStatus {
@@ -1245,6 +1259,16 @@ mod tests {
     }
 
     #[test]
+    fn initialize_instructions_teach_market_discovery_before_giving_up() {
+        let instructions = super::mcp_instructions();
+        assert!(instructions.contains(MCP_MARKET_INSTRUCTIONS));
+        assert!(instructions.contains("market.search"));
+        assert!(instructions.contains("market.install.plan"));
+        assert!(instructions.contains("market.install"));
+        assert!(instructions.contains("模型不得代替用户批准"));
+    }
+
+    #[test]
     fn session_projection_keeps_bootstrap_small_and_requires_activation() {
         let gateway = test_gateway();
         let mut session = McpSessionState::default();
@@ -1252,12 +1276,20 @@ mod tests {
             handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
         let tools = listed["tools"].as_array().unwrap();
         assert!(
-            tools.len() <= 6,
+            tools.len() <= 9,
             "bootstrap projection grew unexpectedly: {tools:?}"
         );
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "capability.catalog.search"));
+        // 市场能力属于 Bootstrap：客户端装能力之前先要能看见市场，
+        // 否则"缺能力"这件事只能靠人来解决。
+        assert!(tools.iter().any(|tool| tool["name"] == "market.search"));
+        assert!(tools.iter().any(|tool| tool["name"] == "market.installed"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "market.install.plan"));
+        assert!(tools.iter().any(|tool| tool["name"] == "market.install"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "capability.catalog.describe"));
@@ -1589,8 +1621,11 @@ mod tests {
     fn business_integration_catalog_change_updates_mcp_discovery_call_and_notifications() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let mut options = Options::from_env();
-        options.api_base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_api_base(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ));
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         options.state_path = std::env::temp_dir().join(format!(
             "himind-mcp-catalog-change-{}-{}.json",
             std::process::id(),

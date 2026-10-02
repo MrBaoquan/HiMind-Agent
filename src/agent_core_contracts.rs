@@ -607,6 +607,8 @@ mod tests {
             include_str!("../contracts/agent-core/v1/extension-candidate.schema.json"),
             include_str!("../contracts/agent-core/v1/extension-lock.schema.json"),
             include_str!("../contracts/agent-core/v1/workflow-package.schema.json"),
+            include_str!("../contracts/agent-core/v1/extension-release-manifest.schema.json"),
+            include_str!("../contracts/agent-core/v1/client-capability-matrix.schema.json"),
         ] {
             let value: Value = serde_json::from_str(source).unwrap();
             assert!(value.get("$id").and_then(Value::as_str).is_some());
@@ -631,7 +633,7 @@ mod tests {
         let validator = jsonschema::validator_for(&schema).unwrap();
         for source in [
             include_str!("../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"),
-            include_str!("../workflows/wechat-miniprogram-delivery/workflow.json"),
+            include_str!("../workflows/wechat-experience-upload/workflow.json"),
         ] {
             let fixture: Value = serde_json::from_str(source).unwrap();
             assert!(

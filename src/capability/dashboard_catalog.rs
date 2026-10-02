@@ -138,7 +138,7 @@ pub(crate) fn invoke_catalog_capability(
 }
 
 fn is_loopback_api_base(options: &Options) -> bool {
-    let Ok(url) = Url::parse(&options.api_base) else {
+    let Ok(url) = Url::parse(&options.api_base()) else {
         return false;
     };
     matches!(
@@ -207,7 +207,7 @@ fn catalog_operation_url(
     route: &str,
     input: &Value,
 ) -> Result<(Url, Vec<String>), Box<dyn Error>> {
-    let mut url = Url::parse(&options.api_base)?;
+    let mut url = Url::parse(&options.api_base())?;
     let mut consumed = Vec::new();
     {
         let mut segments = url
@@ -412,7 +412,7 @@ enum FetchResult {
 
 fn fetch_catalog(options: &Options, etag: &str) -> Result<FetchResult, Box<dyn Error>> {
     let access = platform_access_token(options, BUSINESS_CONTEXT_READ_SCOPE)?;
-    let url = catalog_url(&options.api_base)?;
+    let url = catalog_url(&options.api_base())?;
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let mut request = client
         .get(url)
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn independent_provider_does_not_expose_a_cached_dashboard_snapshot() {
         let mut options = Options::from_env();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let provider = DashboardCatalogProvider::from_snapshot(
             &options,
             DashboardCatalogSnapshot::dashboard("cached".into(), vec![contract()]),
@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn catalog_routes_encode_path_segments_and_remove_consumed_fields() {
         let mut options = Options::from_env();
-        options.api_base = "https://example.test/root".into();
+        options.set_api_base("https://example.test/root");
         let input = json!({"example_id":"展项 1", "q":"hello"});
         let (url, consumed) = catalog_operation_url(
             &options,
@@ -953,7 +953,10 @@ mod tests {
 
     fn options_for_test_server(listener: &TcpListener) -> Options {
         let mut options = Options::from_env();
-        options.api_base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        options.set_api_base(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ));
         let expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

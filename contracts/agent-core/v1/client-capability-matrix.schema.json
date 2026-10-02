@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himind.local/contracts/agent-core/v1/client-capability-matrix.schema.json",
+  "title": "AI Client Capability Matrix",
+  "description": "客户端 × 作用域 × 能力矩阵。静态能力声明来自 Agent 内置表，availability 是运行期覆盖层：同一份矩阵在任何机器上都描述同样的能力，只有可用性会随本机安装情况变化。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "clients"],
+  "properties": {
+    "schema_version": {
+      "const": "client_capability_matrix.v1"
+    },
+    "clients": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/client"
+      }
+    }
+  },
+  "$defs": {
+    "clientId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+    },
+    "scopeTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["directory"],
+      "properties": {
+        "directory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "env_key": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+        }
+      }
+    },
+    "skillsCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["standard", "scopes"],
+      "properties": {
+        "standard": {
+          "enum": ["agentskills.io", "himind-store"]
+        },
+        "scopes": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "user": {
+              "$ref": "#/$defs/scopeTarget"
+            },
+            "project": {
+              "$ref": "#/$defs/scopeTarget"
+            }
+          }
+        }
+      }
+    },
+    "mcpCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transports"],
+      "properties": {
+        "transports": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["stdio", "http", "sse"]
+          }
+        },
+        "target_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/clientId"
+          }
+        },
+        "config_format": {
+          "enum": ["TOML", "JSON", "JSONC", "manual", "none"]
+        },
+        "auto_configure": {
+          "type": "boolean"
+        },
+        "server_id": {
+          "type": "string"
+        }
+      }
+    },
+    "pluginsCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executor"],
+      "properties": {
+        "executor": {
+          "enum": ["agent", "client"]
+        },
+        "server_id": {
+          "type": "string"
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "skills": {
+          "$ref": "#/$defs/skillsCapability"
+        },
+        "mcp": {
+          "$ref": "#/$defs/mcpCapability"
+        },
+        "plugins": {
+          "$ref": "#/$defs/pluginsCapability"
+        }
+      }
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "enum": ["ready", "not_installed", "not_configured", "unsupported"]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "detected": {
+          "type": "boolean"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "scope": {
+          "enum": ["agent", "user", "project", "none"]
+        },
+        "resolved_target": {
+          "type": "string"
+        }
+      }
+    },
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "support_level", "capabilities"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/clientId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "aliases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/clientId"
+          }
+        },
+        "support_level": {
+          "enum": ["official", "verified", "compatible"]
+        },
+        "support_note": {
+          "type": "string"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "availability": {
+          "$ref": "#/$defs/availability"
+        }
+      }
+    }
+  }
+}

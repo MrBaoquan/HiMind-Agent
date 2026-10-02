@@ -11,12 +11,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::mcp_registry::{McpServerSpec, McpTransport};
-use crate::runtime::process::configure_hidden_process;
+use crate::runtime::process::{self, configure_hidden_process};
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_MCP_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MCP_STDIO_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// 握手预算的下限。`npx -y` / `uvx` 这类包管理器首次运行要先下载依赖，
+/// 慢网络下十几秒还出不来第一帧响应，压太紧会把「正在下载」误报成失败。
+const STARTUP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct McpProbeResult {
@@ -62,6 +65,22 @@ pub(crate) fn probe_report(server: &McpServerSpec) -> McpProbeResult {
             }
         }
     }
+}
+
+/// 预设用到的前置命令。桌面端在用户点「添加」之前就能说清缺什么，
+/// 比先落库、再让他在结果里读一条英文启动错误便宜得多。
+const PRESET_REQUIREMENTS: [&str; 3] = ["npx", "node", "uvx"];
+
+pub(crate) fn probe_requirements() -> Value {
+    let mut executables = serde_json::Map::new();
+    for name in PRESET_REQUIREMENTS {
+        let entry = match process::resolve_executable(name) {
+            Some(path) => json!({ "available": true, "path": path.to_string_lossy() }),
+            None => json!({ "available": false, "path": "" }),
+        };
+        executables.insert(name.to_string(), entry);
+    }
+    Value::Object(executables)
 }
 
 pub(crate) fn probe_stdio_command(
@@ -155,7 +174,15 @@ impl McpStdioSession {
         if server.command.trim().is_empty() {
             return Err("command_not_found: MCP stdio command is empty".into());
         }
-        let mut command = Command::new(&server.command);
+        // 先落到真实文件再启动：`npx` 在 Windows 上是 `npx.cmd`，直接交给
+        // Command::new 只会得到一句 program not found。
+        let program = process::resolve_executable(&server.command).ok_or_else(|| {
+            format!(
+                "command_not_found: 找不到命令「{}」，请先安装它，或把完整路径填进启动命令",
+                server.command
+            )
+        })?;
+        let mut command = Command::new(&program);
         command
             .args(&server.args)
             .stdin(Stdio::piped())
@@ -170,7 +197,7 @@ impl McpStdioSession {
         configure_hidden_process(&mut command);
         let mut child = ChildGuard(command.spawn().map_err(|error| {
             format!(
-                "command_not_found: failed to start '{}': {error}",
+                "process_start_failed: 启动命令「{}」失败：{error}",
                 server.command
             )
         })?);
@@ -195,7 +222,7 @@ impl McpStdioSession {
                 "clientInfo": { "name": "himind-agent-downstream", "version": env!("CARGO_PKG_VERSION") }
             }),
         )?;
-        let startup_timeout = Duration::from_millis(server.tool_call_timeout_ms.clamp(1, 15_000));
+        let startup_timeout = startup_budget(server.tool_call_timeout_ms);
         let initialize = wait_for_response(&receiver, 1, startup_timeout)?;
         if let Some(error) = initialize.get("error") {
             if is_unsupported_protocol_response(&initialize) {
@@ -590,7 +617,14 @@ fn spawn_json_reader(
                     }
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => break,
+                // 子进程关掉 stdout（崩溃、跑完就退、参数不对）时立刻说清楚，
+                // 不然调用方要一直等到超时才拿到一句含糊的 startup_timeout。
+                Ok(None) => {
+                    let _ = sender.send(Err(
+                        "process_exit: MCP 子进程已退出，没有返回响应".to_string()
+                    ));
+                    break;
+                }
                 Err(error) => {
                     let _ = sender.send(Err(format!("process_exit: {error}")));
                     break;
@@ -644,16 +678,34 @@ fn wait_for_response(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("startup_timeout: MCP response timed out".into());
+            return Err(response_timeout_error(timeout));
         }
-        let message = receiver
-            .recv_timeout(remaining)
-            .map_err(|error| format!("startup_timeout: {error}"))?
-            .map_err(std::io::Error::other)?;
+        let message = match receiver.recv_timeout(remaining) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(response_timeout_error(timeout)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("process_exit: MCP 子进程已退出，没有返回响应".into());
+            }
+        }
+        .map_err(std::io::Error::other)?;
         if message.get("id").and_then(Value::as_u64) == Some(id) {
             return Ok(message);
         }
     }
+}
+
+/// 首次握手给足预算：至少 `STARTUP_TIMEOUT_FLOOR`，条目自己配了更长的
+/// 工具调用超时时以它为准。工具调用本身仍按条目配置超时，不跟着放宽。
+fn startup_budget(tool_call_timeout_ms: u64) -> Duration {
+    Duration::from_millis(tool_call_timeout_ms.max(1)).max(STARTUP_TIMEOUT_FLOOR)
+}
+
+fn response_timeout_error(timeout: Duration) -> Box<dyn Error> {
+    format!(
+        "startup_timeout: MCP 服务在 {}s 内没有响应；首次运行可能正在下载依赖，稍后重试",
+        timeout.as_secs().max(1)
+    )
+    .into()
 }
 
 struct ChildGuard(std::process::Child);
@@ -669,9 +721,65 @@ impl Drop for ChildGuard {
 mod tests {
     use super::{
         is_protocol_version_error, is_unsupported_protocol_response, negotiated_protocol_version,
-        parse_sse_json,
+        parse_sse_json, probe_requirements, startup_budget, wait_for_response,
     };
     use serde_json::json;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn dead_child_reports_process_exit_instead_of_waiting_for_timeout() {
+        let (sender, receiver) = mpsc::sync_channel::<Result<serde_json::Value, String>>(4);
+        // 读线程发现 stdout 关闭时会先发一条，再断开。
+        sender
+            .send(Err(
+                "process_exit: MCP 子进程已退出，没有返回响应".to_string()
+            ))
+            .unwrap();
+        drop(sender);
+        let error = wait_for_response(&receiver, 1, Duration::from_secs(30))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("process_exit:"), "{error}");
+
+        // 通道直接断掉（读线程已结束）同样按退出处理，不拖到超时。
+        let (sender, receiver) = mpsc::sync_channel::<Result<serde_json::Value, String>>(4);
+        drop(sender);
+        let error = wait_for_response(&receiver, 1, Duration::from_secs(30))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("process_exit:"), "{error}");
+    }
+
+    #[test]
+    fn startup_budget_tolerates_cold_package_downloads() {
+        // 默认 30s 工具调用超时不再把握手压到 15s：首次 `npx -y` 要下载依赖。
+        assert_eq!(startup_budget(30_000), Duration::from_secs(60));
+        // 小超时（如内置自检用的 10s）同样不该让握手提前失败。
+        assert_eq!(startup_budget(10_000), Duration::from_secs(60));
+        // 条目自己配得更宽松时以它为准，不被地板值砍回去。
+        assert_eq!(startup_budget(90_000), Duration::from_secs(90));
+        // 0 走 `max(1)` 兜底，仍然是地板值。
+        assert_eq!(startup_budget(0), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn requirements_report_the_preset_prerequisites() {
+        let report = probe_requirements();
+        for name in super::PRESET_REQUIREMENTS {
+            let entry = report
+                .get(name)
+                .unwrap_or_else(|| panic!("missing requirement report: {name}"));
+            assert!(
+                entry
+                    .get("available")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some(),
+                "{name} must report an availability flag"
+            );
+            assert!(entry.get("path").is_some(), "{name} must report a path");
+        }
+    }
 
     #[test]
     fn parses_streamable_http_sse_data() {

@@ -16,9 +16,88 @@ static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 const MAX_PLUGIN_INVOCATIONS: usize = 4;
 const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_PLUGIN_RESPONSE_BYTES: usize = 1024 * 1024;
+/// 单条插件响应的传输上限。
+///
+/// 这里刻意给得比"业务上想内联多少"更宽：合法能力（例如把产物 base64 内联给插件自己的
+/// 预览界面）本来就可能是几 MB。1 MiB 会把这种正常调用判成插件故障，进而阻塞全部依赖者。
+/// 默认 16 MiB，并可用 `HIMIND_AGENT_MAX_PLUGIN_RESPONSE_BYTES` 覆盖；真正的超大传输应
+/// 由能力改成分页或返回引用，而不是继续抬高上限。
+const DEFAULT_MAX_PLUGIN_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLUGIN_STDERR_BYTES: usize = 64 * 1024;
+
+/// "最近失败"作为降级信号的有效窗口。
+///
+/// 健康记录是历史事实，不该永久污染依赖者：一次超限响应或一次超时会在几周后仍然让
+/// 所有依赖它的技能显示"部分功能不可用"。超过这个窗口的失败只留在插件卡片里供排障，
+/// 不再影响技能状态；窗口内再次失败会刷新时间戳。
+pub(crate) const PLUGIN_FAILURE_RECENCY_SECONDS: u64 = 24 * 60 * 60;
+
+/// 插件调用的失败分类。
+///
+/// 关键区别是「这是插件坏了，还是这次调用不行」：只有进程/协议层面的故障才计入插件健康
+/// 并可能触发熔断；能力层错误与超出传输上限的响应属于这次调用的问题，返回给调用方即可，
+/// 不应让插件的所有依赖者一起不可用。
+#[derive(Debug)]
+pub(crate) enum PluginInvocationError {
+    /// 进程或 JSON-RPC 传输失败：计入插件健康。
+    Transport(String),
+    /// 插件正常应答但返回 error：不计入插件健康，也不触发熔断。
+    Capability { capability: String, message: String },
+    /// 单条响应超过传输上限：不计入插件健康，提示该能力改成分页或返回引用。
+    ResponseTooLarge {
+        plugin: String,
+        capability: String,
+        observed_bytes: usize,
+        limit: usize,
+    },
+}
+
+impl PluginInvocationError {
+    /// 是否应计入插件健康（进而可能熔断）。
+    pub(crate) fn records_health(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl std::fmt::Display for PluginInvocationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(message) => write!(formatter, "{message}"),
+            Self::Capability {
+                capability,
+                message,
+            } => write!(formatter, "plugin capability {capability} failed: {message}"),
+            Self::ResponseTooLarge {
+                plugin,
+                capability,
+                observed_bytes,
+                limit,
+            } => write!(
+                formatter,
+                "plugin {plugin} 的 {capability} 响应超过单条上限：已读到 {observed_bytes} 字节，上限 {limit} 字节。该能力应改为分页或返回引用（可用 HIMIND_AGENT_MAX_PLUGIN_RESPONSE_BYTES 调整上限）。"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PluginInvocationError {}
+
+/// 单条插件响应的实际上限，允许用环境变量覆盖以便排障。
+fn max_plugin_response_bytes() -> usize {
+    std::env::var("HIMIND_AGENT_MAX_PLUGIN_RESPONSE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_PLUGIN_RESPONSE_BYTES)
+}
 const PLUGIN_FAILURE_THRESHOLD: u32 = 3;
+
+/// 熔断后的冷却窗口。
+///
+/// 熔断的目的不是永久封禁插件，而是避免连续失败继续拖垮调用方：冷却结束后进入半开
+/// 状态，允许下一次调用去验证插件是否已经恢复——成功就清空健康记录，失败则重新计时。
+/// 少了这一步，被熔断的插件再也不会被调用，也就永远没有自愈的机会。
+const PLUGIN_BREAKER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PluginHealth {
@@ -28,6 +107,27 @@ struct PluginHealth {
     last_failure_at: Option<u64>,
     #[serde(default)]
     last_error: Option<String>,
+}
+
+/// 熔断是否仍然生效（处于冷却窗口内）。
+///
+/// 超过冷却窗口的失败只作为排障信息保留在插件卡片里，不再阻止调用：插件的健康记录
+/// 是历史事实，但"历史失败"不能变成永久不可用。
+fn circuit_is_open(health: &PluginHealth) -> bool {
+    if health.failure_count < PLUGIN_FAILURE_THRESHOLD {
+        return false;
+    }
+    match health.last_failure_at {
+        Some(at) => unix_now().saturating_sub(at) < PLUGIN_BREAKER_COOLDOWN.as_secs(),
+        None => true,
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -144,6 +244,11 @@ pub(crate) struct PluginRegistryItem {
     pub entry_size: Option<u64>,
     pub previous_version: Option<String>,
     pub rollback_available: bool,
+    /// 本机开发登记（免安装直挂）接管了同名已安装副本时才有的字段，记录被接管的
+    /// 已安装版本。界面据此回答"我本来装的是哪个版本、现在跑的又是哪个版本"，
+    /// 而不是让一条开发草稿顶掉已安装条目、把版本号和操作入口一起带偏。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides_installed_version: Option<String>,
     pub capabilities: Vec<PluginCapabilityManifest>,
     pub permissions: Vec<String>,
     pub plugin_dependencies: Vec<PluginDependencyManifest>,
@@ -152,6 +257,9 @@ pub(crate) struct PluginRegistryItem {
     pub error: Option<String>,
     pub failure_count: u32,
     pub circuit_open: bool,
+    /// 最近一次失败的时间（epoch 秒）。用于判断"最近失败"是否仍在有效窗口内。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<u64>,
 }
 
 pub(crate) fn plugin_registry_dir() -> PathBuf {
@@ -183,6 +291,9 @@ fn register_development_plugin_at(
     let manifest = parse_plugin_manifest(content.trim_start_matches('\u{feff}'))?;
     validate_manifest_contributions(&root, &manifest)?;
     validate_development_entry(&root, &manifest)?;
+    // 多个工作区会话可以同时登记各自的开发插件，读改写必须整体串行化，
+    // 否则后登记的会话会把先登记的条目整表覆盖掉。
+    let _lock = crate::store::atomic_file::lock(registry_path)?;
     let mut entries = development_plugins_at(registry_path);
     entries.retain(|entry| entry.id != manifest.id);
     entries.push(DevelopmentPlugin {
@@ -209,6 +320,7 @@ fn unregister_development_plugin_at(
     plugin_id: &str,
     registry_path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
+    let _lock = crate::store::atomic_file::lock(registry_path)?;
     let mut entries = development_plugins_at(registry_path);
     let original_len = entries.len();
     entries.retain(|entry| entry.id != plugin_id);
@@ -230,6 +342,11 @@ fn development_plugins() -> Vec<DevelopmentPlugin> {
     development_plugins_at(&development_registry_path())
 }
 
+/// 版本比较统一走技能解析器里的语义化比较，避免插件侧再写一套规则。
+fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    crate::skill::resolver::compare_versions(left, right)
+}
+
 /// 免安装直挂的插件及其源码/产物目录，供分发单元状态展示。
 pub(crate) fn development_plugin_entries() -> Vec<(String, PathBuf)> {
     development_plugins()
@@ -249,16 +366,56 @@ fn write_development_plugins_at(
     path: &std::path::Path,
     entries: &[DevelopmentPlugin],
 ) -> Result<(), Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(entries)?)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(temporary, path)?;
+    // 原子替换：并发读永远看到完整内容，也不会因为多个会话共用同一个
+    // `.json.tmp` 而互相截断。调用方负责持有注册表锁。
+    crate::store::atomic_file::atomic_write(path, &serde_json::to_vec_pretty(entries)?)?;
     Ok(())
+}
+
+/// 把本机开发登记合并进已安装清单。
+///
+/// 两条规则合起来才叫"单一真源"：
+/// 1. 已安装副本是"我拥有的能力"，默认它就是这条目的全部事实；
+/// 2. 开发登记只有在版本严格更高时才接管条目——它代表运行态真的换成了本机开发版本，
+///    此时条目必须留下被接管的已安装版本（`overrides_installed_version`），
+///    否则用户会看到"已安装"的版本号突然倒退回一条草稿，或者以为插件被降级了。
+///
+/// 版本相同或更低的开发登记不产生任何接管：它仍是「扩展开发」里的草稿，
+/// 但不参与能力列表，免得旧草稿静默盖住用户真正安装的版本。
+fn merge_development_items(
+    items: &mut Vec<PluginRegistryItem>,
+    development_items: Vec<PluginRegistryItem>,
+) {
+    for development_item in development_items {
+        let mut installed_versions = items
+            .iter()
+            .filter(|item| item.id == development_item.id)
+            .map(|item| item.version.clone());
+        let Some(installed_version) = installed_versions.next() else {
+            // 没有已安装副本：这条开发登记就是该插件在本机的唯一存在形式。
+            items.push(development_item);
+            continue;
+        };
+        let installed_version = installed_versions.fold(installed_version, |current, other| {
+            if compare_plugin_versions(&other, &current) == std::cmp::Ordering::Greater {
+                other
+            } else {
+                current
+            }
+        });
+        if compare_plugin_versions(&development_item.version, &installed_version)
+            != std::cmp::Ordering::Greater
+        {
+            continue;
+        }
+        let index = items
+            .iter()
+            .position(|item| item.id == development_item.id)
+            .expect("已安装副本在上面已经确认存在");
+        let mut taken_over = development_item;
+        taken_over.overrides_installed_version = Some(installed_version);
+        items[index] = taken_over;
+    }
 }
 
 pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
@@ -273,10 +430,19 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
             items.push(read_plugin_item(path, false));
         }
     }
-    for entry in development_plugins() {
-        items.retain(|item| item.id != entry.id);
-        items.push(read_plugin_item(PathBuf::from(entry.path), true));
-    }
+    // 开发登记（免安装直挂）是"我正在开发的那份制品"，不是"我拥有的能力"。
+    // 它一旦无条件覆盖同名已安装副本，界面就会出现"已安装"却挂着更低版本号，
+    // 运行态也会静默跑起旧草稿（例如 v0.3.11 盖住已安装的 v0.3.13）。
+    // 只有开发版本严格更高时才接管，否则已安装副本是唯一真源。
+    let development_items = development_plugins()
+        .into_iter()
+        .map(|entry| PathBuf::from(entry.path))
+        // 目录已被删除或移动时登记已失效，直接跳过，不要用一条读不出来的记录
+        // 去顶掉用户真正安装在 plugins/ 下的副本。
+        .filter(|path| path.is_dir())
+        .map(|path| read_plugin_item(path, true))
+        .collect();
+    merge_development_items(&mut items, development_items);
     items.sort_by(|a, b| a.id.cmp(&b.id));
     for (plugin_id, issue) in plugin_dependency_cycle_issues(&items) {
         if let Some(item) = items
@@ -405,8 +571,19 @@ pub(crate) fn plugin_dependency_issues(
             else {
                 return Some(format!("缺少必需插件 {}", dependency.plugin_id));
             };
-            if !provider.enabled || provider.error.is_some() {
-                return Some(format!("必需插件 {} 当前不可用", dependency.plugin_id));
+            // 只有真的不可用（被停用或已熔断）才阻断依赖者。仅仅"最近一次调用失败"
+            // 不算不可用——否则一次超时/一次超限响应就会永久阻断所有依赖它的插件，
+            // 而且被阻断后它再也不会被调用，无法自愈。
+            if !provider.enabled {
+                return Some(format!(
+                    "必需插件 {} {}",
+                    dependency.plugin_id,
+                    if provider.circuit_open {
+                        "连续失败已熔断"
+                    } else {
+                        "当前已停用"
+                    }
+                ));
             }
             if !dependency.min_version.trim().is_empty()
                 && crate::skill::resolver::compare_versions(
@@ -451,6 +628,7 @@ pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Ve
                 entry_size: None,
                 previous_version: None,
                 rollback_available: false,
+                overrides_installed_version: None,
                 capabilities: manifest.capabilities.clone(),
                 permissions: manifest.permissions.clone(),
                 plugin_dependencies: manifest.plugin_dependencies.clone(),
@@ -459,6 +637,7 @@ pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Ve
                 error: None,
                 failure_count: 0,
                 circuit_open: false,
+                last_failure_at: None,
             };
             plugin_dependency_issues(&candidate, &installed)
         }
@@ -580,6 +759,7 @@ fn builtin_plugin(
         entry_size: None,
         previous_version: None,
         rollback_available: false,
+        overrides_installed_version: None,
         capabilities: capability_ids
             .iter()
             .map(|id| PluginCapabilityManifest {
@@ -601,6 +781,7 @@ fn builtin_plugin(
         error: None,
         failure_count: 0,
         circuit_open: false,
+        last_failure_at: None,
     }
 }
 
@@ -718,7 +899,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             let disabled = path.join("disabled").exists();
             let health_root = plugin_health_root(&path, development, &manifest.id);
             let health = read_plugin_health(&health_root);
-            let circuit_open = health.failure_count >= PLUGIN_FAILURE_THRESHOLD;
+            let circuit_open = circuit_is_open(&health);
             let source = fs::read_to_string(path.join("current").join("policy.json"))
                 .ok()
                 .and_then(|content| serde_json::from_str::<Value>(&content).ok())
@@ -736,6 +917,12 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                     }
                 });
             let availability = manifest_availability(&manifest);
+            // 上一版本与当前版本相同时不算"可回滚"：互换只会让版本号原地不动。
+            let previous_version = previous_plugin_version(&path);
+            let rollback_available = previous_version.as_deref().is_some_and(|previous| {
+                crate::skill::resolver::compare_versions(previous, &manifest.version)
+                    != std::cmp::Ordering::Equal
+            });
             PluginRegistryItem {
                 id: manifest.id,
                 name: manifest.name,
@@ -764,9 +951,9 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 entry: manifest.entry,
                 entry_modified_at: entry_metadata.as_ref().and_then(|metadata| metadata.0),
                 entry_size: entry_metadata.map(|metadata| metadata.1),
-                previous_version: previous_plugin_version(&path),
-                rollback_available: path.join("current").join("plugin.json").exists()
-                    && path.join("previous").join("plugin.json").exists(),
+                previous_version,
+                rollback_available,
+                overrides_installed_version: None,
                 capabilities: manifest.capabilities,
                 permissions: manifest.permissions,
                 plugin_dependencies: manifest.plugin_dependencies,
@@ -778,6 +965,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                     .or(health.last_error),
                 failure_count: health.failure_count,
                 circuit_open,
+                last_failure_at: health.last_failure_at,
             }
         }
         Err(error) => PluginRegistryItem {
@@ -801,6 +989,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             entry_size: None,
             previous_version: None,
             rollback_available: false,
+            overrides_installed_version: None,
             capabilities: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
@@ -809,6 +998,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             error: Some(error.to_string()),
             failure_count: 0,
             circuit_open: false,
+            last_failure_at: None,
         },
     }
 }
@@ -932,10 +1122,7 @@ fn record_plugin_failure(root: &std::path::Path, error: &str) {
         .failure_count
         .saturating_add(1)
         .min(PLUGIN_FAILURE_THRESHOLD);
-    health.last_failure_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|value| value.as_secs());
+    health.last_failure_at = Some(unix_now());
     health.last_error = Some(error.chars().take(2048).collect());
     let _ = write_plugin_health(root, &health);
     if !was_unhealthy && health.failure_count >= PLUGIN_FAILURE_THRESHOLD {
@@ -1028,7 +1215,14 @@ fn invoke_plugin_capability_for_item(
     if result.is_ok() {
         clear_plugin_health(&health_root);
     } else if let Err(error) = &result {
-        record_plugin_failure(&health_root, &error.to_string());
+        // 只有进程/协议故障才算插件不健康；能力层错误与超限响应只属于这次调用。
+        let records = error
+            .downcast_ref::<PluginInvocationError>()
+            .map(PluginInvocationError::records_health)
+            .unwrap_or(true);
+        if records {
+            record_plugin_failure(&health_root, &error.to_string());
+        }
     }
     ACTIVE_INVOCATIONS.fetch_sub(1, Ordering::Release);
     result
@@ -1117,7 +1311,7 @@ fn invoke_plugin_process(
         let mut bytes = Vec::new();
         let result = reader
             .by_ref()
-            .take((MAX_PLUGIN_RESPONSE_BYTES + 1) as u64)
+            .take((max_plugin_response_bytes() + 1) as u64)
             .read_until(b'\n', &mut bytes)
             .map(|_| bytes);
         let _ = response_tx.send(result);
@@ -1151,11 +1345,14 @@ fn invoke_plugin_process(
     if !status.success() {
         return Err(format!("plugin exited with status: {status}").into());
     }
-    if response_bytes.len() > MAX_PLUGIN_RESPONSE_BYTES {
-        return Err(format!(
-            "plugin response exceeds {} bytes: {}",
-            MAX_PLUGIN_RESPONSE_BYTES, plugin.id
-        )
+    let response_limit = max_plugin_response_bytes();
+    if response_bytes.len() > response_limit {
+        return Err(PluginInvocationError::ResponseTooLarge {
+            plugin: plugin.id.clone(),
+            capability: capability_id.to_string(),
+            observed_bytes: response_bytes.len(),
+            limit: response_limit,
+        }
         .into());
     }
     let response_line = String::from_utf8(response_bytes)?;
@@ -1165,7 +1362,13 @@ fn invoke_plugin_process(
 
     let response: Value = serde_json::from_str(response_line.trim())?;
     if let Some(error) = response.get("error") {
-        return Err(format!("plugin error: {error}").into());
+        // 插件正常应答、只是这次能力调用报了错（例如参数不合法或业务前置不满足）：
+        // 这是能力层结果，不属于插件健康问题，不能据此把插件和它的依赖者一起判死。
+        return Err(PluginInvocationError::Capability {
+            capability: capability_id.to_string(),
+            message: error.to_string(),
+        }
+        .into());
     }
     Ok(response.get("result").cloned().unwrap_or(response))
 }
@@ -1283,6 +1486,25 @@ pub(crate) fn plugin_execution_dir(plugin: &PluginRegistryItem) -> PathBuf {
     }
 }
 
+/// 依赖锁校验用的插件内容目录：已安装副本取 `versions/<当前版本>`，开发直挂取源码目录。
+///
+/// 不能直接用 `path`（插件产品根）：那个目录里还躺着 `current/`、`previous/`、
+/// `versions/` 和安装期写进去的 `policy.json`（记录来源、治理、授权等本机状态），
+/// 同一个版本在不同机器上装一次摘要就变一次，跨机器校验必然对不上。版本目录是
+/// 打包产物的原样落点，只有它才和发布侧算出来的摘要一致。
+pub(crate) fn plugin_content_dir(plugin: &PluginRegistryItem) -> PathBuf {
+    let root = PathBuf::from(&plugin.path);
+    let version = plugin.version.trim();
+    if validate_plugin_version(version).is_ok() {
+        let version_dir = root.join("versions").join(version);
+        if version_dir.is_dir() {
+            return version_dir;
+        }
+    }
+    // 开发直挂（免安装登记）的插件目录本身就是内容根，没有 `versions/<版本>` 这一层。
+    root
+}
+
 /// Returns the private, per-plugin data directory.
 ///
 /// Extensions own their runtime state (archives, caches, indexes) and the Agent
@@ -1293,7 +1515,7 @@ pub(crate) fn plugin_data_dir(plugin_id: &str) -> PathBuf {
     let safe_id = if is_safe_resource_segment(plugin_id) {
         plugin_id.to_string()
     } else {
-        plugin_id
+        let sanitized: String = plugin_id
             .chars()
             .map(|character| {
                 if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
@@ -1302,7 +1524,14 @@ pub(crate) fn plugin_data_dir(plugin_id: &str) -> PathBuf {
                     '_'
                 }
             })
-            .collect()
+            .collect();
+        // 清洗解决不了 `..`、以点号结尾这类名字（点号本来就在字符集里），
+        // 它们拼进路径会被文件系统解释成别的目录，所以再加一个固定前缀。
+        if crate::path_guard::is_safe_dir_name(&sanitized) {
+            sanitized
+        } else {
+            format!("plugin-{}", sanitized.trim_end_matches(['.', ' ']))
+        }
     };
     if let Some(root) = env::var_os("HIMIND_PLUGIN_DATA_ROOT") {
         let root = PathBuf::from(root);
@@ -1331,6 +1560,9 @@ pub(crate) fn validate_manifest_contributions(
     if !is_safe_resource_segment(&manifest.id) {
         return Err(format!("invalid plugin id: {}", manifest.id).into());
     }
+    // 版本号会被拼成 `versions/<版本>`。它不参与任何"用户可见的名字"，却直接
+    // 决定安装落点，所以必须和 ID 用同一把尺子量。
+    validate_plugin_version(&manifest.version)?;
     validate_independent_capability_contract(manifest)?;
     let mut dependency_ids = std::collections::HashSet::new();
     for dependency in &manifest.plugin_dependencies {
@@ -1448,9 +1680,28 @@ pub(crate) fn validate_development_entry(
 
 fn is_safe_resource_segment(value: &str) -> bool {
     !value.is_empty()
+        && crate::path_guard::is_safe_dir_name(value)
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+/// 插件版本号会原样拼进 `versions/<版本>` 目录名，因此比"任意字符串"更严：
+/// 字符集受限之外，还必须是文件系统会当成普通名字的那种（不是 `.`、`..`、
+/// 也不是以点号结尾的名字，后者在 Windows 上会被规范化掉）。
+///
+/// 这里不强制三段式语义化版本：老包可能用 `1.0` 这类写法，装不上会变成
+/// 用户侧的功能回归；真正要挡住的是"版本号把安装落点挪出插件目录"。
+pub(crate) fn validate_plugin_version(version: &str) -> Result<(), Box<dyn Error>> {
+    let trimmed = version.trim();
+    if !crate::path_guard::is_safe_dir_name(trimmed)
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+    {
+        return Err(format!("invalid plugin version: {version}").into());
+    }
+    Ok(())
 }
 
 fn relative_plugin_resource(
@@ -1829,6 +2080,30 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// 熔断是"冷却"而不是"封禁"：冷却窗口内拒绝调用，窗口结束后重新放行，
+    /// 让下一次调用有机会成功并把插件带回可用状态。
+    #[test]
+    fn plugin_breaker_reopens_after_cooldown() {
+        let cooling = PluginHealth {
+            failure_count: PLUGIN_FAILURE_THRESHOLD,
+            last_failure_at: Some(unix_now()),
+            last_error: Some("plugin timed out after 30 seconds".to_string()),
+        };
+        assert!(circuit_is_open(&cooling));
+
+        let cooled_down = PluginHealth {
+            last_failure_at: Some(unix_now() - PLUGIN_BREAKER_COOLDOWN.as_secs() - 1),
+            ..cooling.clone()
+        };
+        assert!(!circuit_is_open(&cooled_down));
+
+        let below_threshold = PluginHealth {
+            failure_count: PLUGIN_FAILURE_THRESHOLD - 1,
+            ..cooling
+        };
+        assert!(!circuit_is_open(&below_threshold));
+    }
+
     #[test]
     fn legacy_plugin_view_defaults_to_quick_access_metadata() {
         let manifest = parse_plugin_manifest(
@@ -1923,6 +2198,51 @@ mod tests {
         };
 
         assert!(validate_manifest_contributions(&root, &manifest).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 版本号会被拼成 `versions/<版本>`：`..` 之类会改变落点的写法必须在清单
+    /// 校验阶段就被拒，而不是等到拼接路径时才被文件系统解释成上级目录。
+    #[test]
+    fn rejects_version_that_escapes_the_version_directory() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-version-test-{}", next_request_id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut manifest = PluginManifest {
+            id: "demo.version".to_string(),
+            name: "Demo".to_string(),
+            author: "测试作者".to_string(),
+            description: String::new(),
+            release_notes: "测试插件版本号。".to_string(),
+            version: "1.0.0".to_string(),
+            entry: "plugin.exe".to_string(),
+            runtime: "process-jsonrpc-stdio".to_string(),
+            min_agent_version: String::new(),
+            categories: Vec::new(),
+            governance: "optional".to_string(),
+            capabilities: Vec::new(),
+            permissions: Vec::new(),
+            plugin_dependencies: Vec::new(),
+            contributes: PluginContributions::default(),
+        };
+        assert!(validate_manifest_contributions(&root, &manifest).is_ok());
+
+        for version in [".", "..", "...", "1.0.0.", "..\\..\\escaped", "../escaped"] {
+            manifest.version = version.to_string();
+            assert!(
+                validate_plugin_version(version).is_err(),
+                "{version:?} 不该通过版本号校验"
+            );
+            assert!(
+                validate_manifest_contributions(&root, &manifest).is_err(),
+                "{version:?} 不该通过插件清单校验"
+            );
+        }
+        manifest.version = "0.0.0+sha.abcdef123456".to_string();
+        assert!(
+            validate_manifest_contributions(&root, &manifest).is_ok(),
+            "标准包用内容摘要生成的版本号必须继续可用"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2097,6 +2417,55 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// 一个 Agent 可以同时服务多个工作区会话，每个会话都在登记自己的开发插件。
+    /// 并发登记不允许丢条目，也不允许出现读不到的中间态。
+    #[test]
+    fn concurrent_development_plugin_registrations_lose_nothing() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-dev-concurrent-{}", next_request_id()));
+        let registry = root.join("plugin-development.json");
+        let projects = (0..6)
+            .map(|index| {
+                let project = root.join(format!("project-{index}"));
+                fs::create_dir_all(project.join("bin")).unwrap();
+                fs::write(project.join("bin/demo.exe"), "test executable").unwrap();
+                fs::write(
+                    project.join("plugin.json"),
+                    format!(
+                        r#"{{"id":"demo.concurrent.{index}","name":"Demo {index}","version":"1.0.0","runtime":"process-jsonrpc-stdio","entry":"bin/demo.exe"}}"#
+                    ),
+                )
+                .unwrap();
+                project
+            })
+            .collect::<Vec<_>>();
+
+        let barrier = std::sync::Barrier::new(projects.len());
+        std::thread::scope(|scope| {
+            for project in &projects {
+                let registry = registry.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    register_development_plugin_at(project, &registry).unwrap();
+                });
+            }
+        });
+
+        let mut ids = development_plugins_at(&registry)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            (0..6)
+                .map(|index| format!("demo.concurrent.{index}"))
+                .collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rejects_unbuilt_or_escaping_development_entry() {
         let root =
@@ -2118,6 +2487,75 @@ mod tests {
         )
         .unwrap();
         assert!(register_development_plugin_at(&project, &registry).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_copy_stays_authoritative_until_development_version_is_newer() {
+        let root =
+            std::env::temp_dir().join(format!("agent-plugin-merge-test-{}", next_request_id()));
+        let installed_dir = root.join("plugins/demo.merge");
+        let development_dir = root.join("draft/demo.merge");
+        let write_package = |dir: &std::path::Path, version: &str| {
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("bin/demo.exe"), "test executable").unwrap();
+            fs::write(
+                dir.join("plugin.json"),
+                format!(
+                    r#"{{"id":"demo.merge","name":"Demo","version":"{version}","runtime":"process-jsonrpc-stdio","entry":"bin/demo.exe"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write_package(&installed_dir, "0.3.13");
+
+        // 旧草稿（更低版本）不接管：这就是用户报的"已安装却挂着 v0.3.11"。
+        write_package(&development_dir, "0.3.11");
+        let mut items = vec![read_plugin_item(installed_dir.clone(), false)];
+        merge_development_items(
+            &mut items,
+            vec![read_plugin_item(development_dir.clone(), true)],
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].version, "0.3.13");
+        assert!(!items[0].development);
+        assert!(items[0].overrides_installed_version.is_none());
+
+        // 版本相同也不接管：重建一份同版本草稿不该让已安装条目变成"开发中"。
+        write_package(&development_dir, "0.3.13");
+        let mut items = vec![read_plugin_item(installed_dir.clone(), false)];
+        merge_development_items(
+            &mut items,
+            vec![read_plugin_item(development_dir.clone(), true)],
+        );
+        assert_eq!(items[0].version, "0.3.13");
+        assert!(!items[0].development);
+
+        // 更高版本接管，但必须留下被接管的已安装版本，界面上两个版本都要说清楚。
+        write_package(&development_dir, "0.3.14");
+        let mut items = vec![read_plugin_item(installed_dir.clone(), false)];
+        merge_development_items(
+            &mut items,
+            vec![read_plugin_item(development_dir.clone(), true)],
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].version, "0.3.14");
+        assert!(items[0].development);
+        assert_eq!(
+            items[0].overrides_installed_version.as_deref(),
+            Some("0.3.13")
+        );
+
+        // 没有已安装副本时，开发登记就是这条插件在本机的唯一存在形式。
+        let mut items: Vec<PluginRegistryItem> = Vec::new();
+        merge_development_items(
+            &mut items,
+            vec![read_plugin_item(development_dir.clone(), true)],
+        );
+        assert_eq!(items.len(), 1);
+        assert!(items[0].development);
+        assert!(items[0].overrides_installed_version.is_none());
+
         let _ = fs::remove_dir_all(root);
     }
 }

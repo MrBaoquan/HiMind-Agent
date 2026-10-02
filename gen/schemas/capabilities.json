@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"主窗口与设置窗口的事件订阅权限。前端只用到一个插件能力：@tauri-apps/api/event 的 listen/unlisten（设置窗口深链导航、扩展批量更新进度）。没有这份 capability 时 Tauri 会以「Command plugin:event|listen not allowed by ACL」拒绝注册，事件静默丢失，界面看起来像没反应。","local":true,"windows":["main","settings"],"permissions":["core:event:default"]}}

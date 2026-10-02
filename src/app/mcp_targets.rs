@@ -303,11 +303,13 @@ fn json_target_definitions(home: &Path) -> Vec<JsonTargetDefinition> {
             "claude-desktop",
             "Claude Desktop",
             "claude",
-            app_data.join("Claude").join("claude_desktop_config.json"),
+            // 3P 启用时 Claude Desktop 的 userData 指向 `Claude-3p`，`mcpServers` 也随之
+            // 落在那边；沿用 1P 路径会写出一个客户端根本不读的文件。
+            crate::app::ai_provider_import::claude_desktop_app_config_path(),
             "mcpServers",
             "JSON",
             standard,
-            vec![app_data.join("Claude")],
+            crate::app::ai_provider_import::claude_desktop_detect_dirs(),
             true,
         ),
         target(
@@ -896,7 +898,7 @@ fn parse_json_document(content: &str, format: &str) -> Result<Value, serde_json:
     }
 }
 
-fn strip_jsonc_comments(content: &str) -> String {
+pub(crate) fn strip_jsonc_comments(content: &str) -> String {
     let mut output = String::with_capacity(content.len());
     let bytes = content.as_bytes();
     let mut index = 0;

@@ -1,0 +1,87 @@
+[
+  {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.himind.curated/memory",
+    "title": "记忆",
+    "description": "让 AI 跨会话记住你的偏好和事实。",
+    "version": "2026.8.31",
+    "repository": { "url": "https://github.com/modelcontextprotocol/servers", "source": "github" },
+    "_meta": { "io.himind.catalog": { "curated": true, "runtimeLabel": "Node.js（npx）" } },
+    "packages": [
+      {
+        "registryType": "npm",
+        "identifier": "@modelcontextprotocol/server-memory",
+        "version": "2026.8.31",
+        "runtimeHint": "npx",
+        "transport": { "type": "stdio" },
+        "runtimeArguments": [{ "type": "positional", "value": "-y" }]
+      }
+    ]
+  },
+  {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.himind.curated/sequential-thinking",
+    "title": "顺序思考",
+    "description": "把复杂问题拆成一步一步推演。",
+    "version": "2026.8.31",
+    "repository": { "url": "https://github.com/modelcontextprotocol/servers", "source": "github" },
+    "_meta": { "io.himind.catalog": { "curated": true, "runtimeLabel": "Node.js（npx）" } },
+    "packages": [
+      {
+        "registryType": "npm",
+        "identifier": "@modelcontextprotocol/server-sequential-thinking",
+        "version": "2026.8.31",
+        "runtimeHint": "npx",
+        "transport": { "type": "stdio" },
+        "runtimeArguments": [{ "type": "positional", "value": "-y" }]
+      }
+    ]
+  },
+  {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.himind.curated/filesystem",
+    "title": "文件系统",
+    "description": "让 AI 读写你指定的目录。",
+    "version": "2026.8.31",
+    "repository": { "url": "https://github.com/modelcontextprotocol/servers", "source": "github" },
+    "_meta": { "io.himind.catalog": { "curated": true, "runtimeLabel": "Node.js（npx）" } },
+    "packages": [
+      {
+        "registryType": "npm",
+        "identifier": "@modelcontextprotocol/server-filesystem",
+        "version": "2026.8.31",
+        "runtimeHint": "npx",
+        "transport": { "type": "stdio" },
+        "runtimeArguments": [{ "type": "positional", "value": "-y" }],
+        "packageArguments": [
+          {
+            "type": "positional",
+            "valueHint": "directory",
+            "isRequired": true,
+            "placeholder": "选择要授权给 AI 的目录",
+            "description": "这个目录会被 AI 读写，请只授权确实需要的范围。"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "io.himind.curated/everything",
+    "title": "示例工具",
+    "description": "官方示例服务，用来检查连接是否正常。",
+    "version": "2026.8.31",
+    "repository": { "url": "https://github.com/modelcontextprotocol/servers", "source": "github" },
+    "_meta": { "io.himind.catalog": { "curated": true, "runtimeLabel": "Node.js（npx）" } },
+    "packages": [
+      {
+        "registryType": "npm",
+        "identifier": "@modelcontextprotocol/server-everything",
+        "version": "2026.8.31",
+        "runtimeHint": "npx",
+        "transport": { "type": "stdio" },
+        "runtimeArguments": [{ "type": "positional", "value": "-y" }]
+      }
+    ]
+  }
+]

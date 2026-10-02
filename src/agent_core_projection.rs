@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::api::client::load_agent_state;
 use crate::api::oauth::{platform_access_token, AI_CONVERSATION_SCOPE};
-use crate::store::local_runs::{LocalRunLedger, ProjectionOutboxRecord};
+use crate::store::local_runs::{LocalRunLedger, ProjectionDeadLetterGroup, ProjectionOutboxRecord};
 use crate::Options;
 
 const PROJECTION_BATCH_LIMIT: usize = 32;
@@ -32,12 +32,37 @@ pub(crate) struct ProjectionSyncStatus {
     pub dead_letter: u64,
     pub oldest_pending_at: String,
     pub last_error: String,
+    /// 同步失败按原因归组（最多 3 类）：界面只需给出「卡在哪一类错误上」，不用展开全部记录。
+    pub dead_letter_reasons: Vec<ProjectionDeadLetterGroup>,
+}
+
+/// 手工重投死信的结果：重投只把记录放回队列，真正上报由投影循环或 `--drain` 完成。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProjectionRequeueReport {
+    pub requeued: usize,
+    pub dead_letter_before: u64,
+    pub dead_letter_after: u64,
+    pub pending_after: u64,
+    pub remaining_reasons: Vec<ProjectionDeadLetterGroup>,
+}
+
+/// 一次性排空队列的结果，用于批量恢复后立刻确认「确实追上去了」。
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct ProjectionDrainReport {
+    pub batches: usize,
+    pub projected: usize,
+    pub retried: usize,
+    pub dead_letter: usize,
+    pub skipped: usize,
+    pub pending_after: u64,
+    pub stopped_reason: String,
 }
 
 pub(crate) fn projection_sync_status(
     options: &Options,
 ) -> Result<ProjectionSyncStatus, Box<dyn Error>> {
-    let summary = LocalRunLedger::open_default()?.projection_outbox_summary()?;
+    let ledger = LocalRunLedger::open_default()?;
+    let summary = ledger.projection_outbox_summary()?;
     let dashboard_enabled = options.mode().dashboard_enabled();
     let state = if !dashboard_enabled {
         "local_only"
@@ -47,6 +72,11 @@ pub(crate) fn projection_sync_status(
         "pending"
     } else {
         "synced"
+    };
+    let dead_letter_reasons = if summary.dead_letter > 0 {
+        ledger.dead_letter_projection_groups(3)?
+    } else {
+        Vec::new()
     };
     Ok(ProjectionSyncStatus {
         dashboard_enabled,
@@ -58,7 +88,60 @@ pub(crate) fn projection_sync_status(
         dead_letter: summary.dead_letter,
         oldest_pending_at: summary.oldest_pending_at,
         last_error: summary.last_error,
+        dead_letter_reasons,
     })
+}
+
+/// 重投死信：`None` 覆盖全部死信，`Some(片段)` 只覆盖 `last_error` 命中该片段的记录。
+pub(crate) fn requeue_dead_letter_projections(
+    error_fragment: Option<&str>,
+) -> Result<ProjectionRequeueReport, Box<dyn Error>> {
+    let ledger = LocalRunLedger::open_default()?;
+    let dead_letter_before = ledger.projection_outbox_summary()?.dead_letter;
+    let requeued = ledger.requeue_dead_letter_projections(error_fragment)?;
+    let summary = ledger.projection_outbox_summary()?;
+    Ok(ProjectionRequeueReport {
+        requeued,
+        dead_letter_before,
+        dead_letter_after: summary.dead_letter,
+        pending_after: summary.pending,
+        remaining_reasons: ledger.dead_letter_projection_groups(5)?,
+    })
+}
+
+/// 重投之后把待发队列一次排空，省掉「重投完还要盯着 30 秒一轮的循环」。
+///
+/// 循环每轮最多处理 [`PROJECTION_BATCH_LIMIT`] 条，因此这里按批推进；某一轮完全没有进展
+/// （例如工作台仍不可达、记录全部在重试退避中）就停下，把结果交回调用方判断。
+pub(crate) fn drain_pending_projections(
+    options: &Options,
+    max_batches: usize,
+) -> Result<ProjectionDrainReport, Box<dyn Error>> {
+    if !options.mode().dashboard_enabled() {
+        return Err("AI 工作台未启用，本地运行记录会保留到重新对接后再同步".into());
+    }
+    let mut report = ProjectionDrainReport::default();
+    for _ in 0..max_batches.clamp(1, 2000) {
+        let batch = flush_pending_projections(options)?;
+        report.batches += 1;
+        report.projected += batch.projected;
+        report.retried += batch.retried;
+        report.dead_letter += batch.dead_letter;
+        report.skipped += batch.skipped;
+        if batch.projected + batch.retried + batch.dead_letter + batch.skipped == 0 {
+            break;
+        }
+    }
+    let summary = LocalRunLedger::open_default()?.projection_outbox_summary()?;
+    report.pending_after = summary.pending;
+    report.stopped_reason = if summary.pending == 0 {
+        "drained".to_string()
+    } else if report.batches >= max_batches.clamp(1, 2000) {
+        "batch_limit".to_string()
+    } else {
+        "no_progress".to_string()
+    };
+    Ok(report)
 }
 
 pub(crate) fn flush_pending_projections(
@@ -142,7 +225,7 @@ fn deliver_projection(
     let response = client
         .post(format!(
             "{}/api/integrations/agent-core/v1/projections",
-            options.api_base.trim_end_matches('/')
+            options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(access_token)
         .header("X-HiMind-Agent-ID", agent_id)
@@ -231,7 +314,7 @@ mod tests {
         });
 
         let options = crate::Options {
-            api_base: format!("http://{address}"),
+            api_base: crate::api_base_cell(format!("http://{address}")),
             ..crate::Options::from_env()
         };
         let client = Client::builder()

@@ -35,6 +35,7 @@ use crate::capability::software_distribution::{
 use crate::capability::types::{
     CapabilityAvailability, CapabilityDescriptor, InvocationContext, InvocationTransport,
 };
+use crate::extension_contracts::DistributionTarget;
 use crate::store::credentials::{local_login_status_json, local_login_status_value};
 use crate::store::types::LocalWorkerStatus;
 use crate::svn::service::{
@@ -126,6 +127,20 @@ enum CapabilityHandler {
     ExtensionWorkspaceClear,
     ExtensionRevisionCreate,
     ExtensionLock,
+    ExtensionDistributionTargetGet,
+    ExtensionDistributionTargetSet,
+    ExtensionDistributionPreview,
+    ExtensionDistributionPublish,
+    ExtensionDistributionStateGet,
+    ReleaseInstallPlan,
+    ReleaseInstallApply,
+    GithubAccountGet,
+    GithubAccountSet,
+    GithubAccountRemove,
+    GithubAppAuthorizeStart,
+    GithubAppAuthorizePoll,
+    GithubAppInstallations,
+    GithubAppInstallationSelect,
     InnerAdminLoginStatus,
     SystemOpenFolder,
     FilesystemDelete,
@@ -155,8 +170,10 @@ enum CapabilityHandler {
     SkillClientsUnregister,
     SkillSubmissionSubmit,
     SkillSubmissionStatus,
+    SkillCandidateConfirm,
     PluginCandidateSave,
     PluginCandidateTest,
+    PluginCandidateConfirm,
     WorkflowCandidateSave,
     WorkflowCandidateTest,
     WorkflowCandidateConfirm,
@@ -220,6 +237,10 @@ enum CapabilityHandler {
     McpRegistrationRemoveAll,
     McpConnectionTest,
     BusinessIntegrationDynamic(BusinessCapabilityContract),
+    MarketSearch,
+    MarketInstalled,
+    MarketInstallPlan,
+    MarketInstall,
 }
 
 #[derive(Clone)]
@@ -592,7 +613,7 @@ impl CapabilityGateway {
             registration(
                 "ai.client.import",
                 "接入 AI 客户端",
-                "为指定 AI 客户端配置指定 AI 服务；执行前应确认目标客户端、服务源和本机配置变更。",
+                "为指定 AI 客户端配置指定 AI 服务；执行前应确认目标客户端、服务源和本机配置变更。目标已注册其它来源时默认拒绝，replace=true 表示先撤销旧注册再写入。",
                 "local_write",
                 json!({
                     "type": "object",
@@ -602,6 +623,11 @@ impl CapabilityGateway {
                             "type": "string",
                             "default": "managed",
                             "pattern": "^(managed|custom:[A-Za-z0-9_-]{1,64})$"
+                        },
+                        "replace": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "目标客户端已注册其它 AI 服务时，先撤销旧注册再写入当前服务"
                         }
                     },
                     "required": ["target"],
@@ -675,7 +701,7 @@ impl CapabilityGateway {
                         "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
                         "display_name": { "type": "string" },
                         "base_url": { "type": "string" },
-                        "protocol": { "type": "string", "enum": ["openai-chat", "openai-responses"] },
+                        "protocol": { "type": "string", "enum": ["openai-chat", "openai-responses", "anthropic"] },
                         "model": { "type": "string" },
                         "models": { "type": "array", "items": { "type": "string" } },
                         "api_key": { "type": "string" }
@@ -884,15 +910,19 @@ impl CapabilityGateway {
             registration(
                 "extension.workspace.current",
                 "当前扩展工作区",
-                "返回当前扩展工作区、绑定来源，以及检测到的插件或 Skill 项目身份。",
+                "返回当前扩展工作区、绑定来源，以及检测到的插件或 Skill 项目身份。可传入 workspace_root 查询指定会话的工作区。",
                 "read_only",
-                json!({ "type": "object", "additionalProperties": false }),
+                json!({
+                    "type": "object",
+                    "properties": { "workspace_root": { "type": "string" } },
+                    "additionalProperties": false
+                }),
                 CapabilityHandler::ExtensionWorkspaceCurrent,
             ),
             registration(
                 "extension.workspace.bind",
                 "绑定扩展工作区",
-                "将外部 AI 会话绑定到聚合仓库、插件或 Skill 目录；不打开文件夹，不依赖 Dashboard。",
+                "将外部 AI 会话绑定到聚合仓库、插件或 Skill 目录；绑定按会话累加，互不覆盖。",
                 "local_write",
                 json!({
                     "type": "object",
@@ -905,9 +935,13 @@ impl CapabilityGateway {
             registration(
                 "extension.workspace.clear",
                 "清除扩展工作区绑定",
-                "清除 Agent 保存的外部 AI 扩展工作区绑定，恢复会话或进程目录。",
+                "清除 Agent 保存的外部 AI 扩展工作区绑定；传入 workspace_root 只解除该目录，否则清除本机全部绑定。",
                 "local_write",
-                json!({ "type": "object", "additionalProperties": false }),
+                json!({
+                    "type": "object",
+                    "properties": { "workspace_root": { "type": "string" } },
+                    "additionalProperties": false
+                }),
                 CapabilityHandler::ExtensionWorkspaceClear,
             ),
             registration(
@@ -934,6 +968,285 @@ impl CapabilityGateway {
                 "read_only",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::ExtensionLock,
+            ),
+            registration(
+                "extension.distribution.target.get",
+                "读取扩展分发目标",
+                "读取扩展项目的生效分发目标（工作台 / GitHub / 两者）及其来源：项目覆盖、分发单元默认或系统默认。不传 kind 和 id 时返回全部项目。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionDistributionTargetGet,
+            ),
+            registration(
+                "extension.distribution.target.set",
+                "设置扩展分发目标",
+                "设置扩展项目的分发目标覆盖。传 targets 为生效集合，传 inherit=true 清除覆盖并回到分发单元默认。空集合会被拒绝。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
+                        "id": { "type": "string", "minLength": 1 },
+                        "targets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "enum": ["workbench", "github"] }
+                        },
+                        "inherit": { "type": "boolean" }
+                    },
+                    "required": ["kind", "id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionDistributionTargetSet,
+            ),
+            registration(
+                "extension.distribution.preview",
+                "预览扩展发布",
+                "在不产生任何远端副作用的前提下，返回这次发布的目标、仓库、tag、资产名、制品摘要与凭据状态。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
+                        "id": { "type": "string" },
+                        "version": { "type": "string" }
+                    },
+                    "required": ["kind", "id", "version"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionDistributionPreview,
+            ),
+            registration(
+                "extension.distribution.publish",
+                "按目标发布扩展",
+                "按项目生效的分发目标投递已确认候选制品：先 GitHub Release（tag + 制品 + 发布清单），再工作台提审。全部成功为 released，部分成功为 partially_published，失败写入分发台账。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
+                        "id": { "type": "string" },
+                        "version": { "type": "string" }
+                    },
+                    "required": ["kind", "id", "version"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionDistributionPublish,
+            ),
+            registration(
+                "extension.distribution.state.get",
+                "读取扩展分发台账",
+                "读取扩展制品的分发台账：每个版本在各目标上的状态、tag、Release 地址、制品摘要与错误信息。不传 kind 和 id 时返回全部记录。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] },
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionDistributionStateGet,
+            ),
+            registration(
+                "github.account.get",
+                "读取 GitHub 账号",
+                "读取本机保存的 GitHub 分发账号状态（登录名与已授权仓库）。不返回令牌内容。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::GithubAccountGet,
+            ),
+            registration(
+                "github.account.set",
+                "授权 GitHub 账号",
+                "校验并保存 GitHub 分发凭据：先用令牌调用 GitHub 校验登录名，再以 DPAPI 加密存储。令牌不会写入日志或项目记录。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "token": { "type": "string", "minLength": 1 },
+                        "token_kind": { "type": "string", "enum": ["fine_grained_pat", "classic_pat"] },
+                        "repositories": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["token"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::GithubAccountSet,
+            ),
+            registration(
+                "github.account.remove",
+                "解除 GitHub 授权",
+                "删除本机保存的 GitHub 分发凭据。",
+                "local_write",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::GithubAccountRemove,
+            ),
+            registration(
+                "github.app.authorize.start",
+                "开始 GitHub App 授权",
+                "申请 GitHub App 设备码，返回 user_code 与验证地址，用户在浏览器完成授权后用 github.app.authorize.poll 继续。需要组织先注册 App 并配置 HIMIND_GITHUB_APP_CLIENT_ID。",
+                "local_write",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::GithubAppAuthorizeStart,
+            ),
+            registration(
+                "github.app.authorize.poll",
+                "轮询 GitHub App 授权",
+                "用设备码换取 user token；返回 pending / slow_down 时按 interval 再次调用。授权成功会保存授权事实并返回可用安装列表。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": { "device_code": { "type": "string", "minLength": 1 } },
+                    "required": ["device_code"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::GithubAppAuthorizePoll,
+            ),
+            registration(
+                "github.app.installations",
+                "列出 GitHub App 安装",
+                "列出当前用户可用的 GitHub App 安装（组织或个人），供绑定发布目标。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::GithubAppInstallations,
+            ),
+            registration(
+                "github.app.installation.select",
+                "绑定 GitHub App 安装",
+                "绑定选定的安装；之后的发布、安装与私仓读取都使用该安装签发的短期令牌。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": { "installation_id": { "type": "string", "minLength": 1 } },
+                    "required": ["installation_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::GithubAppInstallationSelect,
+            ),
+            registration(
+               "extension.distribution.install.plan",
+                "解析扩展安装计划",
+                "读取 GitHub Release 的发布清单，按依赖优先的拓扑序返回安装计划。会在本机验证依赖是否已安装、pin 是否与清单一致，不写入任何安装目录。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": { "type": "string", "minLength": 1 },
+                        "tag": { "type": "string", "minLength": 1 },
+                        "id": { "type": "string", "minLength": 1 },
+                        "version": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["repository", "tag", "id", "version"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ReleaseInstallPlan,
+            ),
+            registration(
+                "extension.distribution.install",
+                "从 Release 安装扩展",
+                "按发布清单安装扩展：逐个下载并校验制品摘要，依赖优先安装，任一环节失败整体回滚。dry_run=true 只下载与校验，不写入安装目录。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": { "type": "string", "minLength": 1 },
+                        "tag": { "type": "string", "minLength": 1 },
+                        "id": { "type": "string", "minLength": 1 },
+                        "version": { "type": "string", "minLength": 1 },
+                        "dry_run": { "type": "boolean" }
+                    },
+                    "required": ["repository", "tag", "id", "version"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ReleaseInstallApply,
+            ),
+            registration(
+                "market.search",
+                "市场能力搜索",
+                "在扩展市场里搜索可安装的技能、插件与工作流。缺能力时先用它找候选，再判断是否要装。只读，不改动本机。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["skill", "plugin", "workflow"] },
+                        "query": { "type": "string", "maxLength": 200 },
+                        "category": { "type": "string", "maxLength": 120 },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                        "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                        "source": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::MarketSearch,
+            ),
+            registration(
+                "market.installed",
+                "已安装能力盘点",
+                "盘点本机已经拥有的技能、插件与工作流：技能带安装落点，插件带运行态，工作流带启停与来源。只读。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["skill", "plugin", "workflow"] }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::MarketInstalled,
+            ),
+            registration(
+                "market.install.plan",
+                "市场安装计划",
+                "在真正安装之前先给出计划：版本、来源、制品摘要、依赖、安装落点与阻塞原因。dry_run 只算是计划的一部分，本能力本身不写入任何文件。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["skill", "plugin", "workflow"] },
+                        "id": { "type": "string", "minLength": 1, "maxLength": 200 },
+                        "version": { "type": "string" },
+                        "source": { "type": "string" },
+                        "artifact_id": { "type": "string" },
+                        "sha256": { "type": "string" },
+                        "workspace_root": { "type": "string" },
+                        "target_clients": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["kind", "id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::MarketInstallPlan,
+            ),
+            registration(
+                "market.install",
+                "从市场安装能力",
+                "把市场里的技能、插件或工作流装到本机。执行前会重新算一遍计划，计划未就绪时拒绝执行；技能可装到全局或指定项目目录，并可指定投放的 AI 客户端。这是写入本机的操作，须由用户确认后执行，模型不得替用户批准。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["skill", "plugin", "workflow"] },
+                        "id": { "type": "string", "minLength": 1, "maxLength": 200 },
+                        "version": { "type": "string" },
+                        "source": { "type": "string" },
+                        "artifact_id": { "type": "string" },
+                        "sha256": { "type": "string" },
+                        "workspace_root": { "type": "string" },
+                        "target_clients": { "type": "array", "items": { "type": "string" } },
+                        "dry_run": { "type": "boolean" }
+                    },
+                    "required": ["kind", "id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::MarketInstall,
             ),
             registration(
                 "system.health",
@@ -1685,6 +1998,14 @@ impl CapabilityGateway {
                 CapabilityHandler::SkillCandidateTest,
             ),
             registration(
+                "extension.skill.candidate.confirm",
+                "确认 Skill 候选",
+                "复验候选包哈希后确认当前版本，后续提交审核只能引用该不可变候选。",
+                "local_write",
+                authoring_identity_schema(),
+                CapabilityHandler::SkillCandidateConfirm,
+            ),
+            registration(
                 "extension.test",
                 "测试扩展候选",
                 "按插件、Skill 或 Workflow 类型执行候选测试并返回结构化报告。",
@@ -1788,6 +2109,14 @@ impl CapabilityGateway {
                 "local_write",
                 authoring_identity_schema(),
                 CapabilityHandler::PluginCandidateTest,
+            ),
+            registration(
+                "extension.plugin.candidate.confirm",
+                "确认插件候选",
+                "复验候选包哈希后确认当前版本，后续提交审核只能引用该不可变候选。",
+                "local_write",
+                authoring_identity_schema(),
+                CapabilityHandler::PluginCandidateConfirm,
             ),
             registration(
                 "extension.workflow.candidate.save",
@@ -2183,21 +2512,32 @@ impl CapabilityGateway {
             }
         }
         // User-managed MCP servers are discovered lazily and projected into
-        // the same gateway as built-in and plugin capabilities. Discovery
-        // failures are isolated to that downstream server.
-        if let Ok(downstream) = self.downstream_mcp.list_capabilities() {
-            for (descriptor, _) in downstream {
-                let capability_id = descriptor.id.clone();
-                if registry.contains_key(&capability_id) {
-                    continue;
+        // the same gateway as built-in and plugin capabilities. A downstream
+        // that fails to start only removes its own tools, unless the user
+        // marked it as required, in which case the missing toolset is an error
+        // instead of a silent gap.
+        match self.downstream_mcp.list_capabilities() {
+            Ok(downstream) => {
+                // 标记为「必须可用」的下游连不上时，宁可直接失败，也不要让会话
+                // 拿着一套残缺的工具继续跑。
+                if let Some(failure) = downstream.blocking_failures.into_iter().next() {
+                    return Err(failure.into());
                 }
-                let mut registration = CapabilityRegistration {
-                    descriptor,
-                    handler: CapabilityHandler::DownstreamMcp(capability_id),
-                };
-                apply_registry_metadata(&mut registration.descriptor, &registration.handler);
-                insert_registration(&mut registry, registration)?;
+                for (descriptor, _) in downstream.capabilities {
+                    let capability_id = descriptor.id.clone();
+                    if registry.contains_key(&capability_id) {
+                        continue;
+                    }
+                    let mut registration = CapabilityRegistration {
+                        descriptor,
+                        handler: CapabilityHandler::DownstreamMcp(capability_id),
+                    };
+                    apply_registry_metadata(&mut registration.descriptor, &registration.handler);
+                    insert_registration(&mut registry, registration)?;
+                }
             }
+            // 读不了个人 MCP 配置不算致命：这类工具本就可选，缺了不影响其它能力。
+            Err(_) => {}
         }
         // Remote business systems are optional providers. Independent mode
         // never reads their catalog; Connected mode projects ordinary
@@ -2353,7 +2693,7 @@ impl CapabilityGateway {
             return Err(serde_json::json!({
                 "code": "control_plane_required",
                 "capability_id": capability_id,
-                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换到组织模式并重启 Agent"
+                "message": "此能力由 AI 工作台提供；请在设置中开启「AI 工作台」后重试"
             })
             .to_string()
             .into());
@@ -2606,7 +2946,9 @@ impl CapabilityGateway {
                     context.clone(),
                 )
             }
-            CapabilityHandler::ScheduleList => crate::scheduler::list(crate::scheduler::now_epoch()),
+            CapabilityHandler::ScheduleList => {
+                crate::scheduler::list(crate::scheduler::now_epoch())
+            }
             CapabilityHandler::ScheduleSet => {
                 crate::scheduler::set(&input, crate::scheduler::now_epoch())
             }
@@ -2657,12 +2999,7 @@ impl CapabilityGateway {
                         }
                     }
                 }
-                crate::skill_run::start(
-                    self.options(),
-                    "",
-                    skill_id,
-                    &run_input,
-                )
+                crate::skill_run::start(self.options(), "", skill_id, &run_input)
             }
             CapabilityHandler::SkillRunList => {
                 let limit = input
@@ -2748,6 +3085,28 @@ impl CapabilityGateway {
             }
             CapabilityHandler::CapabilityCatalogDescribe => {
                 Ok(self.describe_capability(context, &input)?)
+            }
+            CapabilityHandler::MarketSearch => {
+                let agent_id = self.paired_agent_id();
+                Ok(crate::app::market::search(
+                    &self.options,
+                    &agent_id,
+                    &input,
+                )?)
+            }
+            CapabilityHandler::MarketInstalled => Ok(crate::app::market::installed(&input)?),
+            CapabilityHandler::MarketInstallPlan => {
+                let agent_id = self.paired_agent_id();
+                Ok(crate::app::market::plan(&self.options, &agent_id, &input)?)
+            }
+            CapabilityHandler::MarketInstall => {
+                let agent_id = self.paired_agent_id();
+                Ok(crate::app::market::install(
+                    &self.options,
+                    &agent_id,
+                    &input,
+                    context.source,
+                )?)
             }
             CapabilityHandler::AIClientList => Ok(serde_json::to_value(
                 crate::app::ai_provider_import::status(&self.options),
@@ -2836,13 +3195,171 @@ impl CapabilityGateway {
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
             CapabilityHandler::AuthoringPreflight => self.authoring_preflight(input),
             CapabilityHandler::ExtensionWorkspaceCurrent => {
-                crate::extension_projects::current_workspace()
+                crate::extension_projects::current_workspace(input.get("workspace_root"))
             }
             CapabilityHandler::ExtensionWorkspaceBind => self.bind_extension_workspace(input),
-            CapabilityHandler::ExtensionWorkspaceClear => self.clear_extension_workspace(),
+            CapabilityHandler::ExtensionWorkspaceClear => self.clear_extension_workspace(input),
             CapabilityHandler::ExtensionRevisionCreate => self.create_extension_revision(input),
             CapabilityHandler::ExtensionLock => {
                 Ok(serde_json::to_value(crate::app::extension_lock::load()?)?)
+            }
+            CapabilityHandler::ExtensionDistributionTargetGet => {
+                self.read_distribution_targets(input)
+            }
+            CapabilityHandler::ExtensionDistributionTargetSet => {
+                self.set_distribution_targets(input)
+            }
+            CapabilityHandler::ExtensionDistributionPreview => {
+                let (kind, id, version) = distribution_identity(&input, true)?;
+                crate::app::distribution_publish::preview(kind, &id, &version)
+            }
+            CapabilityHandler::ExtensionDistributionPublish => {
+                let (kind, id, version) = distribution_identity(&input, true)?;
+                let agent_id = self.load_paired_agent()?;
+                let report = crate::app::distribution_publish::publish(
+                    &self.options,
+                    &agent_id,
+                    kind,
+                    &id,
+                    &version,
+                )?;
+                Ok(report)
+            }
+            CapabilityHandler::ExtensionDistributionStateGet => {
+                let view = crate::app::distribution_state::load()?;
+                let kind = input
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let id = input
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let items = match (kind, id) {
+                    (Some(kind), Some(id)) => view.for_asset(kind, id),
+                    (None, None) => view.all(),
+                    _ => return Err("kind 与 id 必须同时提供，或同时省略以读取全部记录".into()),
+                };
+                Ok(json!({ "items": items }))
+            }
+            CapabilityHandler::GithubAccountGet => Ok(serde_json::to_value(
+                crate::store::github_credentials::status()?,
+            )?),
+            CapabilityHandler::GithubAccountSet => self.set_github_account(input),
+            CapabilityHandler::GithubAccountRemove => {
+                let removed = crate::store::github_credentials::remove()?;
+                Ok(json!({
+                    "state": "ready",
+                    "removed": removed,
+                    "account": crate::store::github_credentials::status()?,
+                }))
+            }
+            CapabilityHandler::GithubAppAuthorizeStart => {
+                let client_id = crate::app::github_app::configured_client_id();
+                let authorization = crate::app::github_app::start_device_flow(&client_id)?;
+                Ok(json!({
+                    "state": "pending",
+                    "client_id": client_id,
+                    "authorization": authorization,
+                    "next_steps": [
+                        "在浏览器打开 verification_uri 并输入 user_code",
+                        "按 interval 周期调用 github.app.authorize.poll，直到返回 authorized"
+                    ]
+                }))
+            }
+            CapabilityHandler::GithubAppAuthorizePoll => {
+                let device_code = input
+                    .get("device_code")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("device_code is required")?;
+                let client_id = crate::app::github_app::configured_client_id();
+                match crate::app::github_app::poll_device_flow(&client_id, device_code)? {
+                    crate::app::github_app::DevicePollOutcome::Authorized(token) => {
+                        let record = crate::store::github_credentials::GithubAppRecord {
+                            login: String::new(),
+                            client_id: client_id.clone(),
+                            installation_id: String::new(),
+                            installation_account: String::new(),
+                            user_token: token.access_token.clone(),
+                            refresh_token: token.refresh_token.clone(),
+                            user_token_expires_at: (crate::app::github_app::now_epoch()
+                                + token.expires_in)
+                                .to_string(),
+                        };
+                        crate::store::github_credentials::save_app_state(&record)?;
+                        let installations =
+                            crate::app::github_app::list_installations(&record.user_token)?;
+                        Ok(json!({
+                            "state": "authorized",
+                            "installations": installations,
+                            "next_steps": [
+                                "调用 github.app.installation.select 绑定发布用的安装"
+                            ]
+                        }))
+                    }
+                    crate::app::github_app::DevicePollOutcome::Pending => {
+                        Ok(json!({ "state": "pending" }))
+                    }
+                    crate::app::github_app::DevicePollOutcome::SlowDown => {
+                        Ok(json!({ "state": "slow_down" }))
+                    }
+                    crate::app::github_app::DevicePollOutcome::Expired => {
+                        Ok(json!({ "state": "expired" }))
+                    }
+                    crate::app::github_app::DevicePollOutcome::Denied => {
+                        Ok(json!({ "state": "denied" }))
+                    }
+                }
+            }
+            CapabilityHandler::GithubAppInstallations => {
+                let state = crate::store::github_credentials::app_state()?
+                    .ok_or("GitHub App 尚未授权，请先调用 github.app.authorize.start")?;
+                Ok(json!({
+                    "installations": crate::app::github_app::list_installations(&state.user_token)?,
+                }))
+            }
+            CapabilityHandler::GithubAppInstallationSelect => {
+                let installation_id = input
+                    .get("installation_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("installation_id is required")?;
+                let state = crate::store::github_credentials::app_state()?
+                    .ok_or("GitHub App 尚未授权，请先调用 github.app.authorize.start")?;
+                let selected = crate::app::github_app::list_installations(&state.user_token)?
+                    .into_iter()
+                    .find(|item| item.id == installation_id)
+                    .ok_or("未找到该安装，请先调用 github.app.installations")?;
+                crate::app::github_app::select_installation(&selected)?;
+                Ok(json!({
+                    "state": "ready",
+                    "installation": selected,
+                    "account": crate::store::github_credentials::status()?,
+                }))
+            }
+            CapabilityHandler::ReleaseInstallPlan => {
+                let (repository, tag, id, version) = release_install_identity(&input)?;
+                Ok(serde_json::to_value(crate::app::release_install::plan(
+                    &repository,
+                    &tag,
+                    &id,
+                    &version,
+                )?)?)
+            }
+            CapabilityHandler::ReleaseInstallApply => {
+                let (repository, tag, id, version) = release_install_identity(&input)?;
+                let dry_run = input
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let plan = crate::app::release_install::plan(&repository, &tag, &id, &version)?;
+                let report = crate::app::release_install::install(&plan, dry_run)?;
+                Ok(json!({ "plan": plan, "report": report }))
             }
             CapabilityHandler::InnerAdminLoginStatus => Ok(local_login_status_json()),
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
@@ -2898,6 +3415,12 @@ impl CapabilityGateway {
                 self.save_skill_candidate(input)
             }
             CapabilityHandler::SkillCandidateTest => self.test_skill_candidate(input),
+            CapabilityHandler::SkillCandidateConfirm => {
+                let (id, version) = authoring_identity(&input)?;
+                Ok(serde_json::to_value(crate::skill::authoring::confirm(
+                    &id, &version,
+                )?)?)
+            }
             CapabilityHandler::ExtensionTest => self.test_extension_candidate(input),
             CapabilityHandler::SkillClientRegister => {
                 let skill_id = input
@@ -2947,6 +3470,12 @@ impl CapabilityGateway {
                 )?)?)
             }
             CapabilityHandler::PluginCandidateTest => self.test_plugin_candidate(input),
+            CapabilityHandler::PluginCandidateConfirm => {
+                let (id, version) = authoring_identity(&input)?;
+                Ok(serde_json::to_value(crate::plugin_authoring::confirm(
+                    &id, &version,
+                )?)?)
+            }
             CapabilityHandler::WorkflowCandidateSave => {
                 validate_mcp_capability_workspace(context, capability_id, &input)?;
                 let source_root = input
@@ -3148,8 +3677,11 @@ impl CapabilityGateway {
             CapabilityHandler::MediaJobCancel => crate::api::media::cancel(&self.options, input),
             CapabilityHandler::PluginCapability(id) => {
                 validate_mcp_capability_workspace(context, &id, &input)?;
-                let output =
-                    invoke_plugin_capability(&id, input.clone(), self.trusted_dashboard_url())?;
+                let output = invoke_plugin_capability(
+                    &id,
+                    input.clone(),
+                    self.trusted_dashboard_url().as_deref(),
+                )?;
                 finalize_plugin_capability(context, &id, &input, output)
             }
             CapabilityHandler::DownstreamMcp(id) => self.downstream_mcp.invoke(&id, input),
@@ -3482,7 +4014,8 @@ impl CapabilityGateway {
                     ],
                 )
             })?;
-        let current = crate::extension_projects::current_workspace()?;
+        let bound = Value::String(crate::extension_workspace::display_path(&path));
+        let current = crate::extension_projects::current_workspace(Some(&bound))?;
         Ok(json!({
             "state": "ready",
             "bound": true,
@@ -3495,30 +4028,185 @@ impl CapabilityGateway {
         }))
     }
 
-    fn clear_extension_workspace(&self) -> Result<Value, Box<dyn Error>> {
-        let previous = crate::extension_workspace::bound_root()
-            .map(|path| crate::extension_workspace::display_path(&path));
-        crate::extension_workspace::clear_binding().map_err(|error| {
-            crate::extension_authoring::blocked_error(
-                "workspace",
-                vec![crate::extension_authoring::blocker(
-                    "extension_workspace_clear_failed",
+    fn clear_extension_workspace(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        // 传入 workspace_root 时只解除该目录，避免一个会话清掉别的并发会话的工作区；
+        // 不带参数时保留原有的"清除本机全部绑定"语义。
+        let requested = input
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let removed =
+            crate::extension_workspace::unbind(requested.map(Path::new)).map_err(|error| {
+                crate::extension_authoring::blocked_error(
                     "workspace",
-                    error.to_string(),
-                    "检查 Agent 用户目录权限后重试",
-                    true,
-                )],
-                Vec::new(),
-                vec!["重新调用 extension.workspace.clear".to_string()],
-            )
-        })?;
-        let current = crate::extension_projects::current_workspace()?;
+                    vec![crate::extension_authoring::blocker(
+                        "extension_workspace_clear_failed",
+                        "workspace",
+                        error.to_string(),
+                        "检查 Agent 用户目录权限后重试",
+                        true,
+                    )],
+                    Vec::new(),
+                    vec!["重新调用 extension.workspace.clear".to_string()],
+                )
+            })?;
+        let removed: Vec<String> = removed
+            .iter()
+            .map(|path| crate::extension_workspace::display_path(path))
+            .collect();
+        // 解除后回读的必须是"这次调用所属的会话"，否则并发会话会拿到别的会话目录。
+        let current =
+            crate::extension_projects::current_workspace(requested.map(Value::from).as_ref())?;
         Ok(json!({
             "state": "ready",
             "bound": false,
-            "previous_workspace_root": previous,
+            "removed_workspace_roots": removed,
+            "previous_workspace_root": removed.last(),
             "workspace": current,
             "next_steps": ["重新调用 extension.workspace.current 确认当前会话目录"]
+        }))
+    }
+
+    fn read_distribution_targets(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (kind, id) {
+            (Some(kind), Some(id)) => {
+                let kind = crate::extension_projects::ExtensionProjectKind::parse(kind)?;
+                let project = crate::extension_projects::get(&format!("{}:{}", kind.as_str(), id))?;
+                Ok(distribution_target_payload(&project))
+            }
+            (None, None) => {
+                let projects = crate::extension_projects::list()?
+                    .into_iter()
+                    .filter(|project| {
+                        !project.distribution_targets.is_empty()
+                            || !project.source_unit_key.trim().is_empty()
+                    })
+                    .map(|project| distribution_target_payload(&project))
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "projects": projects,
+                    "available_targets": available_distribution_targets(),
+                    "default_targets": ["workbench"]
+                }))
+            }
+            _ => Err("kind 与 id 必须同时提供，或同时省略以读取全部项目".into()),
+        }
+    }
+
+    fn set_distribution_targets(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let kind = input
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("kind is required")?;
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("id is required")?;
+        let kind = crate::extension_projects::ExtensionProjectKind::parse(kind)?;
+        let inherit = input
+            .get("inherit")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let targets = match input.get("targets") {
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|item| {
+                        parse_distribution_target(item.as_str().ok_or("targets 只能包含字符串")?)
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+            ),
+            Some(_) => return Err("targets 必须是数组".into()),
+            None => None,
+        };
+        if inherit && targets.is_some() {
+            return Err("inherit=true 与 targets 不能同时提供".into());
+        }
+        if !inherit && targets.is_none() {
+            return Err("需要提供 targets，或传 inherit=true 以继承分发单元默认".into());
+        }
+        let project = crate::extension_projects::set_distribution_targets(
+            kind,
+            id,
+            match (&targets, inherit) {
+                (Some(targets), _) => Some(targets.as_slice()),
+                (None, true) => None,
+                (None, false) => unreachable!("targets 或 inherit 必居其一"),
+            },
+        )?;
+        let payload = distribution_target_payload(&project);
+        Ok(json!({
+            "state": "ready",
+            "kind": kind.as_str(),
+            "id": id,
+            "targets": payload["targets"].clone(),
+            "source": payload["source"].clone(),
+            "unit_targets": payload["unit_targets"].clone(),
+            "available_targets": payload["available_targets"].clone(),
+            "project": payload["project"].clone(),
+            "next_steps": [
+                "调用 extension.distribution.target.get 确认生效目标",
+                "发布入口按目标集合决定投递工作台或 GitHub"
+            ]
+        }))
+    }
+
+    /// 校验并保存 GitHub 分发凭据。登录名以 GitHub 返回为准，不采信调用方输入。
+    fn set_github_account(&self, input: Value) -> Result<Value, Box<dyn Error>> {
+        let token = input
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("token is required")?;
+        let token_kind = input
+            .get("token_kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let repositories = match input.get("repositories") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| -> Box<dyn Error> {
+                            "repositories 只能包含字符串".into()
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("repositories 必须是数组".into()),
+            None => Vec::new(),
+        };
+        let identity = crate::app::github_publisher::verify_token(token)?;
+        let account = crate::store::github_credentials::set_account(
+            &identity.login,
+            token,
+            token_kind,
+            &repositories,
+        )?;
+        Ok(json!({
+            "state": "ready",
+            "account": account,
+            "identity": { "login": identity.login, "id": identity.id },
+            "next_steps": [
+                "调用 extension.distribution.preview 确认发布计划",
+                "调用 extension.distribution.publish 按目标发布"
+            ]
         }))
     }
 
@@ -3545,7 +4233,14 @@ impl CapabilityGateway {
         }
 
         let mut blockers = Vec::new();
-        let workspace_state = match crate::extension_workspace::current_root() {
+        let requested_workspace = input
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        // 显式传入的 workspace_root 就是本次会话的工作区；只有调用方没传时，
+        // 才回落到进程级会话环境变量、进程目录和历史绑定。
+        let workspace_state = match crate::extension_workspace::resolve_root(requested_workspace) {
             Ok((path, source, bound)) if path.is_dir() => Some((path, source, bound)),
             Ok((path, _, _)) => {
                 blockers.push(crate::extension_authoring::blocker(
@@ -3559,10 +4254,10 @@ impl CapabilityGateway {
             }
             Err(error) => {
                 blockers.push(crate::extension_authoring::blocker(
-                    "extension_workspace_unavailable",
+                    "extension_workspace_invalid",
                     "workspace",
                     error.to_string(),
-                    "确认 AI 会话工作区仍然存在并重新调用 extension.workspace.current",
+                    "传入存在且可访问的 workspace_root，或重新调用 extension.workspace.current",
                     true,
                 ));
                 None
@@ -3570,6 +4265,8 @@ impl CapabilityGateway {
         };
         let current = workspace_state.as_ref().map(|(path, _, _)| path.clone());
         if let Some((current, source, _bound)) = workspace_state.as_ref() {
+            // 显式传入的 workspace_root（source = "request"）是会话自己声明的
+            // 工作区，不构成"未绑定"。
             if *source == "process_current_dir" {
                 blockers.push(crate::extension_authoring::blocker(
                     "extension_workspace_unbound",
@@ -3587,38 +4284,6 @@ impl CapabilityGateway {
                     "调用 extension.workspace.bind，并传入扩展聚合仓库或单个扩展项目目录",
                     true,
                 ));
-            }
-        }
-        // A session workspace supplied by HiMind AI is already explicit and
-        // valid; only an implicit process directory must be rebound by MCP.
-        if let Some(requested) = input
-            .get("workspace_root")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if let Some(current) = current.as_ref() {
-                match Path::new(requested).canonicalize() {
-                    Ok(path) if path == *current || path.starts_with(current) => {}
-                    Ok(path) => blockers.push(crate::extension_authoring::blocker(
-                        "extension_workspace_mismatch",
-                        "workspace",
-                        format!(
-                            "请求工作区 {} 与当前 AI 工作区 {} 不一致",
-                            path.display(),
-                            current.display()
-                        ),
-                        "切换 AI 会话工作区，或使用 extension.workspace.current 返回的 workspace_root",
-                        false,
-                    )),
-                    Err(error) => blockers.push(crate::extension_authoring::blocker(
-                        "extension_workspace_invalid",
-                        "workspace",
-                        format!("无法访问请求工作区: {error}"),
-                        "传入存在且可访问的 workspace_root",
-                        true,
-                    )),
-                }
             }
         }
 
@@ -3666,7 +4331,7 @@ impl CapabilityGateway {
                     "extension_tool_missing",
                     "toolchain",
                     format!("三件套未提供必需能力: {required}"),
-                    "启用并重新安装 AI 扩展开发工具插件，然后重启 Agent",
+                    "启用并重新安装扩展开发工具插件，然后重启 Agent",
                     true,
                 ));
             }
@@ -3677,14 +4342,19 @@ impl CapabilityGateway {
                 if crate::skill::resolver::compare_versions(&plugin.version, minimum)
                     == std::cmp::Ordering::Less
                 {
+                    let hint = authoring_upgrade_hint(
+                        "plugin",
+                        "com.himind.extension-development-tools",
+                        minimum,
+                    );
                     blockers.push(crate::extension_authoring::blocker(
                         "extension_tools_plugin_outdated",
                         "toolchain",
                         format!(
-                            "AI 扩展开发工具版本 {} 低于最低要求 {}",
+                            "扩展开发工具版本 {} 低于最低要求 {}",
                             plugin.version, minimum
                         ),
-                        "安装最新 AI 扩展开发工具插件后重新执行预检",
+                        format!("把扩展开发工具升级到 {minimum} 或更高后重新执行预检。{hint}"),
                         true,
                     ));
                 }
@@ -3693,21 +4363,21 @@ impl CapabilityGateway {
                 "extension_tools_plugin_unavailable",
                 "toolchain",
                 format!(
-                    "AI 扩展开发工具插件不可用{}",
+                    "扩展开发工具插件不可用{}",
                     plugin
                         .error
                         .as_deref()
                         .map(|value| format!(": {value}"))
                         .unwrap_or_default()
                 ),
-                "在本机启用 AI 扩展开发工具插件并重新执行预检",
+                "在本机启用扩展开发工具插件并重新执行预检",
                 true,
             )),
             Ok(None) => blockers.push(crate::extension_authoring::blocker(
                 "extension_tools_plugin_missing",
                 "toolchain",
-                "未安装 AI 扩展开发工具插件",
-                "安装三件套中的 AI 扩展开发工具插件后重新执行预检",
+                "未安装扩展开发工具插件",
+                "安装三件套中的扩展开发工具插件后重新执行预检",
                 true,
             )),
             Err(error) => blockers.push(crate::extension_authoring::blocker(
@@ -3771,16 +4441,19 @@ impl CapabilityGateway {
                             ));
                         }
                     }
-                    Some(record) => blockers.push(crate::extension_authoring::blocker(
-                        "authoring_skill_outdated",
-                        "toolchain",
-                        format!(
-                            "{} 版本 {} 低于最低要求 {}",
-                            record.manifest.name, record.manifest.version, minimum
-                        ),
-                        "从聚合扩展仓库安装最新三件套 Skill 后重试",
-                        true,
-                    )),
+                    Some(record) => {
+                        let hint = authoring_upgrade_hint("skill", skill_id, minimum);
+                        blockers.push(crate::extension_authoring::blocker(
+                            "authoring_skill_outdated",
+                            "toolchain",
+                            format!(
+                                "{} 版本 {} 低于最低要求 {}",
+                                record.manifest.name, record.manifest.version, minimum
+                            ),
+                            format!("把该三件套 Skill 升级到 {minimum} 或更高后重试。{hint}"),
+                            true,
+                        ));
+                    }
                     None => blockers.push(crate::extension_authoring::blocker(
                         "authoring_skill_missing",
                         "toolchain",
@@ -3799,17 +4472,36 @@ impl CapabilityGateway {
             }
         }
 
+        // 扩展开发工具版本过低时，下游的「三件套缺少必需能力」和「Skill 契约未
+        // 满足」都是同一个根因的派生症状：老插件不提供新契约，Skill 再有新版本也
+        // 起不来。把它们指回根因，避免用户和模型照着字面去重装 Skill、重装能力，
+        // 绕一圈却始终升不到达标版本。
+        if blockers
+            .iter()
+            .any(|item| item.code == "extension_tools_plugin_outdated")
+        {
+            const ROOT_CAUSE: &str = "（根因是扩展开发工具版本过低，先按上一条把它升级到达标版本）";
+            for item in blockers.iter_mut() {
+                if matches!(
+                    item.code.as_str(),
+                    "extension_tool_missing" | "authoring_skill_contract_mismatch"
+                ) {
+                    item.remediation.push_str(ROOT_CAUSE);
+                }
+            }
+        }
+
         let mut warnings = Vec::new();
         if !self.options.mode().dashboard_enabled() {
             warnings.push(crate::extension_authoring::warning(
-                "独立模式可完成本地创作、候选测试和客户端注册；提审与组织分发需在组织模式执行。",
+                "本机可以完成本地创作、候选测试和客户端注册；提审与分发需要在对接 AI 工作台后执行。",
             ));
         } else if crate::api::client::load_agent_state(&self.options.state_path)
             .ok()
             .is_none_or(|state| state.agent_id.trim().is_empty())
         {
             warnings.push(crate::extension_authoring::warning(
-                "当前为组织模式，但 Agent 尚未完成工作台配对；本地创作不受影响，提审前需完成配对。",
+                "已开启 AI 工作台对接，但 HiMind 账号尚未授权；本地创作不受影响，提审前需完成授权。",
             ));
         }
         let next_steps = if kind == "workflow" {
@@ -4239,7 +4931,7 @@ impl CapabilityGateway {
             return Err(serde_json::json!({
                 "code": "control_plane_required",
                 "capability_id": capability_id,
-                "message": "当前运行模式不支持此能力；如需使用，请在设置中切换到组织模式并重启 Agent"
+                "message": "此能力由 AI 工作台提供；请在设置中开启「AI 工作台」后重试"
             })
             .to_string()
             .into());
@@ -4250,16 +4942,16 @@ impl CapabilityGateway {
             &plugin.id,
             capability_id,
             params.clone(),
-            self.trusted_dashboard_url(),
+            self.trusted_dashboard_url().as_deref(),
         )?;
         finalize_plugin_capability(context, capability_id, &params, output)
     }
 
-    fn trusted_dashboard_url(&self) -> Option<&str> {
+    fn trusted_dashboard_url(&self) -> Option<String> {
         self.options
             .mode()
             .control_plane_enabled()
-            .then_some(self.options.api_base.as_str())
+            .then(|| self.options.api_base())
     }
 
     fn publish_software_release(
@@ -4299,7 +4991,7 @@ impl CapabilityGateway {
             .build()?;
         crate::api::distribution::publish_software_release_with_artifact(
             &client,
-            &self.options.api_base,
+            &self.options.api_base(),
             &agent_id,
             &access.token,
             &request,
@@ -4466,7 +5158,7 @@ impl CapabilityGateway {
             .build()?;
         Ok(
             json!({ "items": crate::api::distribution::skill_submissions(
-            &client, &self.options.api_base, &agent_id, &access.token
+            &client, &self.options.api_base(), &agent_id, &access.token
         )? }),
         )
     }
@@ -4519,7 +5211,7 @@ impl CapabilityGateway {
             .build()?;
         crate::api::distribution::workflow_submissions(
             &client,
-            &self.options.api_base,
+            &self.options.api_base(),
             &agent_id,
             &access.token,
         )
@@ -4536,7 +5228,7 @@ impl CapabilityGateway {
             .build()?;
         Ok(
             json!({ "items": crate::api::distribution::plugin_submissions(
-            &client, &self.options.api_base, &agent_id, &access.token
+            &client, &self.options.api_base(), &agent_id, &access.token
         )? }),
         )
     }
@@ -4552,7 +5244,7 @@ impl CapabilityGateway {
             .build()?;
         crate::api::distribution::extension_review_queue(
             &client,
-            &self.options.api_base,
+            &self.options.api_base(),
             &agent_id,
             &access.token,
             &input,
@@ -4571,7 +5263,7 @@ impl CapabilityGateway {
             .build()?;
         crate::api::distribution::extension_review_get(
             &client,
-            &self.options.api_base,
+            &self.options.api_base(),
             &agent_id,
             &access.token,
             &kind,
@@ -4622,7 +5314,7 @@ impl CapabilityGateway {
             .build()?;
         crate::api::distribution::extension_review_decide(
             &client,
-            &self.options.api_base,
+            &self.options.api_base(),
             &agent_id,
             &access.token,
             &kind,
@@ -4637,10 +5329,23 @@ impl CapabilityGateway {
     fn load_paired_agent(&self) -> Result<String, Box<dyn Error>> {
         let state = crate::api::client::load_agent_state(&self.options.state_path)?;
         if state.agent_id.trim().is_empty() || state.credential.trim().is_empty() {
-            return Err("Agent 尚未完成 Dashboard 配对".into());
+            return Err("HiMind 账号尚未授权".into());
         }
         self.options.set_agent_credential(&state.credential);
         Ok(state.agent_id)
+    }
+
+    /// 市场能力的授权要求比工作台能力更宽松：本地与 GitHub 扩展源不依赖工作台，
+    /// 所以未授权时也要能搜索和安装它们。工作台来源所需的授权由市场侧在计划里
+    /// 明确记为 blocked_reasons，而不是在这里一刀切地把整个市场关掉。
+    fn paired_agent_id(&self) -> String {
+        match crate::api::client::load_agent_state(&self.options.state_path) {
+            Ok(state) => {
+                self.options.set_agent_credential(&state.credential);
+                state.agent_id
+            }
+            Err(_) => String::new(),
+        }
     }
 }
 
@@ -4996,6 +5701,9 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
                 handler,
                 CapabilityHandler::SoftwareDistributionPublish
                     | CapabilityHandler::ExtensionReviewDecide
+                    // 从市场装能力会写入本机磁盘，属于"改变我这台机器"的操作，
+                    // 必须有人确认，不能由模型单方面批准。
+                    | CapabilityHandler::MarketInstall
             );
     descriptor.idempotency = if descriptor.risk_level == "read_only" {
         "safe"
@@ -5052,6 +5760,10 @@ fn is_extension_tool_capability(capability_id: &str) -> bool {
             | "extension.skill.scaffold"
             | "extension.skill.validate"
             | "extension.skill.package"
+            | "extension.workflow.scaffold"
+            | "extension.workflow.validate"
+            | "extension.workflow.build"
+            | "extension.workflow.package"
     )
 }
 
@@ -5517,6 +6229,107 @@ fn annotate_business_exhibit_id_contract(descriptor: &mut CapabilityDescriptor) 
     );
 }
 
+fn available_distribution_targets() -> Vec<&'static str> {
+    vec!["workbench", "github"]
+}
+
+/// 发布相关能力的公共入参解析：kind / id / version。
+fn distribution_identity(
+    input: &Value,
+    require_version: bool,
+) -> Result<
+    (
+        crate::extension_projects::ExtensionProjectKind,
+        String,
+        String,
+    ),
+    Box<dyn Error>,
+> {
+    let kind_value = input
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("kind is required")?;
+    let kind = crate::extension_projects::ExtensionProjectKind::parse(kind_value)?;
+    let id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("id is required")?
+        .to_string();
+    let version = input
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    match (version, require_version) {
+        (Some(version), _) => Ok((kind, id, version)),
+        (None, false) => Ok((kind, id, String::new())),
+        (None, true) => Err("version is required".into()),
+    }
+}
+
+/// Release 安装相关能力的公共入参解析。
+fn release_install_identity(
+    input: &Value,
+) -> Result<(String, String, String, String), Box<dyn Error>> {
+    let read = |key: &str| -> Result<String, Box<dyn Error>> {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| -> Box<dyn Error> { format!("{key} is required").into() })
+    };
+    Ok((
+        read("repository")?,
+        read("tag")?,
+        read("id")?,
+        read("version")?,
+    ))
+}
+
+fn parse_distribution_target(value: &str) -> Result<DistributionTarget, Box<dyn Error>> {
+    DistributionTarget::parse(value).ok_or_else(|| -> Box<dyn Error> {
+        format!("分发目标必须是 workbench 或 github，收到: {value}").into()
+    })
+}
+
+fn distribution_target_payload(project: &crate::extension_projects::ExtensionProject) -> Value {
+    let unit_targets = crate::extension_projects::unit_distribution_targets_for(
+        project.kind,
+        &project.extension_id,
+    );
+    json!({
+        "kind": project.kind.as_str(),
+        "id": project.extension_id,
+        "project_id": project.id,
+        "name": project.name,
+        "unit_key": project.source_unit_key,
+        "targets": project
+            .distribution_targets
+            .iter()
+            .map(|target| target.as_str())
+            .collect::<Vec<_>>(),
+        "source": project.distribution_targets_source,
+        "declared_targets": project
+            .distribution_targets_declared
+            .iter()
+            .map(|target| target.as_str())
+            .collect::<Vec<_>>(),
+        "unit_targets": unit_targets
+            .iter()
+            .map(|target| target.as_str())
+            .collect::<Vec<_>>(),
+        "available_targets": available_distribution_targets(),
+        "project": project,
+    })
+}
+
 fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailability {
     match handler {
         CapabilityHandler::AuthoringIdentity
@@ -5526,17 +6339,37 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::ExtensionWorkspaceClear
         | CapabilityHandler::ExtensionRevisionCreate
         | CapabilityHandler::ExtensionLock
+        | CapabilityHandler::ExtensionDistributionTargetGet
+        | CapabilityHandler::ExtensionDistributionTargetSet
+        | CapabilityHandler::ExtensionDistributionPreview
+        | CapabilityHandler::ExtensionDistributionPublish
+        | CapabilityHandler::ExtensionDistributionStateGet
+        | CapabilityHandler::GithubAccountGet
+        | CapabilityHandler::GithubAccountSet
+        | CapabilityHandler::GithubAccountRemove
+        | CapabilityHandler::GithubAppAuthorizeStart
+        | CapabilityHandler::GithubAppAuthorizePoll
+        | CapabilityHandler::GithubAppInstallations
+        | CapabilityHandler::GithubAppInstallationSelect
+        | CapabilityHandler::ReleaseInstallPlan
+        | CapabilityHandler::ReleaseInstallApply
         | CapabilityHandler::ExtensionTest
         | CapabilityHandler::SkillCandidateSave
         | CapabilityHandler::SkillCandidateTest
+        | CapabilityHandler::SkillCandidateConfirm
         | CapabilityHandler::SkillClientRegister
         | CapabilityHandler::SkillClientUnregister
         | CapabilityHandler::SkillClientsUnregister
         | CapabilityHandler::PluginCandidateSave
         | CapabilityHandler::PluginCandidateTest
+        | CapabilityHandler::PluginCandidateConfirm
         | CapabilityHandler::WorkflowCandidateSave
         | CapabilityHandler::WorkflowCandidateTest
         | CapabilityHandler::WorkflowCandidateConfirm => CapabilityAvailability::Local,
+        CapabilityHandler::MarketSearch
+        | CapabilityHandler::MarketInstalled
+        | CapabilityHandler::MarketInstallPlan
+        | CapabilityHandler::MarketInstall => CapabilityAvailability::Local,
         CapabilityHandler::WorkflowSubmissionSubmit
         | CapabilityHandler::WorkflowSubmissionStatus
         | CapabilityHandler::PluginSubmissionSubmit
@@ -5672,8 +6505,7 @@ fn validate_mcp_capability_workspace(
     if software_scoped {
         validate_software_workspace_root(workspace_root)
     } else {
-        let current = crate::extension_projects::current_workspace_path()?;
-        validate_extension_workspace_root(&current, workspace_root)
+        validate_extension_workspace_root(workspace_root)
     }
 }
 
@@ -5698,87 +6530,23 @@ fn validate_extension_tool_workspace(input: &Value) -> Result<(), Box<dyn Error>
             )
         })?;
 
-    let (current, source, _bound) =
-        crate::extension_workspace::current_root().map_err(|error| {
-            crate::extension_authoring::blocked_error(
-                "unknown",
-                vec![crate::extension_authoring::blocker(
-                    "extension_workspace_unavailable",
-                    "workspace",
-                    error.to_string(),
-                    "调用 extension.workspace.bind 绑定扩展工程目录",
-                    true,
-                )],
-                Vec::new(),
-                vec!["调用 extension.workspace.current 确认工作区".to_string()],
-            )
-        })?;
-    if source == "process_current_dir"
-        || crate::extension_workspace::is_agent_managed_path(&current)
-    {
-        return Err(crate::extension_authoring::blocked_error(
-            "unknown",
-            vec![crate::extension_authoring::blocker(
-                "extension_workspace_unbound",
-                "workspace",
-                "当前 AI 工作区尚未绑定扩展工程目录",
-                "调用 extension.workspace.bind，并传入扩展聚合仓库、插件或 Skill 目录",
-                true,
-            )],
-            Vec::new(),
-            vec![
-                "调用 extension.workspace.bind 绑定扩展工作区".to_string(),
-                "重新调用 extension.workspace.current 确认绑定".to_string(),
-            ],
-        ));
-    }
-
-    let requested = Path::new(workspace_root).canonicalize().map_err(|error| {
+    // 同一进程可能同时服务多个 HiMind AI 工作区会话，调用方传入的 workspace_root
+    // 就是本次会话的工作区，不再要求它等于某个全局工作区。这里只挡住真实危险的
+    // 情况：目录不存在，或者指向 Agent 自身安装目录 / 数据目录。
+    crate::extension_workspace::validate_authoring_root(workspace_root).map_err(|message| {
         crate::extension_authoring::blocked_error(
             "unknown",
             vec![crate::extension_authoring::blocker(
                 "extension_workspace_invalid",
                 "workspace",
-                format!("无法访问请求工作区: {error}"),
-                "传入存在且可访问的 workspace_root",
+                message,
+                "传入存在且可访问的扩展聚合仓库、插件或 Skill 目录",
                 true,
             )],
             Vec::new(),
             vec!["修正 workspace_root 后重新调用扩展开发能力".to_string()],
         )
     })?;
-    if !requested.is_dir() {
-        return Err(crate::extension_authoring::blocked_error(
-            "unknown",
-            vec![crate::extension_authoring::blocker(
-                "extension_workspace_invalid",
-                "workspace",
-                "workspace_root 必须是目录",
-                "传入存在且可访问的扩展工作区目录",
-                false,
-            )],
-            Vec::new(),
-            vec!["修正 workspace_root 后重新调用扩展开发能力".to_string()],
-        ));
-    }
-    if !requested.starts_with(&current) {
-        return Err(crate::extension_authoring::blocked_error(
-            "unknown",
-            vec![crate::extension_authoring::blocker(
-                "extension_workspace_mismatch",
-                "workspace",
-                format!(
-                    "请求工作区 {} 与当前扩展工作区 {} 不一致",
-                    requested.display(),
-                    current.display()
-                ),
-                "切换 AI 会话工作区，或使用 extension.workspace.current 返回的 workspace_root",
-                false,
-            )],
-            Vec::new(),
-            vec!["将 workspace_root 改为当前扩展工作区或其子目录".to_string()],
-        ));
-    }
     Ok(())
 }
 
@@ -5814,20 +6582,6 @@ fn validate_mcp_candidate_package(
                 vec!["重新调用候选保存能力并传入 package_path".to_string()],
             )
         })?;
-    let current = crate::extension_projects::current_workspace_path().map_err(|error| {
-        crate::extension_authoring::blocked_error(
-            "unknown",
-            vec![crate::extension_authoring::blocker(
-                "extension_workspace_unavailable",
-                "workspace",
-                error.to_string(),
-                "先调用 extension.workspace.bind 绑定扩展工程目录",
-                true,
-            )],
-            Vec::new(),
-            vec!["调用 extension.workspace.current 确认工作区".to_string()],
-        )
-    })?;
     let package = Path::new(package_path).canonicalize().map_err(|error| {
         crate::extension_authoring::blocked_error(
             "unknown",
@@ -5842,16 +6596,42 @@ fn validate_mcp_candidate_package(
             vec!["重新构建并打包扩展后重试".to_string()],
         )
     })?;
-    if !package.is_file() || !package.starts_with(&current) {
+    if !package.is_file() {
+        return Err(crate::extension_authoring::blocked_error(
+            "unknown",
+            vec![crate::extension_authoring::blocker(
+                "extension_package_invalid",
+                "package",
+                "候选包必须是文件".to_string(),
+                "传入存在且可访问的 .hmpkg、.hmskill 或 .zip 文件",
+                false,
+            )],
+            Vec::new(),
+            vec!["重新构建并打包扩展后重试".to_string()],
+        ));
+    }
+    // 候选包必须来自开发者自己的工作区。工作区按次解析：显式传入的
+    // workspace_root、当前会话环境变量、以及本 Agent 记住的工作区都算数，
+    // 这样多个并发会话各自保存候选时不会互相冲突。
+    let roots = crate::extension_workspace::known_authoring_roots(
+        input.get("workspace_root").and_then(Value::as_str),
+    );
+    let inside_workspace = roots.iter().any(|root| package.starts_with(root));
+    if roots.is_empty() || !inside_workspace {
+        let hint = roots
+            .first()
+            .map(|root| crate::extension_workspace::display_path(root))
+            .unwrap_or_default();
         return Err(crate::extension_authoring::blocked_error(
             "unknown",
             vec![crate::extension_authoring::blocker(
                 "extension_workspace_unbound",
                 "workspace",
-                format!(
-                    "候选包必须位于当前 AI 扩展工作区内: {}",
-                    crate::extension_workspace::display_path(&current)
-                ),
+                if hint.is_empty() {
+                    "候选包必须位于已绑定或当前会话的扩展工作区内".to_string()
+                } else {
+                    format!("候选包必须位于扩展工作区内: {hint}")
+                },
                 "调用 extension.workspace.bind 绑定候选包所在的聚合仓库或扩展项目目录",
                 true,
             )],
@@ -5866,15 +6646,16 @@ fn validate_mcp_candidate_package(
     Ok(())
 }
 
-fn validate_extension_workspace_root(
-    current: &Path,
-    requested: &str,
-) -> Result<(), Box<dyn Error>> {
-    let requested = Path::new(requested).canonicalize()?;
-    if !requested.starts_with(current) {
+/// 扩展能力的工作区门禁。
+///
+/// 工作区由调用方按次传入 —— 同一个 Agent 进程会同时服务多个 HiMind AI 工作区
+/// 会话，硬性比对某个全局工作区会让第二个会话直接不可用。这里只要求它指向一个
+/// 真实存在、且不是 Agent 自身安装目录或数据目录的目录。
+fn validate_extension_workspace_root(requested: &str) -> Result<(), Box<dyn Error>> {
+    if let Err(message) = crate::extension_workspace::validate_authoring_root(requested) {
         return Err(serde_json::json!({
-            "code": "extension_workspace_mismatch",
-            "message": "workspace_root 必须与当前 AI 扩展工作区一致，或位于该工作区内"
+            "code": "extension_workspace_invalid",
+            "message": message
         })
         .to_string()
         .into());
@@ -6245,6 +7026,47 @@ fn insert_registration(
     Ok(())
 }
 
+/// 工具链阻塞的升级提示：把「本机哪个扩展来源能拿到达标版本」一并说清。
+///
+/// 组织通道和本地/GitHub 来源的版本可能长期错位，只回报「版本太低」会让模型和
+/// 用户都停在原地：既不知道本机能不能升，也不知道去哪升。这里复用扩展来源快照
+/// （内存缓存 + 跨进程文件锁，成本可接受），供 preflight 的 remediation 直接给出
+/// 出处；快照不可用时不追加任何说法，避免编造来源。
+fn authoring_upgrade_hint(asset_kind: &str, asset_id: &str, minimum: &str) -> String {
+    let candidates: Vec<(String, String)> = match asset_kind {
+        "plugin" => crate::app::extension_source::plugin_versions(asset_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (item.version, item.source))
+            .collect(),
+        "skill" => crate::app::extension_source::skill_versions(asset_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (item.version, item.source))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let Some(best) = candidates
+        .iter()
+        .max_by(|left, right| crate::skill::resolver::compare_versions(&left.0, &right.0))
+    else {
+        return format!(
+            "本机扩展来源里没有 {asset_id} 的任何镜像，先在「我的能力 → 来源管理」添加包含它的来源。"
+        );
+    };
+    if crate::skill::resolver::compare_versions(&best.0, minimum) != std::cmp::Ordering::Less {
+        format!(
+            "本机扩展来源最高可拿到 {}（来源 {}）：在「我的能力」里安装该来源版本即可。",
+            best.0, best.1
+        )
+    } else {
+        format!(
+            "本机所有来源最高只有 {}（来源 {}），需要先把 ≥{} 的版本发布到组织/开发环境通道。",
+            best.0, best.1, minimum
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6336,7 +7158,7 @@ mod tests {
     #[test]
     fn replacing_business_catalog_invalidates_gateway_registry_cache() {
         let mut options = crate::Options::from_env();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let context = InvocationContext::local_http();
@@ -6385,7 +7207,7 @@ mod tests {
     #[test]
     fn health_distinguishes_mcp_stdio_from_mcp_over_local_http() {
         let mut options = crate::Options::from_env();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let gateway = CapabilityGateway::new(
             options,
             Arc::new(Mutex::new(LocalWorkerStatus {
@@ -6560,8 +7382,8 @@ mod tests {
     }
 
     #[test]
-    fn authoring_tool_workspace_guard_rejects_missing_binding() {
-        let requested = std::env::temp_dir().join(format!(
+    fn authoring_tool_workspace_guard_accepts_any_real_session_workspace() {
+        let root = std::env::temp_dir().join(format!(
             "himind-authoring-workspace-guard-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6569,17 +7391,33 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let requested = root.join("session-a");
         std::fs::create_dir_all(&requested).unwrap();
-        let error = validate_extension_tool_workspace(&json!({
+
+        // 多会话并发下每个会话自带工作区，任意真实目录都应放行，
+        // 不再要求它等于某个全局工作区。
+        validate_extension_tool_workspace(&json!({
             "workspace_root": requested.to_string_lossy()
+        }))
+        .unwrap();
+
+        // 真正危险的输入仍然要被挡住：不存在的目录、Agent 自身目录。
+        let missing = root.join("does-not-exist");
+        let error = validate_extension_tool_workspace(&json!({
+            "workspace_root": missing.to_string_lossy()
         }))
         .unwrap_err()
         .to_string();
-        let _ = std::fs::remove_dir_all(&requested);
-        assert!(
-            error.contains("extension_workspace_unbound")
-                || error.contains("extension_workspace_mismatch")
-        );
+        assert!(error.contains("extension_workspace_invalid"), "{error}");
+
+        let managed = validate_extension_tool_workspace(&json!({
+            "workspace_root": crate::store::paths::agent_home().to_string_lossy()
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(managed.contains("extension_workspace_invalid"), "{managed}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -6597,7 +7435,7 @@ mod tests {
         std::fs::write(&file, b"keep").unwrap();
         let mut options = crate::Options::from_env();
         options.state_path = root.join("state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let result = gateway
@@ -6853,7 +7691,7 @@ mod tests {
             crate::app::runtime_mode::AgentMode::Independent,
         )
         .unwrap();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let error = gateway
@@ -6868,7 +7706,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("control_plane_required"));
-        assert!(error.contains("当前运行模式不支持"));
+        assert!(error.contains("AI 工作台"));
         let local_error = gateway
             .invoke(
                 &InvocationContext::new(
@@ -6909,7 +7747,7 @@ mod tests {
         ));
         let mut options = crate::Options::from_env();
         options.state_path = root.join("agent-state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let visible = gateway
@@ -6971,7 +7809,7 @@ mod tests {
     #[test]
     fn ai_client_capability_schemas_follow_the_adapter_registry() {
         let mut options = crate::Options::from_env();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         let registry = gateway.registry().unwrap();
@@ -7035,7 +7873,7 @@ mod tests {
         ));
         let mut options = crate::Options::from_env();
         options.state_path = root.join("agent-state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let mut gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
         gateway.business_provider = Arc::new(DashboardCatalogProvider::from_snapshot(
@@ -7084,7 +7922,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_development_workspace_must_match_the_ai_session_root() {
+    fn extension_development_workspace_accepts_each_sessions_own_root() {
         let root = std::env::temp_dir().join(format!(
             "himind-extension-workspace-boundary-{}-{}",
             std::process::id(),
@@ -7094,16 +7932,20 @@ mod tests {
                 .as_nanos()
         ));
         let workspace = root.join("workspace");
-        let outside = root.join("outside");
+        let sibling = root.join("sibling-workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let current = workspace.canonicalize().unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
 
-        validate_extension_workspace_root(&current, workspace.to_str().unwrap()).unwrap();
-        let error = validate_extension_workspace_root(&current, outside.to_str().unwrap())
+        // 同一进程服务多个 DSH 工作区会话：每个会话在自己的目录里创作，
+        // 两个目录都是合法的，互不构成越界。
+        validate_extension_workspace_root(workspace.to_str().unwrap()).unwrap();
+        validate_extension_workspace_root(sibling.to_str().unwrap()).unwrap();
+
+        // 只有不存在或指向 Agent 自身目录的输入才被拒绝。
+        let error = validate_extension_workspace_root(root.join("missing").to_str().unwrap())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("extension_workspace_mismatch"));
+        assert!(error.contains("extension_workspace_invalid"), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 

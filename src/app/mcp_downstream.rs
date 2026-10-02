@@ -13,6 +13,25 @@ use crate::capability::types::{CapabilityAvailability, CapabilityDescriptor};
 const MAX_TOOL_PAGES: usize = 100;
 const MAX_TOOLS: usize = 5000;
 const MAX_CURSOR_LENGTH: usize = 512;
+/// 下游进程重启、升级、换端口都会让调用瞬间失败。DSH 桥用的是 5 次 / 500ms
+/// 起步 / 30s 封顶的退避，这里保持一致，避免两套重试手感不一样。
+const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
+const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+
+/// 一次下游能力扫描的结果。
+pub(crate) struct DownstreamCapabilityScan {
+    pub(crate) capabilities: Vec<(CapabilityDescriptor, String)>,
+    /// 标记为「必须可用」的下游连不上时的原因。非空说明这套工具面是残缺的。
+    pub(crate) blocking_failures: Vec<String>,
+}
+
+/// 单次调用的失败原因。传输层失败可以重连重试；工具自己返回的错误说明请求已经送到，
+/// 再试一次只会让用户多等几秒，所以直接抛给模型。
+enum ToolCallFailure {
+    Transport(Box<dyn Error>),
+    Tool(String),
+}
 
 #[derive(Clone)]
 pub(crate) struct DownstreamMcpManager {
@@ -54,16 +73,26 @@ impl DownstreamMcpManager {
         }
     }
 
-    pub(crate) fn list_capabilities(
-        &self,
-    ) -> Result<Vec<(CapabilityDescriptor, String)>, Box<dyn Error>> {
+    pub(crate) fn list_capabilities(&self) -> Result<DownstreamCapabilityScan, Box<dyn Error>> {
         let servers = mcp_registry::list(&self.state_path)?;
-        let mut result = Vec::new();
+        let mut capabilities = Vec::new();
+        let mut blocking_failures = Vec::new();
         let mut ids = HashSet::new();
         for server in servers.into_iter().filter(|server| server.enabled) {
             let tools = match self.tools_for(&server) {
                 Ok(tools) => tools,
-                Err(_) => continue,
+                Err(error) => {
+                    // 默认情况下下游工具是可选的，连不上就少一套工具。
+                    // 但用户显式要求「必须可用」时不能再装作没事：少一套工具
+                    // 会让模型拿着残缺的能力面继续回答，比直接报错更难排查。
+                    if server.fail_on_startup_error {
+                        blocking_failures.push(format!(
+                            "downstream_mcp_required_unavailable: {} ({error})",
+                            server.display_name
+                        ));
+                    }
+                    continue;
+                }
             };
             for tool in tools {
                 let original_name = tool
@@ -82,7 +111,7 @@ impl DownstreamMcpManager {
                     .get("inputSchema")
                     .cloned()
                     .unwrap_or_else(|| json!({ "type": "object" }));
-                result.push((
+                capabilities.push((
                     CapabilityDescriptor {
                         id,
                         version: "mcp-1.0.0".to_string(),
@@ -115,7 +144,10 @@ impl DownstreamMcpManager {
                 ));
             }
         }
-        Ok(result)
+        Ok(DownstreamCapabilityScan {
+            capabilities,
+            blocking_failures,
+        })
     }
 
     pub(crate) fn invoke(
@@ -126,7 +158,16 @@ impl DownstreamMcpManager {
         let servers = mcp_registry::list(&self.state_path)?;
         let mut ids = HashSet::new();
         for server in servers.into_iter().filter(|server| server.enabled) {
-            let tools = self.tools_for(&server)?;
+            let tools = match self.tools_for(&server) {
+                Ok(tools) => tools,
+                // 别的下游掉线不该挡住这次调用；只有「必须可用」的连接才升级成错误。
+                Err(error) => {
+                    if server.fail_on_startup_error {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
             for tool in tools {
                 let original_name = tool
                     .get("name")
@@ -150,30 +191,64 @@ impl DownstreamMcpManager {
         tool_name: &str,
         input: Value,
     ) -> Result<Value, Box<dyn Error>> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "downstream MCP session lock poisoned")?;
-        let entry = sessions
-            .get_mut(&server.stable_id)
-            .ok_or("downstream MCP session is not connected")?;
-        let response = entry.session.request(
-            "tools/call",
-            json!({ "name": tool_name, "arguments": input }),
-        );
-        match response {
-            Ok(response) => {
-                if let Some(error) = response.get("error") {
-                    sessions.remove(&server.stable_id);
-                    return Err(format!("downstream_tool_failed: {error}").into());
+        // 「断开后自动重连」开着时按退避重试，关掉就是一次失败一次报错。
+        let attempts = reconnect_attempts(server.reconnect);
+        let mut delay_ms = RECONNECT_INITIAL_DELAY_MS;
+        let mut last_error: Option<Box<dyn Error>> = None;
+        for attempt in 1..=attempts {
+            match self.call_tool_once(server, tool_name, &input) {
+                Ok(result) => return Ok(result),
+                // 工具已经收到请求并给出了错误，重试没有意义。
+                Err(ToolCallFailure::Tool(message)) => return Err(message.into()),
+                Err(ToolCallFailure::Transport(error)) => {
+                    last_error = Some(error);
+                    self.drop_session(&server.stable_id)?;
+                    if attempt == attempts {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms = next_retry_delay(delay_ms);
                 }
-                Ok(response.get("result").cloned().unwrap_or_else(|| json!({})))
-            }
-            Err(error) => {
-                sessions.remove(&server.stable_id);
-                Err(error)
             }
         }
+        Err(last_error.unwrap_or_else(|| "downstream MCP call failed".into()))
+    }
+
+    fn call_tool_once(
+        &self,
+        server: &McpServerSpec,
+        tool_name: &str,
+        input: &Value,
+    ) -> Result<Value, ToolCallFailure> {
+        // 会话可能是上次失败时被丢掉的，先补一次连接，避免第一次调用必然失败。
+        self.tools_for(server).map_err(ToolCallFailure::Transport)?;
+        let response = {
+            let mut sessions = self.sessions.lock().map_err(|_| {
+                ToolCallFailure::Transport("downstream MCP session lock poisoned".into())
+            })?;
+            let entry = sessions.get_mut(&server.stable_id).ok_or_else(|| {
+                ToolCallFailure::Transport("downstream MCP session is not connected".into())
+            })?;
+            entry.session.request(
+                "tools/call",
+                json!({ "name": tool_name, "arguments": input.clone() }),
+            )
+        }
+        .map_err(ToolCallFailure::Transport)?;
+        if let Some(error) = response.get("error") {
+            return Err(ToolCallFailure::Tool(format!(
+                "downstream_tool_failed: {error}"
+            )));
+        }
+        Ok(response.get("result").cloned().unwrap_or_else(|| json!({})))
+    }
+
+    fn drop_session(&self, stable_id: &str) -> Result<(), Box<dyn Error>> {
+        self.sessions
+            .lock()
+            .map_err(|_| "downstream MCP session lock poisoned")?
+            .remove(stable_id);
+        self.remove_cached_tools(stable_id)
     }
 
     fn tools_for(&self, server: &McpServerSpec) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -316,6 +391,19 @@ fn unique_tool_id(server_id: &str, tool_name: &str, ids: &mut HashSet<String>) -
     }
 }
 
+/// 断线后最多重试几次。没开重连就只试一次，失败直接报给调用方。
+fn reconnect_attempts(reconnect: bool) -> u32 {
+    if reconnect {
+        RECONNECT_MAX_ATTEMPTS
+    } else {
+        1
+    }
+}
+
+fn next_retry_delay(current_ms: u64) -> u64 {
+    (current_ms * 2).min(RECONNECT_MAX_DELAY_MS)
+}
+
 fn safe_segment(value: &str) -> String {
     let mut output = value
         .chars()
@@ -335,8 +423,81 @@ fn safe_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tools_page, safe_segment};
+    use super::{
+        next_retry_delay, parse_tools_page, reconnect_attempts, safe_segment, DownstreamMcpManager,
+    };
+    use crate::app::mcp_registry::McpServerConfig;
     use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn downstream_server(
+        name: &str,
+        fail_on_startup_error: bool,
+        reconnect: bool,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            server_name: name.to_string(),
+            display_name: name.to_string(),
+            transport: "stdio".to_string(),
+            // 一个不存在的可执行文件名：连接必然失败，而且失败得很快。
+            command: "himind-agent-missing-binary-for-test".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: String::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            tool_call_timeout_ms: 30_000,
+            fail_on_startup_error,
+            reconnect,
+            enabled: true,
+        }
+    }
+
+    fn temp_state(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "himind-downstream-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root.join("agent-state.json")
+    }
+
+    #[test]
+    fn reconnect_policy_matches_the_declared_bridge_defaults() {
+        assert_eq!(reconnect_attempts(true), 5);
+        assert_eq!(reconnect_attempts(false), 1);
+        assert_eq!(next_retry_delay(500), 1_000);
+        assert_eq!(next_retry_delay(16_000), 30_000);
+        assert_eq!(next_retry_delay(30_000), 30_000);
+    }
+
+    #[test]
+    fn required_downstream_failures_are_reported_instead_of_disappearing() {
+        let state = temp_state("required");
+        crate::app::mcp_settings::upsert(&state, downstream_server("required-tools", true, false))
+            .unwrap();
+        let scan = DownstreamMcpManager::new(&state)
+            .list_capabilities()
+            .unwrap();
+        assert!(scan.capabilities.is_empty());
+        assert_eq!(scan.blocking_failures.len(), 1);
+        assert!(scan.blocking_failures[0].starts_with("downstream_mcp_required_unavailable"));
+        assert!(scan.blocking_failures[0].contains("required-tools"));
+
+        // 同一个连接改成可选后，缺一套工具只是缺工具，不算错误。
+        crate::app::mcp_settings::upsert(&state, downstream_server("required-tools", false, false))
+            .unwrap();
+        let scan = DownstreamMcpManager::new(&state)
+            .list_capabilities()
+            .unwrap();
+        assert!(scan.capabilities.is_empty());
+        assert!(scan.blocking_failures.is_empty());
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
+    }
 
     #[test]
     fn tool_segments_are_stable_and_safe() {
