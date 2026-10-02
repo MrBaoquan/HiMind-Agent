@@ -14,6 +14,29 @@ pub(crate) struct WorkflowGatewayExecutor {
     run_id: String,
 }
 
+/// 候选冻结步骤由运行器注入的固定入参。
+///
+/// 运行期和启动前预检查共用这一份来源：否则预检查会报「缺少
+/// candidate_artifact_id」，而真正运行时其实由运行器补上。
+pub(crate) fn candidate_freeze_inputs(
+    package: &WorkflowPackage,
+    step: &WorkflowStep,
+) -> Vec<(&'static str, Value)> {
+    if step.candidate_action.trim() != "freeze" {
+        return Vec::new();
+    }
+    let Some(policy) = package.candidate.as_ref() else {
+        return Vec::new();
+    };
+    vec![
+        (
+            "candidate_artifact_id",
+            Value::String(policy.artifact_id.clone()),
+        ),
+        ("allow_dirty", Value::Bool(policy.allow_dirty)),
+    ]
+}
+
 impl WorkflowGatewayExecutor {
     pub(crate) fn new(
         gateway: CapabilityGateway,
@@ -228,8 +251,10 @@ mod tests {
             schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.test".to_string(),
             version: "1.0.0".to_string(),
+            distribution_targets: Vec::new(),
             name: "Test".to_string(),
             description: String::new(),
+            release_notes: String::new(),
             min_agent_version: "0.3.47".to_string(),
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),

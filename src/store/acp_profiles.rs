@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::path::{Path, PathBuf};
 const ACP_PROFILE_SCHEMA_VERSION: &str = "acp_runtime_profiles.v1";
 const MAX_ACP_PROFILES: usize = 100;
 const MAX_ACP_PROFILE_ARGUMENTS: usize = 64;
+const MAX_ACP_PROFILE_ENVIRONMENT: usize = 32;
 const MAX_ACP_PROFILE_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -16,6 +18,10 @@ pub(crate) struct AcpRuntimeProfileRecord {
     pub executable: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// 传给该 ACP Agent 子进程的环境变量。真实 Agent 常靠环境变量切换运行模式，
+    /// 例如只读模式或工作区根目录。
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub version: String,
     pub permission_policy: String,
@@ -200,6 +206,16 @@ fn validate_profile(profile: &AcpRuntimeProfileRecord) -> Result<(), String> {
     if profile.version.len() > 200 || profile.version.chars().any(char::is_control) {
         return Err("ACP runtime version is invalid".to_string());
     }
+    if profile.env.len() > MAX_ACP_PROFILE_ENVIRONMENT
+        || profile.env.iter().any(|(key, value)| {
+            let key = key.trim();
+            !valid_environment_key(key)
+                || value.len() > 4_000
+                || value.chars().any(char::is_control)
+        })
+    {
+        return Err("ACP runtime environment is invalid".to_string());
+    }
     if !matches!(
         profile.permission_policy.as_str(),
         "deny" | "allow_once" | "prompt"
@@ -207,6 +223,15 @@ fn validate_profile(profile: &AcpRuntimeProfileRecord) -> Result<(), String> {
         return Err("ACP runtime permission policy is invalid".to_string());
     }
     Ok(())
+}
+
+fn valid_environment_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('=')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn valid_provider_id(value: &str) -> bool {
@@ -235,6 +260,7 @@ mod tests {
             display_name: "ACP Fixture".to_string(),
             executable: "pwsh".to_string(),
             args: vec!["-NoProfile".to_string()],
+            env: Default::default(),
             version: "1.0.0".to_string(),
             permission_policy: "deny".to_string(),
             enabled: true,

@@ -46,6 +46,15 @@ pub(crate) struct ProjectionOutboxSummary {
     pub last_error: String,
 }
 
+/// 死信按 last_error 归组后的结果：排障时先看「卡在哪几类错误上」，再决定重投范围。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProjectionDeadLetterGroup {
+    pub last_error: String,
+    pub count: u64,
+    pub oldest_at: String,
+    pub newest_at: String,
+}
+
 impl LocalRunLedger {
     pub(crate) fn open_default() -> Result<Self, Box<dyn Error>> {
         let root = crate::store::paths::agent_home();
@@ -954,23 +963,81 @@ impl LocalRunLedger {
         &self,
         error_fragment: &str,
     ) -> Result<usize, Box<dyn Error>> {
-        let error_fragment = error_fragment.trim();
-        if error_fragment.is_empty() {
-            return Ok(0);
-        }
+        self.requeue_dead_letter_projections(Some(error_fragment))
+    }
+
+    /// 重投死信：`None` 覆盖全部死信，`Some(片段)` 只覆盖 `last_error` 命中该片段的记录。
+    ///
+    /// 重投只把记录放回待发队列并清零重试计数，不修改内容；若故障仍未修复，记录会重新落回死信，
+    /// 因此调用方不需要担心「重投即丢数据」。
+    pub(crate) fn requeue_dead_letter_projections(
+        &self,
+        error_fragment: Option<&str>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let fragment = match error_fragment {
+            None => None,
+            Some(value) => match value.trim() {
+                "" => return Ok(0),
+                trimmed => Some(trimmed),
+            },
+        };
         let connection = self.connection()?;
-        let changed = connection.execute(
-            "UPDATE projection_outbox
-             SET status = 'pending',
-                 attempts = 0,
-                 next_attempt_at = '',
-                 last_error = '',
-                 updated_at = ?2
-             WHERE status = 'dead_letter'
-               AND instr(last_error, ?1) > 0",
-            params![error_fragment, unix_now_string()],
-        )?;
+        let changed = match fragment {
+            Some(fragment) => connection.execute(
+                "UPDATE projection_outbox
+                 SET status = 'pending',
+                     attempts = 0,
+                     next_attempt_at = '',
+                     last_error = '',
+                     updated_at = ?2
+                 WHERE status = 'dead_letter'
+                   AND instr(last_error, ?1) > 0",
+                params![fragment, unix_now_string()],
+            )?,
+            None => connection.execute(
+                "UPDATE projection_outbox
+                 SET status = 'pending',
+                     attempts = 0,
+                     next_attempt_at = '',
+                     last_error = '',
+                     updated_at = ?1
+                 WHERE status = 'dead_letter'",
+                params![unix_now_string()],
+            )?,
+        };
         Ok(changed)
+    }
+
+    /// 死信按错误归组，供 CLI 与界面回答「同步失败卡在哪一类原因上」。
+    pub(crate) fn dead_letter_projection_groups(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProjectionDeadLetterGroup>, Box<dyn Error>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT last_error,
+                    COUNT(*),
+                    MIN(updated_at),
+                    MAX(updated_at)
+             FROM projection_outbox
+             WHERE status = 'dead_letter'
+             GROUP BY last_error
+             ORDER BY COUNT(*) DESC, last_error ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit.clamp(1, 20) as i64], |row| {
+            Ok(ProjectionDeadLetterGroup {
+                last_error: row.get(0)?,
+                count: row.get::<_, i64>(1)?.max(0) as u64,
+                oldest_at: row.get(2)?,
+                newest_at: row.get(3)?,
+            })
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            groups.push(row?);
+        }
+        Ok(groups)
     }
 
     fn connection(&self) -> Result<Connection, Box<dyn Error>> {
@@ -1394,6 +1461,103 @@ mod tests {
         let summary = ledger.projection_outbox_summary().unwrap();
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.dead_letter, 1);
+    }
+
+    #[test]
+    fn requeue_without_fragment_covers_every_dead_letter() {
+        let ledger = ledger();
+        let unauthorized = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-unauthorized",
+                "projection:run-unauthorized",
+                &serde_json::json!({"run_id": "run-unauthorized"}),
+            )
+            .unwrap();
+        let contract = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-contract",
+                "projection:run-contract",
+                &serde_json::json!({"run_id": "run-contract"}),
+            )
+            .unwrap();
+        let projected = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-ok",
+                "projection:run-ok",
+                &serde_json::json!({"run_id": "run-ok"}),
+            )
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(unauthorized, "HTTP 401 Unauthorized")
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(contract, "invalid json")
+            .unwrap();
+        ledger.mark_projection_projected(projected).unwrap();
+
+        // 契约类错误以前没有重投入口，正是「全量重投」要覆盖的场景。
+        assert_eq!(ledger.requeue_dead_letter_projections(None).unwrap(), 2);
+        let summary = ledger.projection_outbox_summary().unwrap();
+        assert_eq!(summary.pending, 2);
+        assert_eq!(summary.dead_letter, 0);
+        assert_eq!(summary.projected, 1);
+        // 已成功上报的记录不能被重投逻辑带回来。
+        assert_eq!(ledger.pending_projections(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn empty_requeue_fragment_leaves_dead_letters_untouched() {
+        let ledger = ledger();
+        let dead = ledger
+            .enqueue_projection(
+                "run_projection",
+                "run-dead",
+                "projection:run-dead",
+                &serde_json::json!({"run_id": "run-dead"}),
+            )
+            .unwrap();
+        ledger
+            .mark_projection_dead_letter(dead, "invalid json")
+            .unwrap();
+        // 空白片段等于「没有指定范围」：宁可什么都不做，也不要把全部死信一次性重投。
+        assert_eq!(
+            ledger.requeue_dead_letter_projections(Some("   ")).unwrap(),
+            0
+        );
+        assert_eq!(ledger.projection_outbox_summary().unwrap().dead_letter, 1);
+    }
+
+    #[test]
+    fn dead_letter_groups_summarize_failures_by_reason() {
+        let ledger = ledger();
+        for (aggregate, error) in [
+            ("run-a", "invalid json"),
+            ("run-b", "invalid json"),
+            ("run-c", "HTTP 401 Unauthorized"),
+        ] {
+            let id = ledger
+                .enqueue_projection(
+                    "run_projection",
+                    aggregate,
+                    &format!("projection:{aggregate}"),
+                    &serde_json::json!({ "run_id": aggregate }),
+                )
+                .unwrap();
+            ledger.mark_projection_dead_letter(id, error).unwrap();
+        }
+
+        let groups = ledger.dead_letter_projection_groups(5).unwrap();
+        assert_eq!(groups.len(), 2);
+        // 占多数的错误排在前面，排障时先看到的就是主要矛盾。
+        assert_eq!(groups[0].last_error, "invalid json");
+        assert_eq!(groups[0].count, 2);
+        assert!(!groups[0].oldest_at.is_empty());
+        assert!(groups[0].newest_at >= groups[0].oldest_at);
+        assert_eq!(groups[1].last_error, "HTTP 401 Unauthorized");
+        assert_eq!(groups[1].count, 1);
     }
 
     #[test]

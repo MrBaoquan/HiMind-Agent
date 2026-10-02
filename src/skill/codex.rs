@@ -1,12 +1,13 @@
 use crate::skill::clients::manifest_supports_client;
 use crate::skill::manifest::validate_skill_id;
-use crate::skill::resolver::{CapabilityFact, SkillReadiness};
+use crate::skill::resolver::{compare_versions, CapabilityFact, SkillReadiness};
 use crate::skill::store::{SkillStore, SKILL_SYNC_MODE_SYMLINK};
 use crate::skill::target::{self, SkillTarget};
 use crate::skill::types::{SkillReceipt, SkillRecord};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -32,15 +33,20 @@ struct RenderOutcome {
 pub(crate) fn status_json(
     agent_version: &str,
     capability_facts: &[CapabilityFact],
+    store: &SkillStore,
+    records: &[SkillRecord],
+    configured_sync_mode: &str,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let store = SkillStore::new();
-    store.bootstrap_builtin_skills()?;
-    let configured_sync_mode = store.sync_mode()?;
-    let target = resolve_target(&store)?;
-    let sync_mode = target::effective_sync_mode(&configured_sync_mode, &target);
-    let records = store.list_records()?;
+    let target = resolve_target(store)?;
+    let sync_mode = target::effective_sync_mode(configured_sync_mode, &target);
+    // 工作区固定版本快照：同一个工作区下的全部技能共用一次读盘结果。
+    let pins = target
+        .workspace_root
+        .as_deref()
+        .map(crate::skill::target::WorkspacePinSnapshot::load)
+        .transpose()?;
     let items = records
-        .into_iter()
+        .iter()
         .map(|record| {
             skill_status_entry(
                 &target.root,
@@ -48,6 +54,8 @@ pub(crate) fn status_json(
                 agent_version,
                 capability_facts,
                 record,
+                configured_sync_mode,
+                pins.as_ref(),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -154,10 +162,10 @@ pub(crate) fn repair_json(
             let backup = target
                 .root
                 .join(format!(".himind-{slug}-user-backup-{}", unique_stamp()));
-            fs::rename(&render_root, &backup)?;
+            target.rename_guarded(&render_root, &backup, "备份被本地修改过的 Skill 目录")?;
             Some(backup)
         } else {
-            fs::remove_dir_all(&render_root)?;
+            target.remove_tree_guarded(&render_root, "清理被本地修改过的 Skill 目录")?;
             None
         }
     } else {
@@ -165,9 +173,11 @@ pub(crate) fn repair_json(
     };
     let outcome = render_skill(&target, &record)?;
     if render_root != target.root.join(&slug) && render_root.exists() {
-        let _ = fs::remove_dir_all(&render_root);
+        let _ = target.remove_tree_guarded(&render_root, "清理旧布局的 Skill 目录");
         if let Some(parent) = render_root.parent() {
-            let _ = fs::remove_dir(parent);
+            if let Ok(root) = target.trusted_root() {
+                let _ = root.remove_empty_dir(parent, "清理旧布局的空目录");
+            }
         }
     }
     Ok(json!({
@@ -261,10 +271,11 @@ fn skill_status_entry(
     target: &SkillTarget,
     agent_version: &str,
     capability_facts: &[CapabilityFact],
-    record: SkillRecord,
+    record: &SkillRecord,
+    configured_sync_mode: &str,
+    pins: Option<&target::WorkspacePinSnapshot>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let configured_sync_mode = SkillStore::new().sync_mode()?;
-    let sync_mode = target::effective_sync_mode(&configured_sync_mode, target);
+    let sync_mode = target::effective_sync_mode(configured_sync_mode, target);
     let readiness =
         SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, "codex");
     let render_root = render_root_for_record(target, &record)?;
@@ -304,12 +315,13 @@ fn skill_status_entry(
     // receipt with the Store head would otherwise report a deliberate pin as
     // "outdated"; compare with the pin and surface the newer Store version as
     // an explicit update instead.
-    let pinned_version = target
-        .workspace_root
-        .as_deref()
-        .map(|root| target::workspace_pinned_version(root, &record.manifest.id))
-        .transpose()?
-        .flatten();
+    let pinned_version = match target.workspace_root.as_deref() {
+        Some(root) => match pins {
+            Some(snapshot) => snapshot.pinned_version(&record.manifest.id),
+            None => target::workspace_pinned_version(root, &record.manifest.id)?,
+        },
+        None => None,
+    };
     let expected_version = pinned_version
         .clone()
         .unwrap_or_else(|| record.manifest.version.clone());
@@ -326,14 +338,16 @@ fn skill_status_entry(
         "modified"
     } else if update_available && mode_stale {
         "outdated"
-    } else if receipt
-        .as_ref()
-        .map(|receipt| receipt.version != expected_version)
-        .unwrap_or(false)
-    {
+    } else if receipt.as_ref().is_some_and(|receipt| {
+        // 只有来源版本确实更高才算"有更新"。安装版本高于来源版本（例如来源被回滚到
+        // 旧版本）时不再提示更新，否则这个按钮实际会把用户已装好的技能降级。
+        compare_versions(&expected_version, &receipt.version) == Ordering::Greater
+    }) {
         "outdated"
     } else if mode_stale {
-        "modified"
+        // 内容与收据一致，只是渲染方式与当前设置不同：这是"需要重新同步"，
+        // 不是"用户改过文件"。两者必须分开，否则界面会吓人也会误导排障方向。
+        "render_stale"
     } else {
         "installed"
     };
@@ -341,6 +355,7 @@ fn skill_status_entry(
         "not_installed" => vec!["install"],
         "outdated" => vec!["update", "uninstall"],
         "modified" => vec!["repair", "uninstall"],
+        "render_stale" => vec!["repair", "uninstall"],
         "installed" => vec!["repair", "uninstall"],
         _ => Vec::new(),
     };
@@ -348,6 +363,12 @@ fn skill_status_entry(
         "record": record,
         "readiness": readiness,
         "rendered_root": crate::skill::target::display_path(&render_root),
+        // 安装位置：给前端区分"全局技能目录"与"某个指定目录"，不再靠路径猜测。
+        "target_scope": if target.is_workspace() { "directory" } else { "global" },
+        "location_root": target
+            .workspace_root
+            .as_ref()
+            .map(|root| crate::skill::target::display_path(root)),
         "rendered": render_root.exists(),
         "rendered_valid": receipt_ok,
         "client_state": client_state,
@@ -435,13 +456,15 @@ fn render_skill(
             && existing.render_mode == sync_mode
             && existing.checksums == checksums
         {
-            let _ = fs::remove_dir_all(&staging_dir);
+            let _ = target.remove_tree_guarded(&staging_dir, "清理渲染暂存目录");
             target::record_deployment(
                 target,
                 "codex",
                 &record.manifest.id,
                 &record.manifest.version,
                 &render_root,
+                &sync_mode,
+                &existing.files,
             )?;
             target::record_workspace_skill(target, record, "himind-store")?;
             return Ok(RenderOutcome {
@@ -455,7 +478,12 @@ fn render_skill(
         }
     }
 
-    copy_skill_tree(&record.version_root, &staging_dir, &sync_mode)?;
+    // 渲染失败必须顺手清掉 staging：否则客户端会递归发现里面的 SKILL.md，
+    // 把一个渲染到一半的半成品当成第二个技能。
+    if let Err(error) = copy_skill_tree(target, &record.version_root, &staging_dir, &sync_mode) {
+        let _ = target.remove_tree_guarded(&staging_dir, "清理渲染暂存目录");
+        return Err(error);
+    }
     let receipt = SkillReceipt {
         skill_id: record.manifest.id.clone(),
         version: record.manifest.version.clone(),
@@ -479,16 +507,17 @@ fn render_skill(
         serde_json::to_vec_pretty(&receipt)?,
     )?;
     if render_root.exists() {
-        fs::rename(&render_root, &backup_dir)?;
+        target.rename_guarded(&render_root, &backup_dir, "备份现有 Skill 目录")?;
     }
-    if let Err(error) = fs::rename(&staging_dir, &render_root) {
+    if let Err(error) = target.rename_guarded(&staging_dir, &render_root, "换入新的 Skill 目录")
+    {
         if backup_dir.exists() {
-            let _ = fs::rename(&backup_dir, &render_root);
+            let _ = target.rename_guarded(&backup_dir, &render_root, "回滚 Skill 目录");
         }
         return Err(error.into());
     }
     if backup_dir.exists() {
-        fs::remove_dir_all(&backup_dir)?;
+        target.remove_tree_guarded(&backup_dir, "清理 Skill 备份目录")?;
     }
     target::record_deployment(
         target,
@@ -496,6 +525,8 @@ fn render_skill(
         &record.manifest.id,
         &record.manifest.version,
         &render_root,
+        &receipt.render_mode,
+        &rendered_files,
     )?;
     target::record_workspace_skill(target, record, "himind-store")?;
 
@@ -545,7 +576,7 @@ fn uninstall_skill(
     if receipt.target_kind != target.target_kind || receipt.workspace_id != target.workspace_id {
         return Err("Codex Skill 托管收据属于其他安装目标，拒绝卸载".into());
     }
-    remove_rendered_tree(&render_root, &receipt)?;
+    remove_rendered_tree(target, &render_root, &receipt)?;
     if render_root == legacy_current {
         let _ = fs::remove_file(legacy_root.join("current.json"));
         let _ = fs::remove_file(legacy_root.join("previous.json"));
@@ -632,6 +663,26 @@ fn codex_default_candidates(store: &SkillStore) -> Vec<(String, PathBuf)> {
     candidates
 }
 
+/// 当前实际生效的 Codex 技能根目录。
+///
+/// 目录卫生清理用它来判断"某个 legacy 技能是否已经在现代布局里有副本"，
+/// 只有已有副本时才敢删老的 `current/`、`previous/` 树。
+pub(crate) fn active_root() -> Option<PathBuf> {
+    resolve_target(&SkillStore::new())
+        .ok()
+        .map(|target| target.root)
+}
+
+/// 本机所有候选的 Codex 技能根目录（不含内部预览目录）。
+pub(crate) fn global_candidate_roots() -> Vec<PathBuf> {
+    let store = SkillStore::new();
+    codex_default_candidates(&store)
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| !path.ends_with(".preview"))
+        .collect()
+}
+
 fn skill_slug(record: &SkillRecord) -> Result<String, Box<dyn Error>> {
     let slug = record
         .manifest
@@ -657,12 +708,13 @@ fn validate_skill_slug(slug: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn copy_skill_tree(
+    target: &SkillTarget,
     source_root: &Path,
     target_root: &Path,
     mode: &str,
 ) -> Result<(), Box<dyn Error>> {
     if target_root.exists() {
-        fs::remove_dir_all(target_root)?;
+        target.remove_tree_guarded(target_root, "清理渲染暂存目录")?;
     }
     fs::create_dir_all(target_root)?;
     for entry in WalkDir::new(source_root) {
@@ -791,24 +843,58 @@ fn read_receipt(root: &Path) -> Result<SkillReceipt, Box<dyn Error>> {
     )?)
 }
 
+/// 校验已渲染副本时使用的"内容集合"。
+///
+/// 收据是随版本演进的结构：早期版本把 `checksums.sha256` 这类内部记账文件也计入内容，
+/// 现在的规则把内部文件排除。直接比较两个集合会把**内容其实完全一致**的历史副本判成
+/// "已被修改"。这里统一按当前规则取内容集合：内部文件两侧都不参与比较，真实改动
+/// （内容不一致、文件缺失、出现未登记文件）依然会被检出。
+fn receipt_content_checksums(receipt: &SkillReceipt) -> std::collections::BTreeMap<String, String> {
+    receipt
+        .checksums
+        .iter()
+        .filter(|(path, _)| !crate::skill::manifest::is_internal_package_file(path))
+        .map(|(path, checksum)| (path.clone(), checksum.clone()))
+        .collect()
+}
+
 fn validate_rendered_skill(root: &Path, receipt: &SkillReceipt) -> Result<(), Box<dyn Error>> {
     let checksums = compute_checksums(root, RECEIPT_NAME)?;
-    if checksums != receipt.checksums {
+    if checksums != expected_content_checksums(receipt)? {
         return Err(format!("rendered skill was modified: {}", receipt.skill_id).into());
     }
     Ok(())
 }
 
+/// 渲染副本"应当"具备的内容集合。
+///
+/// copy 渲染把内容复制进目标目录，收据里的 checksums 就是权威快照，之后的任何差异都来自
+/// 本地改动。symlink 渲染的目标目录里是 Store 版本的链接，内容始终由 Store 托管：收据只是
+/// 渲染当时的快照，Store 版本内容被就地修正（例如批量订正文案）后快照会过期，继续按快照
+/// 比对会把"来源已更新"误报成"用户改过文件"。所以这类副本改为与真实来源比对。
+fn expected_content_checksums(
+    receipt: &SkillReceipt,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    if receipt.render_mode == SKILL_SYNC_MODE_SYMLINK {
+        let source = PathBuf::from(receipt.source_root.trim());
+        if source.is_dir() {
+            return compute_checksums(&source, RECEIPT_NAME);
+        }
+    }
+    Ok(receipt_content_checksums(receipt))
+}
+
 fn rendered_drift(root: &Path, receipt: &SkillReceipt) -> Result<Vec<String>, Box<dyn Error>> {
     let actual = compute_checksums(root, RECEIPT_NAME)?;
+    let expected = expected_content_checksums(receipt)?;
     let mut changed = Vec::new();
-    for (path, checksum) in &receipt.checksums {
+    for (path, checksum) in &expected {
         if actual.get(path) != Some(checksum) {
             changed.push(path.clone());
         }
     }
     for path in actual.keys() {
-        if !receipt.checksums.contains_key(path) {
+        if !expected.contains_key(path) {
             changed.push(path.clone());
         }
     }
@@ -817,9 +903,13 @@ fn rendered_drift(root: &Path, receipt: &SkillReceipt) -> Result<Vec<String>, Bo
     Ok(changed)
 }
 
-fn remove_rendered_tree(root: &Path, receipt: &SkillReceipt) -> Result<(), Box<dyn Error>> {
+fn remove_rendered_tree(
+    target: &SkillTarget,
+    root: &Path,
+    receipt: &SkillReceipt,
+) -> Result<(), Box<dyn Error>> {
     validate_rendered_skill(root, receipt)?;
-    fs::remove_dir_all(root)?;
+    target.remove_tree_guarded(root, "卸载 Skill")?;
     Ok(())
 }
 

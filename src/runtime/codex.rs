@@ -59,7 +59,7 @@ fn execute_claimed(
     process::remove_file_if_present(&invocation.result_path);
     update_agent_run_status(
         client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &claim.run.id,
         &claim.claim_token,

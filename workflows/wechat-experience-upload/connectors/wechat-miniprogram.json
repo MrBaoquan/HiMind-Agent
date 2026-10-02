@@ -1,0 +1,38 @@
+{
+  "schema_version": "connector_manifest.v1",
+  "id": "wechat-miniprogram",
+  "version": "1.0.0",
+  "name": "微信小程序上传连接器",
+  "description": "为指定展馆和环境的微信小程序体验版上传提供上传私钥和 miniprogram-ci 检查。",
+  "availability": "local",
+  "credential_ownership": "agent",
+  "auth": [
+    "api_key"
+  ],
+  "capabilities": [
+    "wechat.miniprogram.build",
+    "wechat.miniprogram.ci.readiness",
+    "wechat.miniprogram.upload"
+  ],
+  "scopes": [
+    "wechat.miniprogram.deploy"
+  ],
+  "supported_platforms": [
+    "windows"
+  ],
+  "health_check": {
+    "type": "capability",
+    "target": "wechat.miniprogram.ci.readiness",
+    "input": {
+      "require_ci_installed": false
+    }
+  },
+  "credentials": [
+    {
+      "handle": "wechat-upload-private-key",
+      "target": "private_key_path",
+      "kind": "file_path",
+      "required": false
+    }
+  ]
+}

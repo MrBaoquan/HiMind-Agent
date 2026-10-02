@@ -1,12 +1,13 @@
 use crate::skill::clients::manifest_supports_client;
 use crate::skill::manifest::validate_skill_id;
-use crate::skill::resolver::{CapabilityFact, SkillReadiness};
+use crate::skill::resolver::{compare_versions, CapabilityFact, SkillReadiness};
 use crate::skill::store::{SkillStore, SKILL_SYNC_MODE_SYMLINK};
 use crate::skill::target::SkillTarget;
 use crate::skill::types::{SkillReceipt, SkillRecord};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::env;
@@ -41,10 +42,39 @@ pub(crate) fn status_for_target(
     let store = SkillStore::new();
     store.bootstrap_builtin_skills()?;
     let configured_sync_mode = store.sync_mode()?;
-    let sync_mode = crate::skill::target::effective_sync_mode(&configured_sync_mode, &target);
-    let items = store
-        .list_records()?
-        .into_iter()
+    let records = store.list_records()?;
+    status_for_target_with(
+        client_id,
+        target,
+        agent_version,
+        capability_facts,
+        &records,
+        &configured_sync_mode,
+    )
+}
+
+/// 与 [`status_for_target`] 同源，只是把「记录清单 + 同步模式」交给调用方一次
+/// 取好再复用。
+///
+/// 一次状态快照要给二十来个客户端各出一份清单，若每个客户端都自己重读一遍
+/// 全部技能记录，就是二十倍的重复文件读取；这是本机技能页十秒级耗时的主要来源。
+pub(crate) fn status_for_target_with(
+    client_id: &str,
+    target: DirectSkillTarget,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+    records: &[SkillRecord],
+    configured_sync_mode: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let sync_mode = crate::skill::target::effective_sync_mode(configured_sync_mode, &target);
+    // 工作区固定版本快照：同一个工作区下的全部技能共用一次读盘结果。
+    let pins = target
+        .workspace_root
+        .as_deref()
+        .map(crate::skill::target::WorkspacePinSnapshot::load)
+        .transpose()?;
+    let items = records
+        .iter()
         .map(|record| {
             skill_status_entry(
                 &target.root,
@@ -53,6 +83,8 @@ pub(crate) fn status_for_target(
                 capability_facts,
                 record,
                 client_id,
+                configured_sync_mode,
+                pins.as_ref(),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -185,10 +217,10 @@ pub(crate) fn repair_for_target(
                 skill_slug(&record)?,
                 unique_stamp()
             ));
-            fs::rename(&rendered_root, &backup)?;
+            target.rename_guarded(&rendered_root, &backup, "备份被本地修改过的 Skill 目录")?;
             Some(backup)
         } else {
-            fs::remove_dir_all(&rendered_root)?;
+            target.remove_tree_guarded(&rendered_root, "清理被本地修改过的 Skill 目录")?;
             None
         }
     } else {
@@ -259,11 +291,12 @@ fn skill_status_entry(
     target: &SkillTarget,
     agent_version: &str,
     capability_facts: &[CapabilityFact],
-    record: SkillRecord,
+    record: &SkillRecord,
     client_id: &str,
+    configured_sync_mode: &str,
+    pins: Option<&crate::skill::target::WorkspacePinSnapshot>,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let configured_sync_mode = SkillStore::new().sync_mode()?;
-    let sync_mode = crate::skill::target::effective_sync_mode(&configured_sync_mode, target);
+    let sync_mode = crate::skill::target::effective_sync_mode(configured_sync_mode, target);
     let readiness =
         SkillReadiness::resolve(&record.manifest, capability_facts, agent_version, client_id);
     let rendered_root = target_root.join(skill_slug(&record)?);
@@ -301,12 +334,15 @@ fn skill_status_entry(
     // Keep the same pin semantics as the Codex adapter: a project that
     // deliberately holds an older version is not "outdated", it simply has an
     // explicit update available.
-    let pinned_version = target
-        .workspace_root
-        .as_deref()
-        .map(|root| crate::skill::target::workspace_pinned_version(root, &record.manifest.id))
-        .transpose()?
-        .flatten();
+    let pinned_version = match pins {
+        Some(pins) => pins.pinned_version(&record.manifest.id),
+        None => target
+            .workspace_root
+            .as_deref()
+            .map(|root| crate::skill::target::workspace_pinned_version(root, &record.manifest.id))
+            .transpose()?
+            .flatten(),
+    };
     let expected_version = pinned_version
         .clone()
         .unwrap_or_else(|| record.manifest.version.clone());
@@ -323,14 +359,15 @@ fn skill_status_entry(
         "modified"
     } else if update_available && mode_stale {
         "outdated"
-    } else if receipt
-        .as_ref()
-        .map(|receipt| receipt.version != expected_version)
-        .unwrap_or(false)
-    {
+    } else if receipt.as_ref().is_some_and(|receipt| {
+        // 见 Codex 适配器：只有来源版本确实更高才提示更新，避免把已装的较新版本降级。
+        compare_versions(&expected_version, &receipt.version) == Ordering::Greater
+    }) {
         "outdated"
     } else if mode_stale {
-        "modified"
+        // 内容与收据一致，只是渲染方式与当前设置不同：这是"需要重新同步"，
+        // 不是"用户改过文件"。两者必须分开，否则界面会吓人也会误导排障方向。
+        "render_stale"
     } else {
         "installed"
     };
@@ -338,6 +375,7 @@ fn skill_status_entry(
         "not_installed" => vec!["install"],
         "outdated" => vec!["update", "uninstall"],
         "modified" => vec!["repair"],
+        "render_stale" => vec!["repair"],
         "installed" => vec!["uninstall"],
         _ => Vec::new(),
     };
@@ -345,6 +383,12 @@ fn skill_status_entry(
         "record": record,
         "readiness": readiness,
         "rendered_root": crate::skill::target::display_path(&rendered_root),
+        // 安装位置：给前端区分"全局技能目录"与"某个指定目录"，不再靠路径猜测。
+        "target_scope": if target.is_workspace() { "directory" } else { "global" },
+        "location_root": target
+            .workspace_root
+            .as_ref()
+            .map(|root| crate::skill::target::display_path(root)),
         "rendered": rendered_root.exists(),
         "rendered_valid": receipt_ok,
         "client_state": client_state,
@@ -412,6 +456,8 @@ fn render_skill(
                 &record.manifest.id,
                 &record.manifest.version,
                 &rendered_root,
+                &sync_mode,
+                &receipt.files,
             )?;
             crate::skill::target::record_workspace_skill(target, record, "himind-store")?;
             return Ok(RenderOutcome {
@@ -425,7 +471,12 @@ fn render_skill(
         }
     }
 
-    copy_skill_tree(&record.version_root, &staging_root, &sync_mode)?;
+    // 渲染失败必须顺手清掉 staging：否则客户端会递归发现里面的 SKILL.md，
+    // 把一个渲染到一半的半成品当成第二个技能。
+    if let Err(error) = copy_skill_tree(target, &record.version_root, &staging_root, &sync_mode) {
+        let _ = target.remove_tree_guarded(&staging_root, "清理渲染暂存目录");
+        return Err(error);
+    }
     let receipt = SkillReceipt {
         skill_id: record.manifest.id.clone(),
         version: record.manifest.version.clone(),
@@ -450,16 +501,17 @@ fn render_skill(
     )?;
 
     if rendered_root.exists() {
-        fs::rename(&rendered_root, &backup_root)?;
+        target.rename_guarded(&rendered_root, &backup_root, "备份现有 Skill 目录")?;
     }
-    if let Err(error) = fs::rename(&staging_root, &rendered_root) {
+    if let Err(error) = target.rename_guarded(&staging_root, &rendered_root, "换入新的 Skill 目录")
+    {
         if backup_root.exists() {
-            let _ = fs::rename(&backup_root, &rendered_root);
+            let _ = target.rename_guarded(&backup_root, &rendered_root, "回滚 Skill 目录");
         }
         return Err(error.into());
     }
     if backup_root.exists() {
-        fs::remove_dir_all(&backup_root)?;
+        target.remove_tree_guarded(&backup_root, "清理 Skill 备份目录")?;
     }
     crate::skill::target::record_deployment(
         target,
@@ -467,6 +519,8 @@ fn render_skill(
         &record.manifest.id,
         &record.manifest.version,
         &rendered_root,
+        &receipt.render_mode,
+        &files,
     )?;
     crate::skill::target::record_workspace_skill(target, record, "himind-store")?;
     Ok(RenderOutcome {
@@ -510,7 +564,7 @@ fn uninstall_skill(
         return Err(format!("{client_name} Skill 托管收据属于其他安装目标，拒绝卸载").into());
     }
     validate_rendered_skill(&rendered_root, &receipt)?;
-    fs::remove_dir_all(&rendered_root)?;
+    target.remove_tree_guarded(&rendered_root, "卸载 Skill")?;
     crate::skill::target::remove_deployment(target, client_id, skill_id)?;
     crate::skill::target::remove_workspace_skill_if_unused(target, skill_id)?;
     Ok(json!({"skill_id": skill_id, "removed": true}))
@@ -553,12 +607,13 @@ fn validate_skill_slug(slug: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn copy_skill_tree(
+    target: &SkillTarget,
     source_root: &Path,
     target_root: &Path,
     mode: &str,
 ) -> Result<(), Box<dyn Error>> {
     if target_root.exists() {
-        fs::remove_dir_all(target_root)?;
+        target.remove_tree_guarded(target_root, "清理渲染暂存目录")?;
     }
     fs::create_dir_all(target_root)?;
     for entry in WalkDir::new(source_root) {
@@ -678,22 +733,48 @@ fn symlink_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>>
 }
 
 fn validate_rendered_skill(root: &Path, receipt: &SkillReceipt) -> Result<(), Box<dyn Error>> {
-    if compute_checksums(root)? != receipt.checksums {
+    if compute_checksums(root)? != expected_content_checksums(receipt)? {
         return Err(format!("rendered skill was modified: {}", receipt.skill_id).into());
     }
     Ok(())
 }
 
+/// 见 Codex 适配器同名函数：历史收据把内部记账文件也计入内容，比较时按当前规则取集合，
+/// 避免把内容一致的历史副本误判成"已被修改"。
+fn receipt_content_checksums(receipt: &SkillReceipt) -> std::collections::BTreeMap<String, String> {
+    receipt
+        .checksums
+        .iter()
+        .filter(|(path, _)| !crate::skill::manifest::is_internal_package_file(path))
+        .map(|(path, checksum)| (path.clone(), checksum.clone()))
+        .collect()
+}
+
+/// 见 Codex 适配器同名函数：symlink 渲染的内容由 Store 托管，收据只是渲染当时的快照，
+/// 按快照比对会把"来源已更新"误报成"用户改过文件"，这类副本改为与真实来源比对。
+fn expected_content_checksums(
+    receipt: &SkillReceipt,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    if receipt.render_mode == SKILL_SYNC_MODE_SYMLINK {
+        let source = PathBuf::from(receipt.source_root.trim());
+        if source.is_dir() {
+            return compute_checksums(&source);
+        }
+    }
+    Ok(receipt_content_checksums(receipt))
+}
+
 fn rendered_drift(root: &Path, receipt: &SkillReceipt) -> Result<Vec<String>, Box<dyn Error>> {
     let actual = compute_checksums(root)?;
+    let expected = expected_content_checksums(receipt)?;
     let mut changed = Vec::new();
-    for (path, checksum) in &receipt.checksums {
+    for (path, checksum) in &expected {
         if actual.get(path) != Some(checksum) {
             changed.push(path.clone());
         }
     }
     for path in actual.keys() {
-        if !receipt.checksums.contains_key(path) {
+        if !expected.contains_key(path) {
             changed.push(path.clone());
         }
     }
@@ -748,6 +829,59 @@ mod tests {
             current: true,
             previous_version: None,
         }
+    }
+
+    /// 历史收据把 `checksums.sha256` 计入内容，当前规则把内部文件排除。
+    /// 两侧必须对齐，否则"内容完全一致的旧副本"会被误报成"已被修改"。
+    /// 同时保证真实改动仍能被检出。
+    #[test]
+    fn legacy_receipt_checksums_do_not_look_like_user_edits() {
+        let root = env::temp_dir().join(format!("himind-copilot-receipt-{}", unique_stamp()));
+        let rendered = root.join("rendered");
+        fs::create_dir_all(&rendered).unwrap();
+        fs::write(rendered.join("SKILL.md"), "# 内容").unwrap();
+        fs::write(rendered.join("checksums.sha256"), "内部记账文件").unwrap();
+
+        let mut checksums = compute_checksums(&rendered).unwrap();
+        // 旧收据额外记录了内部文件，这正是历史副本的形态。
+        let internal = format!(
+            "{:x}",
+            Sha256::digest(fs::read(rendered.join("checksums.sha256")).unwrap())
+        );
+        checksums.insert("checksums.sha256".to_string(), internal);
+        let mut receipt = super::SkillReceipt {
+            skill_id: "com.himind.skill.copilot-test".to_string(),
+            version: "1.0.0".to_string(),
+            client: CLIENT_ID.to_string(),
+            agent_profile: crate::store::paths::profile_name(),
+            source_root: String::new(),
+            rendered_root: rendered.to_string_lossy().to_string(),
+            rendered_at: "1".to_string(),
+            render_mode: "copy".to_string(),
+            target_kind: crate::skill::target::TARGET_KIND_GLOBAL.to_string(),
+            workspace_root: None,
+            workspace_id: None,
+            files: Vec::new(),
+            checksums,
+        };
+
+        assert!(validate_rendered_skill(&rendered, &receipt).is_ok());
+        assert!(rendered_drift(&rendered, &receipt).unwrap().is_empty());
+
+        // 真实改动仍然要被检出。
+        fs::write(rendered.join("SKILL.md"), "# 被改过的内容").unwrap();
+        assert!(validate_rendered_skill(&rendered, &receipt).is_err());
+        assert!(!rendered_drift(&rendered, &receipt).unwrap().is_empty());
+
+        // 出现未登记文件同样算漂移。
+        fs::write(rendered.join("SKILL.md"), "# 内容").unwrap();
+        fs::write(rendered.join("extra.md"), "未登记").unwrap();
+        receipt.files = vec!["checksums.sha256".to_string(), "SKILL.md".to_string()];
+        assert!(rendered_drift(&rendered, &receipt)
+            .unwrap()
+            .iter()
+            .any(|path| path == "extra.md"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -832,6 +966,28 @@ mod tests {
             uninstall_skill(&target_b, &record.manifest.id, CLIENT_ID, "Copilot").unwrap_err();
         assert!(error.to_string().contains("属于其他安装目标"));
         assert!(target_a.root.join("copilot-test").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 台账与收据里的路径不参与删除决策：任何落在可信根之外的目标都必须拒绝，
+    /// 也不能把可信根本身当成删除目标。
+    #[test]
+    fn refuses_to_touch_a_projection_outside_the_trusted_root() {
+        let root = env::temp_dir().join(format!("himind-copilot-guard-{}", unique_stamp()));
+        let workspace = root.join("project");
+        fs::create_dir_all(workspace.join(".agents").join("skills")).unwrap();
+        let outside = root.join("important");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "keep").unwrap();
+
+        let target = SkillTarget::workspace(&workspace, ".agents/skills", "workspace").unwrap();
+        assert!(target.remove_tree_guarded(&outside, "卸载 Skill").is_err());
+        assert!(outside.join("keep.txt").is_file());
+        // 可信根本身不能被当成卸载目标，否则一次路径拼接失误就能删掉整个安装目录。
+        assert!(target
+            .remove_tree_guarded(&workspace, "卸载 Skill")
+            .is_err());
+        assert!(workspace.join(".agents").join("skills").is_dir());
         let _ = fs::remove_dir_all(root);
     }
 }

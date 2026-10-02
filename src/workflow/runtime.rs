@@ -55,6 +55,7 @@ pub(crate) fn execute_runtime_step(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut runtime_facts: Option<(String, String, String)> = None;
+    let mut acp_facts: Option<Value> = None;
     let output = match provider.as_str() {
         "personal.codex" => execute_codex(&workspace, &prompt, timeout_seconds, is_canceled)?,
         "personal.github-copilot" => {
@@ -63,7 +64,8 @@ pub(crate) fn execute_runtime_step(
         "himind.fixture" => fixture_runtime_output(&step.id, &workspace, input)?,
         "himind.builtin" => {
             let outcome = crate::runtime::deepseek_harness::execute_workflow(
-                options.ok_or("himind.builtin runtime step is unavailable without Agent options")?,
+                options
+                    .ok_or("himind.builtin runtime step is unavailable without Agent options")?,
                 &workspace,
                 &prompt,
                 timeout_seconds,
@@ -79,14 +81,27 @@ pub(crate) fn execute_runtime_step(
             outcome.text
         }
         provider if crate::runtime::acp::is_provider(provider) => {
-            crate::runtime::acp::execute_workflow(
+            let execution = crate::runtime::acp::execute_workflow(
                 provider,
                 &workspace,
                 &prompt,
                 timeout_seconds,
                 run_id,
                 is_canceled,
-            )?
+            )?;
+            // ACP 步骤把真实会话事实留痕：工作台需要能回答“这一步由哪个 ACP 会话
+            // 执行、真实 Agent 发起了多少次工具调用与权限请求”，否则链路不可审计。
+            acp_facts = Some(json!({
+                "provider": provider,
+                "session_id": execution.session_id,
+                "stop_reason": execution.stop_reason,
+                "update_count": execution.update_count,
+                "tool_call_count": execution.tool_call_count,
+                "permission_request_count": execution.permission_requests.len(),
+                "denied_client_methods": execution.denied_client_methods,
+                "log_path": execution.log_path,
+            }));
+            execution.final_text
         }
         value => return Err(format!("unsupported workflow runtime provider: {value}").into()),
     };
@@ -102,6 +117,11 @@ pub(crate) fn execute_runtime_step(
             object.insert("model".to_string(), json!(model));
             object.insert("service_source".to_string(), json!(service_source));
             object.insert("endpoint".to_string(), json!(endpoint));
+        }
+    }
+    if let Some(facts) = acp_facts {
+        if let Some(object) = result.as_object_mut() {
+            object.insert("acp".to_string(), facts);
         }
     }
     if let Some(structured) = structured {
@@ -200,9 +220,11 @@ fn resolve_provider(provider: &str) -> Result<String, Box<dyn Error>> {
 
 fn enforce_runtime_network_policy(
     provider: &str,
-    allow_network: bool,
+    allow_network: Option<bool>,
 ) -> Result<(), Box<dyn Error>> {
-    if allow_network || provider == "himind.fixture" {
+    // 只有显式声明 `allow_network: false` 的步骤才要求 Runtime 提供网络隔离；
+    // 不声明表示作者没有提出这项约束。
+    if allow_network != Some(false) || provider == "himind.fixture" {
         return Ok(());
     }
     Err(format!(
@@ -311,7 +333,11 @@ fn resolve_workspace(template: &str, input: &Value) -> Result<String, Box<dyn Er
                 .ok()
                 .map(|path| path.to_string_lossy().to_string())
         })
-        .unwrap_or_else(|| crate::store::paths::agent_home().to_string_lossy().to_string());
+        .unwrap_or_else(|| {
+            crate::store::paths::agent_home()
+                .to_string_lossy()
+                .to_string()
+        });
     let workspace = process::canonical_workspace(&candidate)?;
     Ok(workspace.to_string_lossy().to_string())
 }
@@ -563,7 +589,10 @@ mod tests {
             enforce_runtime_tool_policy("himind.builtin", "default").unwrap(),
             false
         );
-        assert_eq!(enforce_runtime_tool_policy("himind.builtin", "").unwrap(), false);
+        assert_eq!(
+            enforce_runtime_tool_policy("himind.builtin", "").unwrap(),
+            false
+        );
         // 无法保证禁用工具的 Provider 必须 fail closed，而不是静默降级成“尽力而为”。
         assert!(enforce_runtime_tool_policy("personal.codex", "none").is_err());
         assert!(enforce_runtime_tool_policy("himind.builtin", "read-only").is_err());
@@ -620,9 +649,11 @@ mod tests {
 
     #[test]
     fn rejects_network_disabled_policy_for_unisolated_provider() {
-        assert!(enforce_runtime_network_policy("personal.codex", false).is_err());
-        assert!(enforce_runtime_network_policy("personal.github-copilot", false).is_err());
-        assert!(enforce_runtime_network_policy("himind.fixture", false).is_ok());
-        assert!(enforce_runtime_network_policy("personal.codex", true).is_ok());
+        assert!(enforce_runtime_network_policy("personal.codex", Some(false)).is_err());
+        assert!(enforce_runtime_network_policy("personal.github-copilot", Some(false)).is_err());
+        assert!(enforce_runtime_network_policy("himind.fixture", Some(false)).is_ok());
+        assert!(enforce_runtime_network_policy("personal.codex", Some(true)).is_ok());
+        // 未声明网络约束时不得把「无法证明隔离」当成拒绝服务的理由。
+        assert!(enforce_runtime_network_policy("personal.codex", None).is_ok());
     }
 }

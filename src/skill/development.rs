@@ -59,6 +59,9 @@ fn register_skill_at(path: &Path, registry: &Path) -> Result<String, Box<dyn Err
     let root = path.canonicalize()?;
     let manifest = load_skill_manifest(&root)?;
     validate_skill_id(&manifest.id)?;
+    // 同一个 Agent 可能同时服务多个工作区会话，每个会话都在登记自己的开发
+    // Skill。读改写必须整体串行化，否则先登记的会话会被后登记的整表覆盖。
+    let _lock = crate::store::atomic_file::lock(registry)?;
     let mut entries = entries_at(registry);
     entries.retain(|entry| entry.id != manifest.id);
     entries.push(DevelopmentSkill {
@@ -74,6 +77,7 @@ pub(crate) fn unregister_skill(skill_id: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn unregister_skill_at(skill_id: &str, registry: &Path) -> Result<(), Box<dyn Error>> {
+    let _lock = crate::store::atomic_file::lock(registry)?;
     let mut entries = entries_at(registry);
     entries.retain(|entry| entry.id != skill_id);
     write_entries_at(registry, &entries)
@@ -128,15 +132,9 @@ fn entries_at(path: &Path) -> Vec<DevelopmentSkill> {
 }
 
 fn write_entries_at(path: &Path, entries: &[DevelopmentSkill]) -> Result<(), Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(entries)?)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temporary, path)?;
+    // 换用原子替换：既让并发读永远看到完整内容，也避免多个会话共用同一个
+    // `.json.tmp` 互相截断。调用方负责持有注册表锁。
+    crate::store::atomic_file::atomic_write(path, &serde_json::to_vec_pretty(entries)?)?;
     Ok(())
 }
 
@@ -210,6 +208,57 @@ mod tests {
         let entries = entries_at(&registry);
         assert_eq!(entries.len(), 1);
         assert!(record_at(Path::new(&entries[0].path)).is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 同一个 Agent 会被多个工作区会话共用。多个会话各自登记开发 Skill 时，
+    /// 读改写整体串行化后必须一条不丢；共用 `.json.tmp` 的旧写法会互相截断。
+    #[test]
+    fn concurrent_development_skill_registrations_lose_nothing() {
+        let base = std::env::temp_dir().join(format!(
+            "himind-skill-development-concurrent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let registry = base.join("skill-development.json");
+        let sources = (0..6)
+            .map(|index| {
+                let source = base
+                    .join(format!("workspace-{index}"))
+                    .join("skills")
+                    .join(format!("demo-{index}"));
+                write_skill(
+                    &source,
+                    &format!("com.himind.skill.concurrent.{index}"),
+                    "0.1.0",
+                );
+                source
+            })
+            .collect::<Vec<_>>();
+
+        let barrier = std::sync::Barrier::new(sources.len());
+        std::thread::scope(|scope| {
+            for source in &sources {
+                let registry = registry.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    register_skill_at(source, &registry).unwrap();
+                });
+            }
+        });
+
+        let mut ids = entries_at(&registry)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            (0..6)
+                .map(|index| format!("com.himind.skill.concurrent.{index}"))
+                .collect::<Vec<_>>()
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

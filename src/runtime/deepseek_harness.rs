@@ -55,7 +55,12 @@ const HIMIND_AGENT_PATCH_MARKER: &str =
     "# Agent-owned context. This layer is regenerated for each new HiMind AI session.";
 const INDEPENDENT_ACTIVE_PROVIDER_ID: &str = "himind-local-ai";
 const INDEPENDENT_ACTIVE_API_KEY_ENV: &str = "HIMIND_LOCAL_AI_API_KEY";
+/// Agent 为托管会话写入的 provider id 与它引用的凭据名。两者一起构成 Agent
+/// 自有的路由身份，只允许出现在会话 overlay 里，不允许留在用户文档中。
+const HIMIND_MANAGED_PROVIDER_ID: &str = "himind-proxy";
+const HIMIND_MANAGED_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 const DSH_SETTINGS_MIGRATION_MARKER: &str = ".himind-dsh-settings-v2";
+const DSH_SETTINGS_MIGRATION_VERSION: u32 = 4;
 const INTERACTIVE_HOME_DIRECTORY: &str = "interactive";
 const INTERACTIVE_HOME_MIGRATION_MARKER: &str = ".himind-interactive-home-v1.json";
 const INTERACTIVE_HOME_MIGRATION_MAX_FILES: u64 = 200_000;
@@ -124,6 +129,10 @@ pub(crate) struct InteractiveLaunch {
     pub permission_mode: &'static str,
     /// 这次运行实际用到的 AI 服务来源：`managed`（平台托管）/ `custom`（本机自定义服务）/ `native`（Runtime 自身配置）。
     pub service_source: &'static str,
+    /// 非空表示本次会话是「降级启动」：AI 工作台本该提供模型凭据，但当前
+    /// 拿不到，于是按本机 Runtime 配置启动。面板据此说清真实原因，而不是
+    /// 把「工作台登录态缺失」说成「HiMind AI 不可用」。
+    pub control_plane_notice: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -476,6 +485,23 @@ struct Invocation {
     models: Vec<String>,
     permission_mode: &'static str,
     run_id: String,
+    route_source: ModelRouteSource,
+}
+
+/// 本次运行真正拿到模型凭据的那条来源。
+///
+/// 它和 `Options::mode` 是两件事：连接模式下也可能拿不到工作台凭据（未授权 /
+/// 授权过期 / 工作台不可达），此时会话会降级到本机凭据。overlay 里的 provider
+/// 行必须按这个「事实」写，否则会写出 `himind-proxy` + `DEEPSEEK_API_KEY`，
+/// 而这次运行注入的其实是本机服务的密钥，运行时就只能报「凭据缺失」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelRouteSource {
+    /// 工作台下发的按次（claim-scoped）代理凭据。
+    Managed,
+    /// 用户在本机「设置 → AI 连接 → 模型服务」里选中的自定义服务。
+    LocalService,
+    /// 本机 DSH `settings.yaml` 自己选的路由，Agent 不覆写。
+    Native,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,7 +658,7 @@ pub(crate) fn check_update(
     )
     .map_err(|error| format!("检查 HiMind AI 运行时更新失败: {error}"))?;
     if let Some(resolved) = update {
-        validate_update(&options.api_base, &resolved)?;
+        validate_update(&options.api_base(), &resolved)?;
         let update = resolved.update;
         return Ok(DeepSeekHarnessRuntimeUpdateStatus {
             update_available: true,
@@ -705,7 +731,7 @@ fn install_resolved_with_progress(
         report_progress("ready", 100, "HiMind AI 运行时已是最新版本");
         return Ok(status());
     };
-    validate_update(&options.api_base, &resolved)?;
+    validate_update(&options.api_base(), &resolved)?;
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(INSTALL_TIMEOUT_SECONDS))
         .build()
@@ -741,6 +767,35 @@ pub(crate) fn prepare_interactive_launch(
     options: &Options,
     workspace: Option<&Path>,
 ) -> Result<InteractiveLaunch, String> {
+    prepare_interactive_launch_with(options, workspace, ControlPlaneFallback::Fail)
+}
+
+/// 交互入口专用的启动准备。
+///
+/// 与 [`prepare_interactive_launch`] 的唯一区别是：AI 工作台本该提供模型凭据
+/// 但当前拿不到时，不再拒绝启动，而是降级为本机 Runtime 配置继续拉起会话，
+/// 并把真实原因写进 `control_plane_notice`。无头工作流执行仍然沿用严格模式，
+/// 因为那里的「没登录」是一个需要用户处理的明确失败。
+pub(crate) fn prepare_interactive_launch_allow_degraded(
+    options: &Options,
+    workspace: Option<&Path>,
+) -> Result<InteractiveLaunch, String> {
+    prepare_interactive_launch_with(options, workspace, ControlPlaneFallback::Degrade)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneFallback {
+    /// 控制面凭据不可用时直接失败。
+    Fail,
+    /// 控制面凭据不可用时按本机 Runtime 配置启动。
+    Degrade,
+}
+
+fn prepare_interactive_launch_with(
+    options: &Options,
+    workspace: Option<&Path>,
+    fallback: ControlPlaneFallback,
+) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     let workspace = interactive_workspace(workspace)?;
@@ -764,9 +819,29 @@ pub(crate) fn prepare_interactive_launch(
             workspace,
         );
     }
-    let delegated =
-        crate::api::oauth::platform_access_token(options, crate::api::oauth::AI_CONVERSATION_SCOPE)
-            .map_err(|error| error.to_string())?;
+    let delegated = match crate::api::oauth::platform_access_token(
+        options,
+        crate::api::oauth::AI_CONVERSATION_SCOPE,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            if fallback == ControlPlaneFallback::Fail {
+                return Err(error.to_string());
+            }
+            // HiMind AI 是主入口而不是准入门槛：工作台登录态缺失或过期时，
+            // 会话仍要按本机 Runtime 配置启动，让用户看到自己的工作区和会话
+            // 记录（这些属于本机 DSH 数据），并把真实原因原样带出去。
+            let mut launch = prepare_independent_interactive_launch(
+                options,
+                executable.to_string_lossy().to_string(),
+                version,
+                workspace,
+            )?;
+            launch.control_plane_notice = degraded_notice(&error.to_string(), &launch);
+            eprintln!("{}", launch.control_plane_notice);
+            return Ok(launch);
+        }
+    };
     let credential =
         crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
             .map_err(|error| error.to_string())?;
@@ -786,9 +861,10 @@ pub(crate) fn prepare_interactive_launch(
         models: models.clone(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         run_id: "interactive".to_string(),
+        route_source: ModelRouteSource::Managed,
     };
-    ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
-    let agent_patch = agent_overlay_path(&home);
+    let agent_patch =
+        ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
@@ -804,6 +880,7 @@ pub(crate) fn prepare_interactive_launch(
         catalog_fingerprint: sync_snapshot.catalog_fingerprint,
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         service_source: "managed",
+        control_plane_notice: String::new(),
     })
 }
 
@@ -839,7 +916,7 @@ pub(crate) fn execute_workflow(
     // 工具 schema，也就不可能“去工作区找文件”。这和 prompt 里的约定不同，是
     // 平台强制的事实。
     let patch = if disable_tools {
-        write_no_tools_overlay(&launch.home)?
+        write_no_tools_overlay(&launch.agent_patch)?
     } else {
         launch.agent_patch.clone()
     };
@@ -923,16 +1000,21 @@ fn prepare_independent_interactive_launch(
     workspace: PathBuf,
 ) -> Result<InteractiveLaunch, String> {
     let home = native_dsh_home(&version)?;
-    let (provider_config, api_key, service_source) =
+    let (provider_config, api_key, service_source, route_source) =
         match active_independent_provider_config().map_err(|error| error.to_string())? {
-            Some(projection) => (projection.0, projection.1, "custom"),
+            Some(projection) => (
+                projection.0,
+                projection.1,
+                "custom",
+                ModelRouteSource::LocalService,
+            ),
             None => {
                 let provider_config = native_dsh_provider_config(&home);
                 let api_key = match provider_config.api_key_env.as_deref() {
                     Some(api_key_env) => env::var(api_key_env).unwrap_or_default(),
                     None => String::new(),
                 };
-                (provider_config, api_key, "native")
+                (provider_config, api_key, "native", ModelRouteSource::Native)
             }
         };
     let api_key_env = provider_config.api_key_env.clone();
@@ -950,9 +1032,10 @@ fn prepare_independent_interactive_launch(
         models: models.clone(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         run_id: "interactive".to_string(),
+        route_source,
     };
-    ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
-    let agent_patch = agent_overlay_path(&home);
+    let agent_patch =
+        ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
     Ok(InteractiveLaunch {
         executable: PathBuf::from(executable),
         home,
@@ -968,7 +1051,46 @@ fn prepare_independent_interactive_launch(
         catalog_fingerprint: String::new(),
         permission_mode: INTERACTIVE_PERMISSION_MODE,
         service_source,
+        control_plane_notice: String::new(),
     })
+}
+
+/// 控制面不可用时的提示。
+///
+/// 保留上游的真实原因，避免把「授权文件缺失 / 授权过期 / 未登录」压成同一句
+/// 无法排查的话；同时说清这次会话实际用的是哪份凭据。凭据为空时点明下一步，
+/// 因为那是用户唯一能自己解决的情况。
+fn degraded_notice(reason: &str, launch: &InteractiveLaunch) -> String {
+    let reason = reason.trim();
+    let source = match launch.service_source {
+        "custom" => "本机模型服务",
+        _ => "本机 DSH 模型配置",
+    };
+    let head = if reason.is_empty() {
+        "AI 工作台暂不可用".to_string()
+    } else {
+        format!("AI 工作台暂不可用（{reason}）")
+    };
+    if launch.api_key.trim().is_empty() {
+        // 先给用户自己能做的那一步（本机补模型凭据），再说工作台为什么没接管：
+        // 反过来会让人以为「必须先登录工作台」，而本机其实可以独立跑。
+        let next_step = format!(
+            "本次会话改用{source}，但当前没有可用的模型凭据，请在「设置 → AI 连接 → 模型服务」添加或选择。"
+        );
+        // 「还没登录工作台」只是这次没走托管路由，不构成故障：本机凭据缺失才是
+        // 用户此刻要处理的事。再补一句工作台告警，会把本来可以独立使用的会话
+        // 说成残缺状态，和「不连工作台也能完整使用」的心智相反。
+        if reason.is_empty() || is_unenrolled_reason(reason) {
+            return next_step;
+        }
+        return format!("{next_step}{head}。");
+    }
+    format!("{head}，本次会话改用{source}。")
+}
+
+/// 只表示「本机没有工作台登录态」的原因文案，不是需要用户排查的故障。
+fn is_unenrolled_reason(reason: &str) -> bool {
+    reason.contains("请先登录")
 }
 
 fn active_independent_provider_config(
@@ -1609,7 +1731,7 @@ fn execute_claimed(
     ensure_home_config(&invocation, options)?;
     update_agent_run_status(
         client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &claim.run.id,
         &claim.claim_token,
@@ -1708,13 +1830,14 @@ fn build_invocation(
         api_key: claim.claim_token.clone(),
         base_url: format!(
             "{}/api/agent/runs/{}/ai/v1",
-            options.api_base.trim_end_matches('/'),
+            options.api_base().trim_end_matches('/'),
             claim.run.id
         ),
         model: claim.ai_model.trim().to_string(),
         models: vec![claim.ai_model.trim().to_string()],
         permission_mode,
         run_id: claim.run.id.clone(),
+        route_source: ModelRouteSource::Managed,
     })
 }
 
@@ -1786,14 +1909,29 @@ fn windows_node_command(executable: &std::ffi::OsStr) -> Option<Command> {
     Some(command)
 }
 
-fn ensure_home_config(invocation: &Invocation, options: &Options) -> Result<(), Box<dyn Error>> {
+/// 生成 home 级配置，并返回**本次会话**该用的 overlay 路径。
+///
+/// 返回路径而不只是写入文件，是因为交互 overlay 与工作区一一对应：
+/// 调用方必须拿到自己那份，不能去读 home 级的公共文件。
+fn ensure_home_config(
+    invocation: &Invocation,
+    options: &Options,
+) -> Result<PathBuf, Box<dyn Error>> {
     fs::create_dir_all(&invocation.home)?;
     ensure_himind_skill_adapter(&invocation.home, options)?;
     migrate_legacy_managed_settings(&invocation.home)?;
+    // 这次会话用不上工作台路由（未授权 / 授权过期 / 用户关掉对接）时，用户
+    // 文档里若还留着 Agent 自有的 `himind-proxy`，Runtime 只会拿它去解析
+    // `DEEPSEEK_API_KEY` 并报「凭据缺失」，而本次注入的是本机服务密钥。
+    // 所以写 overlay 之前先把那份路由退回去，让会话 base 生效。
+    if invocation.route_source != ModelRouteSource::Managed
+        && !agent_owned_route_is_viable(&invocation.home)
+    {
+        release_agent_owned_model_route(&invocation.home)?;
+    }
     ensure_himind_profile(&invocation.home, options, invocation)?;
     ensure_himind_headless_profile(&invocation.home, options, invocation)?;
-    ensure_agent_overlay(&invocation.home, options, invocation)?;
-    Ok(())
+    ensure_agent_overlay(&invocation.home, options, invocation)
 }
 
 fn ensure_himind_profile(
@@ -1929,8 +2067,33 @@ fn agent_overlay_path(home: &Path) -> PathBuf {
         .join(HIMIND_AGENT_OVERLAY_FILE)
 }
 
-/// 无工具 overlay 的文件名：与交互 overlay 并存，互不覆盖。
-const HIMIND_AGENT_NO_TOOLS_OVERLAY_FILE: &str = "agent-no-tools.patch.yml";
+/// 会话级交互 overlay 的路径：一个工作区一份。
+///
+/// DSH 在**进程启动时**读取 `--patch`，而 `--patch` 里写着该会话的
+/// `HIMIND_AI_WORKSPACE`。同一个 home 下并发跑两个工作区会话时，如果共用
+/// `agent.patch.yml`，后启动的写入会盖住前一个尚未读完的内容，A 会话的 MCP
+/// 桥会拿着 B 的工作区去建扩展。按工作区派生文件名即可让两份内容并存。
+fn interactive_overlay_path(home: &Path, workspace: &Path) -> PathBuf {
+    home.join(HIMIND_AGENT_OVERLAY_DIR).join(format!(
+        "agent.{}.patch.yml",
+        workspace_fingerprint(workspace)
+    ))
+}
+
+/// 工作区的稳定短标识：同一目录恒定、不同目录不碰撞，且不把绝对路径写进文件名。
+fn workspace_fingerprint(workspace: &Path) -> String {
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let text = canonical.to_string_lossy().to_lowercase();
+    // FNV-1a：只需稳定与低碰撞，不需要密码学强度。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
 
 /// 每一步都要禁用的工具行。
 ///
@@ -1961,23 +2124,39 @@ const NO_TOOLS_DISABLED_ROWS: &[&str] = &[
 ];
 
 /// 生成（或刷新）禁用全部工具行的 overlay，返回可传给 `--patch` 的路径。
-fn write_no_tools_overlay(home: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let base = fs::read_to_string(agent_overlay_path(home))?;
+///
+/// 从**本次会话**的 overlay 派生，因此 `HIMIND_AI_WORKSPACE` 与会话一致；
+/// 输出文件名同样带会话标识，避免并发会话互相覆盖。home 级基线沿用
+/// `agent-no-tools.patch.yml` 这个名字，保持既有路径不变。
+fn write_no_tools_overlay(base_patch: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let base = fs::read_to_string(base_patch)?;
     let overlay = no_tools_overlay_text(&base);
-    let path = home
-        .join(HIMIND_AGENT_OVERLAY_DIR)
-        .join(HIMIND_AGENT_NO_TOOLS_OVERLAY_FILE);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let path = no_tools_overlay_path(base_patch);
     fs::write(&path, overlay)?;
     Ok(path)
+}
+
+fn no_tools_overlay_path(base_patch: &Path) -> PathBuf {
+    // 用 file_stem 会把 `agent.patch.yml` 截成 `agent.patch`，叠出来变成
+    // `agent.patch-no-tools.patch.yml`。这里按完整后缀切分，保持
+    // `agent-no-tools.patch.yml` / `agent.<会话标识>-no-tools.patch.yml`。
+    let name = base_patch
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("agent.patch.yml");
+    let stem = name
+        .strip_suffix(".patch.yml")
+        .or_else(|| name.rsplit_once('.').map(|(stem, _)| stem))
+        .unwrap_or(name);
+    base_patch.with_file_name(format!("{stem}-no-tools.patch.yml"))
 }
 
 /// 在已有 overlay 之上追加“禁用工具行”。保持纯函数便于测试。
 fn no_tools_overlay_text(base: &str) -> String {
     let mut overlay = base.trim_end().to_string();
-    overlay.push_str("\n\n# HiMind workflow step with tool_policy=none: no model-facing tool stays mounted.\n");
+    overlay.push_str(
+        "\n\n# HiMind workflow step with tool_policy=none: no model-facing tool stays mounted.\n",
+    );
     for row in NO_TOOLS_DISABLED_ROWS {
         overlay.push_str(&format!("- id: {row}\n  disabled: true\n"));
     }
@@ -1988,22 +2167,25 @@ fn ensure_agent_overlay(
     home: &Path,
     options: &Options,
     invocation: &Invocation,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<PathBuf, Box<dyn Error>> {
     validate_agent_mcp_namespace(home)?;
-    let path = agent_overlay_path(home);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let directory = home.join(HIMIND_AGENT_OVERLAY_DIR);
+    fs::create_dir_all(&directory)?;
     let overlay = render_himind_agent_overlay(
         home,
         options,
+        invocation.route_source,
         &invocation.model,
         &invocation.base_url,
         &invocation.models,
         &invocation.workspace,
     )?;
-    fs::write(path, overlay)?;
-    Ok(())
+    // home 级基线：无工具 overlay 从它派生，外部工具也按这个固定路径阅读。
+    fs::write(directory.join(HIMIND_AGENT_OVERLAY_FILE), &overlay)?;
+    // 会话级副本：并发会话各读自己那份，见 `interactive_overlay_path`。
+    let path = interactive_overlay_path(home, &invocation.workspace);
+    fs::write(&path, &overlay)?;
+    Ok(path)
 }
 
 fn validate_agent_mcp_namespace(home: &Path) -> Result<(), Box<dyn Error>> {
@@ -2105,6 +2287,7 @@ fn merge_profile_package(path: &Path, defaults: &str) -> Result<(), Box<dyn Erro
 fn render_himind_profile_patch(
     home: &Path,
     options: &Options,
+    route_source: ModelRouteSource,
     default_model: &str,
     base_url: &str,
     models: &[String],
@@ -2112,6 +2295,7 @@ fn render_himind_profile_patch(
     render_himind_profile_patch_from_base(
         home,
         options,
+        route_source,
         default_model,
         base_url,
         models,
@@ -2123,6 +2307,7 @@ fn render_himind_profile_patch(
 fn render_himind_agent_overlay(
     home: &Path,
     options: &Options,
+    route_source: ModelRouteSource,
     default_model: &str,
     base_url: &str,
     models: &[String],
@@ -2131,6 +2316,7 @@ fn render_himind_agent_overlay(
     let mut patch = render_himind_profile_patch_from_base(
         home,
         options,
+        route_source,
         default_model,
         base_url,
         models,
@@ -2146,6 +2332,7 @@ fn render_himind_agent_overlay(
 fn render_himind_profile_patch_from_base(
     home: &Path,
     options: &Options,
+    route_source: ModelRouteSource,
     default_model: &str,
     base_url: &str,
     models: &[String],
@@ -2160,14 +2347,19 @@ fn render_himind_profile_patch_from_base(
             "\n\n# Managed sessions are embedded by HiMind Agent and must never open the DSH URL in the default browser.\n- id: web-runtime\n  config:\n    openBrowser: false\n",
         );
     }
-    if options.mode().dashboard_enabled() {
-        append_managed_model_profile(&mut patch, home, default_model, base_url, models)?;
-    } else if let Some(service) = crate::store::ai_services::active_service()? {
-        append_independent_service_profile(&mut patch, &service)?;
-    } else {
-        patch.push_str(
-            "\n\n# Independent Mode: provider and model selection remain owned by DSH settings.yaml.\n",
-        );
+    match route_source {
+        ModelRouteSource::Managed => {
+            append_managed_model_profile(&mut patch, home, default_model, base_url, models)?;
+        }
+        ModelRouteSource::LocalService => {
+            match crate::store::ai_services::active_service()? {
+                Some(service) => append_independent_service_profile(&mut patch, &service)?,
+                // 服务在本机被删掉 / 被取消选中：退回 Runtime 自己的路由，
+                // 让 DSH 用它 settings.yaml 里那份配置，而不是写一条空 provider。
+                None => append_native_route_comment(&mut patch),
+            }
+        }
+        ModelRouteSource::Native => append_native_route_comment(&mut patch),
     }
     patch.push_str("\n\n# Agent-owned context. This layer is regenerated for each new HiMind AI session.\n- insert:\n");
     patch.push_str(&format!(
@@ -2195,11 +2387,39 @@ fn render_himind_profile_patch_from_base(
     patch.push_str(
         "        failOnStartupError: false\n        reconnect:\n          enabled: true\n          initialDelayMs: 500\n          maxDelayMs: 30000\n          maxAttempts: 5\n",
     );
+    // DSH 桥默认只等 60 秒，而下游连接允许配到 10 分钟。桥是所有下游的唯一出口，
+    // 桥先超时会把「工具还在跑」误报成失败，所以这里取下游里最长的等待时间。
+    patch.push_str(&format!(
+        "        toolCallTimeoutMs: {}\n",
+        himind_mcp_bridge_tool_timeout_ms(&options.state_path),
+    ));
     patch.push_str(&format!(
         "\n    - id: {HIMIND_SKILL_ROW_ID}\n      name: '@deepseek-ai/dsh-skill-filesystem'\n      config:\n        providerName: himind-managed\n        includeDefaultRoots: true\n        customSkillDirs:\n          - {}\n        watch: false\n",
         yaml_scalar(&home.join(HIMIND_SKILL_ADAPTER_DIR).to_string_lossy()),
     ));
     Ok(patch)
+}
+
+/// DSH 桥的默认工具等待时间只有 60 秒，但下游连接可以配到 10 分钟。
+/// 桥是所有下游工具的唯一出口：桥先超时，用户看到的是「工具没跑起来」，
+/// 而实际原因只是等待时间被上游截断。所以这里取已启用下游里最长的超时。
+fn himind_mcp_bridge_tool_timeout_ms(state_path: &Path) -> u64 {
+    const BRIDGE_DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
+    const DOWNSTREAM_MAX_TOOL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+    let longest_downstream = crate::app::mcp_registry::list(state_path)
+        .map(|servers| {
+            servers
+                .into_iter()
+                .filter(|server| server.enabled)
+                .map(|server| server.tool_call_timeout_ms)
+                .max()
+                .unwrap_or_default()
+        })
+        // 读不到配置时退回 DSH 默认值，不要因为一个附属文件把会话开不起来。
+        .unwrap_or_default();
+    longest_downstream
+        .max(BRIDGE_DEFAULT_TOOL_TIMEOUT_MS)
+        .min(DOWNSTREAM_MAX_TOOL_TIMEOUT_MS)
 }
 
 fn append_managed_model_profile(
@@ -2259,6 +2479,14 @@ fn append_managed_model_profile(
     Ok(())
 }
 
+/// Runtime 自主路由时只留说明：provider 与 model 全部由 DSH `settings.yaml`
+/// 拥有，Agent 不写任何 `llm-pi-ai` / `agent-default-model` 行。
+fn append_native_route_comment(patch: &mut String) {
+    patch.push_str(
+        "\n\n# Independent Mode: provider and model selection remain owned by DSH settings.yaml.\n",
+    );
+}
+
 fn append_independent_service_profile(
     patch: &mut String,
     service: &crate::store::ai_services::CustomAIService,
@@ -2266,11 +2494,19 @@ fn append_independent_service_profile(
     let model = service.model.trim();
     let base_url = service.base_url.trim();
     if model.is_empty() || base_url.is_empty() {
-        return Err("本机 AI 服务的模型或 Base URL 不完整".into());
+        return Err("本机模型服务的模型或 Base URL 不完整".into());
     }
     let api = match &service.protocol {
         crate::store::ai_services::AIServiceProtocol::OpenaiChat => "openai-completions",
         crate::store::ai_services::AIServiceProtocol::OpenaiResponses => "openai-responses",
+        crate::store::ai_services::AIServiceProtocol::Anthropic => "anthropic-messages",
+    };
+    // Anthropic 适配器走 Anthropic SDK 约定，在 baseURL 后自行追加 `/v1/messages`；
+    // 带 `/v1` 的写法会让请求落到 `/v1/v1/messages`，因此这里统一写回 API 根地址。
+    let base_url = if service.protocol.is_anthropic() {
+        crate::store::ai_services::anthropic_api_root(base_url)
+    } else {
+        base_url.to_string()
     };
     let mut catalog = vec![model.to_string()];
     catalog.extend(
@@ -2299,7 +2535,7 @@ fn append_independent_service_profile(
         yaml_scalar(INDEPENDENT_ACTIVE_API_KEY_ENV),
         yaml_scalar(api),
     ));
-    patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(base_url)));
+    patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(&base_url)));
     patch.push_str("        models:\n");
     for model in catalog {
         let model = yaml_scalar(&model);
@@ -2346,21 +2582,133 @@ fn read_user_model_selection(home: &Path) -> Result<Option<UserModelSelection>, 
     }))
 }
 
+/// 用户文档里那份「Agent 自有路由」现在还能不能用。
+///
+/// 判定依据只有一条：`agent-default-model` 选中的 provider 是否指向
+/// `himind-proxy`，以及它引用的凭据在本进程环境里是否真的存在（托管会话会
+/// 注入 `DEEPSEEK_API_KEY`）。能用就保留（托管会话正在跑）；不能用就必须退回
+/// 组合 base 层，否则 Runtime 会拿着本机服务的密钥去解析一条失效的工作台路由
+/// 并报「凭据缺失」。
+fn agent_owned_route_is_viable(home: &Path) -> bool {
+    agent_owned_route_is_viable_with(
+        home,
+        !env::var(HIMIND_MANAGED_API_KEY_ENV)
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+    )
+}
+
+/// [`agent_owned_route_is_viable`] 的显式凭据版本：把「凭据是否存在」作为
+/// 参数传进来，让调用点与测试都能在不受进程环境影响的前提下判定。
+fn agent_owned_route_is_viable_with(home: &Path, credential_present: bool) -> bool {
+    match read_user_model_selection(home) {
+        Ok(Some(selection)) if selection.provider == HIMIND_MANAGED_PROVIDER_ID => {
+            credential_present
+        }
+        // 用户自己的 provider（`sfkey` / `custom`）与 Agent 无关，保持原样；
+        // 文档读不出来时同样不动，宁可保持现状也不要破坏用户手写的设置。
+        _ => true,
+    }
+}
+
+/// 把用户文档从「Agent 自有路由」退回去：删掉 `agent-default-model`（回到 base
+/// 层默认值）、删掉 `llm-pi-ai.providers.himind-proxy`（避免残留的工作台地址被
+/// 其它 provider 误用），并把因此变空的 namespace 一并回收。
+///
+/// 用户自己的 provider（如 `sfkey`）与主题等偏好原样保留；文档里没有 Agent
+/// 痕迹时连写盘都不做，返回 `false`。
+fn release_agent_owned_model_route(home: &Path) -> Result<bool, Box<dyn Error>> {
+    let path = home.join("settings.yaml");
+    let Ok(source) = fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let mut document = serde_yaml::from_str::<YamlValue>(&source).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("读取 DSH 模型设置失败: {error}"),
+        )
+    })?;
+    let Some(root) = document.as_mapping_mut() else {
+        return Ok(false);
+    };
+    let mut changed = false;
+
+    // 1) `agent-default-model` 指向 Agent 自有 provider 时整段删除。
+    let owns_default_model = root
+        .get(YamlValue::String("agent-default-model".to_string()))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|namespace| namespace.get(YamlValue::String("provider".to_string())))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        == Some(HIMIND_MANAGED_PROVIDER_ID);
+    if owns_default_model {
+        root.remove(YamlValue::String("agent-default-model".to_string()));
+        changed = true;
+    }
+
+    // 2) `llm-pi-ai.providers.himind-proxy` 删除，空掉的层级逐级回收。
+    let mut release_llm_namespace = false;
+    if let Some(llm) = root
+        .get_mut(YamlValue::String("llm-pi-ai".to_string()))
+        .and_then(YamlValue::as_mapping_mut)
+    {
+        let mut removed_provider = false;
+        let mut prune_providers = false;
+        if let Some(providers) = llm
+            .get_mut(YamlValue::String("providers".to_string()))
+            .and_then(YamlValue::as_mapping_mut)
+        {
+            removed_provider = providers
+                .remove(YamlValue::String(HIMIND_MANAGED_PROVIDER_ID.to_string()))
+                .is_some();
+            prune_providers = removed_provider && providers.is_empty();
+        }
+        if prune_providers {
+            llm.remove(YamlValue::String("providers".to_string()));
+        }
+        release_llm_namespace = removed_provider && llm.is_empty();
+        changed |= removed_provider;
+    }
+    if release_llm_namespace {
+        root.remove(YamlValue::String("llm-pi-ai".to_string()));
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+    fs::write(&path, serde_yaml::to_string(&document)?)?;
+    Ok(true)
+}
+
 fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
     let marker = home.join(DSH_SETTINGS_MIGRATION_MARKER);
-    if marker.is_file() {
+    let applied = fs::read_to_string(&marker)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|version| version >= DSH_SETTINGS_MIGRATION_VERSION);
+    if applied {
         return Ok(());
     }
     // Settings are user-owned state. Runtime upgrades must not delete or
     // rewrite the selected model, provider overrides, or UI preferences.
-    fs::write(marker, b"3\n")?;
+    //
+    // v4：Agent 不再把工作台路由写进用户 `settings.yaml`（改由每次会话的
+    // overlay 承担），所以早先版本写下的那份路由身份要退回去，否则它会压过
+    // overlay，让降级会话拿着本机密钥去解析工作台 provider。用户自己的
+    // provider 与 UI 偏好原样保留。
+    match release_agent_owned_model_route(home) {
+        Ok(_) => fs::write(&marker, format!("{DSH_SETTINGS_MIGRATION_VERSION}\n"))?,
+        // 标记延后：这次没清掉就下次再试，绝不因为一次失败把迁移标成已完成。
+        Err(error) => eprintln!("himind-agent: DSH 模型设置迁移延后: {error}"),
+    }
     Ok(())
 }
 
 fn himind_mcp_arguments(options: &Options) -> Vec<String> {
     let mut arguments = vec!["--mcp".to_string()];
     if options.mode().dashboard_enabled() {
-        arguments.extend(["--api".to_string(), options.api_base.clone()]);
+        arguments.extend(["--api".to_string(), options.api_base().clone()]);
     }
     arguments.extend([
         "--mode".to_string(),
@@ -2641,7 +2989,6 @@ fn shorten_dsh_skill_name(value: &str) -> String {
         "software-distribution" => "software-dist".to_string(),
         "unihper-unity-development" => "unity-dev".to_string(),
         "git-svn-commit-summary" => "commit-summary".to_string(),
-        "image-delivery-preflight" => "image-preflight".to_string(),
         other => other.to_string(),
     }
 }
@@ -2743,6 +3090,56 @@ pub(crate) fn interactive_home_path() -> Result<PathBuf, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     native_dsh_home(&version)
+}
+
+/// 当前 Runtime 的启动可执行文件（托管安装是 `<version>\bin\dsh.cmd`）。
+///
+/// 需要它本身而不只是 home 的调用方目前只有一个：沙箱写权限预热要顺着它反推
+/// 版本目录，去拿同目录下的 `node.exe` 与厂商 ACL 模块。
+pub(crate) fn interactive_executable() -> Result<PathBuf, String> {
+    resolve_executable()
+        .map(PathBuf::from)
+        .map_err(|error| error.to_string())
+}
+
+/// DSH 最近使用过、且当前仍然存在的工作区。
+///
+/// 主入口（侧栏 HiMind AI）不带工作目录，早期实现退回进程当前目录，而桌面启动器
+/// 把当前目录设成 `logs`，于是每次打开都在日志目录里新开一个工作区，历史会话看起来
+/// 像是丢了。DSH 自己在 `storages/workspace.json` 里维护工作区清单，这里取最近更新
+/// 且目录仍可用的那一个，效果等同于主流编辑器的「重新打开上次工作区」。
+pub(crate) fn recent_interactive_workspace() -> Option<PathBuf> {
+    let home = interactive_home_path().ok()?;
+    recent_workspace_in(&home)
+}
+
+fn recent_workspace_in(home: &Path) -> Option<PathBuf> {
+    let source = fs::read_to_string(home.join("storages").join("workspace.json")).ok()?;
+    let document = serde_json::from_str::<Value>(&source).ok()?;
+    let workspaces = document.get("tables")?.get("workspaces")?.as_object()?;
+    let mut latest: Option<(String, PathBuf)> = None;
+    for entry in workspaces.values() {
+        let Some(path) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if !path.is_dir() {
+            continue;
+        }
+        let updated = entry
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let newer = match latest.as_ref() {
+            Some((current, _)) => updated > *current,
+            None => true,
+        };
+        if newer {
+            latest = Some((updated, path));
+        }
+    }
+    latest.map(|(_, path)| path)
 }
 
 fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
@@ -2931,20 +3328,68 @@ fn first_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_independent_provider_config, dsh_run_home, dsh_skill_name, ensure_interactive_home,
-        ensure_profile_patch, first_line, himind_mcp_arguments, managed_model_catalog,
-        merge_profile_package, migrate_legacy_managed_settings, native_dsh_provider_config,
-        no_tools_overlay_text, parse_native_dsh_provider_config, parse_runtime_version,
-        remove_managed_runtime,
-        render_himind_agent_overlay, render_himind_profile_patch,
-        render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
-        skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
+        active_independent_provider_config, agent_owned_route_is_viable,
+        agent_owned_route_is_viable_with, append_independent_service_profile, degraded_notice,
+        dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
+        himind_mcp_arguments, managed_model_catalog, merge_profile_package,
+        migrate_legacy_managed_settings, native_dsh_provider_config, no_tools_overlay_text,
+        parse_native_dsh_provider_config, parse_runtime_version, recent_workspace_in,
+        release_agent_owned_model_route, remove_managed_runtime, render_himind_agent_overlay,
+        render_himind_profile_patch, render_himind_profile_patch_from_base, safe_relative_path,
+        safe_segment, skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
         validate_runtime_agent_compatibility, versioned_home, InteractiveEventProjector,
+        InteractiveLaunch, ModelRouteSource,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    /// 并发工作区会话必须各占一份 overlay：同名文件会让后启动的会话把
+    /// 自己的 `HIMIND_AI_WORKSPACE` 盖到前一个会话上。
+    #[test]
+    fn interactive_overlays_are_scoped_to_workspace() {
+        let home = Path::new("C:/agent/runtimes/deepseek-harness/homes/interactive");
+        let alpha = Path::new("F:/WebProjects/dsh-live-ws-alpha");
+        let beta = Path::new("F:/WebProjects/dsh-live-ws-beta");
+        let alpha_overlay = super::interactive_overlay_path(home, alpha);
+        let beta_overlay = super::interactive_overlay_path(home, beta);
+        assert_ne!(alpha_overlay, beta_overlay);
+        assert_ne!(
+            alpha_overlay,
+            super::agent_overlay_path(home),
+            "会话 overlay 不能落在 home 级基线文件名上"
+        );
+        // 同一个目录的写法差异（大小写 / 分隔符）必须归一成同一份 overlay。
+        assert_eq!(
+            alpha_overlay,
+            super::interactive_overlay_path(home, Path::new("F:/WebProjects/DSH-Live-WS-Alpha"))
+        );
+        let name = alpha_overlay
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            name.starts_with("agent.") && name.ends_with(".patch.yml"),
+            "{name}"
+        );
+    }
+
+    /// 无工具 overlay 从会话级文件派生，文件名带同一标识，避免互相覆盖；
+    /// home 级基线仍落到 `agent-no-tools.patch.yml`，外部路径约定不变。
+    #[test]
+    fn no_tools_overlay_follows_its_base_file() {
+        assert_eq!(
+            super::no_tools_overlay_path(Path::new("C:/home/.himind/agent.patch.yml")),
+            Path::new("C:/home/.himind/agent-no-tools.patch.yml")
+        );
+        assert_eq!(
+            super::no_tools_overlay_path(Path::new("C:/home/.himind/agent.deadbeef.patch.yml")),
+            Path::new("C:/home/.himind/agent.deadbeef-no-tools.patch.yml")
+        );
+    }
 
     #[test]
     fn no_tools_overlay_disables_every_model_facing_tool_row() {
@@ -2959,7 +3404,13 @@ mod tests {
             );
         }
         // 关键工具行一个都不能漏：文件、Shell、网络、子代理与 HiMind MCP。
-        for row in ["tool-fs", "tool-pwsh", "tool-web", "tool-subagent", "himind-agent-mcp"] {
+        for row in [
+            "tool-fs",
+            "tool-pwsh",
+            "tool-web",
+            "tool-subagent",
+            "himind-agent-mcp",
+        ] {
             assert!(super::NO_TOOLS_DISABLED_ROWS.contains(&row));
         }
     }
@@ -2991,6 +3442,60 @@ mod tests {
             config.models,
             vec!["deepseek-chat", "deepseek-reasoner", "local-compatible"]
         );
+    }
+
+    #[test]
+    fn recent_workspace_prefers_latest_existing_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-dsh-recent-workspace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let older = root.join("older");
+        let newer = root.join("newer");
+        let missing = root.join("missing");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(&newer).unwrap();
+        std::fs::create_dir_all(root.join("storages")).unwrap();
+        std::fs::write(
+            root.join("storages").join("workspace.json"),
+            serde_json::to_vec(&json!({
+                "unit": { "name": "workspace", "version": 2 },
+                "tables": {
+                    "workspaces": {
+                        "older": {
+                            "path": older.to_string_lossy(),
+                            "title": "older",
+                            "updatedAt": "2026-01-01T00:00:00.000Z",
+                        },
+                        "newer": {
+                            "path": newer.to_string_lossy(),
+                            "title": "newer",
+                            "updatedAt": "2026-09-01T00:00:00.000Z",
+                        },
+                        // 目录已经不存在的工作区不能被采用，否则会话会起在一个死路径上。
+                        "missing": {
+                            "path": missing.to_string_lossy(),
+                            "title": "missing",
+                            "updatedAt": "2026-12-01T00:00:00.000Z",
+                        },
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(recent_workspace_in(&root), Some(newer.clone()));
+
+        std::fs::remove_dir_all(&newer).unwrap();
+        assert_eq!(recent_workspace_in(&root), Some(older));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(recent_workspace_in(&root), None);
     }
 
     #[test]
@@ -3164,12 +3669,13 @@ mod tests {
     #[test]
     fn managed_profile_adds_agent_mcp_and_himind_skills_without_disabling_dsh_roots() {
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let patch = render_himind_profile_patch(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
+            ModelRouteSource::Managed,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string(), "model-fast".to_string()],
@@ -3203,6 +3709,7 @@ mod tests {
         let patch = render_himind_agent_overlay(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
+            ModelRouteSource::Native,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string()],
@@ -3230,6 +3737,7 @@ mod tests {
         let mut old = render_himind_profile_patch(
             &root,
             &crate::Options::from_env(),
+            ModelRouteSource::Native,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string()],
@@ -3285,17 +3793,18 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = root.join("agent-state.json");
         crate::app::runtime_mode::save(
             &options.state_path,
             crate::app::runtime_mode::AgentMode::Independent,
         )
         .unwrap();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let profile = render_himind_profile_patch(
             &root,
             &options,
+            ModelRouteSource::Native,
             "local-model",
             "https://provider.example/v1",
             &["local-model".to_string()],
@@ -3310,6 +3819,8 @@ mod tests {
 
     #[test]
     fn selected_local_service_projects_to_independent_profile_without_editing_settings() {
+        // 这个用例会重定向进程级的 Agent home，与其它并行用例串行执行。
+        let _env_guard = crate::store::paths::test_env_lock();
         let root = std::env::temp_dir().join(format!(
             "himind-independent-local-service-{}-{}",
             std::process::id(),
@@ -3351,10 +3862,11 @@ mod tests {
             std::fs::write(&settings_path, original_settings).unwrap();
             let mut options = crate::Options::from_env();
             options.state_path = root.join("agent-state.json");
-            options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+            options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
             let profile = render_himind_profile_patch(
                 &dsh_home,
                 &options,
+                ModelRouteSource::LocalService,
                 "native-model",
                 "https://native.example/v1",
                 &["native-model".to_string()],
@@ -3379,18 +3891,189 @@ mod tests {
         result
     }
 
+    /// 回归护栏：模式（Connected）不再决定 provider 行，凭据来源才决定。
+    ///
+    /// 线上曾出现「connected + 工作台未登录」的组合：overlay 按模式写
+    /// `himind-proxy / DEEPSEEK_API_KEY`，实际注入的却是本机 AI 服务的密钥，
+    /// 于是 Runtime 报 `MISSING_CREDENTIAL`，并发会话全部空转。这里断言降级
+    /// 会话只写本机服务那条路由，绝不写工作台路由。
+    #[test]
+    fn connected_mode_degraded_session_never_projects_dashboard_provider() {
+        // 与前两个用例一样会重定向进程级 Agent home，共用同一把环境锁串行执行。
+        let _env_guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-connected-degraded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let result = (|| {
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "deepseek".to_string(),
+                display_name: "DeepSeek".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                protocol: crate::store::ai_services::AIServiceProtocol::OpenaiChat,
+                model: "deepseek-chat".to_string(),
+                models: vec!["deepseek-chat".to_string()],
+                api_key: "sk-deepseek-secret".to_string(),
+            })
+            .unwrap();
+            crate::store::ai_services::set_active("deepseek").unwrap();
+
+            let mut options = crate::Options::from_env();
+            options.state_path = root.join("agent-state.json");
+            options.set_api_base("https://dashboard.example");
+            crate::app::runtime_mode::save(
+                &options.state_path,
+                crate::app::runtime_mode::AgentMode::Connected,
+            )
+            .unwrap();
+            options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+            assert!(options.mode().dashboard_enabled());
+
+            let profile = render_himind_profile_patch(
+                &root,
+                &options,
+                ModelRouteSource::LocalService,
+                "deepseek-chat",
+                "https://api.deepseek.com/v1",
+                &["deepseek-chat".to_string()],
+            )
+            .unwrap();
+            assert!(profile.contains("himind-local-ai"));
+            assert!(profile.contains("HIMIND_LOCAL_AI_API_KEY"));
+            assert!(!profile.contains("himind-proxy"));
+            assert!(!profile.contains("DEEPSEEK_API_KEY"));
+            // 控制面地址仍会出现在 Agent 网关的 `--api` 参数里，那是业务调用
+            // 用的地址，与模型路由无关；只要它没变成 provider 行即可。
+            assert!(profile.contains("--api"));
+
+            // 反向对照：同一份 Connected 配置，走托管路由时就必须写工作台
+            // provider，证明分支由凭据来源决定，而不是被写成永远走本机。
+            let managed = render_himind_profile_patch(
+                &root,
+                &options,
+                ModelRouteSource::Managed,
+                "himind-model",
+                "https://dashboard.example/api/agent/runs/run-1/ai/v1",
+                &["himind-model".to_string()],
+            )
+            .unwrap();
+            assert!(managed.contains("himind-proxy"));
+            assert!(managed.contains("DEEPSEEK_API_KEY"));
+        })();
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
+    /// 降级且没有任何可用凭据时，提示必须给出用户能自己执行的下一步；
+    /// 有凭据时只说清换用了哪份来源，不制造多余的焦虑。
+    #[test]
+    fn degraded_notice_points_to_ai_service_settings_only_when_credentials_are_missing() {
+        let mut launch = InteractiveLaunch {
+            executable: PathBuf::from("himind-agent-mcp.exe"),
+            home: PathBuf::from("C:/agent/home"),
+            workspace: PathBuf::from("F:/WebProjects/example"),
+            user_id: String::new(),
+            api_key: String::new(),
+            api_key_env: None,
+            base_url: String::new(),
+            agent_patch: PathBuf::from("C:/agent/home/agent.patch.yml"),
+            default_model: String::new(),
+            models: Vec::new(),
+            credential_fingerprint: String::new(),
+            catalog_fingerprint: String::new(),
+            permission_mode: "default",
+            service_source: "custom",
+            control_plane_notice: String::new(),
+        };
+        let missing = degraded_notice("authorization expired", &launch);
+        assert!(missing.contains("authorization expired"));
+        assert!(missing.contains("本机模型服务"));
+        assert!(missing.contains("设置 → AI 连接 → 模型服务"));
+
+        // 只是没登录工作台：提示只给用户能自己做的那一步，不再补一句工作台告警。
+        let unenrolled = degraded_notice("请先登录 HiMind 账号", &launch);
+        assert!(unenrolled.contains("设置 → AI 连接 → 模型服务"));
+        assert!(!unenrolled.contains("AI 工作台暂不可用"));
+        assert!(!unenrolled.contains("请先登录"));
+
+        launch.api_key = "sk-live-secret".to_string();
+        let ready = degraded_notice("authorization expired", &launch);
+        assert!(ready.contains("本机模型服务"));
+        assert!(!ready.contains("设置 → AI 连接 → 模型服务"));
+        assert!(!ready.contains("sk-live-secret"));
+
+        launch.service_source = "native";
+        let native = degraded_notice("", &launch);
+        assert!(native.contains("本机 DSH 模型配置"));
+    }
+
+    #[test]
+    fn anthropic_local_service_projects_as_anthropic_messages_on_the_api_root() {
+        // 与上一个用例一样会重定向进程级 Agent home，共用同一把环境锁串行执行。
+        let _env_guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-independent-anthropic-service-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let result = (|| {
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "local-anthropic".to_string(),
+                display_name: "Local Anthropic".to_string(),
+                // 用户按 OpenAI 习惯带上 `/v1`；Anthropic SDK 会自行追加，必须回到根地址。
+                base_url: "https://api.moonshot.cn/anthropic/v1".to_string(),
+                protocol: crate::store::ai_services::AIServiceProtocol::Anthropic,
+                model: "kimi-k3".to_string(),
+                models: vec!["kimi-k3".to_string()],
+                api_key: "sk-anthropic-secret".to_string(),
+            })
+            .unwrap();
+            crate::store::ai_services::set_active("local-anthropic").unwrap();
+            let mut patch = String::new();
+            let (service, _) = crate::store::ai_services::load_secret("local-anthropic").unwrap();
+            append_independent_service_profile(&mut patch, &service).unwrap();
+            assert!(patch.contains("api: \"anthropic-messages\""), "{patch}");
+            assert!(
+                patch.contains("baseURL: \"https://api.moonshot.cn/anthropic\""),
+                "{patch}"
+            );
+            assert!(!patch.contains("/anthropic/v1\""), "{patch}");
+        })();
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
     #[test]
     fn dsh_mcp_launch_uses_the_active_mode_and_omits_dashboard_api_when_independent() {
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Independent;
+        options.set_api_base("https://dashboard.example");
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
         let arguments = himind_mcp_arguments(&options);
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--mode", "independent"]));
         assert!(!arguments.iter().any(|argument| argument == "--api"));
 
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let connected_arguments = himind_mcp_arguments(&options);
         assert!(connected_arguments
             .windows(2)
@@ -3417,13 +4100,14 @@ mod tests {
         )
         .unwrap();
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = root.join("agent-state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
 
         let profile = render_himind_profile_patch(
             &root,
             &options,
+            ModelRouteSource::Managed,
             "glm-5.2",
             "https://gateway.example/v1",
             &["glm-5.2".to_string(), "qwen-max".to_string()],
@@ -3455,13 +4139,14 @@ mod tests {
         )
         .unwrap();
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = root.join("agent-state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
 
         let profile = render_himind_profile_patch(
             &root,
             &options,
+            ModelRouteSource::Managed,
             "glm-5.2",
             "https://gateway.example/v1",
             &["glm-5.2".to_string()],
@@ -3486,7 +4171,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = root.join("agent-state.json");
         let server = McpServerConfig {
             server_name: "project-tools".to_string(),
@@ -3508,6 +4193,7 @@ mod tests {
         let patch = render_himind_profile_patch(
             &root.join("runtime-home"),
             &options,
+            ModelRouteSource::Managed,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string()],
@@ -3517,6 +4203,84 @@ mod tests {
         assert!(!patch.contains("id: himind-agent-personal-mcp-project-tools"));
         assert!(!patch.contains("serverName: \"project-tools\""));
         assert!(!patch.contains("\"API_KEY\": \"local-secret\""));
+        // 这个连接是停用状态，桥不应被它拖长等待时间。
+        assert!(patch.contains("toolCallTimeoutMs: 60000"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_bridge_waits_at_least_as_long_as_the_slowest_enabled_downstream() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-profile-mcp-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut options = crate::Options::from_env();
+        options.set_api_base("https://dashboard.example");
+        options.state_path = root.join("agent-state.json");
+
+        let render = |options: &crate::Options, home: &std::path::Path| {
+            render_himind_profile_patch(
+                home,
+                options,
+                ModelRouteSource::Managed,
+                "model-default",
+                "https://gateway.example/v1",
+                &["model-default".to_string()],
+            )
+            .unwrap()
+        };
+        let home = root.join("runtime-home");
+        let downstream = |name: &str, timeout: u64, enabled: bool| McpServerConfig {
+            server_name: name.to_string(),
+            display_name: name.to_string(),
+            transport: "stdio".to_string(),
+            command: "node".to_string(),
+            args: vec!["server.js".to_string()],
+            env: BTreeMap::new(),
+            cwd: String::new(),
+            url: String::new(),
+            headers: BTreeMap::new(),
+            tool_call_timeout_ms: timeout,
+            fail_on_startup_error: false,
+            reconnect: true,
+            enabled,
+        };
+
+        // 桥自身也是 stdio 服务，连不上就当会话缺工具；等待时间只跟下游对齐。
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 60000"));
+
+        crate::app::mcp_settings::upsert(
+            &options.state_path,
+            downstream("slow-tools", 240_000, true),
+        )
+        .unwrap();
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 240000"));
+
+        // 停用的下游不参与，等待时间回落到 60 秒。
+        crate::app::mcp_settings::upsert(
+            &options.state_path,
+            downstream("slow-tools", 240_000, false),
+        )
+        .unwrap();
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 60000"));
+
+        // 两个下游时取更长的那个，并且不超过注册表允许的上限。
+        crate::app::mcp_settings::upsert(
+            &options.state_path,
+            downstream("slow-tools", 240_000, true),
+        )
+        .unwrap();
+        crate::app::mcp_settings::upsert(
+            &options.state_path,
+            downstream("fast-tools", 90_000, true),
+        )
+        .unwrap();
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 240000"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3626,12 +4390,13 @@ mod tests {
     #[test]
     fn profile_route_uses_only_the_claim_scoped_himind_proxy() {
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let profile = render_himind_profile_patch(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
+            ModelRouteSource::Managed,
             "deepseek-model",
             "https://dashboard.example/api/agent/runs/run-1/ai/v1",
             &["deepseek-model".to_string(), "fast-model".to_string()],
@@ -3669,8 +4434,11 @@ mod tests {
         ));
     }
 
+    /// 旧版本 Agent 曾把工作台路由写进 home 级 `settings.yaml`（用户文档层），
+    /// 那一层的优先级高于每次会话的 overlay。v4 迁移必须把它退回去，同时只
+    /// 保留用户自己的内容。
     #[test]
-    fn legacy_generated_settings_are_preserved_without_rewriting_user_preferences() {
+    fn agent_owned_settings_route_is_released_on_migration() {
         let root = std::env::temp_dir().join(format!(
             "himind-settings-migration-{}-{}",
             std::process::id(),
@@ -3690,10 +4458,106 @@ mod tests {
 
         let migrated = std::fs::read_to_string(root.join("settings.yaml")).unwrap();
         assert!(migrated.contains("theme:"));
-        assert!(migrated.contains("agent-default-model"));
-        assert!(migrated.contains("llm-pi-ai"));
-        assert!(root.join(super::DSH_SETTINGS_MIGRATION_MARKER).is_file());
+        assert!(!migrated.contains("agent-default-model"));
+        assert!(!migrated.contains("himind-proxy"));
+        assert!(!migrated.contains("gateway.example"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(super::DSH_SETTINGS_MIGRATION_MARKER))
+                .unwrap()
+                .trim(),
+            super::DSH_SETTINGS_MIGRATION_VERSION.to_string()
+        );
+        // 迁移是一次性的：标记到位后再跑不会重新写盘。
+        let after_marker = std::fs::read_to_string(root.join("settings.yaml")).unwrap();
+        migrate_legacy_managed_settings(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("settings.yaml")).unwrap(),
+            after_marker
+        );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 用户自己的 provider 与 Agent 自有路由共处一份文档时，只回收 Agent 那份。
+    #[test]
+    fn sfkey_provider_survives_agent_route_release() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-settings-sfkey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.yaml"),
+            "agent-default-model:\n  provider: himind-proxy\n  model: glm-5.2\nllm-pi-ai:\n  providers:\n    himind-proxy:\n      displayName: HiMind AI\n      apiKeyEnv: DEEPSEEK_API_KEY\n      api: openai-completions\n      baseURL: https://gateway.example/v1\n      models:\n        - id: glm-5.2\n    sfkey:\n      displayName: SFKEY\n      apiKeyEnv: SFKEY_API_KEY\n      api: openai-completions\n      baseURL: https://sfkey.example/v1\n      models:\n        - id: my-model\n",
+        )
+        .unwrap();
+
+        assert!(release_agent_owned_model_route(&root).unwrap());
+
+        let migrated = std::fs::read_to_string(root.join("settings.yaml")).unwrap();
+        let document: serde_yaml::Value = serde_yaml::from_str(&migrated).unwrap();
+        assert!(document.get("agent-default-model").is_none());
+        let providers = document
+            .get("llm-pi-ai")
+            .and_then(|value| value.get("providers"))
+            .expect("用户 provider 必须保留");
+        assert!(providers.get("himind-proxy").is_none());
+        assert_eq!(
+            providers
+                .get("sfkey")
+                .and_then(|value| value.get("baseURL"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("https://sfkey.example/v1")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 降级会话（Connected 但没拿到工作台凭据）必须把这份路由退回去，否则它
+    /// 压过 overlay，Runtime 只会拿着本机密钥去解析工作台 provider 并报
+    /// `MISSING_CREDENTIAL`。
+    #[test]
+    fn degraded_session_releases_agent_owned_route() {
+        let _env_guard = crate::store::paths::test_env_lock();
+        let previous_key = std::env::var_os(super::HIMIND_MANAGED_API_KEY_ENV);
+        std::env::remove_var(super::HIMIND_MANAGED_API_KEY_ENV);
+        let root = std::env::temp_dir().join(format!(
+            "himind-settings-degraded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let result = (|| {
+            std::fs::write(
+                root.join("settings.yaml"),
+                "theme:\n  mode: dark\nagent-default-model:\n  provider: himind-proxy\n  model: glm-5.2\nllm-pi-ai:\n  providers:\n    himind-proxy:\n      displayName: HiMind AI\n      apiKeyEnv: DEEPSEEK_API_KEY\n      api: openai-completions\n      baseURL: https://gateway.example/v1\n      models:\n        - id: glm-5.2\n",
+            )
+            .unwrap();
+
+            // 没有托管凭据时这份路由已经失效；有凭据（托管会话正在跑）则保留。
+            assert!(!agent_owned_route_is_viable(&root));
+            assert!(agent_owned_route_is_viable_with(&root, true));
+            // `ensure_home_config` 降级分支做的正是这一步。
+            assert!(release_agent_owned_model_route(&root).unwrap());
+
+            let migrated = std::fs::read_to_string(root.join("settings.yaml")).unwrap();
+            assert!(migrated.contains("theme:"));
+            assert!(!migrated.contains("himind-proxy"));
+            assert!(!migrated.contains("agent-default-model"));
+            // 已经干净了就不该再产生写盘。
+            assert!(!release_agent_owned_model_route(&root).unwrap());
+        })();
+        match previous_key {
+            Some(value) => std::env::set_var(super::HIMIND_MANAGED_API_KEY_ENV, value),
+            None => std::env::remove_var(super::HIMIND_MANAGED_API_KEY_ENV),
+        }
+        let _ = std::fs::remove_dir_all(root);
+        result
     }
 
     #[test]
@@ -3754,12 +4618,13 @@ mod tests {
     #[test]
     fn managed_headless_profile_reuses_himind_services_without_web_surface() {
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let profile = render_himind_profile_patch_from_base(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
+            ModelRouteSource::Managed,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string(), "model-fast".to_string()],
@@ -3777,12 +4642,13 @@ mod tests {
     #[test]
     fn managed_web_profile_disables_dsh_browser_handoff() {
         let mut options = crate::Options::from_env();
-        options.api_base = "https://dashboard.example".to_string();
+        options.set_api_base("https://dashboard.example");
         options.state_path = std::path::PathBuf::from("C:/HiMind/state.json");
-        options.effective_mode = crate::app::runtime_mode::AgentMode::Connected;
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let profile = render_himind_profile_patch_from_base(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
+            ModelRouteSource::Managed,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string()],
@@ -3796,6 +4662,7 @@ mod tests {
         let overlay = render_himind_agent_overlay(
             std::path::Path::new("C:/HiMind/runtime-home"),
             &options,
+            ModelRouteSource::Managed,
             "model-default",
             "https://gateway.example/v1",
             &["model-default".to_string()],

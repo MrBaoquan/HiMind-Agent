@@ -7,6 +7,7 @@ use crate::extension_contracts::{
     ExtensionLockRuntime, ExtensionSourceKind, ExtensionSourceRef,
     EXTENSION_CANDIDATE_SCHEMA_VERSION, EXTENSION_LOCK_SCHEMA_VERSION,
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -27,6 +28,12 @@ pub(crate) struct WorkflowDraftManifest {
     pub version: String,
     #[serde(default)]
     pub release_notes: String,
+    /// 工作流要求的最低 Agent 版本。
+    ///
+    /// 与 `release_notes` 一样是发布元数据：草稿不带它，发布到工作台时这个约束
+    /// 就会变成空串，等于市场对这个工作流不再做版本门禁。
+    #[serde(default)]
+    pub min_agent_version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -38,6 +45,9 @@ pub(crate) struct WorkflowPluginDependency {
     pub plugin_id: String,
     #[serde(default)]
     pub required: bool,
+    /// 依赖声明的最低版本；空串表示不限版本。
+    #[serde(default)]
+    pub min_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +81,16 @@ pub(crate) struct WorkflowDraft {
 }
 
 impl WorkflowDraft {
+    /// 该版本的候选是否已经离开本机（提交到工作台或发布到分发渠道）。
+    ///
+    /// 未离开本机的候选只是构建产物，允许随源码重建；一旦提交，内容必须冻结，
+    /// 修改只能通过递增版本号表达。
+    pub(crate) fn released_from_local(&self) -> bool {
+        matches!(self.state, ExtensionCandidateState::Submitted)
+            || self.submitted_at.is_some()
+            || self.dashboard_submission_id.is_some()
+    }
+
     pub(crate) fn candidate_record(&self) -> Result<ExtensionCandidate, Box<dyn Error>> {
         let package = crate::workflow::load_from_directory(&self.source_root)?;
         let dependencies = workflow_dependency_refs(&package.dependencies);
@@ -162,6 +182,12 @@ pub(crate) fn submit(
     if draft.state != ExtensionCandidateState::Confirmed {
         return Err("Workflow Candidate 尚未确认".into());
     }
+    // 分发目标门禁：只有把工件交给组织工作台的项目才允许提审。
+    crate::extension_projects::ensure_distribution_target(
+        crate::extension_projects::ExtensionProjectKind::Workflow,
+        package_id,
+        crate::extension_contracts::DistributionTarget::Workbench,
+    )?;
     let lock_path = draft
         .lock_path
         .as_deref()
@@ -181,7 +207,7 @@ pub(crate) fn submit(
     )?;
     let submitted = crate::api::distribution::submit_workflow(
         &client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &access.token,
         &draft.candidate_path,
@@ -235,6 +261,7 @@ fn save_from_source_to_root(
         |_| true,
     )?;
     let candidate_path = draft_root.join(format!("{}-{}.hmwf", package.id, package.version));
+    let previous = read_from_root(storage_root, &package.id, &package.version).ok();
     let temporary = draft_root.join(format!(
         ".{}-{}.{}.staging",
         package.id,
@@ -246,18 +273,25 @@ fn save_from_source_to_root(
     if candidate_path.exists() {
         let existing = sha256_file(&candidate_path)?;
         if !existing.eq_ignore_ascii_case(&candidate_sha256) {
+            if previous
+                .as_ref()
+                .is_some_and(WorkflowDraft::released_from_local)
+            {
+                let _ = fs::remove_file(&temporary);
+                return Err(format!(
+                    "Workflow 候选版本内容发生变化: {} v{}；该版本已提交，修改请递增版本号",
+                    package.id, package.version
+                )
+                .into());
+            }
+            fs::remove_file(&candidate_path)?;
+            fs::rename(&temporary, &candidate_path)?;
+        } else {
             let _ = fs::remove_file(&temporary);
-            return Err(format!(
-                "Workflow 候选版本内容发生变化: {} v{}",
-                package.id, package.version
-            )
-            .into());
         }
-        let _ = fs::remove_file(&temporary);
     } else {
         fs::rename(&temporary, &candidate_path)?;
     }
-    let previous = read_from_root(storage_root, &package.id, &package.version).ok();
     let now = now_stamp();
     let draft = WorkflowDraft {
         package_id: package.id.clone(),
@@ -268,15 +302,17 @@ fn save_from_source_to_root(
             name: package.name,
             description: package.description,
             version: package.version,
-            release_notes: String::new(),
+            release_notes: package.release_notes,
+            min_agent_version: package.min_agent_version,
             capabilities: package.capabilities,
             plugin_dependencies: package
                 .dependencies
                 .plugins
                 .iter()
-                .map(|plugin_id| WorkflowPluginDependency {
-                    plugin_id: plugin_id.clone(),
-                    required: true,
+                .map(|plugin| WorkflowPluginDependency {
+                    plugin_id: plugin.id().to_string(),
+                    required: plugin.required,
+                    min_version: plugin.min_version.trim().to_string(),
                 })
                 .collect(),
         },
@@ -310,10 +346,9 @@ fn test_in_root(
 ) -> Result<WorkflowDraft, Box<dyn Error>> {
     let mut draft = read_from_root(storage_root, package_id, version)?;
     let package = crate::workflow::load_from_directory(&draft.source_root)?;
-    let preflight = capabilities
-        .map(|capabilities| {
-            crate::workflow::preflight(&package, crate::VERSION, capabilities, &Value::Null)
-        });
+    let preflight = capabilities.map(|capabilities| {
+        crate::workflow::preflight(&package, crate::VERSION, capabilities, &Value::Null)
+    });
     if let Some(report) = preflight.as_ref().filter(|report| !report.ready) {
         return Err(format!("Workflow Preflight 未通过: {}", report.blockers.join("；")).into());
     }
@@ -389,50 +424,90 @@ fn resolve_dependency_lock(
     let mut dependencies = Vec::new();
     let mut missing = Vec::new();
 
-    for plugin_id in &package.dependencies.plugins {
+    for declared in &package.dependencies.plugins {
+        let plugin_id = declared.id();
         match crate::capability::plugin::find_plugin(plugin_id) {
             Ok(Some(plugin)) if plugin.enabled && plugin.error.is_none() => {
-                let sha256 = directory_content_sha256(Path::new(&plugin.path))?;
+                record_dependency_gap(
+                    declared.required,
+                    version_gap(
+                        "Plugin",
+                        plugin_id,
+                        &plugin.version,
+                        declared.min_version.trim(),
+                    ),
+                    &mut missing,
+                );
+                let sha256 = super::store::package_payload_digest(
+                    &crate::capability::plugin::plugin_content_dir(&plugin),
+                )?;
                 dependencies.push(ExtensionLockDependency {
                     kind: ExtensionAssetKind::Plugin,
                     id: plugin.id,
                     version: plugin.version,
                     sha256,
                     source_id: plugin.source,
-                    required: true,
+                    required: declared.required,
                 });
             }
-            Ok(Some(plugin)) => missing.push(format!(
-                "Plugin {plugin_id} 不可用{}",
-                plugin
-                    .error
-                    .as_deref()
-                    .map(|error| format!(": {error}"))
-                    .unwrap_or_default()
-            )),
-            Ok(None) => missing.push(format!("缺少 Plugin {plugin_id}")),
-            Err(error) => missing.push(format!("读取 Plugin {plugin_id} 失败: {error}")),
+            Ok(Some(plugin)) => record_dependency_gap(
+                declared.required,
+                format!(
+                    "Plugin {plugin_id} 不可用{}",
+                    plugin
+                        .error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                ),
+                &mut missing,
+            ),
+            Ok(None) => record_dependency_gap(
+                declared.required,
+                format!("缺少 Plugin {plugin_id}"),
+                &mut missing,
+            ),
+            Err(error) => record_dependency_gap(
+                declared.required,
+                format!("读取 Plugin {plugin_id} 失败: {error}"),
+                &mut missing,
+            ),
         }
     }
 
     let skill_records = crate::skill::store::SkillStore::new().list_records()?;
-    for skill_id in &package.dependencies.skills {
+    for declared in &package.dependencies.skills {
+        let skill_id = declared.id();
         match skill_records
             .iter()
             .find(|record| record.manifest.id == *skill_id)
         {
             Some(record) => {
-                let sha256 = directory_content_sha256(&record.version_root)?;
+                record_dependency_gap(
+                    declared.required,
+                    version_gap(
+                        "Skill",
+                        skill_id,
+                        &record.manifest.version,
+                        declared.min_version.trim(),
+                    ),
+                    &mut missing,
+                );
+                let sha256 = super::store::package_payload_digest(&record.version_root)?;
                 dependencies.push(ExtensionLockDependency {
                     kind: ExtensionAssetKind::Skill,
                     id: record.manifest.id.clone(),
                     version: record.manifest.version.clone(),
                     sha256,
                     source_id: "skill-store".to_string(),
-                    required: true,
+                    required: declared.required,
                 });
             }
-            None => missing.push(format!("缺少 Skill {skill_id}")),
+            None => record_dependency_gap(
+                declared.required,
+                format!("缺少 Skill {skill_id}"),
+                &mut missing,
+            ),
         }
     }
 
@@ -508,32 +583,6 @@ fn resolve_dependency_lock(
     Ok(lock)
 }
 
-pub(super) fn directory_content_sha256(root: &Path) -> Result<String, Box<dyn Error>> {
-    let mut entries = Vec::new();
-    for entry in walkdir::WalkDir::new(root).min_depth(1) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        entries.push((relative, entry.path().to_path_buf()));
-    }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hasher = Sha256::new();
-    for (relative, path) in entries {
-        let content = fs::read(path)?;
-        hasher.update((relative.len() as u64).to_le_bytes());
-        hasher.update(relative.as_bytes());
-        hasher.update((content.len() as u64).to_le_bytes());
-        hasher.update(content);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 fn list_from_root(root: &Path) -> Result<Vec<WorkflowDraft>, Box<dyn Error>> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -579,12 +628,12 @@ fn workflow_dependency_refs(
     let mut items = dependencies
         .plugins
         .iter()
-        .map(|id| dependency(ExtensionAssetKind::Plugin, id))
+        .map(|item| dependency(ExtensionAssetKind::Plugin, item.id(), item.required))
         .chain(
             dependencies
                 .skills
                 .iter()
-                .map(|id| dependency(ExtensionAssetKind::Skill, id)),
+                .map(|item| dependency(ExtensionAssetKind::Skill, item.id(), item.required)),
         )
         .collect::<Vec<_>>();
     items.sort();
@@ -592,15 +641,39 @@ fn workflow_dependency_refs(
     items
 }
 
-fn dependency(kind: ExtensionAssetKind, id: &str) -> ExtensionDependencyRef {
+fn dependency(kind: ExtensionAssetKind, id: &str, required: bool) -> ExtensionDependencyRef {
     ExtensionDependencyRef {
         kind,
         id: id.trim().to_string(),
         version: String::new(),
         sha256: String::new(),
         source_id: String::new(),
-        required: true,
+        required,
     }
+}
+
+/// 依赖缺失时按必需与否分流：必需依赖阻断打包，可选依赖只是让锁里没有这一条。
+fn record_dependency_gap(required: bool, reason: String, missing: &mut Vec<String>) {
+    if required && !reason.is_empty() {
+        missing.push(reason);
+    }
+}
+
+/// 已安装版本低于声明的最低版本时给出说明，满足则返回空串。
+fn version_gap(kind: &str, id: &str, installed: &str, min_version: &str) -> String {
+    if min_version.is_empty() {
+        return String::new();
+    }
+    let (Ok(installed), Ok(minimum)) = (
+        Version::parse(installed.trim()),
+        Version::parse(min_version),
+    ) else {
+        return String::new();
+    };
+    if installed < minimum {
+        return format!("{kind} {id} 版本 {installed} 低于声明的最低版本 {minimum}");
+    }
+    String::new()
 }
 
 fn draft_version_root(root: &Path, package_id: &str, version: &str) -> PathBuf {
@@ -650,6 +723,13 @@ mod tests {
     }
 
     fn workflow_root_with_dependencies(name: &str, plugins: Vec<&str>) -> PathBuf {
+        workflow_root_with_declared_dependencies(
+            name,
+            json!({ "plugins": plugins, "skills": [], "connectors": [], "runtimes": [] }),
+        )
+    }
+
+    fn workflow_root_with_declared_dependencies(name: &str, dependencies: Value) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "himind-workflow-authoring-{name}-{}",
             unique_suffix()
@@ -664,12 +744,7 @@ mod tests {
                 "version": "1.0.0",
                 "name": "Authoring Example",
                 "min_agent_version": "0.3.47",
-                "dependencies": {
-                    "plugins": plugins,
-                    "skills": [],
-                    "connectors": [],
-                    "runtimes": []
-                },
+                "dependencies": dependencies,
                 "steps": [{
                     "id": "START",
                     "title": "Start",
@@ -732,6 +807,84 @@ mod tests {
         assert_eq!(lock.root.id, "com.example.authoring");
         assert!(lock.dependencies.is_empty());
         assert!(tested.lock_path.unwrap().is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restaging_rebuilds_an_unsubmitted_candidate_when_the_source_changes() {
+        let root = workflow_root("restage-unsubmitted");
+        let source = root.join("source");
+        let storage = root.join("storage");
+        let first = save_from_source_to_root(&source, &storage).unwrap();
+        assert_eq!(first.state, ExtensionCandidateState::Candidate);
+
+        let manifest_path = source.join("workflow.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["name"] = json!("Authoring Renamed");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let restaged = save_from_source_to_root(&source, &storage).unwrap();
+        assert_ne!(restaged.candidate_sha256, first.candidate_sha256);
+        assert_eq!(restaged.state, ExtensionCandidateState::Candidate);
+        assert_eq!(restaged.manifest.name, "Authoring Renamed");
+        assert!(restaged.lock.is_none());
+        assert!(restaged.confirmed_at.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restaging_a_submitted_candidate_requires_a_new_version() {
+        let root = workflow_root("restage-submitted");
+        let source = root.join("source");
+        let storage = root.join("storage");
+        save_from_source_to_root(&source, &storage).unwrap();
+        let mut submitted = read_from_root(&storage, "com.example.authoring", "1.0.0").unwrap();
+        submitted.state = ExtensionCandidateState::Submitted;
+        submitted.submitted_at = Some(now_stamp());
+        persist(&storage, &submitted).unwrap();
+
+        let manifest_path = source.join("workflow.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["name"] = json!("Authoring Renamed");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = save_from_source_to_root(&source, &storage).unwrap_err();
+        assert!(error.to_string().contains("递增版本号"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn optional_dependency_declared_as_object_does_not_block_the_lock() {
+        let root = workflow_root_with_declared_dependencies(
+            "optional-dependency",
+            json!({
+                "plugins": [],
+                "skills": [{
+                    "skill_id": "definitely-missing-himind-skill",
+                    "required": false,
+                    "min_version": "1.0.0"
+                }],
+                "connectors": [],
+                "runtimes": []
+            }),
+        );
+        let source = root.join("source");
+        let storage = root.join("storage");
+        save_from_source_to_root(&source, &storage).unwrap();
+        let tested = test_in_root("com.example.authoring", "1.0.0", &storage, None).unwrap();
+        assert_eq!(tested.state, ExtensionCandidateState::Tested);
+        let lock = tested.lock.unwrap();
+        assert!(lock.dependencies.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

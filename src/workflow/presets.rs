@@ -3,6 +3,9 @@
 //! 同一个工作流常常要针对多个工作区反复启动，差别只有 `workspace_root` 之类的少量参数。
 //! 预设把这套参数存下来：启动时选预设 → 只改工作区 → 跑。预设只是**参数模板**，
 //! 不改变运行语义，也不参与调度（定时是 scheduler 的职责）。
+//!
+//! 这一层在界面上对用户叫「启动方案」（"用哪套方案启动"），代码里沿用 preset 这个词：
+//! 两边指的是同一件东西，改文案时不用动这里的标识符。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +26,9 @@ pub(crate) struct WorkflowRunPreset {
     pub entrypoint: String,
     #[serde(default)]
     pub exitpoint: String,
+    /// 常用（置顶）：用户把常跑的那几套钉在列表最前面。
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -66,8 +72,10 @@ pub(crate) fn list(workflow_id: &str) -> Result<Value, Box<dyn Error>> {
         items.retain(|item| item.workflow_id == filter);
     }
     items.sort_by(|left, right| {
-        left.workflow_id
-            .cmp(&right.workflow_id)
+        right
+            .pinned
+            .cmp(&left.pinned)
+            .then_with(|| left.workflow_id.cmp(&right.workflow_id))
             .then_with(|| left.label.cmp(&right.label))
     });
     Ok(json!({
@@ -123,6 +131,7 @@ pub(crate) fn set(input: &Value, now: i64) -> Result<Value, Box<dyn Error>> {
             input: json!({}),
             entrypoint: String::new(),
             exitpoint: String::new(),
+            pinned: false,
             created_at: now.to_string(),
             updated_at: String::new(),
         });
@@ -141,6 +150,10 @@ pub(crate) fn set(input: &Value, now: i64) -> Result<Value, Box<dyn Error>> {
         .unwrap_or_default()
         .trim()
         .to_string();
+    // 置顶只认调用方显式给出的值：改参数、改名时没带 pinned，就沿用原来钉没钉。
+    if let Some(pinned) = input.get("pinned").and_then(Value::as_bool) {
+        record.pinned = pinned;
+    }
     record.updated_at = now.to_string();
     items.retain(|item| item.id != record.id);
     items.push(record.clone());
@@ -165,6 +178,39 @@ pub(crate) fn delete(id: &str) -> Result<Value, Box<dyn Error>> {
         save(&items)?;
     }
     Ok(json!({ "removed": removed, "id": id }))
+}
+
+/// 取一条属于该工作流的预设。
+///
+/// 定时计划这类「引用预设」的调用方要在执行时读到预设**当前**的值，
+/// 所以这里返回整条记录，而不是把它拍平成一份快照。
+pub(crate) fn find(
+    workflow_id: &str,
+    preset_id: &str,
+) -> Result<Option<WorkflowRunPreset>, Box<dyn Error>> {
+    let workflow = workflow_id.trim();
+    let id = preset_id.trim();
+    if workflow.is_empty() || id.is_empty() {
+        return Ok(None);
+    }
+    Ok(load()?
+        .into_iter()
+        .find(|item| item.id == id && item.workflow_id == workflow))
+}
+
+/// 预设是参数基线，`overrides` 是调用方显式给出的键：只覆盖它给出的那些。
+///
+/// 这样「预设里改了工作区，所有引用它的计划自动跟上」才成立；计划里没有出现过的键
+/// 不会被一个陈旧副本钉死。逐键覆盖（而不是递归合并）是刻意的：参数值本身是整体，
+/// 例如凭据对象被替换时就该整体替换。
+pub(crate) fn merge_override(base: &Value, overrides: &Value) -> Value {
+    let mut merged = base.as_object().cloned().unwrap_or_default();
+    if let Some(overrides) = overrides.as_object() {
+        for (key, value) in overrides {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
 }
 
 /// 默认名称：显式给了工作区就用目录名，否则用“默认参数”。
@@ -204,12 +250,42 @@ mod tests {
     #[test]
     fn default_label_prefers_the_workspace_leaf() {
         assert_eq!(
-            default_label("com.himind.workflow.tech-radar", &json!({"workspace_root": "F:\\\\WebProjects\\\\项目看板"})),
+            default_label(
+                "com.himind.workflow.tech-radar",
+                &json!({"workspace_root": "F:\\\\WebProjects\\\\项目看板"})
+            ),
             "项目看板"
         );
         assert_eq!(
             default_label("com.himind.workflow.tech-radar", &json!({})),
             "com.himind.workflow.tech-radar 默认参数"
+        );
+    }
+
+    #[test]
+    fn overrides_only_replace_the_keys_they_carry() {
+        let base = json!({"workspace_root": "F:/new", "app_id": "wx1", "retries": 2});
+        let overrides = json!({"retries": 5});
+        assert_eq!(
+            merge_override(&base, &overrides),
+            json!({"workspace_root": "F:/new", "app_id": "wx1", "retries": 5})
+        );
+    }
+
+    #[test]
+    fn merge_override_survives_empty_or_non_object_input() {
+        // 计划没存覆盖项时就该原样用预设，而不是把预设清空。
+        assert_eq!(
+            merge_override(&json!({"workspace_root": "F:/new"}), &json!({})),
+            json!({"workspace_root": "F:/new"})
+        );
+        assert_eq!(
+            merge_override(&json!({"workspace_root": "F:/new"}), &json!(null)),
+            json!({"workspace_root": "F:/new"})
+        );
+        assert_eq!(
+            merge_override(&Value::Null, &json!({"workspace_root": "F:/new"})),
+            json!({"workspace_root": "F:/new"})
         );
     }
 }

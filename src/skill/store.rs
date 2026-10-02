@@ -1,3 +1,4 @@
+use crate::app::extension_lock::TransientPolicy;
 use crate::skill::manifest::{
     load_skill_manifest, validate_skill_package_root, write_skill_package,
 };
@@ -173,6 +174,19 @@ impl SkillStore {
                     fs::remove_dir_all(rendered_root)?;
                 }
             }
+            // 目录只是技能的一半：台账和来源记录留着，自动更新与依赖解析就会继续把
+            // 这门已经下线的技能当成「已安装 vX」，用户机器上于是长期留着一条
+            // 「界面里查不到、台账里查得到」的分叉记录。
+            let _ = crate::app::extension_lock::remove_at(
+                &crate::app::extension_lock::path_for_state_root(&self.extension_state_root),
+                "skill",
+                skill_id,
+            );
+            crate::app::extension_source::remove_provenance_at(
+                &self.extension_state_root,
+                "skill",
+                skill_id,
+            );
         }
         Ok(())
     }
@@ -280,6 +294,8 @@ impl SkillStore {
                 fs::remove_dir_all(rendered)?;
             }
         }
+        // 来源记录跟着资产走：留着会让自动更新把已经卸掉的技能当成待更新项。
+        crate::app::extension_source::remove_provenance("skill", skill_id);
         Ok(existed)
     }
 
@@ -305,6 +321,8 @@ impl SkillStore {
             "skill",
             skill_id,
         );
+        // 来源记录跟着资产走：留着会让自动更新把已经卸掉的技能当成待更新项。
+        crate::app::extension_source::remove_provenance("skill", skill_id);
         Ok(true)
     }
 
@@ -403,6 +421,9 @@ impl SkillStore {
         let skill_root = self.skill_root_for_scope(&manifest.scope, expected_id);
         let versions_root = skill_root.join("versions");
         fs::create_dir_all(&versions_root)?;
+        // 安装台账里的版本号会直接变成目录名。清单校验已经挡了 `..`，这里再按
+        // 可信根确认一次落点：技能目录被换成指向别处的联接时同样要被拒。
+        let skill_guard = crate::path_guard::TrustedRoot::new(&skill_root)?;
         let mut transaction = crate::app::extension_lock::InstallGuard::begin_at(
             &self.extension_state_root.join("extension-transactions"),
             "skill",
@@ -413,7 +434,8 @@ impl SkillStore {
         let staging = skill_root.join(format!("staging-{}", now_stamp()));
         copy_package_tree(package_root, &staging)?;
         transaction.stage("staged")?;
-        let version_root = versions_root.join(expected_version);
+        let version_root =
+            skill_guard.ensure_within(&versions_root.join(expected_version), "写入技能版本目录")?;
         if version_root.exists() {
             let existing = crate::skill::manifest::parse_checksums(&fs::read_to_string(
                 version_root.join("checksums.sha256"),
@@ -423,7 +445,12 @@ impl SkillStore {
             )?)?;
             if existing != incoming {
                 let _ = fs::remove_dir_all(&staging);
-                return Err("同一 Skill 版本已存在且内容不同，请提升版本号".into());
+                // 与插件侧同一套说法：安装失败的提示要同时给发布者和安装者一条出路。
+                return Err(format!(
+                    "本机已有 v{}，内容与这个来源不一致，不能覆盖。请先卸载本机版本，或改用更高版本",
+                    expected_version
+                )
+                .into());
             }
             fs::remove_dir_all(&staging)?;
         } else if let Err(error) = fs::rename(&staging, &version_root) {
@@ -453,6 +480,7 @@ impl SkillStore {
         )?;
         transaction.stage("lock_committed")?;
         transaction.commit()?;
+        prune_skill_versions(&skill_root, TransientPolicy::Remove);
         Ok(record)
     }
 
@@ -532,6 +560,67 @@ impl SkillStore {
     }
 }
 
+/// 安装完成后收掉历史版本目录。
+///
+/// 保留三类：`current.json` / `previous.json` 指向的两版（回退要用），以及仍被
+/// 客户端渲染收据引用的版本——软链接模式下客户端目录里是指回版本目录的链接，
+/// 删掉就等于把已装的技能删坏。更早的版本只能重新下载，留着只会让本地目录
+/// 随每次升级无限膨胀。
+fn prune_skill_versions(skill_root: &Path, transient: TransientPolicy) -> usize {
+    let versions_root = skill_root.join("versions");
+    // 路径拿不准就整体放弃，宁可留着历史版本，也不能误删还在被引用的版本。
+    let Ok(canonical_versions) = versions_root.canonicalize() else {
+        return 0;
+    };
+    let mut keep = ["current.json", "previous.json"]
+        .iter()
+        .filter_map(|name| read_pointer(&skill_root.join(name)).ok().flatten())
+        .map(|pointer| pointer.version)
+        .collect::<Vec<_>>();
+    if keep.is_empty() {
+        return 0;
+    }
+    for source in crate::skill::hygiene::referenced_render_sources() {
+        let Some(parent) = source.parent() else {
+            continue;
+        };
+        if parent.canonicalize().ok().as_deref() != Some(canonical_versions.as_path()) {
+            continue;
+        }
+        if let Some(name) = source.file_name() {
+            keep.push(name.to_string_lossy().to_string());
+        }
+    }
+    crate::app::extension_lock::prune_version_dirs(&versions_root, &keep, transient)
+}
+
+/// 启动巡检：把每个已装技能的 `versions/` 收敛到当前两版，返回删除的目录数。
+///
+/// 安装完成时的收敛只覆盖刚装过的那一个技能，不再更新技能的历史版本会一直留着。
+/// 与安装期不同，巡检传 `TransientPolicy::RemoveStale`：别的线程可能正在安装，
+/// 只有确定放旧的暂存残留才会被清掉。
+pub(crate) fn sweep_skill_versions() -> usize {
+    let store = SkillStore::new();
+    let mut removed = 0;
+    for scope in ["builtin", "managed", "user"] {
+        let Ok(entries) = fs::read_dir(store.root.join(scope)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let skill_root = entry.path();
+            // 没有版本指针的目录不是托管技能（例如用户自己摊开的目录）。
+            if !skill_root.join("current.json").is_file() {
+                continue;
+            }
+            removed += prune_skill_versions(&skill_root, TransientPolicy::RemoveStale);
+        }
+    }
+    removed
+}
+
 fn copy_package_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(target)?;
     for entry in walkdir::WalkDir::new(source) {
@@ -604,6 +693,11 @@ pub(crate) fn retired_skill_ids() -> &'static [&'static str] {
     &[
         "com.himind.skill.environment-doctor",
         "com.himind.skill.image-delivery-preflight",
+        // 稳定 ID 从 `engineering-workflow-orchestrator` 收敛到
+        // `dev-workflow-orchestrator` 之后，旧 ID 在市场和扩展源里都不再存在。
+        // 留在盘上的那一份永远等不到更新，登录态里还会显示成一条来源未知的
+        // 已装技能，所以按退役处理：清干净，让用户从市场重装新 ID 的那一份。
+        "com.himind.skill.engineering-workflow-orchestrator",
     ]
 }
 
@@ -627,6 +721,26 @@ mod tests {
         fs::write(root.join("checksums.sha256"), content).unwrap();
     }
 
+    fn lock_entry(id: &str) -> crate::app::extension_lock::ExtensionLockEntry {
+        crate::app::extension_lock::ExtensionLockEntry {
+            asset_kind: "skill".to_string(),
+            asset_id: id.to_string(),
+            version: "1.0.3".to_string(),
+            source_id: "local-test".to_string(),
+            source: "local:local-test".to_string(),
+            repository: String::new(),
+            reference: String::new(),
+            catalog_path: String::new(),
+            source_commit: String::new(),
+            artifact_url: String::new(),
+            artifact_id: String::new(),
+            sha256: String::new(),
+            dependencies: Vec::new(),
+            agent_profile: "test".to_string(),
+            updated_at: now_stamp(),
+        }
+    }
+
     #[test]
     fn retires_removed_builtin_skill_seed() {
         let root = test_store_root();
@@ -645,6 +759,50 @@ mod tests {
         let records = store.installed_records().unwrap();
         assert!(records.is_empty());
         assert!(!retired_builtin.exists());
+        assert!(!retired_managed.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retiring_a_skill_clears_its_ledger_entry_and_provenance() {
+        let root = test_store_root();
+        let store = SkillStore::with_root(root.clone());
+        let retired = "com.himind.skill.image-delivery-preflight";
+        let kept = "com.himind.skill.keep-me";
+        let retired_managed = root.join("managed").join(retired);
+        fs::create_dir_all(&retired_managed).unwrap();
+        fs::write(retired_managed.join("legacy.txt"), "retired").unwrap();
+
+        // 台账与来源记录是「已安装」的第二、第三份事实。只删目录，用户机器上就会
+        // 长期留着一条界面里查不到、自动更新与依赖解析却仍然认得的记录。
+        let state_root = store.extension_state_root.clone();
+        let mut lock = crate::app::extension_lock::ExtensionLockFile::default();
+        lock.entries
+            .insert(format!("skill:{retired}"), lock_entry(retired));
+        lock.entries
+            .insert(format!("skill:{kept}"), lock_entry(kept));
+        fs::create_dir_all(&state_root).unwrap();
+        fs::write(
+            crate::app::extension_lock::path_for_state_root(&state_root),
+            serde_json::to_vec_pretty(&lock).unwrap(),
+        )
+        .unwrap();
+        let provenance = state_root.join("extension-provenance");
+        fs::create_dir_all(&provenance).unwrap();
+        for id in [retired, kept] {
+            fs::write(provenance.join(format!("skill-{id}.json")), "{}").unwrap();
+        }
+
+        store.bootstrap_builtin_skills().unwrap();
+
+        let remaining: crate::app::extension_lock::ExtensionLockFile = serde_json::from_slice(
+            &fs::read(crate::app::extension_lock::path_for_state_root(&state_root)).unwrap(),
+        )
+        .unwrap();
+        assert!(!remaining.entries.contains_key(&format!("skill:{retired}")));
+        assert!(remaining.entries.contains_key(&format!("skill:{kept}")));
+        assert!(!provenance.join(format!("skill-{retired}.json")).exists());
+        assert!(provenance.join(format!("skill-{kept}.json")).exists());
         assert!(!retired_managed.exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -749,7 +907,7 @@ mod tests {
         let error = store
             .install_organization_package(&package, &manifest.id, &manifest.version)
             .unwrap_err();
-        assert!(error.to_string().contains("内容不同"));
+        assert!(error.to_string().contains("内容与这个来源不一致"));
         let _ = fs::remove_dir_all(root);
     }
 

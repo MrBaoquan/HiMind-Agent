@@ -1,10 +1,8 @@
 use semver::Version;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
-use std::env;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::WorkflowPackage;
 use crate::api::types::RuntimeInstallationReport;
@@ -30,6 +28,9 @@ pub(crate) struct WorkflowToolPreflight {
 pub(crate) struct WorkflowSkillPreflight {
     pub id: String,
     pub available: bool,
+    /// 依赖声明里这条是必需还是可选；可选缺失只给警告。
+    #[serde(default)]
+    pub required: bool,
     pub version: String,
     pub scope: String,
 }
@@ -219,6 +220,9 @@ pub(crate) fn preflight(
     available_capabilities: &[CapabilityDescriptor],
     input: &Value,
 ) -> WorkflowPreflight {
+    // 预检、探针和实际运行必须看到同一份输入：只填部分参数时，
+    // 这里先补齐启动表单声明的默认值，避免「默认值只在界面生效」。
+    let input = &super::with_launch_defaults(package, input);
     let mut diagnostics = Vec::new();
 
     match (
@@ -291,20 +295,32 @@ pub(crate) fn preflight(
         })
         .collect::<Vec<_>>();
 
-    for plugin_id in &package.dependencies.plugins {
+    for declared in &package.dependencies.plugins {
+        let plugin_id = declared.id();
         let source = format!("plugin:{plugin_id}");
         if !available_capabilities
             .iter()
             .any(|capability| capability.source == source)
         {
-            push_blocker(
-                &mut diagnostics,
-                "plugin.unavailable",
-                "dependencies",
-                format!("required workflow plugin is unavailable or disabled: {plugin_id}"),
-                "安装并启用该 Plugin，然后重新执行启动前检查。",
-                true,
-            );
+            if declared.required {
+                push_blocker(
+                    &mut diagnostics,
+                    "plugin.unavailable",
+                    "dependencies",
+                    format!("required workflow plugin is unavailable or disabled: {plugin_id}"),
+                    "安装并启用该 Plugin，然后重新执行启动前检查。",
+                    true,
+                );
+            } else {
+                push_warning(
+                    &mut diagnostics,
+                    "plugin.optional_unavailable",
+                    "dependencies",
+                    format!("optional workflow plugin is unavailable or disabled: {plugin_id}"),
+                    "工作流可以继续运行；需要该 Plugin 提供的步骤会走降级路径。",
+                    true,
+                );
+            }
         }
     }
 
@@ -314,25 +330,38 @@ pub(crate) fn preflight(
         .dependencies
         .skills
         .iter()
-        .map(|skill_id| {
+        .map(|declared| {
+            let skill_id = declared.id();
             let record = crate::skill::store::SkillStore::new()
                 .get_record(skill_id)
                 .ok()
                 .flatten();
             let available = record.is_some();
             if !available {
-                push_blocker(
-                    &mut diagnostics,
-                    "skill.unavailable",
-                    "dependencies",
-                    format!("required workflow skill is unavailable: {skill_id}"),
-                    "安装或启用该 Skill，然后重新执行启动前检查。",
-                    true,
-                );
+                if declared.required {
+                    push_blocker(
+                        &mut diagnostics,
+                        "skill.unavailable",
+                        "dependencies",
+                        format!("required workflow skill is unavailable: {skill_id}"),
+                        "安装或启用该 Skill，然后重新执行启动前检查。",
+                        true,
+                    );
+                } else {
+                    push_warning(
+                        &mut diagnostics,
+                        "skill.optional_unavailable",
+                        "dependencies",
+                        format!("optional workflow skill is unavailable: {skill_id}"),
+                        "工作流可以继续运行；需要该 Skill 的步骤会走降级路径。",
+                        true,
+                    );
+                }
             }
             WorkflowSkillPreflight {
-                id: skill_id.clone(),
+                id: skill_id.to_string(),
                 available,
+                required: declared.required,
                 version: record
                     .as_ref()
                     .map(|record| record.manifest.version.clone())
@@ -576,45 +605,294 @@ fn validate_capability_step_inputs(
     run_input: &Value,
     diagnostics: &mut Vec<WorkflowDiagnostic>,
 ) {
-    for step in &package.steps {
-        if step.kind.trim() != "capability" {
-            continue;
-        }
-        let capability_id = step.capability_id.trim();
-        if capability_id.is_empty() {
-            continue;
-        }
-        let Some(capability) = capability_map.get(capability_id) else {
-            continue;
+    let launch = LaunchContract::for_package(package);
+    validate_step_inputs(
+        &package.steps,
+        package,
+        capability_map,
+        run_input,
+        &launch,
+        diagnostics,
+    );
+}
+
+/// 启动时调用方能提供的输入集合。
+///
+/// 预检要回答的是「这个 Workflow 有没有人能在启动时把参数给上」，而不是
+/// 「参数留空时能力会不会失败」——后者属于运行期输入校验。
+struct LaunchContract {
+    form_fields: Vec<super::WorkflowLaunchField>,
+    /// 分段执行时，入口声明的 requires 就是调用方契约。
+    entry_requirements: std::collections::BTreeSet<String>,
+    /// connector 在运行期把凭据解析到 target 名下注入。
+    connector_targets: std::collections::BTreeSet<String>,
+    /// 按表单默认值推导 `when` 条件的上下文。
+    condition_context: Value,
+    segmented: bool,
+}
+
+enum InputCoverage {
+    /// 启动时一定会带上值。
+    Guaranteed,
+    /// 只有用户主动填写时才有值。
+    Optional,
+    /// 没有任何人在启动时提供它。
+    Missing,
+}
+
+impl LaunchContract {
+    fn for_package(package: &WorkflowPackage) -> Self {
+        let form_fields = super::launch_form_fields(package);
+        let segmented = package.execution_policy.trim() != "strict";
+        let entry_requirements = if segmented {
+            package
+                .entrypoints
+                .iter()
+                .flat_map(|entrypoint| entrypoint.requires.iter().cloned())
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
         };
-        let mut merged = run_input.as_object().cloned().unwrap_or_default();
-        if let Some(step_input) = step.input.as_object() {
-            for (name, value) in step_input {
-                merged.insert(name.clone(), value.clone());
+        let connector_targets = package
+            .connectors
+            .iter()
+            .flat_map(|connector| connector.credentials.iter())
+            .map(|credential| credential.target.trim())
+            .filter(|target| !target.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut defaults = serde_json::Map::new();
+        for field in &form_fields {
+            if !field.default.is_null() {
+                defaults.insert(field.id.clone(), field.default.clone());
             }
         }
-        // 运行器会给每个步骤注入 workflow_context，这里补上同样的键，
-        // 免得把「运行期才注入的输入」误判成缺失。
-        merged
-            .entry("workflow_context".to_string())
-            .or_insert_with(|| Value::Object(Default::default()));
-        let merged = Value::Object(merged);
-        // 先用运行期的过滤规则对齐输入，再校验：预检查的对象与真正下发给能力的对象一致。
-        let filtered = super::executor::capability_input(&capability.input_schema, &merged);
-        if let Err(error) = crate::capability::service::validate_capability_input_schema(
-            &capability.input_schema,
-            &filtered,
-        ) {
-            push_blocker(
+        Self {
+            form_fields,
+            entry_requirements,
+            connector_targets,
+            condition_context: serde_json::json!({ "input": Value::Object(defaults) }),
+            segmented,
+        }
+    }
+
+    fn coverage(&self, name: &str) -> InputCoverage {
+        if self.connector_targets.contains(name)
+            || self.entry_requirements.contains(name)
+            || self
+                .form_fields
+                .iter()
+                .any(|field| field.guaranteed && launch_field_matches(field, name))
+        {
+            return InputCoverage::Guaranteed;
+        }
+        if self
+            .form_fields
+            .iter()
+            .any(|field| launch_field_matches(field, name))
+        {
+            return InputCoverage::Optional;
+        }
+        InputCoverage::Missing
+    }
+
+    /// 判定 `when` 条件时，表单默认值只是兜底，调用方实际传了什么才算数。
+    /// 否则用户勾上「请求回滚」后，预检仍按默认的 false 跳过回滚步骤，
+    /// 缺的入参要等运行到那一步才暴露。
+    fn condition_context(&self, run_input: &Value) -> Value {
+        let mut context = self.condition_context.clone();
+        let Some(defaults) = context.get_mut("input").and_then(Value::as_object_mut) else {
+            return context;
+        };
+        let Some(values) = run_input.as_object() else {
+            return context;
+        };
+        for (name, value) in values {
+            defaults.insert(name.clone(), value.clone());
+        }
+        context
+    }
+}
+
+fn launch_field_matches(field: &super::WorkflowLaunchField, name: &str) -> bool {
+    field.id == name || (!field.target.is_empty() && field.target == name)
+}
+
+fn validate_step_inputs(
+    steps: &[super::WorkflowStep],
+    package: &WorkflowPackage,
+    capability_map: &std::collections::BTreeMap<&str, &CapabilityDescriptor>,
+    run_input: &Value,
+    launch: &LaunchContract,
+    diagnostics: &mut Vec<WorkflowDiagnostic>,
+) {
+    let condition_context = launch.condition_context(run_input);
+    for step in steps {
+        if let Some(condition) = step.when.as_ref() {
+            // 按启动输入就能判定「这一步不跑」时，它的专属入参不该被当成缺失；
+            // 条件引用了步骤输出这类未知信息时会返回错误，此时按「可能会跑」继续校验。
+            if matches!(
+                super::evaluate_condition(condition, &condition_context),
+                Ok(false)
+            ) {
+                continue;
+            }
+        }
+        if step.kind.trim() == "capability" {
+            validate_capability_step_input(
+                step,
+                package,
+                capability_map,
+                run_input,
+                launch,
                 diagnostics,
-                "capability.input.invalid",
-                "input",
-                format!("{capability_id}（步骤 {}）：{error}", step.id),
-                "按启动表单的字段声明修正参数：列表字段每行一项，取值必须在允许范围内；不改也可以清空该项用默认值。",
-                true,
+            );
+        }
+        if let Some(loop_config) = step.loop_config.as_ref() {
+            validate_step_inputs(
+                &loop_config.steps,
+                package,
+                capability_map,
+                run_input,
+                launch,
+                diagnostics,
             );
         }
     }
+}
+
+fn validate_capability_step_input(
+    step: &super::WorkflowStep,
+    package: &WorkflowPackage,
+    capability_map: &std::collections::BTreeMap<&str, &CapabilityDescriptor>,
+    run_input: &Value,
+    launch: &LaunchContract,
+    diagnostics: &mut Vec<WorkflowDiagnostic>,
+) {
+    let capability_id = step.capability_id.trim();
+    if capability_id.is_empty() {
+        return;
+    }
+    let Some(capability) = capability_map.get(capability_id) else {
+        return;
+    };
+    let mut merged = run_input.as_object().cloned().unwrap_or_default();
+    if let Some(step_input) = step.input.as_object() {
+        for (name, value) in step_input {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    for (name, value) in super::executor::candidate_freeze_inputs(package, step) {
+        merged.insert(name.to_string(), value);
+    }
+    // 运行器会给每个步骤注入这几个键，这里补上同样的键，
+    // 免得把「运行期才注入的输入」误判成缺失。
+    merged
+        .entry("workflow_context".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if step.candidate_action.trim() == "require" {
+        merged
+            .entry("candidate".to_string())
+            .or_insert_with(|| Value::Object(Default::default()));
+    }
+    if step
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| !runtime.input_artifacts.is_empty())
+    {
+        merged
+            .entry("input_artifacts".to_string())
+            .or_insert_with(|| Value::Object(Default::default()));
+    }
+    let merged = Value::Object(merged);
+    // 先用运行期的过滤规则对齐输入，再校验：预检查的对象与真正下发给能力的对象一致。
+    let filtered = super::executor::capability_input(&capability.input_schema, &merged);
+    for (name, coverage) in
+        required_properties_without_value(&capability.input_schema, &filtered, launch)
+    {
+        match coverage {
+            // 分段执行时用户按入口逐次启动，表单声明的可选项就是调用方契约；
+            // 但它没被标成必填，用户可能直接留空，所以只提示不阻断。
+            InputCoverage::Optional if launch.segmented => push_warning(
+                diagnostics,
+                "capability.input.optional",
+                "input",
+                format!(
+                    "{capability_id}（步骤 {}）：{name} 由启动表单提供但未标必填，用户可能留空",
+                    step.id
+                ),
+                "把该字段标为 required，或加入对应入口的 requires，让启动时一定会带上它。",
+                true,
+            ),
+            _ => push_blocker(
+                diagnostics,
+                "capability.input.invalid",
+                "input",
+                format!(
+                    "{capability_id}（步骤 {}）：capability input is missing required property: {name}",
+                    step.id
+                ),
+                "为该 Step 补上入参，或在启动表单中声明同名必填字段；两者都没有时能力无法被调用。",
+                true,
+            ),
+        }
+    }
+    // 第二道校验负责取值合法性（类型、枚举、列表写法）。它内部的 required 判定
+    // 不认启动契约，会把表单/入口提供的属性重复判成缺失，所以先按启动契约重算 required。
+    let runtime_schema = schema_for_runtime_validation(&capability.input_schema, launch);
+    if let Err(error) =
+        crate::capability::service::validate_capability_input_schema(&runtime_schema, &filtered)
+    {
+        push_blocker(
+            diagnostics,
+            "capability.input.invalid",
+            "input",
+            format!("{capability_id}（步骤 {}）：{error}", step.id),
+            "按启动表单的字段声明修正参数：列表字段每行一项，取值必须在允许范围内；不改也可以清空该项用默认值。",
+            true,
+        );
+    }
+}
+
+/// 返回「没有值时能力会失败」的必填属性，以及它的启动覆盖程度。
+fn required_properties_without_value(
+    schema: &Value,
+    input: &Value,
+    launch: &LaunchContract,
+) -> Vec<(String, InputCoverage)> {
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    required
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| input.get(*name).is_none_or(Value::is_null))
+        .map(|name| (name.to_string(), launch.coverage(name)))
+        .filter(|(_, coverage)| !matches!(coverage, InputCoverage::Guaranteed))
+        .collect()
+}
+
+/// 从 schema 的 `required` 中剔除启动契约已经覆盖的属性，只留下必须由 Workflow 自己补齐的部分。
+fn schema_for_runtime_validation(schema: &Value, launch: &LaunchContract) -> Value {
+    let Some(required) = schema.get("required").and_then(Value::as_array) else {
+        return schema.clone();
+    };
+    let remaining: Vec<Value> = required
+        .iter()
+        .filter(|name| {
+            name.as_str()
+                .is_none_or(|name| matches!(launch.coverage(name), InputCoverage::Missing))
+        })
+        .cloned()
+        .collect();
+    if remaining.len() == required.len() {
+        return schema.clone();
+    }
+    let mut relaxed = schema.clone();
+    if let Some(object) = relaxed.as_object_mut() {
+        object.insert("required".to_string(), Value::Array(remaining));
+    }
+    relaxed
 }
 
 pub(crate) fn validate_environment_lock(
@@ -777,7 +1055,7 @@ fn runtime_requires_network_isolation(steps: &[super::WorkflowStep]) -> bool {
     steps.iter().any(|step| {
         step.runtime
             .as_ref()
-            .is_some_and(|runtime| !runtime.allow_network)
+            .is_some_and(|runtime| runtime.allow_network == Some(false))
             || step
                 .loop_config
                 .as_ref()
@@ -960,6 +1238,7 @@ pub(crate) fn preflight_with_connector_probes<F>(
 where
     F: FnMut(&str, Value) -> Result<Value, Box<dyn Error>>,
 {
+    let input = &super::with_launch_defaults(package, input);
     let mut report = preflight(package, agent_version, available_capabilities, input);
     let probes = probe_connectors(package, available_capabilities, input, invoke);
     apply_connector_probes(&mut report, &probes);
@@ -1184,64 +1463,18 @@ fn tool_values(requirements: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// 复用运行时那套解析逻辑：PATHEXT 后缀优先、带上常见 Node/uv 安装目录兜底。
+/// 之前这里是自己实现的「原名优先」，在 `C:\Program Files\nodejs` 这种同时存在
+/// `npx`（shell 脚本）和 `npx.cmd` 的目录里会命中前者，工作流预检因此误报缺失。
 fn resolve_executable(name: &str) -> Option<PathBuf> {
-    let candidate = Path::new(name);
-    if candidate.is_absolute() || candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
-    }
-    let path = env::var_os("PATH")?;
-    let extensions = executable_extensions();
-    for directory in env::split_paths(&path) {
-        let direct = directory.join(name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        for extension in &extensions {
-            let with_extension = directory.join(format!("{name}{extension}"));
-            if with_extension.is_file() {
-                return Some(with_extension);
-            }
-        }
-    }
-    None
-}
-
-fn executable_extensions() -> HashSet<String> {
-    #[cfg(windows)]
-    {
-        let from_environment = env::var_os("PATHEXT")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(';')
-                    .map(|extension| extension.to_ascii_lowercase())
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        if from_environment.is_empty() {
-            [".exe", ".cmd", ".bat", ".com"]
-                .into_iter()
-                .map(ToOwned::to_owned)
-                .collect()
-        } else {
-            from_env_extensions(from_environment)
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        HashSet::new()
-    }
-}
-
-#[cfg(windows)]
-fn from_env_extensions(values: HashSet<String>) -> HashSet<String> {
-    values
+    crate::runtime::process::resolve_executable(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capability::types::CapabilityAvailability;
+    use crate::workflow::WorkflowDependencyRef;
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1252,8 +1485,10 @@ mod tests {
             schema_version: crate::workflow::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.test".to_string(),
             version: "1.0.0".to_string(),
+            distribution_targets: Vec::new(),
             name: "Test".to_string(),
             description: String::new(),
+            release_notes: String::new(),
             min_agent_version: "0.3.47".to_string(),
             local_requirements: json!({"required_tools": required_tools}),
             optional_providers: Vec::new(),
@@ -1406,7 +1641,7 @@ mod tests {
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
-            allow_network: false,
+            allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
             timeout_seconds: 0,
@@ -1445,7 +1680,7 @@ mod tests {
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
-            allow_network: false,
+            allow_network: Some(false),
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
             timeout_seconds: 0,
@@ -1487,7 +1722,7 @@ mod tests {
             prompt: "Implement.".to_string(),
             workspace_path: String::new(),
             result_schema: String::new(),
-            allow_network: false,
+            allow_network: Some(false),
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
             timeout_seconds: 0,
@@ -1509,9 +1744,47 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_allow_network_does_not_require_isolation() {
+        let mut package = package(Vec::new());
+        package.supported_runtimes = vec!["personal.codex".to_string()];
+        package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
+            provider: "personal.codex".to_string(),
+            prompt: "Implement.".to_string(),
+            workspace_path: String::new(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            timeout_seconds: 0,
+        });
+        package.steps[0].capability_id.clear();
+        package.steps[0].kind = "runtime".to_string();
+
+        let mut diagnostics = Vec::new();
+        let runtimes = evaluate_runtime_preflight(
+            &package,
+            &[RuntimeInstallationReport {
+                provider: "personal.codex".to_string(),
+                version: "1.2.3".to_string(),
+                status: "ready".to_string(),
+                capabilities: json!({
+                    "network_isolated": false,
+                    "tool_access": "workspace-write"
+                }),
+            }],
+            &mut diagnostics,
+        );
+
+        assert!(runtimes[0].available);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
     fn missing_skill_dependency_blocks_preflight() {
         let mut package = package(Vec::new());
-        package.dependencies.skills = vec!["definitely-missing-himind-skill".to_string()];
+        package.dependencies.skills = vec![WorkflowDependencyRef::required(
+            "definitely-missing-himind-skill",
+        )];
         let report = preflight(
             &package,
             "0.3.47",
@@ -1521,10 +1794,36 @@ mod tests {
         assert!(!report.ready);
         assert_eq!(report.skills.len(), 1);
         assert!(!report.skills[0].available);
+        assert!(report.skills[0].required);
         assert!(report
             .blockers
             .iter()
             .any(|blocker| blocker.contains("definitely-missing-himind-skill")));
+    }
+
+    #[test]
+    fn optional_skill_dependency_only_warns() {
+        let mut package = package(Vec::new());
+        package.dependencies.skills = vec![WorkflowDependencyRef {
+            id: "definitely-missing-himind-skill".to_string(),
+            required: false,
+            min_version: "0.4.0".to_string(),
+        }];
+        let report = preflight(
+            &package,
+            "0.3.47",
+            &[capability("system.health")],
+            &json!({}),
+        );
+        assert!(report.ready);
+        assert_eq!(report.skills.len(), 1);
+        assert!(!report.skills[0].available);
+        assert!(!report.skills[0].required);
+        assert!(report.blockers.is_empty());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("definitely-missing-himind-skill")));
     }
 
     #[test]
@@ -1732,5 +2031,200 @@ mod tests {
         assert_eq!(report.connectors[0].health_status, "passed");
         assert!(report.connectors[0].health_message.contains("200"));
         server.join().unwrap();
+    }
+
+    fn workspace_with_view(view: Value) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "himind-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("ui")).unwrap();
+        std::fs::write(
+            root.join("ui").join("workflow-view.json"),
+            serde_json::to_vec(&view).unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    fn input_requiring(required: Vec<&str>) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"workspace_root": {"type": "string"}, "target_version": {"type": "string"}},
+            "required": required,
+            "additionalProperties": false
+        })
+    }
+
+    fn launch_form_package(view: Value, policy: &str) -> (WorkflowPackage, PathBuf) {
+        let root = workspace_with_view(view);
+        let mut package = package(Vec::new());
+        package.source_root = root.clone();
+        package.execution_policy = policy.to_string();
+        package.ui.entry = "ui/workflow-view.json".to_string();
+        (package, root)
+    }
+
+    #[test]
+    fn launch_form_field_covers_capability_required_property() {
+        let view = json!({
+            "schema_version": "workflow_view.v1",
+            "title": "Test",
+            "sections": [{
+                "id": "main",
+                "title": "Main",
+                "fields": [{"id": "workspace_root", "label": "Workspace", "type": "text", "required": true}]
+            }]
+        });
+        let (package, root) = launch_form_package(view, "segmented");
+        let capability = {
+            let mut capability = capability("system.health");
+            capability.input_schema = input_requiring(vec!["workspace_root"]);
+            capability
+        };
+        let report = preflight(&package, "0.3.47", &[capability], &json!({}));
+        assert!(report.ready, "{:?}", report.blockers);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_workflow_requires_optional_form_field_to_be_declared_required() {
+        let view = json!({
+            "schema_version": "workflow_view.v1",
+            "title": "Test",
+            "sections": [{
+                "id": "main",
+                "title": "Main",
+                "fields": [{"id": "workspace_root", "label": "Workspace", "type": "text"}]
+            }]
+        });
+        let (package, root) = launch_form_package(view, "strict");
+        let capability = {
+            let mut capability = capability("system.health");
+            capability.input_schema = input_requiring(vec!["workspace_root"]);
+            capability
+        };
+        let report = preflight(&package, "0.3.47", &[capability], &json!({}));
+        assert!(!report.ready);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("workspace_root")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn condition_disabled_step_is_not_validated() {
+        let view = json!({
+            "schema_version": "workflow_view.v1",
+            "title": "Test",
+            "sections": [{
+                "id": "main",
+                "title": "Main",
+                "fields": [
+                    {"id": "rollback_requested", "label": "Rollback", "type": "boolean", "default": false},
+                    {"id": "target_version", "label": "Target", "type": "text"}
+                ]
+            }]
+        });
+        let (mut package, root) = launch_form_package(view, "strict");
+        package.steps[0].when = Some(crate::workflow::WorkflowCondition {
+            operator: "equals".to_string(),
+            path: "input.rollback_requested".to_string(),
+            value: json!(true),
+            conditions: Vec::new(),
+        });
+        let capability = {
+            let mut capability = capability("system.health");
+            capability.input_schema = input_requiring(vec!["target_version"]);
+            capability
+        };
+        let report = preflight(&package, "0.3.47", &[capability], &json!({}));
+        assert!(report.ready, "{:?}", report.blockers);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn condition_step_is_validated_once_run_input_enables_it() {
+        let view = json!({
+            "schema_version": "workflow_view.v1",
+            "title": "Test",
+            "sections": [{
+                "id": "main",
+                "title": "Main",
+                "fields": [
+                    {"id": "rollback_requested", "label": "Rollback", "type": "boolean", "default": false},
+                    {"id": "target_version", "label": "Target", "type": "text"}
+                ]
+            }]
+        });
+        let (mut package, root) = launch_form_package(view, "strict");
+        package.steps[0].when = Some(crate::workflow::WorkflowCondition {
+            operator: "equals".to_string(),
+            path: "input.rollback_requested".to_string(),
+            value: json!(true),
+            conditions: Vec::new(),
+        });
+        let capability = {
+            let mut capability = capability("system.health");
+            capability.input_schema = input_requiring(vec!["target_version"]);
+            capability
+        };
+        let report = preflight(
+            &package,
+            "0.3.47",
+            &[capability],
+            &json!({"rollback_requested": true}),
+        );
+        assert!(!report.ready, "条件开启后缺入参必须报出来");
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("target_version")),
+            "{:?}",
+            report.blockers
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connector_credential_target_covers_required_property() {
+        let mut package = package(Vec::new());
+        package.execution_policy = "strict".to_string();
+        package.connectors = vec![crate::workflow::WorkflowConnectorManifest {
+            schema_version: crate::workflow::connector::CONNECTOR_MANIFEST_SCHEMA_VERSION
+                .to_string(),
+            id: "wechat-miniprogram".to_string(),
+            version: "1.0.0".to_string(),
+            name: "Connector".to_string(),
+            description: String::new(),
+            availability: "local".to_string(),
+            credential_ownership: "agent".to_string(),
+            auth: vec!["api_key".to_string()],
+            capabilities: vec!["system.health".to_string()],
+            scopes: Vec::new(),
+            supported_platforms: Vec::new(),
+            health_check: Value::Null,
+            credentials: vec![crate::workflow::WorkflowConnectorCredential {
+                handle: "wechat-upload-private-key".to_string(),
+                target: "private_key_path".to_string(),
+                kind: "file_path".to_string(),
+                required: false,
+            }],
+        }];
+        let mut capability = capability("system.health");
+        capability.input_schema = json!({
+            "type": "object",
+            "properties": {"private_key_path": {"type": "string"}},
+            "required": ["private_key_path"],
+            "additionalProperties": false
+        });
+        let report = preflight(&package, "0.3.47", &[capability], &json!({}));
+        assert!(report.ready, "{:?}", report.blockers);
     }
 }

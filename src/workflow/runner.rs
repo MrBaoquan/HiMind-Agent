@@ -178,6 +178,10 @@ impl WorkflowRunner {
         parent_run_id: &str,
     ) -> Result<LocalRun, Box<dyn Error>> {
         package.validate().map_err(std::io::Error::other)?;
+        // 无论从界面、定时计划还是命令行走进来，都先补齐启动表单声明的默认值，
+        // 运行计划、上下文和步骤输入看到的是同一份输入。
+        let merged_input = super::with_launch_defaults(package, input);
+        let input = &merged_input;
         let now = timestamp();
         let execution_plan = Self::build_execution_plan(package, input)?;
         let completion_mode = execution_plan.completion_mode();
@@ -484,6 +488,8 @@ impl WorkflowRunner {
         loop_context: Option<&Value>,
     ) -> Result<WorkflowRunOutcome, Box<dyn Error>> {
         package.validate().map_err(std::io::Error::other)?;
+        let merged_workflow_input = super::with_launch_defaults(package, workflow_input);
+        let workflow_input = &merged_workflow_input;
         if run.status.is_terminal() {
             return Ok(outcome(run, String::new(), Vec::new()));
         }
@@ -2039,14 +2045,8 @@ fn execution_input_from_context(
     if let Some(candidate) = candidate.as_ref() {
         input.insert("candidate".to_string(), candidate.clone());
     }
-    if step.candidate_action == "freeze" {
-        if let Some(policy) = package.candidate.as_ref() {
-            input.insert(
-                "candidate_artifact_id".to_string(),
-                Value::String(policy.artifact_id.clone()),
-            );
-            input.insert("allow_dirty".to_string(), Value::Bool(policy.allow_dirty));
-        }
+    for (name, value) in super::executor::candidate_freeze_inputs(package, step) {
+        input.insert(name.to_string(), value);
     }
     input.insert("workflow_context".to_string(), workflow_context);
     Ok(Value::Object(input))
@@ -2234,8 +2234,10 @@ mod tests {
             schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.runner-test".to_string(),
             version: "1.0.0".to_string(),
+            distribution_targets: Vec::new(),
             name: "Runner test".to_string(),
             description: String::new(),
+            release_notes: String::new(),
             min_agent_version: "0.3.47".to_string(),
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),
@@ -2357,7 +2359,12 @@ mod tests {
         // The workflow declares the middle step as an optional enhancement.
         workflow.steps[1].on_failure = "continue".to_string();
         let run = runner
-            .start("agent-1", &workflow, "degrade-request", &serde_json::json!({}))
+            .start(
+                "agent-1",
+                &workflow,
+                "degrade-request",
+                &serde_json::json!({}),
+            )
             .unwrap();
         let executor = DegradeExecutor {
             seen: RefCell::new(Vec::new()),

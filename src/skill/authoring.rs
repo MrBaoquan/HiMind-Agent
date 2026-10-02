@@ -132,8 +132,9 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
         validate_relative_package_path(path)?;
         if matches!(
             path.as_str(),
-            "skill.json" | "SKILL.md" | "checksums.sha256" | ".himind-render.json"
-        ) {
+            "skill.json" | "SKILL.md" | ".himind-render.json"
+        ) || crate::app::local_package::is_checksums_file(path)
+        {
             return Err(format!("Skill 附加文件使用了保留路径: {path}").into());
         }
         contents.push(path.clone());
@@ -811,8 +812,14 @@ pub(crate) fn submit(
 ) -> Result<AuthoringDraft, Box<dyn Error>> {
     let draft = read(skill_id, version)?;
     ensure_ready_to_submit(&draft)?;
+    // 分发目标门禁：只有把工件交给组织工作台的项目才允许提审。
+    crate::extension_projects::ensure_distribution_target(
+        crate::extension_projects::ExtensionProjectKind::Skill,
+        skill_id,
+        crate::extension_contracts::DistributionTarget::Workbench,
+    )?;
     if agent_id.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let access = crate::api::oauth::platform_access_token(
         options,
@@ -836,7 +843,7 @@ pub(crate) fn submit(
     )?;
     let submitted = crate::api::distribution::submit_skill(
         &client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &access.token,
         &draft.candidate_path,
@@ -852,7 +859,14 @@ pub(crate) fn submit(
 }
 
 pub(crate) fn ensure_ready_to_submit(draft: &AuthoringDraft) -> Result<(), Box<dyn Error>> {
-    ensure_candidate_unchanged(draft)
+    ensure_candidate_unchanged(draft)?;
+    if draft.tested_at.is_none() {
+        return Err("Skill 候选包尚未完成测试".into());
+    }
+    if draft.confirmed_at.is_none() {
+        return Err("Skill Candidate 尚未确认".into());
+    }
+    Ok(())
 }
 
 fn plugin_dependency_issues(dependencies: &[SkillPluginDependency]) -> Vec<String> {

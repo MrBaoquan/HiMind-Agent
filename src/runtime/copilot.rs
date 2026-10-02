@@ -55,7 +55,7 @@ fn execute_claimed(
     let invocation = build_invocation(executable, version, claim)?;
     update_agent_run_status(
         client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &claim.run.id,
         &claim.claim_token,

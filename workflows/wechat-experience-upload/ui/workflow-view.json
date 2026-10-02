@@ -1,0 +1,121 @@
+{
+  "schema_version": "workflow_view.v1",
+  "title": "微信小程序体验版上传",
+  "sections": [
+    {
+      "id": "target",
+      "title": "上传目标",
+      "fields": [
+        {
+          "id": "venue",
+          "label": "展馆",
+          "type": "select",
+          "required": true,
+          "default": "hdcybwg",
+          "hint": "默认邯郸成语博物馆，按需切换。",
+          "options": [
+            { "value": "fdkjg", "label": "肥东科技馆" },
+            { "value": "szsng", "label": "深圳少年宫" },
+            { "value": "zzkjg", "label": "漳州科技馆" },
+            { "value": "yjhlq", "label": "伊金霍洛旗" },
+            { "value": "szkjg", "label": "随州科技馆" },
+            { "value": "sxkjg", "label": "濉溪科技馆" },
+            { "value": "qzkjg", "label": "衢州科技馆" },
+            { "value": "hzkjg", "label": "贺州科技馆" },
+            { "value": "gskjg", "label": "固始科技馆" },
+            { "value": "jykjg", "label": "江阴科技馆" },
+            { "value": "hdcybwg", "label": "邯郸成语博物馆" },
+            { "value": "sdjywhg", "label": "四大家鱼文化馆" },
+            { "value": "sanxia", "label": "三峡" }
+          ]
+        },
+        {
+          "id": "environment",
+          "label": "服务器环境",
+          "type": "select",
+          "required": true,
+          "default": "development",
+          "hint": "默认开发环境。",
+          "options": [
+            { "value": "development", "label": "开发环境" },
+            { "value": "production", "label": "生产环境" }
+          ]
+        },
+        {
+          "id": "version",
+          "label": "体验版版本号",
+          "type": "text",
+          "placeholder": "留空按日期生成，如 1.26.0929",
+          "hint": "留空即按日期自动生成。"
+        },
+        {
+          "id": "description",
+          "label": "版本说明",
+          "type": "text",
+          "placeholder": "留空自动填「版本号 + 上传时间」"
+        }
+      ]
+    },
+    {
+      "id": "advanced",
+      "title": "高级",
+      "fields": [
+        {
+          "id": "workspace_root",
+          "label": "工作区目录",
+          "type": "text",
+          "default": "F:\\WebProjects\\kerun_user",
+          "placeholder": "例如 F:\\WebProjects\\kerun_user",
+          "hint": "默认指向展馆预约小程序仓库，换仓库时改这里。",
+          "picker": "directory"
+        },
+        {
+          "id": "source_root",
+          "label": "源码根目录",
+          "type": "text",
+          "placeholder": "留空等于工作区目录",
+          "hint": "构建脚本在这个目录执行，通常不用填。",
+          "picker": "directory"
+        },
+        {
+          "id": "project_root",
+          "label": "小程序产物目录",
+          "type": "text",
+          "placeholder": "留空自动使用 源码根目录\\dist\\wx",
+          "hint": "上传需要它包含 project.config.json，通常不用填。",
+          "picker": "directory"
+        },
+        {
+          "id": "upload_channel",
+          "label": "上传通道",
+          "type": "select",
+          "default": "auto",
+          "hint": "默认自动：本机能读到上传私钥就走 CI 直传（全程无人值守），读不到才用开发者工具（需在工具窗口点一次确认）。",
+          "options": [
+            { "value": "auto", "label": "自动（推荐）" },
+            { "value": "wechatide", "label": "微信开发者工具" },
+            { "value": "ci", "label": "CI 上传（需私钥）" }
+          ]
+        },
+        {
+          "id": "wechatide_client",
+          "label": "wechatide Client",
+          "type": "text",
+          "default": "Copilot",
+          "placeholder": "须与微信开发者工具授权弹窗中的 clientName 一致"
+        },
+        {
+          "id": "credential_handles",
+          "label": "CI 上传私钥",
+          "type": "credential",
+          "target": "private_key_path",
+          "default": "wechat-upload-private-key"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    "build",
+    "upload"
+  ]
+}

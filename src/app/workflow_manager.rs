@@ -14,6 +14,18 @@ const MAX_WORKFLOW_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_WORKFLOW_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_WORKFLOW_ARCHIVE_ENTRIES: usize = 100_000;
 
+/// 远端取用（GitHub Release 扩展源、工作台分发）安装时是否再要求包内 `manifest.sig`。
+///
+/// 远端链路在下载阶段就完成了一次更强的认证：`download_public` / `download_dashboard`
+/// 先按发布记录校验大小与 SHA-256，再用发布清单的 `signature` / `signature_key_id` /
+/// `rsa-pss-sha256` 对整份 `.hmwf` 验签。发布清单签名覆盖整个制品，强于只覆盖
+/// `checksums.sha256` 的包内签名，所以远端安装不再重复要求包内签名——与插件、技能
+/// 「只信任发布清单签名」的策略一致。
+///
+/// 包内签名仍是本地目录安装与 `workflow install-archive --require-signature`
+/// 的唯一信任根；契约见 docs/workflow-package-contract-v1.md 第 9 节。
+const REMOTE_REQUIRE_PACKAGE_SIGNATURE: bool = false;
+
 pub(crate) fn install_local_catalog_item(
     item: &WorkflowCatalogItem,
     require_signature: bool,
@@ -34,12 +46,14 @@ pub(crate) fn install_public_catalog_item(
         .timeout(std::time::Duration::from_secs(180))
         .user_agent("HiMind-Agent")
         .build()?;
+    // 这里的 require_signature 约束的是发布清单签名，已在上一步完成；解包后不再
+    // 要求包内 manifest.sig，见 REMOTE_REQUIRE_PACKAGE_SIGNATURE。
     let archive = download_public(&client, item, require_signature)?;
     let staging = std::env::temp_dir().join(format!("himind-public-workflow-{}", unique_suffix()));
     let result = (|| {
         extract_archive(&archive, &staging)?;
         let root = package_root(&staging)?;
-        install_from_directory(item, &root, require_signature)
+        install_from_directory(item, &root, REMOTE_REQUIRE_PACKAGE_SIGNATURE)
     })();
     let _ = fs::remove_file(archive);
     let _ = fs::remove_dir_all(staging);
@@ -66,7 +80,8 @@ pub(crate) fn install_dashboard_catalog_item(
         extract_archive(&archive, &staging)?;
         let root = package_root(&staging)?;
         let lock = catalog_lock(item)?.ok_or("组织 Workflow 缺少依赖锁 extension_lock")?;
-        install_from_directory_with_lock(item, &root, true, Some(lock))
+        // 工作台分发同样在 download_dashboard 里按发布清单签名认证过整份制品。
+        install_from_directory_with_lock(item, &root, REMOTE_REQUIRE_PACKAGE_SIGNATURE, Some(lock))
     })();
     let _ = fs::remove_file(archive);
     let _ = fs::remove_dir_all(staging);
@@ -96,7 +111,7 @@ pub(crate) fn install_dashboard_catalog_workflow_bound(
     let item = if let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) {
         crate::api::distribution::workflow_versions(
             &client,
-            &options.api_base,
+            &options.api_base(),
             &state.agent_id,
             &state.credential,
             workflow_id,
@@ -107,7 +122,7 @@ pub(crate) fn install_dashboard_catalog_workflow_bound(
     } else {
         crate::api::distribution::workflow_catalog(
             &client,
-            &options.api_base,
+            &options.api_base(),
             &state.agent_id,
             &state.credential,
         )?
@@ -144,16 +159,33 @@ pub(crate) fn install_dashboard_catalog_workflow_bound(
 fn install_from_directory(
     item: &WorkflowCatalogItem,
     root: &Path,
-    require_signature: bool,
+    require_package_signature: bool,
 ) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
     let lock = catalog_lock(item)?;
-    install_from_directory_with_lock(item, root, require_signature, lock)
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    install_into_store(&store, item, root, require_package_signature, lock)
 }
 
 fn install_from_directory_with_lock(
     item: &WorkflowCatalogItem,
     root: &Path,
-    require_signature: bool,
+    require_package_signature: bool,
+    lock: Option<ExtensionLock>,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    install_into_store(&store, item, root, require_package_signature, lock)
+}
+
+/// 把已经解包好的 Workflow 目录装进给定仓库。
+///
+/// `require_package_signature` 只决定包内 `manifest.sig` 是否为必需：远端取用传
+/// [`REMOTE_REQUIRE_PACKAGE_SIGNATURE`]，本地目录与显式 `--require-signature`
+/// 安装传调用方给出的策略。仓库由调用方传入，测试才能不依赖 `HIMIND_AGENT_HOME`。
+fn install_into_store(
+    store: &crate::workflow::WorkflowStore,
+    item: &WorkflowCatalogItem,
+    root: &Path,
+    require_package_signature: bool,
     lock: Option<ExtensionLock>,
 ) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
     let package = crate::workflow::load_from_directory(root)?;
@@ -162,9 +194,9 @@ fn install_from_directory_with_lock(
     }
     ensure_agent_version_supported(&package.min_agent_version)?;
     let lock_required = lock.is_some();
-    crate::workflow::WorkflowStore::open_default()?.install_from_directory_with_metadata(
+    store.install_from_directory_with_metadata(
         root,
-        require_signature,
+        require_package_signature,
         &item.sha256,
         lock,
         lock_required,
@@ -352,7 +384,7 @@ fn download_dashboard(
     if item.file_size == 0 || item.file_size > MAX_WORKFLOW_ARCHIVE_BYTES {
         return Err("Workflow 制品大小无效或超过 256 MiB 限制".into());
     }
-    let api = url::Url::parse(&options.api_base)?;
+    let api = url::Url::parse(&options.api_base())?;
     let url = url::Url::parse(&item.download_url)?;
     if api.scheme() != url.scheme()
         || api.host_str() != url.host_str()
@@ -592,6 +624,91 @@ mod tests {
         assert!(error.to_string().contains("HTTPS"));
     }
 
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// 按安装期口径写一份 `checksums.sha256`：只覆盖内容文件，不含打包元数据。
+    fn write_checksums(root: &Path) {
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+            let at_root = relative
+                .parent()
+                .map(|parent| parent.as_os_str().is_empty())
+                .unwrap_or(true);
+            let name = relative.file_name().and_then(|name| name.to_str());
+            if at_root && matches!(name, Some("checksums.sha256") | Some("manifest.sig")) {
+                continue;
+            }
+            files.push(relative);
+        }
+        files.sort();
+        let mut content = String::new();
+        for relative in files {
+            let hash = sha256_file(&root.join(&relative)).unwrap();
+            content.push_str(&format!(
+                "{hash}  {}\n",
+                relative.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        fs::write(root.join("checksums.sha256"), content).unwrap();
+    }
+
+    // 远端链路（GitHub Release 扩展源、工作台分发）在下载阶段已按发布清单签名认证整份
+    // 制品，因此不再重复要求包内 manifest.sig；本地目录安装的签名要求保持不变。
+    #[test]
+    fn remote_install_accepts_package_without_manifest_signature() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let package = crate::workflow::load_from_directory(&fixture).unwrap();
+        let staging =
+            std::env::temp_dir().join(format!("himind-remote-signature-test-{}", unique_suffix()));
+        let package_root = staging.join("package");
+        copy_dir(&fixture, &package_root);
+        write_checksums(&package_root);
+        assert!(!package_root.join("manifest.sig").is_file());
+
+        let mut catalog_item = item("https://github.com/example/repo/releases/download/x/y.hmwf");
+        catalog_item.workflow_id = package.id.clone();
+        catalog_item.version = package.version.clone();
+
+        let remote_store = crate::workflow::WorkflowStore::new(staging.join("store-remote"));
+        let installed = install_into_store(
+            &remote_store,
+            &catalog_item,
+            &package_root,
+            REMOTE_REQUIRE_PACKAGE_SIGNATURE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(installed.package.id, package.id);
+        assert_eq!(installed.package.version, package.version);
+
+        let strict_store = crate::workflow::WorkflowStore::new(staging.join("store-strict"));
+        let error = install_into_store(&strict_store, &catalog_item, &package_root, true, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("manifest.sig"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_dir_all(staging);
+    }
+
     #[test]
     fn extracts_workflow_archive_and_accepts_single_wrapper_directory() {
         let archive = archive(&[(
@@ -623,7 +740,7 @@ mod tests {
     #[test]
     fn local_archive_accepts_matching_companion_extension_lock() {
         let package_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-miniprogram-delivery");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
         let package = crate::workflow::load_from_directory(&package_root).unwrap();
         let archive_path = std::env::temp_dir().join(format!(
             "himind-workflow-lock-match-{}.hmwf",
@@ -657,7 +774,7 @@ mod tests {
     #[test]
     fn local_archive_rejects_companion_lock_for_different_artifact() {
         let package_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-miniprogram-delivery");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
         let package = crate::workflow::load_from_directory(&package_root).unwrap();
         let archive_path = std::env::temp_dir().join(format!(
             "himind-workflow-lock-mismatch-{}.hmwf",
@@ -732,7 +849,7 @@ mod tests {
         let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
         std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &trusted_root);
         let mut options = crate::Options::from_env();
-        options.api_base = format!("http://{address}");
+        options.set_api_base(&format!("http://{address}"));
         options.set_agent_credential("test-credential");
         let item = WorkflowCatalogItem {
             file_size: payload.len() as u64,

@@ -131,10 +131,20 @@ pub(crate) struct SkillDeployment {
     pub(crate) workspace_id: Option<String>,
     pub(crate) rendered_root: String,
     pub(crate) updated_at: String,
-    #[serde(default = "default_management_mode")]
-    pub(crate) management_mode: String,
+    /// 归属：`managed` 表示这份副本由 HiMind 渲染并持有，删除时只动
+    /// [`Self::managed_keys`]；`native` 表示目录归仓库或客户端自己所有。
+    /// 兼容字段名 `management_mode`，旧台账仍可直接读取。
+    #[serde(default = "default_management_mode", alias = "management_mode")]
+    pub(crate) ownership: String,
     #[serde(default)]
     pub(crate) source: String,
+    /// 实际落盘策略：`copy` / `symlink`。计划面与台账用同一个值，
+    /// 避免"界面上说复制、实际做了软链接"这种无法追溯的状态。
+    #[serde(default)]
+    pub(crate) strategy: String,
+    /// 渲染时写入的受管条目（相对 [`Self::rendered_root`]）。
+    #[serde(default)]
+    pub(crate) managed_keys: Vec<String>,
     #[serde(default)]
     pub(crate) content_sha256: String,
 }
@@ -172,6 +182,58 @@ impl SkillTarget {
     pub(crate) fn is_workspace(&self) -> bool {
         self.target_kind == TARGET_KIND_WORKSPACE
     }
+
+    /// 由适配器配置推导出的可信根。
+    ///
+    /// 这是路径安全的核心不变量：删除、覆盖、改名都必须用这里的根做包含性校验，
+    /// 不能信任台账（`skill-deployments.json`）、项目锁（`.himind/skills.lock.json`）
+    /// 或渲染收据里记录的路径字符串 —— 它们都可能出现在仓库里并被他人改写。
+    ///
+    /// 根的选取刻意贴着"谁选了它"：工作区目标回到工作区根，主目录目标回到主目录，
+    /// 只有用户显式指定的目录（环境变量）才以目录自身为根。
+    pub(crate) fn trusted_root(&self) -> Result<crate::path_guard::TrustedRoot, Box<dyn Error>> {
+        let base = if self.is_workspace() {
+            self.workspace_root
+                .clone()
+                .ok_or("工作区目标缺少工作区根，拒绝执行文件操作")?
+        } else if self.source.starts_with("userprofile:") {
+            user_home_root()?
+        } else {
+            self.root.clone()
+        };
+        crate::path_guard::TrustedRoot::nearest_existing(&base)
+    }
+
+    /// 校验并递归删除目标目录，目标必须落在适配器推导出的可信根内。
+    pub(crate) fn remove_tree_guarded(
+        &self,
+        candidate: &Path,
+        action: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        self.trusted_root()?.remove_tree(candidate, action)
+    }
+
+    /// 校验并移动目录，源和目标都必须落在同一个可信根内。
+    ///
+    /// 渲染的"先暂存、再换入、失败回滚"整条链路都走这里：只有确认暂存目录和备份
+    /// 目录都在客户端根目录里，才允许把已存在的渲染结果搬走。
+    pub(crate) fn rename_guarded(
+        &self,
+        from: &Path,
+        to: &Path,
+        action: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.trusted_root()?.rename_within(from, to, action)
+    }
+}
+
+/// 用户主目录。主目录下的客户端技能目录以主目录为可信根，这样
+/// `~/.claude` 被替换成指向别处的联接时会立刻暴露。
+fn user_home_root() -> Result<PathBuf, Box<dyn Error>> {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "无法确定用户主目录，拒绝执行文件操作".into())
 }
 
 /// Resolve an explicit workspace or the process-level opt-in used by CLI/MCP.
@@ -326,6 +388,34 @@ fn pinned_version_in(
         .map(|item| item.version.clone())
 }
 
+/// 工作区「固定版本」的一次性快照。
+///
+/// 计状态时逐个技能调 [`workspace_pinned_version`]，会把同一份
+/// `.himind/skills.lock.json` 与 `skill-deployments.json` 反复读盘解析
+/// （技能数 × 客户端数 次）。这里把它们读一次，同一个工作区下的全部技能
+/// 复用同一份结果。
+pub(crate) struct WorkspacePinSnapshot {
+    workspace_id: String,
+    lock: SkillWorkspaceLock,
+    deployments: Vec<SkillDeployment>,
+}
+
+impl WorkspacePinSnapshot {
+    pub(crate) fn load(workspace_root: &Path) -> Result<Self, Box<dyn Error>> {
+        let workspace_root = canonical_workspace_root(workspace_root)?;
+        Ok(Self {
+            workspace_id: workspace_id(&workspace_root),
+            lock: read_workspace_lock(&workspace_root)?,
+            deployments: read_deployments()?,
+        })
+    }
+
+    /// 与 [`workspace_pinned_version`] 同口径，只是不再重复读盘。
+    pub(crate) fn pinned_version(&self, skill_id: &str) -> Option<String> {
+        pinned_version_in(&self.lock, &self.deployments, &self.workspace_id, skill_id)
+    }
+}
+
 pub(crate) fn remove_workspace_skill(
     workspace_root: &Path,
     skill_id: &str,
@@ -463,40 +553,71 @@ fn record_allowed_in(
 /// deployment, or is assigned to the selected workspace.  Packages installed
 /// before deployment records existed remain globally visible for backwards
 /// compatibility.
-pub(crate) fn skill_visible_to_himind(
-    record: &crate::skill::types::SkillRecord,
-    workspace_root: Option<&Path>,
-) -> Result<bool, Box<dyn Error>> {
-    if matches!(
-        record.manifest.scope,
-        crate::skill::types::SkillScope::Builtin
-    ) {
-        return Ok(true);
+/// 「这个技能在 HiMind AI 侧可见吗」的一次性快照：部署台账与工作区锁各读一次。
+///
+/// 逐技能各自读一遍台账会把同一份文件重复解析 技能数 次（技能多时是秒级开销），
+/// 所以批量判定必须走这里，读完一次后只做内存判断。
+pub(crate) struct HimindVisibility {
+    deployments_by_skill: BTreeMap<String, Vec<SkillDeployment>>,
+    workspace_id: Option<String>,
+    workspace_lock: Option<SkillWorkspaceLock>,
+}
+
+impl HimindVisibility {
+    pub(crate) fn load(workspace_root: Option<&Path>) -> Result<Self, Box<dyn Error>> {
+        let mut deployments_by_skill: BTreeMap<String, Vec<SkillDeployment>> = BTreeMap::new();
+        for deployment in read_deployments()? {
+            deployments_by_skill
+                .entry(deployment.skill_id.clone())
+                .or_default()
+                .push(deployment);
+        }
+        let (workspace_id, workspace_lock) = match workspace_root {
+            Some(root) => {
+                let root = canonical_workspace_root(root)?;
+                let id = workspace_id(&root);
+                (Some(id), Some(read_workspace_lock(&root)?))
+            }
+            None => (None, None),
+        };
+        Ok(Self {
+            deployments_by_skill,
+            workspace_id,
+            workspace_lock,
+        })
     }
-    let deployments = deployments_for_skill(&record.manifest.id)?;
-    if deployments.is_empty() {
-        return Ok(true);
+
+    /// 单个技能的可见性判断，不重复读盘。
+    pub(crate) fn visible(&self, record: &crate::skill::types::SkillRecord) -> bool {
+        if matches!(
+            record.manifest.scope,
+            crate::skill::types::SkillScope::Builtin
+        ) {
+            return true;
+        }
+        let Some(deployments) = self.deployments_by_skill.get(&record.manifest.id) else {
+            return true;
+        };
+        if deployments.is_empty() {
+            return true;
+        }
+        if deployments
+            .iter()
+            .any(|item| item.target_kind == TARGET_KIND_GLOBAL)
+        {
+            return true;
+        }
+        let (Some(id), Some(lock)) = (self.workspace_id.as_deref(), self.workspace_lock.as_ref())
+        else {
+            return false;
+        };
+        if let Some(entry) = lock.skills.get(&record.manifest.id) {
+            return entry.enabled && entry.management == MANAGEMENT_MODE_MANAGED;
+        }
+        deployments.iter().any(|item| {
+            item.target_kind == TARGET_KIND_WORKSPACE && item.workspace_id.as_deref() == Some(id)
+        })
     }
-    if deployments
-        .iter()
-        .any(|item| item.target_kind == TARGET_KIND_GLOBAL)
-    {
-        return Ok(true);
-    }
-    let Some(workspace_root) = workspace_root else {
-        return Ok(false);
-    };
-    let workspace_root = canonical_workspace_root(workspace_root)?;
-    let id = workspace_id(&workspace_root);
-    if let Some(entry) = read_workspace_lock(&workspace_root)?
-        .skills
-        .get(&record.manifest.id)
-    {
-        return Ok(entry.enabled && entry.management == MANAGEMENT_MODE_MANAGED);
-    }
-    Ok(deployments.iter().any(|item| {
-        item.target_kind == TARGET_KIND_WORKSPACE && item.workspace_id.as_deref() == Some(&id)
-    }))
 }
 
 fn package_content_sha256(root: &Path) -> Result<String, Box<dyn Error>> {
@@ -612,10 +733,20 @@ pub(crate) fn record_deployment(
     skill_id: &str,
     version: &str,
     rendered_root: &Path,
+    strategy: &str,
+    managed_keys: &[String],
 ) -> Result<(), Box<dyn Error>> {
     #[cfg(test)]
     {
-        let _ = (target, client_id, skill_id, version, rendered_root);
+        let _ = (
+            target,
+            client_id,
+            skill_id,
+            version,
+            rendered_root,
+            strategy,
+            managed_keys,
+        );
         return Ok(());
     }
     #[cfg(not(test))]
@@ -627,6 +758,11 @@ pub(crate) fn record_deployment(
                 && item.target_kind == target.target_kind
                 && item.workspace_id == target.workspace_id)
         });
+        // 台账要能回答"这份副本是什么、谁写的、怎么写的、内容是什么"，否则
+        // 更新/卸载只能靠猜测，回滚也就无从谈起。
+        let mut managed_keys = managed_keys.to_vec();
+        managed_keys.sort();
+        managed_keys.dedup();
         deployments.push(SkillDeployment {
             skill_id: skill_id.to_string(),
             version: version.to_string(),
@@ -639,11 +775,79 @@ pub(crate) fn record_deployment(
             workspace_id: target.workspace_id.clone(),
             rendered_root: rendered_root.to_string_lossy().to_string(),
             updated_at: deployment_stamp(),
-            management_mode: MANAGEMENT_MODE_MANAGED.to_string(),
+            ownership: MANAGEMENT_MODE_MANAGED.to_string(),
             source: "himind-store".to_string(),
-            content_sha256: String::new(),
+            strategy: strategy.to_string(),
+            managed_keys,
+            content_sha256: package_content_sha256(rendered_root).unwrap_or_default(),
         });
         write_deployments(&deployments)
+    }
+}
+
+/// 清掉某个技能在指定目录下的全部台账记录。
+///
+/// 这里只动台账、不碰文件系统：目录真的还在时，删除走的是
+/// [`crate::skill::unregister_skill_clients_json`] 那条受可信根校验的链路；
+/// 目录已经不在时才来清台账。因此入参只做形状校验（技能 ID 字符集、目录必须是
+/// 绝对路径且不含上级引用），避免伪造/写坏的字符串把台账匹配到别的目录上。
+///
+/// 返回清理掉的记录数，供界面如实反馈。
+pub(crate) fn purge_deployments_at(
+    skill_id: &str,
+    location: &str,
+) -> Result<usize, Box<dyn Error>> {
+    #[cfg(test)]
+    {
+        let _ = (skill_id, location);
+        return Ok(0);
+    }
+    #[cfg(not(test))]
+    {
+        if skill_id.is_empty()
+            || !skill_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(format!("Skill ID 无效: {skill_id}").into());
+        }
+        let location_path = Path::new(location);
+        if location.trim().is_empty() || !location_path.is_absolute() {
+            return Err(format!("安装位置必须是绝对路径: {location}").into());
+        }
+        if location_path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(format!("安装位置不能包含上级目录引用: {location}").into());
+        }
+        let normalized = location
+            .trim()
+            .trim_start_matches("\\\\?\\")
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\");
+        let mut deployments = read_deployments()?;
+        let before = deployments.len();
+        deployments.retain(|item| {
+            let same_skill = item.skill_id == skill_id;
+            let same_location = item
+                .workspace_root
+                .as_deref()
+                .map(|root| {
+                    root.trim()
+                        .trim_start_matches("\\\\?\\")
+                        .trim_end_matches(['\\', '/'])
+                        .replace('/', "\\")
+                        == normalized
+                })
+                .unwrap_or(false);
+            !(same_skill && same_location)
+        });
+        let removed = before - deployments.len();
+        if removed > 0 {
+            write_deployments(&deployments)?;
+        }
+        Ok(removed)
     }
 }
 
@@ -701,6 +905,15 @@ pub(crate) fn other_deployments_for_skill(
             !(item.target_kind == target.target_kind && item.workspace_id == target.workspace_id)
         })
         .collect())
+}
+
+/// 全量部署台账。
+///
+/// 调用方要按技能分组时必须用它：逐技能调 [`deployments_for_skill`] 会把同一份
+/// 文件重复读盘解析 技能数 次，在"统计每个技能装到了哪些位置"这种场景里是被放大的
+/// 热区。需要单个技能时二者等价。
+pub(crate) fn all_deployments() -> Result<Vec<SkillDeployment>, Box<dyn Error>> {
+    read_deployments()
 }
 
 fn deployments_path() -> PathBuf {
@@ -804,7 +1017,7 @@ pub(crate) fn discover_project_skill_conflicts(root: &Path) -> Vec<SkillConflict
     directories.extend(
         crate::skill::clients::DIRECTORY_CLIENTS
             .iter()
-            .map(|client| root.join(client.project_dir)),
+            .filter_map(|client| client.skill_project_dir().map(|dir| root.join(dir))),
     );
     directories.sort();
     directories.dedup();
@@ -1210,8 +1423,10 @@ mod tests {
             workspace_id: Some(workspace_id.to_string()),
             rendered_root: format!("C:/workspaces/{workspace_id}/.agents/skills/{skill_id}"),
             updated_at: stamp.to_string(),
-            management_mode: MANAGEMENT_MODE_MANAGED.to_string(),
+            ownership: MANAGEMENT_MODE_MANAGED.to_string(),
             source: "himind-store".to_string(),
+            strategy: crate::skill::store::SKILL_SYNC_MODE_COPY.to_string(),
+            managed_keys: vec!["SKILL.md".to_string()],
             content_sha256: String::new(),
         }
     }
@@ -1225,5 +1440,50 @@ mod tests {
             "himind-skill-workspace-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    /// 升级前的台账只有 `management_mode`。用户机器上已经存在这些文件，
+    /// 读取必须继续可用；写入则统一用新的 operation 字段名。
+    #[test]
+    fn legacy_ledger_entries_stay_readable_after_the_operation_upgrade() {
+        let legacy = serde_json::json!({
+            "skill_id": "demo",
+            "version": "1.0.0",
+            "client_id": "codex",
+            "target_kind": TARGET_KIND_WORKSPACE,
+            "workspace_root": "C:/repo",
+            "workspace_id": "abc",
+            "rendered_root": "C:/repo/.agents/skills/demo",
+            "updated_at": "1",
+            "management_mode": MANAGEMENT_MODE_MANAGED,
+            "source": "himind-store",
+            "content_sha256": ""
+        });
+        let record: SkillDeployment = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.ownership, MANAGEMENT_MODE_MANAGED);
+        assert!(record.strategy.is_empty());
+        assert!(record.managed_keys.is_empty());
+
+        let written = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            written["ownership"],
+            serde_json::json!(MANAGEMENT_MODE_MANAGED)
+        );
+        assert!(written.get("management_mode").is_none());
+        assert_eq!(written["strategy"], serde_json::json!(""));
+        assert_eq!(written["managed_keys"], serde_json::json!([]));
+    }
+
+    /// 台账文件是"安装过什么、写到哪里、怎么写的、内容是什么"的唯一权威来源，
+    /// 因此这里连读写链路一起锁住，避免只测试结构体。
+    #[test]
+    fn operation_ledger_round_trips_through_the_deployment_file() {
+        let original = vec![deployment("demo", "1.2.0", "ws-1", "1700000000000")];
+        write_deployments(&original).unwrap();
+        let read = read_deployments().unwrap();
+        assert_eq!(read, original);
+        assert_eq!(read[0].strategy, crate::skill::store::SKILL_SYNC_MODE_COPY);
+        assert_eq!(read[0].managed_keys, vec!["SKILL.md".to_string()]);
+        let _ = std::fs::remove_file(deployments_path());
     }
 }

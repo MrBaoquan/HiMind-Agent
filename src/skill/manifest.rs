@@ -21,10 +21,9 @@ pub(crate) fn skill_readme_path(root: &Path) -> PathBuf {
 
 pub(crate) fn is_internal_package_file(path: &str) -> bool {
     let path = path.replace('\\', "/");
-    matches!(
-        path.as_str(),
-        "checksums.sha256" | ".himind" | ".himind-render.json"
-    ) || path.starts_with(".himind/")
+    crate::app::local_package::is_checksums_file(&path)
+        || matches!(path.as_str(), ".himind" | ".himind-render.json")
+        || path.starts_with(".himind/")
 }
 
 pub(crate) fn load_skill_manifest(root: &Path) -> Result<SkillManifest, Box<dyn Error>> {
@@ -242,7 +241,9 @@ fn load_standard_skill_manifest(root: &Path) -> Result<SkillManifest, Box<dyn Er
         .map(Ok)
         .unwrap_or_else(|| standard_package_content_version(root))?;
     let mut contents = collect_package_files(root)?;
-    contents.retain(|path| path != "checksums.sha256" && !path.starts_with(".himind/"));
+    contents.retain(|path| {
+        !crate::app::local_package::is_checksums_file(path) && !path.starts_with(".himind/")
+    });
     contents.push(".himind/manifest.json".to_string());
     contents.sort();
     contents.dedup();
@@ -335,7 +336,7 @@ fn flatten_single_wrapper(root: &Path) -> Result<Option<String>, Box<dyn Error>>
         if entry.file_type()?.is_dir() {
             directories.push(entry.path());
         } else if entry.file_type()?.is_file()
-            && entry.file_name().to_string_lossy() != "checksums.sha256"
+            && !crate::app::local_package::is_checksums_file(&entry.file_name().to_string_lossy())
         {
             files.push(entry.path());
         }
@@ -356,7 +357,9 @@ fn flatten_single_wrapper(root: &Path) -> Result<Option<String>, Box<dyn Error>>
     for entry in entries {
         let name = entry.file_name();
         let destination = root.join(&name);
-        if name.to_string_lossy() == "checksums.sha256" && destination.exists() {
+        if crate::app::local_package::is_checksums_file(&name.to_string_lossy())
+            && destination.exists()
+        {
             let _ = fs::remove_file(entry.path());
             continue;
         }
@@ -376,7 +379,7 @@ fn flatten_single_wrapper(root: &Path) -> Result<Option<String>, Box<dyn Error>>
 fn write_package_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     let mut rows = Vec::new();
     for relative in collect_package_files(root)? {
-        if relative == "checksums.sha256" {
+        if crate::app::local_package::is_checksums_file(&relative) {
             continue;
         }
         let digest = Sha256::digest(fs::read(root.join(&relative))?);
@@ -413,7 +416,7 @@ pub(crate) fn parse_checksums(content: &str) -> Result<HashMap<String, String>, 
             return Err(format!("checksums.sha256 第 {} 行摘要无效", index + 1).into());
         }
         validate_relative_package_path(relative)?;
-        if relative == "checksums.sha256"
+        if crate::app::local_package::is_checksums_file(relative)
             || expected
                 .insert(relative.replace('\\', "/"), checksum.to_ascii_lowercase())
                 .is_some()
@@ -454,6 +457,7 @@ fn validate_client_id(value: &str) -> Result<(), Box<dyn Error>> {
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        || !crate::path_guard::is_safe_dir_name(value.trim())
     {
         return Err(format!("invalid client id: {value}").into());
     }
@@ -468,6 +472,9 @@ fn validate_skill_version(value: &str) -> Result<(), Box<dyn Error>> {
     if !trimmed
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        // 版本号会被拼成 `versions/<版本>`，光看字符集挡不住 `..`（点号在字符集里），
+        // 它会把这个技能的版本目录挪到 skill 根目录甚至上一级。
+        || !crate::path_guard::is_safe_dir_name(trimmed)
     {
         return Err(format!("invalid version: {value}").into());
     }

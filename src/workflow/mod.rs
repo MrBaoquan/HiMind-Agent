@@ -1,10 +1,12 @@
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+use crate::extension_contracts::DistributionTarget;
 
 mod authoring;
 mod candidate;
@@ -31,10 +33,6 @@ pub(crate) use authoring::{
 #[allow(unused_imports)]
 pub(crate) use candidate::{freeze_candidate, read_candidate};
 #[allow(unused_imports)]
-pub(crate) use presets::{
-    delete as delete_run_preset, list as list_run_presets, set as set_run_preset,
-};
-#[allow(unused_imports)]
 pub(crate) use condition::evaluate_condition;
 #[allow(unused_imports)]
 pub(crate) use connector::{
@@ -52,6 +50,12 @@ pub(crate) use preflight::{
     WorkflowCapabilityPreflight, WorkflowConnectorCredentialPreflight, WorkflowConnectorPreflight,
     WorkflowConnectorProbe, WorkflowDiagnostic, WorkflowPreflight, WorkflowRuntimePreflight,
     WorkflowSkillPreflight, WorkflowToolPreflight,
+};
+#[allow(unused_imports)]
+pub(crate) use presets::{
+    delete as delete_run_preset, find as find_run_preset, list as list_run_presets,
+    load as load_run_presets, merge_override as merge_run_preset_input, set as set_run_preset,
+    WorkflowRunPreset,
 };
 #[allow(unused_imports)]
 pub(crate) use runner::{
@@ -73,9 +77,21 @@ pub(crate) struct WorkflowPackage {
     pub schema_version: String,
     pub id: String,
     pub version: String,
+    /// 作者声明的分发落点（`workbench` / `github`）。
+    ///
+    /// 属于发布元数据，运行期不参与执行：Agent 读它来判断这个制品允许发到哪里。
+    /// 声明即硬约束，本机设置只能在声明范围内收窄，不能扩权。
+    #[serde(default)]
+    pub distribution_targets: Vec<DistributionTarget>,
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// 本版本更新说明，用于市场与更新日志展示。
+    ///
+    /// 与 `distribution_targets` 一样属于发布元数据，运行期不参与执行：Agent 在
+    /// 发布拓展时把它写进发布清单，市场据此渲染版本更新说明。
+    #[serde(default)]
+    pub release_notes: String,
     pub min_agent_version: String,
     #[serde(default = "default_object")]
     pub local_requirements: Value,
@@ -117,13 +133,113 @@ pub(crate) struct WorkflowPackage {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowDependencies {
     #[serde(default)]
-    pub skills: Vec<String>,
+    pub skills: Vec<WorkflowDependencyRef>,
     #[serde(default)]
-    pub plugins: Vec<String>,
+    pub plugins: Vec<WorkflowDependencyRef>,
     #[serde(default)]
     pub connectors: Vec<String>,
     #[serde(default)]
     pub runtimes: Vec<String>,
+}
+
+/// 工作流依赖里的一条声明。
+///
+/// 字符串写法表示「本分发内的必需依赖」；对象写法可以补 `required` 与
+/// `min_version`，用于跨分发依赖（依赖由别的分发发布，这里解析不到确定制品）
+/// 或需要声明版本下限的场景。只声明 ID 的依赖序列化回字符串，简单声明不被
+/// 扩写成对象，源码清单保持可读。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowDependencyRef {
+    pub id: String,
+    pub required: bool,
+    pub min_version: String,
+}
+
+impl WorkflowDependencyRef {
+    pub(crate) fn required(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into().trim().to_string(),
+            required: true,
+            min_version: String::new(),
+        }
+    }
+
+    /// 运行期只关心「这条依赖的 ID」时用这个取值，避免到处写 `.id`。
+    pub(crate) fn id(&self) -> &str {
+        self.id.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowDependencyRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(id) => {
+                let id = id.trim();
+                if id.is_empty() {
+                    return Err(serde::de::Error::custom("workflow dependency id is empty"));
+                }
+                Ok(Self::required(id))
+            }
+            Value::Object(map) => {
+                let text = |key: &str| {
+                    map.get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let id = ["plugin_id", "skill_id", "id"]
+                    .into_iter()
+                    .map(text)
+                    .find(|candidate| !candidate.is_empty())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("workflow dependency object needs an id")
+                    })?;
+                let required = match map.get("required") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Bool(flag)) => *flag,
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(format!(
+                            "workflow dependency {id} required must be a boolean"
+                        )))
+                    }
+                };
+                Ok(Self {
+                    id,
+                    required,
+                    min_version: text("min_version"),
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "workflow dependency must be a string id or an object",
+            )),
+        }
+    }
+}
+
+impl Serialize for WorkflowDependencyRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.required && self.min_version.trim().is_empty() {
+            return serializer.serialize_str(self.id.trim());
+        }
+        let mut object = serde_json::Map::new();
+        object.insert("id".to_string(), Value::String(self.id.trim().to_string()));
+        object.insert("required".to_string(), Value::Bool(self.required));
+        if !self.min_version.trim().is_empty() {
+            object.insert(
+                "min_version".to_string(),
+                Value::String(self.min_version.trim().to_string()),
+            );
+        }
+        Value::Object(object).serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,8 +302,13 @@ pub(crate) struct WorkflowRuntimeStep {
     pub workspace_path: String,
     #[serde(default)]
     pub result_schema: String,
+    /// 网络约束：`null`（未声明）表示不额外要求，`true` 表示允许联网，
+    /// `false` 表示要求 Runtime 提供可证明的网络隔离。
+    ///
+    /// 只有显式 `false` 才会在预检里要求 `network_isolated=true` 的 Runtime；
+    /// 不声明不会把「无法证明隔离」变成拒绝服务。
     #[serde(default)]
-    pub allow_network: bool,
+    pub allow_network: Option<bool>,
     /// 该步骤需要的上游 Artifact（按 package 里声明的 id）。
     ///
     /// 平台把 Artifact 以**文件路径**注入 `input.input_artifacts`，并把上游步骤输出
@@ -295,6 +416,32 @@ enum WorkflowViewField {
     Definition(WorkflowViewFieldDefinition),
 }
 
+/// 下拉/列表字段的可选值。
+///
+/// 只写字符串时值与显示文本相同（老包继续可用）；写成 `{ value, label }`
+/// 时提交给能力的是 `value`，用户看到的是 `label`——展馆这种
+/// 「机器标识是 szkjg、人话是随州科技馆」的取值就靠它区分，
+/// 否则界面只能把机器标识直接怼给用户。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum WorkflowViewOption {
+    Value(String),
+    Labeled {
+        value: String,
+        #[serde(default)]
+        label: String,
+    },
+}
+
+impl WorkflowViewOption {
+    fn value(&self) -> &str {
+        match self {
+            WorkflowViewOption::Value(value) => value.as_str(),
+            WorkflowViewOption::Labeled { value, .. } => value.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowViewFieldDefinition {
@@ -308,7 +455,7 @@ struct WorkflowViewFieldDefinition {
     #[serde(default)]
     default: Value,
     #[serde(default)]
-    options: Vec<String>,
+    options: Vec<WorkflowViewOption>,
     #[serde(default)]
     placeholder: String,
     #[serde(default)]
@@ -344,6 +491,14 @@ impl WorkflowPackage {
         validate_unique_text("capability", &self.capabilities)?;
         validate_unique_text("optional provider", &self.optional_providers)?;
         validate_unique_text("supported runtime", &self.supported_runtimes)?;
+        validate_dependency_refs("skill", &self.dependencies.skills)?;
+        validate_dependency_refs("plugin", &self.dependencies.plugins)?;
+        let declared_targets = self
+            .distribution_targets
+            .iter()
+            .map(|target| target.as_str().to_string())
+            .collect::<Vec<_>>();
+        validate_unique_text("distribution target", &declared_targets)?;
 
         if let Some(candidate) = self.candidate.as_ref() {
             validate_workflow_id(&candidate.artifact_id)?;
@@ -451,6 +606,95 @@ pub(crate) fn package_dir(root: &Path, package_id: &str) -> Result<PathBuf, Box<
     Ok(root.join(package_id))
 }
 
+/// 启动表单声明的一个字段。
+///
+/// `guaranteed` 表示这次启动一定会带上该字段：要么表单必填，要么有默认值。
+/// 预检查据此区分「Workflow 忘了声明参数」和「参数由启动表单提供」，
+/// 避免把表单字段误判成缺失的能力入参。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WorkflowLaunchField {
+    pub id: String,
+    /// credential 之类的字段在运行期由 connector 解析后注入到 `target` 名下，
+    /// 因此「启动时一定有值」的属性名既可能是 id，也可能是 target。
+    pub target: String,
+    pub guaranteed: bool,
+    /// 表单默认值：预检按它推导「用户不改任何字段时这一步会不会执行」。
+    pub default: Value,
+    /// 凭据字段默认值是「句柄名」而不是明文，必须按 `id: { target: handle }` 的
+    /// 结构并入输入，和界面上提交凭据的方式保持一致。
+    pub credential: bool,
+}
+
+/// 读取声明式启动表单的字段清单；没有表单或表单不可读时返回空集。
+pub(crate) fn launch_form_fields(package: &WorkflowPackage) -> Vec<WorkflowLaunchField> {
+    let entry = package.ui.entry.trim();
+    if entry.is_empty() {
+        return Vec::new();
+    }
+    let Ok(bytes) = fs::read(package.source_root.join(entry)) else {
+        return Vec::new();
+    };
+    let Ok(view) = serde_json::from_slice::<WorkflowViewManifest>(&bytes) else {
+        return Vec::new();
+    };
+    view.sections
+        .iter()
+        .flat_map(|section| section.fields.iter())
+        .map(|field| match field {
+            WorkflowViewField::Id(id) => WorkflowLaunchField {
+                id: id.clone(),
+                target: String::new(),
+                guaranteed: false,
+                default: Value::Null,
+                credential: false,
+            },
+            WorkflowViewField::Definition(definition) => WorkflowLaunchField {
+                guaranteed: definition.required || !definition.default.is_null(),
+                id: definition.id.clone(),
+                target: definition.target.clone(),
+                default: definition.default.clone(),
+                credential: definition.field_type == "credential",
+            },
+        })
+        .collect()
+}
+
+/// 把声明式启动表单里的默认值补进运行输入。
+///
+/// 启动表单的默认值此前只服务于界面预填：从定时计划、命令行走同一条工作流时，
+/// 用户不填就会退回能力自身的兜底，容易在运行中途才暴露缺参。
+/// 这里统一在运行入口补齐缺失字段，让「不填也能按默认值跑」成为所有入口的一致行为。
+/// 只填补缺失或显式 `null` 的键，用户主动填的空串（例如「版本号留空按日期生成」）不会被覆盖。
+pub(crate) fn with_launch_defaults(package: &WorkflowPackage, input: &Value) -> Value {
+    let mut merged = match input {
+        Value::Object(object) => object.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for field in launch_form_fields(package) {
+        if field.default.is_null() {
+            continue;
+        }
+        // 已显式给值的字段保持用户输入，只补缺失或显式 null 的键。
+        if merged.get(&field.id).is_some_and(|value| !value.is_null()) {
+            continue;
+        }
+        if field.credential {
+            // 凭据以句柄结构提交，明文和句柄不能混在同一个键上。
+            let target = if field.target.trim().is_empty() {
+                "value"
+            } else {
+                field.target.trim()
+            };
+            let mut handle = serde_json::Map::new();
+            handle.insert(target.to_string(), field.default.clone());
+            merged.insert(field.id.clone(), Value::Object(handle));
+        } else {
+            merged.insert(field.id.clone(), field.default.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
 fn validate_workflow_id(value: &str) -> Result<(), String> {
     if value.trim().is_empty()
         || value.len() > 200
@@ -469,6 +713,28 @@ fn default_object() -> Value {
 
 fn default_true() -> bool {
     true
+}
+
+/// 校验一条工作流依赖声明：ID 非空且不重复、最低版本是规范版本号。
+fn validate_dependency_refs(kind: &str, refs: &[WorkflowDependencyRef]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for item in refs {
+        let id = item.id();
+        if id.is_empty() {
+            return Err(format!("workflow {kind} dependency must declare an id"));
+        }
+        validate_workflow_id(id)?;
+        if !seen.insert(id.to_string()) {
+            return Err(format!("duplicate workflow {kind} dependency: {id}"));
+        }
+        let min_version = item.min_version.trim();
+        if !min_version.is_empty() {
+            Version::parse(min_version).map_err(|error| {
+                format!("invalid workflow {kind} dependency min_version: {error}")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn default_git_source() -> String {
@@ -512,8 +778,16 @@ fn validate_execution_contract(
     validate_endpoint_scope("exit", &package.exits, step_ids)?;
     // 默认入口/出口必须指向真实声明的端点，否则等于给调用方埋了一个必失败路径。
     for (label, value, endpoints) in [
-        ("default_entrypoint", package.default_entrypoint.trim(), &package.entrypoints),
-        ("default_exitpoint", package.default_exitpoint.trim(), &package.exits),
+        (
+            "default_entrypoint",
+            package.default_entrypoint.trim(),
+            &package.entrypoints,
+        ),
+        (
+            "default_exitpoint",
+            package.default_exitpoint.trim(),
+            &package.exits,
+        ),
     ] {
         if value.is_empty() {
             continue;
@@ -667,6 +941,26 @@ fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>
                 )
                 .into());
             }
+            // 选项值重复或为空会让下拉出现两个「看起来一样、提交后不一样」的项，
+            // 属于包写错了，直接在安装校验里挡掉。
+            let mut option_values = HashSet::new();
+            for option in &definition.options {
+                let value = option.value().trim();
+                if value.is_empty() {
+                    return Err(format!(
+                        "workflow view field {} has an empty option value",
+                        definition.id
+                    )
+                    .into());
+                }
+                if !option_values.insert(value.to_string()) {
+                    return Err(format!(
+                        "workflow view field {} has a duplicate option value: {}",
+                        definition.id, value
+                    )
+                    .into());
+                }
+            }
             if definition.field_type == "credential" && definition.target.trim().is_empty() {
                 return Err(format!(
                     "workflow view credential field {} requires a target",
@@ -675,18 +969,14 @@ fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>
                 .into());
             }
             if !matches!(definition.picker.as_str(), "" | "directory") {
-                return Err(format!(
-                    "workflow view field {} picker is invalid",
-                    definition.id
-                )
-                .into());
+                return Err(
+                    format!("workflow view field {} picker is invalid", definition.id).into(),
+                );
             }
             if !matches!(definition.span.as_str(), "" | "full") {
-                return Err(format!(
-                    "workflow view field {} span is invalid",
-                    definition.id
-                )
-                .into());
+                return Err(
+                    format!("workflow view field {} span is invalid", definition.id).into(),
+                );
             }
         }
     }
@@ -1146,20 +1436,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_wechat_miniprogram_delivery_package() {
+    fn loads_wechat_experience_upload_package() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let package = load_from_directory(&root).unwrap();
-        assert_eq!(
-            package.id,
-            "com.himind.workflow.wechat-miniprogram-delivery"
-        );
-        assert!(package.steps.iter().any(|step| step.id == "DEV-LOOP"));
+        assert_eq!(package.id, "com.himind.workflow.wechat-experience-upload");
+        assert!(package.steps.iter().any(|step| step.id == "WX-BUILD"));
         assert!(package.steps.iter().any(|step| step.id == "WX-CANDIDATE"));
         assert!(package
             .capabilities
             .contains(&"workflow.candidate.freeze".to_string()));
+        // 该工作流只做构建与上传，不再内嵌 AI 开发 Loop。
+        assert!(package.steps.iter().all(|step| step.kind != "loop"));
+        assert!(package.supported_runtimes.is_empty());
+    }
+
+    #[test]
+    fn workflow_dependency_declarations_accept_string_and_object_forms() {
+        // 字符串 = 本分发内的必需依赖；对象可以补 required 与 min_version。
+        let dependencies: WorkflowDependencies = serde_json::from_str(
+            r#"{
+                "skills": [
+                    "develop-himind-skills",
+                    {"skill_id": "wechatide-skill", "required": false, "min_version": "0.4.0"}
+                ],
+                "plugins": [
+                    {"id": "com.himind.software-distribution", "min_version": "1.2.0"},
+                    "com.himind.wechat-miniprogram-tools"
+                ],
+                "connectors": [],
+                "runtimes": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(dependencies.skills[0].id(), "develop-himind-skills");
+        assert!(dependencies.skills[0].required);
+        assert_eq!(dependencies.skills[1].id(), "wechatide-skill");
+        assert!(!dependencies.skills[1].required);
+        assert_eq!(dependencies.skills[1].min_version, "0.4.0");
+        assert_eq!(
+            dependencies.plugins[0].id(),
+            "com.himind.software-distribution"
+        );
+        assert_eq!(dependencies.plugins[0].min_version, "1.2.0");
+        assert!(dependencies.plugins[1].required);
+
+        // 只声明 ID 的依赖写回字符串，带约束的才展开成对象。
+        let encoded = serde_json::to_value(&dependencies).unwrap();
+        assert_eq!(
+            encoded["skills"][0],
+            Value::String("develop-himind-skills".to_string())
+        );
+        assert_eq!(encoded["skills"][1]["required"], Value::Bool(false));
+        assert_eq!(
+            encoded["skills"][1]["min_version"],
+            Value::String("0.4.0".to_string())
+        );
+        assert_eq!(
+            encoded["plugins"][0]["id"],
+            Value::String("com.himind.software-distribution".to_string())
+        );
+    }
+
+    #[test]
+    fn workflow_dependency_declarations_reject_invalid_entries() {
+        let duplicate: WorkflowDependencies = serde_json::from_str(
+            r#"{"skills": ["same-skill", {"id": "same-skill"}], "plugins": []}"#,
+        )
+        .unwrap();
+        assert!(validate_dependency_refs("skill", &duplicate.skills)
+            .unwrap_err()
+            .contains("duplicate"));
+
+        let bad_version: WorkflowDependencies = serde_json::from_str(
+            r#"{"skills": [{"id": "some-skill", "min_version": "0.4"}], "plugins": []}"#,
+        )
+        .unwrap();
+        assert!(validate_dependency_refs("skill", &bad_version.skills)
+            .unwrap_err()
+            .contains("min_version"));
+
+        assert!(serde_json::from_str::<WorkflowDependencies>(r#"{"skills": [42]}"#).is_err());
+        assert!(serde_json::from_str::<WorkflowDependencies>(
+            r#"{"skills": [{"required": false}]}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -1177,11 +1539,12 @@ mod tests {
     #[test]
     fn workflow_package_v1_current_product_remains_compatible() {
         let package: WorkflowPackage = serde_json::from_str(include_str!(
-            "../../workflows/wechat-miniprogram-delivery/workflow.json"
+            "../../workflows/wechat-experience-upload/workflow.json"
         ))
         .unwrap();
         package.validate().unwrap();
-        assert!(package.steps.iter().any(|step| step.kind == "loop"));
+        assert!(package.steps.iter().all(|step| step.kind != "loop"));
+        assert!(package.steps.iter().any(|step| step.id == "WX-BUILD"));
         assert!(package
             .steps
             .iter()
@@ -1192,13 +1555,15 @@ mod tests {
     fn segmented_workflow_requires_declared_entry_and_exit_steps() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.execution_policy = "segmented".to_string();
+        package.default_entrypoint = "build".to_string();
+        package.default_exitpoint = "checkpoint".to_string();
         package.entrypoints = vec![WorkflowEndpoint {
-            id: "develop".to_string(),
-            at_step: "DEV-LOOP".to_string(),
-            label: "开发".to_string(),
+            id: "build".to_string(),
+            at_step: "WX-BUILD".to_string(),
+            label: "构建".to_string(),
             requires: vec!["project".to_string()],
             produces: Vec::new(),
         }];
@@ -1222,11 +1587,14 @@ mod tests {
     fn strict_workflow_rejects_custom_entrypoints_and_exits() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
+        // 该 fixture 现在按分段执行发布，这条用例只验证 strict 契约本身。
+        package.execution_policy = "strict".to_string();
+        package.exits = Vec::new();
         package.entrypoints = vec![WorkflowEndpoint {
-            id: "develop".to_string(),
-            at_step: "DEV-LOOP".to_string(),
+            id: "build".to_string(),
+            at_step: "WX-BUILD".to_string(),
             label: String::new(),
             requires: Vec::new(),
             produces: Vec::new(),
@@ -1268,7 +1636,7 @@ mod tests {
     fn rejects_step_dependency_cycles() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let first = package.steps[0].id.clone();
         let second = package.steps[1].id.clone();
@@ -1281,7 +1649,7 @@ mod tests {
     fn rejects_custom_ui_path_escape() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.ui.mode = "custom".to_string();
         package.ui.entry = "../outside.html".to_string();
@@ -1292,7 +1660,7 @@ mod tests {
     fn rejects_missing_asset() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let temp = std::env::temp_dir().join(format!(
             "himind-workflow-missing-asset-{}-{}",
             std::process::id(),
@@ -1314,7 +1682,7 @@ mod tests {
     fn rejects_invalid_declarative_ui_field_type() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let temp = std::env::temp_dir().join(format!(
             "himind-workflow-invalid-view-{}-{}",
             std::process::id(),
@@ -1336,20 +1704,55 @@ mod tests {
     }
 
     #[test]
+    fn launch_defaults_fill_missing_input_for_every_entrypoint() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-experience-upload");
+        let package = load_from_directory(&root).unwrap();
+
+        // 定时计划或命令行只给了部分参数时，其余按启动表单默认值补齐。
+        let merged = with_launch_defaults(&package, &serde_json::json!({ "version": "" }));
+        assert_eq!(merged["venue"], "hdcybwg");
+        assert_eq!(merged["environment"], "development");
+        assert_eq!(merged["workspace_root"], "F:\\WebProjects\\kerun_user");
+        // 凭据默认值是句柄，必须按界面同样的结构并入，不能被当作明文塞进 target 键。
+        assert_eq!(
+            merged["credential_handles"]["private_key_path"],
+            "wechat-upload-private-key"
+        );
+        // 显式空串代表「版本号留空，按日期生成」，不能被默认值覆盖。
+        assert_eq!(merged["version"], "");
+
+        // 显式传值永远优先于默认值。
+        let merged = with_launch_defaults(&package, &serde_json::json!({ "venue": "szkjg" }));
+        assert_eq!(merged["venue"], "szkjg");
+
+        // 非对象输入退化为「全部使用默认值」，而不是直接失败。
+        let merged = with_launch_defaults(&package, &Value::Null);
+        assert_eq!(merged["venue"], "hdcybwg");
+    }
+
+    #[test]
     fn accepts_runtime_step_and_condition_contracts() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
         step.kind = "runtime".to_string();
         step.capability_id.clear();
+        // 首步是普通能力步骤，转成 Runtime Step 前先确认它没有 loop 声明。
+        step.loop_config = None;
+        // 声明式 Runtime Provider 必须先在本包声明，否则 validate 直接拒绝。
+        package
+            .supported_runtimes
+            .push("personal.codex".to_string());
         step.runtime = Some(WorkflowRuntimeStep {
             provider: "personal.codex".to_string(),
             prompt: "Implement the next change from the current feedback.".to_string(),
             workspace_path: "input.project_root".to_string(),
             result_schema: String::new(),
-            allow_network: false,
+            allow_network: None,
             input_artifacts: Vec::new(),
             tool_policy: String::new(),
             timeout_seconds: 1_800,
@@ -1372,25 +1775,24 @@ mod tests {
     fn rejects_runtime_step_timeout_above_one_day() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
-        let loop_step = package
-            .steps
-            .iter_mut()
-            .find(|step| step.id == "DEV-LOOP")
-            .unwrap();
-        loop_step
-            .loop_config
-            .as_mut()
-            .unwrap()
-            .steps
-            .iter_mut()
-            .find(|step| step.id == "DEV-CODE")
-            .unwrap()
-            .runtime
-            .as_mut()
-            .unwrap()
-            .timeout_seconds = 86_401;
+        let step = &mut package.steps[0];
+        step.kind = "runtime".to_string();
+        step.capability_id.clear();
+        package
+            .supported_runtimes
+            .push("personal.codex".to_string());
+        step.runtime = Some(WorkflowRuntimeStep {
+            provider: "personal.codex".to_string(),
+            prompt: "Run one bounded iteration.".to_string(),
+            workspace_path: "input.workspace_root".to_string(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            timeout_seconds: 86_401,
+        });
         assert!(package
             .validate()
             .unwrap_err()
@@ -1401,7 +1803,7 @@ mod tests {
     fn accepts_bounded_development_loop() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
         step.kind = "loop".to_string();
@@ -1446,7 +1848,7 @@ mod tests {
     fn rejects_loop_without_iteration_condition() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         let step = &mut package.steps[0];
         step.kind = "loop".to_string();
@@ -1484,11 +1886,11 @@ mod tests {
     fn candidate_requires_one_freeze_step() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let mut package = load_from_directory(&root).unwrap();
         package.candidate = Some(WorkflowCandidatePolicy {
             required: true,
-            artifact_id: "release-record".to_string(),
+            artifact_id: "candidate".to_string(),
             source: "git".to_string(),
             allow_dirty: false,
         });

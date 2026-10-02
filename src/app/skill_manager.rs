@@ -46,12 +46,12 @@ pub(crate) fn catalog(
 ) -> Result<Vec<SkillCatalogItem>, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    skill_catalog(&client, &options.api_base, agent_id, &credential)
+    skill_catalog(&client, &options.api_base(), agent_id, &credential)
 }
 
 pub(crate) fn install(
@@ -243,7 +243,7 @@ pub(crate) fn plan_install_bound(
 ) -> Result<SkillInstallPlan, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -400,9 +400,9 @@ fn catalog_item(
 ) -> Result<SkillCatalogItem, Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
-    let latest = skill_catalog(client, &options.api_base, agent_id, &credential)?
+    let latest = skill_catalog(client, &options.api_base(), agent_id, &credential)?
         .into_iter()
         .find(|item| item.skill_id == skill_id)
         .ok_or_else(|| "Skill 未上架或当前不可用".to_string())?;
@@ -413,7 +413,7 @@ fn catalog_item(
             if latest.management != "user_managed" || latest.managed {
                 return Err("该 Skill 由组织管理，不能切换版本".into());
             }
-            skill_versions(client, &options.api_base, agent_id, &credential, skill_id)?
+            skill_versions(client, &options.api_base(), agent_id, &credential, skill_id)?
                 .into_iter()
                 .find(|item| item.version == version)
                 .ok_or_else(|| format!("Skill 版本 v{version} 不可用"))?
@@ -461,7 +461,7 @@ fn download(
     if item.file_size == 0 || item.file_size > MAX_SKILL_ARCHIVE_BYTES {
         return Err("Skill 制品大小无效或超过 16 MiB 限制".into());
     }
-    let api = url::Url::parse(&options.api_base)?;
+    let api = url::Url::parse(&options.api_base())?;
     let url = url::Url::parse(&item.download_url)?;
     if api.scheme() != url.scheme()
         || api.host_str() != url.host_str()
@@ -677,7 +677,8 @@ pub(crate) fn verify_declared_contents(root: &Path) -> Result<(), Box<dyn Error>
             .strip_prefix(root)?
             .to_string_lossy()
             .replace('\\', "/");
-        if relative != "checksums.sha256" && !declared.contains(&relative) {
+        if !crate::app::local_package::is_checksums_file(&relative) && !declared.contains(&relative)
+        {
             return Err(format!("Skill 包含 Manifest 未声明的文件: {relative}").into());
         }
     }

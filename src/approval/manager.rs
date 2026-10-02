@@ -150,8 +150,15 @@ impl ApprovalManager {
     }
 
     /// Workflow approvals use a stable, run-scoped ID so every local surface
-    /// observes and resolves the same durable request. They remain pending
-    /// until a user decides or the owning workflow run is canceled.
+    /// observes and resolves the same durable request.
+    ///
+    /// They go through the same rule/profile resolution as capability
+    /// approvals: R3+ steps stay manual under `balanced`/`relaxed`, and only
+    /// become automatic when the user has explicitly granted it (an
+    /// `auto_approve` rule under `trusted`/`full_access`, or the
+    /// `full_access` profile itself). Deciding this here — instead of forcing
+    /// a manual prompt — is what keeps "完全放行" from still popping a dialog
+    /// for every scheduled workflow run.
     pub fn request_workflow_approval_with_cancel<F>(
         &self,
         approval_id: &str,
@@ -206,7 +213,7 @@ impl ApprovalManager {
             capability_id,
             ApprovalMode::Manual,
             true,
-            true,
+            false,
             Some(&risk_level),
             title,
             description,
@@ -584,8 +591,13 @@ impl ApprovalManager {
         Ok(true)
     }
 
-    /// Remove the Dashboard binding when the user logs out. Requests then use
-    /// the local profile only after an explicit local confirmation.
+    /// Remove the Dashboard binding when the workbench authorization is
+    /// revoked, expires, or the Agent leaves connected mode.
+    ///
+    /// The local approval posture deliberately survives: the Agent must stay
+    /// fully usable without the workbench, and silently downgrading would turn
+    /// an explicit 完全放行 / 完全信任 choice back into approval popups. Only
+    /// identity-scoped grant rules are tied to the account.
     pub fn clear_identity(&self) -> Result<bool, String> {
         let mut settings = self.settings.lock().map_err(|e| e.to_string())?;
         if settings.owner_user_id.is_empty() && settings.agent_id.is_empty() {
@@ -595,21 +607,17 @@ impl ApprovalManager {
         settings.owner_user_id.clear();
         settings.agent_id.clear();
         settings.binding_updated_at = unix_now();
-        settings.risk_acknowledged_at = 0;
-        settings.risk_acknowledged_duration_seconds = 0;
+        // Local posture (profile + risk acknowledgement) is intentionally kept.
         reset_identity_sensitive_rules(&mut settings);
-        if matches!(
-            settings.profile.as_str(),
-            "relaxed" | "trusted" | "full_access" | "focus"
-        ) {
-            settings.profile = "balanced".to_string();
-        }
         if let Err(error) = persist_settings(&self.settings_path, &settings) {
             *settings = previous;
             return Err(error);
         }
         drop(settings);
-        self.add_log("warn", "Dashboard 账号已退出，审批档位已回到平衡");
+        self.add_log(
+            "info",
+            "工作台账号已解除绑定；本机审批档位保持不变，只收回账号级授权规则",
+        );
         Ok(true)
     }
 
@@ -791,19 +799,20 @@ impl ApprovalManager {
         risk_level: Option<&str>,
     ) -> (ApprovalMode, bool) {
         if let Ok(settings) = self.settings.lock() {
-            // A Dashboard-bound profile must never survive an account switch
-            // or logout. The persisted OAuth identity is read on every
-            // invocation so background workers fail closed even before the UI
-            // refreshes its identity status.
+            // A different workbench account must never inherit the previous
+            // account's posture, so the persisted OAuth identity is re-read on
+            // every invocation and background workers fail closed even before
+            // the UI refreshes its identity status. A *missing* or expired
+            // authorization is not an account switch: the Agent is designed to
+            // stay fully usable without the workbench, so the local posture
+            // keeps applying there.
             if !settings.owner_user_id.is_empty() || !settings.agent_id.is_empty() {
-                let identity_matches =
+                if let Some((agent_id, user_id)) =
                     crate::api::oauth::persisted_authorization_identity(&self.identity_path)
-                        .map(|(agent_id, user_id)| {
-                            agent_id == settings.agent_id && user_id == settings.owner_user_id
-                        })
-                        .unwrap_or(false);
-                if !identity_matches {
-                    return (ApprovalMode::Manual, false);
+                {
+                    if agent_id != settings.agent_id || user_id != settings.owner_user_id {
+                        return (ApprovalMode::Manual, false);
+                    }
                 }
             }
             let profile = settings.profile.as_str();
@@ -1279,6 +1288,24 @@ fn reset_identity_sensitive_rules(settings: &mut ApprovalSettings) {
     });
 }
 
+/// 给拿不到 `AgentState` 句柄的后台线程写一条事件日志（例如沙箱预热线程）。
+///
+/// 与 [`ApprovalManager::add_log`] 共用同一份落盘格式与轮转，只是不进内存缓冲：
+/// 内存缓冲服务前端那个「日志」列表，是为用户能看到并跟着排查的事情准备的；
+/// 预热属于我们自己的准备工作，用户不需要在界面里读它。
+pub(crate) fn append_event_log(level: &str, message: &str) {
+    let entry = LogEntry {
+        time: now_string(),
+        timestamp: unix_now(),
+        level: level.to_string(),
+        message: redact_message(message),
+    };
+    let path = crate::store::paths::agent_home()
+        .join("logs")
+        .join("agent-events.jsonl");
+    persist_log_entry(&path, &entry);
+}
+
 fn persist_log_entry(path: &std::path::Path, entry: &LogEntry) {
     if let Some(parent) = path.parent() {
         if fs::create_dir_all(parent).is_err() {
@@ -1417,7 +1444,9 @@ mod log_tests {
 #[cfg(test)]
 mod destructive_tests {
     use super::ApprovalManager;
-    use crate::approval::types::{ApprovalFactStatus, ApprovalMode, PendingApproval, RequestType};
+    use crate::approval::types::{
+        ApprovalFactStatus, ApprovalMode, ApprovalRequest, PendingApproval, RequestType,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1433,6 +1462,31 @@ mod destructive_tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// 等一个审批请求进入队列。
+    ///
+    /// 等的是另一个线程布置出来的结果，不能用「固定轮询 N 次」当超时：整套测试
+    /// 并行跑时机器本来就忙，500ms 预算被耗光，用例就会随机失败。改成按截止时间
+    /// 等——正常路径几十毫秒返回，真出问题也在预算内给出 None。
+    fn wait_for_pending(
+        manager: &ApprovalManager,
+        matches: impl Fn(&ApprovalRequest) -> bool,
+    ) -> Option<ApprovalRequest> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(request) = manager
+                .list_pending()
+                .into_iter()
+                .find(|request| matches(request))
+            {
+                return Some(request);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -1455,14 +1509,7 @@ mod destructive_tests {
                 "test target".to_string(),
             )
         });
-        let request_id = (0..50).find_map(|_| {
-            let pending = manager.list_pending();
-            let id = pending.first().map(|item| item.id.clone());
-            if id.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            id
-        });
+        let request_id = wait_for_pending(&manager, |_| true).map(|item| item.id);
         let request_id = request_id.expect("destructive request must enter manual queue");
         manager.respond(&request_id, false).expect("reject request");
         assert_eq!(
@@ -1786,6 +1833,61 @@ mod destructive_tests {
     }
 
     #[test]
+    fn local_posture_survives_missing_or_revoked_workbench_authorization() {
+        let home = test_home("full-access-without-workbench");
+        fs::create_dir_all(home.join("data")).unwrap();
+        let manager = ApprovalManager::new_in(home.clone());
+        // 曾经对接过工作台：绑定记录还在，但授权已经失效或被取消。
+        manager.bind_identity("user-a", "agent-a").unwrap();
+        manager.update_profile("full_access", true).unwrap();
+        assert!(matches!(
+            manager.get_mode_for_key(
+                "wechat.miniprogram.upload",
+                ApprovalMode::Manual,
+                true,
+                Some("R3")
+            ),
+            ApprovalMode::AutoApprove
+        ));
+
+        // 解除工作台绑定后本机档位同样保持不变。
+        manager.clear_identity().unwrap();
+        let settings = manager.get_settings();
+        assert!(settings.owner_user_id.is_empty());
+        assert_eq!(settings.profile, "full_access");
+        assert!(settings.risk_acknowledgement_valid(super::unix_now()));
+        assert!(matches!(
+            manager.get_mode_for_key(
+                "wechat.miniprogram.upload",
+                ApprovalMode::Manual,
+                true,
+                Some("R3")
+            ),
+            ApprovalMode::AutoApprove
+        ));
+
+        // 换成另一个工作台账号才需要重新确认，避免继承他人档位。
+        fs::write(
+            home.join("data").join("agent-user-authorization.json"),
+            serde_json::json!({
+                "version": 1,
+                "agent_id": "agent-a",
+                "user_id": "user-b",
+                "scope": "agent.profile",
+                "refresh_token_protected": "test",
+                "refresh_expires_at": 4_000_000_000u64,
+                "updated_at": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        manager.bind_identity("user-b", "agent-a").unwrap();
+        assert_eq!(manager.get_settings().profile, "balanced");
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn profile_data_authorization_drives_full_access_identity_matching() {
         let home = test_home("profile-data-identity");
         fs::create_dir_all(home.join("data")).unwrap();
@@ -1833,16 +1935,7 @@ mod destructive_tests {
                 "target=codex".to_string(),
             )
         });
-        let request_id = (0..50).find_map(|_| {
-            let id = manager
-                .list_pending()
-                .first()
-                .map(|request| request.id.clone());
-            if id.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            id
-        });
+        let request_id = wait_for_pending(&manager, |_| true).map(|item| item.id);
         let request_id = request_id.expect("exact manual rule must enter the approval queue");
         manager.respond(&request_id, false).unwrap();
         assert!(!worker.join().expect("approval worker panicked").unwrap());
@@ -1913,16 +2006,7 @@ mod destructive_tests {
             )
         });
         let desktop = ApprovalManager::new_in(home.clone());
-        let request_id = (0..50).find_map(|_| {
-            let id = desktop
-                .list_pending()
-                .first()
-                .map(|request| request.id.clone());
-            if id.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            id
-        });
+        let request_id = wait_for_pending(&desktop, |_| true).map(|item| item.id);
         let request_id = request_id.expect("desktop broker must discover durable request");
         desktop.respond(&request_id, true).expect("approve request");
         assert!(worker.join().expect("approval worker panicked").unwrap());
@@ -1939,7 +2023,9 @@ mod destructive_tests {
     fn workflow_approval_uses_stable_id_without_timeout() {
         let home = test_home("workflow-stable-id");
         let manager = Arc::new(ApprovalManager::new_in(home.clone()));
-        manager.update_profile("full_access", true).unwrap();
+        // 默认档位（balanced）下 R3 工作流步骤必须人工确认，用来验证工作流审批
+        // 走的是稳定的 run 级 ID，并且不会被套上超时。完全放行档位下的自动批准
+        // 由 workflow_approval_is_auto_approved_under_full_access 单独覆盖。
         let approval_id = "workflow:run-1:WX-UPLOAD".to_string();
         let worker_manager = Arc::clone(&manager);
         let worker_approval_id = approval_id.clone();
@@ -1954,16 +2040,7 @@ mod destructive_tests {
             )
         });
 
-        let request = (0..50).find_map(|_| {
-            let request = manager
-                .list_pending()
-                .into_iter()
-                .find(|request| request.id == approval_id);
-            if request.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            request
-        });
+        let request = wait_for_pending(&manager, |request| request.id == approval_id);
         let request = request.expect("workflow approval must enter the global queue");
         assert_eq!(request.timeout_seconds, 0);
         assert_eq!(request.remaining_seconds, 0);
@@ -1977,6 +2054,41 @@ mod destructive_tests {
         assert_eq!(
             manager.list_recent_facts()[0].status,
             ApprovalFactStatus::Approved
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// 完全放行档位下，工作流步骤（含 R3 上传）不应该再弹窗打扰用户：
+    /// 它和普通能力审批走同一套规则解析，因此自动批准、不进全局队列。
+    #[test]
+    fn workflow_approval_is_auto_approved_under_full_access() {
+        let home = test_home("workflow-full-access");
+        let manager = Arc::new(ApprovalManager::new_in(home.clone()));
+        manager.update_profile("full_access", true).unwrap();
+        let approval_id = "workflow:run-1:WX-UPLOAD".to_string();
+        manager
+            .request_workflow_approval_with_cancel(
+                &approval_id,
+                "wechat.miniprogram.upload",
+                "R3",
+                "Workflow: 上传体验版".to_string(),
+                "run_id=run-1 step_id=WX-UPLOAD".to_string(),
+                || Ok(false),
+            )
+            .unwrap();
+
+        // 调用是同步返回的：返回时决定已经做出，队列里就不该留下这条请求。
+        assert!(
+            manager.list_pending().is_empty(),
+            "完全放行下工作流审批不应进入人工队列"
+        );
+        let facts = manager.list_recent_facts();
+        assert_eq!(facts[0].id, approval_id);
+        assert_eq!(facts[0].status, ApprovalFactStatus::Approved);
+        assert_eq!(
+            facts[0].resolution_reason,
+            "full_access_profile_auto_approved"
         );
         drop(manager);
         let _ = fs::remove_dir_all(home);
@@ -1999,16 +2111,11 @@ mod destructive_tests {
                 || Ok(false),
             )
         });
-        for _ in 0..50 {
-            if manager
-                .list_pending()
-                .iter()
-                .any(|request| request.id == approval_id)
-            {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        let first_pending = wait_for_pending(&manager, |request| request.id == approval_id);
+        assert!(
+            first_pending.is_some(),
+            "first workflow approval must enter the global queue"
+        );
         manager.interrupt(&approval_id, "test_restart").unwrap();
         assert_eq!(
             first.join().expect("approval worker panicked").unwrap(),
@@ -2027,16 +2134,7 @@ mod destructive_tests {
                 || Ok(false),
             )
         });
-        let request = (0..50).find_map(|_| {
-            let request = manager
-                .list_pending()
-                .into_iter()
-                .find(|request| request.id == approval_id);
-            if request.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            request
-        });
+        let request = wait_for_pending(&manager, |request| request.id == approval_id);
         assert!(
             request.is_some(),
             "same workflow approval must be recreated"

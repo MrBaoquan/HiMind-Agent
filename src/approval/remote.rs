@@ -123,7 +123,7 @@ pub(crate) fn active_grant(
     let response = client
         .get(format!(
             "{}/api/grants?status=active",
-            options.api_base.trim_end_matches('/')
+            options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(&access.token)
         .header("X-HiMind-Agent-ID", &access.agent_id)
@@ -520,7 +520,7 @@ fn approval_request(
     if access.agent_id.trim() != state.agent_id.trim() {
         return Err("Dashboard 授权与当前 Agent 实例不匹配".into());
     }
-    let mut url = url::Url::parse(&options.api_base)?;
+    let mut url = url::Url::parse(&options.api_base())?;
     {
         let mut segments = url
             .path_segments_mut()

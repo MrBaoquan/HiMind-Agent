@@ -79,7 +79,7 @@ pub(crate) fn run_loop(
     let mut state = if options.reenroll {
         register_agent(
             &client,
-            &options.api_base,
+            &options.api_base(),
             &options.state_path,
             VERSION,
             &options.enrollment_token,
@@ -87,7 +87,7 @@ pub(crate) fn run_loop(
     } else {
         load_or_register(
             &client,
-            &options.api_base,
+            &options.api_base(),
             &options.state_path,
             VERSION,
             &options.enrollment_token,
@@ -96,7 +96,7 @@ pub(crate) fn run_loop(
     if crate::api::client::agent_credential_rotation_due(&state) {
         state = match crate::api::client::rotate_agent_credential(
             &client,
-            &options.api_base,
+            &options.api_base(),
             &options.state_path,
             &state,
         ) {
@@ -105,7 +105,7 @@ pub(crate) fn run_loop(
                 eprintln!("Agent credential rotation deferred: {error}");
                 load_or_register(
                     &client,
-                    &options.api_base,
+                    &options.api_base(),
                     &options.state_path,
                     VERSION,
                     &options.enrollment_token,
@@ -117,7 +117,7 @@ pub(crate) fn run_loop(
     let identity_generation = options.identity_generation();
     if let Err(error) = crate::api::client::sync_svn_management_credentials(
         &client,
-        &options.api_base,
+        &options.api_base(),
         &state.agent_id,
         &state.credential,
     ) {
@@ -155,7 +155,11 @@ pub(crate) fn run_loop(
     }
     crate::app::plugin_manager::flush_status_outbox(&options, &state.agent_id);
 
-    println!("agent {} connected to {}", state.agent_id, options.api_base);
+    println!(
+        "agent {} connected to {}",
+        state.agent_id,
+        options.api_base()
+    );
     let restart_requested = Arc::new(AtomicBool::new(false));
     let heartbeat_stop = Arc::new(AtomicBool::new(false));
     let heartbeat_stop_for_thread = Arc::clone(&heartbeat_stop);
@@ -186,7 +190,7 @@ pub(crate) fn run_loop(
             if crate::api::client::agent_credential_rotation_due(&heartbeat_agent_state) {
                 heartbeat_agent_state = match crate::api::client::rotate_agent_credential(
                     &heartbeat_client,
-                    &heartbeat_options.api_base,
+                    &heartbeat_options.api_base(),
                     &heartbeat_options.state_path,
                     &heartbeat_agent_state,
                 ) {
@@ -195,7 +199,7 @@ pub(crate) fn run_loop(
                         eprintln!("Agent credential rotation deferred: {error}");
                         match load_or_register(
                             &heartbeat_client,
-                            &heartbeat_options.api_base,
+                            &heartbeat_options.api_base(),
                             &heartbeat_options.state_path,
                             VERSION,
                             &heartbeat_options.enrollment_token,
@@ -227,7 +231,7 @@ pub(crate) fn run_loop(
             let heartbeat_credential = heartbeat_options.agent_credential();
             if let Err(error) = crate::api::client::sync_svn_management_credentials(
                 &heartbeat_client,
-                &heartbeat_options.api_base,
+                &heartbeat_options.api_base(),
                 &heartbeat_agent_id,
                 &heartbeat_credential,
             ) {
@@ -243,7 +247,7 @@ pub(crate) fn run_loop(
             }
             match heartbeat_with_runtime_installations(
                 &heartbeat_client,
-                &heartbeat_options.api_base,
+                &heartbeat_options.api_base(),
                 &heartbeat_agent_id,
                 &heartbeat_credential,
                 Some(&runtime_installations),
@@ -306,7 +310,7 @@ pub(crate) fn run_loop(
                         "offline",
                         false,
                         "",
-                        "Dashboard Agent 凭据已失效，需要管理员重新授权配对",
+                        "HiMind 账号凭据已失效，需要管理员重新授权",
                     );
                     heartbeat_restart_requested.store(true, Ordering::SeqCst);
                     break;
@@ -440,7 +444,7 @@ pub(crate) fn run_loop(
         }
         let tasks = match poll_tasks(
             &client,
-            &options.api_base,
+            &options.api_base(),
             &state.agent_id,
             &state.credential,
         ) {
@@ -505,7 +509,7 @@ fn load_distribution_client(
 ) -> Result<Option<crate::api::distribution::DistributionState>, Box<dyn Error>> {
     load_distribution(
         client,
-        &options.api_base,
+        &options.api_base(),
         &crate::api::distribution::distribution_state_path(&options.state_path),
         &std::env::var("HIMIND_DISTRIBUTION_PRODUCT_KEY")
             .unwrap_or_else(|_| "himind-agent".to_string()),
@@ -549,7 +553,15 @@ pub(crate) fn run_supervisor(
                         "Dashboard 任务 Worker 已停止"
                     },
                 );
-                break;
+                if !independent {
+                    break;
+                }
+                // 关闭「AI 工作台」后保持待命：开关重新打开时自动重新对接，
+                // 不需要重启 Agent。
+                retry_delay = Duration::from_secs(2);
+                while !options.mode().dashboard_enabled() {
+                    thread::sleep(Duration::from_secs(2));
+                }
             }
             Err(error) => {
                 let message = error.to_string();

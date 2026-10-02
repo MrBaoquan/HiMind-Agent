@@ -42,6 +42,11 @@ trait AIRuntimeAdapter: Sync {
         options: &Options,
         workspace: Option<&Path>,
     ) -> Result<BuiltinAIInteractiveLaunch, String>;
+    fn prepare_interactive_launch_allow_degraded(
+        &self,
+        options: &Options,
+        workspace: Option<&Path>,
+    ) -> Result<BuiltinAIInteractiveLaunch, String>;
     fn interactive_tool_context_summary(
         &self,
         options: &Options,
@@ -63,6 +68,30 @@ static ACTIVE_RUNTIME_ADAPTER: DeepSeekHarnessAdapter = DeepSeekHarnessAdapter;
 
 fn active_adapter() -> &'static dyn AIRuntimeAdapter {
     &ACTIVE_RUNTIME_ADAPTER
+}
+
+/// Runtime 引擎的启动描述 → 产品边界描述。这里是唯一一处字段映射，
+/// 避免两条入口（严格 / 可降级）各写一份而漏掉新增字段。
+fn from_engine_launch(
+    launch: Result<deepseek_harness::InteractiveLaunch, String>,
+) -> Result<BuiltinAIInteractiveLaunch, String> {
+    launch.map(|launch| BuiltinAIInteractiveLaunch {
+        executable: launch.executable,
+        home: launch.home,
+        workspace: launch.workspace,
+        user_id: launch.user_id,
+        api_key: launch.api_key,
+        api_key_env: launch.api_key_env,
+        base_url: launch.base_url,
+        agent_patch: launch.agent_patch,
+        default_model: launch.default_model,
+        models: launch.models,
+        credential_fingerprint: launch.credential_fingerprint,
+        catalog_fingerprint: launch.catalog_fingerprint,
+        permission_mode: launch.permission_mode,
+        service_source: launch.service_source,
+        control_plane_notice: launch.control_plane_notice,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,6 +166,10 @@ pub(crate) struct BuiltinAIInteractiveLaunch {
     pub credential_fingerprint: String,
     pub catalog_fingerprint: String,
     pub permission_mode: &'static str,
+    /// `managed` / `custom` / `native`：本次会话模型凭据的真实来源。
+    pub service_source: &'static str,
+    /// 非空表示会话按本机配置降级启动，内容是需要向用户解释的真实原因。
+    pub control_plane_notice: String,
 }
 
 pub(crate) struct BuiltinAIEventProjector {
@@ -209,6 +242,13 @@ pub(crate) fn prepare_interactive_launch(
     active_adapter().prepare_interactive_launch(options, workspace)
 }
 
+pub(crate) fn prepare_interactive_launch_allow_degraded(
+    options: &Options,
+    workspace: Option<&Path>,
+) -> Result<BuiltinAIInteractiveLaunch, String> {
+    active_adapter().prepare_interactive_launch_allow_degraded(options, workspace)
+}
+
 pub(crate) fn interactive_tool_context_summary(
     options: &Options,
 ) -> Result<BuiltinAIToolContextSummary, String> {
@@ -217,6 +257,14 @@ pub(crate) fn interactive_tool_context_summary(
 
 pub(crate) fn interactive_home_path() -> Result<PathBuf, String> {
     deepseek_harness::interactive_home_path()
+}
+
+pub(crate) fn interactive_executable() -> Result<PathBuf, String> {
+    deepseek_harness::interactive_executable()
+}
+
+pub(crate) fn recent_interactive_workspace() -> Option<PathBuf> {
+    deepseek_harness::recent_interactive_workspace()
 }
 
 pub(crate) fn interactive_event_projector() -> BuiltinAIEventProjector {
@@ -294,23 +342,19 @@ impl AIRuntimeAdapter for DeepSeekHarnessAdapter {
         options: &Options,
         workspace: Option<&Path>,
     ) -> Result<BuiltinAIInteractiveLaunch, String> {
-        deepseek_harness::prepare_interactive_launch(options, workspace).map(|launch| {
-            BuiltinAIInteractiveLaunch {
-                executable: launch.executable,
-                home: launch.home,
-                workspace: launch.workspace,
-                user_id: launch.user_id,
-                api_key: launch.api_key,
-                api_key_env: launch.api_key_env,
-                base_url: launch.base_url,
-                agent_patch: launch.agent_patch,
-                default_model: launch.default_model,
-                models: launch.models,
-                credential_fingerprint: launch.credential_fingerprint,
-                catalog_fingerprint: launch.catalog_fingerprint,
-                permission_mode: launch.permission_mode,
-            }
-        })
+        from_engine_launch(deepseek_harness::prepare_interactive_launch(
+            options, workspace,
+        ))
+    }
+
+    fn prepare_interactive_launch_allow_degraded(
+        &self,
+        options: &Options,
+        workspace: Option<&Path>,
+    ) -> Result<BuiltinAIInteractiveLaunch, String> {
+        from_engine_launch(deepseek_harness::prepare_interactive_launch_allow_degraded(
+            options, workspace,
+        ))
     }
 
     fn interactive_tool_context_summary(

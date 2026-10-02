@@ -207,7 +207,7 @@ fn upload_local_artifact(
     let request_key = format!("{}-{}-{}", claim.run.id, index, digest);
     let response = upload_agent_run_artifact(
         client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &claim.run.id,
         &claim.claim_token,
@@ -262,7 +262,7 @@ fn wait_for_scan(
     loop {
         let artifact = get_agent_run_artifact(
             client,
-            &options.api_base,
+            &options.api_base(),
             agent_id,
             &claim.run.id,
             &claim.claim_token,

@@ -57,12 +57,20 @@ fn validate_execution_plans(package: &WorkflowPackage) -> Result<Value, Box<dyn 
     let mut plans = Vec::new();
     for entrypoint in &package.entrypoints {
         let mut matched = false;
+        let mut last_error = String::new();
+        // 入口声明的前置条件是调用方的契约：静态编排只验证「按声明的入口出发
+        // 能不能走到出口」，不能因为调用方还没提交参数就判定入口不可用。
+        let mut facts = serde_json::Map::new();
+        for requirement in &entrypoint.requires {
+            facts.insert(requirement.clone(), Value::Bool(true));
+        }
         for exitpoint in &package.exits {
             let input = json!({
                 "execution": {
                     "entrypoint": entrypoint.id,
                     "exitpoint": exitpoint.id,
-                }
+                },
+                "facts": Value::Object(facts.clone()),
             });
             match WorkflowRunner::build_execution_plan(package, &input) {
                 Ok(plan) => {
@@ -76,13 +84,18 @@ fn validate_execution_plans(package: &WorkflowPackage) -> Result<Value, Box<dyn 
                         "plan_digest": plan.plan_digest,
                     }));
                 }
-                Err(_) => {}
+                Err(error) => last_error = error.to_string(),
             }
         }
         if !matched {
+            let detail = if last_error.is_empty() {
+                String::new()
+            } else {
+                format!(": {last_error}")
+            };
             return Err(format!(
-                "workflow entrypoint {} cannot reach any declared exit",
-                entrypoint.id
+                "workflow entrypoint {} cannot reach any declared exit{}",
+                entrypoint.id, detail
             )
             .into());
         }
@@ -192,7 +205,7 @@ mod tests {
     fn builds_static_dry_run_for_segmented_wechat_workflow() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
-            .join("wechat-miniprogram-delivery");
+            .join("wechat-experience-upload");
         let package = super::super::load_from_directory(&root).unwrap();
         let report = contract_dry_run_report(&package).unwrap();
         assert_eq!(report["state"], "passed");
@@ -203,7 +216,7 @@ mod tests {
         assert!(report["coverage"]["schema_assets"]
             .as_u64()
             .is_some_and(|count| count > 0));
-        assert_eq!(report["coverage"]["loop_count"], 1);
+        assert_eq!(report["coverage"]["loop_count"], 0);
         assert!(report["uncovered"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "platform_delivery")));

@@ -58,6 +58,10 @@ pub(crate) fn probe_installations() -> Vec<RuntimeInstallationReport> {
     reports
 }
 
+pub(crate) fn probe_acp_executables() -> Value {
+    acp::probe_executables()
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct AgentRunEnvelope {
     pub(crate) run_id: String,
@@ -121,7 +125,7 @@ where
     let credential = options.agent_credential();
     let claim = claim_agent_run(
         client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &task.id,
         &envelope.run_id,
@@ -186,7 +190,7 @@ where
         let value = normalize_execution_result(value, expected_provider);
         update_agent_run_status(
             client,
-            &options.api_base,
+            &options.api_base(),
             agent_id,
             &claim.run.id,
             &claim.claim_token,
@@ -218,7 +222,7 @@ where
             };
             if let Err(report_error) = update_agent_run_status(
                 client,
-                &options.api_base,
+                &options.api_base(),
                 agent_id,
                 &claim.run.id,
                 &claim.claim_token,

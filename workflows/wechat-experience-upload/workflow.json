@@ -1,0 +1,156 @@
+{
+  "schema_version": "workflow_package.v1",
+  "id": "com.himind.workflow.wechat-experience-upload",
+  "version": "1.4.3",
+  "distribution_targets": ["workbench", "github"],
+  "name": "微信小程序体验版上传",
+  "description": "选择展馆和服务器环境，构建后上传微信体验版。",
+  "release_notes": "启动只需确认展馆与服务器环境：工作区、版本号、说明、上传通道都有默认值。上传通道留空即自动——有 CI 上传私钥走直传（无需确认），没有才用开发者工具；等待确认期间重跑会续等同一任务，不重复弹确认框。需要插件 0.3.19。",
+  "min_agent_version": "0.3.47",
+  "local_requirements": {
+    "platform": "windows",
+    "workspace": "git",
+    "required_tools": [
+      "node",
+      "npm",
+      "git"
+    ],
+    "recommended_tools": [
+      "miniprogram-ci"
+    ]
+  },
+  "candidate": {
+    "required": true,
+    "artifact_id": "candidate",
+    "source": "git",
+    "allow_dirty": true
+  },
+  "execution_policy": "segmented",
+  "entrypoints": [
+    {
+      "id": "build",
+      "at_step": "WX-BUILD",
+      "label": "构建交付候选",
+      "requires": ["workspace"]
+    },
+    {
+      "id": "upload",
+      "at_step": "WX-UPLOAD",
+      "label": "上传已有候选",
+      "requires": ["candidate", "readiness", "approval"]
+    }
+  ],
+  "default_entrypoint": "build",
+  "exits": [
+    {
+      "id": "candidate_ready",
+      "at_step": "WX-CANDIDATE",
+      "label": "候选已冻结",
+      "produces": ["candidate"]
+    },
+    {
+      "id": "experience_version",
+      "at_step": "WX-UPLOAD",
+      "label": "体验版已上传",
+      "produces": ["experience_version"]
+    }
+  ],
+  "default_exitpoint": "experience_version",
+  "capabilities": [
+    "workflow.candidate.freeze",
+    "wechat.miniprogram.build",
+    "wechat.miniprogram.ci.readiness",
+    "wechat.miniprogram.upload"
+  ],
+  "dependencies": {
+    "skills": [],
+    "plugins": [
+      {
+        "id": "com.himind.wechat-miniprogram-tools",
+        "required": true,
+        "min_version": "0.3.19"
+      }
+    ],
+    "connectors": [
+      "wechat-miniprogram"
+    ],
+    "runtimes": []
+  },
+  "steps": [
+    {
+      "id": "WX-BUILD",
+      "title": "按展馆和环境构建",
+      "kind": "capability",
+      "capability_id": "wechat.miniprogram.build",
+      "execution_mode": "long_running",
+      "risk_level": "process"
+    },
+    {
+      "id": "WX-CANDIDATE",
+      "title": "冻结上传候选",
+      "kind": "capability",
+      "capability_id": "workflow.candidate.freeze",
+      "candidate_action": "freeze",
+      "execution_mode": "sync",
+      "risk_level": "local_write",
+      "depends_on": [
+        "WX-BUILD"
+      ]
+    },
+    {
+      "id": "WX-READINESS",
+      "title": "校验目标产物和上传环境",
+      "kind": "capability",
+      "capability_id": "wechat.miniprogram.ci.readiness",
+      "candidate_action": "require",
+      "execution_mode": "sync",
+      "risk_level": "read_only",
+      "depends_on": [
+        "WX-CANDIDATE"
+      ]
+    },
+    {
+      "id": "WX-UPLOAD",
+      "title": "上传微信体验版",
+      "kind": "capability",
+      "capability_id": "wechat.miniprogram.upload",
+      "candidate_action": "require",
+      "execution_mode": "long_running",
+      "risk_level": "R3",
+      "approval_required": true,
+      "depends_on": [
+        "WX-READINESS"
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "candidate",
+      "artifact_type": "candidate",
+      "name": "不可变上传候选",
+      "schema": "artifacts/candidate.schema.json",
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 1048576
+    },
+    {
+      "id": "experience-version",
+      "artifact_type": "wechat_experience_version",
+      "name": "微信体验版记录",
+      "schema": "artifacts/experience-version.schema.json",
+      "required": true,
+      "validation": "strict",
+      "max_bytes": 4194304
+    }
+  ],
+  "ui": {
+    "mode": "declarative",
+    "surfaces": [
+      "agent",
+      "dashboard"
+    ],
+    "entry": "ui/workflow-view.json"
+  },
+  "supported_runtimes": [],
+  "created_at": "2026-09-17T00:00:00Z"
+}

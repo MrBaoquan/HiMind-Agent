@@ -50,6 +50,21 @@ impl AgentMode {
         }
     }
 
+    pub(crate) fn as_code(self) -> u8 {
+        match self {
+            Self::Independent => 0,
+            Self::Connected => 1,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> Self {
+        if code == 1 {
+            Self::Connected
+        } else {
+            Self::Independent
+        }
+    }
+
     pub(crate) fn dashboard_enabled(self) -> bool {
         matches!(self, Self::Connected)
     }
@@ -72,9 +87,15 @@ impl AgentMode {
 pub(crate) fn control_plane_required_error() -> String {
     serde_json::json!({
         "code": "control_plane_required",
-        "message": "当前运行模式不支持此功能；如需使用，请在设置中切换到组织模式并重启 Agent"
+        "message": "此功能需要对接 AI 工作台；请在设置中开启「AI 工作台」后重试"
     })
     .to_string()
+}
+
+/// 测试夹具：构造与 `Options::workbench_mode` 同构的共享运行状态。
+#[cfg(test)]
+pub(crate) fn mode_cell(mode: AgentMode) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+    std::sync::Arc::new(std::sync::atomic::AtomicU8::new(mode.as_code()))
 }
 
 #[allow(dead_code)]

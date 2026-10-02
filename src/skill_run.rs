@@ -4,10 +4,10 @@
 //! 结果写在 `agent_home/skill-runs/<run_id>/`（`run.json` + `prompt.md` + `result.md`），
 //! 因此“定时跑一个技能”跑完之后有明确的产物可以回看、可以定位。
 
-use crate::Options;
 use crate::skill::store::SkillStore;
 use crate::store::atomic_file::atomic_write;
 use crate::store::paths::agent_home;
+use crate::Options;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::error::Error;
@@ -110,6 +110,17 @@ pub(crate) fn get(run_id: &str) -> Result<Option<SkillRunRecord>, Box<dyn Error>
 /// 最近的技能运行，按开始时间倒序。
 pub(crate) fn list(limit: usize) -> Result<Value, Box<dyn Error>> {
     let root = runs_root();
+    let items = recent(limit)?;
+    Ok(json!({
+        "root": root.to_string_lossy().to_string(),
+        "total": items.len(),
+        "runs": items,
+    }))
+}
+
+/// 与 `list` 同源，但返回结构化记录，供统一活动列表复用同一套自愈逻辑。
+pub(crate) fn recent(limit: usize) -> Result<Vec<SkillRunRecord>, Box<dyn Error>> {
+    let root = runs_root();
     let mut items = Vec::new();
     if root.is_dir() {
         for entry in fs::read_dir(&root)?.flatten() {
@@ -137,11 +148,7 @@ pub(crate) fn list(limit: usize) -> Result<Value, Box<dyn Error>> {
     items.sort_by(|left, right| right.started_at.cmp(&left.started_at));
     let limit = if limit == 0 { 20 } else { limit };
     items.truncate(limit);
-    Ok(json!({
-        "root": root.to_string_lossy().to_string(),
-        "total": items.len(),
-        "runs": items,
-    }))
+    Ok(items)
 }
 
 /// 技能运行的 workspace：优先用输入里的 workspace_root，其次当前工作区，最后 Agent 目录。
@@ -398,7 +405,10 @@ mod tests {
     fn tool_policy_defaults_to_no_tools() {
         // 默认不开工具：定时运行无人值守，先要可复现的结果。
         assert_eq!(tool_policy(&json!({})).unwrap(), "none");
-        assert_eq!(tool_policy(&json!({"tools": "default"})).unwrap(), "default");
+        assert_eq!(
+            tool_policy(&json!({"tools": "default"})).unwrap(),
+            "default"
+        );
         assert_eq!(tool_policy(&json!({"tools": ""})).unwrap(), "none");
         assert!(tool_policy(&json!({"tools": "all"})).is_err());
     }

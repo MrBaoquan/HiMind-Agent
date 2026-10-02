@@ -209,7 +209,7 @@ pub(crate) fn start_run_lease_renewal(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let client = client.clone();
-    let api_base = options.api_base.clone();
+    let api_base = options.api_base().clone();
     let credential = options.agent_credential();
     let agent_id = agent_id.to_string();
     let run_id = claim.run.id.clone();
@@ -366,9 +366,112 @@ pub(crate) fn hidden_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// 把用户填的命令解析成真实可执行文件路径。
+///
+/// Windows 上 `npx`、`uvx`、`pnpm` 这类命令落地的是 `.cmd` 批处理，而
+/// `Command::new("npx")` 只会按 `.exe` 去 PATH 里找，找不到就直接报
+/// `program not found`——终端里敲得好好的命令到了这里必然失败。桌面端由启动器
+/// 拉起时环境又比终端干净，所以除了 PATHEXT，这里还兜了几个常见安装目录，
+/// 免得「装了 Node 但 GUI 里找不到」这种问题留给用户排查。
+///
+/// 带路径分隔符的输入按原样校验；其余一律走名字查找。
+pub(crate) fn resolve_executable(program: &str) -> Option<PathBuf> {
+    let program = program.trim();
+    if program.is_empty() {
+        return None;
+    }
+    if program.contains('/') || program.contains('\\') {
+        let direct = Path::new(program);
+        return direct.is_file().then(|| direct.to_path_buf());
+    }
+    for directory in executable_search_directories() {
+        for name in executable_candidate_names(program) {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// 待查文件名。Windows 下 PATHEXT 后缀优先，原名最后兜底。
+///
+/// 顺序很关键：`C:\Program Files\nodejs` 里同时存在无扩展名的 `npx`（Git for Windows
+/// 的 shell 脚本）和 `npx.cmd`。按原名优先会先命中（或跳过）错误的那个文件，
+/// Windows 无法直接 CreateProcess 无扩展名脚本，会报 os error 193。
+fn executable_candidate_names(program: &str) -> Vec<String> {
+    #[cfg(not(windows))]
+    {
+        vec![program.to_string()]
+    }
+    #[cfg(windows)]
+    {
+        let extensions = env::var_os("PATHEXT")
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+        let mut names = Vec::new();
+        // 已经写明后缀的（如 `npx.cmd`）优先按原样匹配，避免多走一轮后缀拼接。
+        let named_extension = std::path::Path::new(program)
+            .extension()
+            .map(|value| format!(".{}", value.to_string_lossy()))
+            .filter(|extension| {
+                extensions
+                    .split(';')
+                    .any(|known| known.trim().eq_ignore_ascii_case(extension))
+            });
+        if named_extension.is_some() {
+            names.push(program.to_string());
+        }
+        for extension in extensions.split(';') {
+            let extension = extension.trim();
+            if !extension.is_empty() {
+                names.push(format!("{program}{extension}"));
+            }
+        }
+        names.push(program.to_string());
+        names
+    }
+}
+
+fn executable_search_directories() -> Vec<PathBuf> {
+    let mut directories = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    #[cfg(windows)]
+    {
+        for (key, suffix) in [
+            ("ProgramFiles", "nodejs"),
+            ("ProgramFiles(x86)", "nodejs"),
+            ("LOCALAPPDATA", "Programs\\nodejs"),
+            ("APPDATA", "npm"),
+            ("LOCALAPPDATA", "pnpm"),
+            ("LOCALAPPDATA", "Microsoft\\WinGet\\Links"),
+            ("USERPROFILE", ".bun\\bin"),
+            ("USERPROFILE", ".local\\bin"),
+            ("USERPROFILE", ".cargo\\bin"),
+            ("USERPROFILE", "scoop\\shims"),
+        ] {
+            if let Some(root) = env::var_os(key).filter(|value| !value.is_empty()) {
+                directories.push(PathBuf::from(root).join(suffix));
+            }
+        }
+        directories.push(PathBuf::from("C:\\ProgramData\\chocolatey\\bin"));
+    }
+    #[cfg(not(windows))]
+    {
+        directories.push(PathBuf::from("/usr/local/bin"));
+        directories.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+    directories
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{summarize_output, wait_for_child_until, wait_for_child_until_with_cancel};
+    use super::{
+        executable_candidate_names, summarize_output, wait_for_child_until,
+        wait_for_child_until_with_cancel,
+    };
     use std::error::Error;
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -380,6 +483,26 @@ mod tests {
         assert_eq!(summary.chars().count(), 200);
         assert!(summary.starts_with("header"));
         assert!(summary.ends_with("ROOT_CAUSE"));
+    }
+
+    /// Windows 的 `npx` 目录里同时有无扩展名脚本和 `npx.cmd`，候选顺序必须先看后缀，
+    /// 否则会拿到无法直接 CreateProcess 的那个文件（os error 193）。
+    #[test]
+    fn windows_prefers_pathext_suffixed_candidates() {
+        let names = executable_candidate_names("npx");
+        #[cfg(windows)]
+        {
+            let first = names.first().expect("至少有一个候选名");
+            assert!(
+                first.len() > "npx".len(),
+                "第一个候选应是带后缀的可执行文件，实际为 {first}"
+            );
+            assert_eq!(names.last().map(String::as_str), Some("npx"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(names, vec!["npx".to_string()]);
+        }
     }
 
     #[test]
