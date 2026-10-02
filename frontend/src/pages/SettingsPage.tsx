@@ -1,30 +1,26 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { agentApi, type AgentModeSettings, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings } from '../services/agentApi';
-import { Bell, BellOff, Bot, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Globe2, Inbox, KeyRound, LoaderCircle, LockKeyhole, Monitor, MoreHorizontal, PencilLine, PlugZap, Power, RefreshCw, RotateCcw, Save, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
+import { agentApi, type AgentBackupExportReport, type AgentBackupInspectReport, type AgentBackupRestoreReport, type AgentBackupScope, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type GithubAccountStatus, type GithubAppAuthorization, type GithubAppInstallation, type LogItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe } from '../services/agentApi';
+import { Bell, BellOff, Bot, Check, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Github, Globe2, Inbox, KeyRound, Link2, LockKeyhole, LogIn, Monitor, MoreHorizontal, PencilLine, PlugZap, Power, RefreshCw, RotateCcw, ScanSearch, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
+import { BusyIndicator } from '../components/BusyIndicator';
+import { useConfirm } from '../components/ConfirmDialog';
 import { IconButton, PageHeader, Pill } from '../components/Common';
-
-type SettingsSection = 'remote' | 'approval' | 'remote-tools' | 'accounts' | 'connectors' | 'tools' | 'general';
-
-const SETTINGS_SECTIONS = [
-  { key: 'remote', label: '远程任务', description: '接收与执行', icon: ShieldCheck },
-  { key: 'approval', label: '审批策略', description: '确认与授权', icon: ShieldAlert },
-  { key: 'remote-tools', label: '远程控制', description: '客户端路径', icon: Monitor },
-  { key: 'accounts', label: '账号', description: '内网与代码仓库', icon: KeyRound },
-  { key: 'connectors', label: '工作流连接器', description: '工作流服务', icon: PlugZap },
-  { key: 'tools', label: '工具', description: '本机编辑器', icon: Wrench },
-  { key: 'general', label: '通用', description: '启动与更新', icon: Power },
-] satisfies { key: SettingsSection; label: string; description: string; icon: typeof ShieldCheck }[];
+import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
+import { WorkbenchConnectionsPanel, type WorkbenchConnectionDraft } from '../components/WorkbenchConnectionsPanel';
+import { LogsPage } from './LogsPage';
+import { localRuntimeMeta } from './runtimeProviderView';
+import { settingsSectionMeta, settingsSectionTabFor, settingsSectionTabs, type SettingsSection, type SettingsTab } from '../settingsModel';
 
 const BUILTIN_APPROVAL_RULES = new Set(['remote_connect', 'upload_code', 'upload_placeholder', 'controlled_operation', '*', 'risk:R1', 'risk:R2', 'risk:R3', 'risk:R4']);
 
+/** Tauri 拒绝时抛出的通常是字符串，这里统一取出可读原因，避免把真实失败原因盖成通用文案。 */
+function failureText(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  return fallback;
+}
+
 type ApprovalProfile = 'strict' | 'balanced' | 'relaxed' | 'trusted' | 'full_access' | 'silent_deny';
 type ApprovalRuleMode = 'inherit' | 'manual' | 'auto_approve' | 'auto_deny';
-
-function agentModeLabel(mode?: string) {
-  if (mode === 'independent') return '独立模式';
-  if (mode === 'connected') return '工作台模式';
-  return '未确定';
-}
 
 function connectorAvailabilityLabel(availability: string) {
   if (availability === 'local') return '本机连接';
@@ -38,7 +34,7 @@ const APPROVAL_PROFILE_OPTIONS = [
   { value: 'balanced', label: '推荐', description: '查询预览自动执行，修改操作先确认', icon: ShieldCheck },
   { value: 'relaxed', label: '少打扰', description: '查询和普通修改自动执行', icon: BellOff },
   { value: 'trusted', label: '完全信任', description: '常规及高风险操作自动执行，最高风险仍确认', icon: KeyRound },
-  { value: 'full_access', label: '完全放行', description: '所有受控操作自动执行，包括最高风险操作', icon: UnlockKeyhole },
+  { value: 'full_access', label: '完全放行', description: '所有受控操作自动执行，含工作流步骤与最高风险操作', icon: UnlockKeyhole },
   { value: 'silent_deny', label: '只执行已授权项', description: '其他受控请求直接拒绝，不弹审批', icon: ShieldX },
 ] satisfies ChoiceOption[];
 
@@ -72,6 +68,20 @@ export function SettingsPage({
   onSaveLogin,
   onLogoutLogin,
   onOpenInnerAdmin,
+  identity,
+  onRevokeAuthorization,
+  workbenchConnections,
+  workbenchConnectionsError,
+  workbenchBusyId = '',
+  workbenchAuthorization,
+  onRefreshWorkbenchConnections,
+  onAddWorkbenchConnection,
+  onRenameWorkbenchConnection,
+  onRemoveWorkbenchConnection,
+  onSwitchWorkbenchConnection,
+  onEnrollWorkbenchConnection,
+  onProbeWorkbenchConnection,
+  onAuthorizeWorkbenchConnection,
   onRemoteExecutionChange,
   onRemoteClientsChange,
   onRuleChange,
@@ -97,8 +107,12 @@ export function SettingsPage({
   onCancelUpdateDownload,
   onInstallUpdate,
   onUpdatePreferences,
+  logs,
+  onExportDiagnostics,
   independentMode = false,
-  initialSection = 'remote',
+  section,
+  tab = null,
+  onTabChange,
 }: {
   settings: ApprovalSettings | null;
   remoteExecutionSettings: RemoteExecutionSettings | null;
@@ -114,6 +128,21 @@ export function SettingsPage({
   onSaveLogin: () => void;
   onLogoutLogin: () => void;
   onOpenInnerAdmin: () => void;
+  identity: DashboardIdentityStatus | null;
+  onRevokeAuthorization: () => void;
+  workbenchConnections: WorkbenchConnectionsSnapshot | null;
+  /** 连接清单读取失败的原因；有值时面板显示错误态而不是「读取中」。 */
+  workbenchConnectionsError?: string;
+  workbenchBusyId?: string;
+  workbenchAuthorization: DashboardAuthorizationProgress | null;
+  onRefreshWorkbenchConnections: () => void;
+  onAddWorkbenchConnection: (draft: WorkbenchConnectionDraft) => Promise<void>;
+  onRenameWorkbenchConnection: (id: string, displayName: string, purpose: string) => Promise<void>;
+  onRemoveWorkbenchConnection: (connection: WorkbenchConnection) => void;
+  onSwitchWorkbenchConnection: (connection: WorkbenchConnection) => void;
+  onEnrollWorkbenchConnection: (id: string, enrollmentToken: string) => Promise<void>;
+  onProbeWorkbenchConnection: (apiBase: string) => Promise<WorkbenchProbe>;
+  onAuthorizeWorkbenchConnection: (connection: WorkbenchConnection) => void;
   onRemoteExecutionChange: (settings: RemoteExecutionSettings, fullAccessConfirmed?: boolean) => void;
   onRemoteClientsChange: (overview: RemoteClientOverview) => void;
   onRuleChange: (requestType: string, mode: string) => void;
@@ -139,9 +168,15 @@ export function SettingsPage({
   onCancelUpdateDownload: () => void;
   onInstallUpdate: () => void;
   onUpdatePreferences: (autoCheck: boolean, autoDownload: boolean) => void;
+  logs: LogItem[];
+  onExportDiagnostics: () => void;
   independentMode?: boolean;
-  initialSection?: SettingsSection;
+  section: SettingsSection;
+  /** 页内页签：条目把无先后关系的板块并在一处，默认落到第一块。 */
+  tab?: SettingsTab | null;
+  onTabChange?: (tab: SettingsTab) => void;
 }) {
+  const confirm = useConfirm();
   const [builtinAIRuntimeStatus, setBuiltinAIRuntimeStatus] = useState<BuiltinAIRuntimeStatus | null>(null);
   const [builtinAIRuntimeInstallation, setBuiltinAIRuntimeInstallation] = useState<BuiltinAIRuntimeInstallationStatus | null>(null);
   const [builtinAIRuntimeBusy, setBuiltinAIRuntimeBusy] = useState(false);
@@ -149,8 +184,25 @@ export function SettingsPage({
   const [builtinAIRuntimeFeedback, setBuiltinAIRuntimeFeedback] = useState('');
   const [connectorStates, setConnectorStates] = useState<ConnectorStateItem[]>([]);
   const [connectorBusy, setConnectorBusy] = useState('');
+  const [githubAccount, setGithubAccount] = useState<GithubAccountStatus | null>(null);
+  const [githubToken, setGithubToken] = useState('');
+  const [githubBusy, setGithubBusy] = useState(false);
+  const [githubFeedback, setGithubFeedback] = useState('');
+  const [githubMethod, setGithubMethod] = useState<'app' | 'pat'>('app');
+  const [githubClientId, setGithubClientId] = useState('');
+  const [githubDevice, setGithubDevice] = useState<(GithubAppAuthorization & { client_id: string }) | null>(null);
+  const [githubInstallations, setGithubInstallations] = useState<GithubAppInstallation[]>([]);
   const [connectorFeedback, setConnectorFeedback] = useState('');
   const [pendingRuntimeUninstall, setPendingRuntimeUninstall] = useState(false);
+  const [backupScope, setBackupScope] = useState<AgentBackupScope | null>(null);
+  const [backupPassphrase, setBackupPassphrase] = useState('');
+  const [backupIncludeDeviceIdentity, setBackupIncludeDeviceIdentity] = useState(false);
+  const [backupBusy, setBackupBusy] = useState<'' | 'export' | 'inspect' | 'restore'>('');
+  const [backupFeedback, setBackupFeedback] = useState('');
+  const [backupExportReport, setBackupExportReport] = useState<AgentBackupExportReport | null>(null);
+  const [backupInspectReport, setBackupInspectReport] = useState<AgentBackupInspectReport | null>(null);
+  const [backupRestoreReport, setBackupRestoreReport] = useState<AgentBackupRestoreReport | null>(null);
+  const [pendingBackupRestore, setPendingBackupRestore] = useState(false);
   const [approvalCapabilityId, setApprovalCapabilityId] = useState('');
   const [approvalCapabilityMode, setApprovalCapabilityMode] = useState<Exclude<ApprovalRuleMode, 'inherit'>>('manual');
   const exactApprovalRules = Object.entries(settings?.rules || {}).filter(([requestType]) => !BUILTIN_APPROVAL_RULES.has(requestType));
@@ -249,6 +301,124 @@ export function SettingsPage({
       setConnectorFeedback('暂时无法读取连接器状态');
     }
   };
+  const refreshGithubAccount = async () => {
+    try {
+      const account = await agentApi.githubDistributionAccount();
+      setGithubAccount(account);
+      // 撤销授权后 client_id 仍然保留，再次授权时不必重新向管理员索取。
+      setGithubClientId(previous => previous || account.app_client_id || '');
+      if (account.authorized && account.auth_kind !== 'app') setGithubMethod('pat');
+    } catch {
+      setGithubFeedback('暂时无法读取 GitHub 授权状态');
+    }
+  };
+  const saveGithubToken = async () => {
+    if (!githubToken.trim()) return;
+    setGithubBusy(true);
+    setGithubFeedback('');
+    try {
+      const account = await agentApi.setGithubDistributionAccount(githubToken.trim());
+      setGithubAccount(account);
+      setGithubToken('');
+      setGithubFeedback(`已授权 GitHub 账号 ${account.login}`);
+    } catch (error) {
+      setGithubFeedback(failureText(error, 'GitHub 授权失败'));
+      // 校验失败时不把令牌留在界面上，避免明文长时间停在输入框里。
+      setGithubToken('');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+  const clearGithubToken = async () => {
+    setGithubBusy(true);
+    setGithubFeedback('');
+    try {
+      await agentApi.removeGithubDistributionAccount();
+      setGithubAccount(await agentApi.githubDistributionAccount());
+      setGithubInstallations([]);
+      setGithubFeedback('已解除 GitHub 授权');
+    } catch (error) {
+      setGithubFeedback(failureText(error, '解除 GitHub 授权失败'));
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+  const startGithubAppAuthorization = async () => {
+    setGithubBusy(true);
+    setGithubFeedback('');
+    try {
+      const started = await agentApi.startGithubAppAuthorization(githubClientId.trim() || undefined);
+      setGithubClientId(started.client_id);
+      setGithubDevice({ client_id: started.client_id, ...started.authorization });
+    } catch (error) {
+      setGithubFeedback(failureText(error, 'GitHub App 授权失败'));
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+  const openGithubAuthorizationPage = async () => {
+    if (!githubDevice) return;
+    try {
+      // 优先用带 user_code 的地址：授权页直接预填，用户少一次手输。
+      await agentApi.openGithubAuthorizationPage(githubDevice.verification_uri_complete || githubDevice.verification_uri);
+    } catch (error) {
+      setGithubFeedback(failureText(error, '打开授权页失败'));
+    }
+  };
+  const copyGithubUserCode = async () => {
+    if (!githubDevice) return;
+    try {
+      await navigator.clipboard.writeText(githubDevice.user_code);
+      setGithubFeedback('已复制授权码');
+    } catch {
+      setGithubFeedback('复制失败，请手动输入授权码');
+    }
+  };
+  const cancelGithubAppAuthorization = () => {
+    // 设备码最长可挂 15 分钟，用户改主意时要能退出来重填 client_id，不能只能等超时。
+    setGithubDevice(null);
+    setGithubFeedback('已取消本次授权');
+  };
+  const loadGithubInstallations = async () => {
+    setGithubBusy(true);
+    setGithubFeedback('');
+    try {
+      const result = await agentApi.listGithubAppInstallations();
+      setGithubInstallations(result.installations || []);
+      if (!(result.installations || []).length) setGithubFeedback('没有可用安装，请先在 GitHub 上把 App 安装到目标账号');
+    } catch (error) {
+      setGithubFeedback(failureText(error, '读取安装列表失败'));
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+  const bindGithubInstallation = async (installationId: string) => {
+    setGithubBusy(true);
+    setGithubFeedback('');
+    try {
+      setGithubAccount(await agentApi.selectGithubAppInstallation(installationId));
+      setGithubInstallations([]);
+      setGithubFeedback('已绑定发布账号');
+    } catch (error) {
+      setGithubFeedback(failureText(error, '绑定发布账号失败'));
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+  const importGithubAppPrivateKey = async () => {
+    setGithubBusy(true);
+    setGithubFeedback('');
+    try {
+      setGithubAccount(await agentApi.importGithubAppPrivateKey());
+      setGithubFeedback('私钥已导入');
+    } catch (error) {
+      const message = failureText(error, '导入私钥失败');
+      // 取消选择不是失败，不该在界面上留下红字。
+      setGithubFeedback(message.includes('取消') ? '' : message);
+    } finally {
+      setGithubBusy(false);
+    }
+  };
   const updateConnector = async (connectorId: string, action: 'enable' | 'disable' | 'revoke' | 'restore') => {
     setConnectorBusy(`${connectorId}:${action}`);
     setConnectorFeedback('');
@@ -276,19 +446,103 @@ export function SettingsPage({
   const [editorSaving, setEditorSaving] = useState(false);
   const [pendingRemoteRuntimeUnrestricted, setPendingRemoteRuntimeUnrestricted] = useState<RemoteExecutionSettings | null>(null);
   const [pendingApprovalProfile, setPendingApprovalProfile] = useState<'trusted' | 'full_access' | null>(null);
-  const [agentMode, setAgentMode] = useState<AgentModeSettings | null>(null);
-  const [agentModeBusy, setAgentModeBusy] = useState(false);
-  const [agentModeFeedback, setAgentModeFeedback] = useState('');
   const [remoteClientDrafts, setRemoteClientDrafts] = useState<Record<RemoteClientVendor, string>>({ sunlogin: '', todesk: '' });
   const remoteClientDraftsInitialized = useRef(false);
   const [remoteClientBusy, setRemoteClientBusy] = useState<RemoteClientVendor | 'detect' | null>(null);
   const [remoteClientFeedback, setRemoteClientFeedback] = useState<Record<RemoteClientVendor, string>>({ sunlogin: '', todesk: '' });
-  const [section, setSection] = useState<SettingsSection>(initialSection);
-  useEffect(() => setSection(initialSection), [initialSection]);
+  const [skillSyncMode, setSkillSyncMode] = useState<'copy' | 'symlink'>('copy');
+  const [skillTargetRoot, setSkillTargetRoot] = useState('');
+  const [skillSyncBusy, setSkillSyncBusy] = useState(false);
+  const [skillFeedback, setSkillFeedback] = useState('');
+
+  // 切换写入方式会重写每个技能在每个 AI 工具里的副本，所以按"改设置 + 重新生成 + 汇报结果"三步走。
+  async function chooseSkillSyncMode(mode: 'copy' | 'symlink') {
+    if (mode === skillSyncMode || skillSyncBusy) return;
+    setSkillSyncBusy(true);
+    setSkillFeedback('');
+    try {
+      await agentApi.setSkillSyncMode(mode);
+      await agentApi.syncCodexSkills();
+      setSkillSyncMode(mode);
+      const status = await agentApi.codexSkillStatus();
+      setSkillTargetRoot(status.target_root || '');
+      setSkillFeedback(mode === 'copy' ? '已改为复制文件，并重新生成各工具的副本' : '已改为链接文件，并重新生成各工具的链接');
+    } catch (error) {
+      setSkillFeedback(failureText(error, '更新技能写入方式失败'));
+    } finally {
+      setSkillSyncBusy(false);
+    }
+  }
   useEffect(() => {
     setUnityEditorSettings(settings?.editors || null);
     setUnityEditorPath(settings?.editors?.unity_editor_path || '');
   }, [settings?.editors]);
+  // GitHub 授权状态只在账号页出现时才读取，避免设置窗口打开就产生额外 IPC。
+  useEffect(() => {
+    if (section !== 'accounts') return;
+    void refreshGithubAccount();
+  }, [section]);
+  // 设备流：拿到 user_code 后按 GitHub 给的间隔轮询，直到用户授权、拒绝或超时。
+  // 取消切换小节就停止轮询，避免关掉设置窗口后还在后台打点。
+  useEffect(() => {
+    if (section !== 'accounts' || !githubDevice) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    let intervalMs = Math.max(2, githubDevice.interval || 5) * 1000;
+    const deadline = Date.now() + Math.max(60, githubDevice.expires_in || 900) * 1000;
+    const tick = async () => {
+      try {
+        const result = await agentApi.pollGithubAppAuthorization(githubDevice.client_id, githubDevice.device_code);
+        if (cancelled) return;
+        if (result.state === 'authorized') {
+          setGithubDevice(null);
+          setGithubAccount(await agentApi.githubDistributionAccount());
+          const installations = result.installations || [];
+          setGithubInstallations(installations);
+          setGithubFeedback(installations.length ? '已完成授权，请选择发布账号' : '已完成授权，但还没有可用安装，请先在 GitHub 上安装这个 App');
+          return;
+        }
+        if (result.state === 'expired' || Date.now() > deadline) {
+          setGithubDevice(null);
+          setGithubFeedback('授权超时，请重新开始');
+          return;
+        }
+        if (result.state === 'denied') {
+          setGithubDevice(null);
+          setGithubFeedback('授权被取消');
+          return;
+        }
+        if (result.state === 'slow_down') intervalMs += 5000;
+        timer = window.setTimeout(() => void tick(), intervalMs);
+      } catch (error) {
+        if (!cancelled) {
+          setGithubDevice(null);
+          setGithubFeedback(failureText(error, 'GitHub App 授权失败'));
+        }
+      }
+    };
+    timer = window.setTimeout(() => void tick(), intervalMs);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [section, githubDevice]);
+  // 技能安装方式是全局配置，只有进入「技能」小节时才读取。
+  useEffect(() => {
+    if (section !== 'tooling' || settingsSectionTabFor(section, tab) !== 'skills') return;
+    let active = true;
+    void (async () => {
+      try {
+        const [settingsValue, status] = await Promise.all([agentApi.skillSyncSettings(), agentApi.codexSkillStatus()]);
+        if (!active) return;
+        setSkillSyncMode(settingsValue.mode);
+        setSkillTargetRoot(status.target_root || '');
+      } catch (error) {
+        if (active) setSkillFeedback(failureText(error, '读取技能设置失败'));
+      }
+    })();
+    return () => { active = false; };
+  }, [section, tab]);
   useEffect(() => {
     if (!remoteClients) return;
     const nextDrafts = remoteClientDraftsFromOverview(remoteClients);
@@ -305,41 +559,91 @@ export function SettingsPage({
     });
   }, [remoteClients]);
   useEffect(() => {
-    if (section === 'connectors') void refreshConnectors();
-  }, [section]);
+    if (section === 'services' && settingsSectionTabFor(section, tab) === 'connectors') void refreshConnectors();
+  }, [section, tab]);
   useEffect(() => {
-    let active = true;
-    void agentApi.agentMode().then(value => { if (active) setAgentMode(value); }).catch(error => {
-      if (active) setAgentModeFeedback(error instanceof Error ? error.message : '运行模式读取失败');
-    });
-    return () => { active = false; };
-  }, []);
-
-  async function changeAgentMode(mode: 'connected' | 'independent') {
-    if (!agentMode || agentMode.mode === mode || agentModeBusy) return;
-    const title = mode === 'independent' ? '切换到独立模式？' : '切换到工作台模式？';
-    const message = mode === 'independent'
-      ? '保留本机 AI、技能、插件和工具连接，不再接收工作台任务。保存后需重启应用。'
-      : '连接 HiMind 工作台，启用团队任务、共享服务和审计。保存后需重启应用。';
-    if (!window.confirm(`${title}\n\n${message}`)) return;
-    setAgentModeBusy(true);
-    setAgentModeFeedback('');
-    try {
-      const next = await agentApi.setAgentMode(mode);
-      setAgentMode(next);
-      setAgentModeFeedback('已保存，重启应用后生效');
-    } catch (error) {
-      setAgentModeFeedback(error instanceof Error ? error.message : '运行模式保存失败');
-    } finally {
-      setAgentModeBusy(false);
+    if (section !== 'diagnostics' || settingsSectionTabFor(section, tab) !== 'backup' || backupScope) return;
+    let disposed = false;
+    void agentApi.backupScope()
+      .then(scope => { if (!disposed) setBackupScope(scope); })
+      .catch(() => { if (!disposed) setBackupFeedback('暂时无法读取备份范围'); });
+    return () => { disposed = true; };
+  }, [section, tab, backupScope]);
+  const backupMinPassphrase = backupScope?.minPassphraseChars ?? 8;
+  const exportBackup = async () => {
+    // 只要本机存过账号或凭据，导出就必须带口令，否则包里的凭据是空的。
+    // 在这里挡住，用户不必先选完保存位置才知道要填口令。
+    const passphrase = backupPassphrase.trim();
+    if (!passphrase) {
+      setBackupFeedback(`先设置一个至少 ${backupMinPassphrase} 位的口令，账号与凭据会用它加密`);
+      return;
     }
-  }
-
+    if (passphrase.length < backupMinPassphrase) {
+      setBackupFeedback(`口令至少 ${backupMinPassphrase} 位`);
+      return;
+    }
+    setBackupBusy('export');
+    setBackupFeedback('');
+    try {
+      const result = await agentApi.exportBackup(passphrase, backupIncludeDeviceIdentity);
+      if (result.canceled) {
+        setBackupFeedback('已取消导出');
+        return;
+      }
+      setBackupExportReport(result.report);
+      setBackupInspectReport(null);
+      setBackupRestoreReport(null);
+      setBackupFeedback(`已写入 ${result.report.path}`);
+    } catch (error) {
+      setBackupFeedback(failureText(error, '导出备份包失败'));
+    } finally {
+      setBackupBusy('');
+    }
+  };
+  const inspectBackup = async () => {
+    setBackupBusy('inspect');
+    setBackupFeedback('');
+    try {
+      const result = await agentApi.inspectBackup();
+      if (result.canceled) {
+        setBackupFeedback('已取消查看');
+        return;
+      }
+      setBackupInspectReport(result.report);
+      setBackupExportReport(null);
+      setBackupRestoreReport(null);
+    } catch (error) {
+      setBackupFeedback(failureText(error, '无法读取备份包'));
+    } finally {
+      setBackupBusy('');
+    }
+  };
+  const restoreBackup = async () => {
+    setPendingBackupRestore(false);
+    setBackupBusy('restore');
+    setBackupFeedback('');
+    try {
+      const result = await agentApi.importBackup(null, backupPassphrase.trim() || null);
+      if (result.canceled) {
+        setBackupFeedback('已取消恢复');
+        return;
+      }
+      setBackupRestoreReport(result.report);
+      setBackupExportReport(null);
+      setBackupInspectReport(null);
+      setBackupFeedback(`已恢复 ${result.report.restored.length} 个文件，重启 Agent 后生效`);
+    } catch (error) {
+      setBackupFeedback(failureText(error, '恢复备份失败'));
+    } finally {
+      setBackupBusy('');
+    }
+  };
   async function chooseUnityEditor() {
     const result = await agentApi.pickUnityEditor();
     if (result.path) {
       setUnityEditorPath(result.path);
-      setEditorFeedback('');
+      // 选择路径即保存，不再要求用户再点一次保存按钮。
+      await saveUnityEditor(result.path);
     }
   }
 
@@ -379,7 +683,7 @@ export function SettingsPage({
       const result = await agentApi.pickRemoteClient(vendor);
       if (result.path) {
         setRemoteClientDrafts(current => ({ ...current, [vendor]: result.path || '' }));
-        setRemoteClientFeedback(current => ({ ...current, [vendor]: '' }));
+        await saveRemoteClient(vendor, result.path);
       }
     } catch (error) {
       setRemoteClientFeedback(current => ({ ...current, [vendor]: error instanceof Error ? error.message : '无法打开文件选择器' }));
@@ -403,7 +707,7 @@ export function SettingsPage({
     }
   }
 
-  if (!settings || !remoteExecutionSettings || !loginState) return <div className="page-loading"><span className="spinner" />正在读取应用设置</div>;
+  if (!settings || !remoteExecutionSettings || !loginState) return <div className="page-loading"><BusyIndicator size={15} />正在读取应用设置</div>;
   const configured = loginState.status === 'credentials_configured';
   const editorState = unityEditorSettings || settings.editors;
   const editorDirty = unityEditorPath.trim() !== (editorState?.unity_editor_path || '');
@@ -427,31 +731,30 @@ export function SettingsPage({
     }
     onApprovalProfileChange(next, next === 'trusted');
   };
+  const sectionMeta = settingsSectionMeta(section);
+  const sectionTabs = settingsSectionTabs(section);
+  const activeTab = settingsSectionTabFor(section, tab);
   return (
     <>
-      <PageHeader title="设置" description="配置权限、账号、工具和应用设置。" />
-      <div className="settings-workspace">
-        <label className="settings-section-select">
-          <span>设置分类</span>
-          <select value={section} onChange={event => setSection(event.target.value as SettingsSection)}>
-            {SETTINGS_SECTIONS.map(item => <option key={item.key} value={item.key}>{item.label} · {item.description}</option>)}
-          </select>
-        </label>
-        <nav className="settings-nav" aria-label="设置分类">
-          {SETTINGS_SECTIONS.map(item => (
-            <button key={item.key} className={section === item.key ? 'active' : ''} onClick={() => setSection(item.key)} aria-current={section === item.key ? 'page' : undefined}>
-              <item.icon size={16} />
-              <span><strong>{item.label}</strong><small>{item.description}</small></span>
-            </button>
-          ))}
-        </nav>
+      <PageHeader title={sectionMeta.label} description={sectionMeta.description} />
         <div className="settings-content">
-          {section === 'remote' ? <>
+          {sectionTabs.length ? <div className="settings-tabs" role="tablist" aria-label={`${sectionMeta.label}分类`}>
+            {sectionTabs.map(item => <button
+              key={item.key}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === item.key}
+              className={activeTab === item.key ? 'active' : ''}
+              onClick={() => onTabChange?.(item.key)}
+            >{item.label}</button>)}
+          </div> : null}
+
+          {section === 'automation' ? <>
             <section className="card settings-section">
               <div className="card-header"><span>远程任务</span><Pill kind={remoteExecutionSettings.enabled ? 'success' : 'neutral'}>{remoteExecutionSettings.enabled ? '已启用' : '已关闭'}</Pill></div>
               <div className="card-body setting-list">
                 <SettingRow title="接受远程任务" description="只接收当前 HiMind 账号发给这台电脑的任务"><label className="toggle"><input type="checkbox" checked={remoteExecutionSettings.enabled} onChange={event => updateRemoteExecution({ enabled: event.target.checked })} /><span className="slider"></span></label></SettingRow>
-                <SettingRow title="远程任务访问范围" description={remoteExecutionSettings.enabled ? '限制远程任务可以访问的文件范围；不改变审批设置' : '启用远程任务后生效'}>
+                <SettingRow title="远程任务访问范围" description={remoteExecutionSettings.enabled ? '限制可访问的文件范围；不改审批设置' : '启用远程任务后生效'}>
                   <select aria-label="远程任务访问范围" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.access_mode} onChange={event => updateRemoteExecution({ access_mode: event.target.value as RemoteExecutionSettings['access_mode'] })}>
                     <option value="exhibit_linked">仅限项目目录（推荐）</option>
                     <option value="full_access">允许访问本机全部文件（高风险）</option>
@@ -459,7 +762,7 @@ export function SettingsPage({
                 </SettingRow>
                 <SettingRow title="执行工具" description={remoteExecutionSettings.enabled ? '自动模式会选择本机可用的 AI 工具' : '启用远程任务后生效'}>
                   <select aria-label="远程任务执行工具" disabled={!remoteExecutionSettings.enabled} value={remoteExecutionSettings.default_provider} onChange={event => updateRemoteExecution({ default_provider: event.target.value as RemoteExecutionSettings['default_provider'] })}>
-                    <option value="himind.builtin">HiMind AI（推荐）</option><option value="auto">自动选择可用工具</option><option value="personal.codex">Codex</option><option value="personal.github-copilot">GitHub Copilot</option>
+                    <option value="himind.builtin">{localRuntimeMeta('himind.builtin').name}（推荐）</option><option value="auto">自动选择可用工具</option><option value="personal.codex">{localRuntimeMeta('personal.codex').name}</option><option value="personal.github-copilot">{localRuntimeMeta('personal.github-copilot').name}</option>
                   </select>
                 </SettingRow>
               </div>
@@ -479,17 +782,14 @@ export function SettingsPage({
                   </div>
                   <div className="actions-row runtime-actions">
                     <button className="btn btn-primary" disabled={builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking} onClick={() => void primaryRuntimeAction()}>
-                      {builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking ? <LoaderCircle className="spin" size={15} /> : runtimeReady && builtinAIRuntimeInstallation?.update_available ? <Download size={15} /> : runtimeReady ? <RefreshCw size={15} /> : <Download size={15} />}
+                      {builtinAIRuntimeBusy || builtinAIRuntimeCheckBusy || runtimeWorking ? <BusyIndicator size={15} /> : runtimeReady && builtinAIRuntimeInstallation?.update_available ? <Download size={15} /> : runtimeReady ? <RefreshCw size={15} /> : <Download size={15} />}
                       {runtimeWorking ? `${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}中 ${builtinAIRuntimeInstallation?.progress_percent || 0}%` : !runtimeReady ? '安装 HiMind AI' : builtinAIRuntimeInstallation?.update_available ? `更新到 v${builtinAIRuntimeInstallation.available_version}` : builtinAIRuntimeCheckBusy ? '检查中' : '检查更新'}
                     </button>
-                    <details className="runtime-more-actions">
-                      <summary title="更多操作" aria-label="更多操作"><MoreHorizontal size={17} /></summary>
-                      <div>
-                        <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void installLocalBuiltinAIRuntime()}><FolderOpen size={14} />从本地安装包安装</button>
-                         {runtimeReady ? <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void startBuiltinAIRuntimeOperation('repair')}><Wrench size={14} />修复 HiMind AI</button> : null}
-                         {runtimeReady ? <button type="button" className="danger-text" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => setPendingRuntimeUninstall(true)}><Trash2 size={14} />卸载 HiMind AI</button> : <button type="button" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => void refreshBuiltinAIRuntime()}><RefreshCw size={14} />重新检测</button>}
-                      </div>
-                    </details>
+                    <ActionMenu label="更多" icon={<MoreHorizontal size={16} />} title="HiMind AI 运行时的更多操作">{close => <>
+                      <ActionMenuItem icon={<FolderOpen size={15} />} label="从本地安装包安装" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => { void installLocalBuiltinAIRuntime(); close(); }} />
+                      {runtimeReady ? <ActionMenuItem icon={<Wrench size={15} />} label="修复 HiMind AI" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => { void startBuiltinAIRuntimeOperation('repair'); close(); }} /> : null}
+                      {runtimeReady ? <ActionMenuItem danger icon={<Trash2 size={15} />} label="卸载 HiMind AI" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => { setPendingRuntimeUninstall(true); close(); }} /> : <ActionMenuItem icon={<ScanSearch size={15} />} label="重新检测" disabled={builtinAIRuntimeBusy || runtimeWorking} onClick={() => { void refreshBuiltinAIRuntime(); close(); }} />}
+                    </>}</ActionMenu>
                   </div>
                 </div>
                 {runtimeWorking ? <div className="runtime-install-progress" role="status" aria-label={`${runtimeActionLabel(builtinAIRuntimeInstallation?.operation || 'install')}进度 ${builtinAIRuntimeInstallation?.progress_percent || 0}%`}><span style={{ width: `${builtinAIRuntimeInstallation?.progress_percent || 0}%` }} /></div> : null}
@@ -513,10 +813,10 @@ export function SettingsPage({
               <div className="approval-settings-body">
                 <div className="approval-identity-row">
                   <div><strong>授权归属</strong><span>{independentMode ? '审批设置只保存在本机' : settings.owner_user_id ? '审批设置与当前工作台账号和这台电脑绑定' : '当前审批设置仅保存在本机'}</span></div>
-                  <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '独立模式' : settings.owner_user_id ? '已绑定账号' : '本机模式'}</Pill>
+                  <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '未对接工作台' : settings.owner_user_id ? '已绑定账号' : '本机模式'}</Pill>
                 </div>
-                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>独立模式下，审批记录和提醒只保存在本机。由其他工具直接执行的操作不经过这里。</span></div> : null}
-                <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>完全放行只跳过普通操作的确认。工作流中的人工审批仍需确认，也不会解除远程任务的目录限制。</span></div>
+                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>未对接 AI 工作台时，记录与提醒只存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
+              <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>受控操作不再询问，工作流确认步骤也跳过；工作台侧授权与远程目录限制不受影响。</span></div>
 
                 <div className="approval-settings-group">
                   <div className="approval-group-heading"><strong>什么时候需要我确认</strong><span>单项例外会优先于整体设置</span></div>
@@ -552,7 +852,7 @@ export function SettingsPage({
                     <SettingRow title="新增与普通修改" description="新增记录、更新项目或写入普通文件"><ApprovalRuleChoice label="新增与普通修改" value={approvalRuleValue(settings, 'risk:R2')} onChange={mode => onRuleChange('risk:R2', mode)} /></SettingRow>
                     <SettingRow title="删除、发布与权限变更" description="高风险操作；自动允许仅在完全信任或完全放行下可用"><ApprovalRuleChoice label="删除、发布与权限变更" value={approvalRuleValue(settings, 'risk:R3')} autoApproveDisabled={!['trusted', 'full_access'].includes(approvalProfile)} onChange={mode => onRuleChange('risk:R3', mode)} /></SettingRow>
                     <SettingRow title="系统级操作" description="仅在完全放行时可设为自动允许"><ApprovalRuleChoice label="系统级操作" value={approvalRuleValue(settings, 'risk:R4')} autoApproveDisabled={approvalProfile !== 'full_access'} onChange={mode => onRuleChange('risk:R4', mode)} /></SettingRow>
-                    <SettingRow title="系统保护边界" description="系统目录、应用数据、安装目录、磁盘根、越界路径及超限批量操作"><Pill kind="danger">始终阻止</Pill></SettingRow>
+                <SettingRow title="系统保护边界" description="系统目录、应用数据、安装目录、磁盘根与越界路径"><Pill kind="danger">始终阻止</Pill></SettingRow>
                     <SettingRow title="其他受控操作" description="没有单独分类但仍需审批的操作"><ApprovalRuleChoice label="其他受控操作" value={approvalRuleValue(settings, 'controlled_operation')} onChange={mode => onRuleChange('controlled_operation', mode)} /></SettingRow>
                     <SettingRow title="未分类普通操作" description="尚未分类的非高风险操作"><ApprovalRuleChoice label="未分类普通操作" value={approvalRuleValue(settings, '*')} onChange={mode => onRuleChange('*', mode)} /></SettingRow>
                     {exactApprovalRules.map(([requestType, mode]) => <SettingRow key={requestType} title={requestType} description="功能单项例外"><ApprovalRuleChoice label={requestType} value={mode as ApprovalRuleMode} autoApproveDisabled={(requestType === 'risk:R4' && approvalProfile !== 'full_access') || (isHighRiskRuleKey(requestType) && !['trusted', 'full_access'].includes(approvalProfile))} onChange={next => onRuleChange(requestType, next)} /></SettingRow>)}
@@ -571,8 +871,8 @@ export function SettingsPage({
               </div>
             </section> : null}
 
-          {section === 'remote-tools' ? <section className="card settings-section remote-client-settings">
-              <div className="card-header"><span>远程控制</span><div className="card-header-actions"><button type="button" className="btn btn-icon" title="重新检测" aria-label="重新检测远程控制客户端" disabled={remoteClientBusy !== null} onClick={() => void detectRemoteClients()}>{remoteClientBusy === 'detect' ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button></div></div>
+          {section === 'services' && activeTab === 'remote-clients' ? <section className="card settings-section remote-client-settings">
+              <div className="card-header"><span>远程控制</span><div className="card-header-actions"><button type="button" className="btn btn-icon" title="重新检测本机客户端" aria-label="重新检测本机客户端" disabled={remoteClientBusy !== null} onClick={() => void detectRemoteClients()}>{remoteClientBusy === 'detect' ? <BusyIndicator size={16} /> : <ScanSearch size={16} />}</button></div></div>
             <div className="remote-client-body">
               <div className="remote-client-list">
                 {REMOTE_CLIENT_OPTIONS.map(option => <RemoteClientCard key={option.vendor} option={option} status={remoteClients?.items.find(item => item.vendor === option.vendor)} path={remoteClientDrafts[option.vendor]} busy={remoteClientBusy === option.vendor} feedback={remoteClientFeedback[option.vendor]} onPathChange={path => { setRemoteClientDrafts(current => ({ ...current, [option.vendor]: path })); setRemoteClientFeedback(current => ({ ...current, [option.vendor]: '' })); }} onPick={() => void chooseRemoteClient(option.vendor)} onSave={() => void saveRemoteClient(option.vendor)} onClear={() => void saveRemoteClient(option.vendor, '')} />)}
@@ -580,7 +880,24 @@ export function SettingsPage({
             </div>
           </section> : null}
 
-          {section === 'accounts' ? <section className="card settings-section settings-credentials">
+          {section === 'accounts' ? <>
+          <WorkbenchConnectionsPanel
+            snapshot={workbenchConnections}
+            error={workbenchConnectionsError || ''}
+            identity={identity}
+            authorization={workbenchAuthorization}
+            busyId={workbenchBusyId}
+            onRefresh={onRefreshWorkbenchConnections}
+            onAdd={onAddWorkbenchConnection}
+            onRename={onRenameWorkbenchConnection}
+            onRemove={onRemoveWorkbenchConnection}
+            onSwitch={onSwitchWorkbenchConnection}
+            onEnroll={onEnrollWorkbenchConnection}
+            onProbe={onProbeWorkbenchConnection}
+            onAuthorize={onAuthorizeWorkbenchConnection}
+            onRevoke={onRevokeAuthorization}
+          />
+          <section className="card settings-section settings-credentials">
             <div className="card-header">账号</div>
             <div className="credential-section">
               <div className="credential-heading"><span>内网账号</span><Pill kind={configured ? 'success' : 'warn'}>{configured ? '已配置' : '待配置'}</Pill></div>
@@ -596,13 +913,98 @@ export function SettingsPage({
               {svnConnections[0] ? <div className="svn-connection-row">
                 <div className="account-icon"><Database size={17} /></div>
                 <div className="svn-connection-main"><strong>{svnConnections[0].username}</strong><span>{svnConnections[0].base_url}</span><small>{svnConnections[0].status === 'invalid' ? '请更新账号并重新测试' : svnConnections[0].status === 'unreachable' ? '请检查 SVN 服务和本机客户端' : '项目仓库地址由项目自动生成'}</small></div>
-                <div className="actions-row svn-connection-actions"><button className="btn" disabled={svnTesting} onClick={onTestSvnConnection}>{svnTesting ? <><LoaderCircle size={14} className="spin" />测试中</> : '测试'}</button><button className="btn" disabled={svnTesting} onClick={onOpenSvnModal}>更新账号</button><button className="btn btn-danger-quiet" disabled={svnTesting} onClick={onRemoveSvnConnection}>清除</button></div>
+                <div className="actions-row svn-connection-actions"><button className="btn" disabled={svnTesting} onClick={onTestSvnConnection}>{svnTesting ? <><BusyIndicator size={14} />测试中</> : '测试'}</button><button className="btn" disabled={svnTesting} onClick={onOpenSvnModal}>更新账号</button><button className="btn btn-danger-quiet" disabled={svnTesting} onClick={onRemoveSvnConnection}>清除</button></div>
               </div> : <div className="account-row"><div className="account-icon"><Database size={17} /></div><div><span>公司 SVN</span><strong>尚未配置个人账号</strong></div><button className="btn btn-primary" onClick={onOpenSvnModal}>配置账号</button></div>}
               <div className="security-note compact"><ShieldCheck size={16} /><span>密码只保存在当前 Windows 用户的本地加密存储中。</span></div>
             </div>
-          </section> : null}
+            <div className="credential-section">
+              <div className="credential-heading"><span>GitHub 账号</span><Pill kind={githubAccount?.authorized ? 'success' : 'neutral'}>{githubAccount?.authorized ? '已授权' : '未授权'}</Pill></div>
+              {githubAccount?.authorized ? <div className="account-row">
+                <div className="account-icon"><Github size={17} /></div>
+                <div>
+                  <span>{githubAccount.auth_kind === 'app' ? 'GitHub App' : '个人访问令牌'}</span>
+                  <strong>{githubAccount.login || '已授权'}</strong>
+                  <small>{githubAccount.auth_kind === 'app'
+                    ? [githubAccount.installation_account ? `发布账号 ${githubAccount.installation_account}` : '尚未绑定发布账号', githubAccount.private_key_configured ? '' : '尚未导入私钥'].filter(Boolean).join(' · ')
+                    : '扩展版本可发布为 GitHub Release'}</small>
+                </div>
+                <div className="actions-row">
+                  {githubAccount.auth_kind === 'app' && !githubAccount.private_key_configured
+                    ? <button className="btn btn-primary" disabled={githubBusy} onClick={() => void importGithubAppPrivateKey()}>{githubBusy ? <BusyIndicator size={15} /> : <KeyRound size={15} />}导入私钥</button>
+                    : null}
+                  {githubAccount.auth_kind === 'app' && githubAccount.private_key_configured
+                    ? <button className="btn" disabled={githubBusy} onClick={() => void loadGithubInstallations()}>{githubBusy ? <BusyIndicator size={15} /> : null}更换发布账号</button>
+                    : null}
+                  <button className="btn btn-danger-quiet" disabled={githubBusy} onClick={() => void clearGithubToken()}>{githubBusy ? <BusyIndicator size={15} /> : <Trash2 size={15} />}解除授权</button>
+                </div>
+              </div> : <>
+                <div className="segmented-control" role="group" aria-label="GitHub 授权方式">
+                  <button type="button" className={githubMethod === 'app' ? 'active' : ''} disabled={githubBusy || Boolean(githubDevice)} onClick={() => setGithubMethod('app')}>GitHub App</button>
+                  <button type="button" className={githubMethod === 'pat' ? 'active' : ''} disabled={githubBusy || Boolean(githubDevice)} onClick={() => setGithubMethod('pat')}>个人令牌</button>
+                </div>
+                {githubMethod === 'app' ? <div className="field-group" style={{ marginTop: 12 }}>
+                  {githubDevice ? <>
+                    <label className="field-label">在 GitHub 上输入这个授权码</label>
+                    <div className="actions-row">
+                      <code className="device-code">{githubDevice.user_code}</code>
+                      <button type="button" className="btn" onClick={() => void copyGithubUserCode()}>复制</button>
+                      <button type="button" className="btn btn-primary" onClick={() => void openGithubAuthorizationPage()}><ExternalLink size={15} />打开授权页</button>
+                      <button type="button" className="btn btn-quiet" onClick={cancelGithubAppAuthorization}>取消</button>
+                    </div>
+                <p className="field-hint">「打开授权页」会带上授权码；授权完成后本页自动继续，无需确认。</p>
+                  </> : <>
+                    <label className="field-label" htmlFor="github-app-client-id">App client_id</label>
+                    <input
+                      id="github-app-client-id"
+                      autoComplete="off"
+                      value={githubClientId}
+                      disabled={githubBusy}
+                      placeholder="Iv23li..."
+                      onChange={event => { setGithubClientId(event.target.value); setGithubFeedback(''); }}
+                    />
+                    <p className="field-hint">组织注册 App 时生成，授权一次之后无需再填。</p>
+                    <div className="actions-row" style={{ marginTop: 8 }}>
+                      <button type="button" className="btn btn-primary" disabled={githubBusy} onClick={() => void startGithubAppAuthorization()}>{githubBusy ? <BusyIndicator size={15} /> : <LogIn size={15} />}开始授权</button>
+                    </div>
+                  </>}
+                </div> : <div className="field-group" style={{ marginTop: 12 }}>
+                  <label className="field-label" htmlFor="github-distribution-token">个人访问令牌</label>
+                  <input
+                    id="github-distribution-token"
+                    type="password"
+                    autoComplete="off"
+                    value={githubToken}
+                    disabled={githubBusy}
+                    placeholder="细粒度令牌，需要 Contents: Read and write"
+                    onChange={event => { setGithubToken(event.target.value); setGithubFeedback(''); }}
+                  />
+                  <p className="field-hint">临时方案：令牌会跟随账号有效期，App 授权更省事。</p>
+                  <div className="actions-row" style={{ marginTop: 8 }}>
+                    <button type="button" className="btn btn-primary" disabled={githubBusy || !githubToken.trim()} onClick={() => void saveGithubToken()}>{githubBusy ? <BusyIndicator size={15} /> : <LogIn size={15} />}校验并授权</button>
+                  </div>
+                </div>}
+              </>}
+              {githubInstallations.length ? <div className="field-group" style={{ marginTop: 12 }}>
+                <label className="field-label">选择发布账号</label>
+                {githubInstallations.map(item => (
+                  <div key={item.id} className="account-row">
+                    <div className="account-icon"><Github size={16} /></div>
+                    <div>
+                      <span>{item.account_type === 'Organization' ? '组织安装' : '个人安装'}</span>
+                      <strong>{item.account}</strong>
+                      <small>{item.repository_selection === 'all' ? '全部仓库' : '部分仓库'}</small>
+                    </div>
+                    <div className="actions-row"><button type="button" className="btn" disabled={githubBusy} onClick={() => void bindGithubInstallation(item.id)}>绑定</button></div>
+                  </div>
+                ))}
+              </div> : null}
+              <div className="security-note compact"><ShieldCheck size={16} /><span>凭据经 DPAPI 加密保存在本机，只用于创建 tag 与 Release，不写入日志或控制面。</span></div>
+              {githubFeedback ? <div className="inline-feedback visible" role="status">{githubFeedback}</div> : null}
+            </div>
+          </section>
+          </> : null}
 
-          {section === 'connectors' ? <section className="card settings-section">
+          {section === 'services' && activeTab === 'connectors' ? <section className="card settings-section">
             <div className="card-header">
               <span>工作流连接器</span>
               <Pill kind={connectorStates.some(item => item.revoked || !item.enabled) ? 'warn' : connectorStates.length ? 'success' : 'neutral'}>{connectorStates.length}</Pill>
@@ -619,7 +1021,7 @@ export function SettingsPage({
                   <Pill kind={connector.revoked ? 'danger' : connector.enabled ? 'success' : 'warn'}>{connector.revoked ? '已撤销' : connector.enabled ? '已启用' : '已停用'}</Pill>
                   <div className="actions-row">
                     {!connector.revoked ? <button className="btn btn-icon" title={connector.enabled ? '停用连接器' : '启用连接器'} aria-label={connector.enabled ? '停用连接器' : '启用连接器'} disabled={Boolean(connectorBusy)} onClick={() => void updateConnector(connector.id, connector.enabled ? 'disable' : 'enable')}><Power size={15} /></button> : null}
-                    {connector.revoked ? <button className="btn" disabled={Boolean(connectorBusy)} onClick={() => void updateConnector(connector.id, 'restore')}>恢复</button> : <button className="btn btn-danger-quiet" disabled={Boolean(connectorBusy)} onClick={() => { if (window.confirm(`确认撤销连接器“${connector.name}”？本地凭据将被删除。`)) void updateConnector(connector.id, 'revoke'); }}>撤销</button>}
+                    {connector.revoked ? <button className="btn" disabled={Boolean(connectorBusy)} onClick={() => void updateConnector(connector.id, 'restore')}>恢复</button> : <button className="btn btn-danger-quiet" disabled={Boolean(connectorBusy)} onClick={() => { void confirm({ title: `撤销连接器「${connector.name}」？`, description: '本地保存的连接器凭据会被删除，需要重新授权才能再用。', confirmText: '撤销' }).then(accepted => { if (accepted) void updateConnector(connector.id, 'revoke'); }); }}>撤销</button>}
                   </div>
                 </div>
               )) : <div className="unity-editor-source"><div><span>工作流连接器</span><strong>暂无已安装工作流连接器</strong></div><small>安装带有连接器的工作流后会显示在这里。</small></div>}
@@ -627,7 +1029,29 @@ export function SettingsPage({
             </div>
           </section> : null}
 
-          {section === 'tools' ? <section className="card settings-section unity-editor-card">
+          {section === 'tooling' && activeTab === 'skills' ? <section className="card settings-section">
+            <div className="card-header">技能写入方式</div>
+            <div className="card-body skill-settings-body">
+              <div className="actions-row">
+                <button type="button" className={skillSyncMode === 'copy' ? 'btn btn-primary' : 'btn'} disabled={skillSyncBusy} onClick={() => void chooseSkillSyncMode('copy')}><Check size={15} />复制文件</button>
+                <button type="button" className={skillSyncMode === 'symlink' ? 'btn btn-primary' : 'btn'} disabled={skillSyncBusy} onClick={() => void chooseSkillSyncMode('symlink')}><Link2 size={15} />链接文件</button>
+                {skillSyncBusy ? <BusyIndicator size={15} /> : null}
+              </div>
+              <p className="field-hint">
+                {skillSyncMode === 'copy'
+                  ? '复制：每个 AI 工具目录下各存一份独立副本，日常用这个。'
+                  : '链接：工具目录指向本机技能库，改动即时生效；部分系统需先开启开发者模式。'}
+              </p>
+              <div className="actions-row">
+                <button className="btn" type="button" disabled={!skillTargetRoot} title={skillTargetRoot || '技能目录尚未就绪'} onClick={() => void agentApi.openFolder(skillTargetRoot)}><FolderOpen size={15} />打开技能目录</button>
+                <code className="skill-target-path">{skillTargetRoot || '技能目录尚未就绪'}</code>
+              </div>
+              <p className="field-hint">默认装到全局，所有工具可用；要单独装一份，用技能详情里的「安装到指定目录…」。</p>
+              {skillFeedback ? <div className="inline-feedback visible" role="status">{skillFeedback}</div> : null}
+            </div>
+          </section> : null}
+
+          {section === 'tooling' && activeTab === 'tools' ? <section className="card settings-section unity-editor-card">
             <div className="card-header"><span>Unity 编辑器</span><Pill kind={editorState?.valid ? 'success' : 'warn'}>{editorStatus}</Pill></div>
             <div className="unity-editor-body">
               <div className="unity-editor-source">
@@ -637,38 +1061,112 @@ export function SettingsPage({
               <label className="unity-editor-field" htmlFor="unity-editor-path">
                 <span>Unity.exe 路径</span>
                 <div className="unity-editor-input">
-                  <input id="unity-editor-path" value={unityEditorPath} onChange={event => { setUnityEditorPath(event.target.value); setEditorFeedback(''); }} placeholder="请选择 Unity.exe" />
-                  <button className="btn btn-icon" title="选择 Unity.exe" aria-label="选择 Unity.exe" onClick={chooseUnityEditor}><FolderOpen size={16} /></button>
+                  <input id="unity-editor-path" value={unityEditorPath} onChange={event => { setUnityEditorPath(event.target.value); setEditorFeedback(''); }} onBlur={() => { if (editorDirty && unityEditorPath.trim()) void saveUnityEditor(); }} placeholder="请选择 Unity.exe" />
+                  <button className="btn btn-icon" title="选择 Unity.exe" aria-label="选择 Unity.exe" disabled={editorSaving} onClick={chooseUnityEditor}>{editorSaving ? <BusyIndicator size={16} /> : <FolderOpen size={16} />}</button>
                 </div>
               </label>
               <div className="unity-editor-footer">
-                <span className={editorFeedback ? 'inline-feedback visible' : 'inline-feedback'}>{editorFeedback || (editorDirty ? '路径尚未保存' : '')}</span>
+                <span className={editorFeedback ? 'inline-feedback visible' : 'inline-feedback'}>{editorFeedback}</span>
                 <div className="unity-editor-actions">
                   <button className="btn" disabled={editorSaving || (!editorDirty && editorState?.source !== 'agent')} onClick={() => saveUnityEditor('')}><RotateCcw size={15} />恢复默认</button>
-                  <button className="btn btn-primary" disabled={editorSaving || !editorDirty || !unityEditorPath.trim()} onClick={() => saveUnityEditor()}>{editorSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}保存</button>
                 </div>
               </div>
             </div>
           </section> : null}
 
-          {section === 'general' ? <>
+          {section === 'diagnostics' && activeTab === 'logs' ? <LogsPage embedded logs={logs} onExport={onExportDiagnostics} /> : null}
+
+          {section === 'diagnostics' && activeTab === 'backup' ? <>
             <section className="card settings-section">
-              <div className="card-header"><span>运行模式</span><Pill kind={agentMode?.mode === 'independent' ? 'success' : 'neutral'}>{agentModeLabel(agentMode?.mode)}</Pill></div>
-              <div className="card-body setting-list">
-                <SettingRow title="运行模式" description="独立模式适合个人使用；工作台模式适合团队使用。">
-                  <div className="mode-options" role="radiogroup" aria-label="运行模式">
-                    <label className={agentMode?.mode === 'connected' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'connected'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('connected')} /><span>工作台模式</span></label>
-                    <label className={agentMode?.mode === 'independent' ? 'mode-option active' : 'mode-option'}><input type="radio" name="agent-mode" checked={agentMode?.mode === 'independent'} disabled={!agentMode || agentModeBusy} onChange={() => void changeAgentMode('independent')} /><span>独立模式</span></label>
-                  </div>
-                </SettingRow>
-                {agentMode ? <div className="mode-state-summary" role="status">
-                  <span>当前生效：{agentModeLabel(agentMode.effective_mode)}</span>
-                  <span>重启后：{agentModeLabel(agentMode.pending_mode)}</span>
-                  {agentMode.requires_restart ? <strong>重启应用后切换</strong> : null}
-                </div> : null}
-                {agentModeFeedback ? <div className="inline-feedback visible" role="status">{agentModeFeedback}</div> : null}
-              </div>
+              <div className="card-header"><span>备份包</span><Pill kind="neutral">配置与凭据</Pill></div>
+              {/* 口令输入要落在 <form> 里：口令是这一屏的主输入，回车提交给「导出备份包」才是自然动作，
+                  同时 Chromium 也不会再判定「密码框不属于任何表单」。 */}
+              <form
+                onSubmit={event => {
+                  event.preventDefault();
+                  if (!backupBusy) void exportBackup();
+                }}
+              >
+                <div className="card-body setting-list">
+                  <SettingRow title="口令" description={`加密账号与凭据，至少 ${backupMinPassphrase} 位；不写入备份包，忘记无法找回。`}>
+                    <input type="password" aria-label="备份包口令" autoComplete="new-password" value={backupPassphrase} placeholder={`至少 ${backupMinPassphrase} 位`} onChange={event => setBackupPassphrase(event.target.value)} />
+                  </SettingRow>
+                  <SettingRow title="包含设备身份" description="只在本机重装时勾选；换机恢复保留新机器身份。">
+                    <label className="toggle"><input type="checkbox" checked={backupIncludeDeviceIdentity} onChange={event => setBackupIncludeDeviceIdentity(event.target.checked)} /><span className="slider"></span></label>
+                  </SettingRow>
+                </div>
+                <div className="card-body actions-row backup-actions">
+                  <button type="submit" className="btn btn-primary" disabled={Boolean(backupBusy)}>{backupBusy === 'export' ? <BusyIndicator size={15} /> : <Download size={15} />}导出备份包</button>
+                  <button type="button" className="btn" disabled={Boolean(backupBusy)} onClick={() => void inspectBackup()}>{backupBusy === 'inspect' ? <BusyIndicator size={15} /> : <ScanSearch size={15} />}查看备份包</button>
+                  <button type="button" className="btn" disabled={Boolean(backupBusy)} onClick={() => setPendingBackupRestore(true)}>{backupBusy === 'restore' ? <BusyIndicator size={15} /> : <RotateCcw size={15} />}从备份包恢复</button>
+                </div>
+              </form>
+              {backupFeedback ? <div className="card-body"><div className="inline-feedback visible" role="status">{backupFeedback}</div></div> : null}
             </section>
+
+            {backupExportReport ? <section className="card settings-section">
+              <div className="card-header"><span>已导出</span><Pill kind="success">{formatBackupBytes(backupExportReport.total_bytes)}</Pill></div>
+              <div className="software-update-summary">
+                <div><span>文件</span><strong>{backupExportReport.file_count} 个</strong></div>
+                <div><span>凭据</span><strong>{backupExportReport.credentials} 项</strong></div>
+              </div>
+              <div className="card-body backup-body">
+                <code className="backup-path" title={backupExportReport.path}>{backupExportReport.path}</code>
+                <div className="backup-tags">{backupExportReport.categories.map(item => <span className="pill neutral" key={item.category}>{item.category} {item.files}</span>)}</div>
+                {backupExportReport.skipped.length ? <BackupDetails summary={`未打包 ${backupExportReport.skipped.length} 项`} items={backupExportReport.skipped.map(item => `${item.path} · ${item.reason}`)} /> : null}
+                {backupExportReport.warnings.length ? <BackupDetails summary={`提醒 ${backupExportReport.warnings.length} 条`} items={backupExportReport.warnings} /> : null}
+              </div>
+            </section> : null}
+
+            {backupInspectReport ? <section className="card settings-section">
+              <div className="card-header"><span>备份包内容</span><Pill kind="neutral">v{backupInspectReport.version}</Pill></div>
+              <div className="software-update-summary">
+                <div><span>导出时间</span><strong>{formatBackupTime(backupInspectReport.created_at)}</strong></div>
+                <div><span>导出设备</span><strong>{backupInspectReport.machine || '—'}</strong></div>
+                <div><span>文件</span><strong>{backupInspectReport.file_count} 个 · {formatBackupBytes(backupInspectReport.total_bytes)}</strong></div>
+                <div><span>凭据</span><strong>{backupInspectReport.credentials} 项{backupInspectReport.needs_passphrase ? ' · 需要口令' : ''}</strong></div>
+              </div>
+              <div className="card-body backup-body">
+                <code className="backup-path" title={backupInspectReport.path}>{backupInspectReport.path}</code>
+                <div className="backup-tags">{backupInspectReport.categories.map(item => <span className="pill neutral" key={item.category}>{item.category} {item.files}</span>)}</div>
+                {backupInspectReport.credential_files.length ? <BackupDetails summary={`含凭据的文件 ${backupInspectReport.credential_files.length} 个`} items={backupInspectReport.credential_files} /> : null}
+                {backupInspectReport.warnings.length ? <BackupDetails summary={`提醒 ${backupInspectReport.warnings.length} 条`} items={backupInspectReport.warnings} /> : null}
+              </div>
+            </section> : null}
+
+            {backupRestoreReport ? <section className="card settings-section">
+              <div className="card-header"><span>已恢复</span><Pill kind="success">{backupRestoreReport.restored.length} 个文件</Pill></div>
+              <div className="software-update-summary">
+                <div><span>凭据</span><strong>{backupRestoreReport.credentials} 项</strong></div>
+                <div><span>恢复前快照</span><strong>{backupRestoreReport.snapshot}</strong></div>
+              </div>
+              <div className="card-body backup-body">
+                <small>配置已写回本机，重启 HiMind Agent 后生效。</small>
+                {backupRestoreReport.credential_failures.length ? <BackupDetails summary={`${backupRestoreReport.credential_failures.length} 项凭据需要重新配置`} items={backupRestoreReport.credential_failures} /> : null}
+                {backupRestoreReport.missing_paths.length ? <BackupDetails summary={`${backupRestoreReport.missing_paths.length} 个路径在这台机器上不存在`} items={backupRestoreReport.missing_paths.map(item => `${item.source}：${item.path}`)} /> : null}
+                {backupRestoreReport.pending_push.length ? <BackupDetails summary="需要重新推送" items={backupRestoreReport.pending_push} /> : null}
+                {backupRestoreReport.warnings.length ? <BackupDetails summary={`提醒 ${backupRestoreReport.warnings.length} 条`} items={backupRestoreReport.warnings} /> : null}
+              </div>
+            </section> : null}
+
+            <section className="card settings-section">
+              <details className="backup-scope-details">
+                <summary>备份范围</summary>
+                {backupScope ? <div className="backup-scope">
+                  <div>
+                    <h3>进入备份包</h3>
+                    <ul>{backupScope.entries.filter(item => item.included).map(item => <li key={item.name}><span>{item.name}</span><small>{item.category}</small></li>)}</ul>
+                  </div>
+                  <div>
+                    <h3>不进备份包</h3>
+                    <ul>{backupScope.entries.filter(item => !item.included).map(item => <li key={item.name}><span>{item.name}</span><small>{item.reason}</small></li>)}</ul>
+                  </div>
+                </div> : <div className="card-body"><span className="inline-feedback">正在读取备份范围…</span></div>}
+              </details>
+            </section>
+          </> : null}
+
+          {section === 'general' ? <>
             <section className="card settings-section">
               <div className="card-header">软件更新</div>
               <div className="software-update-summary">
@@ -676,8 +1174,8 @@ export function SettingsPage({
                 <div><span>最近检查</span><strong>{formatUpdateTime(updateStatus?.last_checked_at)}</strong></div>
               </div>
               <div className="card-body setting-list">
-                <SettingRow title="自动检查更新" description="定期检查是否有新版本"><label className="toggle"><input type="checkbox" checked={updateStatus?.auto_check ?? true} onChange={event => onUpdatePreferences(event.target.checked, event.target.checked && (updateStatus?.auto_download ?? true))} /><span className="slider"></span></label></SettingRow>
-                <SettingRow title="自动下载更新" description="有新版本时在后台下载，安装前会通知你"><label className="toggle"><input type="checkbox" disabled={!updateStatus?.auto_check} checked={updateStatus?.auto_download ?? true} onChange={event => onUpdatePreferences(updateStatus?.auto_check ?? true, event.target.checked)} /><span className="slider"></span></label></SettingRow>
+                <SettingRow title="自动检查更新"><label className="toggle"><input type="checkbox" checked={updateStatus?.auto_check ?? true} onChange={event => onUpdatePreferences(event.target.checked, event.target.checked && (updateStatus?.auto_download ?? true))} /><span className="slider"></span></label></SettingRow>
+                <SettingRow title="自动下载更新" description="安装前会通知你"><label className="toggle"><input type="checkbox" disabled={!updateStatus?.auto_check} checked={updateStatus?.auto_download ?? true} onChange={event => onUpdatePreferences(updateStatus?.auto_check ?? true, event.target.checked)} /><span className="slider"></span></label></SettingRow>
               </div>
               <div className="software-update-state">
                 <div>
@@ -689,24 +1187,24 @@ export function SettingsPage({
                   {updateStatus?.status === 'downloading' ? <button className="btn" onClick={onCancelUpdateDownload}>取消下载</button> : null}
                   {updateStatus?.available_version && !['downloading', 'ready', 'installing'].includes(updateStatus.status) ? <button className="btn" disabled={updateBusy} onClick={onDownloadUpdate}><Download size={15} />下载更新</button> : null}
                   {updateStatus?.status === 'ready' ? <button className="btn btn-primary" disabled={updateBusy} onClick={onInstallUpdate}><RefreshCw size={15} />重启并更新</button> : null}
-                  <button className="btn" disabled={updateBusy || ['checking', 'downloading', 'installing'].includes(updateStatus?.status || '')} onClick={onCheckUpdate}>{updateBusy || updateStatus?.status === 'checking' ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}检查更新</button>
+                  <button className="btn" disabled={updateBusy || ['checking', 'downloading', 'installing'].includes(updateStatus?.status || '')} onClick={onCheckUpdate}>{updateBusy || updateStatus?.status === 'checking' ? <BusyIndicator size={15} /> : <RefreshCw size={15} />}检查更新</button>
                 </div>
               </div>
             </section>
             <section className="card settings-section">
               <div className="card-header">启动设置</div>
               <div className="card-body setting-list">
-                <SettingRow title="开机自启" description="登录 Windows 后自动启动 HiMind Agent"><label className="toggle"><input type="checkbox" checked={settings.auto_start} onChange={event => onAutoStartChange(event.target.checked)} /><span className="slider"></span></label></SettingRow>
+                <SettingRow title="开机自启"><label className="toggle"><input type="checkbox" checked={settings.auto_start} onChange={event => onAutoStartChange(event.target.checked)} /><span className="slider"></span></label></SettingRow>
               </div>
             </section>
           </> : null}
         </div>
-      </div>
       {loginModalOpen ? <LoginModal configured={configured} username={loginUsername} password={loginPassword} onClose={onCloseLoginModal} onUsernameChange={onUsernameChange} onPasswordChange={onPasswordChange} onSave={onSaveLogin} onLogout={onLogoutLogin} onOpenInnerAdmin={onOpenInnerAdmin} /> : null}
       {svnModalOpen ? <SvnConnectionModal draft={svnDraft} exists={svnConnections.length > 0} onClose={onCloseSvnModal} onChange={onSvnDraftChange} onSave={onSaveSvnConnection} /> : null}
       {pendingApprovalProfile ? <ApprovalTrustConfirmation profile={pendingApprovalProfile} onClose={() => setPendingApprovalProfile(null)} onConfirm={(durationSeconds) => { onApprovalProfileChange(pendingApprovalProfile, true, durationSeconds); setPendingApprovalProfile(null); }} /> : null}
       {pendingRemoteRuntimeUnrestricted ? <RemoteRuntimeUnrestrictedConfirmation onClose={() => setPendingRemoteRuntimeUnrestricted(null)} onConfirm={() => { onRemoteExecutionChange(pendingRemoteRuntimeUnrestricted, true); setPendingRemoteRuntimeUnrestricted(null); }} /> : null}
       {pendingRuntimeUninstall ? <RuntimeUninstallConfirmation onClose={() => setPendingRuntimeUninstall(false)} onConfirm={() => { setPendingRuntimeUninstall(false); void startBuiltinAIRuntimeOperation('uninstall'); }} /> : null}
+      {pendingBackupRestore ? <BackupRestoreConfirmation onClose={() => setPendingBackupRestore(false)} onConfirm={() => void restoreBackup()} /> : null}
     </>
   );
 }
@@ -762,11 +1260,51 @@ function describeUpdateMessage(status: AgentUpdateStatus | null) {
   return status.release_notes || 'HiMind Agent 会定期检查更新。';
 }
 
+function BackupDetails({ summary, items }: { summary: string; items: string[] }) {
+  return (
+    <details className="backup-details">
+      <summary>{summary}</summary>
+      <ul>{items.map(item => <li key={item}>{item}</li>)}</ul>
+    </details>
+  );
+}
+
+function formatBackupBytes(bytes: number): string {
+  if (!bytes || bytes < 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${index === 0 || value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[index]}`;
+}
+
+function formatBackupTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value || '—' : parsed.toLocaleString();
+}
+
+function BackupRestoreConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+  return (
+    <div className="modal-backdrop" onClick={onClose} role="presentation">
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="backup-restore-title" onClick={event => event.stopPropagation()}>
+        <div className="modal-header"><div><h3 id="backup-restore-title">从备份包恢复？</h3><p>会覆盖本机账号、凭据与已装能力；恢复前自动快照，包外文件不受影响。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-body">
+          <div className="full-access-warning"><LockKeyhole size={20} /><div><strong>凭据按当前 Windows 账号重新加密</strong><span>包内凭据会用你填的口令改写成只对本机生效；口令不对时不覆盖任何文件。</span></div></div>
+          <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><RotateCcw size={15} />选择备份包并恢复</button></div></div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function RuntimeUninstallConfirmation({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
   return (
     <div className="modal-backdrop" role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="runtime-uninstall-title">
-        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI？</h3><p>HiMind AI 将暂时不可用，个人 AI 服务、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI？</h3><p>HiMind AI 将暂时不可用，个人模型服务、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body"><div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Trash2 size={15} />确认卸载</button></div></div></div>
       </div>
     </div>
@@ -779,7 +1317,7 @@ function RemoteRuntimeUnrestrictedConfirmation({ onClose, onConfirm }: { onClose
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="remote-runtime-unrestricted-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header"><div><h3 id="remote-runtime-unrestricted-title">允许远程任务访问全部文件？</h3><p>仅在任务确实需要访问项目目录以外的文件时开启。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程任务将能访问当前 Windows 账户允许的本机资源</strong><span>任务可能访问项目目录以外的文件、工具和网络资源。仍会受到审批设置和 Windows 权限限制。</span></div></div>
+          <div className="full-access-warning"><ShieldAlert size={20} /><div><strong>远程任务将能访问当前 Windows 账户允许的本机资源</strong><span>可访问项目目录以外的文件和网络资源，仍受审批设置与 Windows 权限限制。</span></div></div>
           <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Bot size={15} />确认启用</button></div></div>
         </div>
       </div>
@@ -819,13 +1357,13 @@ function ApprovalTrustConfirmation({ profile, onClose, onConfirm }: { profile: '
           <IconButton icon={X} label="关闭" onClick={onClose} />
         </div>
         <div className="modal-body approval-trust-body">
-          <div className="approval-trust-intro"><strong>{fullAccess ? '受控操作将不再弹出确认' : '常规及高风险操作将自动执行'}</strong><span>工作流中的人工审批仍会保留。授权仅适用于当前应用，可随时在审批中心或设置中恢复。</span></div>
+          <div className="approval-trust-intro"><strong>{fullAccess ? '受控操作将不再弹出确认' : '常规及高风险操作将自动执行'}</strong><span>授权仅适用于当前应用，可随时在审批中心或设置中恢复。</span></div>
           <div className="approval-trust-scope">
             <div className="approval-trust-scope-item"><FolderOpen size={17} /><div><strong>本地文件</strong><span>删除、批量清理或覆盖工作区文件。</span></div></div>
             <div className="approval-trust-scope-item"><Database size={17} /><div><strong>工作台数据</strong><span>删除项目或记录、解除关联、替换人员、发布变更。</span></div></div>
             <div className="approval-trust-scope-item"><Globe2 size={17} /><div><strong>第三方工具</strong><span>{fullAccess ? '所有受控的第三方操作。' : '高风险的外部写入和集成操作。'}</span></div></div>
           </div>
-          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '工作流中的人工审批、单项规则、系统保护目录和工作台权限仍然有效，也不会解除远程任务的目录限制。' : '普通查询、修改和高风险操作将自动放行；工作流中的人工审批与最高风险操作仍会请求确认。'}</span></div></div>
+          <div className="approval-trust-boundaries"><LockKeyhole size={16} /><div><strong>策略边界</strong><span>{fullAccess ? '单项规则、系统保护目录和工作台权限仍然有效。' : '普通查询、修改和高风险操作将自动放行；最高风险操作仍会请求确认。'}</span></div></div>
           <div className="field-group approval-trust-duration">
             <label className="field-label" htmlFor="approval-trust-duration">授权有效期</label>
             <select id="approval-trust-duration" value={durationSeconds} onChange={event => setDurationSeconds(Number(event.target.value))}>
@@ -856,10 +1394,14 @@ function SvnConnectionModal({ draft, exists, onClose, onChange, onSave }: { draf
   );
 }
 
-function SettingRow({ title, description, children }: { title: string; description: string; children: ReactNode }) {
+/**
+ * 设置项说明只写「非默认行为」和「后果」。
+ * 默认值、一目了然的行为不写；`description` 省略时整行不渲染。
+ */
+function SettingRow({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
     <div className="setting-row">
-      <div><div className="label-text">{title}</div><div className="label-desc">{description}</div></div>
+      <div><div className="label-text">{title}</div>{description ? <div className="label-desc">{description}</div> : null}</div>
       <div className="setting-control">{children}</div>
     </div>
   );
@@ -982,16 +1524,17 @@ function RemoteClientCard({ option, status, path, busy, feedback, onPathChange, 
         <strong>{option.name}</strong>
       </div>
       <div className="remote-client-path-input">
-        <input id={`remote-client-${option.vendor}`} aria-label={`${option.name}路径`} value={path} onChange={event => onPathChange(event.target.value)} placeholder={detectedPath || `选择 ${option.name}.exe`} title={path || detectedPath || ''} />
-        <button type="button" className="btn btn-icon" title={`选择 ${option.name} 程序`} aria-label={`选择 ${option.name} 程序`} disabled={busy} onClick={onPick}><FolderOpen size={16} /></button>
+        <input id={`remote-client-${option.vendor}`} aria-label={`${option.name}路径`} value={path} onChange={event => onPathChange(event.target.value)} onBlur={() => { if (dirty && path.trim()) onSave(); }} placeholder={detectedPath || `选择 ${option.name}.exe`} title={path || detectedPath || ''} />
+        <button type="button" className="btn btn-icon" title={`选择 ${option.name} 程序`} aria-label={`选择 ${option.name} 程序`} disabled={busy} onClick={onPick}>{busy ? <BusyIndicator size={16} /> : <FolderOpen size={16} />}</button>
       </div>
-      <div className="remote-client-footer">
-        {feedback ? <span className="inline-feedback visible" role="status">{feedback}</span> : null}
-        <div className="remote-client-actions">
-          {status?.configured_by === 'manual' ? <button type="button" className="btn btn-danger-quiet" title="清除手动路径" aria-label={`清除 ${option.name} 手动路径`} disabled={busy} onClick={onClear}><Trash2 size={14} /></button> : null}
-          <button type="button" className="btn btn-icon btn-primary" title="保存路径" aria-label={`保存 ${option.name} 路径`} disabled={busy || !dirty || (!path.trim() && !persistedPath)} onClick={onSave}>{busy ? <LoaderCircle size={14} className="spin" /> : <Save size={14} />}</button>
+      {feedback || status?.configured_by === 'manual' ? (
+        <div className="remote-client-footer">
+          {feedback ? <span className="inline-feedback visible" role="status">{feedback}</span> : null}
+          <div className="remote-client-actions">
+            {status?.configured_by === 'manual' ? <button type="button" className="btn btn-danger-quiet" title="清除手动路径" aria-label={`清除 ${option.name} 手动路径`} disabled={busy} onClick={onClear}><Trash2 size={14} /></button> : null}
+          </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }

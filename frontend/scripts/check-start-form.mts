@@ -39,4 +39,27 @@ typed.domains = 'cv,llm,ar-vr';
 assert.equal(invalidOptionValue(fields[0], typed.domains), 'cv,llm,ar-vr');
 assert.equal(invalidOptionValue(fields[0], 'cv\ngeneral'), '');
 
+// 带显示名称的下拉：下拉显示中文，提交与校验都走机器值。
+// 包只写字符串时两者相同，不能因为补了 label 就把「展馆」提交成「三峡」。
+const venue = normalizeStartField({
+  id: 'venue',
+  label: '展馆',
+  type: 'select',
+  required: true,
+  options: [
+    { value: 'szkjg', label: '随州科技馆' },
+    { value: 'sanxia', label: '三峡' },
+    'hdcybwg',
+  ],
+});
+assert.deepEqual(venue.optionEntries, [
+  { value: 'szkjg', label: '随州科技馆' },
+  { value: 'sanxia', label: '三峡' },
+  { value: 'hdcybwg', label: 'hdcybwg' },
+]);
+assert.deepEqual(venue.options, ['szkjg', 'sanxia', 'hdcybwg']);
+assert.equal(invalidOptionValue(venue, 'sanxia'), '');
+assert.equal(invalidOptionValue(venue, '三峡'), '三峡');
+assert.equal(fieldsToInput([venue], { venue: 'sanxia' }).venue, 'sanxia');
+
 console.log('start form conversion checks passed');

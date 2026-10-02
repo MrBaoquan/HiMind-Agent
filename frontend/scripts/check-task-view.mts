@@ -9,9 +9,14 @@ import {
   formatDuration,
   formatRelativeTime,
   taskBucket,
+  taskElapsedSeconds,
+  taskProgressLabel,
+  taskProgressValue,
   taskStatusLabel,
   taskStatusTone,
+  taskStepLabel,
   taskTypeLabel,
+  shortRunId,
 } from '../src/pages/taskView.ts';
 
 // 状态集合必须互斥，否则同一个任务会被同时算进「进行中」和「需处理」。
@@ -28,6 +33,10 @@ assert.equal(taskBucket('canceling'), 'active');
 assert.equal(taskBucket('completed'), 'completed');
 assert.equal(taskBucket('failed'), 'attention');
 assert.equal(taskBucket('canceled'), 'attention');
+// 本机运行台账的 waiting 必须归到「需处理」，否则等待审批的运行会隐形。
+assert.equal(taskBucket('waiting'), 'attention');
+assert.ok(!TASK_ACTIVE_STATUSES.has('waiting'));
+assert.equal(taskStatusLabel('waiting'), '等待确认');
 // 未知状态不能被悄悄算进已完成，否则指标卡会虚高。
 assert.equal(taskBucket('queued'), 'unknown');
 assert.equal(taskBucket(''), 'unknown');
@@ -63,5 +72,37 @@ assert.equal(formatDuration('2026-09-21T11:00:00Z', '2026-09-21T12:30:00Z'), '1 
 assert.equal(formatDuration('2026-09-21T11:00:00Z', null), '');
 assert.equal(formatDuration(null, null), '');
 assert.equal(formatDuration('bad', '2026-09-21T12:00:00Z'), '');
+
+// 长运行号只留尾号：短号原样显示，长号不能被截成一行看不清的乱码。
+assert.equal(shortRunId('run_42'), 'run_42');
+assert.equal(shortRunId('run_12345678'), 'run_12345678');
+assert.equal(shortRunId(' workflow_run_inv_1790228440476_15:1790228443195-41 '), '#319541');
+// 本机运行号尾部的 `_<进程号>` 是排查用的，展示层要剥掉，不能出现 `674_6480` 这种尾巴。
+assert.equal(shortRunId('workflow_run_inv_1790232622171_15:1790232624674_6480'), '#624674');
+assert.equal(shortRunId(''), '');
+
+// 进度未知必须说「进行中」：显示 0% 会被读成「一步都没动」。
+assert.equal(taskProgressValue(null), null);
+assert.equal(taskProgressValue(undefined), null);
+assert.equal(taskProgressValue(Number.NaN), null);
+assert.equal(taskProgressValue(-5), 0);
+assert.equal(taskProgressValue(66.6), 67);
+assert.equal(taskProgressValue(140), 100);
+assert.equal(taskProgressLabel(null), '进行中');
+assert.equal(taskProgressLabel(0), '0%');
+assert.equal(taskProgressLabel(50), '50%');
+
+// 步骤文案没有总数就不显示，且完成的步数不会超过总数。
+assert.equal(taskStepLabel(2, 5), '步骤 2/5');
+assert.equal(taskStepLabel(0, 0), '');
+assert.equal(taskStepLabel(null, 5), '');
+assert.equal(taskStepLabel(2, null), '');
+assert.equal(taskStepLabel(9, 5), '步骤 5/5');
+
+// 「已运行」按秒走动，起点缺失或坏值时给 null，界面不显示而不是显示 0 秒。
+assert.equal(taskElapsedSeconds('2026-09-21T11:59:00Z', now), 60);
+assert.equal(taskElapsedSeconds(null, now), null);
+assert.equal(taskElapsedSeconds('bad', now), null);
+assert.equal(taskElapsedSeconds('2026-09-21T12:00:30Z', now), 0);
 
 console.log('task view checks passed');

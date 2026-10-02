@@ -12,7 +12,6 @@ import {
   MonitorDot,
   Link2Off,
   PlugZap,
-  RefreshCw,
   Settings2,
   ShieldCheck,
   Unplug,
@@ -21,7 +20,9 @@ import { PageHeader, Pill } from '../components/Common';
 import { AcpProfilesPanel } from './AcpProfilesPanel';
 import { AiServicesPanel } from './AiServicesPanel';
 import type {
+  AIServiceProtocol,
   AIServiceListResult,
+  AIServiceTemplateListResult,
   AcpRuntimeProfileInput,
   AcpRuntimeProfileSnapshot,
   CustomAIService,
@@ -38,6 +39,7 @@ type AiConnectionsPageProps = {
   testResult: McpConnectionTestResult | null;
   busyAction: string | null;
   aiServices: AIServiceListResult | null;
+  aiServiceTemplates: AIServiceTemplateListResult | null;
   acpProfiles: AcpRuntimeProfileSnapshot | null;
   onOpenAccount: () => void;
   onRefresh: () => void;
@@ -51,16 +53,16 @@ type AiConnectionsPageProps = {
     id: string;
     display_name: string;
     base_url: string;
-    protocol: 'openai-chat' | 'openai-responses';
+    protocol: AIServiceProtocol;
     model: string;
     models: string[];
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
-  onImportAIClient: (target: string, service?: string) => Promise<void>;
+  onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
-  onFetchModels: (input: { base_url: string; api_key: string }) => Promise<string[]>;
+  onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
   onSaveAcpProfile: (input: AcpRuntimeProfileInput) => Promise<void>;
   onSetAcpProfileEnabled: (providerId: string, enabled: boolean) => Promise<void>;
@@ -75,6 +77,7 @@ export function AiConnectionsPage({
   testResult,
   busyAction,
   aiServices,
+  aiServiceTemplates,
   acpProfiles,
   onOpenAccount,
   onRefresh,
@@ -137,23 +140,23 @@ export function AiConnectionsPage({
 
   return (
     <div className="ai-page">
-      <PageHeader
-        title="AI 连接"
-        description="管理工具连接、模型服务和本地 AI 客户端。"
-        actions={<button className="btn btn-icon" title="刷新状态" aria-label="刷新状态" disabled={Boolean(busyAction)} onClick={onRefresh}><RefreshCw size={16} /></button>}
-      />
+      <PageHeader title="AI 连接" />
 
       <div className="ai-tabs" role="tablist" aria-label="AI 连接分类">
-        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>工具连接</button>
-        <button type="button" id="ai-tab-services" role="tab" aria-selected={activeTab === 'services'} aria-controls="ai-panel-services" className={`ai-tab${activeTab === 'services' ? ' active' : ''}`} onClick={() => setActiveTab('services')}>AI 服务</button>
-         <button type="button" id="ai-tab-acp" role="tab" aria-selected={activeTab === 'acp'} aria-controls="ai-panel-acp" className={`ai-tab${activeTab === 'acp' ? ' active' : ''}`} onClick={() => setActiveTab('acp')}>AI 客户端</button>
+        {/* 三个 tab 各自回答一个问题，名称直接写清「做什么」：
+            「MCP 接入」= 把 HiMind 能力给别的工具用，「模型服务」= HiMind 用谁的模型，
+            「运行环境」= 谁来执行 AI 步骤。ACP 只是其中一种执行方，同屏还会列本机已装的
+            Codex / Copilot / 内置引擎，所以页签不能写成「工作流 AI 客户端」。
+            id 保持稳定，外部脚本与深链依赖它。 */}
+        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>MCP 接入</button>
+        <button type="button" id="ai-tab-services" role="tab" aria-selected={activeTab === 'services'} aria-controls="ai-panel-services" className={`ai-tab${activeTab === 'services' ? ' active' : ''}`} onClick={() => setActiveTab('services')}>模型服务</button>
+         <button type="button" id="ai-tab-acp" role="tab" aria-selected={activeTab === 'acp'} aria-controls="ai-panel-acp" className={`ai-tab${activeTab === 'acp' ? ' active' : ''}`} onClick={() => setActiveTab('acp')}>运行环境</button>
       </div>
 
       {activeTab === 'acp' ? (
         <AcpProfilesPanel
           snapshot={acpProfiles}
           busyAction={busyAction}
-          onRefresh={onRefresh}
           onSave={onSaveAcpProfile}
           onSetEnabled={onSetAcpProfileEnabled}
           onRemove={onRemoveAcpProfile}
@@ -162,6 +165,7 @@ export function AiConnectionsPage({
         <div id="ai-panel-services" role="tabpanel" aria-labelledby="ai-tab-services">
           <AiServicesPanel
             aiServices={aiServices}
+            templates={aiServiceTemplates}
             onRefresh={onRefresh}
             onSaveAIService={onSaveAIService}
             onSetActiveAIService={onSetActiveAIService}
@@ -179,7 +183,7 @@ export function AiConnectionsPage({
             <div className="ai-overview-main">
               <div className="ai-overview-icon">{attentionCount ? <CircleAlert size={20} /> : <ShieldCheck size={20} />}</div>
               <div className="ai-overview-copy">
-                <span className="ai-overview-eyebrow">工具连接</span>
+                <span className="ai-overview-eyebrow">MCP 接入</span>
                 <strong>{headline}</strong>
                 <span>{headlineDescription}</span>
               </div>
@@ -193,10 +197,9 @@ export function AiConnectionsPage({
               <button className="btn btn-primary" disabled={Boolean(busyAction) || !groups.actionable.length} onClick={onApplyAll}>
                 <PlugZap size={15} />{busyAction === 'apply-all' ? '正在连接' : groups.actionable.length ? '连接全部' : groups.manual.length ? '需要手动配置' : '连接已完成'}
               </button>
-              <button className="btn btn-icon ai-overview-remove" title="断开全部连接" aria-label="断开全部连接" disabled={Boolean(busyAction) || !groups.connected.length} onClick={onRemoveAll}><Link2Off size={16} /></button>
-              <button className="btn btn-icon" title="检查本机连接" aria-label="检查本机连接" disabled={Boolean(busyAction)} onClick={onTest}>
-                <Activity size={16} />
-              </button>
+              {/* 概览卡只有一屏宽：编排三个文字按钮会把「13 个 AI 工具待连接」压成一列单字。
+                  这里留主操作和一次诊断，「断开全部」下沉到它作用的「已连接」列表头。 */}
+              <button className="btn btn-quiet" disabled={Boolean(busyAction)} onClick={onTest}><Activity size={15} />检查连接</button>
             </div>
           </section>
 
@@ -220,9 +223,9 @@ export function AiConnectionsPage({
             {groups.builtin.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
           </ConnectionSection> : null}
 
-          <ConnectionSection title="已连接" description="这些 AI 工具已经可以使用 HiMind。" count={groups.connected.length}>
+          <ConnectionSection title="已连接" description="这些 AI 工具已经可以使用 HiMind。" count={groups.connected.length} action={groups.connected.length ? <button className="btn ai-overview-remove" disabled={Boolean(busyAction)} onClick={onRemoveAll}><Link2Off size={14} />断开全部</button> : null}>
             {groups.connected.map(target => <ConnectionRow key={target.id} target={target} busyAction={busyAction} onApplyTarget={onApplyTarget} onRemoveTarget={onRemoveTarget} onCopyTarget={copyConfiguration} onOpenDirectory={onOpenDirectory} />)}
-            {!groups.connected.length ? <EmptyConnectionRow text="还没有连接其他 AI 工具" /> : null}
+            {!groups.connected.length ? <EmptyConnectionRow text="还没有接入任何 AI 工具" /> : null}
           </ConnectionSection>
 
           <ConnectionSection title="待连接" description="可自动完成连接配置。" count={groups.actionable.length} tone={groups.actionable.length ? 'attention' : 'default'}>
@@ -266,9 +269,10 @@ export function AiConnectionsPage({
   );
 }
 
-function ConnectionSection({ title, description, count, tone = 'default', children }: { title: string; description: string; count: number; tone?: 'default' | 'attention'; children: ReactNode }) {
+function ConnectionSection({ title, description, count, tone = 'default', action, children }: { title: string; description: string; count: number; tone?: 'default' | 'attention'; action?: ReactNode; children: ReactNode }) {
   return <section className={`ai-client-section ${tone === 'attention' ? 'has-attention' : ''}`}>
-    <div className="ai-section-heading"><div><h3>{title}</h3><span>{description}</span></div><Pill kind={tone === 'attention' ? 'warn' : 'neutral'}>{count}</Pill></div>
+    {/* 段落级动作跟着它作用的那张列表走：「断开全部」放在「已连接」的头上，比挂在页头概览里更容易被理解成「它就是断开这些」。 */}
+    <div className="ai-section-heading"><div><h3>{title}</h3><span>{description}</span></div><div className="ai-section-tail">{action}<Pill kind={tone === 'attention' ? 'warn' : 'neutral'}>{count}</Pill></div></div>
     <div className="ai-client-list">{children}</div>
   </section>;
 }
@@ -281,12 +285,20 @@ function ConnectionRow({ target, unavailable = false, busyAction, onApplyTarget,
   const builtin = target.id === 'himind-ai';
   const state = targetState(target);
   const pending = busyAction === `target:${target.id}` || busyAction === `remove:${target.id}`;
+  const actionLabel = target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '连接';
   return <article className={`ai-client-row${builtin ? ' builtin' : ''}${unavailable ? ' unavailable' : ''}`}>
     <div className={`ai-client-icon ${builtin ? 'himind-ai' : targetIconClass(target.id)}`}><TargetIcon target={target} /></div>
     <div className="ai-client-copy"><strong>{target.name}</strong><span>{targetDescription(target)}</span></div>
     <Pill kind={state.kind}>{unavailable ? '暂不可用' : state.label}</Pill>
     <div className="ai-client-registration-actions">
-        {builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 内置</span> : unavailable ? <span className="ai-target-unavailable">暂不可用</span> : !target.supports_auto_configure ? <><button className="btn btn-icon" title={`复制 ${target.name} MCP 配置`} aria-label={`复制 ${target.name} MCP 配置`} onClick={() => onCopyTarget(target)}><Copy size={15} /></button>{target.config_directory ? <button className="btn btn-icon" title={`打开 ${target.name} 配置目录`} aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} /></button> : null}</> : target.state === 'configured' ? <button className="btn btn-icon ai-row-remove" title={`断开 ${target.name}`} aria-label={`断开 ${target.name}`} disabled={pending} onClick={() => onRemoveTarget(target.id)}><Unplug size={15} /></button> : <button className="btn btn-icon btn-primary" title={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '连接'} ${target.name}`} aria-label={`${target.state === 'invalid_config' ? '修复' : target.state === 'needs_repair' ? '更新' : '连接'} ${target.name}`} disabled={pending} onClick={() => onApplyTarget(target.id, target.state === 'invalid_config')}><PlugZap size={15} /></button>}
+        {builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 内置</span>
+          : unavailable ? <span className="ai-target-unavailable">暂不可用</span>
+          : !target.supports_auto_configure ? <>
+            <button className="btn" aria-label={`复制 ${target.name} MCP 配置`} onClick={() => onCopyTarget(target)}><Copy size={15} />复制配置</button>
+            {target.config_directory ? <button className="btn" aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} />打开目录</button> : null}
+          </>
+          : target.state === 'configured' ? <button className="btn ai-row-remove" aria-label={`断开 ${target.name}`} disabled={pending} onClick={() => onRemoveTarget(target.id)}><Unplug size={15} />断开</button>
+          : <button className="btn btn-primary" aria-label={`${actionLabel} ${target.name}`} disabled={pending} onClick={() => onApplyTarget(target.id, target.state === 'invalid_config')}><PlugZap size={15} />{pending ? '处理中' : actionLabel}</button>}
     </div>
   </article>;
 }

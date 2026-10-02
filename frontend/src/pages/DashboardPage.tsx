@@ -1,4 +1,5 @@
-import { ArrowUpRight, CheckCircle2, CircleAlert, Download, LoaderCircle, RefreshCw, Sparkles } from 'lucide-react';
+import { ArrowUpRight, CheckCircle2, CircleAlert, Download, RefreshCw, Sparkles } from 'lucide-react';
+import { BusyIndicator } from '../components/BusyIndicator';
 import { PageHeader, Pill } from '../components/Common';
 import { DashboardIdentityPanel } from '../components/DashboardIdentityPanel';
 import type { AgentStatus, AgentUpdateStatus, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, McpTargetDescriptor, ProjectionSyncStatus, RemoteExecutionSettings } from '../services/agentApi';
@@ -14,14 +15,15 @@ type DashboardPageProps = {
   identityBusy: boolean;
   updateStatus: AgentUpdateStatus | null;
   updateBusy: boolean;
+  projectionRequeueBusy: boolean;
   onOpenDashboard: () => void;
+  onRequeueProjectionDeadLetters: () => void;
   onStartAuthorization: () => void;
   onCancelAuthorization: () => void;
   onOpenAuthorization: () => void;
   onRefreshIdentity: () => void;
   onRevokeAuthorization: () => void;
   onCheckUpdate: () => void;
-  onRefreshProjection: () => void;
   onDownloadUpdate: () => void;
   onInstallUpdate: () => void;
 };
@@ -37,19 +39,20 @@ export function DashboardPage({
   identityBusy,
   updateStatus,
   updateBusy,
+  projectionRequeueBusy,
   onOpenDashboard,
+  onRequeueProjectionDeadLetters,
   onStartAuthorization,
   onCancelAuthorization,
   onOpenAuthorization,
   onRefreshIdentity,
   onRevokeAuthorization,
   onCheckUpdate,
-  onRefreshProjection,
   onDownloadUpdate,
   onInstallUpdate,
 }: DashboardPageProps) {
   if (!status) {
-    return <div className="page-loading"><span className="spinner" />正在读取应用状态</div>;
+    return <div className="page-loading"><BusyIndicator size={15} />正在读取应用状态</div>;
   }
 
   const independentMode = status.mode === 'independent' || status.dashboard_enabled === false;
@@ -58,9 +61,9 @@ export function DashboardPage({
   if (independentMode) {
     return (
       <div className="dashboard-page">
-        <PageHeader title="概览" description="查看连接、同步和更新状态。" />
+        <PageHeader title="Agent 状态" />
         {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
-        <ProjectionStatusPanel status={projectionSyncStatus} onRefresh={onRefreshProjection} />
+        <ProjectionStatusPanel status={projectionSyncStatus} requeueBusy={projectionRequeueBusy} onRequeue={onRequeueProjectionDeadLetters} />
         <section className="workspace-status-panel ready independent-status-panel">
           <div className="workspace-status-body">
             <div className="workspace-status-icon ready" aria-hidden="true"><Sparkles size={25} /></div>
@@ -78,7 +81,7 @@ export function DashboardPage({
         </section>
         <section className="overview-facts" aria-label="运行信息">
           <div><span>版本</span><strong>v{status.version}</strong></div>
-          <div><span>运行模式</span><strong>独立模式</strong></div>
+          <div><span>AI 工作台</span><strong>未连接</strong></div>
           <div><span>本机服务</span><strong>运行中</strong></div>
           <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
         </section>
@@ -91,19 +94,19 @@ export function DashboardPage({
   return (
     <div className="dashboard-page">
       <PageHeader
-        title="概览"
-        description="查看连接、同步和更新状态。"
+        title="Agent 状态"
+        description="查看连接、运行、同步和更新状态。"
         actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
-      <ProjectionStatusPanel status={projectionSyncStatus} onRefresh={onRefreshProjection} />
-      {workerExpected && !workerOnline ? <div className="blocker"><CircleAlert size={18} /><div><strong>{workerIssue.title}</strong><span>{workerIssue.description}</span></div></div> : null}
+      <ProjectionStatusPanel status={projectionSyncStatus} requeueBusy={projectionRequeueBusy} onRequeue={onRequeueProjectionDeadLetters} />
       <DashboardIdentityPanel
         identity={identity}
         authorization={authorization}
         workerOnline={workerOnline}
         dashboardEnabled={status.dashboard_enabled !== false}
-        workerStatusTitle={workerIssue.title}
+        workerAttention={workerIssue.attention}
+        workerIssueTitle={workerIssue.title}
         workerHealthDescription={workerIssue.healthDescription}
         pendingApprovals={approvals.length}
         remoteExecutionEnabled={Boolean(remoteExecutionSettings?.enabled)}
@@ -118,7 +121,9 @@ export function DashboardPage({
       />
       <section className="overview-facts" aria-label="运行信息">
         <div><span>版本</span><strong>v{status.version}</strong></div>
-        <div><span>运行模式</span><strong>工作台模式</strong></div>
+        {/* 这一格只回答「账号现在能不能用工作台」：写死「已对接」会和上面
+            同时出现的「需要登录」自相矛盾。 */}
+        <div><span>AI 工作台</span><strong>{identity?.authorized ? '已授权' : '未连接'}</strong></div>
         <div><span>本机服务</span><strong>运行中</strong></div>
         <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
       </section>
@@ -126,39 +131,72 @@ export function DashboardPage({
   );
 }
 
-function ProjectionStatusPanel({ status, onRefresh }: { status: ProjectionSyncStatus | null; onRefresh: () => void }) {
+// 原因文本来自后端错误日志：换行会把面板撑成多行，超长的 JSON 片段会挤掉右侧指标与操作。
+function summarizeProjectionReason(raw: string): string {
+  const compact = raw.replace(/\s+/g, ' ').trim();
+  const text = projectionReasonText(compact) ?? compact;
+  return text.length > 64 ? `${text.slice(0, 64)}…` : text;
+}
+
+/**
+ * 后端把工作台的原始返回整段带回来了（英文 + JSON 片段），直接摆在面板上读不出结论。
+ * 能归类的给一句中文；认不出来的一律返回 null，原文照旧展示，不猜也不藏。
+ */
+function projectionReasonText(raw: string): string | null {
+  const text = raw.toLowerCase();
+  if (/http 401|unauthorized/.test(text)) return '账号授权已失效，重新授权后会自动重投';
+  if (/http 403|forbidden/.test(text)) return '工作台没有放行这次同步，先确认账号权限';
+  if (/http 404/.test(text)) return '工作台没有这个同步接口（HTTP 404）';
+  if (/http 409|conflict/.test(text)) return '工作台已有同号记录，两边数据冲突';
+  if (/http 400|bad request/.test(text)) return '工作台拒绝接收这条记录（HTTP 400）';
+  if (/timed? ?out|timeout/.test(text)) return '连接工作台超时';
+  if (/dns|connect|network/.test(text)) return '连不上工作台，检查网络或工作台地址';
+  return null;
+}
+
+function ProjectionStatusPanel({ status, requeueBusy, onRequeue }: { status: ProjectionSyncStatus | null; requeueBusy: boolean; onRequeue: () => void }) {
   if (!status) return null;
   const pending = status.pending ?? 0;
   const retrying = status.retrying ?? 0;
   const deadLetter = status.dead_letter ?? 0;
   const projected = status.projected ?? 0;
   const tone = status.state === 'attention' ? 'error' : status.state === 'pending' ? 'warning' : status.state === 'synced' ? 'success' : 'neutral';
-  const title = status.state === 'local_only'
-    ? '仅保存在本机'
-    : status.state === 'attention'
-      ? '同步需要处理'
+  const title = deadLetter
+    ? '同步需要处理'
+    : status.state === 'local_only'
+      ? '仅保存在本机'
       : status.state === 'pending'
         ? '等待同步'
         : '已同步';
-  const description = status.state === 'local_only'
-    ? `当前模式仅在本机运行，已记录 ${status.total} 条任务`
-    : deadLetter
-      ? `${deadLetter} 条任务同步失败，本地运行不受影响`
+  // 只报最主要的一类原因：多数死信来自同一个错误，逐条罗列反而看不清主要矛盾。
+  const primaryReason = status.dead_letter_reasons?.[0];
+  const reasonText = primaryReason ? summarizeProjectionReason(primaryReason.last_error) : '';
+  // 归类后的中文只用来读，原文留在 title 里，排查时一个字段都不少。
+  const reasonDetail = primaryReason ? primaryReason.last_error.replace(/\s+/g, ' ').trim() : '';
+  const description = deadLetter
+    ? `${deadLetter} 条任务同步失败，本地运行不受影响${reasonText ? `；主要原因是「${reasonText}」` : ''}`
+    : status.state === 'local_only'
+      ? `本地已记录 ${status.total} 条运行记录，对接 AI 工作台后会自动同步`
       : pending
         ? `${pending} 条等待同步${retrying ? `，其中 ${retrying} 条正在重试` : ''}`
         : `本地任务已同步 ${projected} 条`;
   return (
-    <section className={`projection-sync-panel ${tone}`}>
+    <section className={`projection-sync-panel ${deadLetter && tone !== 'error' ? `${tone} error` : tone}`}>
       <div className="projection-sync-main">
         {tone === 'success' ? <CheckCircle2 size={18} /> : tone === 'error' ? <CircleAlert size={18} /> : <RefreshCw size={18} />}
-        <div><strong>{title}</strong><span>{description}</span></div>
+        <div><strong>{title}</strong><span title={reasonDetail || undefined}>{description}</span></div>
       </div>
       <div className="projection-sync-metrics">
         <div><span>待同步</span><strong>{pending}</strong></div>
         <div><span>已同步</span><strong>{projected}</strong></div>
         <div><span>同步失败</span><strong>{deadLetter}</strong></div>
       </div>
-      <button className="btn btn-icon" title="刷新同步状态" aria-label="刷新同步状态" onClick={onRefresh}><RefreshCw size={15} /></button>
+      {deadLetter ? (
+        <button className="btn" onClick={onRequeue} disabled={requeueBusy}>
+          {requeueBusy ? <BusyIndicator size={14} /> : <RefreshCw size={14} />}
+          重新同步
+        </button>
+      ) : null}
     </section>
   );
 }
@@ -183,7 +221,7 @@ function AgentUpdateBanner({ status, busy, onCheck, onDownload, onInstall }: { s
         : `发现新版本 v${status.available_version}`;
   return (
     <section className={`agent-update-banner${failed ? ' error' : ''}`}>
-      <div className="agent-update-icon">{downloading || checking ? <LoaderCircle size={19} className="spin" /> : ready || status.status === 'rolled_back' ? <CheckCircle2 size={19} /> : <Download size={19} />}</div>
+      <div className="agent-update-icon">{downloading || checking ? <BusyIndicator size={19} /> : ready || status.status === 'rolled_back' ? <CheckCircle2 size={19} /> : <Download size={19} />}</div>
       <div className="agent-update-copy">
         <div><strong>{title}</strong>{status.mandatory ? <Pill kind="warn">重要更新</Pill> : null}</div>
         <span>{updateBannerMessage(status)}</span>
@@ -217,6 +255,7 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
       description: '桌面端正在建立任务连接，请稍候刷新状态。',
       healthDescription: '本机服务正在建立工作台任务连接。',
       requiresEnrollment: false,
+      attention: false,
     };
   }
   if (reasonCode === 'connected_agent_app_worker_error' && !value) {
@@ -225,6 +264,7 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
       description: '请刷新状态；若问题持续，请从工作台重新连接桌面端。',
       healthDescription: '本机服务仍在运行，但工作台任务连接尚未就绪。',
       requiresEnrollment: false,
+      attention: true,
     };
   }
   if (
@@ -234,9 +274,10 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
   ) {
     return {
       title: '桌面端需要重新连接工作台',
-      description: '这台电脑的设备凭证已失效。请回到 HiMind 工作台重新绑定设备。',
+      description: '这台电脑的设备凭证已失效。请回到 AI 工作台重新绑定设备。',
       healthDescription: '本机服务运行正常，但设备身份已失效，需要从工作台重新绑定。',
       requiresEnrollment: true,
+      attention: true,
     };
   }
   if (normalized.includes('missing scope') || normalized.includes('required scope')) {
@@ -245,6 +286,7 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
       description: '请在下方重新登录并授权工作台账号。',
       healthDescription: '本机服务运行正常，但当前账号授权范围不足。',
       requiresEnrollment: false,
+      attention: true,
     };
   }
   if (
@@ -254,10 +296,11 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
     || normalized.includes('connect error')
   ) {
     return {
-      title: '无法连接 HiMind 工作台',
+      title: '无法连接 AI 工作台',
       description: '请检查网络连接或高级信息中的工作台地址，稍后再试。',
       healthDescription: '本机服务仍在运行，但暂时无法访问工作台。',
       requiresEnrollment: false,
+      attention: true,
     };
   }
   return {
@@ -265,5 +308,6 @@ function describeWorkerIssue(error?: string, reasonCode?: string) {
     description: '请刷新状态；若问题持续，请从工作台重新连接桌面端。',
     healthDescription: '本机服务仍在运行，但工作台任务连接尚未就绪。',
     requiresEnrollment: false,
+    attention: true,
   };
 }

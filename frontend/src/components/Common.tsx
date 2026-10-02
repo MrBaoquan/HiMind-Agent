@@ -29,12 +29,17 @@ export function NotificationCenter({ messages, onClose }: { messages: UiMessage[
   );
 }
 
-export function PageHeader({ title, description, actions }: { title: string; description: string; actions?: ReactNode }) {
+/**
+ * 页头只承担定位，不承担说明。
+ * 标签本身已经说清的事不再重复；`description` 省略时整行不渲染，
+ * 避免出现「为了填满组件而写一句话」的填充文案。
+ */
+export function PageHeader({ title, description, actions }: { title: string; description?: string; actions?: ReactNode }) {
   return (
     <header className={`page-header${actions ? ' has-actions' : ''}`}>
       <div>
         <h2>{title}</h2>
-        <p>{description}</p>
+        {description ? <p>{description}</p> : null}
       </div>
       {actions ? <div className="page-actions">{actions}</div> : null}
     </header>
@@ -45,17 +50,19 @@ export function IconButton({ icon: Icon, label, onClick, disabled }: { icon: Luc
   return <button type="button" className="btn btn-icon" title={label} aria-label={label} onClick={onClick} disabled={disabled}><Icon size={16} /></button>;
 }
 
-export function EmptyState({ icon: Icon, title, text }: { icon: LucideIcon; title: string; text: string }) {
+/** 空态承载「为什么空 + 下一步」；`text` 省略时只留标题，不写凑数的解释。 */
+export function EmptyState({ icon: Icon, title, text }: { icon: LucideIcon; title: string; text?: string }) {
   return (
     <div className="empty">
       <div className="empty-icon"><Icon size={20} aria-hidden="true" /></div>
       <strong>{title}</strong>
-      <span>{text}</span>
+      {text ? <span>{text}</span> : null}
     </div>
   );
 }
 
-export function Pill({ kind, children }: { kind: 'success' | 'warn' | 'danger' | 'neutral'; children: ReactNode }) {
+/** live 表示「此刻正在跑」，其余 kind 表示已落定的结果。 */
+export function Pill({ kind, children }: { kind: 'success' | 'warn' | 'danger' | 'neutral' | 'live'; children: ReactNode }) {
   return <span className={`pill ${kind}`}>{children}</span>;
 }
 

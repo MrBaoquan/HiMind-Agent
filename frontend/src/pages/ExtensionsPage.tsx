@@ -1,21 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
-  Blocks,
-  BookOpen,
-  CheckCircle2,
   CircleAlert,
   Download,
   GitBranch,
-  RefreshCw,
   Search,
   ShieldCheck,
   Store,
-  Workflow,
   X,
 } from 'lucide-react';
 import { EmptyState, PageHeader, Pill, Tags } from '../components/Common';
+import { ExtensionKindMark, capabilityKindIcons } from '../components/ExtensionKindMark';
+import { ExtensionBatchUpdateDialog } from '../components/ExtensionBatchUpdateDialog';
 import { ExtensionSourcesDialog } from '../components/ExtensionSourcesDialog';
+import { McpCatalogPanel } from '../components/McpCatalogPanel';
+import type { McpManager } from '../components/useMcpManager';
 import {
   FUNCTIONAL_CATEGORIES,
   categorySearchText,
@@ -23,14 +22,18 @@ import {
   functionalCategoryMatches,
   resolveFunctionalCategory,
 } from '../data/categoryCatalog';
+import { capabilityKindLabels, extensionKindLabels, marketKindOrder, type ExtensionKind, type McpKind } from '../data/extensionKinds';
 import {
   compareSemanticVersions,
   entryIdentity,
+  friendlySourceName,
+  installActionLabel,
   marketVersionFromEntry,
   mergeMarketEntries,
   newerVersion,
-  resolveSource,
+  resolveSourceIdentity,
   sourceDisplayLabel,
+  sourceNameFor,
   versionIdentity,
   type MarketCandidate,
   type MarketProduct,
@@ -53,9 +56,11 @@ import type {
   WorkflowCenterItem,
 } from '../services/agentApi';
 
-export type ExtensionKind = 'plugin' | 'skill' | 'workflow';
-
 type MarketStateFilter = 'all' | 'available' | 'installed' | 'update';
+
+/// 市场页 Banner 按模块分列。五类目录的错误合并成一段文本时，用户只知道"坏了"，
+/// 不知道坏的是插件、技能还是工作流，也就没法判断"别的还能不能用"。
+export type MarketLoadError = { module: string; message: string };
 
 /// One discoverable extension. Plugin, Skill and Workflow catalogs stay
 /// separate on the wire; this is the read model the page renders so the three
@@ -73,19 +78,8 @@ type MarketEntry = MarketProduct & {
 
 type MarketVersion = MarketCandidate;
 
-const kindLabels: Record<ExtensionKind, string> = { plugin: '插件', skill: '技能', workflow: '工作流' };
-const kindOrder: ExtensionKind[] = ['plugin', 'skill', 'workflow'];
-
 /// 首次进入「市场」时三类目录可能仍在构建扩展源快照，按这个节奏重试。
 const CATALOG_RETRY_DELAYS_MS = [0, 4000, 10000, 20000, 45000, 90000];
-
-const sourceFilters: { id: 'all' | MarketSourceGroup; label: string }[] = [
-  { id: 'all', label: '全部来源' },
-  { id: 'organization', label: '组织发布' },
-  { id: 'system', label: '系统内置' },
-  { id: 'local', label: '本地源码' },
-  { id: 'remote', label: 'GitHub 发布' },
-];
 
 const stateFilters: { id: MarketStateFilter; label: string }[] = [
   { id: 'all', label: '全部状态' },
@@ -97,6 +91,12 @@ const stateFilters: { id: MarketStateFilter; label: string }[] = [
 function readableID(value: string) {
   const tail = value.split(/[.:]/).filter(Boolean).pop() || value;
   return tail.split(/[-_]/).filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function formatPublishedAt(value?: string) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('zh-CN');
 }
 
 function friendlyPermissions(values: string[]) {
@@ -122,13 +122,42 @@ function assignmentLabel(assignment: string | undefined, governance: string | un
   if (isSystem) return '系统内置';
   if (assignment === 'required') return '组织必装';
   if (assignment === 'recommended') return '组织推荐';
-  return '可选安装';
+  // 没有组织策略就不给标签：详情头部挂一个「可选安装」，读起来像个状态，
+  // 实际只是「这条不是组织配发的」，属于把默认值当信息讲。
+  return '';
 }
 
 function assignmentKind(label: string): MarketEntry['policyKind'] {
   if (label === '组织已禁止') return 'danger';
   if (label === '组织必装' || label === '组织推荐') return 'warn';
   return 'neutral';
+}
+
+/// 列表行角标只回答一件事：这个扩展现在能不能用、要不要动它。
+/// 口径与筛选项一致（未安装 / 已安装 / 可更新），组织策略（必装、禁止）
+/// 因为会改变可用性，优先于安装状态展示。
+function marketStateBadge(entry: MarketEntry): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
+  if (entry.blocked) return { label: entry.policyLabel || '组织已禁止', tone: 'danger' };
+  if (updatableVersion(entry)) return { label: '可更新', tone: 'warn' };
+  if (entry.installedVersion) return { label: '已安装', tone: 'success' };
+  if (entry.policyLabel === '组织必装' || entry.policyLabel === '组织推荐') return { label: entry.policyLabel, tone: 'warn' };
+  return { label: '未安装', tone: 'neutral' };
+}
+
+/// 组织禁止或组织管理的扩展，市场里不该宣传「可更新」：详情页的安装按钮本来就是
+/// 禁用的，批量更新也会把它们排除在外。角标、筛选、「全部更新」计数三处统一走这里，
+/// 避免出现「列表说有 5 项可更新，点进去只有 4 项能动手」。
+function updatableVersion(entry: MarketEntry) {
+  if (!entry.updateVersion || entry.blocked || entry.managed) return '';
+  return entry.updateVersion;
+}
+
+/// 列表行显示的版本：有更新就给更新目标（那是这个产品当下最需要被看见的版本），
+/// 本机装了就给本机那一版，都没装才给目录版本。多来源时目录版本是聚合后的头部版本，
+/// 但本机可能装得比它更新，所以这里仍然先认本机版本，避免行里写出「已安装 v1.0.1」
+/// 而本机其实是 v1.0.2 这种自相矛盾的状态。
+function displayVersion(entry: MarketEntry) {
+  return updatableVersion(entry) || entry.installedVersion || entry.version;
 }
 
 type BuildInput = {
@@ -138,9 +167,18 @@ type BuildInput = {
   installedPlugins: PluginItem[];
   installedSkills: CodexSkillStatusItem[];
   installedWorkflows: WorkflowCenterItem[];
+  /// 扩展源配置里的「ID → 名字」，用来把 local:xxx / github:xxx 换成用户认识的名字。
+  sourceNames: Map<string, string>;
 };
 
-function buildEntries({ plugins, skills, workflows, installedPlugins, installedSkills, installedWorkflows }: BuildInput): MarketEntry[] {
+/// 来源名优先用「来源管理」里配置的名字；没有配置项的来源（系统内置、工作台下发、
+/// 随手导入的本机目录）按产品叫法兜底，不退回到"本地源码/组织发布"这类类型词。
+function sourceNameOf(source: { group: MarketSourceGroup; id: string }, nameById: Map<string, string>) {
+  const configured = source.id ? nameById.get(source.id) || '' : '';
+  return friendlySourceName(configured, '') || sourceNameFor(source.group);
+}
+
+function buildEntries({ plugins, skills, workflows, installedPlugins, installedSkills, installedWorkflows, sourceNames: sourceNameById }: BuildInput): MarketEntry[] {
   const installedPluginById = new Map(installedPlugins.map(item => [item.id, item]));
   const installedSkillById = new Map(installedSkills.map(item => [item.record.manifest.id, item]));
   const installedWorkflowById = new Map(installedWorkflows.map(item => [item.package.id, item]));
@@ -148,7 +186,8 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
 
   const pluginEntries = plugins.map<MarketEntry>(item => {
     const installed = installedPluginById.get(item.plugin_id);
-    const source = resolveSource(item.source);
+    const source = resolveSourceIdentity(item.source);
+    const sourceName = sourceNameOf(source, sourceNameById);
     const policy = assignmentLabel(item.assignment, item.governance, item.source === 'system' || item.governance === 'required');
     const permissions = friendlyPermissions(item.permissions || []);
     return {
@@ -169,6 +208,8 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       })),
       sourceGroup: source.group,
       sourceLabel: source.label,
+      sourceId: source.id,
+      sourceName,
       policyLabel: policy,
       policyKind: assignmentKind(policy),
       blocked: item.governance === 'blocked' || item.assignment === 'blocked',
@@ -189,7 +230,8 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
 
   const skillEntries = skills.map<MarketEntry>(item => {
     const installed = installedSkillById.get(item.skill_id);
-    const source = resolveSource(item.source, item.channel);
+    const source = resolveSourceIdentity(item.source, item.channel);
+    const sourceName = sourceNameOf(source, sourceNameById);
     const policy = assignmentLabel(item.assignment, undefined, item.source === 'system');
     const installedVersion = installed && installed.client_state !== 'not_installed' ? installed.installed_version || installed.record.manifest.version : '';
     const availableVersion = installed?.available_version || item.version;
@@ -211,6 +253,8 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       })),
       sourceGroup: source.group,
       sourceLabel: source.label,
+      sourceId: source.id,
+      sourceName,
       policyLabel: policy,
       policyKind: assignmentKind(policy),
       blocked: item.assignment === 'blocked',
@@ -229,7 +273,8 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
 
   const workflowEntries = workflows.map<MarketEntry>(item => {
     const installed = installedWorkflowById.get(item.workflow_id);
-    const source = resolveSource(item.source, item.channel);
+    const source = resolveSourceIdentity(item.source, item.channel);
+    const sourceName = sourceNameOf(source, sourceNameById);
     const policy = assignmentLabel(item.assignment, undefined, item.source === 'system');
     return {
       key: entryIdentity('workflow', item.workflow_id, item.source || '', item.artifact_id || '', item.sha256 || ''),
@@ -244,6 +289,8 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       dependencies: [],
       sourceGroup: source.group,
       sourceLabel: source.label,
+      sourceId: source.id,
+      sourceName,
       policyLabel: policy,
       policyKind: assignmentKind(policy),
       blocked: item.assignment === 'blocked',
@@ -275,6 +322,7 @@ function entrySearchText(entry: MarketEntry) {
     entry.id,
     entry.description,
     entry.author,
+    entry.sourceName || entry.sourceLabel,
     entry.sourceLabel,
     entry.capabilityIds.join(' '),
     categorySearchText(entry.categories),
@@ -289,33 +337,9 @@ function isUncategorized(entry: MarketEntry) {
   return !entry.categories.some(category => Boolean(resolveFunctionalCategory(category)));
 }
 
-/// Installed counts plus update availability for one distribution unit.
-function unitInstallState(unit: ExtensionDistributionUnit) {
-  const installed = new Map(unit.installed.map(item => [`${item.asset_kind}:${item.asset_id}`, item]));
-  let updates = 0;
-  let missing = 0;
-  for (const asset of unit.assets) {
-    const record = installed.get(`${asset.asset_kind}:${asset.asset_id}`);
-    const availableDigest = asset.sha256.trim().toLowerCase();
-    const installedDigest = record?.sha256?.trim().toLowerCase() || '';
-    const digestChanged = Boolean(availableDigest && installedDigest && availableDigest !== installedDigest);
-    // 直接挂载的开发项目在台账中使用 `development` 作为 source_id，
-    // 但它属于本地取用侧，不应在市场里被误报为跨来源更新。
-    const installedSide = record?.side === 'development' ? 'local' : record?.side;
-    const sourceChanged = Boolean(record && (
-      installedSide !== unit.acquisition
-      || (installedSide !== 'local' && installedSide !== 'remote' && record.source_id !== asset.source_id)
-    ));
-    if (!record) missing += 1;
-    if (!record || record.version !== asset.version || digestChanged || sourceChanged) updates += 1;
-  }
-  return { installed: unit.installed.length, updates, missing };
-}
-
-
 export function ExtensionsPage({
   loading,
-  error,
+  errors,
   plugins,
   installedPlugins,
   skills,
@@ -331,6 +355,8 @@ export function ExtensionsPage({
   onInstallPlugin,
   onPlanSkill,
   onInstallSkill,
+  installTargets,
+  onPickSkillLocation,
   onLoadPluginVersions,
   onLoadSkillVersions,
   onLoadWorkflowVersions,
@@ -342,15 +368,20 @@ export function ExtensionsPage({
   extensionSourcesError,
   onRefreshSources,
   onAddSource,
-  onAddLocalSource,
   onUpdateSourceConfig,
   onRemoveSource,
   onSetUnitAcquisition,
-  onSetWorkspace,
   onDevelopWorkspace,
+  openSourcesRequest,
+  onSourcesRequestHandled,
+  mcp,
+  openMcpRequest,
+  onMcpRequestHandled,
+  onManageMcp,
+  onBatchUpdateFinished,
 }: {
   loading: boolean;
-  error: string;
+  errors: MarketLoadError[];
   plugins: PluginCatalogItem[];
   installedPlugins: PluginItem[];
   skills: OrganizationSkillCatalogItem[];
@@ -365,7 +396,9 @@ export function ExtensionsPage({
   onPlanPlugin: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => Promise<PluginInstallPlan>;
   onInstallPlugin: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => Promise<void>;
   onPlanSkill: (skillId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => Promise<SkillInstallPlan>;
-  onInstallSkill: (skillId: string, version: string | undefined, optionalPluginIds: string[], source?: string, artifactId?: string, sha256?: string) => Promise<void>;
+  onInstallSkill: (skillId: string, version: string | undefined, optionalPluginIds: string[], source?: string, artifactId?: string, sha256?: string, clients?: string[], location?: string) => Promise<void>;
+  installTargets: { id: string; name: string; detected: boolean }[];
+  onPickSkillLocation: () => Promise<string>;
   onLoadPluginVersions: (pluginId: string, source?: string) => Promise<PluginCatalogItem[]>;
   onLoadSkillVersions: (skillId: string, source?: string) => Promise<OrganizationSkillCatalogItem[]>;
   onLoadWorkflowVersions: (workflowId: string, source?: string) => Promise<WorkflowCatalogItem[]>;
@@ -377,15 +410,27 @@ export function ExtensionsPage({
   extensionSourcesError: string;
   onRefreshSources: () => Promise<void>;
   onAddSource: (name: string, repository: string, reference: string, catalogPath: string, verification: ExtensionSourceConfig['verification']) => Promise<void>;
-  onAddLocalSource: (name: string, root: string, catalogPath?: string) => Promise<void>;
   onUpdateSourceConfig: (source: ExtensionSourceConfig, enabled: boolean, autoUpdate: boolean, verification: ExtensionSourceConfig['verification']) => Promise<void>;
   onRemoveSource: (sourceId: string) => Promise<void>;
   onSetUnitAcquisition: (unitKey: string, acquisition: ExtensionSourceAcquisition) => Promise<void>;
-  onSetWorkspace: (root: string) => Promise<void>;
   onDevelopWorkspace: (root: string) => void;
+  openSourcesRequest: number;
+  /// 打开来源管理的请求是一次性的：消费掉之后要清零，否则每次重新进入市场都会
+  /// 再把对话框弹出来。
+  onSourcesRequestHandled: () => void;
+  /// MCP 工具是接进来的本机工具，没有制品与版本，所以不走 `entries` 那条目录口径，
+  /// 单独读一份连接状态；市场和「我的能力」两处的启停、编辑都在这里收口。
+  mcp: McpManager;
+  /// 「浏览 MCP 工具」这类跨页入口要能直接把市场切到 MCP 页签，同样是一次性请求。
+  openMcpRequest: number;
+  onMcpRequestHandled: () => void;
+  onManageMcp: () => void;
+  /// 批量更新动过版本之后，市场清单与「我的能力」的安装状态都得重新取一遍。
+  onBatchUpdateFinished: () => void | Promise<void>;
 }) {
-  const [kindFilter, setKindFilter] = useState<'all' | ExtensionKind>('all');
-  const [sourceFilter, setSourceFilter] = useState<'all' | MarketSourceGroup>('all');
+  const [kindFilter, setKindFilter] = useState<'all' | ExtensionKind | McpKind>('all');
+  // 来源筛选按真实来源名的稳定键走（配置源用来源 ID），不再用"本地源码/组织发布"这类类型词。
+  const [sourceFilter, setSourceFilter] = useState<string>('all');
   const [stateFilter, setStateFilter] = useState<MarketStateFilter>('all');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [query, setQuery] = useState('');
@@ -397,11 +442,26 @@ export function ExtensionsPage({
   const [planBusy, setPlanBusy] = useState(false);
   const [installing, setInstalling] = useState('');
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [batchOpen, setBatchOpen] = useState(false);
   const catalogAttempts = useRef(0);
   // `onRefresh` is a fresh closure on every parent render; keeping it in a ref
   // stops the retry effect from resetting its timer before it can fire.
   const refreshCatalogs = useRef(onRefresh);
   refreshCatalogs.current = onRefresh;
+
+  useEffect(() => {
+    if (openSourcesRequest > 0) {
+      setSourcesOpen(true);
+      onSourcesRequestHandled();
+    }
+  }, [openSourcesRequest, onSourcesRequestHandled]);
+
+  useEffect(() => {
+    if (openMcpRequest > 0) {
+      setKindFilter('mcp');
+      onMcpRequestHandled();
+    }
+  }, [openMcpRequest, onMcpRequestHandled]);
 
   // The three catalogs load once at app start; the first call can still be
   // building the extension-source snapshot, which leaves the available list
@@ -418,10 +478,46 @@ export function ExtensionsPage({
     return () => window.clearTimeout(timer);
   }, [loading, plugins.length, skills.length, workflows.length]);
 
-  const entries = useMemo(
-    () => buildEntries({ plugins, skills, workflows, installedPlugins, installedSkills, installedWorkflows }),
-    [installedPlugins, installedSkills, installedWorkflows, plugins, skills, workflows],
+  // 自动登记的本机来源会把绝对路径当作名字，这里先收敛成目录名再交给列表使用。
+  const sourceNameById = useMemo(
+    () => new Map((extensionSourceSnapshot?.sources || []).map(item => [item.source.id, friendlySourceName(item.source.name, item.source.repository)])),
+    [extensionSourceSnapshot],
   );
+
+  const entries = useMemo(
+    () => buildEntries({ plugins, skills, workflows, installedPlugins, installedSkills, installedWorkflows, sourceNames: sourceNameById }),
+    [installedPlugins, installedSkills, installedWorkflows, plugins, skills, sourceNameById, workflows],
+  );
+
+  /// 来源卡片的「待更新」必须和市场列表同一个口径，所以直接把市场算好的更新目标
+  /// 版本交给它：卡片只负责回答「这条更新是不是我这个来源提供的」。
+  /// 组织管理与组织禁止的制品版本由组织推进，`updatableVersion` 已把它们排除，
+  /// 卡片自然也不再统计。
+  const unitUpdateTargets = useMemo(
+    () => new Map(
+      entries
+        .map(entry => [`${entry.kind}:${entry.id}`, updatableVersion(entry)] as [string, string])
+        .filter(([, version]) => Boolean(version)),
+    ),
+    [entries],
+  );
+
+  /// 来源下拉只列出当前目录里真实出现过的来源，用它们的名字；空来源不会占一个选项。
+  const sourceOptions = useMemo(() => {
+    const options = new Map<string, string>();
+    for (const entry of entries) {
+      const keys = entry.sourceKeys || [];
+      const names = entry.sourceNames || [];
+      keys.forEach((key, index) => { if (!options.has(key)) options.set(key, names[index] || key); });
+    }
+    return [...options.entries()].map(([id, label]) => ({ id, label }));
+  }, [entries]);
+
+  // 来源列表会随目录刷新变化（例如某个来源被停用后整批下架）：选中的来源消失时要回到全部，
+  // 否则下拉会停在空白上，用户看不出当前在看什么。
+  useEffect(() => {
+    if (sourceFilter !== 'all' && !sourceOptions.some(option => option.id === sourceFilter)) setSourceFilter('all');
+  }, [sourceFilter, sourceOptions]);
 
   const categoryCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -439,12 +535,12 @@ export function ExtensionsPage({
     const normalized = query.trim().toLowerCase();
     return entries.filter(entry => {
       if (kindFilter !== 'all' && entry.kind !== kindFilter) return false;
-      if (sourceFilter !== 'all' && !(entry.sourceGroups || [entry.sourceGroup]).includes(sourceFilter)) return false;
+      if (sourceFilter !== 'all' && !(entry.sourceKeys || []).includes(sourceFilter)) return false;
       if (categoryFilter === 'uncategorized') { if (!isUncategorized(entry)) return false; }
       else if (categoryFilter !== 'all' && !functionalCategoryMatches(entry.categories, categoryFilter)) return false;
       if (stateFilter === 'available' && entry.installedVersion) return false;
       if (stateFilter === 'installed' && !entry.installedVersion) return false;
-      if (stateFilter === 'update' && !entry.updateVersion) return false;
+      if (stateFilter === 'update' && !updatableVersion(entry)) return false;
       if (normalized && !entrySearchText(entry).includes(normalized)) return false;
       return true;
     });
@@ -457,7 +553,7 @@ export function ExtensionsPage({
 
   const selectedEntry = visibleEntries.find(entry => entry.key === selectedKey) || visibleEntries[0] || null;
   const availableCount = entries.filter(entry => !entry.installedVersion).length;
-  const updateCount = entries.filter(entry => entry.updateVersion).length;
+  const updateCount = entries.filter(entry => updatableVersion(entry)).length;
   const selectedBusyKey = selectedEntry?.key || '';
 
   const loadVersions = useCallback(async (entry: MarketEntry): Promise<MarketVersion[]> => {
@@ -520,137 +616,129 @@ export function ExtensionsPage({
     <div className="plugin-page market-page">
       <PageHeader
         title="市场"
-        description="查找、安装和更新插件、技能与工作流。"
-        actions={<div className="actions-row"><button className="btn" title="管理来源" onClick={() => setSourcesOpen(true)}><GitBranch size={14} />来源管理</button><button className="btn btn-icon" title="刷新市场" aria-label="刷新市场" onClick={onRefresh}><RefreshCw size={16} className={loading ? 'spin' : ''} /></button></div>}
+        actions={<button className="btn" title="管理来源" onClick={() => setSourcesOpen(true)}><GitBranch size={14} />来源管理</button>}
       />
-      {error ? <div className="blocker"><CircleAlert size={18} /><div><strong>部分目录数据读取失败</strong><span>{error}</span></div></div> : null}
-      <section className="extension-summary" aria-label="市场概览">
-        <div><Blocks size={18} /><span><small>插件</small><strong>{kindCounts.plugin}</strong></span></div>
-        <div><BookOpen size={18} /><span><small>技能</small><strong>{kindCounts.skill}</strong></span></div>
-        <div><Workflow size={18} /><span><small>工作流</small><strong>{kindCounts.workflow}</strong></span></div>
-        <div className={updateCount ? 'attention' : ''}><Download size={18} /><span><small>可更新</small><strong>{updateCount}</strong></span></div>
-      </section>
-          {units.length ? (
-            <section className="card extension-unit-panel">
-              <div className="card-header"><strong>扩展仓库</strong><Pill kind="neutral">{units.length}</Pill></div>
-              <div className="extension-unit-list">
-                {units.map(unit => {
-                  const state = unitInstallState(unit);
-                  // Bind the install action to the source selected in the
-                  // snapshot. A DistributionUnit can expose both local and
-                  // remote sources, but installation must never silently
-                  // fall back to the other side when the selected source is
-                  // unavailable.
-                  const sourceId = unit.acquisition === 'local' ? unit.local_source_id : unit.remote_source_id;
-                   const sourceLabel = unit.acquisition === 'remote' ? 'GitHub 发布' : '本地源码';
-                   const stateLabel = state.missing && state.updates > state.missing
-                     ? `${state.missing} 项待安装，${state.updates - state.missing} 项可更新`
-                     : state.missing
-                     ? `${state.missing} 项待安装`
-                     : state.updates
-                       ? `${state.updates} 项可更新`
-                       : state.installed
-                         ? '已是最新'
-                         : '未安装';
-                  const parts = [
-                    unit.plugin_count ? `${unit.plugin_count} 插件` : '',
-                    unit.skill_count ? `${unit.skill_count} 技能` : '',
-                    unit.workflow_count ? `${unit.workflow_count} 工作流` : '',
-                  ].filter(Boolean);
-                  return (
-                    <article className="extension-unit-row" key={unit.unit_key}>
-                      <span>
-                        <strong>{unit.name || unit.repository}</strong>
-                       <small>{sourceLabel}{sourceId ? '' : '（来源不可用）'} · {parts.length ? parts.join(' · ') : '未提供扩展'}{state.installed ? ` · 已安装 ${state.installed} 项` : ''}</small>
-                      </span>
-                      <Pill kind={state.updates ? 'warn' : 'neutral'}>{stateLabel}</Pill>
-                      <button type="button" className="btn" disabled={Boolean(busyUnit) || unit.state !== 'ready' || !sourceId} onClick={() => sourceId && void onInstallUnit(unit.unit_key, sourceId)}>
-                        <Download size={14} />{busyUnit === unit.unit_key ? '处理中' : state.missing && state.updates > state.missing ? '安装或更新' : state.missing ? '安装' : state.updates ? '更新' : state.installed ? '重新安装' : '安装'}
-                      </button>
-                    </article>
-                  );
-                })}
-              </div>
-            </section>
-          ) : null}
-        <section className={`market-workspace compact-master-detail${detailOpen ? ' detail-open' : ''}`}>
+      {errors.length ? <div className="blocker market-load-errors"><CircleAlert size={18} /><div><strong>{errors.length === 1 ? `${errors[0].module}目录读取失败` : `部分目录数据读取失败（${errors.map(item => item.module).join('、')}）`}</strong>{errors.map(item => <span key={item.module}>{item.module}：{item.message}</span>)}</div></div> : null}
+        {/* MCP 工具页签没有列表可铺，主从两栏会空掉半屏，所以整页切成单栏（mcp-mode）。 */}
+        <section className={`market-workspace${kindFilter === 'mcp' ? ' mcp-mode' : ' compact-master-detail'}${detailOpen ? ' detail-open' : ''}`}>
+          {/* 类型页签横跨两栏：它管的是整个市场的范围，不是左列表的筛选条件。
+              挤在 43% 的左列里，五类能力就会折行，右半边还空着。 */}
+          <div className="market-kind-bar">
+            <div className="plugin-tabs market-kind-tabs" role="tablist" aria-label="扩展类型">
+              <button role="tab" aria-selected={kindFilter === 'all'} className={kindFilter === 'all' ? 'active' : ''} onClick={() => { setKindFilter('all'); setDetailOpen(false); }}>全部 <span>{entries.length}</span></button>
+              {marketKindOrder.map(kind => {
+                const KindIcon = capabilityKindIcons[kind];
+                // 市场页签上的数字是「目录里有多少可获得的」，不是「已经装了几条」。
+                const count = kind === 'mcp' ? mcp.catalog.entries.length : kindCounts[kind];
+                return <button role="tab" key={kind} aria-selected={kindFilter === kind} className={kindFilter === kind ? 'active' : ''} onClick={() => { setKindFilter(kind); setDetailOpen(false); }}><KindIcon size={14} />{capabilityKindLabels[kind]} <span>{count}</span></button>;
+              })}
+            </div>
+          </div>
           <aside className="market-browser">
             <div className="market-tools">
-              <label className="plugin-search"><Search size={15} /><span className="sr-only">搜索扩展</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索名称、用途或能力" /></label>
-              <div className="plugin-tabs market-kind-tabs" role="tablist" aria-label="扩展类型">
-                <button role="tab" aria-selected={kindFilter === 'all'} className={kindFilter === 'all' ? 'active' : ''} onClick={() => setKindFilter('all')}>全部 <span>{entries.length}</span></button>
-                {kindOrder.map(kind => <button role="tab" key={kind} aria-selected={kindFilter === kind} className={kindFilter === kind ? 'active' : ''} onClick={() => setKindFilter(kind)}>{kindLabels[kind]} <span>{kindCounts[kind]}</span></button>)}
-              </div>
-              <div className="market-category-block">
-                <div className="market-category-heading"><strong>功能分类</strong><span>按用途查找</span></div>
+              {/* MCP 页签搜的是工具，不是「能力」：同一句占位文案跨页签复用会让人以为这里能搜到插件和技能。 */}
+              <label className="plugin-search"><Search size={15} /><span className="sr-only">{kindFilter === 'mcp' ? '搜索 MCP 工具' : '搜索扩展'}</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder={kindFilter === 'mcp' ? '搜索 MCP 工具名称或用途' : '搜索名称、用途或能力'} /></label>
+              {/* MCP 工具没有功能分类、来源与安装状态这几层筛选，页签下面就不再铺一排用不上的控件。 */}
+              {kindFilter === 'mcp' ? null : <div className="market-category-block">
+                <label className="market-category-select">
+                  <span className="sr-only">功能分类</span>
+                  <select value={categoryFilter} onChange={event => setCategoryFilter(event.target.value)}>
+                    <option value="all">全部分类（{entries.length}）</option>
+                    {FUNCTIONAL_CATEGORIES.map(category => <option key={category.id} value={category.id}>{category.label}（{categoryCounts.get(category.id) || 0}）</option>)}
+                    <option value="uncategorized">未分类（{uncategorizedCount}）</option>
+                  </select>
+                </label>
                 <nav className="market-category-nav" aria-label="扩展功能分类">
                   <button type="button" className={categoryFilter === 'all' ? 'active' : ''} onClick={() => setCategoryFilter('all')}>全部<span>{entries.length}</span></button>
                   {FUNCTIONAL_CATEGORIES.map(category => <button type="button" key={category.id} className={categoryFilter === category.id ? 'active' : ''} onClick={() => setCategoryFilter(category.id)}>{category.label}<span>{categoryCounts.get(category.id) || 0}</span></button>)}
                   <button type="button" className={categoryFilter === 'uncategorized' ? 'active' : ''} onClick={() => setCategoryFilter('uncategorized')}>未分类<span>{uncategorizedCount}</span></button>
                 </nav>
-              </div>
-              <div className="market-refine">
-                <label><span className="sr-only">扩展来源</span><select value={sourceFilter} onChange={event => setSourceFilter(event.target.value as 'all' | MarketSourceGroup)}>{sourceFilters.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+              </div>}
+              {kindFilter === 'mcp' ? null : <div className="market-refine">
+                <label><span className="sr-only">扩展来源</span><select value={sourceFilter} onChange={event => setSourceFilter(event.target.value)}><option value="all">全部来源</option>{sourceOptions.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
                 <label><span className="sr-only">安装状态</span><select value={stateFilter} onChange={event => setStateFilter(event.target.value as MarketStateFilter)}>{stateFilters.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-              </div>
+              </div>}
             </div>
-            <div className="plugin-catalog-result"><span>{visibleEntries.length} 个结果</span></div>
+            {kindFilter === 'mcp' ? null : <>
+            <div className="plugin-catalog-result">
+              <span>{visibleEntries.length} 个扩展</span>
+              <span className="market-result-meta">
+                {updateCount ? <button type="button" className={`market-update-chip${stateFilter === 'update' ? ' active' : ''}`} onClick={() => setStateFilter(stateFilter === 'update' ? 'all' : 'update')} title="只显示有可用更新的扩展">{updateCount} 项可更新</button> : null}
+                {updateCount ? <button type="button" className="market-update-action" onClick={() => setBatchOpen(true)} title="核对来源后批量更新扩展"><Download size={12} />全部更新</button> : null}
+              </span>
+            </div>
             <div className="market-list">
               {visibleEntries.map(entry => {
                 const key = entry.key;
                 const selected = selectedEntry?.key === key;
+                const badge = marketStateBadge(entry);
                 return (
                   <button key={key} type="button" className={`market-item${selected ? ' selected' : ''}`} onClick={() => { setSelectedKey(key); setDetailOpen(true); }}>
-                    <span className={`extension-kind-badge ${entry.kind}`}>{kindLabels[entry.kind]}</span>
+                    {/* 列表行的类型只靠这一格认：图标 + 颜色，文案交给页签和详情头部。 */}
+                    <ExtensionKindMark kind={entry.kind} label={extensionKindLabels[entry.kind]} />
                   <span className="market-item-copy">
                     <strong title={entry.name}>{entry.name}</strong>
-                    <small title={entry.description || `${entry.sourceLabel} · ${entry.author}`}>{entry.description || `${entry.sourceLabel} · ${entry.author}`}</small>
-                    <small className="catalog-item-author">{entry.sourceLabel} · {entry.author} · v{entry.version}</small>
+                    <small title={entry.description || `${entry.sourceName} · ${entry.author}`}>{entry.description || `${entry.sourceName} · ${entry.author}`}</small>
+                    <small className="catalog-item-author">{entry.sourceName} · {entry.author} · v{displayVersion(entry)}</small>
                   </span>
-                    <span className={`skill-state-label ${entry.updateVersion ? 'warn' : entry.installedVersion ? 'success' : 'neutral'}`}>{entry.updateVersion ? '可更新' : entry.installedVersion ? '已安装' : entry.policyLabel}</span>
+                    <span className={`skill-state-label ${badge.tone}`}>{badge.label}</span>
                   </button>
                 );
               })}
               {!loading && !visibleEntries.length ? <EmptyState icon={Search} title="没有匹配的扩展" text={entries.length ? '调整关键词或筛选条件后重试。' : '添加来源后，可安装的扩展会显示在这里。'} /> : null}
             </div>
+            </>}
           </aside>
           <main className="market-detail plugin-catalog-detail">
-            <button type="button" className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回列表</button>
-            {selectedEntry ? (
-              <MarketDetail
-                entry={selectedEntry}
-                loadVersions={loadVersions}
-                installing={planBusy || installing === selectedBusyKey}
-                onInstall={(version) => installEntry(selectedEntry, version)}
-                onManage={() => onOpenKind(selectedEntry.kind)}
-              />
-            ) : <EmptyState icon={Store} title="选择一个扩展" text="查看功能、依赖、版本和安装状态。" />}
+            {kindFilter === 'mcp' ? (
+              // MCP 工具没有版本、依赖与制品签名，详情页那一套用不上，直接把获得面板铺上来。
+              <McpCatalogPanel mcp={mcp} query={query} onManage={onManageMcp} />
+            ) : (
+              <>
+                <button type="button" className="workspace-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回列表</button>
+                {selectedEntry ? (
+                  <MarketDetail
+                    entry={selectedEntry}
+                    loadVersions={loadVersions}
+                    installing={planBusy || installing === selectedBusyKey}
+                    onInstall={(version) => installEntry(selectedEntry, version)}
+                    onManage={() => onOpenKind(selectedEntry.kind)}
+                  />
+                ) : <EmptyState icon={Store} title="选择一个扩展" text="查看功能、依赖、版本和安装状态。" />}
+              </>
+            )}
           </main>
         </section>
       {pluginPlan || skillPlan || planError ? (
         <MarketPlanDialog
           pluginPlan={pluginPlan}
           skillPlan={skillPlan}
+          installTargets={installTargets}
+          onPickLocation={onPickSkillLocation}
           error={planError}
           busy={installing === selectedBusyKey}
           onClose={() => { setPluginPlan(null); setSkillPlan(null); setPlanError(''); }}
           onInstallPlugin={(item) => { setPluginPlan(null); void runInstall(entryIdentity('plugin', item.plugin_id, item.source || '', item.artifact_id || '', item.sha256 || ''), () => onInstallPlugin(item.plugin_id, item.version, item.source, item.artifact_id, item.sha256)); }}
-          onInstallSkill={(item, optionalIds) => { setSkillPlan(null); void runInstall(entryIdentity('skill', item.skill_id, item.source || '', item.artifact_id || '', item.sha256 || ''), () => onInstallSkill(item.skill_id, item.version, optionalIds, item.source, item.artifact_id, item.sha256)); }}
+          onInstallSkill={(item, optionalIds, clients, location) => { setSkillPlan(null); void runInstall(entryIdentity('skill', item.skill_id, item.source || '', item.artifact_id || '', item.sha256 || ''), () => onInstallSkill(item.skill_id, item.version, optionalIds, item.source, item.artifact_id, item.sha256, clients, location)); }}
         />
       ) : null}
+      <ExtensionBatchUpdateDialog
+        open={batchOpen}
+        onClose={() => setBatchOpen(false)}
+        onFinished={onBatchUpdateFinished}
+      />
       <ExtensionSourcesDialog
         open={sourcesOpen}
         workspace={workspace}
         settings={extensionSources}
         snapshot={extensionSourceSnapshot}
+        unitUpdateTargets={unitUpdateTargets}
         loading={extensionSourcesLoading}
         error={extensionSourcesError}
         onClose={() => setSourcesOpen(false)}
-        onSetWorkspace={onSetWorkspace}
         onDevelopWorkspace={onDevelopWorkspace}
         onRefresh={onRefreshSources}
         onAdd={onAddSource}
-        onAddLocal={onAddLocalSource}
         onUpdate={onUpdateSourceConfig}
         onRemove={onRemoveSource}
         onSetAcquisition={onSetUnitAcquisition}
@@ -670,21 +758,24 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
   const [versions, setVersions] = useState<MarketVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsError, setVersionsError] = useState('');
+  // 顶部按钮装的是「这个产品当下最该装的版本」：有可更新版本时就是那个新版本，
+  // 否则才退回目录主来源的版本。同一产品有多个来源时主来源可能比本机已装的还旧，
+  // 直接取主来源版本会出现「列表写着可更新至 v1.0.2，按钮却写着降级到 v1.0.1」。
+  const recommendedVersion = updatableVersion(entry) || entry.version;
   const entryCandidate: MarketVersion = {
-    version: entry.version,
+    version: recommendedVersion,
     publishedAt: '',
     notes: '',
     source: entry.source,
     sourceLabel: sourceDisplayLabel(entry.source, entry.sourceLabel),
+    sourceName: entry.sourceName || sourceDisplayLabel(entry.source, entry.sourceLabel),
     minAgentVersion: entry.minAgentVersion,
     artifactId: entry.artifactId,
     sha256: entry.sha256,
   };
-  const [selectedCandidate, setSelectedCandidate] = useState(versionIdentity(entryCandidate));
 
   useEffect(() => {
     let active = true;
-    setSelectedCandidate(versionIdentity(entryCandidate));
     setVersionsLoading(true);
     setVersionsError('');
     loadVersions(entry)
@@ -695,41 +786,57 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
   }, [entry, loadVersions]);
 
   const sortedVersions = useMemo(() => [...versions].sort((left, right) => compareSemanticVersions(right.version, left.version)), [versions]);
-  const selected = sortedVersions.find(item => versionIdentity(item) === selectedCandidate) || sortedVersions[0];
   const installed = entry.installedVersion;
-  const isCurrent = Boolean(installed) && selected?.version === installed;
-  const actionLabel = entry.blocked ? '组织已禁止安装' : entry.managed ? '组织管理' : installing ? '正在检查' : isCurrent ? '重新安装此版本' : installed ? '安装此版本' : '安装';
+  // 顶部按钮装的是目录里的推荐版本；历史版本在下面的清单里逐行直接装，
+  // 所以按钮必须带上版本号，"安装此版本"这种说法看不出会装成哪一个。
+  const lockingLabel = entry.blocked ? '组织已禁止安装' : entry.managed ? '组织管理' : '';
+  const actionLabel = installing ? '正在检查' : installActionLabel({ target: entryCandidate.version, installed, locked: lockingLabel });
   const disabled = entry.blocked || entry.managed || installing;
+  // 降级不该是详情页最显眼的那个动作，只有安装和升级才用主按钮样式，
+  // 与下方版本清单「本机就是这一版就退回普通样式」的规则保持一致。
+  const headerPrimary = !installed || compareSemanticVersions(entryCandidate.version, installed) > 0;
+  // 本机已装、且没有任何来源给出更高版本时，这个产品对用户的状态是「已经拥有」，
+  // 头部再放一个安装类按钮只会重复版本清单里的动作，所以这里换成一句状态。
+  // 组织已禁止/组织管理的产品例外：那个按钮是在解释「为什么装不了」。
+  const upToDate = !!installed && !updatableVersion(entry) && compareSemanticVersions(entryCandidate.version, installed) <= 0;
+  const showHeaderInstall = !upToDate || !!lockingLabel;
 
   return (
     <>
       <header className="plugin-product-header">
         <div className="plugin-product-title">
-          <span className="plugin-product-mark">{entry.name.slice(0, 1)}</span>
+          <ExtensionKindMark kind={entry.kind} />
           <div>
-            <div><h3>{entry.name}</h3><Pill kind={entry.policyKind}>{entry.policyLabel}</Pill><span className={`extension-kind-badge ${entry.kind}`}>{kindLabels[entry.kind]}</span></div>
-            <span>{entry.sourceLabel} · {entry.author}</span>
+            <div><h3>{entry.name}</h3>{entry.policyLabel ? <Pill kind={entry.policyKind}>{entry.policyLabel}</Pill> : null}</div>
+            {/* 类型在详情头部走文字，形状交给左边那一格，两个彩色小块并排会互相打架。 */}
+            <span>{extensionKindLabels[entry.kind]} · {entry.sourceName} · {entry.author}</span>
           </div>
         </div>
         <div className="actions-row">
-          {installed ? <button type="button" className="btn" onClick={onManage}>管理</button> : null}
-          <button type="button" className="btn btn-primary" disabled={disabled || !selected} onClick={() => selected && onInstall(selected)}><Download size={15} />{actionLabel}</button>
+          {/* 「管理」单独出现时看不出管的是什么；这个按钮实际跳去「我的能力」的对应页签。 */}
+          {installed ? <button type="button" className="btn" title="在「我的能力」里管理" onClick={onManage}>管理已安装</button> : null}
+          {upToDate && !lockingLabel ? <Pill kind="success">已是最新</Pill> : null}
+          {showHeaderInstall ? <button type="button" className={`btn${headerPrimary ? ' btn-primary' : ''}`} disabled={disabled} onClick={() => onInstall(entryCandidate)}><Download size={15} />{actionLabel}</button> : null}
         </div>
       </header>
-       <p className="plugin-product-description">{entry.description || '暂无说明。'}</p>
-      {installed ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>已安装 v{installed}{entry.updateVersion ? ` · 可更新至 v${entry.updateVersion}` : ''}</strong><span>{entry.kind === 'plugin' ? '可在插件页面启用、停用或回滚。' : entry.kind === 'skill' ? '可在技能页面同步、更新或卸载。' : '可在工作流页面启用、停用或运行。'}</span></div></div> : null}
+      {entry.description ? <p className="plugin-product-description">{entry.description}</p> : null}
+      {installed ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>已安装 v{installed}{updatableVersion(entry) ? ` · 可更新至 v${entry.updateVersion}` : entry.managed ? ' · 版本由组织推进' : ''}</strong><span>{entry.kind === 'plugin' ? '可在插件页面启用或停用。' : entry.kind === 'skill' ? '可在技能页面同步、更新或卸载。' : '可在工作流页面启用、停用或运行。'}</span></div></div> : null}
       <section className="plugin-product-section">
         <div className="plugin-section-heading"><div><h4>版本</h4></div><span className="market-section-note">{versionsLoading ? '读取中' : `${sortedVersions.length} 个可安装版本`}</span></div>
         {versionsError ? <div className="market-inline-warning"><CircleAlert size={14} />{versionsError}</div> : null}
         <div className="market-version-list">
-          {sortedVersions.map(candidate => (
-            <button type="button" key={versionIdentity(candidate)} className={versionIdentity(candidate) === selectedCandidate ? 'active' : ''} onClick={() => setSelectedCandidate(versionIdentity(candidate))}>
-              <span><strong>v{candidate.version}</strong><small>{candidate.version === installed ? `本机已安装 · ${candidate.sourceLabel}` : candidate.minAgentVersion ? `需桌面端 v${candidate.minAgentVersion} · ${candidate.sourceLabel}` : candidate.sourceLabel}</small></span>
-              {versionIdentity(candidate) === selectedCandidate ? <CheckCircle2 size={15} /> : null}
-            </button>
-          ))}
+          {sortedVersions.map(candidate => <article className="extension-version-row" key={versionIdentity(candidate)}>
+            <div className="extension-version-main">
+              <div><strong>v{candidate.version}</strong>{candidate.version === installed ? <Pill kind="success">本机已安装</Pill> : null}</div>
+              <time>{[formatPublishedAt(candidate.publishedAt), candidate.sourceName || candidate.sourceLabel, candidate.minAgentVersion ? `需桌面端 v${candidate.minAgentVersion}` : ''].filter(Boolean).join(' · ')}</time>
+              {candidate.notes ? <p>{candidate.notes}</p> : null}
+            </div>
+            {/* 本机已经是这一版时不再给按钮：行首的「本机已安装」已经说明结果，
+                「重新安装 vX」既像补丁，也不是这页推荐的动作；换来源重装走来源管理。
+                其余版本行只有安装和升级用主按钮样式，降级是显式选择。 */}
+            {candidate.version === installed ? null : <button type="button" className={compareSemanticVersions(candidate.version, installed) > 0 ? 'btn btn-primary' : 'btn'} disabled={disabled} onClick={() => onInstall(candidate)}>{installActionLabel({ target: candidate.version, installed, locked: lockingLabel })}</button>}
+          </article>)}
         </div>
-        {selected?.notes ? <p className="workflow-market-notes">{selected.notes}</p> : null}
       </section>
       {entry.dependencies.length ? (
         <section className="plugin-product-section">
@@ -740,7 +847,9 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
       <section className="plugin-product-section">
         <div className="plugin-section-heading"><div><h4>风险与支持</h4></div></div>
         <div className="plugin-product-dependencies">
-          <div><span className="status-dot" /><span>{entry.kind === 'workflow' ? '分发校验' : '权限范围'}</span><span>{kindLabels[entry.kind]}</span><strong>{entry.risk}</strong></div>
+          {/* 标签列只留一句「这一行讲什么」，类型已经在详情头部（插件 · 来源 · 作者）写过，
+              这里再放一次「插件」会被读成权限的一部分。 */}
+          <div><span className="status-dot" /><span>{entry.kind === 'workflow' ? '分发校验' : '权限范围'}</span><strong>{entry.risk}</strong></div>
           {entry.support.length ? <div><span className="status-dot" /><span>可用范围</span><span>{entry.support.join(' · ')}</span><strong>{entry.minAgentVersion ? `桌面端 v${entry.minAgentVersion}+` : '未限制'}</strong></div> : null}
         </div>
       </section>
@@ -749,9 +858,10 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
         <summary>开发者信息</summary>
         <div className="plugin-technical-grid">
           <div><span>稳定 ID</span><code>{entry.id}</code></div>
-          <div><span>类型</span><strong>{kindLabels[entry.kind]}</strong></div>
+          <div><span>类型</span><strong>{extensionKindLabels[entry.kind]}</strong></div>
           <div><span>当前版本</span><strong>v{entry.version}</strong></div>
-          <div><span>来源</span><strong>{entry.sourceLabel}</strong></div>
+          <div><span>来源</span><strong>{entry.sourceName}</strong></div>
+          <div><span>来源类型</span><strong>{entry.sourceLabel}</strong></div>
           <div><span>制品摘要</span><code>{entry.sha256 ? entry.sha256.slice(0, 12) : '实时目录'}</code></div>
           {entry.artifactId ? <div className="wide"><span>制品 ID</span><code>{entry.artifactId}</code></div> : null}
           <div><span>发布者</span><strong>{entry.author}</strong></div>
@@ -763,16 +873,29 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
   );
 }
 
-function MarketPlanDialog({ pluginPlan, skillPlan, error, busy, onClose, onInstallPlugin, onInstallSkill }: {
+function MarketPlanDialog({ pluginPlan, skillPlan, error, busy, installTargets, onClose, onPickLocation, onInstallPlugin, onInstallSkill }: {
   pluginPlan: PluginInstallPlan | null;
   skillPlan: SkillInstallPlan | null;
   error: string;
   busy: boolean;
+  installTargets: { id: string; name: string; detected: boolean }[];
   onClose: () => void;
   onInstallPlugin: (item: PluginCatalogItem) => void;
-  onInstallSkill: (item: OrganizationSkillCatalogItem, optionalPluginIds: string[]) => void;
+  onInstallSkill: (item: OrganizationSkillCatalogItem, optionalPluginIds: string[], clients: string[], location: string) => void;
+  onPickLocation: () => Promise<string>;
 }) {
   const [optionalIds, setOptionalIds] = useState<string[]>([]);
+  // 技能安装时可选投放目标；插件没有这个概念（它装在本机插件目录里）。
+  const [targets, setTargets] = useState<string[]>(installTargets.map(client => client.id));
+  const [targetsTouched, setTargetsTouched] = useState(false);
+  // 安装位置：默认全局，可临时选一个目录，只对这次安装生效。
+  const [location, setLocation] = useState("");
+  useEffect(() => {
+    if (targetsTouched) return;
+    setTargets(installTargets.map(client => client.id));
+  }, [installTargets, targetsTouched]);
+  const targetSummary = targets.length === installTargets.length ? `投放到全部 ${installTargets.length} 个工具` : targets.length ? `投放到 ${targets.length} 个工具` : '不投放，只加入技能库';
+  const locationSummary = location ? location : '全局（各 AI 工具的用户目录）';
   const skillActions = (skillPlan?.plugin_actions || []).map(action => ({ id: action.plugin_id, name: action.plugin_name || readableID(action.plugin_id), required: action.required, action: action.action, targetVersion: action.target_version }));
   const pluginActions = (pluginPlan?.dependency_actions || []).map(action => ({ id: action.plugin_id, name: action.plugin_name || readableID(action.plugin_id), required: true, action: action.action, targetVersion: action.target_version }));
   const actions = skillPlan ? skillActions : pluginActions;
@@ -797,9 +920,16 @@ function MarketPlanDialog({ pluginPlan, skillPlan, error, busy, onClose, onInsta
             ))}
           </div>
         ) : <div className="skill-plan-actions"><span className="skill-section-empty">无依赖</span></div>}
+        {skillPlan ? <div className="skill-plan-targets"><div className="skill-plan-targets-head"><strong>安装位置</strong><small>{locationSummary}</small></div>
+          <div className="skill-plan-location"><input readOnly value={location} placeholder="默认安装到全局技能目录" /><button type="button" className="btn" disabled={busy} onClick={async () => { try { const picked = await onPickLocation(); if (picked) setLocation(picked); } catch { /* 取消不改动 */ } }}>选择目录…</button>{location ? <button type="button" className="text-action" disabled={busy} onClick={() => setLocation("")}>恢复全局</button> : null}</div>
+        </div> : null}
+        {skillPlan ? <div className="skill-plan-targets"><div className="skill-plan-targets-head"><strong>投放目标</strong><small>{targetSummary}</small></div>
+          <div className="skill-plan-target-list">{installTargets.map(client => <label key={client.id}><input type="checkbox" checked={targets.includes(client.id)} disabled={busy} onChange={event => { setTargetsTouched(true); setTargets(current => event.target.checked ? [...current, client.id] : current.filter(id => id !== client.id)); }} /><span>{client.name}{client.detected ? '' : '（本机未检测到）'}</span></label>)}</div>
+          <div className="skill-plan-targets-actions"><button type="button" className="text-action" disabled={busy} onClick={() => { setTargetsTouched(true); setTargets(installTargets.map(client => client.id)); }}>全选</button><button type="button" className="text-action" disabled={busy} onClick={() => { setTargetsTouched(true); setTargets([]); }}>都不投放</button></div>
+        </div> : null}
         <div className="skill-dialog-actions">
           <button className="btn" onClick={onClose}>取消</button>
-          <button className="btn btn-primary" disabled={!ready || busy} onClick={() => { if (skillPlan) onInstallSkill(skillPlan.skill, optionalIds); else if (pluginPlan) onInstallPlugin(pluginPlan.plugin); }}><Download size={15} />确认安装</button>
+          <button className="btn btn-primary" disabled={!ready || busy} onClick={() => { if (skillPlan) onInstallSkill(skillPlan.skill, optionalIds, targets, location); else if (pluginPlan) onInstallPlugin(pluginPlan.plugin); }}><Download size={15} />确认安装</button>
         </div>
       </div>
     </div>

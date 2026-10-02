@@ -7,13 +7,27 @@
     "check:workflow-graph": "node --experimental-strip-types scripts/check-workflow-graph.mts",
     "check:market-catalog": "node --experimental-strip-types scripts/check-market-catalog.mts",
     "check:task-view": "node --experimental-strip-types scripts/check-task-view.mts",
-    "check:ui": "npm run check:start-form && npm run check:run-view && npm run check:workflow-graph && npm run check:market-catalog && npm run check:task-view"
+    "check:shell-structure": "node --experimental-strip-types scripts/check-shell-structure.mts",
+    "check:icon-version": "node --experimental-strip-types scripts/check-icon-version.mts",
+    "check:ai-service-presets": "node --experimental-strip-types scripts/check-ai-service-presets.mts",
+    "generate:ai-service-presets": "node --experimental-strip-types scripts/generate-ai-service-presets.mts",
+    "check:text-layout": "node --experimental-strip-types scripts/check-text-layout.mts",
+    "check:operation-plan": "node --experimental-strip-types scripts/check-operation-plan.mts",
+    "check:projection-requeue": "node --experimental-strip-types scripts/check-projection-requeue.mts",
+    "check:acp-profiles": "node --experimental-strip-types scripts/check-acp-profiles.mts",
+    "check:runtime-providers": "node --experimental-strip-types scripts/check-runtime-providers.mts",
+    "check:mcp-servers": "node --experimental-strip-types scripts/check-mcp-servers.mts",
+    "check:settings-ia": "node --experimental-strip-types scripts/check-settings-ia.mts",
+    "check:copy": "node --experimental-strip-types scripts/check-copy.mts",
+    "check:ui": "npm run check:start-form && npm run check:run-view && npm run check:workflow-graph && npm run check:market-catalog && npm run check:task-view && npm run check:shell-structure && npm run check:icon-version && npm run check:ai-service-presets && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:copy"
   },
   "dependencies": {
-    "react": "latest",
-    "react-dom": "latest",
     "@tauri-apps/api": "latest",
-    "lucide-react": "^0.468.0"
+    "lucide": "^0.468.0",
+    "lucide-react": "^0.468.0",
+    "morphicons": "^1.7.1",
+    "react": "latest",
+    "react-dom": "latest"
   },
   "devDependencies": {
     "@types/react": "latest",

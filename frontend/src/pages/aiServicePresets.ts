@@ -1,17 +1,23 @@
-// AI 服务预设模板。仅收录 OpenAI Chat/Responses 兼容的供应商（HiMind 网关协议约束），
-// 参考 gcmp provider_templates 的 openai_compatible 类目；选中后自动填充表单，仍可手改。
+// 本文件由 scripts/generate-ai-service-presets.mts 生成，请勿手工编辑。
+//
+// 内容来自工作台 AI 服务目录（GET /api/integrations/ai/personal-connections/catalog，
+// GCMP 供应商目录投影），生成时目录版本 0.28.4，共 23 条。
+// 它只在独立模式或目录暂不可用时兜底；能连上工作台时以工作台目录为准。
+// 重新生成：保存目录响应后执行 npm run generate:ai-service-presets -- catalog.json。
+import type { AIServiceProtocol } from '../services/agentApi';
+
 export type AiServicePreset = {
   id: string;
   name: string;
   category: string;
   description: string;
   base_url: string;
-  protocol: 'openai-chat' | 'openai-responses';
+  protocol: AIServiceProtocol;
   default_model: string;
   models: string[];
 };
 
-export const aiServicePresets: AiServicePreset[] = [
+export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'openai',
     name: 'OpenAI API',
@@ -20,7 +26,37 @@ export const aiServicePresets: AiServicePreset[] = [
     base_url: 'https://api.openai.com/v1',
     protocol: 'openai-responses',
     default_model: 'gpt-4.1',
-    models: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'o3'],
+    models: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'o3', 'gpt-image-1', 'dall-e-3', 'tts-1'],
+  },
+  {
+    id: 'anthropic',
+    name: 'Anthropic Claude',
+    category: '国际厂商',
+    description: 'Anthropic 官方 API',
+    base_url: 'https://api.anthropic.com',
+    protocol: 'anthropic',
+    default_model: 'claude-sonnet-4-20250514',
+    models: ['claude-sonnet-4-20250514', 'claude-3-5-haiku-latest'],
+  },
+  {
+    id: 'xai',
+    name: 'xAI Grok',
+    category: '国际厂商',
+    description: 'xAI OpenAI 兼容 API',
+    base_url: 'https://api.x.ai/v1',
+    protocol: 'openai-responses',
+    default_model: 'grok-4.6',
+    models: ['grok-4.6', 'grok-4.5'],
+  },
+  {
+    id: 'mistral',
+    name: 'Mistral AI',
+    category: '国际厂商',
+    description: 'Mistral 官方 API',
+    base_url: 'https://api.mistral.ai/v1',
+    protocol: 'openai-responses',
+    default_model: 'mistral-large-latest',
+    models: ['mistral-large-latest', 'codestral-latest'],
   },
   {
     id: 'deepseek',
@@ -29,8 +65,8 @@ export const aiServicePresets: AiServicePreset[] = [
     description: 'DeepSeek 官方按量 API',
     base_url: 'https://api.deepseek.com/v1',
     protocol: 'openai-responses',
-    default_model: 'deepseek-v4-flash',
-    models: ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4-pro'],
+    default_model: 'deepseek-flash',
+    models: ['deepseek-flash', 'deepseek-v4-pro'],
   },
   {
     id: 'dashscope',
@@ -39,8 +75,38 @@ export const aiServicePresets: AiServicePreset[] = [
     description: '百炼 OpenAI 兼容按量 API',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     protocol: 'openai-responses',
-    default_model: 'kimi/kimi-k3',
-    models: ['kimi/kimi-k3', 'MiniMax/MiniMax-M3'],
+    default_model: 'qwen3.8-max',
+    models: ['qwen3.8-max', 'qwen3.8-flash', 'deepseek-v4.1-flash', 'kimi/kimi-k3', 'MiniMax/MiniMax-M3'],
+  },
+  {
+    id: 'zhipu',
+    name: '智谱 GLM Coding Plan',
+    category: '国内厂商',
+    description: '智谱 Coding Plan OpenAI 兼容入口',
+    base_url: 'https://open.bigmodel.cn/api/v1',
+    protocol: 'openai-responses',
+    default_model: 'glm-5.3',
+    models: ['glm-5.3', 'glm-5.3-flash'],
+  },
+  {
+    id: 'minimax',
+    name: 'MiniMax API',
+    category: '国内厂商',
+    description: 'MiniMax Anthropic 兼容入口',
+    base_url: 'https://api.minimaxi.com/anthropic',
+    protocol: 'anthropic',
+    default_model: 'MiniMax-M3',
+    models: ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-HighSpeed'],
+  },
+  {
+    id: 'kimi',
+    name: 'Kimi API',
+    category: '国内厂商',
+    description: 'Moonshot Anthropic 兼容按量入口',
+    base_url: 'https://api.moonshot.cn/anthropic',
+    protocol: 'anthropic',
+    default_model: 'kimi-k2.6',
+    models: ['kimi-k2.6', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed', 'kimi-k3'],
   },
   {
     id: 'xiaomi',
@@ -49,8 +115,108 @@ export const aiServicePresets: AiServicePreset[] = [
     description: '小米 MiMo OpenAI 兼容 API',
     base_url: 'https://api.xiaomimimo.com/v1',
     protocol: 'openai-responses',
-    default_model: 'mimo-v2.5-pro',
+    default_model: 'mimo-v2.5-pro-ultraspeed',
     models: ['mimo-v2.5-pro-ultraspeed', 'mimo-v2.5-pro', 'mimo-v2.5'],
+  },
+  {
+    id: 'stepfun',
+    name: '阶跃星辰 StepFun',
+    category: '国内厂商',
+    description: 'StepFun Anthropic 兼容按量 API',
+    base_url: 'https://api.stepfun.com',
+    protocol: 'anthropic',
+    default_model: 'step-3.7-flash',
+    models: ['step-3.7-flash', 'step-3.5-flash', 'step-3.5-flash-2603'],
+  },
+  {
+    id: 'antling',
+    name: '蚂蚁百灵',
+    category: '国内厂商',
+    description: '蚂蚁百灵 Anthropic 兼容 API',
+    base_url: 'https://api.ant-ling.com/anthropic',
+    protocol: 'anthropic',
+    default_model: 'Ling-3.0-flash',
+    models: ['Ling-3.0-flash', 'Ling-3.0-flash-VL', 'Ling-3.0-tiny', 'Ling-2.6-1T', 'Ling-2.6-flash', 'Ring-2.6-1T'],
+  },
+  {
+    id: 'longcat',
+    name: '美团 LongCat',
+    category: '国内厂商',
+    description: 'LongCat Anthropic 兼容 API',
+    base_url: 'https://api.longcat.chat/anthropic',
+    protocol: 'anthropic',
+    default_model: 'LongCat-2.0',
+    models: ['LongCat-2.0'],
+  },
+  {
+    id: 'xfyun',
+    name: '讯飞星火 Coding Plan',
+    category: '编码套餐',
+    description: '讯飞 MaaS Coding OpenAI 兼容入口',
+    base_url: 'https://maas-coding-api.cn-huabei-1.xf-yun.com/v2',
+    protocol: 'openai-responses',
+    default_model: 'xsparkx2agent',
+    models: ['xsparkx2agent', 'xsparkx2', 'xsparkx2flash', 'xopdeepseekv4pro', 'xopdeepseekv4flash', 'xopdeepseekv32', 'xopglm52', 'xopglm51', 'xopglm5', 'xopglmv47flash', 'xopkimik26', 'xopkimik25', 'xminimaxm25', 'xopqwen36v35b', 'xopqwen35v35b', 'xopqwen35397b', 'xop3qwencodernext'],
+  },
+  {
+    id: 'kimi-coding',
+    name: 'Kimi Coding',
+    category: '编码套餐',
+    description: 'Kimi Coding 专属 Key',
+    base_url: 'https://api.kimi.com/coding',
+    protocol: 'anthropic',
+    default_model: 'k3',
+    models: ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
+  },
+  {
+    id: 'volcengine-coding',
+    name: '火山方舟 Agent Plan',
+    category: '编码套餐',
+    description: '火山方舟 Agent Plan 专属入口',
+    base_url: 'https://ark.cn-beijing.volces.com/api/plan',
+    protocol: 'anthropic',
+    default_model: 'doubao-seed-2.0-mini',
+    models: ['doubao-seed-2.0-mini', 'doubao-seed-2.0-lite', 'doubao-seed-2.1-turbo', 'doubao-seed-evolving', 'minimax-m3', 'glm-5.3', 'glm-5.3-flash', 'kimi-k2.7-code', 'kimi-k2.8-preview', 'kimi-k3', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'deepseek-v4-pro'],
+  },
+  {
+    id: 'baidu-token',
+    name: '百度千帆 Token Plan（个人版）',
+    category: 'Token 套餐',
+    description: '百度千帆 Token Plan 个人版专属 Key',
+    base_url: 'https://qianfan.baidubce.com/anthropic/tokenplan/personal',
+    protocol: 'anthropic',
+    default_model: 'glm-5.3',
+    models: ['glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'glm-5.1', 'deepseek-v4-pro', 'deepseek-v4-pro-0813', 'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'kimi-k2.6'],
+  },
+  {
+    id: 'baidu-token-enterprise',
+    name: '百度千帆 Token Plan（企业版）',
+    category: 'Token 套餐',
+    description: '百度千帆 Token Plan 企业版专属 Key',
+    base_url: 'https://qianfan.baidubce.com/anthropic/tokenplan/team',
+    protocol: 'anthropic',
+    default_model: 'deepseek-v4-pro',
+    models: ['deepseek-v4-pro', 'deepseek-v4-pro-0813', 'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'glm-5.1', 'glm-5', 'kimi-k2.6'],
+  },
+  {
+    id: 'tencent-token',
+    name: '腾讯混元 Token Plan',
+    category: 'Token 套餐',
+    description: '腾讯云混元 Token Plan 专属接入点',
+    base_url: 'https://api.lkeap.cloud.tencent.com/plan/anthropic',
+    protocol: 'anthropic',
+    default_model: 'hy3',
+    models: ['hy3', 'hy4-preview', 'deepseek-v4-flash-202605', 'deepseek-v4-pro-202606', 'glm-5', 'minimax-m2.7', 'glm-5.1', 'glm-5.2'],
+  },
+  {
+    id: 'tencent-token-enterprise',
+    name: '腾讯混元 Token Plan（企业版）',
+    category: 'Token 套餐',
+    description: '腾讯云混元 Token Plan 企业版专属接入点',
+    base_url: 'https://tokenhub.tencentmaas.com/plan/anthropic',
+    protocol: 'anthropic',
+    default_model: 'glm-5.3',
+    models: ['glm-5.3', 'glm-5.2', 'glm-5', 'glm-5.1', 'glm-5-turbo', 'kimi-k2.7-code', 'kimi-k2.7-code-highspeed', 'kimi-k2.6', 'minimax-m2.7', 'minimax-m3', 'deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-202605', 'deepseek-v4-pro-202606'],
   },
   {
     id: 'openrouter',
@@ -59,8 +225,8 @@ export const aiServicePresets: AiServicePreset[] = [
     description: 'OpenRouter 多厂商聚合 API',
     base_url: 'https://openrouter.ai/api/v1',
     protocol: 'openai-responses',
-    default_model: 'openai/gpt-4.1',
-    models: ['openai/gpt-4.1', 'anthropic/claude-sonnet-4', 'google/gemini-2.5-pro', 'deepseek/deepseek-chat'],
+    default_model: 'anthropic/claude-sonnet-4',
+    models: ['anthropic/claude-sonnet-4', 'google/gemini-2.5-pro', 'openai/gpt-4.1', 'deepseek/deepseek-chat'],
   },
   {
     id: 'siliconflow',
@@ -73,13 +239,13 @@ export const aiServicePresets: AiServicePreset[] = [
     models: ['deepseek-ai/DeepSeek-V3', 'Qwen/Qwen2.5-Coder-32B-Instruct', 'deepseek-ai/DeepSeek-R1', 'Qwen/Qwen3-32B'],
   },
   {
-    id: 'himind',
-    name: 'HiMind 网关',
-    category: '本机',
-    description: 'HiMind 网关 OpenAI 兼容接入点',
-    base_url: 'http://127.0.0.1:18182/gateway/v1',
+    id: 'aihubmix',
+    name: 'AIHubMix',
+    category: '聚合平台',
+    description: 'AIHubMix OpenAI 兼容 API',
+    base_url: 'https://api.inferera.com/v1',
     protocol: 'openai-responses',
-    default_model: 'kimi-k3',
-    models: ['kimi-k3', 'kimi-for-coding'],
+    default_model: 'gpt-4.1',
+    models: ['gpt-4.1', 'claude-sonnet-4', 'gemini-2.5-pro', 'deepseek-chat'],
   },
 ];

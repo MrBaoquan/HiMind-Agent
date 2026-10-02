@@ -1,6 +1,7 @@
-import { ArrowRight, CheckCircle2, CircleAlert, ClipboardCheck, Clock3, MessageCircle, RefreshCw, ShieldCheck, Workflow, XCircle } from 'lucide-react';
-import { EmptyState, IconButton, PageHeader, Pill } from '../components/Common';
+import { ArrowRight, CheckCircle2, CircleAlert, ClipboardCheck, Clock3, MessageCircle, ShieldCheck, Workflow, XCircle } from 'lucide-react';
+import { EmptyState, PageHeader, Pill } from '../components/Common';
 import type { ApprovalItem, WorkflowCenterSnapshot } from '../services/agentApi';
+import { formatStamp } from '../timeFormat';
 
 type WaitingRun = WorkflowCenterSnapshot['runs'][number];
 
@@ -31,13 +32,6 @@ function waitingIcon(item: WaitingRun) {
   return <CircleAlert size={18} />;
 }
 
-function formatTime(value: string) {
-  if (!value) return '--';
-  const numeric = Number(value);
-  const date = Number.isFinite(numeric) && numeric > 0 ? new Date(numeric * 1000) : new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false });
-}
-
 export function InboxPage({ approvals, workflowRuns, onRefresh, onRespond, onOpenWorkflowRun, onOpenApprovalHistory }: {
   approvals: ApprovalItem[];
   workflowRuns: WaitingRun[];
@@ -52,14 +46,15 @@ export function InboxPage({ approvals, workflowRuns, onRefresh, onRespond, onOpe
     <>
       <PageHeader
         title="待处理"
-        description="集中处理需要你决定、反馈或继续操作的事项。"
-        actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenApprovalHistory}><ClipboardCheck size={14} />审批记录</button><IconButton icon={RefreshCw} label="刷新待处理" onClick={onRefresh} /></div>}
+        actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenApprovalHistory}><ClipboardCheck size={14} />审批记录</button></div>}
       />
-      <div className="inbox-summary" aria-label="待处理摘要">
+      {/* 全为 0 时这排统计只是三个零：空态文案已经说清这里会出现什么，
+          数字没有信息量还占掉首屏。有内容时才给出分项计数。 */}
+      {total > 0 ? <div className="inbox-summary" aria-label="待处理摘要">
         <div><strong>{total}</strong><span>全部待处理</span></div>
         <div><strong>{approvals.length}</strong><span>操作审批</span></div>
         <div><strong>{workflowRuns.length}</strong><span>工作流等待</span></div>
-      </div>
+      </div> : null}
       {total === 0 ? (
         <div className="card inbox-empty-card">
           <EmptyState icon={CheckCircle2} title="当前没有待处理事项" text="新的审批、反馈和人工交互会集中显示在这里。" />
@@ -104,7 +99,7 @@ export function InboxPage({ approvals, workflowRuns, onRefresh, onRespond, onOpe
                     <div className="inbox-item-main">
                       <strong>{item.interaction_request?.title || item.workflow_name || item.workflow_id || '工作流运行'}</strong>
                       <span>{waitingLabel(item)}{item.current_step_title ? ` · ${item.current_step_title}` : ''}</span>
-                      <small><Workflow size={12} />{item.app_id || item.project_root || item.workspace_root || '未记录项目'} · {formatTime(item.run.updated_at)}</small>
+                      <small><Workflow size={12} />{item.app_id || item.project_root || item.workspace_root || '未记录项目'} · {formatStamp(item.run.updated_at)}</small>
                       {(item.interaction_request?.description || item.waiting_reason) ? <small className="inbox-item-reason">{item.interaction_request?.description || item.waiting_reason}</small> : null}
                       {(item.interaction_request?.required_action || item.required_action) ? <small className="inbox-item-action">{actionLabel(item.interaction_request?.required_action || item.required_action)}</small> : null}
                     </div>

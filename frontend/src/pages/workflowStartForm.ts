@@ -9,13 +9,29 @@ export type WorkflowStartField = {
   type: string;
   required: boolean;
   defaultValue: unknown;
+  /** 允许取值（提交给能力的机器值）。 */
   options: string[];
+  /**
+   * 选项的「值 → 显示文本」。包只写了字符串时两者相同；
+   * 写了 `{ value, label }` 时下拉显示 label、提交 value。
+   */
+  optionEntries: Array<{ value: string; label: string }>;
   placeholder: string;
   target: string;
   picker: string;
   hint: string;
   span: string;
 };
+
+type OptionSource = string | { value?: unknown; label?: unknown };
+
+function toOptionEntries(options: OptionSource[] | undefined): Array<{ value: string; label: string }> {
+  return (options || []).map(option => {
+    if (typeof option === 'string') return { value: option, label: option };
+    const value = String(option.value ?? '');
+    return { value, label: String(option.label ?? '') || value };
+  });
+}
 
 // 字段级校验错误：抛到提交层时带着字段 id，界面才能把提示放回出错的那一行，
 // 而不是笼统地丢在弹窗底部让人自己翻。
@@ -53,6 +69,7 @@ export function normalizeStartField(field: WorkflowViewField): WorkflowStartFiel
       required: field === 'requirement' || field === 'acceptance_criteria' || field === 'workspace_root' || field === 'project_root' || field === 'app_id',
       defaultValue: field === 'passed' ? true : field === 'rollback_requested' ? false : field === 'package_manager' ? 'npm' : field === 'install_mode' ? 'install' : field === 'environment' ? 'development' : '',
       options,
+      optionEntries: toOptionEntries(options),
       placeholder: '',
       target: field === 'credential_handles' ? 'private_key_path' : '',
       picker: '',
@@ -60,13 +77,15 @@ export function normalizeStartField(field: WorkflowViewField): WorkflowStartFiel
       span: '',
     };
   }
+  const optionEntries = toOptionEntries(field.options);
   return {
     id: field.id,
     label: field.label || field.id,
     type: field.type || 'text',
     required: Boolean(field.required),
     defaultValue: field.default,
-    options: field.options || [],
+    options: optionEntries.map(option => option.value),
+    optionEntries,
     placeholder: field.placeholder || '',
     target: field.target || '',
     picker: field.picker || '',
@@ -151,6 +170,21 @@ export function jsonToFormValues(fields: WorkflowStartField[], input: Record<str
     }
   }
   return values;
+}
+
+/**
+ * 摘要里的「已填 N/M」：布尔 false、空列表、空对象都算没填，
+ * 否则 passed=false、rollback_requested=false 这类默认值会把计数虚高一截。
+ */
+function isFilledValue(value: unknown) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'boolean') return value;
+  if (value && typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0;
+  return String(value ?? '').trim() !== '';
+}
+
+export function filledFieldCount(fields: WorkflowStartField[], values: Record<string, unknown>) {
+  return fields.filter(field => isFilledValue(values[field.id])).length;
 }
 
 // 表单初始值 = 包声明的默认值 + 预设覆盖。

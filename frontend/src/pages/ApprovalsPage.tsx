@@ -1,7 +1,7 @@
 import { useState, type KeyboardEvent } from 'react';
 import type { ApprovalFact, ApprovalItem } from '../services/agentApi';
-import { CheckCircle2, ClipboardCheck, Clock3, History, MonitorUp, RefreshCw, Settings2, ShieldAlert, Upload, XCircle } from 'lucide-react';
-import { EmptyState, IconButton, PageHeader } from '../components/Common';
+import { CheckCircle2, ClipboardCheck, Clock3, History, MonitorUp, Settings2, ShieldAlert, Upload, XCircle } from 'lucide-react';
+import { EmptyState, PageHeader } from '../components/Common';
 
 type ApprovalTab = 'pending' | 'history';
 
@@ -131,8 +131,8 @@ export function ApprovalsPage({ approvals, history, independentMode = false, onR
 
   return (
     <>
-      <PageHeader title="审批" description="处理需要确认的敏感操作。" actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenSettings}><Settings2 size={15} />审批策略</button><IconButton icon={RefreshCw} label="刷新审批" onClick={onRefresh} /></div>} />
-      {independentMode ? <div className="security-note compact approval-independent-note"><ShieldAlert size={16} /><span>独立模式下，审批记录只保存在本机。由其他工具直接执行的操作不经过这里。</span></div> : null}
+      <PageHeader title="审批" description="处理需要确认的敏感操作。" actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenSettings}><Settings2 size={15} />审批策略</button></div>} />
+        {independentMode ? <div className="security-note compact approval-independent-note"><ShieldAlert size={16} /><span>未对接 AI 工作台时，审批记录只保存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
       <div className="card approval-workspace">
         <div className="approval-workspace-header">
           <ApprovalTabs activeTab={activeTab} pendingCount={approvals.length} historyCount={history.length} onChange={setActiveTab} />

@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import type { CatalogView } from '../pages/mcpCatalogView';
 
 export type AgentStatus = {
     version: string;
@@ -49,6 +50,24 @@ export type ProjectionSyncStatus = {
     dead_letter: number;
     oldest_pending_at: string;
     last_error: string;
+    /** 同步失败按原因归组，界面只展示最主要的一类，用来判断该不该重投。 */
+    dead_letter_reasons?: ProjectionDeadLetterGroup[];
+};
+
+export type ProjectionDeadLetterGroup = {
+    last_error: string;
+    count: number;
+    oldest_at: string;
+    newest_at: string;
+};
+
+/** 手工重投结果：重投把记录放回队列，紧随其后的同步由投影循环接手。 */
+export type ProjectionRequeueReport = {
+    requeued: number;
+    dead_letter_before: number;
+    dead_letter_after: number;
+    pending_after: number;
+    remaining_reasons: ProjectionDeadLetterGroup[];
 };
 
 export type CurrentTaskStatus = {
@@ -69,6 +88,30 @@ export type AgentTaskHistoryItem = {
     started_at?: string | null;
     finished_at?: string | null;
     updated_at: string;
+};
+
+/**
+ * 本机运行记录（工作流 / 技能 / 定时派发）。字段刻意与任务历史对齐，
+ * 让同一张列表能同时渲染工作台下发任务和本机运行，不必各自写一套行。
+ */
+export type AgentActivityItem = {
+    id: string;
+    source: 'workflow' | 'skill' | 'schedule' | string;
+    title: string;
+    subtitle?: string;
+    status: string;
+    /** 进度百分比；本机技能运行拿不到步骤指标时为 null，界面按「进行中」显示而不是 0%。 */
+    progress: number | null;
+    step_done?: number | null;
+    step_total?: number | null;
+    detail?: string | null;
+    error?: string | null;
+    created_at: string;
+    started_at?: string | null;
+    finished_at?: string | null;
+    updated_at: string;
+    artifact_count?: number;
+    workflow_run_id?: string;
 };
 
 export type CatalogPage<T> = {
@@ -265,7 +308,11 @@ export type WorkflowViewField = string | {
     type?: 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'list' | 'json' | 'credential' | string;
     required?: boolean;
     default?: unknown;
-    options?: string[];
+    /**
+     * 允许取值。只写字符串时值与显示文本相同；写成 `{ value, label }`
+     * 时提交 `value`、显示 `label`（例如展馆 szkjg / 随州科技馆）。
+     */
+    options?: Array<string | { value: string; label?: string }>;
     placeholder?: string;
     target?: string;
     /** 声明输入控件类型，当前支持 directory（带目录选择按钮）。 */
@@ -330,7 +377,7 @@ export type WorkflowCenterItem = {
 };
 
 /**
- * 平台级定时任务：一条计划描述“什么时候、对什么目标做什么”。
+ * 平台级定时计划：一条计划描述“什么时候、对什么目标做什么”。
  * 目前 `kind` 只有 `workflow`，新增目标类型由平台侧扩展，前端按 kind 渲染。
  */
 export type ScheduleExecution = {
@@ -402,6 +449,8 @@ export type WorkflowRunPreset = {
     input: Record<string, unknown>;
     entrypoint: string;
     exitpoint: string;
+    /** 常用（置顶）：界面上叫「常用」，排在列表最前面。 */
+    pinned?: boolean;
     created_at: string;
     updated_at: string;
 };
@@ -413,6 +462,8 @@ export type WorkflowRunPresetInput = {
     input?: Record<string, unknown>;
     entrypoint?: string;
     exitpoint?: string;
+    /** 不传表示不改动置顶状态：改参数不该顺手把「常用」抹掉。 */
+    pinned?: boolean;
 };
 
 export type WorkflowInteractionKind = 'approval' | 'feedback' | 'form' | 'evidence' | 'external_wait' | string;
@@ -451,6 +502,11 @@ export type ScheduleInput = {
 
 export type WorkflowCenterSnapshot = {
     workflows: WorkflowCenterItem[];
+    /**
+     * 已安装但读取失败的制品。单个坏包不再让整份列表消失，UI 必须把它显示出来
+     * 并给出移除出口，否则用户被卡在「装了什么、为什么用不了」的黑箱里。
+     */
+    library_issues?: WorkflowLibraryIssue[];
     runs: Array<{
         workflow_id: string;
         workflow_name: string;
@@ -470,6 +526,12 @@ export type WorkflowCenterSnapshot = {
     }>;
     catalog?: WorkflowCatalogItem[];
     catalog_error?: string;
+};
+
+export type WorkflowLibraryIssue = {
+    package_id: string;
+    version: string;
+    message: string;
 };
 
 export type ConnectorStateItem = {
@@ -531,7 +593,7 @@ export type WorkflowPreflight = {
     package_version: string;
     agent_version: string;
     capabilities: Array<{ id: string; available: boolean; source: string; availability: string }>;
-    skills: Array<{ id: string; available: boolean; version: string; scope: string }>;
+    skills: Array<{ id: string; available: boolean; required?: boolean; version: string; scope: string }>;
     runtimes: Array<{ id: string; available: boolean; status: string; version: string; network_isolated: boolean; tool_access: string }>;
     connectors: Array<{
         id: string;
@@ -599,15 +661,25 @@ export type AcpRuntimeProfile = {
     enabled: boolean;
 };
 
-export type AcpRuntimeProfileSnapshot = {
-    profiles: AcpRuntimeProfile[];
-    providers: Array<{
-        provider: string;
+  export type AcpRuntimeProfileSnapshot = {
+      profiles: AcpRuntimeProfile[];
+      providers: Array<{
+          provider: string;
+          version?: string;
+          status: 'ready' | 'unavailable' | 'unsupported' | string;
+          capabilities?: Record<string, unknown>;
+      }>;
+      // 预设客户端需要的前置命令是否可用（npx / node / opencode），前端据此提前拦掉不可用的接入。
+      // source=install_location 表示命令不在 PATH、只在已知安装位置找到（OpenCode 桌面版），
+      // 这种情况要把 path 写进配置；version/config_dir 只用于展示。
+      executables?: Record<string, {
+        available: boolean;
+        path: string;
         version?: string;
-        status: 'ready' | 'unavailable' | 'unsupported' | string;
-        capabilities?: Record<string, unknown>;
-    }>;
-};
+        source?: string;
+        config_dir?: string;
+      }>;
+  };
 
 export type AcpRuntimeProfileInput = {
     providerId: string;
@@ -727,6 +799,78 @@ export type DiagnosticsExportResult = {
     path?: string;
 };
 
+export type AgentBackupCategorySummary = {
+    category: string;
+    files: number;
+    bytes: number;
+};
+
+export type AgentBackupSkippedEntry = {
+    path: string;
+    reason: string;
+    size: number;
+};
+
+export type AgentBackupScopeEntry = {
+    name: string;
+    category: string;
+    reason: string;
+    included: boolean;
+};
+
+export type AgentBackupScope = {
+    entries: AgentBackupScopeEntry[];
+    minPassphraseChars: number;
+    format: string;
+    formatVersion: number;
+};
+
+export type AgentBackupExportReport = {
+    path: string;
+    created_at: string;
+    file_count: number;
+    total_bytes: number;
+    credentials: number;
+    includes_device_identity: boolean;
+    categories: AgentBackupCategorySummary[];
+    skipped: AgentBackupSkippedEntry[];
+    warnings: string[];
+};
+
+export type AgentBackupInspectReport = {
+    path: string;
+    format: string;
+    version: number;
+    created_at: string;
+    machine: string;
+    agent_version: string;
+    profile: string;
+    includes_device_identity: boolean;
+    needs_passphrase: boolean;
+    file_count: number;
+    total_bytes: number;
+    credentials: number;
+    credential_files: string[];
+    categories: AgentBackupCategorySummary[];
+    skipped: AgentBackupSkippedEntry[];
+    warnings: string[];
+};
+
+export type AgentBackupRestoreReport = {
+    path: string;
+    snapshot: string;
+    restored: string[];
+    credentials: number;
+    credential_failures: string[];
+    missing_paths: { path: string; source: string }[];
+    pending_push: string[];
+    warnings: string[];
+};
+
+export type AgentBackupExportResult = { canceled: true } | { canceled: false; report: AgentBackupExportReport };
+export type AgentBackupInspectResult = { canceled: true } | { canceled: false; report: AgentBackupInspectReport };
+export type AgentBackupRestoreResult = { canceled: true } | { canceled: false; report: AgentBackupRestoreReport };
+
 export type PluginRegistry = {
     registry_ready: boolean;
     registry_dir?: string;
@@ -771,6 +915,9 @@ export type ExtensionSourceConfig = {
     auto_update: boolean;
     verification: 'required' | 'optional';
     upstream_repository?: string;
+    distribution_id?: string;
+    channel?: string;
+    catalog_id?: string;
 };
 
 export type ExtensionSourceSettings = {
@@ -810,6 +957,9 @@ export type ExtensionSourceAcquisition = 'local' | 'remote';
 export type ExtensionDistributionUnit = {
     unit_key: string;
     name: string;
+    distribution_id?: string;
+    channel?: string;
+    catalog_id?: string;
     acquisition: ExtensionSourceAcquisition;
     local_source_id?: string | null;
     remote_source_id?: string | null;
@@ -846,6 +996,8 @@ export type ExtensionUnitInstallReport = {
     skills: ExtensionUnitAsset[];
     workflows: ExtensionUnitAsset[];
     errors: string[];
+    failures?: { asset_kind: string; asset_id: string; message: string; retryable: boolean }[];
+    retryable?: boolean;
 };
 
 export type ExtensionSourceNotice = {
@@ -862,6 +1014,10 @@ export type ExtensionSourceStatus = {
     generation: string;
     using_cache: boolean;
     error: string;
+    versions?: { asset_kind: string; asset_id: string; version: string }[];
+    source_commit?: string;
+    source_tree?: string;
+    source_dirty?: boolean;
     notices?: ExtensionSourceNotice[];
 };
 
@@ -928,6 +1084,62 @@ export type ExtensionProvenance = {
     auto_update: boolean;
 };
 
+/// 批量更新的安全分组：ready 来源已核对可直接更新，review 需用户显式确认，
+/// managed 由组织统一推进版本、不参与批量更新。分组由后端按安装台账计算。
+export type ExtensionUpdateCandidate = {
+    asset_kind: 'plugin' | 'skill' | 'workflow' | string;
+    asset_id: string;
+    name: string;
+    installed_version: string;
+    target_version: string;
+    source_id: string;
+    source_name: string;
+    channel: string;
+    sha256: string;
+    artifact_id: string;
+    group: 'ready' | 'review' | 'managed' | string;
+    reason: string;
+};
+
+export type ExtensionUpdateTarget = {
+    asset_kind: string;
+    asset_id: string;
+    version: string;
+    source_id: string;
+    sha256: string;
+    artifact_id: string;
+};
+
+export type ExtensionUpdateOutcome = {
+    asset_kind: string;
+    asset_id: string;
+    name: string;
+    from_version: string;
+    to_version: string;
+    status: 'updated' | 'failed' | 'cancelled' | string;
+    message: string;
+    retryable: boolean;
+};
+
+export type ExtensionBatchUpdateReport = {
+    outcomes: ExtensionUpdateOutcome[];
+    updated_count: number;
+    failed_count: number;
+    cancelled: boolean;
+};
+
+export type ExtensionUpdateProgress = {
+    index: number;
+    total: number;
+    asset_kind: string;
+    asset_id: string;
+    name: string;
+    from_version: string;
+    to_version: string;
+    status: 'running' | 'updated' | 'failed' | 'cancelled' | string;
+    message: string;
+};
+
 export type PluginItem = {
     id: string;
     name?: string;
@@ -947,7 +1159,10 @@ export type PluginItem = {
     entry_size?: number;
     previous_version?: string;
     rollback_available?: boolean;
+    /// 本机开发登记接管了同名已安装副本时，这里是被接管的已安装版本。
+    overrides_installed_version?: string | null;
     failure_count?: number;
+    last_failure_at?: number | null;
     circuit_open?: boolean;
     governance?: 'required' | 'managed' | 'optional' | 'blocked';
     availability?: 'local' | 'network_service' | 'control_plane' | string;
@@ -1043,6 +1258,38 @@ export type DashboardAuthorizationProgress = {
     user_id: string;
 };
 
+/// 一个工作台连接：地址 + 它自己的身份。本机能力只有一份，身份按连接各存一份。
+export type WorkbenchConnection = {
+    id: string;
+    display_name: string;
+    purpose: string;
+    api_base: string;
+    active: boolean;
+    registered: boolean;
+    authorized: boolean;
+    agent_id: string;
+    user_id: string;
+    user_name: string;
+    scope: string[];
+    authorized_at: number;
+    refresh_expires_at: number;
+    last_used_at: number;
+    state: 'authorized' | 'registered' | 'unregistered' | string;
+};
+
+export type WorkbenchConnectionsSnapshot = {
+    api_base: string;
+    connections: WorkbenchConnection[];
+};
+
+export type WorkbenchProbe = {
+    api_base: string;
+    reachable: boolean;
+    status: number;
+    message: string;
+    version: string;
+};
+
 export type McpConnectionTestResult = {
     ok: boolean;
     server_name: string;
@@ -1055,6 +1302,18 @@ export type McpConnectionTestResult = {
 export type McpRegistrySnapshot = {
     schema_version: number;
     servers: Array<Record<string, unknown>>;
+};
+
+/** 工具目录的视图与安装请求，字段与后端 mcp_catalog.rs 一一对应。 */
+export type McpCatalogView = CatalogView;
+
+export type McpCatalogInstallRequest = {
+    source_id: string;
+    entry_id: string;
+    values: Record<string, string>;
+    display_name: string;
+    server_name: string;
+    acknowledge: boolean;
 };
 
 export type McpTargetDescriptor = {
@@ -1237,9 +1496,14 @@ export type CodexSkillStatusItem = {
     record: SkillRecord;
     readiness: SkillReadiness;
     rendered_root: string;
+    /** global = 各 AI 工具的用户目录；directory = 用户指定的某个目录 */
+    target_scope?: 'global' | 'directory';
+    /** 指定目录安装时的位置根目录 */
+    location_root?: string | null;
     rendered: boolean;
     rendered_valid: boolean;
-    client_state: 'not_installed' | 'installed' | 'outdated' | 'modified' | 'managed_elsewhere' | 'blocked' | 'unsupported' | 'failed';
+    /** `render_stale` = 内容与收据一致，只是渲染方式与当前设置不同，需要重新同步。 */
+    client_state: 'not_installed' | 'installed' | 'outdated' | 'modified' | 'render_stale' | 'managed_elsewhere' | 'blocked' | 'unsupported' | 'failed';
     installed_version?: string | null;
     managing_profile?: string | null;
     available_version: string;
@@ -1317,6 +1581,8 @@ export type PluginInstallPlan = {
     dependency_actions: Array<SkillPluginInstallAction & { requested_by: string }>;
     blocked_reasons: string[];
     ready: boolean;
+    /** 统一操作计划：安装 / 发布共用一份形状，界面只渲染这一种计划卡。 */
+    plan?: OperationPlan;
 };
 
 export type SkillInstallPlan = {
@@ -1324,6 +1590,110 @@ export type SkillInstallPlan = {
     plugin_actions: SkillPluginInstallAction[];
     blocked_reasons: string[];
     ready: boolean;
+    plan?: OperationPlan;
+};
+
+/**
+ * 统一操作计划（dry-run）。
+ *
+ * 安装与发布在后端被收敛成同一份结构：目标（会写到哪里）、策略（怎么写）、
+ * 步骤（会依次做什么）、依赖（会连带处理什么）、阻断（为什么现在不能做）。
+ * 界面不再各自解释一遍"会发生什么"。
+ */
+export type PlanTarget = {
+    /** `agent` / `client` / `github` / `workbench` / `organization` */
+    kind: string;
+    id: string;
+    label: string;
+    /** 解析后的真实落点：目录路径、`owner/repo`、目录项 ID。 */
+    destination: string;
+    /** `agent` / `user` / `project` / `remote` */
+    scope: string;
+    /** `store` / `copy` / `symlink` / `extract` / `release` / `submit` */
+    strategy: string;
+    /** 该落点当前是否已存在；false 表示这次操作会新建它。 */
+    detected: boolean;
+};
+
+export type PlanStep = {
+    id: string;
+    title: string;
+    detail: string;
+    /** 是否会改变本机或远端状态。 */
+    mutating: boolean;
+};
+
+export type PlanDependency = {
+    kind: string;
+    id: string;
+    name: string;
+    required: boolean;
+    current_version: string;
+    target_version: string;
+    /**
+     * `install` / `update` / `satisfied` / `keep` / `resolve` / `blocked` / `unavailable`
+     * 文案与状态判定集中在 `components/operationPlanText.ts`，界面不直接读这个取值。
+     */
+    action: string;
+    reason: string;
+};
+
+export type PlanItem = {
+    id: string;
+    name: string;
+    version: string;
+    description: string;
+    source: string;
+    artifact_id: string;
+    sha256: string;
+    size_bytes: number;
+};
+
+export type OperationPlan = {
+    schema_version: string;
+    /** `install` / `publish` */
+    operation: string;
+    /** `skill` / `plugin` */
+    capability: string;
+    item: PlanItem;
+    targets: PlanTarget[];
+    dependencies: PlanDependency[];
+    steps: PlanStep[];
+    blocked_reasons: string[];
+    warnings: string[];
+    ready: boolean;
+};
+
+/**
+ * 客户端 × 作用域 × 能力矩阵。
+ *
+ * 静态能力声明跨机器一致，`availability` 是本机运行期覆盖层。功能开关以这份
+ * 矩阵为准，页面不再各自维护客户端清单。
+ */
+export type ClientCapabilityMatrixClient = {
+    id: string;
+    name: string;
+    aliases?: string[];
+    support_level: 'official' | 'verified' | 'compatible' | string;
+    support_note?: string;
+    capabilities: {
+        skills?: { standard: 'agentskills.io' | 'himind-store' | string; scopes: Record<string, { directory: string; env_key?: string }> };
+        mcp?: { transports: string[]; target_ids?: string[]; config_format?: string; auto_configure?: boolean; server_id?: string };
+        plugins?: { executor: 'agent' | 'client' | string; server_id?: string };
+    };
+    availability?: {
+        state: 'ready' | 'not_installed' | 'not_configured' | 'unsupported' | string;
+        detail?: string;
+        detected?: boolean;
+        configured?: boolean;
+        scope?: 'agent' | 'user' | 'project' | 'none' | string;
+        resolved_target?: string;
+    };
+};
+
+export type ClientCapabilityMatrix = {
+    schema_version: string;
+    clients: ClientCapabilityMatrixClient[];
 };
 
 export type AuthoringSkillDraftInput = {
@@ -1481,6 +1851,138 @@ export type ExtensionWorkspaceSettings = {
 
 export type BuiltinAiWorkspaceTarget = { kind: 'project'; projectId: string; name: string; path: string } | { kind: 'extension-workspace'; name: string; path: string } | null;
 
+/**
+ * 「扩展开发」里的一行工作区。`available=false` 表示登记过但目录当前不可用，
+ * 仍然返回用户才能把它移除。`has_catalog` 区分"目录里还没有聚合清单"与
+ * "清单坏了"：前者只是还没有可整体分发的扩展，不是错误。
+ */
+export type ExtensionWorkspaceEntry = {
+    root: string;
+    name: string;
+    available: boolean;
+    has_catalog: boolean;
+    valid: boolean;
+    catalog_path: string;
+    repository: string;
+    default_branch: string;
+    extension_count: number;
+    error: string;
+};
+
+/** 一个正在运行的 HiMind AI 会话，按工作区各一条。 */
+export type BuiltinAiSessionSnapshot = {
+    workspace_root: string;
+    url: string;
+    focus_workspace: boolean;
+    notice: string | null;
+};
+
+/** 扩展制品的分发落点：组织工作台或 GitHub Release。 */
+export type DistributionTarget = 'workbench' | 'github';
+
+/** GitHub 分发账号状态。永远不包含 token 本身。 */
+export type GithubAccountStatus = {
+    authorized: boolean;
+    login: string;
+    token_kind: string;
+    /** `pat`（个人令牌）或 `app`（GitHub App 安装授权）。 */
+    auth_kind: string;
+    /** 已授权的 App client_id；撤销授权后仍保留，便于再次授权时预填。 */
+    app_client_id: string;
+    installation_id: string;
+    installation_account: string;
+    /** 是否已导入 App 私钥（只回布尔值，不回显密钥）。 */
+    private_key_configured: boolean;
+    repositories: string[];
+    updated_at: string;
+    store_path: string;
+};
+
+/** GitHub App 设备流授权信息：用户在浏览器里输入 user_code 完成授权。 */
+export type GithubAppAuthorization = {
+    device_code: string;
+    user_code: string;
+    verification_uri: string;
+    /** 授权码已预填的授权页地址；为空时退回 verification_uri。 */
+    verification_uri_complete: string;
+    expires_in: number;
+    interval: number;
+};
+
+/** 一次 App 安装：发布时用它换取短期安装令牌。 */
+export type GithubAppInstallation = {
+    id: string;
+    account: string;
+    account_type: string;
+    repository_selection: string;
+};
+
+/** 设备流轮询结果；`authorized` 时会带上可绑定的安装列表。 */
+export type GithubAppAuthorizationPoll = {
+    state: 'authorized' | 'pending' | 'slow_down' | 'expired' | 'denied' | string;
+    installations: GithubAppInstallation[] | null;
+};
+
+/** 分发台账条目：某个版本在某个落点上的发布结果。 */
+export type DistributionStateEntry = {
+    kind: string;
+    id: string;
+    version: string;
+    target: DistributionTarget;
+    status: 'pending' | 'published' | 'failed' | string;
+    tag: string;
+    release_id: string;
+    html_url: string;
+    asset_name: string;
+    sha256: string;
+    size_bytes: number;
+    submission_id: string;
+    release_reference: string;
+    channel: string;
+    published_at: string;
+    error: string;
+    attempts: number;
+    updated_at: string;
+};
+
+export type DistributionPreview = {
+    kind: string;
+    id: string;
+    version: string;
+    name: string;
+    targets: DistributionTarget[];
+    github: {
+        repository: string;
+        branch: string;
+        commit: string;
+        tag: string;
+        asset_name: string;
+        manifest_name: string;
+        sha256: string;
+        size_bytes: number;
+        authorized: boolean;
+        login: string;
+        /** 依赖锁定情况：总项数、已 pin 数、未 pin 的 id 列表。 */
+        dependencies: { total: number; pinned: number; unpinned: string[]; blocked: boolean };
+        /** 必需依赖无法 pin 时的阻断原因；非空表示不会发布到 GitHub。 */
+        dependency_blocker: string | null;
+        /** 制品签名状态：配置了私钥就带签名发布，否则按未签名发布。 */
+        signature: { configured: boolean; key_id: string; error: string };
+    };
+    workbench: { distribution_id: string; channel: string; catalog_id: string };
+    /** 统一操作计划：这次发布会写到哪里、依赖是否锁住、为什么被阻断。 */
+    plan?: OperationPlan;
+};
+
+export type DistributionPublishReport = {
+    kind: string;
+    id: string;
+    version: string;
+    targets: DistributionTarget[];
+    status: 'released' | 'partially_published' | 'failed' | string;
+    outcomes: { target: string; status: string; detail?: unknown; error?: string }[];
+};
+
 export type ExtensionProject = {
     id: string;
     kind: ExtensionProjectKind;
@@ -1495,6 +1997,12 @@ export type ExtensionProject = {
     source_default_branch: string;
     source_subdirectory: string;
     source_commit: string;
+    /** 生效的分发目标（清单声明 → 项目覆盖 → 分发单元默认 → 仅工作台）。 */
+    distribution_targets?: DistributionTarget[];
+    /** 扩展清单声明的分发落点，即本机设置的上限；空表示清单未声明。 */
+    distribution_targets_declared?: DistributionTarget[];
+    /** 生效目标的来源：`manifest` 清单声明、`project` 显式覆盖、`unit` 分发单元默认、`default` 系统默认。 */
+    distribution_targets_source?: 'manifest' | 'project' | 'unit' | 'default' | string;
     updated_at: string;
     source_unit_key?: string;
 };
@@ -1607,6 +2115,17 @@ export type SkillSubmissionStatus = {
     updated_at: string;
 };
 
+export type SkillLocationEntry = {
+  scope: 'global' | 'directory';
+  root: string;
+  /** 目录已不存在（用户删了或移走了），只能清理安装记录 */
+  missing?: boolean;
+  clients: string[];
+  version: string;
+  /** 该目录每个副本的落盘策略：`copy` / `symlink`。 */
+  strategies?: string[];
+};
+
 export type CodexSkillStatusResponse = {
     client_id: string;
     client_name?: string;
@@ -1628,6 +2147,7 @@ export type CodexSkillStatusResponse = {
     render_mode?: 'copy' | 'symlink';
     items: CodexSkillStatusItem[];
     clients?: Record<string, CodexSkillStatusResponse>;
+    skill_locations?: Record<string, SkillLocationEntry[]>;
 };
 
 export type SkillConflict = {
@@ -1733,11 +2253,33 @@ export type CodexSkillActionResponse = {
     lock_updated?: boolean;
 };
 
+export type AIServiceProtocol = 'openai-chat' | 'openai-responses' | 'anthropic';
+
+/** 本机 AI 服务预设模板：事实源是工作台 AI 服务目录，Agent 只做协议映射与缓存。 */
+export type AIServiceTemplate = {
+    id: string;
+    name: string;
+    category: string;
+    description: string;
+    base_url: string;
+    protocol: AIServiceProtocol;
+    default_model: string;
+    models: string[];
+};
+
+export type AIServiceTemplateListResult = {
+    /** workbench = 本次从工作台目录读取；cache = 上次成功缓存；unavailable = 暂无模板。 */
+    source: 'workbench' | 'cache' | 'unavailable' | string;
+    reason?: string;
+    synced_at: string;
+    items: AIServiceTemplate[];
+};
+
 export type CustomAIService = {
     id: string;
     display_name: string;
     base_url: string;
-    protocol: 'openai-chat' | 'openai-responses';
+    protocol: AIServiceProtocol;
     model: string;
     models: string[];
     created_at: string;
@@ -1789,8 +2331,10 @@ export const agentApi = {
     status: () => invoke<AgentStatus>('get_agent_status'),
     agentMode: () => invoke<AgentModeSettings>('get_agent_mode'),
     projectionSyncStatus: () => invoke<ProjectionSyncStatus>('get_projection_sync_status'),
+    requeueProjectionDeadLetters: (reason?: string) => invoke<ProjectionRequeueReport>('requeue_projection_dead_letters', { reason: reason ?? null }),
     setAgentMode: (mode: AgentModeSettings['mode']) => invoke<AgentModeSettings>('set_agent_mode', { mode }),
     taskHistory: (limit = 50) => invoke<AgentTaskHistoryItem[]>('get_agent_task_history', { limit }),
+    localActivity: (limit = 60) => invoke<AgentActivityItem[]>('list_local_activity', { limit }),
     updateStatus: () => invoke<AgentUpdateStatus>('get_agent_update_status'),
     checkUpdate: () => invoke<AgentUpdateStatus>('check_agent_update'),
     downloadUpdate: () => invoke<AgentUpdateStatus>('download_agent_update'),
@@ -1804,6 +2348,19 @@ export const agentApi = {
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
     openDashboardAuthorizationPage: () => invoke('open_dashboard_authorization_page'),
     revokeDashboardAuthorization: () => invoke('revoke_dashboard_authorization'),
+    workbenchConnections: () => invoke<WorkbenchConnectionsSnapshot>('list_workbench_connections'),
+    addWorkbenchConnection: (apiBase: string, displayName: string, purpose: string) =>
+        invoke<WorkbenchConnectionsSnapshot>('add_workbench_connection', { apiBase, displayName, purpose }),
+    renameWorkbenchConnection: (id: string, displayName: string, purpose: string) =>
+        invoke<WorkbenchConnectionsSnapshot>('rename_workbench_connection', { id, displayName, purpose }),
+    removeWorkbenchConnection: (id: string) =>
+        invoke<WorkbenchConnectionsSnapshot>('remove_workbench_connection', { id }),
+    probeWorkbenchConnection: (apiBase: string) =>
+        invoke<WorkbenchProbe>('probe_workbench_connection', { apiBase }),
+    switchWorkbenchConnection: (id: string, force = false) =>
+        invoke<WorkbenchConnectionsSnapshot>('switch_workbench_connection', { id, force }),
+    enrollWorkbenchConnection: (id: string, enrollmentToken: string) =>
+        invoke<WorkbenchConnectionsSnapshot>('enroll_workbench_connection', { id, enrollmentToken }),
     testMcpConnection: () => invoke<McpConnectionTestResult>('test_mcp_connection'),
     mcpRegistry: () => invoke<McpRegistrySnapshot>('get_mcp_registry_snapshot'),
     mcpTargets: () => invoke<McpTargetDescriptor[]>('get_mcp_targets'),
@@ -1832,17 +2389,43 @@ export const agentApi = {
     saveBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<BuiltinAIMcpServer>('save_builtin_ai_mcp_server', { server }),
     deleteBuiltinAiMcpServer: (serverName: string) => invoke<boolean>('delete_builtin_ai_mcp_server', { serverName }),
     validateBuiltinAiMcpServer: (server: BuiltinAIMcpServer) => invoke<void>('validate_builtin_ai_mcp_server', { server }),
+    /** 预设要用的前置命令在不在（npx / node），用于在添加之前就把环境问题说清楚。 */
+    mcpRuntimeRequirements: () => invoke<Record<string, { available: boolean; path: string }>>('get_mcp_runtime_requirements'),
+    /** 工具目录（server.json）：只读本地快照，不联网。 */
+    mcpCatalog: () => invoke<McpCatalogView>('get_mcp_catalog'),
+    /** 拉一次目录来源。慢，但要给用户一个显式的「刷新」。 */
+    refreshMcpCatalog: () => invoke<McpCatalogView>('refresh_mcp_catalog'),
+    /** 从目录装一条：写入的仍然是 himind-ai-mcp.json，没有第二个存储。 */
+    installMcpCatalogEntry: (request: McpCatalogInstallRequest) => invoke<BuiltinAIMcpServer>('install_mcp_catalog_entry', { request }),
     reloadBuiltinAiToolContext: () => invoke<void>('reload_builtin_ai_tool_context'),
     installBuiltinAiRuntime: () => invoke<BuiltinAIRuntimeStatus>('install_builtin_ai_runtime'),
     startBuiltinAiRuntimeInstall: (operation: BuiltinAIRuntimeInstallationStatus['operation'] = 'install', manifestPath?: string) => invoke<BuiltinAIRuntimeInstallationStatus>('start_builtin_ai_runtime_install', { operation, manifestPath }),
-    startBuiltinAiSession: (target?: { projectId?: string; extensionWorkspace?: boolean }) => invoke<string>('start_builtin_ai_session', target || {}),
-    openBuiltinAiWeb: (target?: { projectId?: string; extensionWorkspace?: boolean }) => invoke<string>('open_builtin_ai_web', target || {}),
+    /** 每个工作区各一条会话，重复调用同一个工作区只会复用已有会话。 */
+    startBuiltinAiSession: (target?: { projectId?: string; workspaceRoot?: string }) => invoke<string>('start_builtin_ai_session', target || {}),
+    builtinAiSessionNotice: (workspaceRoot?: string) => invoke<string | null>('get_builtin_ai_session_notice', { workspaceRoot: workspaceRoot ?? null }),
+    listBuiltinAiSessions: () => invoke<BuiltinAiSessionSnapshot[]>('list_builtin_ai_sessions'),
+    stopBuiltinAiSession: (workspaceRoot: string) => invoke<boolean>('stop_builtin_ai_session', { workspaceRoot }),
+    openBuiltinAiWeb: (target?: { projectId?: string; workspaceRoot?: string }) => invoke<string>('open_builtin_ai_web', target || {}),
     syncBuiltinAiModels: () => invoke<BuiltinAiModelSyncResult>('sync_builtin_ai_models'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),
     exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_agent_diagnostics'),
+    backupScope: () => invoke<AgentBackupScope>('get_agent_backup_scope'),
+    /**
+     * 导出配置层备份包。`passphrase` 为空表示包里没有需要保护的凭据；
+     * 一旦有账号凭据，后端会拒绝无口令导出。
+     */
+    exportBackup: (passphrase: string | null, includeDeviceIdentity = false) => invoke<AgentBackupExportResult>('export_agent_backup', { passphrase, includeDeviceIdentity }),
+    /** 不传 `path` 时弹出文件选择框。只读检视，不写磁盘。 */
+    inspectBackup: (path?: string | null) => invoke<AgentBackupInspectResult>('inspect_agent_backup', { path: path ?? null }),
+    /** 恢复会先做完整校验，并在覆盖前写自动快照。 */
+    importBackup: (path: string | null, passphrase: string | null) => invoke<AgentBackupRestoreResult>('import_agent_backup', { path, passphrase }),
     plugins: () => invoke<PluginRegistry>('get_plugin_registry'),
-    workflowCenter: () => invoke<WorkflowCenterSnapshot>('get_workflow_center'),
+    /**
+     * `light` 跳过控制面工作流目录的远程拉取，只取本机已安装工作流与运行记录；
+     * 轮询必须走轻量快照，完整快照留给打开发工作流页面和手动刷新。
+     */
+    workflowCenter: (light = false) => invoke<WorkflowCenterSnapshot>('get_workflow_center', { light }),
     schedules: () => invoke<ScheduleList>('list_schedules'),
     workflowPresets: (workflowId?: string) => invoke<{ store_path: string; total: number; presets: WorkflowRunPreset[] }>('list_workflow_presets', { workflowId: workflowId ?? null }),
     setWorkflowPreset: (input: WorkflowRunPresetInput) => invoke<{ saved: boolean; preset: WorkflowRunPreset }>('set_workflow_preset', { input }),
@@ -1893,6 +2476,9 @@ export const agentApi = {
         invoke<ExtensionSourceSettings>('set_extension_unit_acquisition', { unitKey, acquisition }),
     installExtensionUnit: (unitKey: string, sourceId: string) => invoke<ExtensionUnitInstallReport>('install_extension_unit', { unitKey, sourceId }),
     extensionProvenance: () => invoke<ExtensionProvenance[]>('get_extension_provenance'),
+    planExtensionUpdates: () => invoke<ExtensionUpdateCandidate[]>('plan_extension_updates'),
+    applyExtensionUpdates: (targets: ExtensionUpdateTarget[]) => invoke<ExtensionBatchUpdateReport>('apply_extension_updates', { targets }),
+    cancelExtensionUpdates: () => invoke<void>('cancel_extension_updates'),
     pluginCatalog: () => invoke<PluginCatalogItem[]>('get_plugin_catalog'),
     queryPluginCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<PluginCatalogItem>>('query_plugin_catalog', { q, category, page, pageSize }),
     pluginDrafts: () => invoke<AuthoringPluginDraft[]>('list_plugin_drafts'),
@@ -1900,6 +2486,10 @@ export const agentApi = {
     extensionProjects: () => invoke<ExtensionProject[]>('list_extension_projects'),
     extensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('get_extension_workspace'),
     setExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceSettings>('set_extension_workspace', { root }),
+    extensionWorkspaces: () => invoke<ExtensionWorkspaceEntry[]>('list_extension_workspaces'),
+    pickExtensionWorkspaceDir: () => invoke<string | null>('pick_extension_workspace_dir'),
+    addExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceEntry[]>('add_extension_workspace', { root }),
+    removeExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceEntry[]>('remove_extension_workspace', { root }),
     extensionCollaborationProjects: () => invoke<ExtensionRemoteProject[]>('list_extension_collaboration_projects'),
     openExtensionProjects: () => invoke<ExtensionProject[]>('open_extension_projects'),
     associateExtensionProject: (project: ExtensionRemoteProject) =>
@@ -1917,8 +2507,37 @@ export const agentApi = {
                 source_commit: '',
             },
         }),
-    createExtensionProject: (input: CreateExtensionProjectInput) => invoke<ExtensionProject>('create_extension_project', { input }),
+    createExtensionProject: (input: CreateExtensionProjectInput, parentDir?: string) => invoke<ExtensionProject>('create_extension_project', { input, parentDir: parentDir ?? null }),
     buildExtensionProject: (projectId: string) => invoke<ExtensionCandidate>('build_extension_project', { projectId }),
+    /** 设置项目级分发目标；`targets = null` 表示回到分发单元默认。 */
+    setExtensionProjectDistributionTargets: (kind: ExtensionProjectKind, extensionId: string, targets: DistributionTarget[] | null) =>
+      invoke<ExtensionProject>('set_extension_project_distribution_targets', { kind, extensionId, targets }),
+    // targets 传 null 表示回到继承：按清单声明或出厂默认。
+    setExtensionUnitDistributionTargets: (unitKey: string, targets: DistributionTarget[] | null) =>
+      invoke<ExtensionSourceSettings>('set_extension_unit_distribution_targets', { unitKey, targets }),
+    /** 分发预览：无副作用，用于 UI 说明这次会发到哪里。 */
+    previewExtensionDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string) =>
+      invoke<DistributionPreview>('preview_extension_distribution', { kind, extensionId, version }),
+    publishExtensionDistribution: (kind: ExtensionProjectKind, extensionId: string, version: string) =>
+      invoke<DistributionPublishReport>('publish_extension_distribution', { kind, extensionId, version }),
+    extensionDistributionState: (kind?: ExtensionProjectKind, extensionId?: string) =>
+      invoke<DistributionStateEntry[]>('get_extension_distribution_state', { kind, extensionId }),
+    githubDistributionAccount: () => invoke<GithubAccountStatus>('get_github_distribution_account'),
+    setGithubDistributionAccount: (token: string, tokenKind?: string, repositories?: string[]) =>
+      invoke<GithubAccountStatus>('set_github_distribution_account', { token, tokenKind, repositories }),
+    removeGithubDistributionAccount: () => invoke<boolean>('remove_github_distribution_account'),
+    /** 设备流第一步：申请 user_code。client_id 留空时由后端回退到已保存值或环境变量。 */
+    startGithubAppAuthorization: (clientId?: string) =>
+      invoke<{ client_id: string; authorization: GithubAppAuthorization }>('start_github_app_authorization', { clientId }),
+    pollGithubAppAuthorization: (clientId: string, deviceCode: string) =>
+      invoke<GithubAppAuthorizationPoll>('poll_github_app_authorization', { clientId, deviceCode }),
+    listGithubAppInstallations: () =>
+      invoke<{ installations: GithubAppInstallation[] }>('list_github_app_installations'),
+    selectGithubAppInstallation: (installationId: string) =>
+      invoke<GithubAccountStatus>('select_github_app_installation', { installationId }),
+    importGithubAppPrivateKey: () => invoke<GithubAccountStatus>('import_github_app_private_key'),
+    openGithubAuthorizationPage: (verificationUri: string) =>
+      invoke<void>('open_github_authorization_page', { verificationUri }),
     prepareExtensionAuthoring: () => invoke<void>('prepare_extension_authoring'),
     removeExtensionProject: (projectId: string) => invoke('remove_extension_project', { projectId }),
     updateExtensionProjectSource: (projectId: string, input: ExtensionProjectSourceInput, syncRemote = true) => invoke<ExtensionProject>('update_extension_project_source', { projectId, input, syncRemote }),
@@ -1947,7 +2566,10 @@ export const agentApi = {
     queryOrganizationSkillCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<OrganizationSkillCatalogItem>>('query_organization_skill_catalog', { q, category, page, pageSize }),
     skillVersions: (skillId: string, source?: string) => invoke<OrganizationSkillCatalogItem[]>('get_skill_versions', { skillId, source }),
     planOrganizationSkillInstall: (skillId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke<SkillInstallPlan>('plan_organization_skill_install', { skillId, version, source, artifactId, sha256 }),
-    installOrganizationSkill: (skillId: string, version?: string, optionalPluginIds: string[] = [], source?: string, artifactId?: string, sha256?: string) => invoke<OrganizationSkillInstallResponse>('install_organization_skill', { skillId, version, optionalPluginIds, source, artifactId, sha256 }),
+    installOrganizationSkill: (skillId: string, version?: string, optionalPluginIds: string[] = [], source?: string, artifactId?: string, sha256?: string, clients?: string[], location?: string) => invoke<OrganizationSkillInstallResponse>('install_organization_skill', { skillId, version, optionalPluginIds, source, artifactId, sha256, clients, location }),
+    pickSkillLocation: () => invoke<string>('pick_skill_location'),
+    deploySkillToLocation: (skillId: string, location: string, clients?: string[]) => invoke<{ clients: Record<string, unknown> }>('deploy_skill_to_location', { skillId, location, clients }),
+    removeSkillFromLocation: (skillId: string, location: string) => invoke<{ removed_count: number }>('remove_skill_from_location', { skillId, location }),
     skillDrafts: () => invoke<AuthoringSkillDraft[]>('list_skill_drafts'),
     skillSubmissions: () => invoke<SkillSubmissionStatus[]>('list_skill_submissions'),
     importSkillCandidate: (revisionOfVersion?: string, parentSubmissionId?: string) => invoke<AuthoringSkillDraft>('import_skill_candidate', { revisionOfVersion, parentSubmissionId }),
@@ -1957,6 +2579,8 @@ export const agentApi = {
     confirmSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('confirm_skill_draft', { skillId, version }),
     submitSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version }),
     codexSkillStatus: () => invoke<CodexSkillStatusResponse>('get_codex_skill_status'),
+    /** 客户端 × 作用域 × 能力矩阵：功能开关的唯一答案来源。 */
+    clientCapabilityMatrix: () => invoke<ClientCapabilityMatrix>('get_client_capability_matrix'),
     skillWorkspace: () => invoke<SkillWorkspaceStatus>('get_skill_workspace'),
     setSkillWorkspace: (path?: string) => invoke<SkillWorkspaceStatus>('set_skill_workspace', { path: path || null }),
     setSkillWorkspaceEnabled: (skillId: string, enabled: boolean) => invoke<boolean>('set_skill_workspace_enabled', { skillId, enabled }),
@@ -1972,20 +2596,25 @@ export const agentApi = {
     unregisterSkillClient: (skillId: string, clientId: string) => invoke<SkillClientUnregisterResponse>('unregister_skill_client', { skillId, clientId }),
     unregisterSkillClients: (skillId: string) => invoke<SkillClientsUnregisterResponse>('unregister_skill_clients', { skillId }),
     openFolder: (path: string) => invoke('open_folder', { path }),
+    /// 设置窗口的定位由「面板 + 条目 + 页签」三段组成：条目不适用时传空，
+    /// 旧键位（remote / skills / logs……）后端原样透传，由前端统一映射。
+    openSettingsWindow: (panel: 'settings' | 'ai' | 'logs' = 'settings', section?: string, tab?: string, aiTab?: 'mcp' | 'services' | 'acp') => invoke('open_settings_window', { panel, section, tab, aiTab }),
     pickWorkspaceDirectory: () => invoke<{ path?: string }>('pick_workspace_directory'),
     installPlugin: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke('install_plugin', { pluginId, version, source, artifactId, sha256 }),
     uninstallPlugin: (pluginId: string) => invoke('uninstall_plugin', { pluginId }),
     rollbackPlugin: (pluginId: string) => invoke('rollback_plugin', { pluginId }),
+    repairPlugin: (pluginId: string) => invoke('repair_plugin', { pluginId }),
     setPluginEnabled: (pluginId: string, enabled: boolean) => invoke('set_plugin_enabled', { pluginId, enabled }),
     capabilities: () => invoke<CapabilityItem[]>('get_agent_capabilities'),
-    fetchAIServiceModels: (input: { base_url: string; api_key: string }) => invoke<AIServiceModelListResult>('fetch_ai_service_models', { baseUrl: input.base_url, apiKey: input.api_key }),
+    fetchAIServiceModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => invoke<AIServiceModelListResult>('fetch_ai_service_models', { baseUrl: input.base_url, apiKey: input.api_key, protocol: input.protocol }),
     fetchSavedAIServiceModels: (id: string, baseUrl: string) => invoke<AIServiceModelListResult>('fetch_saved_ai_service_models', { id, baseUrl }),
     listAIServices: () => invoke<AIServiceListResult>('list_ai_services'),
+    listAIServiceTemplates: () => invoke<AIServiceTemplateListResult>('list_ai_service_templates'),
     acpRuntimeProfiles: () => invoke<AcpRuntimeProfileSnapshot>('list_acp_runtime_profiles'),
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: 'openai-chat' | 'openai-responses'; model: string; models: string[]; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -1997,7 +2626,7 @@ export const agentApi = {
         }),
     setActiveAIService: (id: string) => invoke<{ active_service_id: string }>('set_active_ai_service', { id }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
-    importAIClient: (target: string, service?: string) => invoke<Record<string, unknown>>('import_ai_client', { target, service }),
+    importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),
     respondApproval: (id: string, approved: boolean) => invoke('respond_approval', { id, approved }),
     setRule: (requestType: string, mode: string) => invoke('set_approval_rule', { requestType, mode }),
