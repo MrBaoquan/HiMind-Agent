@@ -73,7 +73,7 @@ pub(crate) fn independent_status(options: &Options) -> DashboardIdentityStatus {
         state: "independent".to_string(),
         authorized: false,
         online_verified: false,
-        dashboard_base: options.api_base.clone(),
+        dashboard_base: options.api_base().clone(),
         user_name: String::new(),
         user_id: String::new(),
         agent_id: String::new(),
@@ -124,7 +124,7 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
                 state: "invalid_local_authorization".to_string(),
                 authorized: false,
                 online_verified: false,
-                dashboard_base: options.api_base.clone(),
+                dashboard_base: options.api_base().clone(),
                 user_name: String::new(),
                 user_id: String::new(),
                 agent_id,
@@ -148,7 +148,7 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
             },
             authorized: false,
             online_verified: false,
-            dashboard_base: options.api_base.clone(),
+            dashboard_base: options.api_base().clone(),
             user_name: String::new(),
             user_id: String::new(),
             agent_id,
@@ -198,7 +198,7 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
                 .to_string(),
                 authorized: info.active,
                 online_verified: true,
-                dashboard_base: options.api_base.clone(),
+                dashboard_base: options.api_base().clone(),
                 user_name: info.name,
                 user_id: info.sub,
                 agent_id: info.agent_id,
@@ -271,7 +271,7 @@ pub(crate) fn start_authorization(
 
     let flow_for_thread = Arc::clone(&flow);
     thread::spawn(move || {
-        let authorization = match oauth::begin_device_authorization(&options) {
+        let mut authorization = match oauth::begin_device_authorization(&options) {
             Ok(value) => value,
             Err(error) => {
                 finish_with_error(&flow_for_thread, generation, "failed", &error.to_string());
@@ -279,6 +279,13 @@ pub(crate) fn start_authorization(
                 return;
             }
         };
+        // 授权页必须留在当前对接的 Dashboard 上，否则开发环境发起、生产环境确认
+        // 这类跨环境授权会在用户无感知的情况下发生。
+        if let Some(message) =
+            oauth::align_authorization_urls(&options.api_base(), &mut authorization)
+        {
+            logs.add_log("warn", &message);
+        }
         {
             let Ok(mut state) = flow_for_thread.lock() else {
                 return;
@@ -338,6 +345,13 @@ pub(crate) fn start_authorization(
                     );
                 }
                 logs.add_log("info", "Dashboard 账号授权成功");
+                // 授权即参与：拿到账号授权后立刻开始对接工作台，不再需要单独的
+                // 启用开关，也不用重启 Agent。
+                let _ = crate::app::runtime_mode::save(
+                    &options.state_path,
+                    crate::app::runtime_mode::AgentMode::Connected,
+                );
+                options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
                 match svn_result {
                     Some(Ok(true)) => logs.add_log("info", "已按 HiMind 姓名配置 SVN 账号"),
                     Some(Err(error)) => logs.add_log(
@@ -431,7 +445,7 @@ fn status_from_snapshot(
         state: state.to_string(),
         authorized,
         online_verified,
-        dashboard_base: options.api_base.clone(),
+        dashboard_base: options.api_base().clone(),
         user_name: snapshot.display_name,
         user_id: snapshot.user_id,
         agent_id: snapshot.agent_id,

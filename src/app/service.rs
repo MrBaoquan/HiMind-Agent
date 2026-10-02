@@ -138,7 +138,9 @@ pub(crate) fn start_background_services(
     // A VS Code update replaces its versioned product.json. Repair an existing
     // HiMind enrollment before serving the Dashboard so ordinary Agent startup
     // restores the persistent provider allowlist automatically.
-    if options.mode().dashboard_enabled() {
+    // 投影循环随进程常驻：开关切到「AI 工作台」就立即开始上传，关闭就停。
+    // 循环体自己读运行状态，因此不需要重启 Agent。
+    {
         let projection_options = options.clone();
         let _ = thread::Builder::new()
             .name("himind-agent-core-projection-loop".to_string())
@@ -158,6 +160,8 @@ pub(crate) fn start_background_services(
                 }
                 thread::sleep(Duration::from_secs(30));
             });
+    }
+    if options.mode().dashboard_enabled() {
         let reconcile_options = options.clone();
         let _ = thread::Builder::new()
             .name("himind-vscode-reconcile-loop".to_string())
@@ -241,14 +245,40 @@ pub(crate) fn start_background_services(
             }
         });
 
-    if options.mode().dashboard_enabled() {
+    // 已绑定的拓展工作区在启动后顺序预热沙箱写权限：这一步按工作区一次性
+    // （十几万文件的目录实测 90 秒），提前铺好之后，用户第一次让 AI 在工作区里
+    // 跑命令就只剩几十毫秒的命中开销。慢启动不影响功能，所以延后几秒再开始，
+    // 不跟建窗口抢磁盘。
+    {
+        let _ = thread::Builder::new()
+            .name("himind-sandbox-warmup-bootstrap".to_string())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(8));
+                let Ok(executable) = crate::runtime::builtin::interactive_executable() else {
+                    return;
+                };
+                let mut workspaces = crate::extension_workspace::bound_roots();
+                if let Some(recent) = crate::runtime::builtin::recent_interactive_workspace() {
+                    if !workspaces.contains(&recent) {
+                        workspaces.push(recent);
+                    }
+                }
+                workspaces.truncate(8);
+                crate::app::sandbox_warmup::spawn_batch(&executable, workspaces);
+            });
+    }
+
+    // Worker 监管线程常驻：开关打开即开始对接工作台，关闭则回到待命。
+    // 这样用户在设置里切换时不需要重启 Agent。
+    {
         let worker_opts = options.clone();
         let ws = Arc::clone(&worker_status);
         let mgr = approval_mgr.clone();
         thread::spawn(move || {
             worker::run_supervisor(worker_opts, ws, mgr);
         });
-    } else {
+    }
+    {
         if let Ok(mut state) = worker_status.lock() {
             state.dashboard_worker_online = false;
             state.dashboard_worker_error.clear();
@@ -270,6 +300,11 @@ pub(crate) fn start_background_services(
                             }
                         };
                         loop {
+                            // 已对接工作台时更新走工作台通道，本循环让位。
+                            if update_options.mode().dashboard_enabled() {
+                                thread::sleep(Duration::from_secs(60));
+                                continue;
+                            }
                             if let Err(error) =
                                 crate::app::update_manager::background_check_independent(
                                     &client,
@@ -381,7 +416,7 @@ fn handle_local_http(
         }
     };
     let request = String::from_utf8_lossy(&request_bytes);
-    let security = LocalRequestSecurity::new(&options.api_base, options.local_port);
+    let security = LocalRequestSecurity::new(&options.api_base(), options.local_port);
     let response_origin = match security.validate(&request) {
         Ok(origin) => origin,
         Err(message) => {
@@ -456,7 +491,7 @@ fn handle_local_http(
                 &Client::builder()
                     .timeout(std::time::Duration::from_secs(10))
                     .build()?,
-                &options.api_base,
+                &options.api_base(),
                 agent_id,
                 ticket,
                 operation,
@@ -508,7 +543,7 @@ fn handle_local_http(
                 &Client::builder()
                     .timeout(std::time::Duration::from_secs(20))
                     .build()?,
-                &options.api_base,
+                &options.api_base(),
                 &options.state_path,
                 crate::VERSION,
                 &payload.enrollment_token,
@@ -643,7 +678,7 @@ fn handle_local_http(
                 }
                 let principal = match verify_local_agent_ticket(
                     &Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
-                    &options.api_base,
+                    &options.api_base(),
                     agent_id,
                     &payload.ticket,
                     &payload.capability_id,

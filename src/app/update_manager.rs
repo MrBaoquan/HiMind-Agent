@@ -316,7 +316,7 @@ fn check_with_state(
     save(&options.state_path, &status)?;
 
     let update = match if let Some(state) = distribution_state {
-        distribution::check_update(client, &options.api_base, state)
+        distribution::check_update(client, &options.api_base(), state)
     } else {
         crate::app::update_source::check_github(client, options)
     } {
@@ -348,7 +348,7 @@ fn check_with_state(
         if let Some(state) = distribution_state {
             let _ = distribution::report_update_result(
                 client,
-                &options.api_base,
+                &options.api_base(),
                 state,
                 "update_available",
                 crate::VERSION,
@@ -442,7 +442,7 @@ fn download_locked(
         return Err("当前没有可下载的软件更新".into());
     }
     crate::app::system::validate_update_download_url_for_source(
-        &options.api_base,
+        &options.api_base(),
         &status.download_url,
         &status.source,
     )?;
@@ -459,7 +459,7 @@ fn download_locked(
     if let Some(state) = distribution_state {
         let _ = distribution::report_update_result(
             &client,
-            &options.api_base,
+            &options.api_base(),
             state,
             "download_started",
             crate::VERSION,
@@ -479,7 +479,7 @@ fn download_locked(
         if let Some(state) = distribution_state {
             let _ = distribution::report_update_result(
                 &client,
-                &options.api_base,
+                &options.api_base(),
                 state,
                 if DOWNLOAD_CANCELED.load(Ordering::Relaxed) {
                     "download_canceled"
@@ -501,7 +501,7 @@ fn download_locked(
     if let Some(state) = distribution_state {
         let _ = distribution::report_update_result(
             &client,
-            &options.api_base,
+            &options.api_base(),
             state,
             "download_ready",
             crate::VERSION,

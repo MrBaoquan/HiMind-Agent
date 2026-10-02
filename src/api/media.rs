@@ -82,7 +82,7 @@ fn request(
     if delegated.agent_id.trim() != state.agent_id.trim() {
         return Err("Dashboard authorization does not match this Agent".into());
     }
-    let url = api_url(&options.api_base, path)?;
+    let url = api_url(&options.api_base(), path)?;
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let mut builder = client
         .request(method, url)

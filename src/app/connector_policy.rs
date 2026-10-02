@@ -20,12 +20,12 @@ pub(crate) struct ConnectorPolicySyncReport {
 pub(crate) fn sync(options: &crate::Options) -> Result<ConnectorPolicySyncReport, Box<dyn Error>> {
     let state = crate::api::client::load_agent_state(&options.state_path)?;
     if state.agent_id.trim().is_empty() || state.credential.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let bundle = connector_policy_bundle(
         &client,
-        &options.api_base,
+        &options.api_base(),
         &state.agent_id,
         &state.credential,
     )?;

@@ -1,11 +1,9 @@
 use std::{
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -13,7 +11,7 @@ use tauri::http::{Request, Response, StatusCode};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
 use crate::app::builtin_ai_gateway::BuiltinAiCommandGateway;
@@ -29,28 +27,65 @@ use crate::Options;
 
 struct BuiltinAiSession {
     child: Child,
+    home: PathBuf,
     workspace: PathBuf,
     focus_workspace: bool,
+    /// 本会话的降级提示。多会话并发之后提示必须跟着会话走，否则 B 会话的
+    /// 「模型凭据来自本机 AI 服务」会盖到 A 会话的头部。
+    notice: Option<String>,
     proxy: BuiltinAiProxy,
     event_sync: BuiltinAiEventSync,
     model_sync: BuiltinAiModelSync,
     command_gateway: Option<BuiltinAiCommandGateway>,
 }
 
-static BUILTIN_AI_SESSION: std::sync::OnceLock<Mutex<Option<BuiltinAiSession>>> =
-    std::sync::OnceLock::new();
-static BUILTIN_AI_STARTING: std::sync::OnceLock<AtomicBool> = std::sync::OnceLock::new();
+/// 一个 Agent 进程同时服务多个工作区的 HiMind AI 会话。
+///
+/// 用户的实际场景是「同时用 AI 开发两个扩展」：两个工作区各有一个 DSH 进程，
+/// 各自的 MCP 伴生进程带着自己的 `HIMIND_AI_WORKSPACE`。旧实现把会话存成
+/// `Option<BuiltinAiSession>` 单例，开第二个工作区必须先杀掉第一个 —— 正在跑的
+/// 那一轮就没了。现在按工作区目录索引，增删一个会话不碰其它会话。
+static BUILTIN_AI_SESSIONS: OnceLock<Mutex<HashMap<String, BuiltinAiSession>>> = OnceLock::new();
+/// 正在启动的工作区集合，避免同一个目录被并发启动两次。
+static BUILTIN_AI_STARTING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-fn builtin_ai_session() -> &'static Mutex<Option<BuiltinAiSession>> {
-    BUILTIN_AI_SESSION.get_or_init(|| Mutex::new(None))
+fn builtin_ai_sessions() -> &'static Mutex<HashMap<String, BuiltinAiSession>> {
+    BUILTIN_AI_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn builtin_ai_starting() -> &'static AtomicBool {
-    BUILTIN_AI_STARTING.get_or_init(|| AtomicBool::new(false))
+fn builtin_ai_starting() -> &'static Mutex<HashSet<String>> {
+    BUILTIN_AI_STARTING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 会话身份就是工作区目录本身：一个目录一个 DSH 进程，不同目录互不干扰。
+/// Windows 路径大小写不敏感，统一按小写收敛，避免同一个目录开出两个会话。
+fn builtin_ai_session_key(workspace: &Path) -> String {
+    workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase()
+}
+
+/// 会话的降级提示：控制面本该提供模型凭据但拿不到时，说明真实原因。
+/// 会话本身正常启动，提示只是把「模型凭据从哪来」这件事说清楚。
+pub(crate) fn current_builtin_ai_notice(workspace: Option<&Path>) -> Option<String> {
+    let sessions = builtin_ai_sessions().lock().ok()?;
+    match workspace {
+        Some(path) => sessions
+            .get(&builtin_ai_session_key(path))
+            .and_then(|session| session.notice.clone()),
+        None => sessions.values().find_map(|session| session.notice.clone()),
+    }
 }
 
 pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let port = options.local_port;
+    // WebView2 的用户数据目录是进程级独占的：开发实例（或并行实例）跟正在
+    // 运行的生产实例共用一个目录时，后启动的进程会静默建不出主窗口，只剩
+    // 托盘图标。必须在 Tauri 创建任何 WebView 之前把目录按 profile 定下来。
+    let webview_data_dir = crate::store::paths::apply_webview_user_data_dir(port);
+    println!("webview user data dir: {}", webview_data_dir.display());
     let initial_plugin_view = options.plugin_view_launch();
     let initial_protocol_open = options.protocol_open_requested();
 
@@ -99,7 +134,6 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         approval_manager,
         capability_gateway,
         port,
-        dashboard_base: options.api_base.clone(),
         state_path: options.state_path.clone(),
         options: options.clone(),
         dashboard_authorization: Arc::new(Mutex::new(
@@ -109,10 +143,13 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     let popup_approval_manager = Arc::clone(&state.approval_manager);
 
     let builder = tauri::Builder::default();
+    // 单实例键 = identifier + profile（见 app::single_instance）：生产 profile 与
+    // 历史键逐字一致，其它 profile 各占一个键，开发实例与已安装产品互不顶替。
+    // HIMIND_AGENT_ALLOW_PARALLEL_INSTANCE=1 只留给并行验证脚本，跳过守卫。
     let builder = if std::env::var("HIMIND_AGENT_ALLOW_PARALLEL_INSTANCE").as_deref() == Ok("1") {
         builder
     } else {
-        builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        builder.plugin(crate::app::single_instance::init(|app, args, _cwd| {
             if let Some(launch) = crate::parse_plugin_view_launch(&args) {
                 let app = app.clone();
                 let _ = thread::Builder::new()
@@ -180,6 +217,13 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_agent_update_preferences,
             super::commands::install_agent_update,
             super::commands::get_dashboard_identity_status,
+            super::workbench_connections::list_workbench_connections,
+            super::workbench_connections::add_workbench_connection,
+            super::workbench_connections::rename_workbench_connection,
+            super::workbench_connections::remove_workbench_connection,
+            super::workbench_connections::probe_workbench_connection,
+            super::workbench_connections::switch_workbench_connection,
+            super::workbench_connections::enroll_workbench_connection,
             super::commands::get_builtin_ai_activity,
             super::commands::start_dashboard_authorization,
             super::commands::get_dashboard_authorization_progress,
@@ -215,10 +259,17 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::save_builtin_ai_mcp_server,
             super::commands::delete_builtin_ai_mcp_server,
             super::commands::validate_builtin_ai_mcp_server,
+            super::commands::get_mcp_runtime_requirements,
+            super::commands::get_mcp_catalog,
+            super::commands::refresh_mcp_catalog,
+            super::commands::install_mcp_catalog_entry,
             super::commands::reload_builtin_ai_tool_context,
             super::commands::install_builtin_ai_runtime,
             super::commands::start_builtin_ai_runtime_install,
             super::commands::start_builtin_ai_session,
+            super::commands::get_builtin_ai_session_notice,
+            super::commands::list_builtin_ai_sessions,
+            super::commands::stop_builtin_ai_session,
             super::commands::open_builtin_ai_web,
             super::commands::sync_builtin_ai_models,
             super::commands::set_approval_rule,
@@ -232,12 +283,21 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::open_inner_admin_page,
             super::commands::open_agent_directory,
             super::commands::show_main_window,
+            super::commands::open_settings_window,
+            super::commands::window_start_dragging,
+            super::commands::window_minimize,
+            super::commands::window_toggle_maximize,
+            super::commands::window_close,
             super::commands::quit_agent,
             super::commands::set_auto_start,
             super::commands::pick_unity_editor,
             super::commands::save_unity_editor,
             super::commands::get_agent_logs,
             super::commands::export_agent_diagnostics,
+            super::commands::get_agent_backup_scope,
+            super::commands::export_agent_backup,
+            super::commands::inspect_agent_backup,
+            super::commands::import_agent_backup,
             super::commands::get_svn_connections,
             super::commands::save_svn_connection,
             super::commands::remove_svn_connection,
@@ -288,11 +348,15 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::install_extension_unit,
             super::commands::get_extension_provenance,
             super::commands::get_extension_lock,
+            super::commands::plan_extension_updates,
+            super::commands::apply_extension_updates,
+            super::commands::cancel_extension_updates,
             super::commands::import_local_plugin,
             super::commands::import_github_plugin,
             super::commands::import_github_plugin_url,
             super::commands::get_extension_desired_state,
             super::commands::get_agent_task_history,
+            super::commands::list_local_activity,
             super::commands::get_plugin_catalog,
             super::commands::query_plugin_catalog,
             super::commands::get_plugin_versions,
@@ -301,9 +365,12 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::uninstall_plugin,
             super::commands::rollback_plugin,
             super::commands::set_plugin_enabled,
+            super::commands::repair_plugin,
             super::commands::get_agent_capabilities,
             super::commands::get_projection_sync_status,
+            super::commands::requeue_projection_dead_letters,
             super::commands::list_ai_services,
+            super::commands::list_ai_service_templates,
             super::commands::list_acp_runtime_profiles,
             super::commands::save_acp_runtime_profile,
             super::commands::set_acp_runtime_profile_enabled,
@@ -327,10 +394,28 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::list_extension_projects,
             super::commands::get_extension_workspace,
             super::commands::set_extension_workspace,
+            super::commands::list_extension_workspaces,
+            super::commands::pick_extension_workspace_dir,
+            super::commands::add_extension_workspace,
+            super::commands::remove_extension_workspace,
             super::commands::open_extension_projects,
             super::commands::associate_extension_project,
             super::commands::create_extension_project,
             super::commands::build_extension_project,
+            super::commands::set_extension_project_distribution_targets,
+            super::commands::set_extension_unit_distribution_targets,
+            super::commands::get_github_distribution_account,
+            super::commands::set_github_distribution_account,
+            super::commands::remove_github_distribution_account,
+            super::commands::start_github_app_authorization,
+            super::commands::poll_github_app_authorization,
+            super::commands::list_github_app_installations,
+            super::commands::select_github_app_installation,
+            super::commands::import_github_app_private_key,
+            super::commands::open_github_authorization_page,
+            super::commands::preview_extension_distribution,
+            super::commands::publish_extension_distribution,
+            super::commands::get_extension_distribution_state,
             super::commands::prepare_extension_authoring,
             super::commands::remove_extension_project,
             super::commands::list_extension_collaboration_projects,
@@ -363,10 +448,14 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::confirm_skill_draft,
             super::commands::submit_skill_draft,
             super::commands::get_codex_skill_status,
+            super::commands::get_client_capability_matrix,
             super::commands::get_skill_workspace,
             super::commands::set_skill_workspace,
             super::commands::set_skill_workspace_enabled,
             super::commands::pick_skill_workspace,
+            super::commands::pick_skill_location,
+            super::commands::deploy_skill_to_location,
+            super::commands::remove_skill_from_location,
             super::commands::get_skill_sync_settings,
             super::commands::set_skill_sync_mode,
             super::commands::sync_codex_skills,
@@ -420,13 +509,15 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             start_approval_popup_watcher(app.handle().clone(), Arc::clone(&popup_approval_manager));
             // 平台级定时任务由桌面 Agent 自己的调度线程驱动；到点后按目标类型
             // 派发（Workflow 目标走的仍是与手动启动完全相同的 Run 路径）。
-            crate::scheduler::start_scheduler(
-                app.state::<AgentState>().capability_gateway.clone(),
-            );
+            crate::scheduler::start_scheduler(app.state::<AgentState>().capability_gateway.clone());
             // 启动时先收尾上一次进程留下的僵尸运行，再开始调度。
             if let Err(error) = crate::scheduler::abandon_stale_runs() {
                 eprintln!("stale workflow run sweep failed: {error}");
             }
+            start_client_skill_hygiene();
+            start_extension_storage_hygiene();
+            start_mcp_catalog_refresh(app.state::<AgentState>().state_path.clone());
+            fit_main_window_to_monitor(app);
             if let Some(launch) = initial_plugin_view.as_ref() {
                 open_plugin_view(app.handle(), &launch.plugin_id, &launch.view_id)?;
             } else if initial_protocol_open {
@@ -438,6 +529,38 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     builder.run(tauri::generate_context!())?;
 
     Ok(())
+}
+
+/// 启动后台把客户端技能目录扫一遍：清掉旧版 `<id>/current` 布局与渲染中断
+/// 留下的 staging。客户端靠递归发现 `**/SKILL.md`，这些残留会让同一个技能
+/// 在客户端里出现两次，所以每次启动都收尾一次。
+fn start_client_skill_hygiene() {
+    thread::spawn(crate::skill::sweep_client_skill_directories);
+}
+
+/// 启动后台把本机的扩展版本目录扫一遍：插件与技能的 `versions/` 只保留
+/// `current` / `previous` 两版。安装完成时也会打扫，但那一次只覆盖刚装过的
+/// 那一个扩展，装完就不再更新的扩展会一直带着历史版本，目录随版本累积。
+fn start_extension_storage_hygiene() {
+    thread::spawn(|| {
+        let removed = crate::app::plugin_manager::sweep_plugin_versions()
+            + crate::skill::store::sweep_skill_versions();
+        if removed == 0 {
+            return;
+        }
+        crate::approval::manager::ApprovalManager::global().add_log(
+            "info",
+            &format!("已清理 {removed} 个历史版本目录，仅保留可回退的两版"),
+        );
+    });
+}
+
+/// 目录快照过期时在后台补一次。失败只记 warn：目录扫不到不影响已经装好的工具，
+/// 也不该在启动时把界面卡住。
+fn start_mcp_catalog_refresh(state_path: std::path::PathBuf) {
+    thread::spawn(move || {
+        crate::app::mcp_catalog::refresh_if_stale(&state_path);
+    });
 }
 
 fn start_pending_updater_repair(approval_manager: Arc<ApprovalManager>) {
@@ -736,6 +859,102 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 默认窗口按 1280×820 设计；屏幕更小时收进可用区域，最小不低于
+/// 1024×680（与 tauri.conf.json 的 minWidth/minHeight 一致）。
+fn fit_main_window_to_monitor(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(Some(monitor)) = window.primary_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let available_width = monitor.size().width as f64 / scale;
+    let available_height = monitor.size().height as f64 / scale;
+    // 预留任务栏与窗口边缘，避免默认尺寸刚好压在屏幕边界上。
+    let width = (available_width - 120.0).clamp(1024.0, 1280.0);
+    let height = (available_height - 120.0).clamp(680.0, 820.0);
+    let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    let _ = window.center();
+}
+
+pub(crate) fn open_settings_window(
+    app: &tauri::AppHandle,
+    panel: Option<&str>,
+    section: Option<&str>,
+    tab: Option<&str>,
+    ai_tab: Option<&str>,
+) -> Result<(), String> {
+    let panel = match panel.unwrap_or("settings") {
+        "settings" | "ai" | "logs" => panel.unwrap_or("settings"),
+        _ => "settings",
+    };
+    // Legacy section keys are forwarded verbatim so the renderer can remap
+    // old deep links (remote/connectors/tools/skills/backup/logs) onto the
+    // consolidated rail without a silent fall back to "general".
+    let section = section
+        .filter(|value| {
+            matches!(
+                *value,
+                "accounts"
+                    | "ai"
+                    | "services"
+                    | "automation"
+                    | "approval"
+                    | "general"
+                    | "tooling"
+                    | "diagnostics"
+                    | "remote"
+                    | "remote-tools"
+                    | "connectors"
+                    | "tools"
+                    | "skills"
+                    | "backup"
+                    | "logs"
+            )
+        })
+        .unwrap_or("general");
+    let tab = tab
+        .filter(|value| {
+            matches!(
+                *value,
+                "connectors" | "remote-clients" | "tools" | "skills" | "backup" | "logs"
+            )
+        })
+        .unwrap_or("");
+    let ai_tab = ai_tab
+        .filter(|value| matches!(*value, "mcp" | "services" | "acp"))
+        .unwrap_or("mcp");
+    let payload =
+        serde_json::json!({ "panel": panel, "section": section, "tab": tab, "aiTab": ai_tab });
+
+    if let Some(window) = app.get_webview_window("settings") {
+        window
+            .emit("himind:settings-navigate", payload)
+            .map_err(|error| error.to_string())?;
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    // Keep the same entry point as the main window and pass the initial route
+    // through an initialization script. The renderer also recognizes the
+    // native window label, so the settings shell does not depend on this
+    // single signal.
+    let bootstrap = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
+        .initialization_script(format!("window.__HIMIND_SETTINGS_WINDOW__ = {bootstrap};"))
+        .title("HiMind Agent 设置")
+        .inner_size(980.0, 720.0)
+        .min_inner_size(760.0, 520.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn should_hide_internal_window(class_name: &str) -> bool {
     // Tauri delivers AppHandle::exit through the Tao event target window.
@@ -856,38 +1075,99 @@ pub(crate) fn start_builtin_ai_session(
 ) -> Result<String, String> {
     let focus_workspace = workspace.is_some();
     let workspace = requested_builtin_ai_workspace(workspace)?;
+    let key = builtin_ai_session_key(&workspace);
+    if let Some(url) = reuse_builtin_ai_session(&key, focus_workspace)? {
+        return Ok(url);
+    }
     {
-        let active = builtin_ai_session()
+        let mut starting = builtin_ai_starting()
             .lock()
             .map_err(|_| "HiMind AI 会话状态不可用")?;
-        if let Some(session) = active.as_ref() {
-            if session.workspace == workspace && session.focus_workspace == focus_workspace {
-                return Ok(session.proxy.url().to_string());
-            }
+        if !starting.insert(key.clone()) {
+            return Err("HiMind AI 正在启动，请稍后重试".to_string());
         }
-    }
-    if builtin_ai_session()
-        .lock()
-        .map_err(|_| "HiMind AI 会话状态不可用")?
-        .is_some()
-    {
-        stop_builtin_ai_process();
-    }
-    if builtin_ai_starting().swap(true, Ordering::AcqRel) {
-        return Err("HiMind AI 正在启动，请稍后重试".to_string());
     }
 
     let result = start_builtin_ai_session_inner(options, &workspace, focus_workspace);
-    builtin_ai_starting().store(false, Ordering::Release);
-    result
+    if let Ok(mut starting) = builtin_ai_starting().lock() {
+        starting.remove(&key);
+    }
+    let session = result?;
+    let session_url = session.proxy.url().to_string();
+    builtin_ai_sessions()
+        .lock()
+        .map_err(|_| "HiMind AI 会话状态不可用")?
+        .insert(key, session);
+    Ok(session_url)
+}
+
+/// 这个工作区已经在跑就复用它，而不是重启进程。
+///
+/// 项目入口要求「进入后落在该项目」时，才需要把分组里的会话行补上；补失败只是
+/// 分组不好看，不影响这个已经能用的会话。
+fn reuse_builtin_ai_session(key: &str, focus_workspace: bool) -> Result<Option<String>, String> {
+    let mut sessions = builtin_ai_sessions()
+        .lock()
+        .map_err(|_| "HiMind AI 会话状态不可用")?;
+    let Some(session) = sessions.get_mut(key) else {
+        return Ok(None);
+    };
+    if focus_workspace && !session.focus_workspace {
+        let prepared =
+            session
+                .proxy
+                .control()
+                .prepare_rail(&session.home, &session.workspace, true);
+        match prepared {
+            Ok(_) => session.focus_workspace = true,
+            Err(error) => session.notice = Some(error),
+        }
+    }
+    Ok(Some(session.proxy.url().to_string()))
+}
+
+/// 启动一条会话要现起一个完整的 DSH host：解包运行时、起本地服务、再把地址打到
+/// stdout。机器忙或同时在开多条会话时，冷启动十几秒是常态。
+///
+/// 固定预算会把「慢」误判成「坏」——超时分支会直接杀掉进程，用户看到的是
+/// 「启动失败」而不是「还在启动」。所以预算随已运行的会话数增长：并发越多，
+/// 每条新会话允许的等待越宽，同时仍保留上限，避免真卡死时无限等下去。
+/// 真崩溃仍由 `child.try_wait()` 立即返回，不靠超时兜底。
+fn builtin_ai_startup_budget(active_sessions: usize) -> Duration {
+    const BASE_SECONDS: u64 = 45;
+    const PER_SESSION_SECONDS: u64 = 30;
+    const MAX_SECONDS: u64 = 180;
+    let seconds = BASE_SECONDS
+        .saturating_add(PER_SESSION_SECONDS.saturating_mul(active_sessions as u64))
+        .min(MAX_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+/// 已经在跑的会话条数。键被锁住读不到时按 0 处理：预算退化成最保守的基础值，
+/// 不会因为统计失败而放宽限制。
+fn active_builtin_ai_session_count() -> usize {
+    builtin_ai_sessions()
+        .lock()
+        .map(|sessions| sessions.len())
+        .unwrap_or(0)
 }
 
 fn start_builtin_ai_session_inner(
     options: &Options,
     workspace: &Path,
     focus_workspace: bool,
-) -> Result<String, String> {
-    let launch = crate::runtime::builtin::prepare_interactive_launch(options, Some(workspace))?;
+) -> Result<BuiltinAiSession, String> {
+    let startup_budget = builtin_ai_startup_budget(active_builtin_ai_session_count());
+    let launch = crate::runtime::builtin::prepare_interactive_launch_allow_degraded(
+        options,
+        Some(workspace),
+    )?;
+    // 沙箱写权限的第一笔开销是"按工作区一次性"的：ACE 落地要向整棵树传播，实测
+    // 十几万文件的工作区要 90 秒。它会算进用户的第一条命令里，所以在这里就用
+    // 后台线程先付掉——会话启动本身不等它。
+    crate::app::sandbox_warmup::spawn(&launch.executable, &launch.workspace);
+    let notice = (!launch.control_plane_notice.trim().is_empty())
+        .then(|| launch.control_plane_notice.clone());
     let mut command = if launch
         .executable
         .extension()
@@ -912,8 +1192,13 @@ fn start_builtin_ai_session_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::runtime::process::remove_himind_secret_environment(&mut command);
-    if let Some(api_key_env) = launch.api_key_env.as_deref() {
-        command.env(api_key_env, &launch.api_key);
+    // 空值也会覆盖子进程环境：把 `""` 写进 `DEEPSEEK_API_KEY` 会让 Runtime
+    // 报「凭据缺失」，而它本来可以读自己 settings.yaml / .credentials.yaml 里
+    // 的配置。没有密钥时就不要设置这个变量。
+    if !launch.api_key.trim().is_empty() {
+        if let Some(api_key_env) = launch.api_key_env.as_deref() {
+            command.env(api_key_env, &launch.api_key);
+        }
     }
     if !launch.base_url.trim().is_empty() {
         command.env("DEEPSEEK_BASE_URL", &launch.base_url);
@@ -946,7 +1231,7 @@ fn start_builtin_ai_session_inner(
             }
         });
     }
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + startup_budget;
     let url = loop {
         if let Ok(url) = url_receiver.recv_timeout(Duration::from_millis(200)) {
             break url;
@@ -955,7 +1240,10 @@ fn start_builtin_ai_session_inner(
             crate::runtime::process::terminate_process_tree(&mut child);
             let _ = child.wait();
             return Err(builtin_ai_startup_error(
-                "HiMind AI 启动超时，请检查运行时状态",
+                &format!(
+                    "HiMind AI 启动超时（等待 {} 秒），请检查运行时状态",
+                    startup_budget.as_secs()
+                ),
                 &diagnostics,
                 &launch.api_key,
             ));
@@ -972,31 +1260,38 @@ fn start_builtin_ai_session_inner(
         options.clone(),
         crate::app::builtin_ai_gateway::RuntimeCapabilities::conservative(),
     );
-    let mut proxy = BuiltinAiProxy::start(&url, Some(observer)).map_err(|error| {
-        crate::runtime::process::terminate_process_tree(&mut child);
-        let _ = child.wait();
-        error
-    })?;
+    let origin_key = launch.home.to_string_lossy().to_string();
+    let mut proxy =
+        BuiltinAiProxy::start(&url, Some(observer), Some(&origin_key)).map_err(|error| {
+            crate::runtime::process::terminate_process_tree(&mut child);
+            let _ = child.wait();
+            error
+        })?;
     if let Err(error) = proxy.control().verify_browser_entry() {
         proxy.stop();
         crate::runtime::process::terminate_process_tree(&mut child);
         let _ = child.wait();
         return Err(format!("HiMind AI 页面认证失败：{error}"));
     }
-    if focus_workspace {
-        if let Err(error) = proxy.control().start_workspace_session(&launch.workspace) {
-            proxy.stop();
-            crate::runtime::process::terminate_process_tree(&mut child);
-            let _ = child.wait();
-            return Err(format!("无法进入扩展项目工作区：{error}"));
-        }
+    // The rail groups Sessions by Workspace and paints nothing for a closed
+    // group, so the entry registers its own directory and opens the recorded
+    // groups before the page's own scripts boot. Only an explicit project entry
+    // claims a Session row in its group; the default entry reuses whatever the
+    // rail already remembers. A refused Workspace is a degraded rail, not a
+    // reason to keep the user out of HiMind AI.
+    if let Err(error) =
+        proxy
+            .control()
+            .prepare_rail(&launch.home, &launch.workspace, focus_workspace)
+    {
+        append_builtin_ai_diagnostic(&diagnostics, &error);
     }
     let runtime_capabilities =
         crate::app::builtin_ai_gateway::probe_builtin_ai_capabilities(&proxy.control());
     event_sync.set_capabilities(runtime_capabilities);
-    // Connected mode owns the Dashboard-backed model catalog. Independent
-    // mode leaves provider and model selection entirely in native DSH config.
-    if options.mode().dashboard_enabled() {
+    // 只有真的拿到工作台凭据时才把目录推给 DSH：降级会话用的是本机 AI 服务，
+    // 把它的地址与模型写进工作台的 `himind-proxy` 路由会污染用户 settings.yaml。
+    if launch.service_source == "managed" {
         let _ = proxy.control().sync_model_catalog(
             &launch.default_model,
             &launch.base_url,
@@ -1018,26 +1313,27 @@ fn start_builtin_ai_session_inner(
             event_sync.capabilities_state(),
         )
     });
-    let session_url = proxy.url().to_string();
-    let workspace = launch.workspace.clone();
-    *builtin_ai_session()
-        .lock()
-        .map_err(|_| "HiMind AI 会话状态不可用")? = Some(BuiltinAiSession {
+    Ok(BuiltinAiSession {
         child,
-        workspace,
+        home: launch.home.clone(),
+        workspace: launch.workspace.clone(),
         focus_workspace,
+        notice,
         proxy,
         event_sync,
         model_sync,
         command_gateway,
-    });
-    Ok(session_url)
+    })
 }
 
 fn requested_builtin_ai_workspace(workspace: Option<&Path>) -> Result<PathBuf, String> {
     let workspace = match workspace {
         Some(path) => path.to_path_buf(),
-        None => std::env::current_dir().map_err(|error| error.to_string())?,
+        // 主入口没有指定目录时，先复用 DSH 上次使用的工作区，再退到进程当前目录，
+        // 避免每次都在启动器的 `logs` 目录里新开工作区、让历史会话看起来消失。
+        None => crate::runtime::builtin::recent_interactive_workspace()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "无法确定 HiMind AI 工作目录".to_string())?,
     };
     let workspace = workspace
         .canonicalize()
@@ -1084,18 +1380,73 @@ fn builtin_ai_startup_error(
     )
 }
 
+/// 关掉全部会话。用于退出应用、卸载/更新运行时、切换对接模式这类「会话基座
+/// 变了」的场景 —— 单个工作区的开关不要走这里，用 `stop_builtin_ai_session`。
 pub(crate) fn stop_builtin_ai_process() {
-    if let Ok(mut active) = builtin_ai_session().lock() {
-        if let Some(mut session) = active.take() {
-            if let Some(command_gateway) = session.command_gateway.as_mut() {
-                command_gateway.stop();
-            }
-            session.proxy.stop();
-            session.event_sync.stop();
-            crate::runtime::process::terminate_process_tree(&mut session.child);
-            let _ = session.child.wait();
+    stop_builtin_ai_sessions(None);
+}
+
+/// 关掉一个工作区的会话，其它工作区的会话继续跑。返回是否真的关掉了一个。
+pub(crate) fn stop_builtin_ai_session(workspace: &Path) -> bool {
+    stop_builtin_ai_sessions(Some(builtin_ai_session_key(workspace)))
+}
+
+fn stop_builtin_ai_sessions(key: Option<String>) -> bool {
+    let stopped: Vec<BuiltinAiSession> = {
+        let Ok(mut sessions) = builtin_ai_sessions().lock() else {
+            return false;
+        };
+        match key {
+            Some(key) => sessions.remove(&key).into_iter().collect(),
+            None => sessions.drain().map(|(_, session)| session).collect(),
         }
+    };
+    let stopped_any = !stopped.is_empty();
+    for mut session in stopped {
+        if let Some(command_gateway) = session.command_gateway.as_mut() {
+            command_gateway.stop();
+        }
+        session.proxy.stop();
+        session.event_sync.stop();
+        crate::runtime::process::terminate_process_tree(&mut session.child);
+        let _ = session.child.wait();
     }
+    stopped_any
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct BuiltinAiSessionSnapshot {
+    pub workspace_root: String,
+    pub url: String,
+    pub focus_workspace: bool,
+    pub notice: Option<String>,
+}
+
+/// 当前在跑的 HiMind AI 会话，按工作区各一条。界面用它恢复标签页。
+pub(crate) fn builtin_ai_session_snapshots() -> Vec<BuiltinAiSessionSnapshot> {
+    let Ok(sessions) = builtin_ai_sessions().lock() else {
+        return Vec::new();
+    };
+    let mut snapshots: Vec<BuiltinAiSessionSnapshot> = sessions
+        .values()
+        .map(|session| BuiltinAiSessionSnapshot {
+            workspace_root: crate::extension_workspace::display_path(&session.workspace),
+            url: session.proxy.url().to_string(),
+            focus_workspace: session.focus_workspace,
+            notice: session.notice.clone(),
+        })
+        .collect();
+    snapshots.sort_by(|left, right| left.workspace_root.cmp(&right.workspace_root));
+    snapshots
+}
+
+fn first_builtin_ai_session_url() -> Option<String> {
+    let sessions = builtin_ai_sessions().lock().ok()?;
+    sessions
+        .values()
+        .next()
+        .map(|session| session.proxy.url().to_string())
 }
 
 /// Reconcile the active DSH process with the current Dashboard AI service.
@@ -1104,41 +1455,63 @@ pub(crate) fn stop_builtin_ai_process() {
 pub(crate) fn sync_builtin_ai_models(
     options: &Options,
 ) -> Result<BuiltinAiModelSyncResult, String> {
-    let (result, workspace, focus_workspace) = {
-        let active = builtin_ai_session()
+    // 模型目录是全网关共享的：一次同步要把每个在跑的工作区会话都刷一遍，
+    // 否则后开的会话看不到新模型。
+    let plan: Vec<(String, PathBuf, bool)> = {
+        let sessions = builtin_ai_sessions()
             .lock()
             .map_err(|_| "HiMind AI 会话状态不可用")?;
-        let session = active
-            .as_ref()
-            .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?;
-        (
-            session
-                .model_sync
-                .sync_now(options, &session.proxy.control())?,
-            session.workspace.clone(),
-            session.focus_workspace,
-        )
+        if sessions.is_empty() {
+            return Err("HiMind AI 会话尚未启动".to_string());
+        }
+        sessions
+            .iter()
+            .map(|(key, session)| {
+                (
+                    key.clone(),
+                    session.workspace.clone(),
+                    session.focus_workspace,
+                )
+            })
+            .collect()
     };
-    if result.status == "restart_required" {
+    let mut model_count = 0usize;
+    let mut restart_required = false;
+    let mut updated = false;
+    {
+        let sessions = builtin_ai_sessions()
+            .lock()
+            .map_err(|_| "HiMind AI 会话状态不可用")?;
+        for (key, _, _) in &plan {
+            let Some(session) = sessions.get(key) else {
+                continue;
+            };
+            let result = session
+                .model_sync
+                .sync_now(options, &session.proxy.control())?;
+            model_count = model_count.max(result.model_count);
+            updated |= result.status == "updated";
+            restart_required |= result.status == "restart_required";
+        }
+    }
+    if restart_required {
         stop_builtin_ai_process();
-        let session_url =
+        for (_, workspace, focus_workspace) in &plan {
             start_builtin_ai_session(options, focus_workspace.then_some(workspace.as_path()))?;
+        }
         return Ok(BuiltinAiModelSyncResult {
             status: "restarted".to_string(),
-            model_count: result.model_count,
+            model_count,
             restarted: true,
-            session_url,
+            session_url: first_builtin_ai_session_url().unwrap_or_default(),
         });
     }
-    let session_url = builtin_ai_session()
-        .lock()
-        .map_err(|_| "HiMind AI 会话状态不可用")?
-        .as_ref()
-        .map(|session| session.proxy.url().to_string())
-        .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?;
     Ok(BuiltinAiModelSyncResult {
-        session_url,
-        ..result
+        status: if updated { "updated" } else { "unchanged" }.to_string(),
+        model_count,
+        restarted: false,
+        session_url: first_builtin_ai_session_url()
+            .ok_or_else(|| "HiMind AI 会话尚未启动".to_string())?,
     })
 }
 
@@ -1238,8 +1611,22 @@ mod internal_window_filter_tests {
 
 #[cfg(test)]
 mod builtin_ai_startup_tests {
-    use super::builtin_ai_startup_error;
+    use super::{builtin_ai_startup_budget, builtin_ai_startup_error};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// 并发越多，单条会话的启动预算越宽；同时必须有上限，不能无限等。
+    #[test]
+    fn startup_budget_grows_with_concurrency_and_stays_bounded() {
+        let idle = builtin_ai_startup_budget(0);
+        let two = builtin_ai_startup_budget(2);
+        let many = builtin_ai_startup_budget(12);
+
+        assert_eq!(idle, Duration::from_secs(45));
+        assert_eq!(two, Duration::from_secs(105));
+        assert!(many <= Duration::from_secs(180));
+        assert!(many > two && two > idle);
+    }
 
     #[test]
     fn startup_diagnostics_redact_the_runtime_api_key() {

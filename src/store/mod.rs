@@ -3,12 +3,15 @@ pub(crate) mod acp_sessions;
 pub(crate) mod ai_services;
 pub(crate) mod approval_outbox;
 pub(crate) mod atomic_file;
+pub(crate) mod backup_crypto;
 pub(crate) mod connector_credentials;
 pub(crate) mod connector_state;
 pub mod credentials;
+pub(crate) mod github_credentials;
 #[allow(dead_code)]
 pub(crate) mod local_runs;
 pub mod outbox;
 pub(crate) mod paths;
 pub mod plugin_outbox;
 pub mod types;
+pub(crate) mod workbenches;

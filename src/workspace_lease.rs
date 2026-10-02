@@ -204,8 +204,27 @@ pub(crate) fn validate_active(
     Ok(lease)
 }
 
+#[cfg(not(test))]
 fn lease_path() -> PathBuf {
     crate::store::paths::agent_home()
+        .join("data")
+        .join("workspace-leases.json")
+}
+
+/// Tests run in parallel inside one process, and `HIMIND_AGENT_HOME` is
+/// process-global: resolving the production path would let another test's
+/// temporary home move this file between `acquire` and the `validate_active`
+/// that follows it, which surfaces as "workspace lease was not found". Keep a
+/// stable per-process file under the temp directory instead — parallel tests
+/// share it deterministically, and access is already serialized by the file
+/// lock, so leases for different workspaces never collide.
+#[cfg(test)]
+fn lease_path() -> PathBuf {
+    std::env::temp_dir()
+        .join(format!(
+            "himind-agent-test-lease-home-{}",
+            std::process::id()
+        ))
         .join("data")
         .join("workspace-leases.json")
 }
@@ -270,5 +289,22 @@ mod tests {
                 .is_empty()
         );
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn lease_path_ignores_process_home_flips() {
+        let before = super::lease_path();
+        let _guard = crate::store::paths::test_env_lock();
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var(
+            "HIMIND_AGENT_HOME",
+            std::env::temp_dir().join("himind-lease-home-probe"),
+        );
+        let after = super::lease_path();
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        assert_eq!(before, after);
     }
 }

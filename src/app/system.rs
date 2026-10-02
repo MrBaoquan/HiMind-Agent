@@ -59,7 +59,7 @@ pub(crate) fn validate_update_download_url_for_source(
                 || download.password().is_some()
                 || download.port().is_some()
             {
-                return Err("独立模式更新包必须来自 GitHub Release".into());
+                return Err("未对接 AI 工作台时，更新包必须来自 GitHub Release".into());
             }
         }
         "dashboard" => {
@@ -124,6 +124,28 @@ pub(crate) fn signed_agent_updates_required() -> bool {
     env::var("HIMIND_REQUIRE_SIGNED_UPDATES")
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
         .unwrap_or_else(|_| !EMBEDDED_UPDATE_PUBLIC_KEY_PEM.trim().is_empty())
+}
+
+/// 扩展分发是否必须签名。判据与 Agent 更新一致：内嵌了生产公钥就默认要求签名，
+/// 否则（开发期、未内置密钥的构建）只做「有签名就校验」。
+/// 私有仓库自建分发可以显式设 `HIMIND_REQUIRE_SIGNED_EXTENSIONS=false` 关闭要求。
+pub(crate) fn signed_extension_releases_required() -> bool {
+    match env::var("HIMIND_REQUIRE_SIGNED_EXTENSIONS") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.eq_ignore_ascii_case("false") || value == "0" || value.is_empty())
+        }
+        Err(_) => !EMBEDDED_UPDATE_PUBLIC_KEY_PEM.trim().is_empty(),
+    }
+}
+
+/// 签名要求被拒绝时的统一提示：告诉调用方怎么补救，而不是只报「失败」。
+pub(crate) fn unsigned_extension_release_error(id: &str) -> String {
+    format!(
+        "{id} 的发布清单没有签名，当前分发策略要求签名制品。\
+         请在发布侧配置 HIMIND_EXTENSION_SIGNING_PRIVATE_KEY_PATH 与 HIMIND_EXTENSION_SIGNING_KEY_ID 后重新发布；\
+         自建分发可用 HIMIND_REQUIRE_SIGNED_EXTENSIONS=false 关闭签名要求。"
+    )
 }
 
 pub(crate) fn trusted_agent_update_key_ids() -> Vec<String> {
@@ -266,7 +288,7 @@ pub(crate) fn schedule_agent_replace_and_restart(
         "staged_updater": staged_updater,
         "staged_launcher": staged_launcher,
         "staged_vscode_extension": staged_vscode_extension,
-        "api_base": options.api_base,
+        "api_base": options.api_base(),
         "from_version": crate::VERSION,
         "target_version": target_version,
         "local_port": options.local_port,
@@ -286,13 +308,13 @@ pub(crate) fn schedule_agent_replace_and_restart(
 }
 
 fn agent_restart_arguments(options: &Options) -> Vec<String> {
-    let mut arguments = vec![
-        "--api".to_string(),
-        options.api_base.clone(),
+    let mut arguments = vec!["--api".to_string(), options.api_base().clone()];
+    arguments.extend(profile_arguments());
+    arguments.extend([
         "--local-app".to_string(),
         "--local-port".to_string(),
         options.local_port.to_string(),
-    ];
+    ]);
     if !options.state_path.as_os_str().is_empty() {
         arguments.push("--state".to_string());
         arguments.push(options.state_path.to_string_lossy().to_string());
@@ -302,6 +324,21 @@ fn agent_restart_arguments(options: &Options) -> Vec<String> {
     arguments.push("--protocol-url".to_string());
     arguments.push("himind-agent://open".to_string());
     arguments
+}
+
+/// `--profile <name>` for every Agent that is not the installed production one.
+///
+/// A restart, an auto-start entry and an updater relaunch all have to reproduce
+/// the profile the process was launched with. Without it, a development
+/// instance would come back as the installed Agent — that is, with the
+/// production data root — after an update.
+fn profile_arguments() -> Vec<String> {
+    let profile = crate::store::paths::profile_name();
+    if crate::store::paths::is_production_profile(&profile) {
+        Vec::new()
+    } else {
+        vec!["--profile".to_string(), profile]
+    }
 }
 
 pub(crate) fn local_agent_executable_metadata() -> Value {
@@ -439,6 +476,7 @@ fn build_auto_start_command(
         "--local-port".to_string(),
         local_port.to_string(),
     ];
+    parts.extend(profile_arguments());
     if !state_path.as_os_str().is_empty() {
         let absolute_state = if state_path.is_absolute() {
             state_path.to_path_buf()
@@ -1822,6 +1860,59 @@ mod tests {
     use rsa::RsaPrivateKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Repoint the Agent home and profile at a scratch directory for the
+    /// duration of a test.
+    ///
+    /// `Options::from_env()` reconciles the workbench store, and the store
+    /// materialises its active connection — which can delete identity files.
+    /// A test that let that run against the real data root would be a copy of
+    /// the accident this whole change exists to prevent.
+    struct PinnedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous_home: Option<std::ffi::OsString>,
+        previous_profile: Option<std::ffi::OsString>,
+        root: PathBuf,
+    }
+
+    impl PinnedHome {
+        fn new(label: &str, profile: &str) -> Self {
+            let lock = crate::store::paths::test_env_lock();
+            let root = std::env::temp_dir().join(format!(
+                "himind-system-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::create_dir_all(&root);
+            let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+            let previous_profile = std::env::var_os("HIMIND_AGENT_PROFILE");
+            std::env::set_var("HIMIND_AGENT_HOME", &root);
+            std::env::set_var("HIMIND_AGENT_PROFILE", profile);
+            Self {
+                _lock: lock,
+                previous_home,
+                previous_profile,
+                root,
+            }
+        }
+    }
+
+    impl Drop for PinnedHome {
+        fn drop(&mut self) {
+            match self.previous_home.take() {
+                Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+                None => std::env::remove_var("HIMIND_AGENT_HOME"),
+            }
+            match self.previous_profile.take() {
+                Some(value) => std::env::set_var("HIMIND_AGENT_PROFILE", value),
+                None => std::env::remove_var("HIMIND_AGENT_PROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn remote_cli_template_preserves_quoted_arguments() {
         assert_eq!(
@@ -2044,8 +2135,9 @@ mod tests {
 
     #[test]
     fn update_restart_reopens_the_agent_with_a_final_safe_protocol_url() {
+        let _home = PinnedHome::new("restart-production", "production");
         let mut options = crate::Options::from_env();
-        options.api_base = "https://himind.example".to_string();
+        options.set_api_base("https://himind.example");
         options.local_port = 18181;
         options.state_path = PathBuf::from(r"C:\HiMind\agent-state.json");
 
@@ -2061,6 +2153,36 @@ mod tests {
                 "18181",
                 "--state",
                 r"C:\HiMind\agent-state.json",
+                "--protocol-url",
+                "himind-agent://open",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_production_agent_restarts_into_the_same_profile() {
+        let _home = PinnedHome::new("restart-development", "development");
+        let mut options = crate::Options::from_env();
+        options.set_api_base("http://127.0.0.1:18083");
+        options.local_port = 18082;
+        options.state_path = PathBuf::from("/tmp/dev/agent-state.json");
+
+        let arguments = agent_restart_arguments(&options);
+
+        // Without this the relaunched process would fall back to the installed
+        // Agent's data root, which is the whole point of the profile split.
+        assert_eq!(
+            arguments,
+            vec![
+                "--api",
+                "http://127.0.0.1:18083",
+                "--profile",
+                "development",
+                "--local-app",
+                "--local-port",
+                "18082",
+                "--state",
+                "/tmp/dev/agent-state.json",
                 "--protocol-url",
                 "himind-agent://open",
             ]

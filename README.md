@@ -88,7 +88,7 @@ Agent 的 Dashboard 用户身份使用 OAuth 设备授权和轮换 refresh token
 cargo run -- --local-app
 ```
 
-本地开发端口是固定的：Dashboard/API 使用 `18083`，开发 Agent 使用 `18082`。Debug 构建默认按这套拓扑启动（`http://127.0.0.1:18083` + 端口 `18082`），所以直接 `cargo run` 不会撞上已安装的生产 Agent（`18181`）。需要覆盖时用 `--local-port`、`--api`，或 `HIMIND_AGENT_LOCAL_PORT` / `HIMIND_DEVELOPMENT_AGENT_PORT`、`DASHBOARD_API_BASE` / `HIMIND_DEVELOPMENT_AGENT_API_BASE`。
+本地服务端口按构建类型区分：Debug 默认 `18082`，Release 默认 `18181`，所以直接 `cargo run` 不会撞上已安装的生产 Agent。Agent 连接的 AI 工作台地址不再随构建类型变化（ADR 0008）：全新安装在 `data/workbenches.json` 里只播种 `http://localhost:8080` 一条连接，其余连接在「设置 → 账号 → HiMind 账号」里添加、登记和切换。需要指定进程启动时落在哪条连接，用 `--api http://host:port`——它按地址选中或新建一条连接，不改变其它连接的凭据。端口用 `--local-port` 或 `HIMIND_AGENT_LOCAL_PORT` / `HIMIND_DEVELOPMENT_AGENT_PORT` 覆盖，地址用 `DASHBOARD_API_BASE` / `HIMIND_DEVELOPMENT_AGENT_API_BASE` 覆盖。
 
 ## Worker 调试模式
 
@@ -96,7 +96,7 @@ cargo run -- --local-app
 cargo run -- --api http://127.0.0.1:18083
 ```
 
-开发态 Dashboard 由 `scripts/development/start.ps1` 起在 `18083`；只跑 Agent 时用 `scripts/development/start-agent.ps1`，它默认就是 `-Port 18082 -ApiBase http://127.0.0.1:18083`。
+本仓库只随代码分发构建与发布脚本（`scripts/build.ps1`、`scripts/package.ps1`、`scripts/publish-github-release.ps1` 等），没有开发态启动脚本。本地联调时自行起 Dashboard，再用上面的 `--api` 把 Agent 指过去即可。
 
 连接其它 Dashboard API：
 

@@ -170,15 +170,90 @@ fn cleanup_source_root(extracted: &Path) {
     }
 }
 
+/// GitHub API 根地址。与发布/安装使用同一套覆盖开关，便于指向企业版或本地验证端点。
+fn github_api_base() -> String {
+    std::env::var("HIMIND_GITHUB_API_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string())
+}
+
+/// 归档直链的站点根地址（公开仓库走这里，不带凭据）。
+fn github_archive_base() -> String {
+    std::env::var("HIMIND_GITHUB_ARCHIVE_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://github.com".to_string())
+}
+
+/// 归档下载失败时的可执行提示。私有仓库在未授权时同样返回 404，必须区分说明，
+/// 否则用户只会看到「仓库不存在」这种误导性结论。
+fn explain_archive_failure(
+    response: reqwest::blocking::Response,
+    repository: &str,
+) -> Result<reqwest::blocking::Response, Box<dyn Error>> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    Err(archive_failure_message(response.status(), repository).into())
+}
+
+/// 归档读取失败的文案映射。独立成纯函数，便于对每种状态逐一验证。
+fn archive_failure_message(status: reqwest::StatusCode, repository: &str) -> String {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return format!(
+            "读取 GitHub 仓库 {repository} 失败（404）：仓库不存在，或它是私有仓库而本机尚未授权。私有仓库请在设置 → 账号中授权 GitHub 账号后重试。"
+        );
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return format!(
+            "读取 GitHub 仓库 {repository} 失败（{}）：凭据无效或权限不足，请在设置 → 账号中重新授权。",
+            status.as_u16()
+        );
+    }
+    format!(
+        "读取 GitHub 仓库 {repository} 失败：GitHub 返回 HTTP {}",
+        status.as_u16()
+    )
+}
+
 fn download_source(repository: &str, reference: &str) -> Result<PathBuf, Box<dyn Error>> {
     let (owner, name) = parse_repository(repository)?;
     let reference = validate_reference(reference)?;
-    let url = format!("https://github.com/{owner}/{name}/archive/{reference}.zip");
+    // 私仓要带凭据读取：优先走 GitHub API 的归档接口（支持 Bearer），
+    // 公开仓库在未授权时继续用无凭据的 archive 直链，行为不变。
+    let token = crate::store::github_credentials::resolve_token()
+        .ok()
+        .flatten();
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .user_agent("HiMind-Agent")
         .build()?;
-    let mut response = client.get(url).send()?.error_for_status()?;
+    let mut response = match token.as_deref() {
+        Some(token) => {
+            let url = format!(
+                "{}/repos/{owner}/{name}/zipball/{reference}",
+                github_api_base()
+            );
+            let response = client
+                .get(url)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .bearer_auth(token)
+                .send()?;
+            explain_archive_failure(response, repository)?
+        }
+        None => {
+            let url = format!(
+                "{}/{owner}/{name}/archive/{reference}.zip",
+                github_archive_base()
+            );
+            let response = client.get(url).send()?;
+            explain_archive_failure(response, repository)?
+        }
+    };
     let root = std::env::temp_dir().join(format!(
         "himind-github-source-{}-{}",
         std::process::id(),
@@ -561,8 +636,8 @@ fn is_github_segment_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_relative_path, parse_repository, parse_source_url, validate_reference,
-        validate_subpath,
+        archive_failure_message, archive_relative_path, parse_repository, parse_source_url,
+        validate_reference, validate_subpath,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -646,5 +721,21 @@ mod tests {
         }
         assert!(archive_relative_path(&root, "skills/demo").is_err());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn archive_failures_explain_private_repository_authorization() {
+        // 私仓未授权时 GitHub 也返回 404，文案必须同时给出「不存在」与「未授权」两种可能。
+        let not_found =
+            archive_failure_message(reqwest::StatusCode::NOT_FOUND, "owner/private-repo");
+        assert!(not_found.contains("404"));
+        assert!(not_found.contains("私有仓库"));
+        assert!(not_found.contains("授权"));
+        let unauthorized = archive_failure_message(reqwest::StatusCode::FORBIDDEN, "owner/repo");
+        assert!(unauthorized.contains("403"));
+        assert!(unauthorized.contains("重新授权"));
+        let server_error =
+            archive_failure_message(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "owner/repo");
+        assert!(server_error.contains("500"));
     }
 }

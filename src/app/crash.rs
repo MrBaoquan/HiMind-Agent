@@ -50,6 +50,38 @@ pub(crate) fn record_event(level: &str, message: &str) {
     }
 }
 
+/// Block on a startup notice the user must see.
+///
+/// Release builds use the Windows GUI subsystem, so `stderr` goes nowhere: a
+/// refusal that only printed would look like "the Agent started and did
+/// nothing". Callers pass `interactive = false` for stdio MCP/ACP/CLI runs,
+/// where a modal box would deadlock the pipe instead of informing anyone.
+pub(crate) fn show_startup_notice(title: &str, message: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+        };
+        fn wide(value: &str) -> Vec<u16> {
+            value.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+        let title = wide(title);
+        let message = wide(message);
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (title, message);
+    }
+}
+
 fn format_clock(unix_seconds: u64) -> String {
     let seconds_of_day = unix_seconds % 86_400;
     format!(

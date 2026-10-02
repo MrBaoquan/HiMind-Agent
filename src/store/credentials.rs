@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use super::types::{StoredInnerAdminCredentials, StoredSvnConnection};
 
 const UNITY_EDITOR_WORKFLOW_ENV: &str = "unity_art_editor";
-const DPAPI_PREFIX: &str = "dpapi:v1:";
+/// DPAPI 保护值的落盘前缀。备份要识别并重新封装这些值，所以它是 crate 内可见的。
+pub(crate) const DPAPI_PREFIX: &str = "dpapi:v1:";
 
 pub(crate) fn protected_secret_is_current(value: &str) -> bool {
     value.starts_with(DPAPI_PREFIX)

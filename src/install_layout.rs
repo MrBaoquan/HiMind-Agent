@@ -48,6 +48,40 @@ pub(crate) fn updater_path(root: &Path) -> PathBuf {
     root.join(UPDATER_FILE)
 }
 
+/// True when `executable` sits in an installed layout.
+///
+/// Callers use this to tell "the Agent the user installed" apart from "a build
+/// we just ran", so every part of the test has to be true of an installation
+/// and false of a build tree:
+///
+/// 1. the executable itself lives under `<root>/versions/<version>/` or
+///    `<root>/current/`, never in a flat output folder such as
+///    `target/release/`;
+/// 2. the installation root carries the launcher and the updater; and
+/// 3. the root carries the `active-version` pointer the launcher and updater
+///    maintain — or, for a legacy layout, a `current/himind-agent.exe`.
+///
+/// The versioned-path test is what a build output cannot fake on its own: a
+/// release build copies `himind-agent-launcher.exe` and
+/// `himind-agent-updater.exe` next to `himind-agent.exe` in `target/release/`,
+/// so a test that only looked for those two files mistook a build for an
+/// installation and let a development process keep the production profile.
+///
+/// Anything missing means "not installed": the check stays deliberately
+/// tolerant, because a wrong "installed" answer would hand the installed
+/// Agent's data root to a foreign process.
+pub(crate) fn executable_is_installed(executable: &Path) -> bool {
+    if !is_installed_agent_executable(executable) {
+        return false;
+    }
+    let root = installation_root_from_executable(executable);
+    if !(launcher_path(&root).is_file() && updater_path(&root).is_file()) {
+        return false;
+    }
+    read_active_version(&root).ok().flatten().is_some()
+        || root.join("current").join(AGENT_FILE).is_file()
+}
+
 pub(crate) fn stable_launcher_for_executable(executable: &Path) -> PathBuf {
     if !is_installed_agent_executable(executable) {
         return executable.to_path_buf();
@@ -273,8 +307,9 @@ fn wide_path(path: &Path) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_agent_path, installation_root_from_executable, repair_pending_updater,
-        resolve_agent_path, resolve_mcp_path, stable_launcher_for_executable, write_active_version,
+        active_agent_path, executable_is_installed, installation_root_from_executable,
+        repair_pending_updater, resolve_agent_path, resolve_mcp_path,
+        stable_launcher_for_executable, write_active_version,
     };
     use std::fs;
     use std::path::Path;
@@ -397,6 +432,75 @@ mod tests {
         fs::write(launcher, b"launcher").unwrap();
 
         assert_eq!(stable_launcher_for_executable(&agent), agent);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn scratch_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "himind-layout-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn release_build_next_to_launcher_and_updater_is_not_an_installation() {
+        // `cargo build --release` drops all three executables into one flat
+        // folder. Seeing the launcher and updater there must not be read as an
+        // installation, or the build keeps the production profile.
+        let root = scratch_root("build-output");
+        let agent = root.join("target/release/himind-agent.exe");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"agent").unwrap();
+        fs::write(root.join("target/release/himind-agent-launcher.exe"), b"l").unwrap();
+        fs::write(root.join("target/release/himind-agent-updater.exe"), b"u").unwrap();
+
+        assert!(!executable_is_installed(&agent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn versioned_installation_with_active_pointer_is_an_installation() {
+        let root = scratch_root("installed-versioned");
+        let agent = root.join("versions/0.4.0/himind-agent.exe");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"agent").unwrap();
+        fs::write(root.join("himind-agent-launcher.exe"), b"l").unwrap();
+        fs::write(root.join("himind-agent-updater.exe"), b"u").unwrap();
+        write_active_version(&root, "0.4.0").unwrap();
+
+        assert!(executable_is_installed(&agent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_current_installation_without_pointer_is_an_installation() {
+        let root = scratch_root("installed-legacy");
+        let agent = root.join("current/himind-agent.exe");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"agent").unwrap();
+        fs::write(root.join("himind-agent-launcher.exe"), b"l").unwrap();
+        fs::write(root.join("himind-agent-updater.exe"), b"u").unwrap();
+
+        assert!(executable_is_installed(&agent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn versioned_folder_without_pointer_or_current_is_not_an_installation() {
+        // A half-copied layout (version folder plus launcher/updater but no
+        // active-version and no current) must not claim the production root.
+        let root = scratch_root("installed-incomplete");
+        let agent = root.join("versions/0.4.0/himind-agent.exe");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"agent").unwrap();
+        fs::write(root.join("himind-agent-launcher.exe"), b"l").unwrap();
+        fs::write(root.join("himind-agent-updater.exe"), b"u").unwrap();
+
+        assert!(!executable_is_installed(&agent));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -45,6 +45,12 @@ impl TaskCancelGuard {
         }
     }
 
+    /// 最近一次检查是否已经确认取消。轮询型运行时用它把「已取消」翻译成各自的
+    /// 终止语义，而不是靠错误文案反推。
+    pub fn canceled(&self) -> bool {
+        self.canceled
+    }
+
     pub fn check(
         &mut self,
         client: &Client,
@@ -62,7 +68,11 @@ impl TaskCancelGuard {
         }
         self.last_checked = Some(Instant::now());
         let response = match client
-            .get(format!("{}/api/tasks/{}/cancel", options.api_base, task_id))
+            .get(format!(
+                "{}/api/tasks/{}/cancel",
+                options.api_base(),
+                task_id
+            ))
             .header(
                 "Authorization",
                 agent_authorization(agent_id, &options.agent_credential()),
@@ -101,6 +111,11 @@ impl TaskCancelGuard {
 
 pub fn is_task_canceled_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains(TASK_CANCELED_ERROR)
+}
+
+/// 标准取消错误。运行时在终止自身流程后向上抛出它，远端据此把运行收敛为 canceled。
+pub fn task_canceled_error() -> Box<dyn Error> {
+    TASK_CANCELED_ERROR.into()
 }
 
 pub fn load_or_register(
@@ -282,18 +297,23 @@ fn load_agent_state_file(state_path: &Path) -> Result<AgentState, Box<dyn Error>
 }
 
 pub fn save_agent_state(state_path: &Path, state: &AgentState) -> Result<(), Box<dyn Error>> {
-    let _lock = atomic_file::lock(state_path)?;
-    let mut stored = state.clone();
-    stored.credential_protected = protect_secret_for_current_user(&state.credential)?;
-    stored.credential_pending_protected = if state.credential_pending.trim().is_empty() {
-        String::new()
-    } else {
-        protect_secret_for_current_user(&state.credential_pending)?
-    };
-    if stored.credential_updated_at == 0 {
-        stored.credential_updated_at = unix_now();
+    {
+        let _lock = atomic_file::lock(state_path)?;
+        let mut stored = state.clone();
+        stored.credential_protected = protect_secret_for_current_user(&state.credential)?;
+        stored.credential_pending_protected = if state.credential_pending.trim().is_empty() {
+            String::new()
+        } else {
+            protect_secret_for_current_user(&state.credential_pending)?
+        };
+        if stored.credential_updated_at == 0 {
+            stored.credential_updated_at = unix_now();
+        }
+        atomic_file::atomic_write(state_path, &serde_json::to_vec_pretty(&stored)?)?;
     }
-    atomic_file::atomic_write(state_path, &serde_json::to_vec_pretty(&stored)?)?;
+    // The write is done and unlocked; the per-connection identity record follows
+    // it (ADR 0008).
+    crate::store::workbenches::capture_active_quiet(state_path);
     Ok(())
 }
 
@@ -605,6 +625,85 @@ pub fn update_agent_run_status(
         .into());
     }
     Ok(())
+}
+
+// 代码备份归档交付：开发机打包完成后把归档交给 Dashboard 存储域。
+// 用 Agent 凭据（作业已派发给它），不需要用户会话——开发机上没有浏览器。
+pub fn upload_backup_run_archive(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    run_id: &str,
+    path: &Path,
+    sha256: &str,
+    entry_count: usize,
+    source_fingerprint: &str,
+    credential: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("backup archive file name is invalid")?;
+    let part = reqwest::blocking::multipart::Part::file(path)
+        .map_err(|_| "backup archive could not be opened")?
+        .file_name(file_name.to_string());
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("file_name", file_name.to_string())
+        .text("sha256", sha256.to_string())
+        .text("entry_count", entry_count.to_string())
+        .text("source_fingerprint", source_fingerprint.to_string())
+        .part("file", part);
+    let response = client
+        .post(format!(
+            "{}/api/agent/backups/runs/{}/archive",
+            api_base, run_id
+        ))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .multipart(form)
+        .send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "backup archive upload failed (HTTP {}): {}",
+            status.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(response.json::<Value>()?)
+}
+
+// 备份作业结果回填（失败/进度）。成功由归档落盘链路收口，不在这里声明。
+pub fn report_backup_run_result(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    run_id: &str,
+    status: &str,
+    last_error: &str,
+    credential: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let response = client
+        .post(format!(
+            "{}/api/agent/backups/runs/{}/result",
+            api_base, run_id
+        ))
+        .header("Authorization", agent_authorization(agent_id, credential))
+        .json(&json!({"status": status, "last_error": last_error}))
+        .send()?;
+    if !response.status().is_success() {
+        let status_code = response.status();
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "backup run result report failed (HTTP {}): {}",
+            status_code.as_u16(),
+            bounded_response_detail(&detail)
+        )
+        .into());
+    }
+    Ok(response.json::<Value>()?)
 }
 
 pub fn upload_agent_run_artifact(

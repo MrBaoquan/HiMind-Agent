@@ -711,7 +711,7 @@ fn request_with_scope_query_proof(
     if delegated.agent_id.trim() != state.agent_id.trim() {
         return Err("Dashboard 授权与当前 Agent 实例不匹配，请重新授权".into());
     }
-    let mut url = api_url(&options.api_base, path)?;
+    let mut url = api_url(&options.api_base(), path)?;
     if let Some(query) = query {
         url.query_pairs_mut().extend_pairs(query);
     }

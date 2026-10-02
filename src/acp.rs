@@ -20,6 +20,12 @@ const ACP_RUNTIME_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
 const ACP_SESSION_PROMPT_LIMIT: usize = 128 * 1024;
 const ACP_SESSION_PAGE_SIZE: usize = 50;
 
+/// ACP 入站侧的验收夹具：用固定答复替代真实运行时，只用于本地验收。
+/// 该后门必须在发布构建中失效，否则任何进程都能靠一个环境变量绕过真实推理。
+fn acp_fixture_enabled() -> bool {
+    cfg!(debug_assertions) && std::env::var("HIMIND_ACP_FIXTURE").as_deref() == Ok("1")
+}
+
 #[derive(Clone)]
 struct AcpTurn {
     user: String,
@@ -438,18 +444,17 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                             return;
                                         }
                                     };
-                                let provider =
-                                    if std::env::var("HIMIND_ACP_FIXTURE").as_deref() == Ok("1") {
-                                        "himind.fixture"
-                                    } else {
-                                        "himind.builtin"
-                                    };
+                                let provider = if acp_fixture_enabled() {
+                                    "himind.fixture"
+                                } else {
+                                    "himind.builtin"
+                                };
                                 run.runtime_provider = provider.to_string();
                                 if let Some(step) = run.steps.first_mut() {
                                     step.runtime_provider = provider.to_string();
                                 }
                                 let output =
-                                    if std::env::var("HIMIND_ACP_FIXTURE").as_deref() == Ok("1") {
+                                    if acp_fixture_enabled() {
                                         let delay_ms = std::env::var("HIMIND_ACP_FIXTURE_DELAY_MS")
                                             .ok()
                                             .and_then(|value| value.parse::<u64>().ok())

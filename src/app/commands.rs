@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::api::distribution::ExtensionDesiredState;
 use crate::api::types::AgentTaskHistoryItem;
@@ -37,7 +37,6 @@ pub(crate) struct AgentState {
     pub approval_manager: Arc<ApprovalManager>,
     pub capability_gateway: CapabilityGateway,
     pub port: u16,
-    pub dashboard_base: String,
     pub state_path: PathBuf,
     pub options: Options,
     pub dashboard_authorization: Arc<Mutex<crate::app::identity::DashboardAuthorizationFlow>>,
@@ -132,7 +131,7 @@ fn dashboard_agent_user_client(
         .trim()
         .to_string();
     if agent_id.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     let access = crate::api::oauth::platform_access_token(&state.options, required_scope)
         .map_err(|error| error.to_string())?;
@@ -170,10 +169,19 @@ pub(crate) async fn get_dashboard_identity_status(
     let manager = Arc::clone(&state.approval_manager);
     tauri::async_runtime::spawn_blocking(move || {
         let status = crate::app::identity::identity_status(&options);
-        if !status.user_id.trim().is_empty() && !status.agent_id.trim().is_empty() {
-            manager.bind_identity(&status.user_id, &status.agent_id)?;
-        } else {
-            manager.clear_identity()?;
+        match status.state.as_str() {
+            // 读取本地授权文件失败（破损、被占用、正在被其它进程重写）不等于账号
+            // 被撤销。以前这里会顺手 clear_identity()，于是瞬时的读失败会把本地
+            // 授权姿态整块抹掉，用户被迫重新授权——一次读不到文件就清绑定是本末
+            // 倒置。这里保留既有绑定，由 UI 提示「本地授权异常」并引导重新授权。
+            "invalid_local_authorization" => {}
+            _ if !status.user_id.trim().is_empty() && !status.agent_id.trim().is_empty() => {
+                manager.bind_identity(&status.user_id, &status.agent_id)?;
+            }
+            _ => {
+                // 只有工作台明确回答了「没有授权」时才清理本地绑定。
+                manager.clear_identity()?;
+            }
         }
         Ok(status)
     })
@@ -190,7 +198,7 @@ pub(crate) fn get_builtin_ai_activity(
     let response = client
         .get(format!(
             "{}/api/integrations/ai/runtime/sessions/activity",
-            state.dashboard_base.trim_end_matches('/')
+            state.options.api_base().trim_end_matches('/')
         ))
         .bearer_auth(token)
         .header("X-HiMind-Agent-ID", agent_id)
@@ -207,12 +215,36 @@ pub(crate) fn get_builtin_ai_activity(
 pub(crate) fn start_dashboard_authorization(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
-    require_dashboard(&state)?;
+    ensure_dashboard_mode_for_authorization(&state)?;
     crate::app::identity::start_authorization(
         state.options.clone(),
         Arc::clone(&state.dashboard_authorization),
         Arc::clone(&state.approval_manager),
     )
+}
+
+/// 授权即对接：账号授权是用户侧唯一的开关。
+///
+/// 独立模式下点「授权」先切回对接状态再发起设备授权；否则用户「取消授权」后
+/// 就一直停在独立模式，授权按钮每次都按 `control_plane_required` 失败，形成死路。
+fn ensure_dashboard_mode_for_authorization(state: &AgentState) -> Result<(), String> {
+    if state.options.mode().dashboard_enabled() {
+        return Ok(());
+    }
+    crate::app::runtime_mode::save(
+        &state.state_path,
+        crate::app::runtime_mode::AgentMode::Connected,
+    )
+    .map_err(|error| error.to_string())?;
+    state
+        .options
+        .set_mode(crate::app::runtime_mode::AgentMode::Connected);
+    // 独立模式下启动的会话沿用本机配置，切换对接状态后收掉，避免它继续用旧身份。
+    crate::app::ui::stop_builtin_ai_process();
+    state
+        .approval_manager
+        .add_log("info", "已开启 AI 工作台对接");
+    Ok(())
 }
 
 #[tauri::command]
@@ -260,6 +292,18 @@ pub(crate) async fn revoke_dashboard_authorization(
         .approval_manager
         .add_log("info", "已退出 Dashboard 账号授权");
     state.approval_manager.clear_identity()?;
+    // 取消授权即终止对接：授权是唯一的用户侧控制，取消后立即停止任务接收
+    // 与运行记录同步，重启后也不会自动恢复。
+    let _ = crate::app::runtime_mode::save(
+        &state.state_path,
+        crate::app::runtime_mode::AgentMode::Independent,
+    );
+    state
+        .options
+        .set_mode(crate::app::runtime_mode::AgentMode::Independent);
+    state
+        .approval_manager
+        .add_log("info", "已取消 AI 工作台授权，停止对接");
     Ok(())
 }
 
@@ -283,10 +327,18 @@ pub(crate) fn get_mcp_registry_snapshot(
 }
 
 #[tauri::command]
-pub(crate) fn get_mcp_targets(
+pub(crate) async fn get_mcp_targets(
     state: State<'_, AgentState>,
 ) -> Result<Vec<crate::app::mcp_targets::McpTargetDescriptor>, String> {
-    crate::app::mcp_targets::list(&state.options).map_err(|error| error.to_string())
+    // 探测本机 AI 客户端要遍历安装目录与配置文件，秒级耗时。同步命令会在
+    // WebView2 主线程上跑，期间整条 IPC 队列都会堵住，所以这里必须下沉到
+    // 阻塞线程池。
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::mcp_targets::list(&options).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -427,7 +479,7 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
             "worker_reason_code": worker["dashboard_worker_reason_code"],
         },
         "local_port": state.port,
-        "dashboard_base": state.dashboard_base,
+        "dashboard_base": state.options.api_base(),
         "executable_name": executable["name"],
         "executable_path": executable["path"],
         "login_status": login["status"],
@@ -479,23 +531,30 @@ pub(crate) fn set_agent_mode(
 ) -> Result<AgentModeSettings, String> {
     let previous = state.options.mode();
     let mode = crate::app::runtime_mode::AgentMode::parse(&mode)
-        .ok_or_else(|| "运行模式只能是 connected 或 independent".to_string())?;
+        .ok_or_else(|| "AI 工作台开关只能是 connected 或 independent".to_string())?;
     crate::app::runtime_mode::save(&state.state_path, mode).map_err(|error| error.to_string())?;
+    // 立即作用于运行时：Worker、投影与能力可见性都读同一个共享状态，
+    // 因此不需要重启 Agent。
+    state.options.set_mode(mode);
     if previous != mode {
-        // Do not leave a session started under the previous control-plane
-        // policy running while the user is switching modes.
+        // 切换对接状态时收掉按旧策略启动的会话，避免它继续沿用旧的身份。
         crate::app::ui::stop_builtin_ai_process();
     }
     state.approval_manager.add_log(
         "info",
-        &format!("Agent 运行模式已设置为 {}，重启后生效", mode.as_str()),
+        if mode.dashboard_enabled() {
+            "已开启 AI 工作台对接"
+        } else {
+            "已关闭 AI 工作台对接，Agent 继续在本机运行"
+        },
     );
     Ok(AgentModeSettings {
         mode: mode.as_str().to_string(),
-        effective_mode: previous.as_str().to_string(),
+        effective_mode: mode.as_str().to_string(),
         pending_mode: mode.as_str().to_string(),
         dashboard_enabled: mode.dashboard_enabled(),
-        requires_restart: previous != mode,
+        // 开关直接作用于运行时，不再存在“重启后生效”。
+        requires_restart: false,
     })
 }
 
@@ -673,7 +732,7 @@ fn approval_settings_snapshot(state: &AgentState) -> Result<serde_json::Value, S
             0
         };
     let auto_start =
-        is_agent_auto_start_enabled(&state.dashboard_base, state.port, &state.state_path)
+        is_agent_auto_start_enabled(&state.options.api_base(), state.port, &state.state_path)
             .unwrap_or(false);
     Ok(json!({
         "rules": settings.rules,
@@ -1169,21 +1228,20 @@ pub(crate) fn logout_local_login(
 
 #[tauri::command]
 pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), String> {
-    open_url(&state.dashboard_base).map_err(|e| e.to_string())
+    open_url(&state.options.api_base()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub(crate) async fn start_builtin_ai_session(
     state: State<'_, AgentState>,
     project_id: Option<String>,
-    extension_workspace: Option<bool>,
+    workspace_root: Option<String>,
 ) -> Result<String, String> {
     if !crate::runtime::builtin::status().compatible {
         return Err("HiMind AI 运行时尚未安装，请先安装 HiMind AI 运行时".to_string());
     }
-    let extension_workspace = extension_workspace.unwrap_or(false);
-    if extension_workspace && project_id.is_some() {
-        return Err("不能同时指定扩展项目和扩展聚合仓库".to_string());
+    if project_id.is_some() && workspace_root.is_some() {
+        return Err("不能同时指定扩展项目和扩展工作区目录".to_string());
     }
     let project = project_id
         .as_deref()
@@ -1196,28 +1254,23 @@ pub(crate) async fn start_builtin_ai_session(
     {
         return Err("扩展项目目录当前不可用".to_string());
     }
-    let workspace = if extension_workspace {
-        let settings = crate::extension_workspace::settings();
-        if !settings.valid {
-            let message = if settings.error.trim().is_empty() {
-                "扩展聚合仓库当前不可用，请先在扩展页面选择有效目录。".to_string()
-            } else {
-                settings.error
-            };
-            return Err(message);
-        }
-        Some(PathBuf::from(settings.root))
+    // 工作区按目录寻址：调用方说得出目录就用它，不再读「当前工作区」这个全局
+    // 单值 —— 那正是并发场景下 A 会话把 B 会话的目录传下去的原因。
+    let requested_root = workspace_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let workspace = if let Some(root) = requested_root {
+        Some(crate::extension_workspace::validate_authoring_root(root)?)
     } else {
         project
             .as_ref()
             .map(|item| PathBuf::from(&item.workspace_path))
     };
-    let project_name = project
-        .as_ref()
-        .map(|item| item.name.clone())
-        .or_else(|| extension_workspace.then(|| "扩展聚合仓库".to_string()));
+    let project_name = project.as_ref().map(|item| item.name.clone());
     let options = state.options.clone();
     let logs = Arc::clone(&state.approval_manager);
+    let log_workspace = workspace.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         crate::app::ui::start_builtin_ai_session(&options, workspace.as_deref())
     })
@@ -1229,8 +1282,20 @@ pub(crate) async fn start_builtin_ai_session(
                 "info",
                 &project_name
                     .map(|name| format!("HiMind AI 已进入扩展项目: {name}"))
-                    .unwrap_or_else(|| "HiMind AI 会话已启动".to_string()),
+                    .unwrap_or_else(|| match log_workspace.as_deref() {
+                        Some(root) => format!(
+                            "HiMind AI 已进入扩展工作区: {}",
+                            crate::extension_workspace::display_path(root)
+                        ),
+                        None => "HiMind AI 会话已启动".to_string(),
+                    }),
             );
+            if let Some(notice) = log_workspace
+                .as_deref()
+                .and_then(|root| crate::app::ui::current_builtin_ai_notice(Some(root)))
+            {
+                logs.add_log("warn", &notice);
+            }
             Ok(session_url)
         }
         Err(error) => {
@@ -1241,12 +1306,35 @@ pub(crate) async fn start_builtin_ai_session(
 }
 
 #[tauri::command]
+pub(crate) fn get_builtin_ai_session_notice(workspace_root: Option<String>) -> Option<String> {
+    let requested = workspace_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    crate::app::ui::current_builtin_ai_notice(requested.as_deref())
+}
+
+/// 当前在跑的 HiMind AI 会话（按工作区各一条），界面用来恢复标签页。
+#[tauri::command]
+pub(crate) fn list_builtin_ai_sessions() -> Vec<crate::app::ui::BuiltinAiSessionSnapshot> {
+    crate::app::ui::builtin_ai_session_snapshots()
+}
+
+/// 关闭一个工作区的会话，其它工作区的会话继续跑。
+#[tauri::command]
+pub(crate) fn stop_builtin_ai_session(workspace_root: String) -> Result<bool, String> {
+    let root = crate::extension_workspace::validate_authoring_root(&workspace_root)?;
+    Ok(crate::app::ui::stop_builtin_ai_session(&root))
+}
+
+#[tauri::command]
 pub(crate) async fn open_builtin_ai_web(
     state: State<'_, AgentState>,
     project_id: Option<String>,
-    extension_workspace: Option<bool>,
+    workspace_root: Option<String>,
 ) -> Result<String, String> {
-    let session_url = start_builtin_ai_session(state, project_id, extension_workspace).await?;
+    let session_url = start_builtin_ai_session(state, project_id, workspace_root).await?;
     open_url(&session_url).map_err(|error| error.to_string())?;
     Ok(session_url)
 }
@@ -1335,6 +1423,43 @@ pub(crate) fn validate_builtin_ai_mcp_server(
 }
 
 #[tauri::command]
+pub(crate) fn get_mcp_runtime_requirements() -> serde_json::Value {
+    crate::app::mcp_probe::probe_requirements()
+}
+
+#[tauri::command]
+pub(crate) fn get_mcp_catalog(
+    state: State<'_, AgentState>,
+) -> crate::app::mcp_catalog::CatalogView {
+    crate::app::mcp_catalog::view(&state.state_path)
+}
+
+#[tauri::command]
+pub(crate) async fn refresh_mcp_catalog(
+    state: State<'_, AgentState>,
+) -> Result<crate::app::mcp_catalog::CatalogView, String> {
+    // 刷新要联网，必须离开主线程，否则窗口会卡住。
+    let state_path = state.state_path.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::app::mcp_catalog::refresh(&state_path))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn install_mcp_catalog_entry(
+    state: State<'_, AgentState>,
+    request: crate::app::mcp_catalog::InstallRequest,
+) -> Result<crate::app::mcp_registry::McpServerConfig, String> {
+    let config = crate::app::mcp_catalog::install(&state.state_path, &request)?;
+    crate::app::ui::stop_builtin_ai_process();
+    state.approval_manager.add_log(
+        "info",
+        &format!("已从目录安装 HiMind AI MCP 服务: {}", config.server_name),
+    );
+    Ok(config)
+}
+
+#[tauri::command]
 pub(crate) fn reload_builtin_ai_tool_context(state: State<'_, AgentState>) {
     crate::app::ui::stop_builtin_ai_process();
     state
@@ -1361,7 +1486,7 @@ fn present_builtin_ai_start_error(error: &str) -> String {
         || normalized.contains("没有可用的 ai 服务")
         || normalized.contains("没有可用渠道")
     {
-        return "当前账号暂未分配可用 AI 服务".to_string();
+        return "当前账号暂未分配可用模型服务".to_string();
     }
     if normalized.contains("尚未安装") || normalized.contains("组件状态") {
         return "HiMind AI 运行时需要修复，请在设置中处理".to_string();
@@ -1404,6 +1529,49 @@ pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub(crate) async fn open_settings_window(
+    app: AppHandle,
+    panel: Option<String>,
+    section: Option<String>,
+    tab: Option<String>,
+    ai_tab: Option<String>,
+) -> Result<(), String> {
+    crate::app::ui::open_settings_window(
+        &app,
+        panel.as_deref(),
+        section.as_deref(),
+        tab.as_deref(),
+        ai_tab.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub(crate) fn window_start_dragging(window: WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn window_minimize(window: WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn window_toggle_maximize(window: WebviewWindow) -> Result<(), String> {
+    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    if maximized {
+        window.unmaximize().map_err(|error| error.to_string())
+    } else {
+        window.maximize().map_err(|error| error.to_string())
+    }
+}
+
+#[tauri::command]
+pub(crate) fn window_close(window: WebviewWindow) -> Result<(), String> {
+    // 关闭窗口保留 Agent 常驻托盘，与原生关闭行为一致。
+    window.hide().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn quit_agent(app: AppHandle) -> Result<(), String> {
     crate::app::ui::stop_builtin_ai_process();
     app.exit(0);
@@ -1417,7 +1585,7 @@ pub(crate) fn set_auto_start(
 ) -> Result<serde_json::Value, String> {
     let auto_start = set_agent_auto_start(
         enabled,
-        &state.dashboard_base,
+        &state.options.api_base(),
         state.port,
         &state.state_path,
     )
@@ -1508,6 +1676,102 @@ fn diagnostics_unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[tauri::command]
+pub(crate) fn get_agent_backup_scope() -> Result<serde_json::Value, String> {
+    Ok(json!({
+        "entries": crate::app::backup::scope_entries(),
+        "minPassphraseChars": crate::app::backup::min_passphrase_chars(),
+        "format": crate::app::backup::FORMAT_ID,
+        "formatVersion": crate::app::backup::FORMAT_VERSION,
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn export_agent_backup(
+    state: State<'_, AgentState>,
+    passphrase: Option<String>,
+    include_device_identity: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let file_name = format!("himind-agent-backup-{stamp}.zip");
+    let Some(destination) = rfd::FileDialog::new()
+        .set_title("导出 HiMind Agent 备份包")
+        .set_file_name(&file_name)
+        .add_filter("HiMind Agent 备份包", &["zip"])
+        .save_file()
+    else {
+        return Ok(json!({ "canceled": true }));
+    };
+
+    let passphrase = passphrase.filter(|value| !value.trim().is_empty());
+    let request = crate::app::backup::ExportRequest {
+        destination,
+        passphrase,
+        include_device_identity: include_device_identity.unwrap_or(false),
+    };
+    let report = crate::app::backup::export(&request).map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "已导出 Agent 备份包（{} 个文件，{} 项凭据）",
+            report.file_count, report.credentials
+        ),
+    );
+    Ok(json!({ "canceled": false, "report": report }))
+}
+
+#[tauri::command]
+pub(crate) fn inspect_agent_backup(path: Option<String>) -> Result<serde_json::Value, String> {
+    let path = match path.filter(|value| !value.trim().is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let Some(picked) = rfd::FileDialog::new()
+                .set_title("选择 HiMind Agent 备份包")
+                .add_filter("HiMind Agent 备份包", &["zip"])
+                .pick_file()
+            else {
+                return Ok(json!({ "canceled": true }));
+            };
+            picked
+        }
+    };
+    let report = crate::app::backup::inspect(&path).map_err(|error| error.to_string())?;
+    Ok(json!({ "canceled": false, "report": report }))
+}
+
+#[tauri::command]
+pub(crate) fn import_agent_backup(
+    state: State<'_, AgentState>,
+    path: Option<String>,
+    passphrase: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let path = match path.filter(|value| !value.trim().is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let Some(picked) = rfd::FileDialog::new()
+                .set_title("选择要恢复的 HiMind Agent 备份包")
+                .add_filter("HiMind Agent 备份包", &["zip"])
+                .pick_file()
+            else {
+                return Ok(json!({ "canceled": true }));
+            };
+            picked
+        }
+    };
+    let passphrase = passphrase.filter(|value| !value.trim().is_empty());
+    let report = crate::app::backup::restore(&path, passphrase.as_deref())
+        .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "warn",
+        &format!(
+            "已从备份包恢复 {} 个文件，恢复前快照：{}",
+            report.restored.len(),
+            report.snapshot
+        ),
+    );
+    Ok(json!({ "canceled": false, "report": report }))
 }
 
 #[tauri::command]
@@ -1712,9 +1976,72 @@ pub(crate) async fn install_extension_unit(
 }
 
 #[tauri::command]
-pub(crate) fn get_extension_provenance(
+pub(crate) async fn get_extension_provenance(
 ) -> Result<Vec<crate::app::extension_source::ExtensionProvenance>, String> {
-    crate::app::extension_source::list_provenance().map_err(|error| error.to_string())
+    // 读本机扩展台账要遍历来源目录，放到阻塞线程池，别占着 WebView 的
+    // 主线程把同一时刻的其它请求一起堵住。
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::app::extension_source::list_provenance().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 列出可更新的扩展并给出批量更新分组。分组依赖本机安装台账，
+/// 放在后端算，避免前端再实现一份来源核对逻辑而与安装层不一致。
+#[tauri::command]
+pub(crate) async fn plan_extension_updates(
+) -> Result<Vec<crate::app::extension_source::ExtensionUpdateCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::app::extension_source::plan_extension_updates().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 一键批量更新。逐项独立成败，并把每一项的进度推给窗口，
+/// 让「正在更新第 N/M 项」在长任务里可见。
+#[tauri::command]
+pub(crate) async fn apply_extension_updates(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    targets: Vec<crate::app::extension_source::ExtensionUpdateTarget>,
+) -> Result<crate::app::extension_source::ExtensionBatchUpdateReport, String> {
+    crate::app::extension_source::reset_extension_update_cancel();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        crate::app::extension_source::apply_extension_updates(
+            &targets,
+            crate::app::extension_source::extension_update_cancel_flag(),
+            |progress| {
+                let _ = app.emit("himind:extension-update-progress", progress);
+            },
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    // 技能更新后必须重新投射到本机 AI 客户端（全局目录 / 已投放的项目目录），
+    // 否则本机客户端读到的还是旧版本。
+    let capability_facts = skill_capability_facts(&state)?;
+    for outcome in &report.outcomes {
+        if outcome.asset_kind != "skill" || outcome.status != "updated" {
+            continue;
+        }
+        if let Ok(Some(record)) =
+            crate::skill::store::SkillStore::new().get_record(&outcome.asset_id)
+        {
+            let _ =
+                crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts);
+        }
+    }
+    let _ = crate::app::extension_source::reconcile_dsh_presets_now();
+    Ok(report)
+}
+
+/// 批量更新只取消「还没开始安装」的项，不打断正在写入的单个扩展。
+#[tauri::command]
+pub(crate) fn cancel_extension_updates() {
+    crate::app::extension_source::cancel_extension_updates();
 }
 
 #[tauri::command]
@@ -1779,7 +2106,7 @@ pub(crate) async fn get_extension_desired_state(
             .to_string();
         let credential = state.options.agent_credential();
         if agent_id.is_empty() || credential.trim().is_empty() {
-            return Err("Agent 尚未完成 Dashboard 配对".to_string());
+            return Err("HiMind 账号尚未授权".to_string());
         }
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1787,7 +2114,7 @@ pub(crate) async fn get_extension_desired_state(
             .map_err(|error| error.to_string())?;
         crate::api::distribution::extension_desired_state(
             &client,
-            &state.dashboard_base,
+            &state.options.api_base(),
             &agent_id,
             &credential,
         )
@@ -1813,7 +2140,7 @@ pub(crate) async fn get_agent_task_history(
             .to_string();
         let credential = state.options.agent_credential();
         if agent_id.is_empty() || credential.trim().is_empty() {
-            return Err("Agent 尚未完成 Dashboard 配对".to_string());
+            return Err("HiMind 账号尚未授权".to_string());
         }
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1821,12 +2148,25 @@ pub(crate) async fn get_agent_task_history(
             .map_err(|error| error.to_string())?;
         crate::api::client::list_task_history(
             &client,
-            &state.dashboard_base,
+            &state.options.api_base(),
             &agent_id,
             &credential,
             limit.unwrap_or(50).clamp(1, 100),
         )
         .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 本机活动列表：工作流运行与技能运行统一成一份只读视图。
+/// 工作台下发任务仍走工作台历史接口，两种模式都能读到本机这部分。
+#[tauri::command]
+pub(crate) async fn list_local_activity(
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::local_activity::list(limit).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1873,11 +2213,27 @@ pub(crate) async fn list_ai_services(
 }
 
 #[tauri::command]
+pub(crate) async fn list_ai_service_templates(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        serde_json::to_value(crate::app::ai_service_templates::list(&options))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub(crate) async fn list_acp_runtime_profiles() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         Ok(json!({
             "profiles": crate::store::acp_profiles::list().map_err(|error| error.to_string())?,
             "providers": crate::runtime::probe_installations(),
+            // 桌面端要先知道 npx / node / opencode 在不在，才能把「一键接入」
+            // 做成一步，而不是让用户接入完再自己排查为什么不可用。
+            "executables": crate::runtime::probe_acp_executables(),
         }))
     })
     .await
@@ -1897,6 +2253,23 @@ pub(crate) async fn get_projection_sync_status(
     .map_err(|error| error.to_string())?
 }
 
+/// 手工重投同步失败记录。`reason` 为空表示全部死信，否则只重投命中的错误片段。
+#[tauri::command]
+pub(crate) async fn requeue_projection_dead_letters(
+    reason: Option<String>,
+) -> Result<crate::agent_core_projection::ProjectionRequeueReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let fragment = reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        crate::agent_core_projection::requeue_dead_letter_projections(fragment)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub(crate) fn save_acp_runtime_profile(
     state: State<'_, AgentState>,
@@ -1908,12 +2281,25 @@ pub(crate) fn save_acp_runtime_profile(
     permission_policy: String,
     enabled: bool,
 ) -> Result<serde_json::Value, String> {
+    // 桌面端表单当前不编辑环境变量，保存时保留既有配置，避免 UI 一次编辑把
+    // 通过 CLI / 分发写入的 env 抹掉。
+    let environment = crate::store::acp_profiles::list()
+        .ok()
+        .and_then(|profiles| {
+            let target = crate::store::acp_profiles::normalize_provider_id(&provider_id);
+            profiles
+                .into_iter()
+                .find(|profile| profile.provider_id == target)
+                .map(|profile| profile.env)
+        })
+        .unwrap_or_default();
     let profile =
         crate::store::acp_profiles::upsert(crate::store::acp_profiles::AcpRuntimeProfileRecord {
             provider_id,
             display_name,
             executable,
             args,
+            env: environment,
             version,
             permission_policy,
             enabled,
@@ -1978,11 +2364,7 @@ pub(crate) fn save_ai_service(
     models: Vec<String>,
     api_key: String,
 ) -> Result<serde_json::Value, String> {
-    let protocol = match protocol.as_str() {
-        "openai-chat" => crate::store::ai_services::AIServiceProtocol::OpenaiChat,
-        "openai-responses" => crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
-        _ => return Err("protocol 只支持 openai-chat 或 openai-responses".to_string()),
-    };
+    let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
     let service =
         crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
             id,
@@ -2033,7 +2415,7 @@ pub(crate) fn set_active_ai_service(
         state.approval_manager.add_log(
             "info",
             &format!(
-                "已将本机 AI 服务设为 HiMind AI 默认服务: {}",
+                "已将本机模型服务设为 HiMind AI 默认服务: {}",
                 service.display_name
             ),
         );
@@ -2051,9 +2433,15 @@ pub(crate) fn set_active_ai_service(
 pub(crate) fn fetch_ai_service_models(
     base_url: String,
     api_key: String,
+    protocol: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let models =
-        crate::store::ai_services::fetch_models(&base_url, &api_key).map_err(|e| e.to_string())?;
+    let protocol = match protocol.as_deref() {
+        Some(value) => crate::store::ai_services::AIServiceProtocol::parse(value)?,
+        // 历史调用方不带 protocol，保持既有 OpenAI Responses 行为。
+        None => crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+    };
+    let models = crate::store::ai_services::fetch_models(&base_url, &api_key, protocol)
+        .map_err(|e| e.to_string())?;
     Ok(json!({ "models": models }))
 }
 
@@ -2062,9 +2450,10 @@ pub(crate) fn fetch_saved_ai_service_models(
     id: String,
     base_url: String,
 ) -> Result<serde_json::Value, String> {
-    let (_, api_key) = crate::store::ai_services::load_secret(&id).map_err(|e| e.to_string())?;
-    let models =
-        crate::store::ai_services::fetch_models(&base_url, &api_key).map_err(|e| e.to_string())?;
+    let (service, api_key) =
+        crate::store::ai_services::load_secret(&id).map_err(|e| e.to_string())?;
+    let models = crate::store::ai_services::fetch_models(&base_url, &api_key, service.protocol)
+        .map_err(|e| e.to_string())?;
     Ok(json!({ "models": models }))
 }
 
@@ -2073,11 +2462,13 @@ pub(crate) fn import_ai_client(
     state: State<'_, AgentState>,
     target: String,
     service: Option<String>,
+    replace: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let gateway = state.capability_gateway.clone();
     let request = serde_json::json!({
         "target": target,
         "service": service.unwrap_or_else(|| "managed".to_string()),
+        "replace": replace.unwrap_or(false),
     });
     let result = gateway
         .invoke(&InvocationContext::tauri(), "ai.client.import", request)
@@ -2110,8 +2501,15 @@ pub(crate) fn remove_ai_client(
 fn skill_capability_facts(
     state: &AgentState,
 ) -> Result<Vec<crate::skill::resolver::CapabilityFact>, String> {
-    state
-        .capability_gateway
+    capability_facts_for(&state.capability_gateway)
+}
+
+/// 与 [`skill_capability_facts`] 同源，只依赖网关句柄，方便在
+/// `spawn_blocking` 里跑重活。
+fn capability_facts_for(
+    gateway: &CapabilityGateway,
+) -> Result<Vec<crate::skill::resolver::CapabilityFact>, String> {
+    gateway
         .list_capabilities(&InvocationContext::tauri())
         .map(|items| {
             items
@@ -2290,9 +2688,15 @@ pub(crate) fn list_skill_drafts() -> Result<Vec<crate::skill::authoring::Authori
 }
 
 #[tauri::command]
-pub(crate) fn list_extension_projects(
+pub(crate) async fn list_extension_projects(
 ) -> Result<Vec<crate::extension_projects::ExtensionProject>, String> {
-    crate::extension_projects::list().map_err(|error| error.to_string())
+    // 开发项目列表要扫描各工作区目录，同样下沉到阻塞线程池，
+    // 免得占用 WebView 主线程。
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::extension_projects::list().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2306,6 +2710,82 @@ pub(crate) fn set_extension_workspace(
 ) -> Result<crate::extension_workspace::ExtensionWorkspaceSettings, String> {
     crate::extension_workspace::select(std::path::Path::new(root.trim()))
         .map_err(|error| error.to_string())
+}
+
+/// 界面里维护的开发目录清单。列表本身是权威数据，目录不可用时也要返回，
+/// 否则用户没法把失效登记移除。
+#[tauri::command]
+pub(crate) fn list_extension_workspaces() -> Vec<crate::extension_workspace::ExtensionWorkspaceEntry>
+{
+    crate::extension_workspace::workspace_entries()
+}
+
+#[tauri::command]
+pub(crate) fn pick_extension_workspace_dir() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("选择扩展开发目录")
+        .pick_folder()
+        .map(|path| crate::extension_workspace::display_path(&path))
+}
+
+/// 登记一个开发目录。任何真实目录都可以：目录里暂时没有 `extensions.json`
+/// 只是"还没有可整体分发的扩展"，不影响开发。
+#[tauri::command]
+pub(crate) fn add_extension_workspace(
+    root: String,
+) -> Result<Vec<crate::extension_workspace::ExtensionWorkspaceEntry>, String> {
+    let path =
+        crate::extension_workspace::register_root(&root).map_err(|error| error.to_string())?;
+    let display = crate::extension_workspace::display_path(&path);
+    // 记成兜底工作区：AI 会话与 MCP 创作链路在没有显式按次指定时才有落点。
+    let _ = crate::extension_workspace::bind(&path);
+    // 目录自带聚合清单时同步一个本地来源，市场侧据此提供免安装预览。
+    if path.join("extensions.json").is_file() {
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let _ = crate::app::extension_source::add_local_source(&name, &display, None);
+    } else if ["plugin.json", "skill.json", "workflow.json"]
+        .iter()
+        .any(|manifest| path.join(manifest).is_file())
+    {
+        // 目录本身就是一个扩展（单项目工作区）：登记成项目，列表里才会出现它。
+        let _ = crate::extension_projects::register(&path);
+    }
+    Ok(crate::extension_workspace::workspace_entries())
+}
+
+#[tauri::command]
+pub(crate) fn remove_extension_workspace(
+    root: String,
+) -> Result<Vec<crate::extension_workspace::ExtensionWorkspaceEntry>, String> {
+    crate::extension_workspace::unregister_root(&root).map_err(|error| error.to_string())?;
+    let _ = crate::extension_workspace::unbind(Some(std::path::Path::new(root.trim())));
+    // 旧版"当前选中的聚合仓库"如果就是它，一并清掉，否则下次刷新会从配置里复活。
+    let current = crate::extension_workspace::settings();
+    if current.configured
+        && !current.root.trim().is_empty()
+        && crate::extension_workspace::same_root(&current.root, &root)
+    {
+        let _ = crate::extension_workspace::clear();
+    }
+    // 指向这个目录的本地来源一并移除，市场里不留空壳。
+    if let Ok(sources) = crate::app::extension_source::settings() {
+        let detached: Vec<String> = sources
+            .sources
+            .iter()
+            .filter(|source| {
+                source.kind == crate::app::extension_source::ExtensionSourceKind::Local
+                    && crate::extension_workspace::same_root(&source.repository, &root)
+            })
+            .map(|source| source.id.clone())
+            .collect();
+        for source_id in detached {
+            let _ = crate::app::extension_source::remove_source(&source_id);
+        }
+    }
+    Ok(crate::extension_workspace::workspace_entries())
 }
 
 #[tauri::command]
@@ -2344,14 +2824,27 @@ pub(crate) fn associate_extension_project(
 #[tauri::command]
 pub(crate) fn create_extension_project(
     input: crate::extension_projects::CreateExtensionProjectInput,
+    parent_dir: Option<String>,
     state: State<'_, AgentState>,
 ) -> Result<crate::extension_projects::ExtensionProject, String> {
     let identity = crate::app::identity::authoring_identity(&state.options);
-    let Some(parent) = rfd::FileDialog::new()
-        .set_title("选择项目保存位置")
-        .pick_folder()
-    else {
-        return Err("已取消新建扩展项目".to_string());
+    // 指定了工作区就直接建进去：项目落在哪里是"这个扩展属于哪个仓库"的一部分，
+    // 不该让用户在弹框里自己找路径。没指定才退回目录选择。
+    let parent = match parent_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(directory) => crate::extension_workspace::validate_authoring_root(directory)?,
+        None => {
+            let Some(selected) = rfd::FileDialog::new()
+                .set_title("选择项目保存位置")
+                .pick_folder()
+            else {
+                return Err("已取消新建扩展项目".to_string());
+            };
+            selected
+        }
     };
     crate::extension_projects::create(&parent, input, &identity.user_name)
         .map_err(|error| error.to_string())
@@ -2362,6 +2855,222 @@ pub(crate) fn build_extension_project(
     project_id: String,
 ) -> Result<crate::extension_projects::ExtensionCandidate, String> {
     crate::extension_projects::build(&project_id).map_err(|error| error.to_string())
+}
+
+/// 设置扩展项目的分发目标覆盖；`targets = None` 表示回到分发单元默认。
+#[tauri::command]
+pub(crate) fn set_extension_project_distribution_targets(
+    kind: String,
+    extension_id: String,
+    targets: Option<Vec<crate::extension_contracts::DistributionTarget>>,
+) -> Result<crate::extension_projects::ExtensionProject, String> {
+    let kind = crate::extension_projects::ExtensionProjectKind::parse(&kind)
+        .map_err(|error| error.to_string())?;
+    crate::extension_projects::set_distribution_targets(kind, &extension_id, targets.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+/// 设置分发单元级默认分发目标，供单元内全部扩展继承；`None` 表示回到继承。
+#[tauri::command]
+pub(crate) fn set_extension_unit_distribution_targets(
+    unit_key: String,
+    targets: Option<Vec<crate::extension_contracts::DistributionTarget>>,
+) -> Result<crate::app::extension_source::ExtensionSourceSettings, String> {
+    crate::app::extension_source::set_unit_distribution_targets(&unit_key, targets.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+/// GitHub 分发账号：状态查询不返回 token，写入前先调用 GitHub 校验登录名。
+#[tauri::command]
+pub(crate) fn get_github_distribution_account(
+) -> Result<crate::store::github_credentials::GithubAccountStatus, String> {
+    crate::store::github_credentials::status().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_github_distribution_account(
+    token: String,
+    token_kind: Option<String>,
+    repositories: Option<Vec<String>>,
+) -> Result<crate::store::github_credentials::GithubAccountStatus, String> {
+    let identity = crate::app::github_publisher::verify_token(token.trim())
+        .map_err(|error| error.to_string())?;
+    crate::store::github_credentials::set_account(
+        &identity.login,
+        token.trim(),
+        token_kind.as_deref().unwrap_or(""),
+        repositories.as_deref().unwrap_or(&[]),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn remove_github_distribution_account() -> Result<bool, String> {
+    crate::store::github_credentials::remove().map_err(|error| error.to_string())
+}
+
+/// GitHub App 设备流第一步：申请设备码。client_id 由注册 App 的组织提供，可从 UI 传入；
+/// 没传时回退到环境变量或上次授权保存的值。
+#[tauri::command]
+pub(crate) fn start_github_app_authorization(
+    client_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let client_id = client_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(crate::app::github_app::configured_client_id);
+    let authorization =
+        crate::app::github_app::start_device_flow(&client_id).map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({ "client_id": client_id, "authorization": authorization }))
+}
+
+/// 轮询设备授权结果。授权成功后立刻保存授权事实并列出可绑定的安装，
+/// 省掉「再调一次列安装」的往返，UI 拿到结果就能让用户选。
+#[tauri::command]
+pub(crate) fn poll_github_app_authorization(
+    client_id: String,
+    device_code: String,
+) -> Result<serde_json::Value, String> {
+    use crate::app::github_app::DevicePollOutcome;
+    let outcome = crate::app::github_app::poll_device_flow(client_id.trim(), device_code.trim())
+        .map_err(|error| error.to_string())?;
+    let (state, installations) = match outcome {
+        DevicePollOutcome::Authorized(token) => {
+            // 登录名取自 GET /user，而不是用户输入；失败不阻断授权，只是暂时没有可展示的名字。
+            let login = crate::app::github_publisher::verify_token(&token.access_token)
+                .map(|identity| identity.login)
+                .unwrap_or_default();
+            let record = crate::store::github_credentials::GithubAppRecord {
+                login,
+                client_id: client_id.trim().to_string(),
+                installation_id: String::new(),
+                installation_account: String::new(),
+                user_token: token.access_token.clone(),
+                refresh_token: token.refresh_token.clone(),
+                user_token_expires_at: (crate::app::github_app::now_epoch() + token.expires_in)
+                    .to_string(),
+            };
+            crate::store::github_credentials::save_app_state(&record)
+                .map_err(|error| error.to_string())?;
+            let installations = crate::app::github_app::list_installations(&record.user_token)
+                .map_err(|error| error.to_string())?;
+            ("authorized", Some(installations))
+        }
+        DevicePollOutcome::Pending => ("pending", None),
+        DevicePollOutcome::SlowDown => ("slow_down", None),
+        DevicePollOutcome::Expired => ("expired", None),
+        DevicePollOutcome::Denied => ("denied", None),
+    };
+    Ok(serde_json::json!({ "state": state, "installations": installations }))
+}
+
+#[tauri::command]
+pub(crate) fn list_github_app_installations() -> Result<serde_json::Value, String> {
+    let state = crate::store::github_credentials::app_state()
+        .map_err(|error| error.to_string())?
+        .ok_or("GitHub App 尚未授权，请先完成授权")?;
+    let installations = crate::app::github_app::list_installations(&state.user_token)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({ "installations": installations }))
+}
+
+/// 绑定发布用的安装：之后发布走该安装的短期令牌。
+#[tauri::command]
+pub(crate) fn select_github_app_installation(
+    installation_id: String,
+) -> Result<crate::store::github_credentials::GithubAccountStatus, String> {
+    let state = crate::store::github_credentials::app_state()
+        .map_err(|error| error.to_string())?
+        .ok_or("GitHub App 尚未授权，请先完成授权")?;
+    let installations = crate::app::github_app::list_installations(&state.user_token)
+        .map_err(|error| error.to_string())?;
+    let selected = installations
+        .into_iter()
+        .find(|item| item.id == installation_id.trim())
+        .ok_or_else(|| "未找到该安装，请刷新后重新选择".to_string())?;
+    crate::app::github_app::select_installation(&selected).map_err(|error| error.to_string())?;
+    crate::store::github_credentials::status().map_err(|error| error.to_string())
+}
+
+/// 导入 App 私钥（PKCS#1 / PKCS#8 PEM）。私钥只在签发安装令牌时读取，DPAPI 加密落盘。
+#[tauri::command]
+pub(crate) fn import_github_app_private_key(
+) -> Result<crate::store::github_credentials::GithubAccountStatus, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择 GitHub App 私钥（.pem）")
+        .add_filter("PEM 私钥", &["pem", "key"])
+        .pick_file()
+    else {
+        return Err("已取消选择私钥文件".to_string());
+    };
+    let pem = std::fs::read_to_string(&path).map_err(|error| format!("读取私钥失败：{error}"))?;
+    crate::store::github_credentials::save_app_private_key(&pem)
+        .map_err(|error| error.to_string())?;
+    crate::store::github_credentials::status().map_err(|error| error.to_string())
+}
+
+/// 打开 GitHub 设备授权页。只放行 github.com，避免这个命令被当成任意 URL 的跳板。
+#[tauri::command]
+pub(crate) fn open_github_authorization_page(verification_uri: String) -> Result<(), String> {
+    let target = verification_uri.trim();
+    if !target.starts_with("https://github.com/") {
+        return Err("只允许打开 github.com 的授权页面".to_string());
+    }
+    open_url(target).map_err(|error| error.to_string())
+}
+
+/// 发布预览：只读，用于 UI 展示这次会发到哪里、发什么。
+#[tauri::command]
+pub(crate) fn preview_extension_distribution(
+    kind: String,
+    extension_id: String,
+    version: String,
+) -> Result<serde_json::Value, String> {
+    let kind = crate::extension_projects::ExtensionProjectKind::parse(&kind)
+        .map_err(|error| error.to_string())?;
+    let preview = crate::app::distribution_publish::preview(kind, &extension_id, &version)
+        .map_err(|error| error.to_string())?;
+    with_operation_plan(
+        &preview,
+        &crate::app::operation_plan::distribution_publish(&preview),
+    )
+}
+
+/// 按生效目标发布。与 CLI 共用同一编排，失败也会写入分发台账。
+#[tauri::command]
+pub(crate) fn publish_extension_distribution(
+    kind: String,
+    extension_id: String,
+    version: String,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let kind = crate::extension_projects::ExtensionProjectKind::parse(&kind)
+        .map_err(|error| error.to_string())?;
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    crate::app::distribution_publish::publish(
+        &state.options,
+        &agent_id,
+        kind,
+        &extension_id,
+        &version,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn get_extension_distribution_state(
+    kind: Option<String>,
+    extension_id: Option<String>,
+) -> Result<Vec<crate::app::distribution_state::DistributionStateEntry>, String> {
+    let view = crate::app::distribution_state::load().map_err(|error| error.to_string())?;
+    match (kind, extension_id) {
+        (Some(kind), Some(extension_id)) => Ok(view.for_asset(kind.trim(), extension_id.trim())),
+        _ => Ok(view.all()),
+    }
 }
 
 #[tauri::command]
@@ -2381,8 +3090,13 @@ pub(crate) fn list_extension_collaboration_projects(
     require_dashboard(&state)?;
     let (agent_id, token, client) =
         dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
-    crate::api::distribution::extension_projects(&client, &state.dashboard_base, &agent_id, &token)
-        .map_err(|error| error.to_string())
+    crate::api::distribution::extension_projects(
+        &client,
+        &state.options.api_base(),
+        &agent_id,
+        &token,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2401,7 +3115,7 @@ pub(crate) fn update_extension_project_source(
             dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
         crate::api::distribution::upsert_extension_source(
             &client,
-            &state.dashboard_base,
+            &state.options.api_base(),
             &agent_id,
             &token,
             &project,
@@ -2422,7 +3136,7 @@ pub(crate) fn get_extension_collaboration(
         dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
     crate::api::distribution::extension_collaboration(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
         &product_key,
@@ -2440,7 +3154,7 @@ pub(crate) fn list_extension_collaborator_options(
         dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
     crate::api::distribution::extension_collaborator_options(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
         &product_key,
@@ -2460,7 +3174,7 @@ pub(crate) fn invite_extension_collaborator(
         dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
     crate::api::distribution::invite_extension_collaborator(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
         &product_key,
@@ -2481,7 +3195,7 @@ pub(crate) fn update_extension_collaborator(
         dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
     crate::api::distribution::update_extension_collaborator(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
         &product_key,
@@ -2501,7 +3215,7 @@ pub(crate) fn delete_extension_collaborator(
         dashboard_agent_user_client(&state, crate::api::oauth::CREATIVE_SUBMIT_SCOPE)?;
     crate::api::distribution::delete_extension_collaborator(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
         &product_key,
@@ -2518,7 +3232,7 @@ pub(crate) fn list_extension_collaboration_invitations(
         dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
     crate::api::distribution::extension_collaboration_invitations(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
     )
@@ -2535,7 +3249,7 @@ pub(crate) fn respond_extension_collaboration_invitation(
         dashboard_agent_user_client(&state, crate::api::oauth::PROFILE_SCOPE)?;
     crate::api::distribution::respond_extension_collaboration_invitation(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &token,
         &invitation_id,
@@ -2668,7 +3382,7 @@ pub(crate) fn submit_workflow_draft(
         .unwrap_or_default()
         .to_string();
     if agent_id.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     crate::workflow::submit_authoring_candidate(&state.options, &agent_id, &workflow_id, &version)
         .map_err(|error| error.to_string())
@@ -2685,7 +3399,7 @@ pub(crate) fn list_workflow_submissions(
         .unwrap_or_default()
         .to_string();
     if agent_id.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     let access = crate::api::oauth::platform_access_token(
         &state.options,
@@ -2698,7 +3412,7 @@ pub(crate) fn list_workflow_submissions(
         .map_err(|error| error.to_string())?;
     crate::api::distribution::workflow_submissions(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &access.token,
     )
@@ -2716,7 +3430,7 @@ pub(crate) fn list_plugin_submissions(
         .unwrap_or_default()
         .to_string();
     if agent_id.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     let access =
         crate::api::oauth::platform_access_token(&state.options, crate::api::oauth::PROFILE_SCOPE)
@@ -2727,7 +3441,7 @@ pub(crate) fn list_plugin_submissions(
         .map_err(|error| error.to_string())?;
     crate::api::distribution::plugin_submissions(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &access.token,
     )
@@ -2771,7 +3485,7 @@ pub(crate) fn list_skill_submissions(
         .unwrap_or_default()
         .to_string();
     if agent_id.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     let access =
         crate::api::oauth::platform_access_token(&state.options, crate::api::oauth::PROFILE_SCOPE)
@@ -2782,7 +3496,7 @@ pub(crate) fn list_skill_submissions(
         .map_err(|error| error.to_string())?;
     crate::api::distribution::skill_submissions(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         &agent_id,
         &access.token,
     )
@@ -2870,6 +3584,121 @@ fn confirm_authoring_submission(kind: &str, name: &str, version: &str, sha256: &
     )
 }
 
+/// 选择技能安装位置（不产生任何持久化副作用，只返回所选目录）。
+#[tauri::command]
+pub(crate) fn pick_skill_location() -> Result<String, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("选择技能安装位置")
+        .pick_folder()
+    else {
+        return Err("已取消选择安装位置".to_string());
+    };
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 只从指定目录移除某个技能的副本（全局投放与其他目录不受影响）。
+///
+/// 会一并清掉该目录 `.himind/skills.lock.json` 里的对应条目，不留"半管理"残留。
+#[tauri::command]
+pub(crate) fn remove_skill_from_location(
+    skill_id: String,
+    location: String,
+) -> Result<serde_json::Value, String> {
+    // 目录还在：按正常流程移除副本（清文件 + 收据 + 台账 + 该目录的锁条目）。
+    if std::path::Path::new(&location).is_dir() {
+        return with_skill_location(Some(&location), || {
+            crate::skill::unregister_skill_clients_json(&skill_id)
+                .map_err(|error| error.to_string())
+        });
+    }
+    // 目录已被删除（用户删了或移走了）：只清理安装台账，让界面不再显示这条幽灵记录。
+    let removed = crate::skill::target::purge_deployments_at(&skill_id, &location)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "skill_id": skill_id,
+        "location": location,
+        "removed_count": removed,
+        "purged": true,
+    }))
+}
+
+/// 把技能库里已有的一份技能写到指定目录（不经过"重新安装"，也不改动任何持久设置）。
+///
+/// 与安装的区别：安装解决"库里有没有这份技能"，这里解决"把它落到哪个目录"。
+/// 目标目录只对本次调用生效，"当前项目"之类的全局状态不再参与。
+#[tauri::command]
+pub(crate) fn deploy_skill_to_location(
+    skill_id: String,
+    location: String,
+    clients: Option<Vec<String>>,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    with_skill_location(Some(&location), || {
+        let capability_facts = skill_capability_facts(&state)?;
+        let store = crate::skill::store::SkillStore::new();
+        store
+            .bootstrap_builtin_skills()
+            .map_err(|error| error.to_string())?;
+        let record = store
+            .get_record(&skill_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("技能库里没有这份技能: {skill_id}"))?;
+        let rendered = crate::skill::sync_record_to_clients(
+            &record,
+            VERSION,
+            &capability_facts,
+            clients.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "record": record,
+            "clients": rendered,
+            "location": location,
+        }))
+    })
+}
+
+/// 在指定安装位置（或全局）下执行一次技能操作。
+///
+/// 位置只对本次调用生效：通过进程环境告诉渲染层"这次写到哪儿"，调用结束后原样恢复，
+/// 既不写任何持久配置，也不会被"上次选过的项目"改道。这与 CLI 的
+/// `--workspace` / `--global` 语义一致。
+pub(crate) fn with_skill_location<T>(
+    location: Option<&str>,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let previous_target = std::env::var_os("HIMIND_SKILL_TARGET");
+    let previous_workspace = std::env::var_os("HIMIND_SKILL_WORKSPACE");
+    let canonical = match location.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(path) => Some(
+            crate::skill::target::canonical_workspace_root(std::path::Path::new(path))
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    std::env::remove_var("HIMIND_SKILL_TARGET");
+    match canonical.as_ref() {
+        Some(root) => std::env::set_var("HIMIND_SKILL_WORKSPACE", root),
+        None => {
+            std::env::set_var(
+                "HIMIND_SKILL_TARGET",
+                crate::skill::target::TARGET_KIND_GLOBAL,
+            );
+            std::env::remove_var("HIMIND_SKILL_WORKSPACE");
+        }
+    }
+    let result = action();
+    match previous_target {
+        Some(value) => std::env::set_var("HIMIND_SKILL_TARGET", value),
+        None => std::env::remove_var("HIMIND_SKILL_TARGET"),
+    }
+    match previous_workspace {
+        Some(value) => std::env::set_var("HIMIND_SKILL_WORKSPACE", value),
+        None => std::env::remove_var("HIMIND_SKILL_WORKSPACE"),
+    }
+    result
+}
+
 #[tauri::command]
 pub(crate) fn install_organization_skill(
     skill_id: String,
@@ -2878,6 +3707,34 @@ pub(crate) fn install_organization_skill(
     source: Option<String>,
     artifact_id: Option<String>,
     sha256: Option<String>,
+    clients: Option<Vec<String>>,
+    location: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    // 安装位置只对本次调用生效：不改动任何持久设置，也不受"上次选过的项目"影响。
+    // 不指定位置时就是全局安装，这一点与 CLI 的行为一致。
+    with_skill_location(location.as_deref(), || {
+        install_organization_skill_at(
+            skill_id,
+            version,
+            optional_plugin_ids,
+            source,
+            artifact_id,
+            sha256,
+            clients,
+            state,
+        )
+    })
+}
+
+fn install_organization_skill_at(
+    skill_id: String,
+    version: Option<String>,
+    optional_plugin_ids: Option<Vec<String>>,
+    source: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
+    clients: Option<Vec<String>>,
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
     let public_source_id = public_extension_source_id(source.as_deref());
@@ -2896,9 +3753,13 @@ pub(crate) fn install_organization_skill(
         )
         .map_err(|error| error.to_string())?;
         let capability_facts = skill_capability_facts(&state)?;
-        let rendered =
-            crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
-                .map_err(|error| error.to_string())?;
+        let rendered = crate::skill::sync_record_to_clients(
+            &record,
+            VERSION,
+            &capability_facts,
+            clients.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
         let _ = crate::app::extension_source::reconcile_dsh_presets_now();
         return Ok(serde_json::json!({
             "catalog_item": catalog_item,
@@ -2926,9 +3787,13 @@ pub(crate) fn install_organization_skill(
     )
     .map_err(|error| error.to_string())?;
     let capability_facts = skill_capability_facts(&state)?;
-    let rendered =
-        crate::skill::sync_record_to_supported_clients(&record, VERSION, &capability_facts)
-            .map_err(|error| error.to_string())?;
+    let rendered = crate::skill::sync_record_to_clients(
+        &record,
+        VERSION,
+        &capability_facts,
+        clients.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({
         "catalog_item": catalog_item,
         "record": record,
@@ -2947,7 +3812,7 @@ pub(crate) fn plan_organization_skill_install(
     artifact_id: Option<String>,
     sha256: Option<String>,
     state: State<'_, AgentState>,
-) -> Result<crate::app::skill_manager::SkillInstallPlan, String> {
+) -> Result<serde_json::Value, String> {
     let public_source_id = public_extension_source_id(source.as_deref());
     if public_source_id.is_some()
         || (source.is_none()
@@ -2956,13 +3821,14 @@ pub(crate) fn plan_organization_skill_install(
                     && (item.source.starts_with("local:") || item.source.starts_with("github:"))
             }))
     {
-        return crate::app::extension_source::plan_skill_bound(
+        let plan = crate::app::extension_source::plan_skill_bound(
             &skill_id,
             version.as_deref(),
             public_source_id,
             sha256.as_deref(),
         )
-        .map_err(|error| error.to_string());
+        .map_err(|error| error.to_string())?;
+        return skill_plan_payload(&plan);
     }
     require_dashboard(&state)?;
     let agent_id = local_worker_snapshot(&state.worker_status)
@@ -2970,7 +3836,7 @@ pub(crate) fn plan_organization_skill_install(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    crate::app::skill_manager::plan_install_bound(
+    let plan = crate::app::skill_manager::plan_install_bound(
         &state.options,
         &agent_id,
         &skill_id,
@@ -2978,7 +3844,73 @@ pub(crate) fn plan_organization_skill_install(
         artifact_id.as_deref(),
         sha256.as_deref(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    skill_plan_payload(&plan)
+}
+
+/// 技能安装计划：保留原有的 `skill` / `plugin_actions` 字段（既有界面照旧读），
+/// 同时附上统一的 [`crate::app::operation_plan::OperationPlan`]，让"会发生什么"
+/// 只有一套解释。
+fn skill_plan_payload(
+    plan: &crate::app::skill_manager::SkillInstallPlan,
+) -> Result<serde_json::Value, String> {
+    let dependencies = plan
+        .plugin_actions
+        .iter()
+        .map(|action| crate::app::operation_plan::PlanDependency {
+            kind: "plugin".to_string(),
+            id: action.plugin_id.clone(),
+            name: action.plugin_name.clone(),
+            required: action.required,
+            current_version: action.current_version.clone(),
+            target_version: action.target_version.clone(),
+            action: action.action.clone(),
+            reason: action.reason.clone(),
+        })
+        .collect();
+    let unified = crate::app::operation_plan::skill_install(
+        &plan.skill,
+        plan.blocked_reasons.clone(),
+        dependencies,
+    );
+    with_operation_plan(plan, &unified)
+}
+
+fn plugin_plan_payload(
+    plan: &crate::app::plugin_manager::PluginInstallPlan,
+) -> Result<serde_json::Value, String> {
+    let dependencies = plan
+        .dependency_actions
+        .iter()
+        .map(|action| crate::app::operation_plan::PlanDependency {
+            kind: "plugin".to_string(),
+            id: action.plugin_id.clone(),
+            name: action.plugin_name.clone(),
+            required: action.required,
+            current_version: action.current_version.clone(),
+            target_version: action.target_version.clone(),
+            action: action.action.clone(),
+            reason: action.reason.clone(),
+        })
+        .collect();
+    let unified = crate::app::operation_plan::plugin_install(
+        &plan.plugin,
+        plan.blocked_reasons.clone(),
+        dependencies,
+    );
+    with_operation_plan(plan, &unified)
+}
+
+fn with_operation_plan<T: serde::Serialize>(
+    original: &T,
+    unified: &crate::app::operation_plan::OperationPlan,
+) -> Result<serde_json::Value, String> {
+    let mut payload = serde_json::to_value(original).map_err(|error| error.to_string())?;
+    let plan = serde_json::to_value(unified).map_err(|error| error.to_string())?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("plan".to_string(), plan);
+    }
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -3009,7 +3941,7 @@ pub(crate) fn get_skill_versions(
         .unwrap_or_default();
     let credential = state.options.agent_credential();
     if agent_id.is_empty() || credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -3017,7 +3949,7 @@ pub(crate) fn get_skill_versions(
         .map_err(|error| error.to_string())?;
     crate::api::distribution::skill_versions(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         agent_id,
         &credential,
         &skill_id,
@@ -3026,13 +3958,37 @@ pub(crate) fn get_skill_versions(
 }
 
 #[tauri::command]
-pub(crate) fn get_codex_skill_status(
+pub(crate) async fn get_codex_skill_status(
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
-    let capability_facts = skill_capability_facts(&state)?;
-    let clients = crate::skill::client_status_json(VERSION, &capability_facts)
-        .map_err(|error| error.to_string())?;
-    codex_compatible_client_result(clients)
+    // 这份快照要给 20 个客户端 × 全部技能逐个核对渲染收据（含文件校验和），
+    // 单次十秒量级。放在主线程上会把同一时刻的插件、技能、工作台请求全部
+    // 拖到超时，因此整体下沉到阻塞线程池。
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let capability_facts = capability_facts_for(&gateway)?;
+        let clients = crate::skill::client_status_json(VERSION, &capability_facts)
+            .map_err(|error| error.to_string())?;
+        codex_compatible_client_result(clients)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 客户端 × 作用域 × 能力矩阵：静态能力 + 本机可用性。
+///
+/// 这是"某个 AI 工具能不能用某类能力"的唯一答案来源，替代各页面各自维护的
+/// 客户端清单。
+#[tauri::command]
+pub(crate) async fn get_client_capability_matrix(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::app::client_matrix::matrix_json(&options))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -3274,6 +4230,109 @@ pub(crate) fn unregister_skill_clients(skill_id: String) -> Result<serde_json::V
     crate::skill::unregister_skill_clients_json(&skill_id).map_err(|error| error.to_string())
 }
 
+/// 每个技能"文件写到过哪些位置"（全局 / 指定目录），来自部署台账而不是当前目标。
+///
+/// 技能可以同时装在全局和若干目录里，状态查询本身只反映"当前目标"，所以这里单独聚合一
+/// 份位置清单，前端据此展示与管理（更新 / 移除）。
+fn skill_locations_payload(clients: &serde_json::Value) -> serde_json::Value {
+    let mut skill_ids: Vec<String> = Vec::new();
+    if let Some(client_map) = clients.as_object() {
+        for client in client_map.values() {
+            let Some(items) = client.get("items").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let Some(skill_id) = item
+                    .get("record")
+                    .and_then(|record| record.get("manifest"))
+                    .and_then(|manifest| manifest.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if !skill_ids.iter().any(|known| known == skill_id) {
+                    skill_ids.push(skill_id.to_string());
+                }
+            }
+        }
+    }
+    let mut payload = serde_json::Map::new();
+    // 台账整份读一次后再按技能分组。此前是每个技能各读一次同一份文件，
+    // 技能数一多这段纯读盘就成了这个接口的主要耗时。
+    let deployments = crate::skill::target::all_deployments().unwrap_or_default();
+    for skill_id in skill_ids {
+        let mut groups: Vec<(String, bool, String, Vec<String>, String, bool, Vec<String>)> =
+            Vec::new();
+        for deployment in deployments.iter().filter(|item| item.skill_id == skill_id) {
+            let (root, is_directory) = match deployment.workspace_root.as_deref() {
+                Some(root) if !root.trim().is_empty() => (root.to_string(), true),
+                _ => (String::new(), false),
+            };
+            let key = if is_directory {
+                root.clone()
+            } else {
+                String::new()
+            };
+            let present = std::path::Path::new(&deployment.rendered_root).exists();
+            // 落盘策略（复制 / 软链接）来自台账本身：界面能如实说明"这一份是怎么装上去的"。
+            let strategies: Vec<String> = if deployment.strategy.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![deployment.strategy.trim().to_string()]
+            };
+            match groups.iter_mut().find(|entry| entry.0 == key) {
+                Some(entry) => {
+                    if !entry.3.contains(&deployment.client_id) {
+                        entry.3.push(deployment.client_id.clone());
+                    }
+                    if entry.4.is_empty() {
+                        entry.4 = deployment.version.clone();
+                    }
+                    entry.5 = entry.5 || present;
+                    for strategy in strategies {
+                        if !entry.6.contains(&strategy) {
+                            entry.6.push(strategy);
+                        }
+                    }
+                }
+                None => groups.push((
+                    key,
+                    is_directory,
+                    root,
+                    vec![deployment.client_id.clone()],
+                    deployment.version.clone(),
+                    present,
+                    strategies,
+                )),
+            }
+        }
+        let rows: Vec<serde_json::Value> = groups
+            .into_iter()
+            .map(
+                |(_, is_directory, root, clients, version, present, strategies)| {
+                    // 目录还在但副本已被删掉也算"记录已失效"：如实标出来，前端只提供"清理记录"。
+                    let missing = is_directory && !present;
+                    let root = if is_directory {
+                        crate::skill::target::display_path(std::path::Path::new(&root))
+                    } else {
+                        root
+                    };
+                    serde_json::json!({
+                        "scope": if is_directory { "directory" } else { "global" },
+                        "root": root,
+                        "missing": missing,
+                        "clients": clients,
+                        "version": version,
+                        "strategies": strategies,
+                    })
+                },
+            )
+            .collect();
+        payload.insert(skill_id, serde_json::Value::Array(rows));
+    }
+    serde_json::Value::Object(payload)
+}
+
 fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_json::Value, String> {
     let mut codex = clients
         .get("codex")
@@ -3311,12 +4370,14 @@ fn codex_compatible_client_result(clients: serde_json::Value) -> Result<serde_js
                     .unwrap_or_default(),
             )
     });
+    let skill_locations = skill_locations_payload(&clients);
     if let Some(object) = codex.as_object_mut() {
         object.insert(
             "project_skills".to_string(),
             serde_json::Value::Array(project_skills),
         );
         object.insert("clients".to_string(), clients);
+        object.insert("skill_locations".to_string(), skill_locations);
     }
     Ok(codex)
 }
@@ -3341,39 +4402,62 @@ fn public_extension_source_id(source: Option<&str>) -> Option<&str> {
 fn merged_plugin_catalog(
     state: &AgentState,
 ) -> Result<Vec<crate::api::distribution::PluginCatalogItem>, String> {
-    let source_snapshot =
-        crate::app::extension_source::snapshot().map_err(|error| error.to_string())?;
-    let mut items = source_snapshot.plugins;
-    if state.options.mode().dashboard_enabled() {
-        let worker = local_worker_snapshot(&state.worker_status);
-        let agent_id = worker
-            .get("dashboard_agent_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let credential = state.options.agent_credential();
-        if !agent_id.is_empty() && !credential.is_empty() {
-            let client = reqwest::blocking::Client::builder()
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let (items, errors) = merged_plugin_catalog_for(&state.options, &agent_id);
+    if items.is_empty() {
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
+        }
+    }
+    Ok(items)
+}
+
+/// 与 [`merged_plugin_catalog`] 同一份解析规则，但不依赖 Tauri 层的
+/// `AgentState`：能力面（市场搜索 / 计划 / 安装）只能拿到 [`Options`]。
+///
+/// 返回 `(目录项, 错误)`：任何一个来源不可达都不该让整个市场变成空的，调用方
+/// 用错误列表给出"结果可能不完整"的提示。
+pub(crate) fn merged_plugin_catalog_for(
+    options: &Options,
+    agent_id: &str,
+) -> (
+    Vec<crate::api::distribution::PluginCatalogItem>,
+    Vec<String>,
+) {
+    let mut errors = Vec::new();
+    let mut items = match crate::app::extension_source::snapshot() {
+        Ok(snapshot) => snapshot.plugins,
+        Err(error) => {
+            errors.push(error.to_string());
+            Vec::new()
+        }
+    };
+    if options.mode().dashboard_enabled() {
+        let credential = options.agent_credential();
+        if !agent_id.trim().is_empty() && !credential.trim().is_empty() {
+            let dashboard = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
-                .build();
-            let dashboard = match client {
-                Ok(client) => crate::api::distribution::plugin_catalog(
-                    &client,
-                    &state.dashboard_base,
-                    agent_id,
-                    &credential,
-                )
-                .map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
+                .build()
+                .map_err(|error| error.to_string())
+                .and_then(|client| {
+                    crate::api::distribution::plugin_catalog(
+                        &client,
+                        &options.api_base(),
+                        agent_id,
+                        &credential,
+                    )
+                    .map_err(|error| error.to_string())
+                });
             match dashboard {
-                Ok(catalog) => {
-                    items.extend(catalog);
-                }
-                Err(error) if items.is_empty() => return Err(error.to_string()),
-                Err(_) => {}
+                Ok(catalog) => items.extend(catalog),
+                Err(error) => errors.push(error),
             }
         } else if items.is_empty() {
-            return Err("Agent 尚未完成 Dashboard 配对".to_string());
+            errors.push("HiMind 账号尚未授权".to_string());
         }
     }
     let mut seen = HashSet::new();
@@ -3400,32 +4484,48 @@ fn merged_plugin_catalog(
             &mut item.categories,
         );
     }
-    Ok(result)
+    (result, errors)
 }
 
 fn merged_skill_catalog(
     state: &AgentState,
 ) -> Result<Vec<crate::api::distribution::SkillCatalogItem>, String> {
-    let source_snapshot =
-        crate::app::extension_source::snapshot().map_err(|error| error.to_string())?;
-    let mut items = source_snapshot.skills;
-    if state.options.mode().dashboard_enabled() {
-        let worker = local_worker_snapshot(&state.worker_status);
-        let agent_id = worker
-            .get("dashboard_agent_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let credential = state.options.agent_credential();
-        if !agent_id.is_empty() && !credential.is_empty() {
-            match crate::app::skill_manager::catalog(&state.options, agent_id) {
-                Ok(catalog) => {
-                    items.extend(catalog);
-                }
-                Err(error) if items.is_empty() => return Err(error.to_string()),
-                Err(_) => {}
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let (items, errors) = merged_skill_catalog_for(&state.options, &agent_id);
+    if items.is_empty() {
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
+        }
+    }
+    Ok(items)
+}
+
+/// 技能目录的共享解析规则，见 [`merged_plugin_catalog_for`]。
+pub(crate) fn merged_skill_catalog_for(
+    options: &Options,
+    agent_id: &str,
+) -> (Vec<crate::api::distribution::SkillCatalogItem>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut items = match crate::app::extension_source::snapshot() {
+        Ok(snapshot) => snapshot.skills,
+        Err(error) => {
+            errors.push(error.to_string());
+            Vec::new()
+        }
+    };
+    if options.mode().dashboard_enabled() {
+        let credential = options.agent_credential();
+        if !agent_id.trim().is_empty() && !credential.trim().is_empty() {
+            match crate::app::skill_manager::catalog(options, agent_id) {
+                Ok(catalog) => items.extend(catalog),
+                Err(error) => errors.push(error.to_string()),
             }
         } else if items.is_empty() {
-            return Err("Agent 尚未完成 Dashboard 配对".to_string());
+            errors.push("HiMind 账号尚未授权".to_string());
         }
     }
     let mut seen = HashSet::new();
@@ -3450,7 +4550,7 @@ fn merged_skill_catalog(
             &mut item.categories,
         );
     }
-    Ok(result)
+    (result, errors)
 }
 
 fn filter_plugin_catalog(
@@ -3499,7 +4599,7 @@ fn filter_skill_catalog(
 /// The error string is only meaningful when nothing could be resolved at all.
 /// A partially reachable catalog must not present itself as an empty one, so a
 /// non-empty result always reports an empty error.
-fn merged_workflow_catalog(
+pub(crate) fn merged_workflow_catalog(
     options: &crate::Options,
 ) -> Result<(Vec<crate::api::distribution::WorkflowCatalogItem>, String), String> {
     let mut catalog = Vec::new();
@@ -3516,7 +4616,7 @@ fn merged_workflow_catalog(
             {
                 Ok(client) => match crate::api::distribution::workflow_catalog(
                     &client,
-                    &options.api_base,
+                    &options.api_base(),
                     &state.agent_id,
                     &state.credential,
                 ) {
@@ -3672,7 +4772,7 @@ pub(crate) fn get_plugin_versions(
         .unwrap_or_default();
     let credential = state.options.agent_credential();
     if agent_id.is_empty() || credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".to_string());
+        return Err("HiMind 账号尚未授权".to_string());
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -3680,7 +4780,7 @@ pub(crate) fn get_plugin_versions(
         .map_err(|error| error.to_string())?;
     crate::api::distribution::plugin_versions(
         &client,
-        &state.dashboard_base,
+        &state.options.api_base(),
         agent_id,
         &credential,
         &plugin_id,
@@ -3696,7 +4796,7 @@ pub(crate) fn plan_plugin_install(
     source: Option<String>,
     artifact_id: Option<String>,
     sha256: Option<String>,
-) -> Result<crate::app::plugin_manager::PluginInstallPlan, String> {
+) -> Result<serde_json::Value, String> {
     let public_source_id = public_extension_source_id(source.as_deref());
     if public_source_id.is_some()
         || (source.is_none()
@@ -3705,13 +4805,14 @@ pub(crate) fn plan_plugin_install(
                     && (item.source.starts_with("local:") || item.source.starts_with("github:"))
             }))
     {
-        return crate::app::extension_source::plan_plugin_bound(
+        let plan = crate::app::extension_source::plan_plugin_bound(
             &plugin_id,
             version.as_deref(),
             public_source_id,
             sha256.as_deref(),
         )
-        .map_err(|error| error.to_string());
+        .map_err(|error| error.to_string())?;
+        return plugin_plan_payload(&plan);
     }
     require_dashboard(&state)?;
     let snapshot = local_worker_snapshot(&state.worker_status);
@@ -3719,7 +4820,7 @@ pub(crate) fn plan_plugin_install(
         .get("dashboard_agent_id")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    crate::app::plugin_manager::plan_install_bound(
+    let plan = crate::app::plugin_manager::plan_install_bound(
         &state.options,
         agent_id,
         &plugin_id,
@@ -3727,7 +4828,8 @@ pub(crate) fn plan_plugin_install(
         artifact_id.as_deref(),
         sha256.as_deref(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    plugin_plan_payload(&plan)
 }
 
 #[tauri::command]
@@ -3877,6 +4979,15 @@ pub(crate) fn set_plugin_enabled(
     result.map_err(|error| error.to_string())
 }
 
+/// 清除插件失败/熔断记录，让它立刻重新参与能力发现。
+///
+/// 只影响本机的运行健康记录，不改变安装版本与启停状态，因此不进 Dashboard 上报队列
+/// （没有需要同步的事实变化）。
+#[tauri::command]
+pub(crate) fn repair_plugin(plugin_id: String) -> Result<(), String> {
+    crate::app::plugin_manager::repair(&plugin_id).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub(crate) fn open_plugin_directory() -> Result<(), String> {
     let registry = registry_json().map_err(|e| e.to_string())?;
@@ -3937,11 +5048,12 @@ pub(crate) fn invoke_development_plugin(
     if control_plane_capability && !state.options.mode().control_plane_enabled() {
         return Err(crate::app::runtime_mode::control_plane_required_error());
     }
+    let api_base = state.options.api_base();
     let trusted_dashboard_url = state
         .options
         .mode()
         .control_plane_enabled()
-        .then_some(state.options.api_base.as_str());
+        .then_some(api_base.as_str());
     let result = crate::capability::plugin::invoke_plugin_capability_for_plugin(
         &plugin_id,
         &capability_id,
@@ -3994,7 +5106,7 @@ pub(crate) fn get_plugin_view_context(window: WebviewWindow) -> Result<serde_jso
         })
         .ok_or_else(|| "plugin view identity is unavailable".to_string())?;
     let workspace =
-        crate::extension_projects::current_workspace().map_err(|error| error.to_string())?;
+        crate::extension_projects::current_workspace(None).map_err(|error| error.to_string())?;
     let workspace_root = workspace
         .get("workspace_root")
         .and_then(|value| value.as_str())
@@ -4176,8 +5288,10 @@ pub(crate) fn reveal_skill_run(run_id: String) -> Result<(), String> {
 #[tauri::command]
 pub(crate) fn get_workflow_center(
     state: State<'_, AgentState>,
+    light: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    workflow_center_snapshot(state.capability_gateway.options()).map_err(|error| error.to_string())
+    workflow_center_snapshot(state.capability_gateway.options(), light.unwrap_or(false))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -4246,7 +5360,7 @@ pub(crate) fn get_workflow_versions(
             {
                 Ok(client) => match crate::api::distribution::workflow_versions(
                     &client,
-                    &state.dashboard_base,
+                    &state.options.api_base(),
                     agent_id,
                     &credential,
                     &workflow_id,
@@ -5046,13 +6160,16 @@ fn preflight_workflow_with_gateway(
 
 fn workflow_center_snapshot(
     options: &crate::Options,
+    light: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let store = crate::workflow::WorkflowStore::open_default()?;
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
     let metrics = crate::workflow::workflow_metrics_by_package(&ledger)?;
     let mut workflows = Vec::new();
     let mut workflow_names = std::collections::HashMap::<String, String>::new();
-    for item in store.list()? {
+    // 坏包降级成一条 issue 输出给 UI，不再让单个读取失败的制品把整份「我的能力」打空。
+    let (installed, library_issues) = store.list_with_issues()?;
+    for item in installed {
         let view = store.view_json(&item.package)?;
         workflow_names.insert(item.package.id.clone(), item.package.name.clone());
         workflows.push(json!({
@@ -5136,9 +6253,15 @@ fn workflow_center_snapshot(
             "projection_status": projection_status,
         }));
     }
-    let (catalog, catalog_error) = merged_workflow_catalog(options)?;
+    // 轮询走轻量快照：目录会去控制面拉取，不能每 10 秒（运行中每 2.5 秒）打一次网络。
+    let (catalog, catalog_error) = if light {
+        (Vec::new(), String::new())
+    } else {
+        merged_workflow_catalog(options)?
+    };
     Ok(json!({
         "workflows": workflows,
+        "library_issues": library_issues,
         "runs": runs,
         "catalog": catalog,
         "catalog_error": catalog_error,
@@ -5152,6 +6275,7 @@ fn workflow_business_stage(step_id: &str) -> &'static str {
         "WX-PREPARE" => "准备",
         "DEV-LOOP" | "DEV-CODE" | "DEV-TEST" | "DEV-BUILD" | "DEV-REVIEW" => "开发",
         "WX-CONTEXT" => "工程校验",
+        "WX-BUILD" => "构建",
         "WX-CANDIDATE" => "候选冻结",
         "WX-PREVIEW" => "预览",
         "WX-UPLOAD" => "体验版",
@@ -5501,5 +6625,60 @@ mod tests {
             ),
             "无法进入项目工作区：注册 DSH 工作区失败（workspace-invalid-path）：path is invalid"
         );
+    }
+
+    /// 计划面是"加法"：老界面依赖的原字段必须原样保留，计划只能作为附加字段出现，
+    /// 否则加了统一计划就会把既有页面读的字段挤掉。
+    #[test]
+    fn operation_plan_is_attached_without_dropping_legacy_fields() {
+        #[derive(serde::Serialize)]
+        struct LegacyPreview {
+            ready: bool,
+            targets: Vec<String>,
+        }
+
+        let preview = serde_json::json!({
+            "kind": "plugin",
+            "id": "com.example.tools",
+            "name": "示例插件",
+            "version": "1.2.0",
+            "targets": ["github", "workbench"],
+            "github": {
+                "repository": "example/tools",
+                "tag": "v1.2.0",
+                "asset_name": "tools.hmpkg",
+                "manifest_name": "tools.json",
+                "size_bytes": 1024,
+                "sha256": "a".repeat(64),
+                "authorized": true
+            },
+            "workbench": {
+                "catalog_id": "catalog-1",
+                "channel": "stable",
+                "distribution_id": ""
+            }
+        });
+        let plan = crate::app::operation_plan::distribution_publish(&preview);
+        let legacy = LegacyPreview {
+            ready: true,
+            targets: vec!["github".to_string()],
+        };
+
+        let payload = super::with_operation_plan(&legacy, &plan).expect("统一计划载荷");
+        assert_eq!(payload["ready"], serde_json::Value::Bool(true));
+        assert_eq!(payload["targets"][0], "github");
+
+        let attached = &payload["plan"];
+        assert_eq!(
+            attached["schema_version"],
+            crate::app::operation_plan::PLAN_SCHEMA_VERSION
+        );
+        assert_eq!(attached["operation"], "publish");
+        assert_eq!(attached["capability"], "plugin");
+        assert_eq!(attached["item"]["name"], "示例插件");
+        // 落点是执行面的同一份规则：GitHub 是发布制品，工作台是提交审核。
+        assert_eq!(attached["targets"][0]["strategy"], "release");
+        assert_eq!(attached["targets"][1]["strategy"], "submit");
+        assert_eq!(attached["ready"], serde_json::Value::Bool(true));
     }
 }

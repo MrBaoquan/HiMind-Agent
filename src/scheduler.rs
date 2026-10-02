@@ -47,7 +47,8 @@ pub(crate) struct Schedule {
     /// 目标标识：Workflow 目标是 workflow_id。
     #[serde(default)]
     pub target_id: String,
-    /// Workflow 启动预设的来源标识；input 仍保存不可变快照，运行时不依赖预设文件。
+    /// Workflow 启动预设的来源标识。到点运行时按「预设当前值 + 这里的覆盖项」合并出参数：
+    /// 预设里改了工作区，引用它的计划会跟着变，不需要逐条计划再改一遍。
     #[serde(default)]
     pub preset_id: String,
     #[serde(default)]
@@ -380,6 +381,79 @@ fn schedule_json(item: &Schedule) -> Value {
     })
 }
 
+/// 计划引用预设时，身上那些「和预设当前值一样」的键只是建计划当天抄下来的副本。
+/// 删掉它不改变下一次运行用的值（本来就一样），却能让计划重新跟随预设：
+/// 否则用户改了预设里的工作区，计划还抱着一份旧副本，等于白改。
+fn drop_redundant_overrides(
+    item: &mut Schedule,
+    preset: &crate::workflow::WorkflowRunPreset,
+) -> bool {
+    let mut changed = false;
+    let preset_input = preset.input.as_object();
+    if let Some(input) = item.input.as_object_mut() {
+        let before = input.len();
+        input.retain(
+            |key, value| match preset_input.and_then(|base| base.get(key)) {
+                // 和预设同值 → 是副本，删掉；预设里没有这个键 → 是这条计划自己的覆盖，留着。
+                Some(base_value) => !same_param(value, base_value),
+                None => true,
+            },
+        );
+        changed |= input.len() != before;
+    }
+    for (current, preset_value) in [
+        (&mut item.execution.entrypoint, preset.entrypoint.as_str()),
+        (&mut item.execution.exitpoint, preset.exitpoint.as_str()),
+    ] {
+        if !current.is_empty() && current.trim() == preset_value.trim() {
+            current.clear();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 值比较抹平「数字/布尔 ↔ 表单往返后的字符串」这类同值不同型，
+/// 免得多余副本因为类型不同而留下来。
+fn same_param(left: &Value, right: &Value) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (Value::Number(_) | Value::Bool(_), Value::String(_))
+        | (Value::String(_), Value::Number(_) | Value::Bool(_)) => {
+            scalar_text(left) == scalar_text(right)
+        }
+        _ => false,
+    }
+}
+
+fn scalar_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 把所有计划的冗余覆盖项清一遍；返回是否有改动。
+/// 读路径只做这一种无损改写，写完文件里留下的才是「真正需要覆盖的东西」。
+fn compact_overrides(items: &mut [Schedule]) -> bool {
+    let presets = crate::workflow::load_run_presets().unwrap_or_default();
+    let mut changed = false;
+    for item in items.iter_mut() {
+        if item.kind != "workflow" || item.preset_id.trim().is_empty() {
+            continue;
+        }
+        let preset = presets
+            .iter()
+            .find(|preset| preset.id == item.preset_id && preset.workflow_id == item.target_id);
+        if let Some(preset) = preset {
+            changed |= drop_redundant_overrides(item, preset);
+        }
+    }
+    changed
+}
+
 /// 列出计划，并按需要补齐 `next_run_at`（例如计划写入后 Agent 重启过）。
 pub(crate) fn list(now: i64) -> Result<Value, Box<dyn Error>> {
     let mut items = load()?;
@@ -392,6 +466,8 @@ pub(crate) fn list(now: i64) -> Result<Value, Box<dyn Error>> {
             }
         }
     }
+    // 顺手把「抄自预设」的键清掉：这样用户改一次预设，所有引用它的计划都跟上。
+    changed |= compact_overrides(&mut items);
     if changed {
         save(&items)?;
     }
@@ -568,6 +644,37 @@ fn dispatch(
     }
 }
 
+/// 同目标是否还有没跑完的运行？
+///
+/// 计划到点就派发只看时间，不看上一次是否还在跑。对会改工作区的目标来说，上一次
+/// 没结束又开一次，等于让两个 Run 同时写同一份 `dist/`、上游锁和缓存，谁覆盖谁
+/// 全凭运气。派发前查一次运行台账，有在跑的就把这次到点顺延。
+///
+/// 只按计划目标（Workflow id）判断，不区分是谁启动的：手动跑的那次同样占着工作区。
+fn busy_run_for(workflow_id: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    busy_run_in(&ledger, workflow_id)
+}
+
+/// 台账查询本身单独抽出来，测试才能对着一个临时台账验证，不去碰真实 Agent 目录。
+fn busy_run_in(
+    ledger: &crate::store::local_runs::LocalRunLedger,
+    workflow_id: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    for run in ledger.list_runs(100)? {
+        if run.status.is_terminal() {
+            continue;
+        }
+        let Some(plan) = run.execution_plan.as_ref() else {
+            continue;
+        };
+        if plan.workflow_id == workflow_id {
+            return Ok(Some(run.run_id));
+        }
+    }
+    Ok(None)
+}
+
 /// 触发所有到点的计划：派发目标、记录结果、推进下一次时间。
 pub(crate) fn run_due(gateway: CapabilityGateway, now: i64) -> Result<Value, Box<dyn Error>> {
     let mut items = load()?;
@@ -588,34 +695,100 @@ pub(crate) fn run_due(gateway: CapabilityGateway, now: i64) -> Result<Value, Box
         if !run_input.is_object() {
             run_input = json!({});
         }
-        if !item.execution.entrypoint.is_empty() || !item.execution.exitpoint.is_empty() {
-            let execution = json!({
-                "entrypoint": item.execution.entrypoint,
-                "exitpoint": item.execution.exitpoint,
-            });
-            if let Some(object) = run_input.as_object_mut() {
-                object.insert("execution".to_string(), execution);
+        // 预设是这条计划的参数基线：到点按预设「当前」的那份值跑，计划里只留覆盖项。
+        // 用户改一次预设（例如项目换了目录），所有引用它的计划自动跟上，
+        // 而不是各自抱着一份建计划当天的陈旧快照。
+        let mut preset_entrypoint = String::new();
+        let mut preset_exitpoint = String::new();
+        let mut skip_reason = String::new();
+        if item.kind == "workflow" && !item.preset_id.trim().is_empty() {
+            match crate::workflow::find_run_preset(&item.target_id, &item.preset_id) {
+                Ok(Some(preset)) => {
+                    run_input = crate::workflow::merge_run_preset_input(&preset.input, &run_input);
+                    preset_entrypoint = preset.entrypoint.trim().to_string();
+                    preset_exitpoint = preset.exitpoint.trim().to_string();
+                }
+                Ok(None) => {
+                    // 预设被删掉、计划自己也没存参数：没有可用的输入，
+                    // 与其带着一份缺参数的请求去撞一次运行失败，不如把原因记在计划上。
+                    if run_input
+                        .as_object()
+                        .is_some_and(|object| object.is_empty())
+                    {
+                        skip_reason = format!(
+                            "引用的启动预设已不存在：{}。请重新选择预设，或把这套参数保存成计划自带的参数。",
+                            item.preset_id
+                        );
+                    }
+                }
+                Err(error) => {
+                    skip_reason = format!("读取启动预设失败：{error}");
+                }
+            }
+        }
+        if skip_reason.is_empty() {
+            // 入口/出口同样以预设为基线，计划里显式选过的才覆盖。
+            let entrypoint = if item.execution.entrypoint.trim().is_empty() {
+                preset_entrypoint
+            } else {
+                item.execution.entrypoint.clone()
+            };
+            let exitpoint = if item.execution.exitpoint.trim().is_empty() {
+                preset_exitpoint
+            } else {
+                item.execution.exitpoint.clone()
+            };
+            if !entrypoint.is_empty() || !exitpoint.is_empty() {
+                let execution = json!({ "entrypoint": entrypoint, "exitpoint": exitpoint });
+                if let Some(object) = run_input.as_object_mut() {
+                    object.insert("execution".to_string(), execution);
+                }
+            }
+        }
+        // 上一次没跑完就先不派发：顺延，不推进 next_run_at，也不记 last_run_at，
+        // 等它结束后下一个 tick 立刻补上——是「到点顺延」而不是「跳过这一次」。
+        if skip_reason.is_empty() && item.kind == "workflow" {
+            match busy_run_for(&item.target_id) {
+                Ok(Some(busy_run_id)) => {
+                    let note =
+                        format!("上一次运行（{busy_run_id}）还没结束，本次到点顺延，跑完立刻补上");
+                    // 同一条提示只写一次：每 30 秒 tick 重写一次文件没有意义。
+                    if item.last_error != note {
+                        item.last_error = note;
+                        changed = true;
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                // 台账读不出来不该拦住计划本身：记一笔，照常派发。
+                Err(error) => eprintln!("scheduler busy-check failed for {}: {error}", item.id),
             }
         }
         let context =
             InvocationContext::new(InvocationSource::Scheduler, format!("schedule:{}", item.id));
-        let outcome = dispatch(gateway.clone(), item, run_input, context);
         item.last_run_at = now.to_string();
-        match outcome {
-            Ok(value) => {
-                item.last_run_id = value
-                    .get("run_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.pointer("/run/run_id").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .to_string();
-                item.last_status = "accepted".to_string();
-                item.last_error.clear();
-            }
-            Err(error) => {
-                item.last_run_id.clear();
-                item.last_status = "failed".to_string();
-                item.last_error = error.to_string();
+        if !skip_reason.is_empty() {
+            item.last_run_id.clear();
+            item.last_status = "failed".to_string();
+            item.last_error = skip_reason;
+        } else {
+            let outcome = dispatch(gateway.clone(), item, run_input, context);
+            match outcome {
+                Ok(value) => {
+                    item.last_run_id = value
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.pointer("/run/run_id").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                    item.last_status = "accepted".to_string();
+                    item.last_error.clear();
+                }
+                Err(error) => {
+                    item.last_run_id.clear();
+                    item.last_status = "failed".to_string();
+                    item.last_error = error.to_string();
+                }
             }
         }
         match schedule_next_after(&item.cron, now) {
@@ -676,6 +849,10 @@ pub(crate) fn abandon_stale_runs() -> Result<usize, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_core_contracts::{
+        InteractionSource, InteractionTransport, LocalRun, LocalRunExecutionPlan, LocalRunStatus,
+        LOCAL_RUN_SCHEMA_VERSION,
+    };
 
     #[test]
     fn cron_accepts_standard_field_forms() {
@@ -745,5 +922,184 @@ mod tests {
         assert!(validate_target("shell", "ls").is_err());
         assert!(validate_target("", "anything").is_err());
         assert_eq!(SUPPORTED_TARGET_KINDS, &["workflow", "skill"]);
+    }
+
+    fn preset(
+        input: Value,
+        entrypoint: &str,
+        exitpoint: &str,
+    ) -> crate::workflow::WorkflowRunPreset {
+        crate::workflow::WorkflowRunPreset {
+            id: "preset-1".to_string(),
+            workflow_id: "wf.demo".to_string(),
+            label: "演示".to_string(),
+            input,
+            entrypoint: entrypoint.to_string(),
+            exitpoint: exitpoint.to_string(),
+            pinned: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn plan(input: Value, entrypoint: &str, exitpoint: &str) -> Schedule {
+        Schedule {
+            id: "plan-1".to_string(),
+            kind: "workflow".to_string(),
+            target_id: "wf.demo".to_string(),
+            preset_id: "preset-1".to_string(),
+            input,
+            execution: ScheduleExecution {
+                entrypoint: entrypoint.to_string(),
+                exitpoint: exitpoint.to_string(),
+            },
+            cron: "0 9 * * *".to_string(),
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_run_at: String::new(),
+            last_run_id: String::new(),
+            last_status: String::new(),
+            last_error: String::new(),
+            next_run_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn plan_follows_preset_and_only_keeps_real_overrides() {
+        // 建计划那天抄下来的整份副本：工作区、分支都和预设一样。
+        let mut item = plan(
+            json!({ "workspace_root": "F:/demo", "branch": "main", "topic": "日报" }),
+            "run.sh",
+            "",
+        );
+        let base = preset(
+            json!({ "workspace_root": "F:/demo", "branch": "main" }),
+            "run.sh",
+            "",
+        );
+        assert!(drop_redundant_overrides(&mut item, &base));
+        // 与预设同值的键被清掉（跟随预设），只有计划自己的覆盖项留下。
+        assert_eq!(item.input, json!({ "topic": "日报" }));
+        // 入口和预设一致 → 也清掉，回到跟随预设。
+        assert!(item.execution.entrypoint.is_empty());
+
+        // 已清理过一遍：再跑一次不该有改动，避免每次读都重写文件。
+        assert!(!drop_redundant_overrides(&mut item, &base));
+    }
+
+    #[test]
+    fn plan_keeps_values_that_differ_from_the_preset() {
+        let mut item = plan(
+            json!({ "workspace_root": "F:/other", "branch": "release" }),
+            "other.sh",
+            "notify.sh",
+        );
+        let base = preset(
+            json!({ "workspace_root": "F:/demo", "branch": "main" }),
+            "run.sh",
+            "notify.sh",
+        );
+        assert!(drop_redundant_overrides(&mut item, &base));
+        assert_eq!(
+            item.input,
+            json!({ "workspace_root": "F:/other", "branch": "release" })
+        );
+        assert_eq!(item.execution.entrypoint, "other.sh");
+        // 出口和预设同值 → 清掉。
+        assert!(item.execution.exitpoint.is_empty());
+    }
+
+    #[test]
+    fn override_compaction_tolerates_form_round_tripped_scalars() {
+        // 表单往返会把数字/布尔变成字符串，同值不同型也要认成副本，否则清不掉。
+        let mut item = plan(json!({ "shards": "4", "dry_run": "true" }), "", "");
+        let base = preset(json!({ "shards": 4, "dry_run": true }), "", "");
+        assert!(drop_redundant_overrides(&mut item, &base));
+        assert_eq!(item.input, json!({}));
+    }
+
+    fn busy_ledger() -> crate::store::local_runs::LocalRunLedger {
+        let root = std::env::temp_dir().join(format!(
+            "himind-scheduler-busy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::store::local_runs::LocalRunLedger::new(
+            root.join(crate::store::local_runs::LOCAL_RUN_DB_FILE),
+        )
+    }
+
+    fn workflow_run(status: LocalRunStatus, run_id: &str, workflow_id: &str) -> LocalRun {
+        LocalRun {
+            schema_version: LOCAL_RUN_SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            interaction_id: format!("int-{run_id}"),
+            parent_run_id: String::new(),
+            source: InteractionSource::Cron,
+            transport: InteractionTransport::Local,
+            status,
+            runtime_provider: "himind.builtin".to_string(),
+            workspace_ref: "F:/workspace".to_string(),
+            current_step_id: String::new(),
+            completion_mode: "partial".to_string(),
+            execution_plan: Some(LocalRunExecutionPlan {
+                workflow_id: workflow_id.to_string(),
+                execution_policy: "segmented".to_string(),
+                entrypoint: "sync".to_string(),
+                exitpoint: "published".to_string(),
+                entry_step_id: "step-1".to_string(),
+                exit_step_id: "step-2".to_string(),
+                active_step_ids: vec!["step-1".to_string(), "step-2".to_string()],
+                seed_artifacts: Vec::new(),
+                assumptions: Vec::new(),
+                plan_digest: "sha256:test".to_string(),
+            }),
+            steps: Vec::new(),
+            approvals: Vec::new(),
+            artifacts: Vec::new(),
+            usage: None,
+            error: String::new(),
+            created_at: "2026-09-28T00:00:00Z".to_string(),
+            updated_at: format!("2026-09-28T00:00:{:02}Z", run_id.len() % 60),
+        }
+    }
+
+    #[test]
+    fn busy_run_only_counts_unfinished_runs_of_the_same_workflow() {
+        let ledger = busy_ledger();
+        ledger
+            .save_run(&workflow_run(
+                LocalRunStatus::Running,
+                "run-busy",
+                "wf.sync",
+            ))
+            .unwrap();
+        ledger
+            .save_run(&workflow_run(
+                LocalRunStatus::Running,
+                "run-other",
+                "wf.other",
+            ))
+            .unwrap();
+
+        // 同一个工作流还没跑完 → 这条计划顺延；别的目标在跑不关它的事。
+        assert_eq!(
+            busy_run_in(&ledger, "wf.sync").unwrap().as_deref(),
+            Some("run-busy")
+        );
+        assert_eq!(
+            busy_run_in(&ledger, "wf.other").unwrap().as_deref(),
+            Some("run-other")
+        );
+
+        // 终态（成功/失败/取消）不再占着工作区，下一次到点照常派发。
+        let mut finished = workflow_run(LocalRunStatus::Succeeded, "run-busy", "wf.sync");
+        finished.updated_at = "2026-09-28T00:10:00Z".to_string();
+        ledger.save_run(&finished).unwrap();
+        assert_eq!(busy_run_in(&ledger, "wf.sync").unwrap(), None);
     }
 }

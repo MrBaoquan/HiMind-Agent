@@ -1,6 +1,6 @@
 [package]
 name = "himind-agent"
-version = "0.3.47"
+version = "0.3.48"
 edition = "2021"
 default-run = "himind-agent"
 
@@ -51,7 +51,17 @@ rand = "0.8"
 semver = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 jsonschema = { version = "0.26", default-features = false }
+# ACP 出站客户端走官方 SDK（Zed/agentclientprotocol），协议类型、JSON-RPC 分帧、
+# 请求路由与取消原语都由它维护，避免自研报文层与协议演进脱节。
+agent-client-protocol = "2.2"
+# SDK 的传输/执行原语建立在 futures 之上：出站 Sink、入站 Stream 与 block_on。
+futures = "0.3"
+# 备份包的口令加密：PBKDF2-HMAC-SHA256 派生密钥 + AES-256-GCM 认证加密。
+# 纯 Rust 实现，没有 C 编译依赖；与 DPAPI（只对当前 Windows 用户可解）
+# 互补——DPAPI 负责本机落盘，这里负责让凭据能跨机器搬走。
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

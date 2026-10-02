@@ -237,7 +237,9 @@ fn write_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
     let mut content = String::new();
     for entry in walkdir::WalkDir::new(root).min_depth(1) {
         let entry = entry?;
-        if entry.file_type().is_file() && entry.file_name() != "checksums.sha256" {
+        if entry.file_type().is_file()
+            && !crate::app::local_package::is_checksums_file(&entry.file_name().to_string_lossy())
+        {
             let relative = entry
                 .path()
                 .strip_prefix(root)?
@@ -249,7 +251,10 @@ fn write_checksums(root: &Path) -> Result<(), Box<dyn Error>> {
             ));
         }
     }
-    fs::write(root.join("checksums.sha256"), content)?;
+    fs::write(
+        root.join(crate::app::local_package::CHECKSUMS_FILE),
+        content,
+    )?;
     Ok(())
 }
 
@@ -582,8 +587,14 @@ pub(crate) fn submit(
 ) -> Result<PluginDraft, Box<dyn Error>> {
     let mut draft = read(plugin_id, version)?;
     ensure_ready_to_submit(&draft)?;
+    // 分发目标门禁：只有把工件交给组织工作台的项目才允许提审。
+    crate::extension_projects::ensure_distribution_target(
+        crate::extension_projects::ExtensionProjectKind::Plugin,
+        plugin_id,
+        crate::extension_contracts::DistributionTarget::Workbench,
+    )?;
     if agent_id.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let access = crate::api::oauth::platform_access_token(
         options,
@@ -603,7 +614,7 @@ pub(crate) fn submit(
     )?;
     let submitted = crate::api::distribution::submit_plugin(
         &client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &access.token,
         &draft.candidate_path,
@@ -622,7 +633,14 @@ pub(crate) fn submit(
 }
 
 fn ensure_ready_to_submit(draft: &PluginDraft) -> Result<(), Box<dyn Error>> {
-    ensure_candidate_unchanged(draft)
+    ensure_candidate_unchanged(draft)?;
+    if draft.tested_at.is_none() {
+        return Err("插件候选包尚未完成测试".into());
+    }
+    if draft.confirmed_at.is_none() {
+        return Err("插件 Candidate 尚未确认".into());
+    }
+    Ok(())
 }
 
 fn read_archive_manifest(path: &Path) -> Result<PluginManifest, Box<dyn Error>> {
@@ -803,9 +821,10 @@ mod tests {
         assert!(fs::read_to_string(&development_registry)
             .unwrap()
             .contains("com.himind.authoring-test"));
-        assert!(ensure_ready_to_submit(&saved).is_ok());
+        assert!(ensure_ready_to_submit(&saved).is_err());
         let tested = test(&saved.manifest.id, &saved.manifest.version).unwrap();
         assert!(tested.tested_at.is_some());
+        assert!(ensure_ready_to_submit(&tested).is_err());
         let confirmed = confirm(&saved.manifest.id, &saved.manifest.version).unwrap();
         assert!(confirmed.confirmed_at.is_some());
         assert!(ensure_ready_to_submit(&confirmed).is_ok());

@@ -105,7 +105,7 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
         "agent": {
             "version": VERSION,
             "profile": crate::store::paths::profile_name(),
-            "api_base": sanitized_api_base(&options.api_base),
+            "api_base": sanitized_api_base(&options.api_base()),
             "local_port": options.local_port,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
@@ -121,7 +121,8 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
         "storage": {
             "state_file_exists": state_file.is_file(),
             "state_backup_exists": crate::store::atomic_file::backup_path(state_file).is_file(),
-            "authorization_file_exists": state_file.with_file_name("agent-user-authorization.json").is_file(),
+            "authorization_file_exists":
+                crate::api::oauth::authorization_path(state_file).is_file(),
         },
         "device_identity": state,
         "user_authorization": authorization,
@@ -187,9 +188,11 @@ mod tests {
         )
         .unwrap();
         let options = Options {
-            api_base: "http://user:password@127.0.0.1:18083?token=secret".to_string(),
+            api_base: crate::api_base_cell("http://user:password@127.0.0.1:18083?token=secret"),
             state_path,
-            effective_mode: crate::app::runtime_mode::AgentMode::Connected,
+            workbench_mode: crate::app::runtime_mode::mode_cell(
+                crate::app::runtime_mode::AgentMode::Connected,
+            ),
             once: false,
             interval_seconds: 10,
             local_app: true,

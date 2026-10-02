@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -37,14 +37,16 @@ mod extension_contracts;
 mod extension_projects;
 mod extension_workspace;
 mod install_layout;
+mod local_activity;
 mod mcp;
+mod path_guard;
 mod plugin_authoring;
 mod remote;
 mod runtime;
 mod scan;
+mod scheduler;
 mod skill;
 mod skill_run;
-mod scheduler;
 mod store;
 mod svn;
 mod upload;
@@ -79,7 +81,7 @@ use svn::types::{
     SvnCheckoutRequest,
 };
 use upload::smb::execute_smb_upload;
-use upload::tasks::{execute_upload_code, execute_upload_placeholder};
+use upload::tasks::{execute_backup_run, execute_upload_code, execute_upload_placeholder};
 
 // Keep the runtime health version aligned with the version stamped into the
 // updater package. Cargo is the source of truth for both binaries.
@@ -115,10 +117,16 @@ fn protocol_open_requested(args: &[String]) -> bool {
 
 fn main() {
     configure_process_stacks();
-    let options = Options::from_env();
     let arguments = env::args().collect::<Vec<_>>();
     let mcp_mode = should_run_mcp(env!("CARGO_BIN_NAME"), &arguments);
     let acp_mode = should_run_acp(&arguments);
+    // Must run before `Options::from_env()`: that is where the state path — and
+    // with it every other path of this process — is derived from the profile.
+    apply_startup_profile(
+        &arguments,
+        !mcp_mode && !acp_mode && cli_subcommand(&arguments).is_none(),
+    );
+    let options = Options::from_env();
     if let Err(error) = app::extension_lock::recover() {
         eprintln!("extension transaction recovery failed: {error}");
     }
@@ -167,7 +175,7 @@ fn main() {
             std::process::exit(1);
         }
     } else if let Some(arguments) = extension_cli_arguments() {
-        if let Err(error) = run_extension_cli(&arguments) {
+        if let Err(error) = run_extension_cli(&options, &arguments) {
             eprintln!("extension command failed: {error}");
             std::process::exit(1);
         }
@@ -179,6 +187,11 @@ fn main() {
     } else if let Some(arguments) = plugin_cli_arguments() {
         if let Err(error) = run_plugin_cli(&options, &arguments) {
             eprintln!("plugin command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = market_cli_arguments() {
+        if let Err(error) = run_market_cli(&options, &arguments) {
+            eprintln!("market command failed: {error}");
             std::process::exit(1);
         }
     } else if let Some(arguments) = credential_cli_arguments() {
@@ -257,20 +270,145 @@ fn should_run_mcp(binary_name: &str, arguments: &[String]) -> bool {
         || arguments.iter().any(|argument| argument == "--mcp")
 }
 
+/// The value that follows `name`, if the flag appears exactly once.
+fn flag_value<'a>(arguments: &'a [String], name: &str) -> Option<&'a str> {
+    let mut indexes = arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.as_str() == name)
+        .map(|(index, _)| index);
+    let index = indexes.next()?;
+    if indexes.next().is_some() {
+        return None;
+    }
+    arguments.get(index + 1).map(String::as_str)
+}
+
+/// Resolve the Agent profile before anything reads `agent_home()`.
+///
+/// Two things have to happen before `Options::from_env()` builds the state
+/// path, because that is the first `agent_home()` call of the process:
+///
+/// 1. Pick the profile. An explicit selector wins; without one the executable
+///    decides, so a build output runs as `development` instead of opening the
+///    installed Agent's data root.
+/// 2. Refuse the one combination that is never intentional: an installed
+///    `production` profile coming from a binary that is not an installation.
+///    That is exactly how a development session erased a production identity,
+///    and `--profile`/`HIMIND_AGENT_HOME` are the deliberate ways to ask for it
+///    instead.
+///
+/// The resolved name is written into `HIMIND_AGENT_PROFILE`, so every existing
+/// reader — including the MCP companion this process spawns — agrees on it.
+fn apply_startup_profile(arguments: &[String], interactive: bool) {
+    let executable = env::current_exe().unwrap_or_default();
+    let requested = flag_value(arguments, "--profile");
+    if let Some(requested) = requested {
+        if store::paths::normalize_profile(requested).is_none() {
+            let message = format!("--profile 的名称不合法：{requested}");
+            eprintln!("HiMind Agent 拒绝启动：{message}");
+            if interactive {
+                app::crash::show_startup_notice("HiMind Agent 无法启动", &message);
+            }
+            std::process::exit(2);
+        }
+    }
+    let (profile, source) = store::paths::resolve_profile(requested, &executable);
+    let installed = install_layout::executable_is_installed(&executable);
+    if !installed
+        && store::paths::is_production_profile(&profile)
+        && store::paths::explicit_agent_home().is_none()
+    {
+        let message = format!(
+            "这个 himind-agent.exe 不是安装版（{}），不能运行 production profile：\n\
+             继续启动会打开并改写本机已安装 Agent 的数据目录。\n\n\
+             开发请使用：--profile development\n\
+             或运行 scripts\\development\\start-agent.ps1。\n\
+             确实要指定数据目录时，请同时设置 HIMIND_AGENT_HOME。",
+            executable.display()
+        );
+        eprintln!("HiMind Agent 拒绝启动：{message}");
+        if interactive {
+            app::crash::show_startup_notice("HiMind Agent 无法启动", &message);
+        }
+        std::process::exit(2);
+    }
+    store::paths::apply_profile(&profile);
+    if source.inferred() && !installed {
+        eprintln!(
+            "HiMind Agent: 非安装版可执行文件，使用 {profile} profile（数据目录 {}）。",
+            store::paths::agent_home().display()
+        );
+    }
+}
+
 fn should_run_acp(arguments: &[String]) -> bool {
     arguments.get(1).is_some_and(|argument| argument == "acp")
 }
 
-fn trust_cli_arguments() -> Option<Vec<String>> {
+/// 取第一个位置参数（子命令）及其下标，跳过选项名和它们的取值。
+///
+/// 直接在全量参数里 `position(|v| v == "skill")` 会误判：`market search --kind
+/// skill` 里的 `--kind skill` 取值 `skill` 会被当成 `skill` 子命令，于是市场命令
+/// 永远走不到。这里按“选项 + 取值”成对跳过，只认第一个裸参数。
+fn cli_subcommand(arguments: &[String]) -> Option<(usize, &str)> {
+    // 会吃掉下一个参数的选项；不在表里的选项按布尔开关处理。
+    const VALUE_FLAGS: &[&str] = &[
+        "--api",
+        "--profile",
+        "--state",
+        "--interval",
+        "--local-port",
+        "--mode",
+        "--protocol-url",
+        "--workspace",
+        "--kind",
+        "--id",
+        "--version",
+        "--source",
+        "--query",
+        "--category",
+        "--limit",
+        "--cursor",
+        "--client",
+        "--artifact-id",
+        "--sha256",
+        "--env",
+        "--manifest",
+        "--name",
+        "--plugin-id",
+        "--view-id",
+        "--permission",
+        "--reason",
+    ];
+    let mut index = 1;
+    while index < arguments.len() {
+        let token = arguments[index].as_str();
+        if token.starts_with('-') {
+            index += if VALUE_FLAGS.contains(&token) { 2 } else { 1 };
+            continue;
+        }
+        return Some((index, token));
+    }
+    None
+}
+
+/// 命令行入口的参数：只有第一个位置参数等于 `command` 时才返回它后面的参数。
+fn cli_command_arguments(command: &str) -> Option<Vec<String>> {
     let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "trust")?;
+    let (index, token) = cli_subcommand(&arguments)?;
+    if token != command {
+        return None;
+    }
     Some(arguments[index + 1..].to_vec())
 }
 
+fn trust_cli_arguments() -> Option<Vec<String>> {
+    cli_command_arguments("trust")
+}
+
 fn engineering_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "engineering")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("engineering")
 }
 
 fn run_engineering_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -451,15 +589,19 @@ fn run_trust_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn 
 }
 
 fn auth_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "auth")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("auth")
 }
 
 fn run_auth_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments.first().map(String::as_str) {
         Some("login") => {
-            let authorization = api::oauth::begin_device_authorization(options)?;
+            let mut authorization = api::oauth::begin_device_authorization(options)?;
+            // 与界面授权同一套规则：确认页必须落在 --api 指定的 Dashboard 上。
+            if let Some(message) =
+                api::oauth::align_authorization_urls(&options.api_base(), &mut authorization)
+            {
+                println!("Warning: {message}");
+            }
             println!("Open {}", authorization.verification_uri_complete);
             println!("Verification page: {}", authorization.verification_uri);
             println!("Authorization code: {}", authorization.user_code);
@@ -502,14 +644,14 @@ fn run_auth_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn E
             let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
             let state = api::client::load_or_register(
                 &client,
-                &options.api_base,
+                &options.api_base(),
                 &options.state_path,
                 VERSION,
                 &options.enrollment_token,
             )?;
             let rotated = api::client::rotate_agent_credential(
                 &client,
-                &options.api_base,
+                &options.api_base(),
                 &options.state_path,
                 &state,
             )?;
@@ -526,33 +668,195 @@ fn run_auth_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn E
 }
 
 fn plugin_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "plugin")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("plugin")
 }
 
 fn skill_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "skill")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("skill")
+}
+
+fn market_cli_arguments() -> Option<Vec<String>> {
+    cli_command_arguments("market")
+}
+
+/// 市场命令行入口：搜索、盘点、计划、安装。
+///
+/// 与 MCP 的 `market.*` 共用同一份 [`app::market`] 实现，CLI 不引入第二套安装语义。
+/// `--workspace` / `--global` 只对技能的计划与安装有意义，语义与 `skill` 子命令一致。
+fn run_market_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut action = None;
+    let mut input = serde_json::Map::new();
+    let mut location = None;
+    let mut global = false;
+    let mut targets: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let value = arguments[index].as_str();
+        let next = |offset: usize| -> Result<String, Box<dyn Error>> {
+            arguments
+                .get(index + offset)
+                .cloned()
+                .ok_or_else(|| format!("{value} 缺少参数值").into())
+        };
+        match value {
+            "search" | "installed" | "plan" | "install" if action.is_none() => {
+                action = Some(value.to_string());
+                index += 1;
+            }
+            "--kind" => {
+                input.insert("kind".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--id" => {
+                input.insert("id".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--version" => {
+                input.insert("version".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--source" => {
+                input.insert("source".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--query" => {
+                input.insert("query".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--category" => {
+                input.insert("category".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--limit" => {
+                input.insert(
+                    "limit".to_string(),
+                    serde_json::Value::from(next(1)?.parse::<u64>()?),
+                );
+                index += 2;
+            }
+            "--cursor" => {
+                input.insert(
+                    "cursor".to_string(),
+                    serde_json::Value::from(next(1)?.parse::<u64>()?),
+                );
+                index += 2;
+            }
+            "--artifact-id" => {
+                input.insert("artifact_id".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--sha256" => {
+                input.insert("sha256".to_string(), serde_json::Value::from(next(1)?));
+                index += 2;
+            }
+            "--client" => {
+                targets.push(next(1)?.to_ascii_lowercase());
+                index += 2;
+            }
+            "--dry-run" => {
+                input.insert("dry_run".to_string(), serde_json::Value::Bool(true));
+                index += 1;
+            }
+            "--workspace" => {
+                let path = next(1)?;
+                if global {
+                    return Err("--workspace 与 --global 不能同时使用".into());
+                }
+                location = Some(crate::skill::target::canonical_workspace_root(
+                    std::path::Path::new(&path),
+                )?);
+                index += 2;
+            }
+            "--global" => {
+                if location.is_some() {
+                    return Err("--workspace 与 --global 不能同时使用".into());
+                }
+                global = true;
+                index += 1;
+            }
+            // 全局选项已经由 `Options::from_env` 解析过，这里只是把它们的取值也
+            // 跳过，好让 `market search --kind skill --state <path>` 这种把全局
+            // 选项写在子命令之后的自然写法不被当成未知参数拒绝。
+            "--api" | "--state" | "--mode" | "--interval" | "--local-port" => {
+                let _ = next(1)?;
+                index += 2;
+            }
+            "--once" | "--local-app" | "--reenroll" => {
+                index += 1;
+            }
+            other => {
+                // 位置参数：`plan <kind> <id>` / `install <kind> <id>` 的自然写法。
+                if input.get("kind").is_none() {
+                    input.insert("kind".to_string(), serde_json::Value::from(other));
+                } else if input.get("id").is_none() {
+                    input.insert("id".to_string(), serde_json::Value::from(other));
+                } else {
+                    return Err(format!("无法识别的参数: {other}").into());
+                }
+                index += 1;
+            }
+        }
+    }
+    if let Some(root) = location {
+        input.insert(
+            "workspace_root".to_string(),
+            serde_json::Value::from(root.to_string_lossy().to_string()),
+        );
+    }
+    if !targets.is_empty() {
+        input.insert(
+            "target_clients".to_string(),
+            serde_json::Value::Array(
+                targets
+                    .into_iter()
+                    .map(serde_json::Value::from)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    let input = serde_json::Value::Object(input);
+    let agent_id = paired_agent_id_or_empty(options);
+    let value = match action.as_deref() {
+        Some("search") => app::market::search(options, &agent_id, &input)?,
+        Some("installed") => app::market::installed(&input)?,
+        Some("plan") => app::market::plan(options, &agent_id, &input)?,
+        Some("install") => app::market::install(
+            options,
+            &agent_id,
+            &input,
+            crate::capability::types::InvocationSource::Cli,
+        )?,
+        _ => {
+            return Err(
+                "usage: himind-agent market <search|installed|plan|install> [--kind skill|plugin|workflow] [--id <id>] [--version <version>] [--source <source>] [--query <text>] [--category <name>] [--limit <n>] [--cursor <n>] [--client <client-id>] [--workspace <project-root>|--global] [--dry-run]".into(),
+            )
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+/// 市场命令在未授权时仍然可用：本地与 GitHub 扩展源不依赖工作台。
+fn paired_agent_id_or_empty(options: &Options) -> String {
+    match crate::api::client::load_agent_state(&options.state_path) {
+        Ok(state) => {
+            options.set_agent_credential(&state.credential);
+            state.agent_id
+        }
+        Err(_) => String::new(),
+    }
 }
 
 fn extension_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "extension")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("extension")
 }
 
 fn workflow_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "workflow")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("workflow")
 }
 
 fn schedule_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "schedule")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("schedule")
 }
 
 /// 平台级定时任务的命令行入口，便于验收与排障。
@@ -574,19 +878,21 @@ fn run_schedule_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
             );
         }
         [action, id] if action == "delete" => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&scheduler::delete(id)?)?
-            );
+            println!("{}", serde_json::to_string_pretty(&scheduler::delete(id)?)?);
         }
         [action] if action == "tick" => {
             let gateway = capability::service::CapabilityGateway::new(
                 options.clone(),
-                Arc::new(std::sync::Mutex::new(store::types::LocalWorkerStatus::default())),
+                Arc::new(std::sync::Mutex::new(
+                    store::types::LocalWorkerStatus::default(),
+                )),
             );
             println!(
                 "{}",
-                serde_json::to_string_pretty(&scheduler::run_due(gateway, scheduler::now_epoch())?)?
+                serde_json::to_string_pretty(&scheduler::run_due(
+                    gateway,
+                    scheduler::now_epoch()
+                )?)?
             );
         }
         _ => {
@@ -597,21 +903,15 @@ fn run_schedule_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
 }
 
 fn credential_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "credential")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("credential")
 }
 
 fn connector_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "connector")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("connector")
 }
 
 fn approval_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "approval")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("approval")
 }
 
 fn run_approval_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -855,7 +1155,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                 .build()?;
             let items = api::distribution::workflow_catalog(
                 &client,
-                &options.api_base,
+                &options.api_base(),
                 &state.agent_id,
                 &state.credential,
             )?;
@@ -899,6 +1199,69 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                 )?)?
             );
         }
+        [action, rest @ ..] if action == "projection-requeue" => {
+            // 死信以前只能靠内部循环里的一个 401 片段自动重投，契约类故障没有恢复入口。
+            let (mut all, mut drain, mut reason) = (false, false, None::<String>);
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--all" => all = true,
+                    "--drain" => drain = true,
+                    "--reason" => {
+                        let value = rest.get(index + 1).ok_or("--reason 需要一个错误片段参数")?;
+                        reason = Some(value.clone());
+                        index += 1;
+                    }
+                    other => {
+                        return Err(format!("unknown projection-requeue option: {other}").into())
+                    }
+                }
+                index += 1;
+            }
+            if all && reason.is_some() {
+                return Err("projection-requeue: --all 与 --reason 只能选一个".into());
+            }
+            let mut payload = if all {
+                serde_json::to_value(agent_core_projection::requeue_dead_letter_projections(
+                    None,
+                )?)?
+            } else if let Some(fragment) = reason.as_deref() {
+                serde_json::to_value(agent_core_projection::requeue_dead_letter_projections(
+                    Some(fragment),
+                )?)?
+            } else {
+                // 不带范围时只做体检：先把当前死信按原因列清楚，再由调用方决定重投范围。
+                let status = agent_core_projection::projection_sync_status(options)?;
+                let groups = store::local_runs::LocalRunLedger::open_default()?
+                    .dead_letter_projection_groups(5)?;
+                json!({
+                    "requeued": 0,
+                    "dead_letter_before": status.dead_letter,
+                    "dead_letter_after": status.dead_letter,
+                    "pending_after": status.pending,
+                    "remaining_reasons": groups,
+                    "hint": "用 --all 重投全部死信，或用 --reason <片段> 只重投命中该片段的记录；加 --drain 可在重投后立即排空队列",
+                })
+            };
+            if drain {
+                let report = agent_core_projection::drain_pending_projections(options, 200)?;
+                let status = agent_core_projection::projection_sync_status(options)?;
+                let groups = store::local_runs::LocalRunLedger::open_default()?
+                    .dead_letter_projection_groups(5)?;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("drain".to_string(), serde_json::to_value(report)?);
+                    // 顶层字段一律描述「这条命令结束后」的状态：加了 --drain 就别再让人去分辨
+                    // 哪一层数字才是重投后的最终值。
+                    object.insert("dead_letter_after".to_string(), json!(status.dead_letter));
+                    object.insert("pending_after".to_string(), json!(status.pending));
+                    object.insert(
+                        "remaining_reasons".to_string(),
+                        serde_json::to_value(groups)?,
+                    );
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
         [action] if action == "recover" => {
             let ledger = store::local_runs::LocalRunLedger::open_default()?;
             let recovered = ledger.recover_running_runs(false, 100)?;
@@ -912,7 +1275,10 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         [action] if action == "abandon-stale" => {
             // 与 Agent 启动时的自动收尾同一实现：租约过期的运行直接给终态。
             let count = scheduler::abandon_stale_runs()?;
-            println!("{}", serde_json::to_string_pretty(&json!({ "abandoned": count }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "abandoned": count }))?
+            );
         }
         [action] | [action, _] if action == "dispatch" => {
             let limit = workflow_dispatch_limit(arguments);
@@ -1135,7 +1501,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
         }
         _ => {
             return Err(
-                "usage: himind-agent workflow <author-save <dir>|author-test <id> <version>|author-confirm <id> <version>|validate <dir>|doctor <dir|id> [input-json|@file]|package <dir> [output.hmwf]|sign <dir> [output.hmwf]|install-archive <path> [--require-signature]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file] [feedback]|dispatch [limit]|runs|metrics|projection-status|recover [--force]|show <run-id>|verify-run <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
+                "usage: himind-agent workflow <author-save <dir>|author-test <id> <version>|author-confirm <id> <version>|validate <dir>|doctor <dir|id> [input-json|@file]|package <dir> [output.hmwf]|sign <dir> [output.hmwf]|install-archive <path> [--require-signature]|install <dir> [--require-signature]|remote-list|remote-install <id> [version]|list|run <dir|id> [input-json|@file]|resume <run-id> [input-json|@file] [feedback]|dispatch [limit]|runs|metrics|projection-status|projection-requeue [--all|--reason <fragment>] [--drain]|recover [--force]|show <run-id>|verify-run <run-id>|approve <run-id> <step-id>|reject <run-id> <step-id>|cancel <run-id>|enable <id>|disable <id>|rollback <id>|remove <id>>"
                     .into(),
             );
         }
@@ -1262,6 +1628,25 @@ fn package_workflow_archive(
                 staging.join("manifest.sig"),
                 serde_json::to_vec_pretty(&metadata)?,
             )?;
+            // 产物必须能被本机 Agent 读回：先用读取侧同一套校验自验一次，
+            // 否则私钥能签、公钥不受信时照样会产出一个装完就读取失败的坏包。
+            app::system::verify_extension_artifact_signature(
+                &staging.join("checksums.sha256"),
+                metadata
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                key_id,
+                "rsa-pss-sha256",
+                true,
+            )
+            .map_err(|error| {
+                format!(
+                    "workflow signing key {key_id} 产出的签名无法被本机校验通过：{error}。\
+                     请把对应公钥放入 HIMIND_TRUSTED_SIGNING_KEYS_DIR（文件名 {key_id}.pem），\
+                     或改用本机已有受信公钥的 key id 重新打包。"
+                )
+            })?;
             Some(metadata)
         } else {
             None
@@ -1450,14 +1835,87 @@ fn workflow_installation_json(item: &workflow::InstalledWorkflow) -> Value {
     })
 }
 
+/// 把确认这一步也做成可脚本化动作：提审要求候选制品先被确认，
+/// GUI 与 CLI 走同一实现，避免两套语义。
+fn draft_confirm_value(
+    kind: &str,
+    id: &str,
+    version: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    match kind {
+        "plugin" => Ok(serde_json::to_value(crate::plugin_authoring::confirm(
+            id, version,
+        )?)?),
+        "skill" => Ok(serde_json::to_value(crate::skill::authoring::confirm(
+            id, version,
+        )?)?),
+        "workflow" => Ok(serde_json::to_value(
+            crate::workflow::confirm_authoring_candidate(id, version)?,
+        )?),
+        _ => Err("扩展类型必须是 plugin、skill 或 workflow".into()),
+    }
+}
+
 /// Local, scriptable view of the extension sources.
 ///
 /// The development workspace is driven from the UI, but source management is
 /// also needed from shells and verification scripts: listing and refreshing the
 /// snapshot, adding or removing a source, planning an install and reading
 /// provenance.  Every action returns the same JSON the UI consumes.
-fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+fn run_extension_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments {
+        // 提审链路：列出草稿与提交状态，便于验收与排障，不必依赖 GUI。
+        [group, action] if group == "draft" && action == "list" => {
+            let drafts = serde_json::json!({
+                "plugins": crate::plugin_authoring::list()?,
+                "skills": crate::skill::authoring::list()?,
+                "workflows": crate::workflow::list_authoring_drafts()?,
+            });
+            println!("{}", serde_json::to_string_pretty(&drafts)?);
+        }
+        // submit 只对有候选制品且已测试通过的草稿生效；CLI 默认拒绝执行，
+        // 必须显式加 --yes（与 GUI 的确认框同一条同意门）。
+        [group, action, kind, id, version] if group == "draft" && action == "confirm" => {
+            let value = draft_confirm_value(kind, id, version)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        [group, action, kind, id, version] | [group, action, kind, id, version, _]
+            if group == "draft" && action == "submit" =>
+        {
+            if !arguments.iter().any(|value| value == "--yes")
+                && env::var("HIMIND_AGENT_SUBMIT_CONFIRM").as_deref() != Ok("1")
+            {
+                return Err(
+                    "提交候选制品需要显式确认：加 --yes 或设置 HIMIND_AGENT_SUBMIT_CONFIRM=1"
+                        .into(),
+                );
+            }
+            let state = api::client::load_agent_state(&options.state_path)
+                .map_err(|error| format!("读取 HiMind 账号授权状态失败：{error}"))?;
+            options.set_agent_credential(&state.credential);
+            let value = match kind.as_str() {
+                "plugin" => serde_json::to_value(crate::plugin_authoring::submit(
+                    options,
+                    &state.agent_id,
+                    id,
+                    version,
+                )?)?,
+                "skill" => serde_json::to_value(crate::skill::authoring::submit(
+                    options,
+                    &state.agent_id,
+                    id,
+                    version,
+                )?)?,
+                "workflow" => serde_json::to_value(crate::workflow::submit_authoring_candidate(
+                    options,
+                    &state.agent_id,
+                    id,
+                    version,
+                )?)?,
+                _ => return Err("扩展类型必须是 plugin、skill 或 workflow".into()),
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
         [source, action] if source == "source" && action == "list" => {
             println!(
                 "{}",
@@ -1526,14 +1984,15 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             println!("{}", serde_json::to_string_pretty(&settings)?);
         }
         // 取用侧决定单元按哪一侧安装。默认 local，显式写 remote 才会落盘。
-        [source, action, unit_key, acquisition] if source == "source" && action == "acquisition" => {
+        [source, action, unit_key, acquisition]
+            if source == "source" && action == "acquisition" =>
+        {
             let acquisition = match acquisition.as_str() {
                 "local" => app::extension_source::ExtensionSourceAcquisition::Local,
                 "remote" => app::extension_source::ExtensionSourceAcquisition::Remote,
                 other => return Err(format!("取用侧必须是 local 或 remote，收到: {other}").into()),
             };
-            let settings =
-                app::extension_source::set_unit_acquisition(unit_key, acquisition)?;
+            let settings = app::extension_source::set_unit_acquisition(unit_key, acquisition)?;
             println!("{}", serde_json::to_string_pretty(&settings)?);
         }
         [source, action, kind, id] if source == "source" && action == "plan" => {
@@ -1577,6 +2036,393 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 serde_json::to_string_pretty(&app::extension_source::list_provenance()?)?
             );
         }
+        // 分发目标：项目级覆盖与分发单元级默认。`inherit` 表示清除覆盖。
+        [group, action, verb] if group == "project" && action == "target" && verb == "list" => {
+            let projects = crate::extension_projects::list()?
+                .into_iter()
+                .map(|project| {
+                    let unit_targets = crate::extension_projects::unit_distribution_targets_for(
+                        project.kind,
+                        &project.extension_id,
+                    );
+                    serde_json::json!({
+                        "project_id": project.id,
+                        "kind": project.kind.as_str(),
+                        "id": project.extension_id,
+                        "name": project.name,
+                        "unit_key": project.source_unit_key,
+                        "targets": project
+                            .distribution_targets
+                            .iter()
+                            .map(|target| target.as_str())
+                            .collect::<Vec<_>>(),
+                        "source": project.distribution_targets_source,
+                        "declared_targets": project
+                            .distribution_targets_declared
+                            .iter()
+                            .map(|target| target.as_str())
+                            .collect::<Vec<_>>(),
+                        "unit_targets": unit_targets
+                            .iter()
+                            .map(|target| target.as_str())
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "projects": projects,
+                    "available_targets": ["workbench", "github"],
+                    "default_targets": ["workbench"],
+                }))?
+            );
+        }
+        [group, action, verb, kind, id, targets]
+            if group == "project" && action == "target" && verb == "set" =>
+        {
+            let kind = crate::extension_projects::ExtensionProjectKind::parse(kind)?;
+            let targets = cli_distribution_targets(targets)?;
+            let project =
+                crate::extension_projects::set_distribution_targets(kind, id, targets.as_deref())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "project_id": project.id,
+                    "kind": project.kind.as_str(),
+                    "id": project.extension_id,
+                    "targets": project
+                        .distribution_targets
+                        .iter()
+                        .map(|target| target.as_str())
+                        .collect::<Vec<_>>(),
+                    "source": project.distribution_targets_source,
+                }))?
+            );
+        }
+        // GitHub 分发凭据：token 只经本机校验后加密落盘，不接受未验证的登录名。
+        [group, action] if group == "github" && action == "status" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::store::github_credentials::status()?)?
+            );
+        }
+        [group, action, token] if group == "github" && action == "set" => {
+            let identity = app::github_publisher::verify_token(token)?;
+            let account =
+                crate::store::github_credentials::set_account(&identity.login, token, "", &[])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "account": account,
+                    "identity": { "login": identity.login, "id": identity.id },
+                }))?
+            );
+        }
+        [group, action, token, repositories] if group == "github" && action == "set" => {
+            let identity = app::github_publisher::verify_token(token)?;
+            let repositories = repositories
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let account = crate::store::github_credentials::set_account(
+                &identity.login,
+                token,
+                "",
+                &repositories,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "account": account,
+                    "identity": { "login": identity.login, "id": identity.id },
+                }))?
+            );
+        }
+        [group, action, word] if group == "github" && action == "remove" && word == "--yes" => {
+            let removed = crate::store::github_credentials::remove()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "removed": removed,
+                    "account": crate::store::github_credentials::status()?,
+                }))?
+            );
+        }
+        // GitHub App 授权：设备流需要一个已注册的 App client_id。
+        [group, action] if group == "github" && action == "app-start" => {
+            let client_id = app::github_app::configured_client_id();
+            let authorization = app::github_app::start_device_flow(&client_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "authorization": authorization,
+                    "client_id": client_id,
+                    "next_steps": [
+                        "在浏览器打开 verification_uri 并输入 user_code",
+                        "随后用 extension github app-poll <device_code> 完成授权"
+                    ],
+                }))?
+            );
+        }
+        [group, action, device_code] if group == "github" && action == "app-poll" => {
+            let client_id = app::github_app::configured_client_id();
+            let outcome = app::github_app::poll_device_flow(&client_id, device_code)?;
+            match outcome {
+                app::github_app::DevicePollOutcome::Authorized(token) => {
+                    let record = crate::store::github_credentials::GithubAppRecord {
+                        login: String::new(),
+                        client_id: client_id.clone(),
+                        installation_id: String::new(),
+                        installation_account: String::new(),
+                        user_token: token.access_token.clone(),
+                        refresh_token: token.refresh_token.clone(),
+                        user_token_expires_at: (app::github_app::now_epoch() + token.expires_in)
+                            .to_string(),
+                    };
+                    crate::store::github_credentials::save_app_state(&record)?;
+                    // 授权成功后立刻列出可用安装，用户只要再选一次就能发布。
+                    let installations = app::github_app::list_installations(&record.user_token)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "state": "authorized",
+                            "installations": installations,
+                            "next_steps": [
+                                "用 extension github app-select <installation_id> 绑定发布用的安装"
+                            ],
+                        }))?
+                    );
+                }
+                other => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "state": format!("{other:?}"),
+                    }))?
+                ),
+            }
+        }
+        [group, action] if group == "github" && action == "app-installations" => {
+            let state = crate::store::github_credentials::app_state()?
+                .ok_or("GitHub App 尚未授权，请先执行 extension github app-start")?;
+            let installations = app::github_app::list_installations(&state.user_token)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "installations": installations,
+                }))?
+            );
+        }
+        [group, action, installation_id] if group == "github" && action == "app-select" => {
+            let state = crate::store::github_credentials::app_state()?
+                .ok_or("GitHub App 尚未授权，请先执行 extension github app-start")?;
+            let installations = app::github_app::list_installations(&state.user_token)?;
+            let selected = installations
+                .into_iter()
+                .find(|item| item.id == installation_id.trim())
+                .ok_or_else(|| {
+                    format!(
+                        "未找到安装 {installation_id}，请先执行 extension github app-installations"
+                    )
+                })?;
+            app::github_app::select_installation(&selected)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "state": "ready",
+                    "installation": selected,
+                    "account": crate::store::github_credentials::status()?,
+                }))?
+            );
+        }
+        // 导入 App 私钥（PKCS#1 / PKCS#8 PEM）：有私钥才走 App 身份签安装令牌。
+        [group, action, path] if group == "github" && action == "app-key" => {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|error| format!("读取 App 私钥失败：{error}"))?;
+            crate::store::github_credentials::save_app_private_key(&pem)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "state": "ready",
+                    "private_key_configured": true,
+                    "account": crate::store::github_credentials::status()?,
+                    "next_steps": [
+                        "extension github verify owner/repo 确认写权限",
+                        "extension github status 查看当前凭据形态"
+                    ]
+                }))?
+            );
+        }
+        // 只读自检：确认当前凭据（PAT 或 App 安装令牌）对该仓库真的可写，
+        // 发布前先跑一次可以避免把失败留到建 tag 的阶段。
+        [group, action, repository] if group == "github" && action == "verify" => {
+            let token = crate::store::github_credentials::resolve_token()?
+                .ok_or("尚未授权 GitHub 账号，请先执行 extension github set 或 github app-start")?;
+            let info = app::github_publisher::repository_info(&token, repository)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "repository": info.full_name,
+                    "default_branch": info.default_branch,
+                    "private": info.private,
+                    "can_push": info.can_push,
+                    "account": crate::store::github_credentials::status()?,
+                }))?
+            );
+            if !info.can_push {
+                return Err(format!(
+                    "凭据对 {} 没有写权限：App 安装需要勾选该仓库，且 Contents 权限为 Read and write",
+                    info.full_name
+                )
+                .into());
+            }
+        }
+        // 分发：preview 无副作用，publish 需要 --yes 与可用的 GitHub 凭据。
+        [group, action, kind, id, version] if group == "distribution" && action == "preview" => {
+            let kind = crate::extension_projects::ExtensionProjectKind::parse(kind)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::distribution_publish::preview(
+                    kind, id, version,
+                )?)?
+            );
+        }
+        [group, action, kind, id, version] | [group, action, kind, id, version, _]
+            if group == "distribution" && action == "publish" =>
+        {
+            if !arguments.iter().any(|value| value == "--yes")
+                && env::var("HIMIND_AGENT_SUBMIT_CONFIRM").as_deref() != Ok("1")
+            {
+                return Err(
+                    "发布扩展需要显式确认：加 --yes 或设置 HIMIND_AGENT_SUBMIT_CONFIRM=1".into(),
+                );
+            }
+            let kind = crate::extension_projects::ExtensionProjectKind::parse(kind)?;
+            let state = api::client::load_agent_state(&options.state_path)
+                .map_err(|error| format!("读取 HiMind 账号授权状态失败：{error}"))?;
+            options.set_agent_credential(&state.credential);
+            let report =
+                app::distribution_publish::publish(options, &state.agent_id, kind, id, version)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            // 部分完成或失败要以非零退出码返回，脚本与 CI 才能据此停下来人工处理。
+            if report.get("status").and_then(serde_json::Value::as_str) != Some("released") {
+                let failed = report
+                    .get("outcomes")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|outcomes| {
+                        outcomes
+                            .iter()
+                            .filter(|outcome| {
+                                outcome.get("status").and_then(serde_json::Value::as_str)
+                                    == Some("failed")
+                            })
+                            .map(|outcome| {
+                                format!(
+                                    "{}: {}",
+                                    outcome
+                                        .get("target")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("unknown"),
+                                    outcome
+                                        .get("error")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("发布失败")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return Err(format!("发布未全部完成：{}", failed.join("；")).into());
+            }
+        }
+        [group, action] if group == "distribution" && action == "state" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "items": app::distribution_state::load()?.all(),
+                }))?
+            );
+        }
+        [group, action, kind, id] if group == "distribution" && action == "state" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "items": app::distribution_state::load()?.for_asset(kind, id),
+                }))?
+            );
+        }
+        // 从 GitHub Release 安装：plan 只读，install 需要 --yes（dry-run 除外）。
+        [group, action, repository, tag, id, version]
+            if group == "distribution" && action == "plan" =>
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::release_install::plan(
+                    repository, tag, id, version,
+                )?)?
+            );
+        }
+        [group, action, repository, tag, id, version]
+            if group == "distribution" && action == "install" =>
+        {
+            if !arguments.iter().any(|value| value == "--yes")
+                && env::var("HIMIND_AGENT_SUBMIT_CONFIRM").as_deref() != Ok("1")
+            {
+                return Err(
+                    "从 Release 安装扩展需要显式确认：加 --yes（或先加 --dry-run 只校验）".into(),
+                );
+            }
+            let plan = app::release_install::plan(repository, tag, id, version)?;
+            let report = app::release_install::install(&plan, false)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "plan": plan,
+                    "report": report,
+                }))?
+            );
+            if report.state != "ready" {
+                return Err(format!("安装未完成：{}", report.errors.join("；")).into());
+            }
+        }
+        [group, action, repository, tag, id, version, word]
+            if group == "distribution"
+                && action == "install"
+                && (word == "--dry-run" || word == "--yes") =>
+        {
+            let plan = app::release_install::plan(repository, tag, id, version)?;
+            let report = app::release_install::install(&plan, word == "--dry-run")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "plan": plan,
+                    "report": report,
+                }))?
+            );
+            // dry-run 也会真实下载与校验，失败必须让脚本看见。
+            if report.state != "ready" {
+                return Err(format!(
+                    "{}未通过：{}",
+                    if word == "--dry-run" {
+                        "安装预检"
+                    } else {
+                        "安装"
+                    },
+                    report.errors.join("；")
+                )
+                .into());
+            }
+        }
+        [group, action, verb, unit_key, targets]
+            if group == "project" && action == "target" && verb == "unit" =>
+        {
+            let targets = cli_distribution_targets(targets)?;
+            let settings =
+                app::extension_source::set_unit_distribution_targets(unit_key, targets.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
         [source, action] if source == "source" && action == "update" => {
             println!(
                 "{}",
@@ -1584,22 +2430,49 @@ fn run_extension_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             );
         }
         _ => {
-            return Err("usage: himind-agent extension source <list|refresh|add name github-url [ref] [catalog-path] [required|optional]|add-local name path [catalog-path]|remove source-id|enable source-id|disable source-id|acquisition unit-key local|remote|plan plugin|skill|workflow id|install plugin|skill|workflow id [version]|provenance|update>".into());
+            return Err("usage: himind-agent extension <source ...|draft list|draft submit plugin|skill|workflow id version --yes|project target list|project target set kind id workbench,github|inherit|project target unit <unit-key> workbench,github|inherit|github status|github set <token> [owner/repo,...]|github remove --yes|github verify owner/repo|github app-start|github app-poll <device-code>|github app-installations|github app-select <installation-id>|github app-key <pem-path>|distribution preview kind id version|distribution publish kind id version --yes|distribution state [kind id]|distribution plan repository tag id version|distribution install repository tag id version [--dry-run|--yes]>".into());
         }
     }
     Ok(())
 }
 
+/// 解析 CLI 传入的分发目标：`workbench,github` 形式，或 `inherit` 表示继承。
+fn cli_distribution_targets(
+    value: &str,
+) -> Result<Option<Vec<crate::extension_contracts::DistributionTarget>>, Box<dyn std::error::Error>>
+{
+    use crate::extension_contracts::DistributionTarget;
+    if value.trim() == "inherit" {
+        return Ok(None);
+    }
+    let mut targets = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        targets.push(match item {
+            "workbench" => DistributionTarget::Workbench,
+            "github" => DistributionTarget::Github,
+            other => {
+                return Err(
+                    format!("分发目标必须是 workbench、github 或 inherit，收到: {other}").into(),
+                )
+            }
+        });
+    }
+    if targets.is_empty() {
+        return Err("分发目标不能为空，至少需要一个 workbench 或 github".into());
+    }
+    Ok(Some(targets))
+}
+
 fn runtime_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "runtime")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("runtime")
 }
 
 fn mcp_cli_arguments() -> Option<Vec<String>> {
-    let arguments = env::args().collect::<Vec<_>>();
-    let index = arguments.iter().position(|value| value == "mcp")?;
-    Some(arguments[index + 1..].to_vec())
+    cli_command_arguments("mcp")
 }
 
 fn run_mcp_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1687,8 +2560,67 @@ fn run_mcp_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Er
                 serde_json::to_string_pretty(&app::mcp_probe::probe_report(&server))?
             );
         }
+        // 目录（server.json）三件事：看现状、联网刷新、按条目安装。界面走的是同样
+        // 三个函数，这条 CLI 只是让链路可以无头验证（内网自建源、CI、排障）。
+        Some("catalog") if arguments.len() == 1 => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_catalog::view(&options.state_path))?
+            );
+        }
+        Some("catalog-refresh") if arguments.len() == 1 => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_catalog::refresh(&options.state_path))?
+            );
+        }
+        Some("catalog-install") if arguments.len() >= 3 => {
+            let mut request = app::mcp_catalog::InstallRequest {
+                source_id: arguments[1].clone(),
+                entry_id: arguments[2].clone(),
+                ..Default::default()
+            };
+            let mut index = 3;
+            while index < arguments.len() {
+                match arguments[index].as_str() {
+                    "--name" if index + 1 < arguments.len() => {
+                        request.server_name = arguments[index + 1].clone();
+                        index += 2;
+                    }
+                    "--label" if index + 1 < arguments.len() => {
+                        request.display_name = arguments[index + 1].clone();
+                        index += 2;
+                    }
+                    "--set" if index + 1 < arguments.len() => {
+                        let pair = &arguments[index + 1];
+                        let (key, value) = pair.split_once('=').ok_or_else(|| {
+                            format!("--set 需要 key=value 形式，收到: {pair}")
+                        })?;
+                        request.values.insert(key.to_string(), value.to_string());
+                        index += 2;
+                    }
+                    "--acknowledge" => {
+                        request.acknowledge = true;
+                        index += 1;
+                    }
+                    other => {
+                        return Err(format!(
+                            "usage: himind-agent mcp catalog-install <source-id> <entry-id> [--name name] [--label label] [--set key=value]... [--acknowledge]，收到未知参数: {other}"
+                        )
+                        .into())
+                    }
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app::mcp_catalog::install(
+                    &options.state_path,
+                    &request
+                )?)?
+            );
+        }
         _ => {
-            return Err("usage: himind-agent mcp <list|targets|inspect server-id|plan target-id|apply target-id [--reset-invalid]|apply-all [--include-undetected] [--reset-invalid]|remove target-id|remove-all [--include-undetected]|test server-id>".into())
+            return Err("usage: himind-agent mcp <list|targets|inspect server-id|plan target-id|apply target-id [--reset-invalid]|apply-all [--include-undetected] [--reset-invalid]|remove target-id|remove-all [--include-undetected]|test server-id|catalog|catalog-refresh|catalog-install source-id entry-id [--name name] [--label label] [--set key=value]... [--acknowledge]>".into())
         }
     }
     Ok(())
@@ -1781,6 +2713,7 @@ fn run_acp_profile_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let mut version = String::new();
             let mut permission_policy = "deny".to_string();
             let mut enabled = true;
+            let mut environment = std::collections::BTreeMap::new();
             let mut index = 3;
             if arguments
                 .get(index)
@@ -1801,6 +2734,18 @@ fn run_acp_profile_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     }
                     "--permission" if index + 1 < arguments.len() => {
                         permission_policy = arguments[index + 1].clone();
+                        index += 2;
+                    }
+                    "--env" if index + 1 < arguments.len() => {
+                        let entry = arguments[index + 1].trim();
+                        let (key, value) = entry
+                            .split_once('=')
+                            .ok_or("--env expects KEY=VALUE")?;
+                        let key = key.trim();
+                        if key.is_empty() {
+                            return Err("--env expects KEY=VALUE".into());
+                        }
+                        environment.insert(key.to_string(), value.to_string());
                         index += 2;
                     }
                     "--disabled" => {
@@ -1824,6 +2769,7 @@ fn run_acp_profile_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     display_name,
                     executable,
                     args,
+                    env: environment,
                     version,
                     permission_policy,
                     enabled,
@@ -1853,7 +2799,7 @@ fn run_acp_profile_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: himind-agent runtime acp-profile <list|set provider executable [args-json] [--name name] [--version version] [--permission deny|allow_once|prompt] [--disabled]|enable provider|disable provider|remove provider>".into(),
+                "usage: himind-agent runtime acp-profile <list|set provider executable [args-json] [--name name] [--version version] [--permission deny|allow_once|prompt] [--env KEY=VALUE] [--disabled]|enable provider|disable provider|remove provider>".into(),
             )
         }
     }
@@ -1964,12 +2910,19 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
 
 #[derive(Clone)]
 pub(crate) struct Options {
-    api_base: String,
+    /// Live Dashboard/API base of the **active workbench connection**.
+    ///
+    /// Deliberately not a process constant: per ADR 0008 the Agent can be
+    /// pointed at another workbench while it keeps running, so the value is
+    /// shared mutable state and every call site reads it through
+    /// [`Options::api_base`].
+    api_base: Arc<RwLock<String>>,
     state_path: PathBuf,
-    /// The control-plane mode captured when this process starts. Runtime
-    /// settings are persisted for the next launch and must not mutate the
-    /// live service graph halfway through a process lifetime.
-    effective_mode: app::runtime_mode::AgentMode,
+    /// Control-plane binding, shared by every clone of this process. The
+    /// settings switch (AI 工作台) flips it in place, so workers, projection
+    /// and capability visibility follow within one poll interval instead of
+    /// requiring an Agent restart.
+    workbench_mode: Arc<AtomicU8>,
     once: bool,
     interval_seconds: u64,
     local_app: bool,
@@ -1983,16 +2936,53 @@ pub(crate) struct Options {
 }
 
 impl Options {
-    /// Returns the mode used by every service in this process.
-    pub(crate) fn mode(&self) -> app::runtime_mode::AgentMode {
-        self.effective_mode
+    /// The Dashboard/API base of the active workbench connection.
+    pub(crate) fn api_base(&self) -> String {
+        self.api_base
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default()
     }
 
-    /// Returns the mode persisted by the settings panel. It is intentionally
-    /// separate from `mode()` because the persisted value becomes effective
-    /// only after the next process start.
+    /// Point this process at another workbench address.
+    ///
+    /// Never call this on its own: the address and the workbench identity must
+    /// move together, so switching is done by
+    /// [`crate::store::workbenches::switch`] plus
+    /// [`Options::adopt_connection`].
+    pub(crate) fn set_api_base(&self, api_base: &str) {
+        if let Ok(mut current) = self.api_base.write() {
+            *current = api_base.trim().trim_end_matches('/').to_string();
+        }
+    }
+
+    /// Follow a completed workbench switch: new address, and a worker restart
+    /// so the next connection attempt uses the identity that was just
+    /// materialised on disk.
+    pub(crate) fn adopt_connection(&self) {
+        if let Ok(mut credential) = self.agent_credential.write() {
+            credential.clear();
+        }
+        self.identity_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Returns the mode used by every service in this process.
+    pub(crate) fn mode(&self) -> app::runtime_mode::AgentMode {
+        app::runtime_mode::AgentMode::from_code(
+            self.workbench_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Applies a control-plane mode change to the live service graph.
+    pub(crate) fn set_mode(&self, mode: app::runtime_mode::AgentMode) {
+        self.workbench_mode
+            .store(mode.as_code(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 持久化值已经与运行时同步，保留该入口只为兼容既有调用点。
     pub(crate) fn pending_mode(&self) -> app::runtime_mode::AgentMode {
-        app::runtime_mode::load(&self.state_path)
+        self.mode()
     }
 
     pub(crate) fn plugin_view_launch(&self) -> Option<PluginViewLaunch> {
@@ -2004,9 +2994,15 @@ impl Options {
     }
 
     fn from_env() -> Self {
-        let mut api_base = env::var("DASHBOARD_API_BASE")
+        // An explicit address is a *selector*, not the answer: it picks which
+        // workbench connection this process starts on (ADR 0008). Without one
+        // the store decides, and the shipped default only seeds a fresh
+        // install.
+        let mut explicit_api_base = env::var("DASHBOARD_API_BASE")
             .or_else(|_| env::var("HIMIND_DEVELOPMENT_AGENT_API_BASE"))
-            .unwrap_or_else(|_| default_dashboard_api_base().to_string());
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
         let mut state_path = default_state_path();
         let mut once = false;
         let mut interval_seconds = 10;
@@ -2021,11 +3017,29 @@ impl Options {
         while i < args.len() {
             match args[i].as_str() {
                 "--api" if i + 1 < args.len() => {
-                    api_base = args[i + 1].clone();
+                    explicit_api_base = Some(args[i + 1].trim().trim_end_matches('/').to_string());
                     i += 1;
                 }
                 "--state" if i + 1 < args.len() => {
-                    state_path = PathBuf::from(&args[i + 1]);
+                    let requested = PathBuf::from(&args[i + 1]);
+                    // MCP registrations outlive the build that wrote them, and
+                    // an old one still names the production state file. Taking
+                    // it at face value would point this profile at the
+                    // installed Agent's identity, so the profile decides.
+                    if store::paths::explicit_state_crosses_profiles(&requested) {
+                        eprintln!(
+                            "HiMind Agent: 忽略 --state {}（属于 production 数据根），改用 {}。",
+                            requested.display(),
+                            state_path.display()
+                        );
+                    } else {
+                        state_path = requested;
+                    }
+                    i += 1;
+                }
+                // Already applied by `apply_startup_profile`; consumed here so
+                // the value can never be mistaken for a subcommand.
+                "--profile" if i + 1 < args.len() => {
                     i += 1;
                 }
                 "--once" => once = true,
@@ -2054,10 +3068,26 @@ impl Options {
             let _ = std::fs::create_dir_all(parent);
         }
         let effective_mode = mode_override.unwrap_or_else(|| app::runtime_mode::load(&state_path));
+        // ADR 0008: the workbench address belongs to a stored connection, not
+        // to the build. Failures here are not fatal — the Agent still starts
+        // against the address it was told to use.
+        let api_base = match explicit_api_base {
+            Some(value) => store::workbenches::activate_for(&state_path, &value)
+                .map(|connection| connection.api_base)
+                .unwrap_or(value),
+            None => store::workbenches::sync_active(&state_path, SHIPPED_DASHBOARD_API_BASE)
+                .ok()
+                .and_then(|store| {
+                    store
+                        .active_connection()
+                        .map(|connection| connection.api_base.clone())
+                })
+                .unwrap_or_else(|| SHIPPED_DASHBOARD_API_BASE.to_string()),
+        };
         Self {
-            api_base: api_base.trim_end_matches('/').to_string(),
+            api_base: api_base_cell(api_base),
             state_path,
-            effective_mode,
+            workbench_mode: Arc::new(AtomicU8::new(effective_mode.as_code())),
             once,
             interval_seconds,
             local_app,
@@ -2072,32 +3102,44 @@ impl Options {
     }
 }
 
-/// The local development ports are fixed by the repository tooling:
-/// Dashboard/API on 18083 and the development Agent on 18082.  A debug build
-/// follows that topology by default so a plain `cargo run -- --local-app`
-/// cannot collide with the installed production Agent on 18181.  Release
-/// builds keep the shipped 18181 default.
+/// The development Agent is expected to serve on 18082 (local Dashboard/API
+/// typically sits on 18083).  Anything that is not the installed Agent follows
+/// that topology by default, so a plain `cargo run -- --local-app` or a
+/// `target/release` build cannot collide with the installed Agent on 18181.
+/// The decision follows the resolved profile, not `cfg!(debug_assertions)`:
+/// a release build that is not an installation used to take 18181 and fight the
+/// installed Agent for the port.
 fn default_local_port() -> u16 {
     const DEVELOPMENT_PORT: u16 = 18082;
     const PRODUCTION_PORT: u16 = 18181;
+    // Only the installed Agent owns the shipped port. A debug build never
+    // takes it, even when it was told to use the production profile.
+    let production =
+        !cfg!(debug_assertions) && store::paths::profile_name() == store::paths::PRODUCTION_PROFILE;
     env::var("HIMIND_AGENT_LOCAL_PORT")
         .or_else(|_| env::var("HIMIND_DEVELOPMENT_AGENT_PORT"))
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or(if cfg!(debug_assertions) {
-            DEVELOPMENT_PORT
-        } else {
+        .unwrap_or(if production {
             PRODUCTION_PORT
+        } else {
+            DEVELOPMENT_PORT
         })
 }
 
-fn default_dashboard_api_base() -> &'static str {
-    if cfg!(debug_assertions) {
-        "http://127.0.0.1:18083"
-    } else {
-        "http://localhost:8080"
-    }
+/// Shared cell for the live API base. Exists so construction sites (including
+/// test fixtures) do not have to spell out the lock type.
+pub(crate) fn api_base_cell(api_base: impl Into<String>) -> Arc<RwLock<String>> {
+    Arc::new(RwLock::new(api_base.into()))
 }
+
+/// The address a fresh install is seeded with.
+///
+/// Nothing infers a workbench from `cfg!(debug_assertions)` or from the
+/// profile name any more (ADR 0008): a build flag is not something the user can
+/// see or control. Local development passes `--api` explicitly, and every
+/// install can add, enroll and switch workbenches from the UI afterwards.
+const SHIPPED_DASHBOARD_API_BASE: &str = "http://localhost:8080";
 
 fn default_state_path() -> PathBuf {
     store::paths::agent_home()
@@ -2182,17 +3224,54 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_dashboard_api_base, default_local_port, parse_plugin_view_launch,
-        protocol_open_requested, should_run_acp, should_run_mcp, workflow_dispatch_limit,
-        PluginViewLaunch,
+        cli_subcommand, default_local_port, parse_plugin_view_launch, protocol_open_requested,
+        should_run_acp, should_run_mcp, workflow_dispatch_limit, PluginViewLaunch,
+        SHIPPED_DASHBOARD_API_BASE,
     };
     use std::env;
 
+    fn cli_args(values: &[&str]) -> Vec<String> {
+        std::iter::once("himind-agent".to_string())
+            .chain(values.iter().map(|value| value.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn development_builds_default_to_the_fixed_local_ports() {
-        if cfg!(debug_assertions) {
-            assert_eq!(default_dashboard_api_base(), "http://127.0.0.1:18083");
-        }
+    fn cli_subcommand_ignores_flag_values_that_look_like_commands() {
+        assert_eq!(
+            cli_subcommand(&cli_args(&["market", "search"])).unwrap().1,
+            "market"
+        );
+        // `--kind skill` 的取值是 `skill`，但它不是子命令：
+        // 老实现按字面量找 `skill`，市场命令会被误判成技能命令。
+        assert_eq!(
+            cli_subcommand(&cli_args(&["market", "search", "--kind", "skill"]))
+                .unwrap()
+                .1,
+            "market"
+        );
+        // 子命令前面的全局选项（含取值）要先跳过。
+        assert_eq!(
+            cli_subcommand(&cli_args(&[
+                "--state",
+                "C:/tmp/agent-state.json",
+                "skill",
+                "plan",
+                "demo"
+            ]))
+            .unwrap()
+            .1,
+            "skill"
+        );
+        // `skill market` 是技能命令，不是市场命令。
+        assert_eq!(
+            cli_subcommand(&cli_args(&["skill", "market"])).unwrap().1,
+            "skill"
+        );
+    }
+
+    #[test]
+    fn local_port_defaults_follow_the_build_but_the_workbench_does_not() {
         let overridden = env::var("HIMIND_AGENT_LOCAL_PORT").is_ok()
             || env::var("HIMIND_DEVELOPMENT_AGENT_PORT").is_ok();
         if !overridden {
@@ -2201,6 +3280,10 @@ mod tests {
                 if cfg!(debug_assertions) { 18082 } else { 18181 }
             );
         }
+        // ADR 0008: the workbench address is a stored connection, and the
+        // shipped default is the only value the binary contributes. Local
+        // development selects `http://127.0.0.1:18083` via `--api` instead.
+        assert_eq!(SHIPPED_DASHBOARD_API_BASE, "http://localhost:8080");
     }
 
     #[test]
@@ -2394,7 +3477,7 @@ fn execute_task(
                     }
                     if let Err(error) = api::client::renew_task_lease(
                         &renew_client,
-                        &renew_options.api_base,
+                        &renew_options.api_base(),
                         &renew_agent_id,
                         &renew_task_id,
                         &renew_execution_id,
@@ -2506,6 +3589,7 @@ fn execute_task(
         "upload_code" => {
             execute_upload_code(client, options, agent_id, &task, task.payload.as_ref())
         }
+        "backup_run" => execute_backup_run(client, options, agent_id, &task, task.payload.as_ref()),
         "upload_placeholder" => {
             execute_upload_placeholder(client, options, agent_id, &task, task.payload.as_ref())
         }
@@ -2875,7 +3959,7 @@ pub(crate) fn report_task(
     };
     let response = api::client::report_task(
         client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         task_id,
         status,
@@ -2929,7 +4013,7 @@ fn flush_report_outbox(client: &Client, options: &Options, agent_id: &str) {
         }
         match api::client::report_task(
             client,
-            &options.api_base,
+            &options.api_base(),
             &report.agent_id,
             &report.task_id,
             &report.status,
