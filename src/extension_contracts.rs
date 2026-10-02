@@ -23,6 +23,125 @@ impl ExtensionAssetKind {
     }
 }
 
+/// 扩展制品的分发落点。默认只有组织工作台，开发者可以显式增加 GitHub Release。
+///
+/// 用可组合的列表而不是单一枚举：后续增加「内网文件服务器」「私有 registry」
+/// 时不必改 schema，也不影响既有角色。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DistributionTarget {
+    Workbench,
+    Github,
+}
+
+impl DistributionTarget {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Workbench => "workbench",
+            Self::Github => "github",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "workbench" => Some(Self::Workbench),
+            "github" => Some(Self::Github),
+            _ => None,
+        }
+    }
+}
+
+/// 默认分发目标：仅工作台。保持既有发布行为不变。
+pub(crate) fn default_distribution_targets() -> Vec<DistributionTarget> {
+    vec![DistributionTarget::Workbench]
+}
+
+/// 读取扩展清单里作者声明的分发落点。
+///
+/// 清单是制品自带的事实：声明写在 `plugin.json`、`skill.json` 或 `workflow.json` 里，
+/// 随制品一起流转，谁在什么机器上打开都得到同一份约束。
+///
+/// 未知取值忽略而不是报错：新落点（例如后续的私有 registry）出现时，旧 Agent 应当
+/// 退化成「按已知落点约束」，而不是让整个扩展不可用。
+pub(crate) fn declared_distribution_targets(manifest: &Value) -> Vec<DistributionTarget> {
+    let Some(values) = manifest
+        .get("distribution_targets")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for value in values {
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        if let Some(target) = DistributionTarget::parse(raw) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets.sort();
+    targets
+}
+
+/// 用清单声明收窄本机设置。
+///
+/// 声明是硬上限：本机覆盖与分发单元默认都只能取子集，越界部分被裁掉，
+/// 全部越界时回落到声明本身。这样「这个制品能发到哪里」永远由制品自己说了算，
+/// 换台机器、换个账号都不会因为本机设置而多投递。
+pub(crate) fn clamp_distribution_targets(
+    candidate: &[DistributionTarget],
+    declared: &[DistributionTarget],
+) -> Vec<DistributionTarget> {
+    if declared.is_empty() {
+        return candidate.to_vec();
+    }
+    let mut narrowed = candidate
+        .iter()
+        .copied()
+        .filter(|target| declared.contains(target))
+        .collect::<Vec<_>>();
+    if narrowed.is_empty() {
+        return declared.to_vec();
+    }
+    narrowed.sort();
+    narrowed.dedup();
+    narrowed
+}
+
+/// 判断一组目标是否完全落在另一组目标内，用于在写入本机设置时提前拒绝越界。
+pub(crate) fn distribution_targets_are_subset(
+    subset: &[DistributionTarget],
+    superset: &[DistributionTarget],
+) -> bool {
+    subset.iter().all(|target| superset.contains(target))
+}
+
+/// 规范化分发目标：去重、按固定顺序排序，并拒绝空集合。
+///
+/// 空集合会让「允许发到哪里」变成不可判定的状态，因此在入口处就拒绝，
+/// 而不是在发布时才发现没有任何可投递的落点。
+pub(crate) fn normalize_distribution_targets(
+    targets: &[DistributionTarget],
+) -> Result<Vec<DistributionTarget>, Box<dyn Error>> {
+    if targets.is_empty() {
+        return Err("分发目标不能为空，至少需要 workbench 或 github".into());
+    }
+    let mut normalized = targets.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+/// 校验目标集合是否允许投递到指定落点。
+pub(crate) fn distribution_targets_allow(
+    targets: &[DistributionTarget],
+    target: DistributionTarget,
+) -> bool {
+    targets.contains(&target)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExtensionCandidateState {
@@ -399,7 +518,7 @@ fn validate_version(value: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn validate_sha256(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_sha256(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("{name} must be a SHA-256 hex digest").into());
     }
@@ -583,5 +702,48 @@ mod tests {
             ..Default::default()
         };
         assert!(environment.validate().is_err());
+    }
+
+    #[test]
+    fn distribution_targets_normalize_dedups_and_sorts() {
+        let normalized = normalize_distribution_targets(&[
+            DistributionTarget::Github,
+            DistributionTarget::Workbench,
+            DistributionTarget::Github,
+        ])
+        .unwrap();
+        assert_eq!(
+            normalized,
+            vec![DistributionTarget::Workbench, DistributionTarget::Github]
+        );
+    }
+
+    #[test]
+    fn empty_distribution_targets_are_rejected() {
+        assert!(normalize_distribution_targets(&[]).is_err());
+        assert_eq!(
+            default_distribution_targets(),
+            vec![DistributionTarget::Workbench]
+        );
+    }
+
+    #[test]
+    fn distribution_target_serializes_as_stable_ascii_keys() {
+        assert_eq!(
+            serde_json::to_string(&DistributionTarget::Workbench).unwrap(),
+            "\"workbench\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DistributionTarget::Github).unwrap(),
+            "\"github\""
+        );
+        assert!(distribution_targets_allow(
+            &[DistributionTarget::Workbench, DistributionTarget::Github],
+            DistributionTarget::Github
+        ));
+        assert!(!distribution_targets_allow(
+            &[DistributionTarget::Workbench],
+            DistributionTarget::Github
+        ));
     }
 }

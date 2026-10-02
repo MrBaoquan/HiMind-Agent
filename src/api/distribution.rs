@@ -11,6 +11,49 @@ use std::path::{Path, PathBuf};
 
 const MAX_SUBMISSION_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 
+/// 插件状态上报的投递结果分类。
+///
+/// 关键区别是「重试有没有意义」：401/403 可能等用户重新授权，5xx 与超时是暂时故障，
+/// 都值得重试；其余 4xx（典型是工作台没有这个产品的 404）重试一万次也不会变，必须
+/// 丢弃，否则一条死记录会永久堵住整个 outbox。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginStatusDeliveryError {
+    Transient(String),
+    Permanent(String),
+}
+
+impl std::fmt::Display for PluginStatusDeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(message) | Self::Permanent(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl Error for PluginStatusDeliveryError {}
+
+fn classify_plugin_status_failure(status: StatusCode, detail: &str) -> PluginStatusDeliveryError {
+    let detail = detail.trim().chars().take(200).collect::<String>();
+    let message = if detail.is_empty() {
+        format!("插件状态上报失败：工作台返回 HTTP {}", status.as_u16())
+    } else {
+        format!(
+            "插件状态上报失败：工作台返回 HTTP {}（{detail}）",
+            status.as_u16()
+        )
+    };
+    let retryable = status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error();
+    if retryable {
+        PluginStatusDeliveryError::Transient(message)
+    } else {
+        PluginStatusDeliveryError::Permanent(message)
+    }
+}
+
 fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -929,7 +972,10 @@ pub fn submit_skill(
         .text("source_repository", source.source_repository.clone())
         .text("source_branch", source.source_default_branch.clone())
         .text("source_subdirectory", source.source_subdirectory.clone())
-        .text("source_commit", source.source_commit.clone());
+        .text("source_commit", source.source_commit.clone())
+        .text("distribution_id", source.distribution_id.clone())
+        .text("channel", source.channel.clone())
+        .text("catalog_id", source.catalog_id.clone());
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
@@ -985,7 +1031,10 @@ pub fn submit_workflow(
         .text("source_repository", source.source_repository.clone())
         .text("source_branch", source.source_default_branch.clone())
         .text("source_subdirectory", source.source_subdirectory.clone())
-        .text("source_commit", source.source_commit.clone());
+        .text("source_commit", source.source_commit.clone())
+        .text("distribution_id", source.distribution_id.clone())
+        .text("channel", source.channel.clone())
+        .text("catalog_id", source.catalog_id.clone());
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
@@ -1069,7 +1118,10 @@ pub fn submit_plugin(
         .text("source_repository", source.source_repository.clone())
         .text("source_branch", source.source_default_branch.clone())
         .text("source_subdirectory", source.source_subdirectory.clone())
-        .text("source_commit", source.source_commit.clone());
+        .text("source_commit", source.source_commit.clone())
+        .text("distribution_id", source.distribution_id.clone())
+        .text("channel", source.channel.clone())
+        .text("catalog_id", source.catalog_id.clone());
     if let Some(version) = revision_of_version.filter(|value| !value.trim().is_empty()) {
         form = form.text("revision_of_version", version.to_string());
     }
@@ -1659,14 +1711,19 @@ pub fn report_plugin_status(
     agent_id: &str,
     credential: &str,
     report: &PluginStatusReport<'_>,
-) -> Result<(), Box<dyn Error>> {
-    client
+) -> Result<(), PluginStatusDeliveryError> {
+    let response = client
         .post(format!("{api_base}/api/agent/plugins/status"))
         .header("Authorization", format!("Agent {agent_id}:{credential}"))
         .json(report)
-        .send()?
-        .error_for_status()?;
-    Ok(())
+        .send()
+        .map_err(|error| PluginStatusDeliveryError::Transient(error.to_string()))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let detail = response.text().unwrap_or_default();
+    Err(classify_plugin_status_failure(status, &detail))
 }
 
 pub fn distribution_state_path(agent_state_path: &Path) -> PathBuf {

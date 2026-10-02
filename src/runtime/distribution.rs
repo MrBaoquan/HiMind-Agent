@@ -349,7 +349,7 @@ impl RuntimeDistributionProvider for DashboardRuntimeProvider {
     ) -> Result<Option<RuntimeComponentUpdate>, Box<dyn Error>> {
         resolve_dashboard_runtime_component(
             &self.client,
-            &request.options.api_base,
+            &request.options.api_base(),
             RUNTIME_PRODUCT_ID,
             request.current_version,
             RUNTIME_CHANNEL,

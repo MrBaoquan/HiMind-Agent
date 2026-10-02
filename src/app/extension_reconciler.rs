@@ -28,10 +28,10 @@ pub(crate) fn reconcile(
 ) -> Result<(), Box<dyn Error>> {
     let credential = options.agent_credential();
     if agent_id.trim().is_empty() || credential.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-    let desired = extension_desired_state(&client, &options.api_base, agent_id, &credential)?;
+    let desired = extension_desired_state(&client, &options.api_base(), agent_id, &credential)?;
     let persisted = load_snapshot(&snapshot_path())?;
     if previous_generation.is_empty() {
         *previous_generation = persisted.generation.clone();
@@ -87,7 +87,7 @@ pub(crate) fn reconcile(
         generation: desired.generation.clone(),
         items,
     };
-    report_extension_reconcile(&client, &options.api_base, agent_id, &credential, &report)?;
+    report_extension_reconcile(&client, &options.api_base(), agent_id, &credential, &report)?;
     save_snapshot(
         &snapshot_path(),
         &PersistedDesiredSnapshot {

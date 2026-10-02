@@ -5,6 +5,86 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 pub(crate) const CHECKSUMS_FILE: &str = "checksums.sha256";
+pub(crate) const SIGNATURE_FILE: &str = "manifest.sig";
+
+/// 这个文件是打包账本本身，不是扩展内容：它不能出现在自己的账本行里，
+/// 也不参与包内容比较，否则同一份内容换个打单顺序就变成了「内容不一致」。
+pub(crate) fn is_checksums_file(name: &str) -> bool {
+    name.replace('\\', "/") == CHECKSUMS_FILE
+}
+
+/// 打包与签名过程生成的元数据文件。
+///
+/// 它们描述的是「制品怎么被打包的」，不是扩展内容本身：同一个版本从本地目录安装
+/// 和从归档安装，这些文件的字节并不相同。内容摘要必须把它们排除在外，
+/// 否则换来源、重新打包都会被误判成「同版本内容被改写」。
+pub(crate) fn is_packaging_metadata(name: &str) -> bool {
+    let normalized = name.replace('\\', "/");
+    normalized == CHECKSUMS_FILE || normalized == SIGNATURE_FILE
+}
+
+/// 进包内容规则：与官方 `pluginpack.PayloadFiles` 同一份口径。
+///
+/// 这条规则决定「哪些文件会随制品分发给别人」，本地源物化必须照抄，否则同一个
+/// 版本的扩展会因为安装来源不同而落地成不同的文件集合：开发工作区里有源码、
+/// 旧制品、构建缓存，发布载荷里只有运行期文件。依赖锁要钉的是后者。
+pub(crate) fn is_portable_payload_path(relative: &str) -> bool {
+    let normalized = relative.replace('\\', "/");
+    let mut components = normalized.split('/').peekable();
+    while let Some(component) = components.next() {
+        let is_file = components.peek().is_none();
+        if is_file {
+            return !is_skipped_payload_file(component);
+        }
+        if is_skipped_payload_directory(component) {
+            return false;
+        }
+    }
+    false
+}
+
+/// 依赖树、构建缓存与仓库元数据不属于可移植载荷。
+fn is_skipped_payload_directory(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".git" | ".github" | "node_modules" | "dist" | "target" | "test-output"
+    )
+}
+
+/// 构建输入、生成物与本地状态文件不属于可移植载荷。
+fn is_skipped_payload_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".go") {
+        return true;
+    }
+    for suffix in [
+        ".hmpkg",
+        ".hmskill",
+        ".hmwf",
+        ".release-manifest.json",
+        ".pdb",
+        ".log",
+        ".tmp",
+    ] {
+        if lower.ends_with(suffix) {
+            return true;
+        }
+    }
+    matches!(
+        lower.as_str(),
+        "go.mod"
+            | "go.sum"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "checksums.sha256"
+            | "extension-lock.json"
+            | ".gitignore"
+            | ".gitattributes"
+            | ".ds_store"
+            | "thumbs.db"
+    )
+}
 
 /// 本地扩展源直接指向开发工作区，包体必须在安装时现场物化。依赖缓存与点前缀条目
 /// （node_modules、.git、.idea、.vs 等）永远不属于扩展包，否则包体会随依赖缓存失控。
@@ -47,7 +127,7 @@ pub(crate) fn stage_local_package(
             .strip_prefix(source)?
             .to_string_lossy()
             .replace('\\', "/");
-        if relative == CHECKSUMS_FILE || is_pruned(&relative) || !select(&relative) {
+        if is_checksums_file(&relative) || is_pruned(&relative) || !select(&relative) {
             continue;
         }
         entries.push((
@@ -299,6 +379,40 @@ mod tests {
         let error =
             stage_local_package(&fixture.source, &fixture.staging, &few, |_| true).unwrap_err();
         assert!(error.to_string().contains("本地插件文件数量超过 1 个限制"));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn portable_payload_filter_keeps_release_content_only() {
+        assert!(is_portable_payload_path("plugin.json"));
+        assert!(is_portable_payload_path("bin/tool.exe"));
+        assert!(is_portable_payload_path("README.md"));
+        assert!(!is_portable_payload_path("main.go"));
+        assert!(!is_portable_payload_path("go.mod"));
+        assert!(!is_portable_payload_path("tool-1.0.0.hmpkg"));
+        assert!(!is_portable_payload_path("dist/tool.hmpkg"));
+        assert!(!is_portable_payload_path("target/debug/tool.exe"));
+        assert!(!is_portable_payload_path("tool.release-manifest.json"));
+        assert!(!is_portable_payload_path("checksums.sha256"));
+        assert!(!is_portable_payload_path(".gitignore"));
+    }
+
+    #[test]
+    fn staging_a_local_source_matches_published_content() {
+        let fixture = Fixture::new("payload");
+        fixture.write("plugin.json", "{}");
+        fixture.write("bin/tool.exe", "binary");
+        fixture.write("main.go", "package main");
+        fixture.write("tool-1.0.0.hmpkg", "old artifact");
+        fixture.write("dist/tool.hmpkg", "old artifact");
+        let staged = stage_local_package(
+            &fixture.source,
+            &fixture.staging,
+            &limits("本地插件"),
+            is_portable_payload_path,
+        )
+        .unwrap();
+        assert_eq!(staged, vec!["bin/tool.exe", "plugin.json"]);
         fixture.cleanup();
     }
 }

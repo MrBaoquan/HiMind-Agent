@@ -50,12 +50,12 @@ pub(crate) struct TrustStatusReport {
 pub(crate) fn sync(options: &Options) -> Result<TrustSyncReport, Box<dyn Error>> {
     let state = crate::api::client::load_agent_state(&options.state_path)?;
     if state.agent_id.trim().is_empty() || state.credential.trim().is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let bundle = distribution_trust_bundle(
         &client,
-        &options.api_base,
+        &options.api_base(),
         &state.agent_id,
         &state.credential,
     )?;
@@ -308,15 +308,13 @@ fn validate_key_id(key_id: &str) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use rsa::pkcs8::EncodePublicKey;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
-    static TRUST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
+    /// 与 `app::system` 的测试共用同一把锁：两边动的是同一个环境变量
+    /// （`HIMIND_TRUSTED_SIGNING_KEYS_DIR`），各持一把锁会互相插队 —— 这边刚
+    /// 把变量删掉、那边正读它，签名相关用例就会随机失败。锁必须只有一把。
     fn env_lock() -> MutexGuard<'static, ()> {
-        TRUST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap()
+        crate::app::system::signing_env_lock()
     }
 
     fn public_key() -> String {

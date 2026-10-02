@@ -1,4 +1,5 @@
 use crate::api::distribution::{PluginCatalogItem, SkillCatalogItem, WorkflowCatalogItem};
+use crate::extension_contracts::{normalize_distribution_targets, DistributionTarget};
 use crate::store::{atomic_file, paths};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,11 +16,17 @@ const DEFAULT_CATALOG_PATH: &str = ".himind/catalog.json";
 const LOCAL_CATALOG_PATH: &str = "extensions.json";
 const OFFICIAL_EXTENSION_REPOSITORY: &str = "MrBaoquan/himind-extensions";
 const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_DISTRIBUTION_CHANNEL: &str = "stable";
+const DEFAULT_CATALOG_ID: &str = "public";
 pub(crate) const AUTHORING_FEATURE_ID: &str = "com.himind.feature.extension-authoring";
 const AUTHORING_PLUGIN_ID: &str = "com.himind.extension-development-tools";
-const AUTHORING_SKILL_IDS: [&str; 2] = [
+/// 「扩展创作」能力集 = 1 个插件 + 4 个技能。缺任何一项，AI 都不知道
+/// 自己该按什么规范创作对应类型的扩展，所以这里必须成套校验。
+const AUTHORING_SKILL_IDS: [&str; 4] = [
     "com.himind.skill.develop-himind-plugins",
     "com.himind.skill.develop-himind-skills",
+    "com.himind.skill.develop-himind-workflows",
+    "com.himind.skill.develop-himind-conventions",
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +83,9 @@ impl Default for ExtensionSourceAcquisition {
 pub(crate) struct ExtensionDistributionUnit {
     pub unit_key: String,
     pub name: String,
+    pub distribution_id: String,
+    pub channel: String,
+    pub catalog_id: String,
     pub acquisition: ExtensionSourceAcquisition,
     #[serde(default)]
     pub local_source_id: Option<String>,
@@ -157,7 +167,7 @@ pub(crate) struct ExtensionUnitInstallation {
     pub side: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct ExtensionSourceConfig {
     pub id: String,
     pub name: String,
@@ -176,6 +186,16 @@ pub(crate) struct ExtensionSourceConfig {
     /// 并在 `save_settings` 落盘前清空，避免配置里残留过期值。
     #[serde(default)]
     pub upstream_repository: String,
+    /// Stable product identity shared by local, GitHub and Dashboard sources.
+    /// Older settings omit it and are migrated from the repository/upstream.
+    #[serde(default)]
+    pub distribution_id: String,
+    /// Release lane, for example `stable`, `beta` or `dev`.
+    #[serde(default = "default_distribution_channel")]
+    pub channel: String,
+    /// Catalog namespace within a distribution, normally `public`.
+    #[serde(default = "default_catalog_id")]
+    pub catalog_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +208,10 @@ pub(crate) struct ExtensionSourceSettings {
     /// 单元，未登记的单元按 `Local` 处理。
     #[serde(default)]
     pub acquisitions: BTreeMap<String, ExtensionSourceAcquisition>,
+    /// 分发单元默认分发目标：`unit_key` → 目标集合。仅保存显式设置过的
+    /// 单元，未登记的单元按「仅工作台」处理。项目级覆盖优先于这里的默认值。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub distribution_targets: BTreeMap<String, Vec<DistributionTarget>>,
 }
 
 impl Default for ExtensionSourceSettings {
@@ -196,6 +220,7 @@ impl Default for ExtensionSourceSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             sources: Vec::new(),
             acquisitions: BTreeMap::new(),
+            distribution_targets: BTreeMap::new(),
         }
     }
 }
@@ -243,6 +268,14 @@ pub(crate) struct ExtensionSourceCatalog {
     pub source_id: String,
     #[serde(default)]
     pub generation: String,
+    /// Explicit identity prevents an accidentally matching repository URL from
+    /// merging unrelated local and remote sources.
+    #[serde(default)]
+    pub distribution_id: String,
+    #[serde(default = "default_distribution_channel")]
+    pub channel: String,
+    #[serde(default = "default_catalog_id")]
+    pub catalog_id: String,
     #[serde(default)]
     pub plugins: Vec<PluginCatalogItem>,
     #[serde(default)]
@@ -265,8 +298,24 @@ pub(crate) struct ExtensionSourceStatus {
     pub generation: String,
     pub using_cache: bool,
     pub error: String,
+    #[serde(default)]
+    pub versions: Vec<ExtensionSourceVersion>,
+    /// Local source provenance. Empty for GitHub sources.
+    #[serde(default)]
+    pub source_commit: String,
+    #[serde(default)]
+    pub source_tree: String,
+    #[serde(default)]
+    pub source_dirty: bool,
     /// 合并说明（如同名扩展被其他来源优先采用），不影响来源可用状态。
     pub notices: Vec<ExtensionSourceNotice>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionSourceVersion {
+    pub asset_kind: String,
+    pub asset_id: String,
+    pub version: String,
 }
 
 /// 同名扩展未参与合并的说明：按原因分组，避免把每一项拼成一句长文本。
@@ -356,6 +405,7 @@ pub(crate) fn github_source_config(
         };
     let verification = source_verification(&repository, verification)?;
     let id = source_id(&repository, &reference, &catalog_path);
+    let distribution_id = normalize_repository_key(&repository);
     Ok(ExtensionSourceConfig {
         id: id.clone(),
         name: if name.trim().is_empty() {
@@ -371,6 +421,9 @@ pub(crate) fn github_source_config(
         auto_update: false,
         verification,
         upstream_repository: String::new(),
+        distribution_id,
+        channel: DEFAULT_DISTRIBUTION_CHANNEL.to_string(),
+        catalog_id: DEFAULT_CATALOG_ID.to_string(),
     })
 }
 
@@ -452,7 +505,10 @@ pub(crate) fn add_local_source(
         enabled: true,
         auto_update: false,
         verification: ExtensionSourceVerification::Optional,
-        upstream_repository: String::new(),
+        upstream_repository: local_upstream_repository(&root, &aggregate.repository),
+        distribution_id: aggregate_distribution_id(&aggregate, &root),
+        channel: aggregate_channel(&aggregate),
+        catalog_id: aggregate_catalog_id(&aggregate),
     };
     if let Some(existing) = current.sources.iter_mut().find(|item| item.id == id) {
         *existing = source;
@@ -512,7 +568,9 @@ pub(crate) fn remove_source(source_id: &str) -> Result<ExtensionSourceSettings, 
         return Err("扩展源不存在".into());
     }
     save_settings(&current)?;
-    let _ = fs::remove_file(cache_path(source_id));
+    remove_cached_catalog(source_id);
+    // 扩展源被移除后，它留下的来源记录已经无处可查，留着只会挡住其他来源接管同名资产。
+    remove_provenance_for_source(source_id);
     invalidate_snapshot_cache();
     if let Some(removed) = removed {
         reconcile_workspace_after_removal(&removed, &current.sources);
@@ -586,21 +644,41 @@ pub(crate) fn refresh_snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Erro
 
 fn snapshot_with_cache(force: bool) -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
     if !force {
-        if let Some((loaded_at, value)) = snapshot_cache()
-            .lock()
-            .map_err(|_| "扩展源内存缓存不可用")?
-            .as_ref()
-        {
-            if loaded_at.elapsed() < SNAPSHOT_CACHE_TTL {
-                return Ok(value.clone());
-            }
+        if let Some(value) = fresh_cached_snapshot() {
+            return Ok(value);
+        }
+    }
+    // 打开「市场」时会同时发起插件/技能/工作流/来源四路请求，冷缓存下它们都会重建
+    // 快照并重写同一份来源缓存文件。并发重建会让 Windows 的 MoveFileExW 以
+    // access denied 失败，界面上看起来就是"来源刷新失败，请检查权限后重试"这种假
+    // 权限错误。重建本身只是读磁盘 + 写缓存，串行化没有副作用。
+    let _rebuild = snapshot_rebuild_gate()
+        .lock()
+        .map_err(|_| "扩展源刷新锁不可用")?;
+    if !force {
+        // 等锁期间可能已经有线程完成了重建，直接用它的结果。
+        if let Some(value) = fresh_cached_snapshot() {
+            return Ok(value);
         }
     }
     let value = load_snapshot(force)?;
+    store_snapshot_cache(&value)?;
+    Ok(value)
+}
+
+fn fresh_cached_snapshot() -> Option<ExtensionSourceSnapshot> {
+    let cache = snapshot_cache().lock().ok()?;
+    match cache.as_ref() {
+        Some((loaded_at, value)) if loaded_at.elapsed() < SNAPSHOT_CACHE_TTL => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn store_snapshot_cache(value: &ExtensionSourceSnapshot) -> Result<(), Box<dyn Error>> {
     *snapshot_cache()
         .lock()
         .map_err(|_| "扩展源内存缓存不可用")? = Some((Instant::now(), value.clone()));
-    Ok(value)
+    Ok(())
 }
 
 fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
@@ -612,7 +690,12 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
     let mut agent_presets = HashMap::<String, ExtensionAgentPreset>::new();
     let mut conflicts = Vec::<(String, String, String)>::new();
     let mut source_catalogs = HashMap::<String, SourceCatalogAssets>::new();
-    let settings = settings()?;
+    let mut settings = settings()?;
+    // 添加来源时用户只能填仓库、分支和清单路径，通道与目录身份只能从远端清单读回来。
+    // 这里纠正一次并落盘，本地源码源与 GitHub 发布源才会合并成同一个分发单元。
+    if adopt_github_distribution_identities(&mut settings, refresh_remote) {
+        save_settings(&settings)?;
+    }
     let acquisitions = settings.acquisitions.clone();
     let enabled = settings
         .sources
@@ -632,7 +715,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
         let (catalog, using_cache, error) = if refresh {
             match fetch_catalog(&source) {
                 Ok(catalog) => {
-                    save_cached_catalog(&source.id, &catalog)?;
+                    cache_catalog(&source, &catalog);
                     (Some(catalog), false, String::new())
                 }
                 Err(error) => match load_cached_catalog(&source.id) {
@@ -659,6 +742,11 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
                 Err(cache_error) => (None, false, format!("缓存读取失败: {cache_error}")),
             }
         };
+        let local_revision = if source.kind == ExtensionSourceKind::Local {
+            local_source_revision(Path::new(&source.repository))
+        } else {
+            (String::new(), String::new(), false)
+        };
         let mut status = ExtensionSourceStatus {
             source: source.clone(),
             state: if catalog.is_some() {
@@ -673,6 +761,10 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             generation: String::new(),
             using_cache,
             error,
+            versions: Vec::new(),
+            source_commit: local_revision.0,
+            source_tree: local_revision.1,
+            source_dirty: local_revision.2,
             notices: Vec::new(),
         };
         if let Some(mut catalog) = catalog {
@@ -680,6 +772,25 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             status.skill_count = catalog.skills.len();
             status.workflow_count = catalog.workflows.len();
             status.generation = catalog.generation.clone();
+            status.versions = catalog
+                .plugins
+                .iter()
+                .map(|item| ExtensionSourceVersion {
+                    asset_kind: "plugin".to_string(),
+                    asset_id: item.plugin_id.clone(),
+                    version: item.version.clone(),
+                })
+                .chain(catalog.skills.iter().map(|item| ExtensionSourceVersion {
+                    asset_kind: "skill".to_string(),
+                    asset_id: item.skill_id.clone(),
+                    version: item.version.clone(),
+                }))
+                .chain(catalog.workflows.iter().map(|item| ExtensionSourceVersion {
+                    asset_kind: "workflow".to_string(),
+                    asset_id: item.workflow_id.clone(),
+                    version: item.version.clone(),
+                }))
+                .collect();
             let identity = source_identity(&source);
             let mut assets = SourceCatalogAssets::default();
             for item in &mut catalog.plugins {
@@ -1008,14 +1119,25 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
     Ok(result)
 }
 
-/// 反查每个分发单元的已安装台账，让界面能直接回答「本机现在跑的是哪一侧」。
+/// 反查每个分发单元的安装情况，让界面能回答两个不同的问题：
+/// 「本机现在有没有这个制品」和「它是不是来自本单元的取用侧」。
+///
+/// 只用 `extension.lock` 的 `source_id` 判断会产生严重的漏报：本地文件安装会写
+/// `local`、手工导入写 `adhoc`，这些都是「安装方式」而不是来源 ID，无法归属到单元。
+/// 因此这里以本机资产注册表（插件/技能/工作流）作为「已安装」的事实来源，
+/// 产权归属仍按台账判断，归属不上的记为 `foreign`（与结构体注释的定义一致）。
 fn attach_unit_installations(units: &mut [ExtensionDistributionUnit]) {
     let lock = crate::app::extension_lock::load().unwrap_or_default();
     let development_plugins = crate::capability::plugin::development_plugin_entries();
     let development_skills = crate::skill::development::entries();
+    // 注册表口径与「插件」「技能」「工作流」页一致，避免同一事实在不同页面显示不同。
+    let installed_plugins = installed_plugin_versions();
+    let installed_skills = installed_skill_versions();
+    let installed_workflows = installed_workflow_versions();
     for unit in units.iter_mut() {
         let unit_plugins = unit.plugin_ids.clone();
         let unit_skills = unit.skill_ids.clone();
+        let unit_workflows = unit.workflow_ids.clone();
         for entry in lock.entries.values() {
             let side = if Some(&entry.source_id) == unit.local_source_id.as_ref() {
                 "local"
@@ -1032,6 +1154,28 @@ fn attach_unit_installations(units: &mut [ExtensionDistributionUnit]) {
                 sha256: entry.sha256.clone(),
                 side: side.to_string(),
             });
+        }
+        // 已安装但无法归属到本单元的制品：补上版本，标记为另一来源。
+        for plugin_id in &unit_plugins {
+            let Some(version) = installed_plugins.get(plugin_id) else {
+                continue;
+            };
+            unit.installed
+                .push(foreign_installation("plugin", plugin_id, version));
+        }
+        for skill_id in &unit_skills {
+            let Some(version) = installed_skills.get(skill_id) else {
+                continue;
+            };
+            unit.installed
+                .push(foreign_installation("skill", skill_id, version));
+        }
+        for workflow_id in &unit_workflows {
+            let Some(version) = installed_workflows.get(workflow_id) else {
+                continue;
+            };
+            unit.installed
+                .push(foreign_installation("workflow", workflow_id, version));
         }
         for (plugin_id, path) in &development_plugins {
             if !unit_plugins.contains(plugin_id) {
@@ -1077,12 +1221,54 @@ fn attach_unit_installations(units: &mut [ExtensionDistributionUnit]) {
     }
 }
 
+fn foreign_installation(kind: &str, id: &str, version: &str) -> ExtensionUnitInstallation {
+    ExtensionUnitInstallation {
+        asset_kind: kind.to_string(),
+        asset_id: id.to_string(),
+        version: version.to_string(),
+        source_id: String::new(),
+        sha256: String::new(),
+        side: "foreign".to_string(),
+    }
+}
+
+/// 本机已安装的插件版本（与「插件」页同源）。
+fn installed_plugin_versions() -> BTreeMap<String, String> {
+    crate::capability::plugin::scan_plugins()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| (item.id, item.version))
+        .collect()
+}
+
+/// 本机已安装的技能版本（与「技能」页同源）。
+fn installed_skill_versions() -> BTreeMap<String, String> {
+    crate::skill::store::SkillStore::new()
+        .list_records()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| (record.manifest.id, record.manifest.version))
+        .collect()
+}
+
+/// 本机已安装的工作流版本（与「工作流」页同源）。
+fn installed_workflow_versions() -> BTreeMap<String, String> {
+    crate::workflow::WorkflowStore::open_default()
+        .and_then(|store| store.list())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|installed| (installed.package.id, installed.package.version))
+        .collect()
+}
+
 /// 开发直挂是运行时最高优先级的生效来源，排序时排在安装台账之前。
 fn side_priority(side: &str) -> u8 {
     match side {
         "development" => 0,
         "local" => 1,
-        _ => 2,
+        "remote" => 2,
+        // 归属不明的本机安装排最后：它只用于「本机是否有」的计数，不代表来源。
+        _ => 3,
     }
 }
 
@@ -1105,6 +1291,13 @@ fn skill_manifest_version(root: &Path) -> Option<String> {
 fn snapshot_cache() -> &'static Mutex<Option<(Instant, ExtensionSourceSnapshot)>> {
     static CACHE: OnceLock<Mutex<Option<(Instant, ExtensionSourceSnapshot)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 只允许一个线程同时重建扩展源快照，避免并发重写同一份来源缓存（见
+/// `snapshot_with_cache`）。
+fn snapshot_rebuild_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
 }
 
 fn invalidate_snapshot_cache() {
@@ -1198,7 +1391,11 @@ pub(crate) fn list_provenance() -> Result<Vec<ExtensionProvenance>, Box<dyn Erro
     }
     let mut result = Vec::new();
     for entry in fs::read_dir(root)?.flatten() {
-        if !entry.path().is_file() {
+        // 原子写会留一份 `.json.bak`，格式与正文完全一样；不排掉就会出现
+        // 同一个资产的重复来源记录。
+        if !entry.path().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
             continue;
         }
         if let Ok(value) = serde_json::from_slice::<ExtensionProvenance>(&fs::read(entry.path())?) {
@@ -1268,9 +1465,6 @@ pub(crate) fn install_plugin_bound(
     for item in &order {
         let before = crate::app::plugin_manager::local_status(&item.plugin_id);
         let previous_lock = crate::app::extension_lock::read("plugin", &item.plugin_id)?;
-        if before.current_version == item.version && before.enabled {
-            continue;
-        }
         let source = match source_for_catalog_item(&snapshot, &item.source) {
             Ok(source) => source,
             Err(error) => {
@@ -1281,6 +1475,26 @@ pub(crate) fn install_plugin_bound(
                 return Err(error);
             }
         };
+        // 版本相同不足以跳过：只有已装的那一份确实出自本次目标来源时才认为
+        // 无需重装。用户在来源管理里切换取用侧后再点安装，就是要覆盖制品并把
+        // 来源记录改过来；这里若只看版本，界面提示的「重新安装会切换来源」会
+        // 变成一句做不到的承诺。
+        // 本地目录源的 catalog 项没有制品摘要（sha256 恒为空），「版本相同」也就
+        // 代表不了「内容相同」：同一个 1.2.0 里改过 UI，磁盘上留着的还是上一份，
+        // 界面却会报安装成功。技能与工作流的安装本就不做这层跳过，插件这里对齐。
+        if source.kind != ExtensionSourceKind::Local
+            && before.current_version == item.version
+            && before.enabled
+            && installed_provenance_matches(
+                "plugin",
+                &item.plugin_id,
+                source,
+                &item.version,
+                &item.sha256,
+            )
+        {
+            continue;
+        }
         lock_changes.push(("plugin".to_string(), item.plugin_id.clone(), previous_lock));
         let install_result = if source.kind == ExtensionSourceKind::Local {
             let dir = local_item_dir(&item.download_url)?;
@@ -1375,6 +1589,56 @@ fn read_provenance(kind: &str, key: &str) -> Result<Option<ExtensionProvenance>,
         return Ok(None);
     }
     Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+/// 本机装着的这一份，是不是就是 `source` 这次要装的东西。
+///
+/// 判断依据是来源记录：来源 ID 和版本都要对得上，目录里给了摘要时还要对得上
+/// 摘要（本地来源不记摘要，跳过这一项）。记录缺失或读不出来时一律返回 false，
+/// 走正常安装，避免"文件坏了但记录还在"时被误判成已是最新。
+fn installed_provenance_matches(
+    kind: &str,
+    key: &str,
+    source: &ExtensionSourceConfig,
+    version: &str,
+    sha256: &str,
+) -> bool {
+    let Ok(Some(record)) = read_provenance(kind, key) else {
+        return false;
+    };
+    record.source_id == source.id
+        && record.version == version
+        && (sha256.trim().is_empty() || record.sha256.eq_ignore_ascii_case(sha256))
+}
+
+/// 删除某个资产的本机来源记录（含原子写留下的 `.bak` 备份）。
+///
+/// 记录的意义是"已装的这一份是从哪个扩展源的哪个制品来的"，资产被卸载之后
+/// 它就直接过期了：留着不但占位，还会让自动更新把已经卸掉的资产当成待更新项。
+pub(crate) fn remove_provenance(kind: &str, key: &str) {
+    remove_provenance_at(&paths::agent_home().join("data"), kind, key);
+}
+
+/// 在指定状态根上删除来源记录。退役与卸载清理跑在 `SkillStore` 自己的状态根上，
+/// 用全局 `agent_home` 会在测试或非默认 profile 里删到别人的记录。
+pub(crate) fn remove_provenance_at(state_root: &Path, kind: &str, key: &str) {
+    let Ok(path) = provenance_path_at(state_root, kind, key) else {
+        return;
+    };
+    let _ = fs::remove_file(atomic_file::backup_path(&path));
+    let _ = fs::remove_file(&path);
+}
+
+/// 删除某个扩展源留下的全部来源记录，用于移除扩展源时收尾。
+pub(crate) fn remove_provenance_for_source(source_id: &str) {
+    let Ok(records) = list_provenance() else {
+        return;
+    };
+    for record in records {
+        if record.source_id == source_id {
+            remove_provenance(&record.asset_kind, &record.asset_key);
+        }
+    }
 }
 
 fn restore_provenance_changes(changes: &[(String, String, Option<ExtensionProvenance>)]) {
@@ -1791,6 +2055,68 @@ fn set_acquisition_at(
     settings_at(path)
 }
 
+/// 设置某个分发单元的默认分发目标，`None` 表示回到继承（按清单声明或出厂默认）。
+///
+/// 只接受已登记单元的 `unit_key`，避免配置里出现无法归属的目标记录。`["workbench"]`
+/// 既可能是「继承」，也可能是管理员对声明了 GitHub 的扩展做出的收窄，两者裁剪结果
+/// 不同，因此显式选择一律落盘，只有 `inherit` 才删除记录。
+pub(crate) fn set_unit_distribution_targets(
+    unit_key: &str,
+    targets: Option<&[DistributionTarget]>,
+) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
+    let path = settings_path();
+    let mut current = settings_at(&path)?;
+    let known = current
+        .sources
+        .iter()
+        .map(unit_key_of)
+        .collect::<HashSet<_>>();
+    if !known.contains(unit_key) {
+        return Err(format!("扩展分发单元不存在: {unit_key}").into());
+    }
+    match targets {
+        Some(targets) => {
+            let normalized = normalize_distribution_targets(targets)?;
+            current
+                .distribution_targets
+                .insert(unit_key.to_string(), normalized);
+        }
+        None => {
+            current.distribution_targets.remove(unit_key);
+        }
+    }
+    atomic_file::atomic_write(
+        &path,
+        &serde_json::to_vec_pretty(&persisted_settings(&current))?,
+    )?;
+    invalidate_snapshot_cache();
+    settings_at(&path)
+}
+
+/// 读取分发单元显式设置的默认目标；未设置时返回 `None`，表示继承。
+pub(crate) fn unit_distribution_targets_setting(
+    settings: &ExtensionSourceSettings,
+    unit_key: &str,
+) -> Option<Vec<DistributionTarget>> {
+    if unit_key.trim().is_empty() {
+        return None;
+    }
+    settings
+        .distribution_targets
+        .get(unit_key)
+        .filter(|targets| !targets.is_empty())
+        .cloned()
+}
+
+/// 读取分发单元默认目标；未登记时回落到「仅工作台」。
+pub(crate) fn unit_distribution_targets(
+    settings: &ExtensionSourceSettings,
+    unit_key: &str,
+) -> Vec<DistributionTarget> {
+    unit_distribution_targets_setting(settings, unit_key)
+        .unwrap_or_else(crate::extension_contracts::default_distribution_targets)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ExtensionUnitInstallReport {
     pub unit_key: String,
@@ -1799,9 +2125,19 @@ pub(crate) struct ExtensionUnitInstallReport {
     pub skills: Vec<ExtensionUnitAsset>,
     pub workflows: Vec<ExtensionUnitAsset>,
     pub errors: Vec<String>,
+    pub failures: Vec<ExtensionUnitInstallFailure>,
+    pub retryable: bool,
 }
 
-/// 按取用侧把整个分发单元安装/更新到本机。逐个制品执行，单个失败不影响其余。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionUnitInstallFailure {
+    pub asset_kind: String,
+    pub asset_id: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+/// 按取用侧把整个分发单元安装/更新到本机。先完成全量预检，再写入制品。
 pub(crate) fn install_unit(unit_key: &str) -> Result<ExtensionUnitInstallReport, Box<dyn Error>> {
     install_unit_bound(unit_key, None)
 }
@@ -1845,6 +2181,10 @@ pub(crate) fn install_unit_bound(
     if unit.assets.iter().any(|asset| asset.source_id != source_id) {
         return Err("扩展单元包含未绑定当前来源的制品，已阻止安装".into());
     }
+    // Installation mutates plugin/skill/workflow stores. Resolve every
+    // artifact and dependency first so a bad item cannot leave a half-installed
+    // distribution unit behind.
+    preflight_unit_installation(&unit, &snapshot)?;
     let mut report = ExtensionUnitInstallReport {
         unit_key: unit.unit_key.clone(),
         acquisition: unit.acquisition.clone(),
@@ -1852,6 +2192,8 @@ pub(crate) fn install_unit_bound(
         skills: Vec::new(),
         workflows: Vec::new(),
         errors: Vec::new(),
+        failures: Vec::new(),
+        retryable: false,
     };
     for asset in &unit.assets {
         match asset.asset_kind.as_str() {
@@ -1874,9 +2216,9 @@ pub(crate) fn install_unit_bound(
                     signature_algorithm: asset.signature_algorithm.clone(),
                     channel: asset.channel.clone(),
                 }),
-                Err(error) => report
-                    .errors
-                    .push(format!("插件 {} 安装失败: {error}", asset.asset_id)),
+                Err(error) => {
+                    record_install_failure(&mut report, "plugin", &asset.asset_id, error, true)
+                }
             },
             "skill" => match install_skill_bound(
                 &asset.asset_id,
@@ -1897,9 +2239,9 @@ pub(crate) fn install_unit_bound(
                     signature_algorithm: asset.signature_algorithm.clone(),
                     channel: asset.channel.clone(),
                 }),
-                Err(error) => report
-                    .errors
-                    .push(format!("Skill {} 安装失败: {error}", asset.asset_id)),
+                Err(error) => {
+                    record_install_failure(&mut report, "skill", &asset.asset_id, error, true)
+                }
             },
             "workflow" => match install_workflow_bound(
                 &asset.asset_id,
@@ -1920,17 +2262,124 @@ pub(crate) fn install_unit_bound(
                     signature_algorithm: asset.signature_algorithm.clone(),
                     channel: asset.channel.clone(),
                 }),
-                Err(error) => report
-                    .errors
-                    .push(format!("Workflow {} 安装失败: {error}", asset.asset_id)),
+                Err(error) => {
+                    record_install_failure(&mut report, "workflow", &asset.asset_id, error, true)
+                }
             },
-            other => report.errors.push(format!("不支持的扩展类型: {other}")),
+            other => record_install_failure(
+                &mut report,
+                other,
+                &asset.asset_id,
+                format!("不支持的扩展类型: {other}").into(),
+                false,
+            ),
         }
     }
     if !report.plugins.is_empty() {
         crate::capability::service::invalidate_capability_discovery();
     }
     Ok(report)
+}
+
+fn record_install_failure(
+    report: &mut ExtensionUnitInstallReport,
+    asset_kind: &str,
+    asset_id: &str,
+    error: Box<dyn Error>,
+    retryable: bool,
+) {
+    let message = error.to_string();
+    report.errors.push(format!(
+        "{} {} 安装失败: {message}",
+        match asset_kind {
+            "plugin" => "插件",
+            "skill" => "Skill",
+            "workflow" => "Workflow",
+            _ => "扩展",
+        },
+        asset_id
+    ));
+    report.failures.push(ExtensionUnitInstallFailure {
+        asset_kind: asset_kind.to_string(),
+        asset_id: asset_id.to_string(),
+        message,
+        retryable,
+    });
+    report.retryable |= retryable;
+}
+
+fn preflight_unit_installation(
+    unit: &ExtensionDistributionUnit,
+    snapshot: &ExtensionSourceSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    for asset in &unit.assets {
+        let source = snapshot
+            .sources
+            .iter()
+            .map(|status| &status.source)
+            .find(|source| source.id == asset.source_id)
+            .ok_or_else(|| format!("制品 {} 的来源不存在", asset.asset_id))?;
+        validate_asset_identity(&asset.asset_kind, &asset.asset_id)?;
+        if source.kind == ExtensionSourceKind::Local {
+            let dir = local_item_dir(&asset.artifact_url)?;
+            let manifest = match asset.asset_kind.as_str() {
+                "plugin" => "plugin.json",
+                "skill" => "skill.json",
+                "workflow" => "workflow.json",
+                other => return Err(format!("不支持的扩展类型: {other}").into()),
+            };
+            if !dir.join(manifest).is_file() {
+                return Err(format!("本地扩展 {} 缺少 {}", asset.asset_id, manifest).into());
+            }
+        } else {
+            validate_artifact(&source.repository, &asset.artifact_url, 1, &asset.sha256)?;
+            // The complete signature was checked while loading the catalog;
+            // keep the unit-level preflight strict about the metadata needed
+            // by the installer without duplicating the catalog payload.
+            if source.verification.requires_signature()
+                && (asset.signature_key_id.trim().is_empty()
+                    || asset.signature_algorithm.trim().is_empty())
+            {
+                return Err("远端制品缺少签名元数据".into());
+            }
+        }
+        match asset.asset_kind.as_str() {
+            "plugin" => {
+                plan_plugin_bound(
+                    &asset.asset_id,
+                    Some(&asset.version),
+                    Some(&asset.source_id),
+                    Some(&asset.sha256),
+                )?;
+            }
+            "skill" => {
+                plan_skill_bound(
+                    &asset.asset_id,
+                    Some(&asset.version),
+                    Some(&asset.source_id),
+                    Some(&asset.sha256),
+                )?;
+            }
+            "workflow" => {
+                let workflow = snapshot
+                    .workflow_versions
+                    .iter()
+                    .find(|item| {
+                        item.workflow_id == asset.asset_id
+                            && item.version == asset.version
+                            && item.source.ends_with(&format!(":{}", asset.source_id))
+                    })
+                    .ok_or_else(|| format!("扩展源中未找到 Workflow: {}", asset.asset_id))?;
+                if !asset.sha256.trim().is_empty()
+                    && !workflow.sha256.eq_ignore_ascii_case(&asset.sha256)
+                {
+                    return Err(format!("Workflow {} 制品摘要与请求不一致", asset.asset_id).into());
+                }
+            }
+            other => return Err(format!("不支持的扩展类型: {other}").into()),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn plan_skill(
@@ -2061,7 +2510,7 @@ pub(crate) fn ensure_authoring_feature() -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|item| item.plugin_id == AUTHORING_PLUGIN_ID)
         {
-            return Err("扩展创作组件尚未安装，且已配置的扩展源未提供 AI 扩展开发工具".into());
+            return Err("扩展创作组件尚未安装，且已配置的扩展源未提供扩展开发工具".into());
         }
         install_plugin(AUTHORING_PLUGIN_ID, None)?;
     }
@@ -2103,6 +2552,9 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
         if !auto_sources.contains(provenance.source_id.as_str()) {
             continue;
         }
+        // 溯源记录在卸载后会长期保留，因此不能把「来源里有记录」当成
+        // 「本机仍然安装」。自动更新只覆盖已安装能力，否则来源一旦开启
+        // 自动更新，用户主动卸载的扩展会在下次刷新时被自动装回来。
         if provenance.asset_kind == "plugin" {
             let Some(item) = snapshot.plugins.iter().find(|item| {
                 item.plugin_id == provenance.asset_key
@@ -2111,6 +2563,9 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
                 continue;
             };
             let local = crate::app::plugin_manager::local_status(&provenance.asset_key);
+            if local.current_version.trim().is_empty() {
+                continue;
+            }
             if crate::skill::resolver::compare_versions(&item.version, &local.current_version)
                 == std::cmp::Ordering::Greater
             {
@@ -2128,6 +2583,9 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
                 .get_record(&provenance.asset_key)?
                 .map(|record| record.manifest.version)
                 .unwrap_or_default();
+            if current.trim().is_empty() {
+                continue;
+            }
             if crate::skill::resolver::compare_versions(&item.version, &current)
                 == std::cmp::Ordering::Greater
             {
@@ -2149,6 +2607,9 @@ pub(crate) fn reconcile_auto_updates() -> Result<Vec<String>, Box<dyn Error>> {
                 .find(|workflow| workflow.package.id == provenance.asset_key)
                 .map(|workflow| workflow.package.version)
                 .unwrap_or_default();
+            if current.trim().is_empty() {
+                continue;
+            }
             if crate::skill::resolver::compare_versions(&item.version, &current)
                 == std::cmp::Ordering::Greater
             {
@@ -2449,6 +2910,15 @@ fn fetch_catalog(source: &ExtensionSourceConfig) -> Result<ExtensionSourceCatalo
         validate_catalog(&catalog, source)?;
         return Ok(catalog);
     }
+    let catalog = fetch_remote_catalog(source)?;
+    validate_catalog(&catalog, source)?;
+    Ok(catalog)
+}
+
+/// 只把远端清单取回来，不校验来源绑定，供「按远端清单纠正来源身份」使用。
+fn fetch_remote_catalog(
+    source: &ExtensionSourceConfig,
+) -> Result<ExtensionSourceCatalog, Box<dyn Error>> {
     let url = catalog_url(source)?;
     let catalog = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -2458,8 +2928,60 @@ fn fetch_catalog(source: &ExtensionSourceConfig) -> Result<ExtensionSourceCatalo
         .send()?
         .error_for_status()?
         .json::<ExtensionSourceCatalog>()?;
-    validate_catalog(&catalog, source)?;
     Ok(catalog)
+}
+
+/// GitHub 发布源的通道与目录身份由远端清单自己声明：用户在「添加来源」里只能填
+/// 仓库、分支和清单路径，没有可选项。拿到清单后按它的声明纠正一次并落盘，本地
+/// 源码源与该 GitHub 发布源才会落到同一个分发单元，重启后取用键也保持稳定。
+fn adopt_github_distribution_identities(
+    settings: &mut ExtensionSourceSettings,
+    refresh_remote: bool,
+) -> bool {
+    let mut changed = false;
+    for source in settings.sources.iter_mut() {
+        if source.kind != ExtensionSourceKind::Github {
+            continue;
+        }
+        let catalog = if refresh_remote {
+            match fetch_remote_catalog(source) {
+                Ok(catalog) => catalog,
+                Err(_) => continue,
+            }
+        } else {
+            match load_cached_catalog(&source.id) {
+                Ok(Some(catalog)) => catalog,
+                _ => continue,
+            }
+        };
+        if adopt_catalog_distribution_identity(source, &catalog) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn adopt_catalog_distribution_identity(
+    source: &mut ExtensionSourceConfig,
+    catalog: &ExtensionSourceCatalog,
+) -> bool {
+    let distribution_id = normalize_distribution_id(&catalog.distribution_id);
+    let channel = normalize_channel(&catalog.channel);
+    let catalog_id = normalize_catalog_id(&catalog.catalog_id);
+    let mut changed = false;
+    if !distribution_id.is_empty() && distribution_id != source.distribution_id {
+        source.distribution_id = distribution_id;
+        changed = true;
+    }
+    if !channel.is_empty() && channel != source.channel {
+        source.channel = channel;
+        changed = true;
+    }
+    if !catalog_id.is_empty() && catalog_id != source.catalog_id {
+        source.catalog_id = catalog_id;
+        changed = true;
+    }
+    changed
 }
 
 pub(crate) fn validate_catalog(
@@ -2471,6 +2993,27 @@ pub(crate) fn validate_catalog(
     }
     if !catalog.source_id.is_empty() && catalog.source_id != source.id {
         return Err("扩展源目录身份与本机配置不一致".into());
+    }
+    if !catalog.distribution_id.trim().is_empty() {
+        validate_distribution_field(&catalog.distribution_id, "目录分发 ID", true)?;
+        if !source.distribution_id.trim().is_empty()
+            && normalize_distribution_id(&catalog.distribution_id)
+                != normalize_distribution_id(&source.distribution_id)
+        {
+            return Err("扩展源目录分发 ID 与来源配置不一致".into());
+        }
+    }
+    validate_distribution_field(&catalog.channel, "目录分发通道", false)?;
+    if !source.channel.trim().is_empty()
+        && normalize_channel(&catalog.channel) != normalize_channel(&source.channel)
+    {
+        return Err("扩展源目录分发通道与来源配置不一致".into());
+    }
+    validate_distribution_field(&catalog.catalog_id, "目录 ID", false)?;
+    if !source.catalog_id.trim().is_empty()
+        && normalize_catalog_id(&catalog.catalog_id) != normalize_catalog_id(&source.catalog_id)
+    {
+        return Err("扩展源目录 ID 与来源配置不一致".into());
     }
     let mut identities = HashSet::new();
     for item in &catalog.plugins {
@@ -2674,6 +3217,14 @@ fn normalize_path_key(value: &str) -> String {
 /// 分发单元键。本地工作区源优先用它声明的上游仓库作为键，这样它才能与对应的
 /// GitHub 分发源落到同一单元；没有上游仓库时退化为本地路径键。
 pub(crate) fn unit_key_of(source: &ExtensionSourceConfig) -> String {
+    let distribution_id = normalize_distribution_id(&source.distribution_id);
+    let channel = normalize_channel(&source.channel);
+    let catalog_id = normalize_catalog_id(&source.catalog_id);
+    if !distribution_id.is_empty() && !channel.is_empty() && !catalog_id.is_empty() {
+        return format!("{distribution_id}#{channel}#{catalog_id}");
+    }
+    // Compatibility for in-memory fixtures and pre-migration callers. Persisted
+    // settings are normalized by `settings_at` before they reach this path.
     match source.kind {
         ExtensionSourceKind::Local => {
             let upstream = normalize_repository_key(&source.upstream_repository);
@@ -2952,6 +3503,24 @@ fn build_units(
         units.push(ExtensionDistributionUnit {
             unit_key: key.clone(),
             name,
+            distribution_id: preferred
+                .map(|source| source.distribution_id.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| local.map(|source| source.distribution_id.clone()))
+                .or_else(|| remote.map(|source| source.distribution_id.clone()))
+                .unwrap_or_default(),
+            channel: preferred
+                .map(|source| source.channel.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| local.map(|source| source.channel.clone()))
+                .or_else(|| remote.map(|source| source.channel.clone()))
+                .unwrap_or_else(|| DEFAULT_DISTRIBUTION_CHANNEL.to_string()),
+            catalog_id: preferred
+                .map(|source| source.catalog_id.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| local.map(|source| source.catalog_id.clone()))
+                .or_else(|| remote.map(|source| source.catalog_id.clone()))
+                .unwrap_or_else(|| DEFAULT_CATALOG_ID.to_string()),
             acquisition,
             local_source_id: local.map(|source| source.id.clone()),
             remote_source_id: remote.map(|source| source.id.clone()),
@@ -3140,7 +3709,13 @@ fn validate_artifact(
         return Err("GitHub 扩展源制品必须使用 github.com 的 HTTPS Release 地址".into());
     }
     let expected = format!("/{repository}/releases/download/");
-    if !url.path().starts_with(&expected) {
+    // GitHub 的 owner/repo 不区分大小写，目录里的制品地址常为全小写，
+    // 与用户填写的仓库大小写并不总是一致，这里按大小写不敏感比较。
+    if !url
+        .path()
+        .to_ascii_lowercase()
+        .starts_with(&expected.to_ascii_lowercase())
+    {
         return Err("扩展源制品地址不属于配置的 GitHub 仓库".into());
     }
     Ok(())
@@ -3155,7 +3730,11 @@ fn settings_at(path: &Path) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
         return Err(format!("扩展源配置版本不受支持: {}", value.schema_version).into());
     }
     let mut ids = HashSet::new();
-    for source in &value.sources {
+    for source in &mut value.sources {
+        normalize_source_distribution_identity(source);
+        validate_distribution_field(&source.distribution_id, "分发 ID", true)?;
+        validate_distribution_field(&source.channel, "分发通道", false)?;
+        validate_distribution_field(&source.catalog_id, "目录 ID", false)?;
         let expected = match source.kind {
             ExtensionSourceKind::Github => source_id(
                 &normalize_repository(&source.repository)?,
@@ -3178,7 +3757,97 @@ fn settings_at(path: &Path) -> Result<ExtensionSourceSettings, Box<dyn Error>> {
         }
     }
     apply_local_upstreams(&mut value);
+    migrate_acquisition_keys(&mut value.acquisitions, &value.sources);
     Ok(value)
+}
+
+/// Fill identity fields for settings written before the explicit distribution
+/// identity was introduced. This is intentionally deterministic and does not
+/// use a remote response, so a source keeps the same unit key across restarts.
+fn normalize_source_distribution_identity(source: &mut ExtensionSourceConfig) {
+    if source.kind == ExtensionSourceKind::Local {
+        let root = Path::new(source.repository.trim());
+        if let Ok(content) = fs::read_to_string(root.join(&source.catalog_path)) {
+            if let Ok(aggregate) = serde_json::from_str::<LocalAggregateCatalog>(&content) {
+                source.distribution_id = aggregate_distribution_id(&aggregate, root);
+                source.channel = aggregate_channel(&aggregate);
+                source.catalog_id = aggregate_catalog_id(&aggregate);
+                return;
+            }
+        }
+    }
+    if source.distribution_id.trim().is_empty() {
+        source.distribution_id = match source.kind {
+            ExtensionSourceKind::Github => normalize_repository_key(&source.repository),
+            ExtensionSourceKind::Local => {
+                let root = Path::new(source.repository.trim());
+                let aggregate = fs::read_to_string(root.join(&source.catalog_path))
+                    .ok()
+                    .and_then(|content| {
+                        serde_json::from_str::<LocalAggregateCatalog>(&content).ok()
+                    });
+                aggregate
+                    .as_ref()
+                    .map(|value| aggregate_distribution_id(value, root))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        let upstream =
+                            resolve_local_upstream(&source.repository, &source.catalog_path);
+                        if upstream.is_empty() {
+                            local_distribution_fallback(&source.repository)
+                        } else {
+                            upstream
+                        }
+                    })
+            }
+        };
+    } else {
+        source.distribution_id = normalize_distribution_id(&source.distribution_id);
+    }
+    if source.channel.trim().is_empty() {
+        source.channel = DEFAULT_DISTRIBUTION_CHANNEL.to_string();
+    } else {
+        source.channel = normalize_channel(&source.channel);
+    }
+    if source.catalog_id.trim().is_empty() {
+        source.catalog_id = DEFAULT_CATALOG_ID.to_string();
+    } else {
+        source.catalog_id = normalize_catalog_id(&source.catalog_id);
+    }
+}
+
+/// Old settings used `remote:owner/repo` or a local path as the acquisition
+/// key. Move those entries to the explicit identity key while preserving a
+/// user's selected remote side.
+fn migrate_acquisition_keys(
+    acquisitions: &mut BTreeMap<String, ExtensionSourceAcquisition>,
+    sources: &[ExtensionSourceConfig],
+) {
+    let mut aliases = BTreeMap::new();
+    for source in sources {
+        let new_key = unit_key_of(source);
+        let old_key = match source.kind {
+            ExtensionSourceKind::Github => {
+                format!("remote:{}", normalize_repository_key(&source.repository))
+            }
+            ExtensionSourceKind::Local => {
+                let upstream = normalize_repository_key(&source.upstream_repository);
+                if upstream.is_empty() {
+                    format!("local:{}", normalize_path_key(&source.repository))
+                } else {
+                    format!("remote:{upstream}")
+                }
+            }
+        };
+        if old_key != new_key {
+            aliases.insert(old_key, new_key);
+        }
+    }
+    for (old_key, new_key) in aliases {
+        if let Some(value) = acquisitions.remove(&old_key) {
+            acquisitions.entry(new_key).or_insert(value);
+        }
+    }
 }
 
 fn apply_local_upstreams(settings: &mut ExtensionSourceSettings) {
@@ -3234,6 +3903,9 @@ fn persisted_settings(settings: &ExtensionSourceSettings) -> ExtensionSourceSett
         .map(unit_key_of)
         .collect::<HashSet<String>>();
     persisted.acquisitions.retain(|key, _| valid.contains(key));
+    persisted
+        .distribution_targets
+        .retain(|key, _| valid.contains(key));
     for source in persisted.sources.iter_mut() {
         source.upstream_repository = String::new();
     }
@@ -3252,8 +3924,23 @@ fn save_cached_catalog(
     source_id: &str,
     catalog: &ExtensionSourceCatalog,
 ) -> Result<(), Box<dyn Error>> {
-    atomic_file::atomic_write(&cache_path(source_id), &serde_json::to_vec_pretty(catalog)?)?;
+    let path = cache_path(source_id);
+    // 回写缓存时加文件锁：进程内由重建闸门串行化，CLI 与 GUI 这类多进程同时刷新
+    // 同一来源时，锁是唯一的互斥手段。
+    let _lock = atomic_file::lock(&path)?;
+    atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(catalog)?)?;
     Ok(())
+}
+
+/// 回写来源缓存。缓存只服务于"下次离线也能读"，写失败不影响本次已经取到的目录，
+/// 所以降级成事件日志，而不是让整个来源刷新以假权限错误失败。
+fn cache_catalog(source: &ExtensionSourceConfig, catalog: &ExtensionSourceCatalog) {
+    if let Err(error) = save_cached_catalog(&source.id, catalog) {
+        crate::app::crash::record_event(
+            "warn",
+            &format!("扩展源缓存写入失败: {} ({error})", source.id),
+        );
+    }
 }
 
 fn load_cached_catalog(source_id: &str) -> Result<Option<ExtensionSourceCatalog>, Box<dyn Error>> {
@@ -3274,13 +3961,29 @@ fn cache_path(source_id: &str) -> PathBuf {
         .join(format!("{source_id}.json"))
 }
 
+/// 缓存以 `<id>.json` 为主体，旁边还有写入时产生的 `.bak` 与 `.lock`。
+/// 只删主文件会把已移除来源的残渣留在缓存目录里。
+fn remove_cached_catalog(source_id: &str) {
+    let cache = cache_path(source_id);
+    let _ = fs::remove_file(&cache);
+    for suffix in ["bak", "lock"] {
+        let _ = fs::remove_file(cache.with_extension(format!("json.{suffix}")));
+    }
+}
+
 fn provenance_root() -> PathBuf {
     paths::agent_home().join("data/extension-provenance")
 }
 
 fn provenance_path(kind: &str, key: &str) -> Result<PathBuf, Box<dyn Error>> {
+    provenance_path_at(&paths::agent_home().join("data"), kind, key)
+}
+
+fn provenance_path_at(state_root: &Path, kind: &str, key: &str) -> Result<PathBuf, Box<dyn Error>> {
     validate_asset_identity(kind, key)?;
-    Ok(provenance_root().join(format!("{kind}-{key}.json")))
+    Ok(state_root
+        .join("extension-provenance")
+        .join(format!("{kind}-{key}.json")))
 }
 
 fn catalog_url(source: &ExtensionSourceConfig) -> Result<url::Url, Box<dyn Error>> {
@@ -3322,6 +4025,9 @@ fn build_local_catalog(
         schema_version: CATALOG_SCHEMA_VERSION,
         source_id: source.id.clone(),
         generation: String::new(),
+        distribution_id: aggregate_distribution_id(&aggregate, &root),
+        channel: aggregate_channel(&aggregate),
+        catalog_id: aggregate_catalog_id(&aggregate),
         plugins: Vec::new(),
         skills: Vec::new(),
         workflows: Vec::new(),
@@ -3494,7 +4200,9 @@ fn build_local_workflow_item(
         author_name: String::new(),
         categories,
         version: package.version.clone(),
-        release_notes: String::new(),
+        // 与插件、技能一样取自清单：本地源是开发者的预览视图，更新说明要能
+        // 在发布前就看见，否则「写没写说明」只能等到发到市场才知道。
+        release_notes: package.release_notes.clone(),
         published_at: String::new(),
         min_agent_version: package.min_agent_version.clone(),
         capability_ids: package.capabilities.clone(),
@@ -3539,14 +4247,29 @@ fn attach_unit_projects(units: &mut [ExtensionDistributionUnit]) {
 /// Agent 内部的 draft / test-package 目录，否则「用 AI 开发」会改到产物副本，
 /// 下一次构建即被覆盖。
 pub(crate) fn local_source_workspaces() -> Vec<LocalSourceWorkspace> {
+    authoritative_local_sources()
+        .into_iter()
+        .flat_map(|snapshot| snapshot.workspaces)
+        .collect()
+}
+
+/// 已成功读取出清单的本地扩展源快照。
+///
+/// 只有这里返回的源才有资格宣告「某个扩展已经不存在」：目录不可读或清单解析失败
+/// 时不能据此删除项目登记，否则一次临时拔盘就会丢掉开发者的项目绑定。
+pub(crate) fn authoritative_local_sources() -> Vec<LocalSourceSnapshot> {
     let Ok(current) = settings() else {
         return Vec::new();
     };
-    let mut workspaces = Vec::new();
+    let mut snapshots = Vec::new();
+    // Source enablement controls market discovery and installation only. A
+    // developer must still be able to open and build a registered workspace
+    // while its distribution side is paused, so authoring discovery includes
+    // every configured local source and validates it independently below.
     for source in current
         .sources
         .iter()
-        .filter(|source| source.kind == ExtensionSourceKind::Local && source.enabled)
+        .filter(|source| source.kind == ExtensionSourceKind::Local)
     {
         let root = PathBuf::from(&source.repository);
         let Ok(content) = fs::read_to_string(root.join(&source.catalog_path)) else {
@@ -3555,6 +4278,7 @@ pub(crate) fn local_source_workspaces() -> Vec<LocalSourceWorkspace> {
         let Ok(aggregate) = serde_json::from_str::<LocalAggregateCatalog>(&content) else {
             continue;
         };
+        let mut workspaces = Vec::new();
         for entry in &aggregate.extensions {
             let Ok(path) = safe_local_child(&root, &entry.path) else {
                 continue;
@@ -3568,8 +4292,68 @@ pub(crate) fn local_source_workspaces() -> Vec<LocalSourceWorkspace> {
                 unit_key: unit_key_of(source),
             });
         }
+        snapshots.push(LocalSourceSnapshot {
+            root_key: normalize_path_key(&path_key_of(Path::new(&source.repository))),
+            repository: normalize_repository_key(&source.upstream_repository),
+            default_branch: default_branch_of(&aggregate),
+            workspaces,
+        });
     }
-    workspaces
+    snapshots
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LocalSourceSnapshot {
+    /// 源根目录的归一化键，用于按路径判断某条项目登记属于这个源。
+    root_key: String,
+    /// 源声明的上游仓库键，用于跨机器比对同一条项目登记。
+    repository: String,
+    /// 源声明的默认分支，用于补登记时填写发布分支，避免空分支阻断发布。
+    pub default_branch: String,
+    pub workspaces: Vec<LocalSourceWorkspace>,
+}
+
+impl LocalSourceSnapshot {
+    /// 项目登记是否属于这个源。
+    ///
+    /// 两边都声明了仓库时以仓库键为准：登记可能来自另一台机器，本地路径对不上，
+    /// 但上游仓库一致，仍属同一个源；反过来，仓库不同就一定不是这个源的项目，
+    /// 避免同一目录下并存的多仓库被误删。只有至少一侧没有仓库信息时，
+    /// 才退化成「目录是否落在源根之下」。
+    pub fn owns(&self, repository: &str, workspace_path: &Path) -> bool {
+        let registry_key = normalize_repository_key(repository);
+        if !self.repository.is_empty() && !registry_key.is_empty() {
+            return self.repository == registry_key;
+        }
+        let path_key = normalize_path_key(&path_key_of(workspace_path));
+        !self.root_key.is_empty()
+            && (path_key == self.root_key || path_key.starts_with(&format!("{}/", self.root_key)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        root: &Path,
+        repository: &str,
+        default_branch: &str,
+        workspaces: Vec<LocalSourceWorkspace>,
+    ) -> Self {
+        Self {
+            root_key: normalize_path_key(&path_key_of(root)),
+            repository: normalize_repository_key(repository),
+            default_branch: default_branch.to_string(),
+            workspaces,
+        }
+    }
+}
+
+/// 统一成可比较的路径文本：登记里的路径经过 canonicalize，是 Windows 的
+/// `\\?\` 扩展前缀写法，而设置里的源根目录是普通写法，两边必须先对齐。
+fn path_key_of(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy().to_string();
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 #[derive(Debug, Clone)]
@@ -3600,7 +4384,26 @@ fn safe_local_child(root: &Path, relative: &str) -> Result<PathBuf, Box<dyn Erro
 struct LocalAggregateCatalog {
     #[serde(default)]
     repository: String,
+    /// Stable product identity shared with the published catalog. When omitted
+    /// the repository (or Git origin) is used for backwards compatibility.
+    #[serde(default)]
+    distribution_id: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    catalog_id: String,
+    /// 源声明的默认分支；缺省时按 `main` 兜底，与 `extensions.json` 的既有写法一致。
+    #[serde(default)]
+    default_branch: String,
     extensions: Vec<LocalAggregateExtension>,
+}
+
+fn default_branch_of(aggregate: &LocalAggregateCatalog) -> String {
+    let declared = aggregate.default_branch.trim();
+    if !declared.is_empty() {
+        return declared.to_string();
+    }
+    "main".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3632,8 +4435,85 @@ impl LocalAggregateCatalog {
     }
 }
 
+fn aggregate_distribution_id(aggregate: &LocalAggregateCatalog, root: &Path) -> String {
+    let declared = normalize_distribution_id(&aggregate.distribution_id);
+    if !declared.is_empty() {
+        return declared;
+    }
+    let upstream = local_upstream_repository(root, &aggregate.repository);
+    if !upstream.is_empty() {
+        return normalize_distribution_id(&upstream);
+    }
+    local_distribution_fallback(&root.display().to_string())
+}
+
+fn local_distribution_fallback(value: &str) -> String {
+    let digest = Sha256::digest(normalize_path_key(value).as_bytes());
+    format!(
+        "local-{:.16x}",
+        u64::from_be_bytes(digest[..8].try_into().unwrap())
+    )
+}
+
+fn aggregate_channel(aggregate: &LocalAggregateCatalog) -> String {
+    let channel = normalize_channel(&aggregate.channel);
+    if channel.is_empty() {
+        DEFAULT_DISTRIBUTION_CHANNEL.to_string()
+    } else {
+        channel
+    }
+}
+
+fn aggregate_catalog_id(aggregate: &LocalAggregateCatalog) -> String {
+    let catalog_id = normalize_catalog_id(&aggregate.catalog_id);
+    if catalog_id.is_empty() {
+        DEFAULT_CATALOG_ID.to_string()
+    } else {
+        catalog_id
+    }
+}
+
 fn normalize_repository(value: &str) -> Result<String, Box<dyn Error>> {
     Ok(crate::app::github_source::parse_source_url(value)?.repository)
+}
+
+fn normalize_distribution_id(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn normalize_channel(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn normalize_catalog_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn default_distribution_channel() -> String {
+    DEFAULT_DISTRIBUTION_CHANNEL.to_string()
+}
+
+fn default_catalog_id() -> String {
+    DEFAULT_CATALOG_ID.to_string()
+}
+
+fn validate_distribution_field(
+    value: &str,
+    label: &str,
+    allow_slash: bool,
+) -> Result<(), Box<dyn Error>> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-')
+                || (allow_slash && byte == b'/')
+        })
+    {
+        return Err(format!("{label}格式无效").into());
+    }
+    Ok(())
 }
 
 /// 解析本地聚合目录对应的 GitHub 上游仓库（owner/repo）。
@@ -3660,6 +4540,41 @@ fn git_origin_repository(root: &Path) -> Option<String> {
     }
     let value = String::from_utf8(output.stdout).ok()?;
     normalize_git_remote(&value)
+}
+
+/// Read immutable Git provenance for a local source without treating an
+/// uncommitted checkout as a publishable artifact. The UI uses `dirty` to make
+/// that distinction explicit; failures simply mean the directory is not a Git
+/// working tree and are represented by empty commit/tree values.
+fn local_source_revision(root: &Path) -> (String, String, bool) {
+    let commit = git_revision_output(root, &["rev-parse", "HEAD"]);
+    let tree = git_revision_output(root, &["rev-parse", "HEAD^{tree}"]);
+    let dirty = {
+        let mut command = crate::runtime::process::hidden_command("git");
+        command
+            .arg("-C")
+            .arg(root)
+            .args(["status", "--porcelain", "--untracked-files=all"]);
+        command
+            .output()
+            .map(|output| output.status.success() && !output.stdout.is_empty())
+            .unwrap_or(false)
+    };
+    (commit, tree, dirty)
+}
+
+fn git_revision_output(root: &Path, args: &[&str]) -> String {
+    let mut command = crate::runtime::process::hidden_command("git");
+    command.arg("-C").arg(root).args(args);
+    let Ok(output) = command.output() else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn normalize_git_remote(value: &str) -> Option<String> {
@@ -3720,6 +4635,679 @@ fn validate_asset_key(value: &str) -> Result<(), Box<dyn Error>> {
         return Err("扩展 ID 无效".into());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 一键批量更新
+//
+// 市场与「我的能力」都只比较版本号来判断「可更新」，但安装路径是按来源绑定的：
+// 同一个扩展在多个来源里都有更高版本时，只有本机安装台账能证明哪个来源才是
+// 当初安装它的来源。批量更新如果选错来源，轻则整批报错，重则把组织策略下发的
+// 版本覆盖成本地开发版本。因此这里先把候选分成三组：
+//   ready   —— 台账来源与本次更新来源一致，可安全批量更新；
+//   review  —— 无台账或来源已变更，必须由用户显式确认后才更新；
+//   managed —— 组织直接管理版本，不参与手动批量更新。
+// ---------------------------------------------------------------------------
+
+/// 批量更新分组：来源已核对，可直接更新。
+pub(crate) const EXTENSION_UPDATE_GROUP_READY: &str = "ready";
+/// 批量更新分组：来源无法核对，需要用户显式确认。
+pub(crate) const EXTENSION_UPDATE_GROUP_REVIEW: &str = "review";
+/// 批量更新分组：跟随组织策略，不参与批量更新。
+pub(crate) const EXTENSION_UPDATE_GROUP_MANAGED: &str = "managed";
+
+/// 组织下发来源的固定标识，出现在安装台账里。
+const ORGANIZATION_SOURCE_ID: &str = "organization";
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionUpdateCandidate {
+    pub asset_kind: String,
+    pub asset_id: String,
+    pub name: String,
+    pub installed_version: String,
+    pub target_version: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub channel: String,
+    pub sha256: String,
+    pub artifact_id: String,
+    pub group: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ExtensionUpdateTarget {
+    pub asset_kind: String,
+    pub asset_id: String,
+    pub version: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionUpdateOutcome {
+    pub asset_kind: String,
+    pub asset_id: String,
+    pub name: String,
+    pub from_version: String,
+    pub to_version: String,
+    /// updated | failed | cancelled
+    pub status: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionBatchUpdateReport {
+    pub outcomes: Vec<ExtensionUpdateOutcome>,
+    pub updated_count: usize,
+    pub failed_count: usize,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionUpdateProgress {
+    pub index: usize,
+    pub total: usize,
+    pub asset_kind: String,
+    pub asset_id: String,
+    pub name: String,
+    pub from_version: String,
+    pub to_version: String,
+    /// running | updated | failed | cancelled
+    pub status: String,
+    pub message: String,
+}
+
+/// 本机安装台账里登记过的来源。台账是「这个扩展当初从哪来」的唯一凭据：
+/// 来源台账（provenance）优先，它随每次来源安装写入并带制品摘要。
+struct UpdateLedger {
+    source_id: String,
+}
+
+fn update_ledger(
+    provenance: &[ExtensionProvenance],
+    lock: &crate::app::extension_lock::ExtensionLockFile,
+    asset_kind: &str,
+    asset_id: &str,
+) -> UpdateLedger {
+    let recorded = provenance
+        .iter()
+        .find(|item| item.asset_kind == asset_kind && item.asset_key == asset_id)
+        .map(|item| item.source_id.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let locked = lock
+        .entries
+        .get(&format!("{asset_kind}:{asset_id}"))
+        .map(|item| item.source_id.trim().to_string())
+        .filter(|value| !value.is_empty());
+    UpdateLedger {
+        source_id: recorded.or(locked).unwrap_or_default(),
+    }
+}
+
+/// 目录项里的 `local:xxx` / `github:xxx` 前缀剥掉，得到与台账同构的来源 ID。
+fn catalog_source_id(source: &str) -> String {
+    source
+        .strip_prefix("github:")
+        .or_else(|| source.strip_prefix("local:"))
+        .unwrap_or(source)
+        .trim()
+        .to_string()
+}
+
+fn update_source_name(snapshot: &ExtensionSourceSnapshot, source: &str) -> String {
+    let source_id = catalog_source_id(source);
+    let resolved = snapshot
+        .sources
+        .iter()
+        .map(|status| &status.source)
+        .find(|config| config.id == source_id)
+        .map(|config| config.name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(source_id);
+    friendly_source_label(&resolved)
+}
+
+/// 本地目录来源没起名字时，来源配置里存的就是绝对路径，直接显示会把
+/// `F:\WebProjects\himind-extensions` 这种本机路径带到用户面前。这里按市场页
+/// `friendlySourceName` 的同一口径收敛成目录名，非路径来源（如 `owner/repo`）原样保留。
+fn friendly_source_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let bytes = trimmed.as_bytes();
+    let drive_path = bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic();
+    let unc_path = trimmed.contains("\\\\");
+    if !drive_path && !unc_path {
+        return trimmed.to_string();
+    }
+    let cleaned = trimmed.trim_end_matches(['\\', '/']);
+    cleaned
+        .rsplit(['\\', '/'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(cleaned)
+        .to_string()
+}
+
+/// 从候选里挑出要安装的目标：优先沿用台账登记过的来源，其次取最高版本。
+fn pick_update_target<T>(candidates: &[(String, String, T)], ledger_source: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut best_same_source: Option<usize> = None;
+    for (index, (version, source_id, _)) in candidates.iter().enumerate() {
+        let newer = |current: usize| {
+            crate::skill::resolver::compare_versions(version, &candidates[current].0)
+                == std::cmp::Ordering::Greater
+        };
+        if !ledger_source.is_empty()
+            && source_id == ledger_source
+            && best_same_source.map_or(true, newer)
+        {
+            best_same_source = Some(index);
+        }
+        if best.map_or(true, newer) {
+            best = Some(index);
+        }
+    }
+    best_same_source.or(best)
+}
+
+fn classify_update(
+    ledger_source: &str,
+    target_source: &str,
+    target_source_name: &str,
+    managed: bool,
+) -> (&'static str, String) {
+    if managed {
+        // 分组标题已经写清了组织策略，逐项再重复一遍只会把清单撑长。
+        return (EXTENSION_UPDATE_GROUP_MANAGED, String::new());
+    }
+    if target_source.is_empty() {
+        return (
+            EXTENSION_UPDATE_GROUP_REVIEW,
+            "这次更新没有可核对的来源".to_string(),
+        );
+    }
+    if ledger_source.is_empty() {
+        return (
+            EXTENSION_UPDATE_GROUP_REVIEW,
+            "本机没有安装来源记录".to_string(),
+        );
+    }
+    if ledger_source != target_source {
+        return (
+            EXTENSION_UPDATE_GROUP_REVIEW,
+            format!("本机安装来源与本次更新来源（{target_source_name}）不一致"),
+        );
+    }
+    (EXTENSION_UPDATE_GROUP_READY, String::new())
+}
+
+/// 列出所有「版本可更新」的扩展，并给出批量更新的安全分组。
+pub(crate) fn plan_extension_updates() -> Result<Vec<ExtensionUpdateCandidate>, Box<dyn Error>> {
+    let snapshot = snapshot()?;
+    let lock = crate::app::extension_lock::load()?;
+    let provenance = list_provenance()?;
+    let mut candidates = Vec::new();
+    candidates.extend(plan_plugin_updates(&snapshot, &lock, &provenance));
+    candidates.extend(plan_skill_updates(&snapshot, &lock, &provenance));
+    candidates.extend(plan_workflow_updates(&snapshot, &lock, &provenance));
+    candidates.sort_by(|left, right| {
+        left.asset_kind
+            .cmp(&right.asset_kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(candidates)
+}
+
+fn plan_plugin_updates(
+    snapshot: &ExtensionSourceSnapshot,
+    lock: &crate::app::extension_lock::ExtensionLockFile,
+    provenance: &[ExtensionProvenance],
+) -> Vec<ExtensionUpdateCandidate> {
+    let mut by_id: BTreeMap<&str, Vec<&PluginCatalogItem>> = BTreeMap::new();
+    for item in &snapshot.plugins {
+        by_id.entry(item.plugin_id.as_str()).or_default().push(item);
+    }
+    let mut out = Vec::new();
+    for (plugin_id, items) in by_id {
+        let installed = crate::app::plugin_manager::local_status(plugin_id).current_version;
+        if installed.trim().is_empty() {
+            continue;
+        }
+        let available = items
+            .iter()
+            .filter(|item| {
+                crate::skill::resolver::compare_versions(&item.version, &installed)
+                    == std::cmp::Ordering::Greater
+            })
+            .map(|item| (item.version.clone(), catalog_source_id(&item.source), *item))
+            .collect::<Vec<_>>();
+        let ledger = update_ledger(provenance, lock, "plugin", plugin_id);
+        let Some(index) = pick_update_target(&available, &ledger.source_id) else {
+            continue;
+        };
+        let (version, source_id, item) = &available[index];
+        let source_name = update_source_name(snapshot, &item.source);
+        let managed = matches!(
+            crate::app::plugin_manager::local_governance(plugin_id).as_str(),
+            "managed" | "required"
+        ) || ledger.source_id == ORGANIZATION_SOURCE_ID
+            || item.managed
+            || matches!(item.governance.as_str(), "managed" | "required")
+            || item.assignment == "required";
+        let (group, reason) = classify_update(&ledger.source_id, source_id, &source_name, managed);
+        out.push(ExtensionUpdateCandidate {
+            asset_kind: "plugin".to_string(),
+            asset_id: plugin_id.to_string(),
+            name: if item.name.trim().is_empty() {
+                plugin_id.to_string()
+            } else {
+                item.name.clone()
+            },
+            installed_version: installed,
+            target_version: version.clone(),
+            source_id: source_id.clone(),
+            source_name,
+            channel: item.channel.clone(),
+            sha256: item.sha256.clone(),
+            artifact_id: item.artifact_id.clone(),
+            group: group.to_string(),
+            reason,
+        });
+    }
+    out
+}
+
+fn plan_skill_updates(
+    snapshot: &ExtensionSourceSnapshot,
+    lock: &crate::app::extension_lock::ExtensionLockFile,
+    provenance: &[ExtensionProvenance],
+) -> Vec<ExtensionUpdateCandidate> {
+    let store = crate::skill::store::SkillStore::new();
+    let mut by_id: BTreeMap<&str, Vec<&SkillCatalogItem>> = BTreeMap::new();
+    for item in &snapshot.skills {
+        by_id.entry(item.skill_id.as_str()).or_default().push(item);
+    }
+    let mut out = Vec::new();
+    for (skill_id, items) in by_id {
+        let installed = store
+            .get_record(skill_id)
+            .ok()
+            .flatten()
+            .map(|record| record.manifest.version)
+            .unwrap_or_default();
+        if installed.trim().is_empty() {
+            continue;
+        }
+        let available = items
+            .iter()
+            .filter(|item| {
+                crate::skill::resolver::compare_versions(&item.version, &installed)
+                    == std::cmp::Ordering::Greater
+            })
+            .map(|item| (item.version.clone(), catalog_source_id(&item.source), *item))
+            .collect::<Vec<_>>();
+        let ledger = update_ledger(provenance, lock, "skill", skill_id);
+        let Some(index) = pick_update_target(&available, &ledger.source_id) else {
+            continue;
+        };
+        let (version, source_id, item) = &available[index];
+        let source_name = update_source_name(snapshot, &item.source);
+        let managed = ledger.source_id == ORGANIZATION_SOURCE_ID
+            || item.managed
+            || item.assignment == "required"
+            || item.management != "user_managed";
+        let (group, reason) = classify_update(&ledger.source_id, source_id, &source_name, managed);
+        out.push(ExtensionUpdateCandidate {
+            asset_kind: "skill".to_string(),
+            asset_id: skill_id.to_string(),
+            name: if item.name.trim().is_empty() {
+                skill_id.to_string()
+            } else {
+                item.name.clone()
+            },
+            installed_version: installed,
+            target_version: version.clone(),
+            source_id: source_id.clone(),
+            source_name,
+            channel: item.channel.clone(),
+            sha256: item.sha256.clone(),
+            artifact_id: item.artifact_id.clone(),
+            group: group.to_string(),
+            reason,
+        });
+    }
+    out
+}
+
+fn plan_workflow_updates(
+    snapshot: &ExtensionSourceSnapshot,
+    lock: &crate::app::extension_lock::ExtensionLockFile,
+    provenance: &[ExtensionProvenance],
+) -> Vec<ExtensionUpdateCandidate> {
+    let installed_versions = crate::workflow::WorkflowStore::open_default()
+        .and_then(|store| store.list())
+        .map(|workflows| {
+            workflows
+                .into_iter()
+                .map(|workflow| (workflow.package.id, workflow.package.version))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut by_id: BTreeMap<&str, Vec<&WorkflowCatalogItem>> = BTreeMap::new();
+    for item in &snapshot.workflows {
+        by_id
+            .entry(item.workflow_id.as_str())
+            .or_default()
+            .push(item);
+    }
+    let mut out = Vec::new();
+    for (workflow_id, items) in by_id {
+        let Some(installed) = installed_versions.get(workflow_id).cloned() else {
+            continue;
+        };
+        if installed.trim().is_empty() {
+            continue;
+        }
+        let available = items
+            .iter()
+            .filter(|item| {
+                crate::skill::resolver::compare_versions(&item.version, &installed)
+                    == std::cmp::Ordering::Greater
+            })
+            .map(|item| (item.version.clone(), catalog_source_id(&item.source), *item))
+            .collect::<Vec<_>>();
+        let ledger = update_ledger(provenance, lock, "workflow", workflow_id);
+        let Some(index) = pick_update_target(&available, &ledger.source_id) else {
+            continue;
+        };
+        let (version, source_id, item) = &available[index];
+        let source_name = update_source_name(snapshot, &item.source);
+        let managed = ledger.source_id == ORGANIZATION_SOURCE_ID
+            || item.managed
+            || item.assignment == "required"
+            || item.management != "user_managed";
+        let (group, reason) = classify_update(&ledger.source_id, source_id, &source_name, managed);
+        out.push(ExtensionUpdateCandidate {
+            asset_kind: "workflow".to_string(),
+            asset_id: workflow_id.to_string(),
+            name: if item.name.trim().is_empty() {
+                workflow_id.to_string()
+            } else {
+                item.name.clone()
+            },
+            installed_version: installed,
+            target_version: version.clone(),
+            source_id: source_id.clone(),
+            source_name,
+            channel: item.channel.clone(),
+            sha256: item.sha256.clone(),
+            artifact_id: item.artifact_id.clone(),
+            group: group.to_string(),
+            reason,
+        });
+    }
+    out
+}
+
+fn installed_extension_version(asset_kind: &str, asset_id: &str) -> String {
+    match asset_kind {
+        "plugin" => crate::app::plugin_manager::local_status(asset_id).current_version,
+        "skill" => crate::skill::store::SkillStore::new()
+            .get_record(asset_id)
+            .ok()
+            .flatten()
+            .map(|record| record.manifest.version)
+            .unwrap_or_default(),
+        "workflow" => crate::workflow::WorkflowStore::open_default()
+            .and_then(|store| store.list())
+            .map(|workflows| {
+                workflows
+                    .into_iter()
+                    .find(|workflow| workflow.package.id == asset_id)
+                    .map(|workflow| workflow.package.version)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// 在最新快照里复核一个更新目标：版本、来源、制品摘要都必须与预览时一致，
+/// 否则说明来源目录在用户确认前后发生了变化，按失败处理而不是照旧安装。
+fn resolve_update_target(
+    snapshot: &ExtensionSourceSnapshot,
+    target: &ExtensionUpdateTarget,
+) -> Result<String, Box<dyn Error>> {
+    let matches = |source: &str, version: &str| {
+        version == target.version && catalog_source_id(source) == target.source_id
+    };
+    let (name, source, sha256, artifact_id) = match target.asset_kind.as_str() {
+        "plugin" => snapshot
+            .plugins
+            .iter()
+            .find(|item| item.plugin_id == target.asset_id && matches(&item.source, &item.version))
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    item.source.clone(),
+                    item.sha256.clone(),
+                    item.artifact_id.clone(),
+                )
+            }),
+        "skill" => snapshot
+            .skills
+            .iter()
+            .find(|item| item.skill_id == target.asset_id && matches(&item.source, &item.version))
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    item.source.clone(),
+                    item.sha256.clone(),
+                    item.artifact_id.clone(),
+                )
+            }),
+        "workflow" => snapshot
+            .workflows
+            .iter()
+            .find(|item| {
+                item.workflow_id == target.asset_id && matches(&item.source, &item.version)
+            })
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    item.source.clone(),
+                    item.sha256.clone(),
+                    item.artifact_id.clone(),
+                )
+            }),
+        other => return Err(format!("不支持的扩展类型: {other}").into()),
+    }
+    .ok_or_else(|| {
+        format!(
+            "{} v{} 已不在来源目录中，请刷新市场后重试",
+            target.asset_id, target.version
+        )
+    })?;
+    let expected_sha = target.sha256.trim();
+    if !expected_sha.is_empty() && !sha256.eq_ignore_ascii_case(expected_sha) {
+        return Err(format!("{} 的制品摘要已变化，请刷新市场后重试", target.asset_id).into());
+    }
+    let expected_artifact = target.artifact_id.trim();
+    if !expected_artifact.is_empty() && artifact_id != expected_artifact {
+        return Err(format!("{} 的制品已变更，请刷新市场后重试", target.asset_id).into());
+    }
+    source_for_catalog_item(snapshot, &source)?;
+    Ok(if name.trim().is_empty() {
+        target.asset_id.clone()
+    } else {
+        name
+    })
+}
+
+fn installed_sha256_of(target: &ExtensionUpdateTarget) -> Option<&str> {
+    let value = target.sha256.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 执行批量更新。逐项独立成败：某项失败不影响已成功的项，也不会留半装状态，
+/// 因为每个扩展的安装本身仍然走按来源绑定的补偿式安装。
+pub(crate) fn apply_extension_updates(
+    targets: &[ExtensionUpdateTarget],
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(ExtensionUpdateProgress),
+) -> Result<ExtensionBatchUpdateReport, Box<dyn Error>> {
+    let snapshot = snapshot()?;
+    // 插件先于技能：技能的插件依赖在插件更新后就能满足，避免依赖校验先行失败。
+    let mut ordered: Vec<&ExtensionUpdateTarget> = Vec::new();
+    for kind in ["plugin", "skill", "workflow"] {
+        ordered.extend(targets.iter().filter(|target| target.asset_kind == kind));
+    }
+    let total = ordered.len();
+    let mut report = ExtensionBatchUpdateReport {
+        outcomes: Vec::new(),
+        updated_count: 0,
+        failed_count: 0,
+        cancelled: false,
+    };
+    let mut plugin_touched = false;
+    for (offset, target) in ordered.iter().enumerate() {
+        let from_version = installed_extension_version(&target.asset_kind, &target.asset_id);
+        let cancelled = cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let mut progress = ExtensionUpdateProgress {
+            index: offset + 1,
+            total,
+            asset_kind: target.asset_kind.clone(),
+            asset_id: target.asset_id.clone(),
+            name: target.asset_id.clone(),
+            from_version: from_version.clone(),
+            to_version: target.version.clone(),
+            status: if cancelled { "cancelled" } else { "running" }.to_string(),
+            message: if cancelled {
+                "已取消，未执行".to_string()
+            } else {
+                String::new()
+            },
+        };
+        if cancelled {
+            report.cancelled = true;
+            report.outcomes.push(ExtensionUpdateOutcome {
+                asset_kind: target.asset_kind.clone(),
+                asset_id: target.asset_id.clone(),
+                name: target.asset_id.clone(),
+                from_version,
+                to_version: target.version.clone(),
+                status: "cancelled".to_string(),
+                message: "已取消，未执行".to_string(),
+                retryable: true,
+            });
+            on_progress(progress);
+            continue;
+        }
+        let resolved = resolve_update_target(&snapshot, target);
+        let result = match resolved {
+            Err(error) => Err(error),
+            Ok(name) => {
+                progress.name = name;
+                on_progress(progress.clone());
+                match target.asset_kind.as_str() {
+                    "plugin" => install_plugin_bound(
+                        &target.asset_id,
+                        Some(&target.version),
+                        Some(&target.source_id),
+                        installed_sha256_of(target),
+                    )
+                    .map(|_| ()),
+                    "skill" => install_skill_bound(
+                        &target.asset_id,
+                        Some(&target.version),
+                        Some(&target.source_id),
+                        installed_sha256_of(target),
+                    )
+                    .map(|_| ()),
+                    "workflow" => install_workflow_bound(
+                        &target.asset_id,
+                        Some(&target.version),
+                        Some(&target.source_id),
+                        installed_sha256_of(target),
+                    )
+                    .map(|_| ()),
+                    other => Err(format!("不支持的扩展类型: {other}").into()),
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                if target.asset_kind == "plugin" {
+                    plugin_touched = true;
+                }
+                report.updated_count += 1;
+                report.outcomes.push(ExtensionUpdateOutcome {
+                    asset_kind: target.asset_kind.clone(),
+                    asset_id: target.asset_id.clone(),
+                    name: progress.name.clone(),
+                    from_version,
+                    to_version: target.version.clone(),
+                    status: "updated".to_string(),
+                    message: String::new(),
+                    retryable: false,
+                });
+                progress.status = "updated".to_string();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                report.failed_count += 1;
+                report.outcomes.push(ExtensionUpdateOutcome {
+                    asset_kind: target.asset_kind.clone(),
+                    asset_id: target.asset_id.clone(),
+                    name: progress.name.clone(),
+                    from_version,
+                    to_version: target.version.clone(),
+                    status: "failed".to_string(),
+                    message: message.clone(),
+                    retryable: true,
+                });
+                progress.status = "failed".to_string();
+                progress.message = message;
+            }
+        }
+        on_progress(progress);
+    }
+    if plugin_touched {
+        crate::capability::service::invalidate_capability_discovery();
+    }
+    Ok(report)
+}
+
+/// 批量更新的协作式取消标志。一次只允许一个批量任务在跑，因此用进程内单例
+/// 就够了；它只影响「还没开始安装的项」，不打断正在写入的单个扩展。
+static BATCH_UPDATE_CANCEL: OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    OnceLock::new();
+
+fn batch_update_cancel() -> &'static std::sync::atomic::AtomicBool {
+    BATCH_UPDATE_CANCEL
+        .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+pub(crate) fn reset_extension_update_cancel() {
+    batch_update_cancel().store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn cancel_extension_updates() {
+    batch_update_cancel().store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn extension_update_cancel_flag() -> &'static std::sync::atomic::AtomicBool {
+    batch_update_cancel()
 }
 
 fn settings_schema_version() -> u32 {
@@ -3856,6 +5444,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Required,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let mut item = plugin_item("https://github.com/Owner/repo/releases/download/v1/test.hmpkg");
         normalize_plugin_item(&mut item, &source).unwrap();
@@ -3878,6 +5467,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let mut item =
             workflow_item("https://github.com/Owner/repo/releases/download/v1/test.hmwf");
@@ -3893,6 +5483,9 @@ mod tests {
             workflows: vec![item.clone()],
             feature_packs: Vec::new(),
             agent_presets: Vec::new(),
+            distribution_id: String::new(),
+            channel: DEFAULT_DISTRIBUTION_CHANNEL.to_string(),
+            catalog_id: DEFAULT_CATALOG_ID.to_string(),
         };
         validate_catalog(&catalog, &source).unwrap();
         normalize_workflow_item(&mut item, &source).unwrap();
@@ -3973,12 +5566,18 @@ mod tests {
                 auto_update: false,
                 verification: ExtensionSourceVerification::Required,
                 upstream_repository: String::new(),
+                ..Default::default()
             }],
             acquisitions: BTreeMap::new(),
+            distribution_targets: BTreeMap::new(),
         };
         fs::create_dir_all(&root).unwrap();
         atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-        assert_eq!(settings_at(&path).unwrap().sources, value.sources);
+        let loaded = settings_at(&path).unwrap();
+        assert_eq!(loaded.sources.len(), 1);
+        assert_eq!(loaded.sources[0].distribution_id, "owner/repo");
+        assert_eq!(loaded.sources[0].channel, DEFAULT_DISTRIBUTION_CHANNEL);
+        assert_eq!(loaded.sources[0].catalog_id, DEFAULT_CATALOG_ID);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4073,6 +5672,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let mut catalog: ExtensionSourceCatalog = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
@@ -4175,12 +5775,17 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Required,
             upstream_repository: String::new(),
+            distribution_id: "owner/repo".to_string(),
+            channel: DEFAULT_DISTRIBUTION_CHANNEL.to_string(),
+            catalog_id: DEFAULT_CATALOG_ID.to_string(),
+            ..Default::default()
         };
         let unit_key = unit_key_of(&source);
         let value = ExtensionSourceSettings {
             schema_version: 1,
             sources: vec![source],
             acquisitions: BTreeMap::new(),
+            distribution_targets: BTreeMap::new(),
         };
         fs::create_dir_all(&root).unwrap();
         atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(&value).unwrap()).unwrap();
@@ -4227,6 +5832,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: "Owner/repo".to_string(),
+            ..Default::default()
         };
         let remote = ExtensionSourceConfig {
             id: "github-1".to_string(),
@@ -4239,6 +5845,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let local_identity = source_identity(&local);
         let remote_identity = source_identity(&remote);
@@ -4309,6 +5916,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: "Owner/repo".to_string(),
+            ..Default::default()
         };
         let remote = ExtensionSourceConfig {
             id: "github-1".to_string(),
@@ -4321,6 +5929,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Required,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         (local, remote)
     }
@@ -4343,10 +5952,7 @@ mod tests {
         let mut catalogs = HashMap::new();
         catalogs.insert(
             "local:local-1".to_string(),
-            catalog_assets(vec![
-                ("com.example.a", "1.0.0"),
-                ("com.example.b", "2.0.0"),
-            ]),
+            catalog_assets(vec![("com.example.a", "1.0.0"), ("com.example.b", "2.0.0")]),
         );
         catalogs.insert(
             "github:github-1".to_string(),
@@ -4375,7 +5981,10 @@ mod tests {
         // 切到远端后，“另一侧”变成本地。提示是双向的：此时本地目录里的
         // com.example.b 2.0.0 高于线上的 1.9.0，所以同样提示“本地更新”。
         let mut remote_first = BTreeMap::new();
-        remote_first.insert(units[0].unit_key.clone(), ExtensionSourceAcquisition::Remote);
+        remote_first.insert(
+            units[0].unit_key.clone(),
+            ExtensionSourceAcquisition::Remote,
+        );
         let units = build_units(&[local, remote], &remote_first, &catalogs);
         assert_eq!(units[0].acquisition, ExtensionSourceAcquisition::Remote);
         let other = units[0].other_side.as_ref().unwrap();
@@ -4394,7 +6003,10 @@ mod tests {
         );
         // GitHub 源被停用或读取失败时没有目录，此时不得提示“可更新”。
         let units = build_units(&[local, remote], &BTreeMap::new(), &catalogs);
-        let other = units[0].other_side.as_ref().expect("单元仍有另一侧来源配置");
+        let other = units[0]
+            .other_side
+            .as_ref()
+            .expect("单元仍有另一侧来源配置");
         assert_eq!(other.side, "remote");
         assert!(!other.available);
         assert_eq!(other.newer_count, 0);
@@ -4413,6 +6025,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: "Owner/a".to_string(),
+            ..Default::default()
         };
         let second = ExtensionSourceConfig {
             id: "local-2".to_string(),
@@ -4425,11 +6038,46 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: "Owner/b".to_string(),
+            ..Default::default()
         };
         let units = build_units(&[first, second], &BTreeMap::new(), &HashMap::new());
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].state, "unavailable");
         assert_ne!(units[0].unit_key, units[1].unit_key);
+    }
+
+    #[test]
+    fn explicit_distribution_identity_keeps_channels_separate() {
+        let stable = ExtensionSourceConfig {
+            id: "github-stable".to_string(),
+            name: "稳定版".to_string(),
+            kind: ExtensionSourceKind::Github,
+            repository: "Owner/repo".to_string(),
+            reference: "main".to_string(),
+            catalog_path: DEFAULT_CATALOG_PATH.to_string(),
+            enabled: true,
+            auto_update: false,
+            verification: ExtensionSourceVerification::Optional,
+            upstream_repository: String::new(),
+            distribution_id: "owner/repo".to_string(),
+            channel: "stable".to_string(),
+            catalog_id: DEFAULT_CATALOG_ID.to_string(),
+        };
+        let beta = ExtensionSourceConfig {
+            id: "github-beta".to_string(),
+            name: "预览版".to_string(),
+            channel: "beta".to_string(),
+            ..stable.clone()
+        };
+        let units = build_units(&[stable, beta], &BTreeMap::new(), &HashMap::new());
+        assert_eq!(units.len(), 2);
+        assert_ne!(units[0].unit_key, units[1].unit_key);
+        assert!(units
+            .iter()
+            .any(|unit| unit.unit_key.ends_with("#stable#public")));
+        assert!(units
+            .iter()
+            .any(|unit| unit.unit_key.ends_with("#beta#public")));
     }
 
     #[test]
@@ -4445,6 +6093,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let local = ExtensionSourceConfig {
             id: "local-1".to_string(),
@@ -4457,6 +6106,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: "Owner/repo".to_string(),
+            ..Default::default()
         };
         // 配置顺序里 GitHub 源在前：真实工作区就是这样登记的。
         let sources = vec![remote.clone(), local.clone()];
@@ -4523,6 +6173,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let catalog = build_local_catalog(&source).unwrap();
         assert_eq!(catalog.plugins.len(), 1);
@@ -4547,6 +6198,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         assert!(build_local_catalog(&source).is_err());
         let _ = fs::remove_dir_all(&root);
@@ -4565,6 +6217,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         };
         let mut item = plugin_item("https://github.com/Owner/repo/releases/download/v1/test.hmpkg");
         normalize_plugin_item(&mut item, &source).unwrap();
@@ -4621,6 +6274,7 @@ mod tests {
             auto_update: false,
             verification: ExtensionSourceVerification::Optional,
             upstream_repository: String::new(),
+            ..Default::default()
         }
     }
 
@@ -4693,6 +6347,7 @@ mod tests {
                 &workspace_display,
             )],
             acquisitions: BTreeMap::new(),
+            distribution_targets: BTreeMap::new(),
         };
         let path = root.join("extension-sources.json");
         fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();

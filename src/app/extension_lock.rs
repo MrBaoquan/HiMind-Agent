@@ -14,6 +14,61 @@ const LOCK_SCHEMA_VERSION: u32 = 1;
 /// 与扩展源的 `local:<source_id>` 明确区分，避免台账把手工导入误认成扩展源提供。
 pub(crate) const ADHOC_SOURCE: &str = "adhoc";
 
+/// 暂存目录（安装中断残留）的处理策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransientPolicy {
+    /// 调用方刚结束一次安装：暂存目录一定是历史或本次留下的垃圾，直接删。
+    Remove,
+    /// 后台巡检：别的线程可能正在安装，只删已经放旧的那一批。
+    RemoveStale,
+}
+
+/// 清理 `<root>/versions` 里不再需要的目录，返回删除的数量。
+///
+/// 每次升级都会在 `versions/` 落一份新版本目录，但真正有离线价值的只有
+/// `current` 与 `previous` 指向的两版：更早的版本只能在回退界面重新下载。
+/// `keep` 由调用方决定（各资产读取自己版本指针的方式不同），这里只负责
+/// 删掉不在保留名单里的版本目录，以及安装中断留下的暂存目录。
+pub(crate) fn prune_version_dirs(
+    versions_root: &Path,
+    keep: &[String],
+    transient: TransientPolicy,
+) -> usize {
+    let Ok(entries) = fs::read_dir(versions_root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 版本号不会以 `.` 或这些安装期前缀开头，命中即是中断残留。
+        let is_staging = name.starts_with('.')
+            || name.starts_with("staging-")
+            || name.starts_with("current-")
+            || name.starts_with("swap-")
+            || name.starts_with("restore-");
+        if is_staging {
+            let removable = match transient {
+                TransientPolicy::Remove => true,
+                TransientPolicy::RemoveStale => {
+                    crate::skill::hygiene::is_stale_residue(&entry.path(), &name)
+                }
+            };
+            if !removable {
+                continue;
+            }
+        } else if keep.iter().any(|version| version == &name) {
+            continue;
+        }
+        if fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExtensionLockDependency {
     pub asset_kind: String,
@@ -121,24 +176,35 @@ pub(crate) fn upsert(entry: ExtensionLockEntry) -> Result<(), Box<dyn Error>> {
 
 fn upsert_at(lock_path: &Path, entry: ExtensionLockEntry) -> Result<(), Box<dyn Error>> {
     let key = format!("{}:{}", entry.asset_kind, entry.asset_id);
+    // 读-改-写必须整段串行，否则两个并发会话各自装载旧快照后写回，会互相丢条目。
+    let _guard = atomic_file::lock(lock_path)?;
     let mut lock = load_at(lock_path)?;
     lock.entries.insert(key, entry);
     save_at(lock_path, &lock)
 }
 
 pub(crate) fn remove(asset_kind: &str, asset_id: &str) -> Result<(), Box<dyn Error>> {
-    remove_at(&path(), asset_kind, asset_id)
+    remove_at(&path(), asset_kind, asset_id).map(|_| ())
 }
 
+/// 返回「台账里原本有这条」是否为真。
+///
+/// 调用方需要这个布尔值来区分「真的清掉了一行」与「本来就没有」：退役扫描会
+/// 把它当成是否值得记一条日志的依据。没有条目时直接返回，不再把整份台账重写
+/// 一遍——演进出来的调用方里已经有一秒一次的巡检，无变化也写盘会一直空转。
 pub(crate) fn remove_at(
     lock_path: &Path,
     asset_kind: &str,
     asset_id: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
+    let key = format!("{}:{}", asset_kind.trim(), asset_id.trim());
+    let _guard = atomic_file::lock(lock_path)?;
     let mut lock = load_at(lock_path)?;
-    lock.entries
-        .remove(&format!("{}:{}", asset_kind.trim(), asset_id.trim()));
-    save_at(lock_path, &lock)
+    if lock.entries.remove(&key).is_none() {
+        return Ok(false);
+    }
+    save_at(lock_path, &lock)?;
+    Ok(true)
 }
 
 pub(crate) fn read(
@@ -156,6 +222,8 @@ pub(crate) fn restore(
     asset_id: &str,
     previous: Option<ExtensionLockEntry>,
 ) -> Result<(), Box<dyn Error>> {
+    let path = path();
+    let _guard = atomic_file::lock(&path)?;
     let mut lock = load()?;
     let key = format!("{}:{}", asset_kind.trim(), asset_id.trim());
     match previous {
@@ -166,7 +234,7 @@ pub(crate) fn restore(
             lock.entries.remove(&key);
         }
     }
-    save(&lock)
+    save_at(&path, &lock)
 }
 
 pub(crate) fn list() -> Result<Vec<ExtensionLockEntry>, Box<dyn Error>> {
@@ -345,6 +413,39 @@ pub(crate) fn record_local_skill(
     source: &str,
 ) -> Result<(), Box<dyn Error>> {
     record_local_skill_at(&path(), manifest, source)
+}
+
+/// 记录「从 GitHub Release 安装」的来源事实。
+///
+/// 分发侧的依赖 pin 直接读这里：没有摘要与仓库信息，下游就无法给出精确 pin，
+/// 所以安装成功后必须把 Release 的制品摘要、仓库与 tag 写回台账。
+pub(crate) fn record_release_install(
+    asset_kind: &str,
+    asset_id: &str,
+    version: &str,
+    sha256: &str,
+    repository: &str,
+    reference: &str,
+    artifact_url: &str,
+    dependencies: Vec<ExtensionLockDependency>,
+) -> Result<(), Box<dyn Error>> {
+    upsert(ExtensionLockEntry {
+        asset_kind: asset_kind.trim().to_string(),
+        asset_id: asset_id.trim().to_string(),
+        version: version.trim().to_string(),
+        source_id: format!("github:{}", repository.trim()),
+        source: "github".to_string(),
+        repository: repository.trim().to_string(),
+        reference: reference.trim().to_string(),
+        catalog_path: String::new(),
+        source_commit: String::new(),
+        artifact_url: artifact_url.trim().to_string(),
+        artifact_id: String::new(),
+        sha256: sha256.trim().to_ascii_lowercase(),
+        dependencies,
+        agent_profile: crate::store::paths::profile_name(),
+        updated_at: now_stamp(),
+    })
 }
 
 pub(crate) fn record_local_skill_at(

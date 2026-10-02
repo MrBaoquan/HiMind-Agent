@@ -165,7 +165,7 @@ mod tests {
         // 真实发布的 Workflow Package 必须能落到具体功能域，否则扩展市场里
         // 工作流会一直停在「未分类」。
         let package: crate::workflow::WorkflowPackage = serde_json::from_str(include_str!(
-            "../workflows/wechat-miniprogram-delivery/workflow.json"
+            "../workflows/wechat-experience-upload/workflow.json"
         ))
         .expect("workflow package fixture");
         assert_eq!(

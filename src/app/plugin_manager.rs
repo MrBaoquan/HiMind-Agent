@@ -2,6 +2,7 @@ use crate::api::distribution::{
     plugin_catalog, plugin_versions, report_plugin_status, PluginCatalogItem, PluginStatusReport,
     SkillPluginDependency,
 };
+use crate::app::extension_lock::TransientPolicy;
 use crate::app::system::verify_extension_artifact_signature;
 use crate::capability::plugin::{
     is_builtin_plugin, parse_plugin_manifest, plugin_registry_dir, validate_manifest_contributions,
@@ -115,21 +116,29 @@ pub(crate) fn report_status(
     };
     if let Err(send_error) = send_status(options, &record) {
         store_status(&options.state_path, &record)?;
-        return Err(send_error);
+        return Err(Box::new(send_error) as Box<dyn Error>);
     }
     Ok(())
 }
 
-fn send_status(options: &Options, record: &PluginStatusRecord) -> Result<(), Box<dyn Error>> {
+fn send_status(
+    options: &Options,
+    record: &PluginStatusRecord,
+) -> Result<(), crate::api::distribution::PluginStatusDeliveryError> {
     if !options.mode().dashboard_enabled() {
         return Ok(());
     }
     let credential = options.agent_credential();
     if record.agent_id.is_empty() || credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        // 未授权属于可恢复状态：用户随时可能完成授权，保留记录等待重试。
+        return Err(
+            crate::api::distribution::PluginStatusDeliveryError::Transient(
+                "HiMind 账号尚未授权".to_string(),
+            ),
+        );
     }
     let mut client_builder = Client::builder().timeout(std::time::Duration::from_secs(10));
-    if Url::parse(&options.api_base)
+    if Url::parse(&options.api_base())
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .map(|host| {
@@ -143,10 +152,12 @@ fn send_status(options: &Options, record: &PluginStatusRecord) -> Result<(), Box
     {
         client_builder = client_builder.no_proxy();
     }
-    let client = client_builder.build()?;
+    let client = client_builder.build().map_err(|error| {
+        crate::api::distribution::PluginStatusDeliveryError::Transient(error.to_string())
+    })?;
     report_plugin_status(
         &client,
-        &options.api_base,
+        &options.api_base(),
         &record.agent_id,
         &credential,
         &PluginStatusReport {
@@ -170,18 +181,48 @@ pub(crate) fn flush_status_outbox(options: &Options, agent_id: &str) {
             return;
         }
     };
+    replay_status_outbox(records, agent_id, |record| send_status(options, record));
+}
+
+/// 重放状态队列。
+///
+/// 永久失败（例如工作台没有这个产品，返回 404）必须丢弃：重试不会改变结果，留着
+/// 只会让一条死记录永久堵住后续上报。暂时失败（超时、5xx、401/403）保留并按顺序
+/// 停下，等下一次 flush 再试。
+fn replay_status_outbox<F>(
+    records: Vec<(
+        std::path::PathBuf,
+        crate::store::plugin_outbox::PluginStatusRecord,
+    )>,
+    agent_id: &str,
+    mut send: F,
+) where
+    F: FnMut(
+        &crate::store::plugin_outbox::PluginStatusRecord,
+    ) -> Result<(), crate::api::distribution::PluginStatusDeliveryError>,
+{
     for (path, mut record) in records {
         if record.agent_id.is_empty() {
             record.agent_id = agent_id.to_string();
         }
-        match send_status(options, &record) {
+        match send(&record) {
             Ok(()) => {
                 if let Err(error) = remove_status(&path) {
                     eprintln!("plugin status outbox cleanup failed: {error}");
                 }
             }
-            Err(error) => {
-                eprintln!("plugin status outbox replay failed: {error}");
+            Err(crate::api::distribution::PluginStatusDeliveryError::Permanent(error)) => {
+                // 丢掉之前先把原因说清楚，避免静默少报一条状态。
+                eprintln!(
+                    "plugin status outbox dropped {} {}: {error}",
+                    record.action, record.plugin_id
+                );
+                if let Err(cleanup) = remove_status(&path) {
+                    eprintln!("plugin status outbox cleanup failed: {cleanup}");
+                }
+            }
+            Err(crate::api::distribution::PluginStatusDeliveryError::Transient(error)) => {
+                eprintln!("plugin status outbox replay deferred: {error}");
                 break;
             }
         }
@@ -227,7 +268,7 @@ pub(crate) fn install_bound(
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
     let credential = options.agent_credential();
-    let catalog = plugin_catalog(&client, &options.api_base, agent_id, &credential)?;
+    let catalog = plugin_catalog(&client, &options.api_base(), agent_id, &credential)?;
     let plugin = requested_catalog_item(
         &client,
         options,
@@ -472,11 +513,14 @@ fn read_plugin_manifest_from_archive(path: &Path) -> Result<PluginManifest, Box<
 fn pack_local_plugin_directory(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     let staging = env::temp_dir().join(format!("himind-local-plugin-stage-{}", unique_suffix()));
     let result = (|| -> Result<(), Box<dyn Error>> {
+        // 本地源安装必须落成「和发布载荷同一份内容」：开发工作区里有源码、旧制品和
+        // 构建缓存，官方打包器不会把它们放进制品。这里少过滤一个文件，同一版本的插件
+        // 就会因为安装来源不同而摘要不同，依赖锁随之在任何另一台机器上校验失败。
         crate::app::local_package::stage_local_package(
             source,
             &staging,
             &LOCAL_PLUGIN_LIMITS,
-            |_| true,
+            crate::app::local_package::is_portable_payload_path,
         )?;
         crate::app::local_package::archive_directory(&staging, target)
     })();
@@ -508,7 +552,7 @@ pub(crate) fn plan_install_bound(
         .build()?;
     let catalog = plugin_catalog(
         &client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &options.agent_credential(),
     )?;
@@ -549,7 +593,7 @@ fn requested_catalog_item(
             }
             plugin_versions(
                 client,
-                &options.api_base,
+                &options.api_base(),
                 agent_id,
                 &options.agent_credential(),
                 plugin_id,
@@ -580,7 +624,7 @@ pub(crate) fn plan_dependency_set(
         .build()?;
     let catalog_items = plugin_catalog(
         &client,
-        &options.api_base,
+        &options.api_base(),
         agent_id,
         &options.agent_credential(),
     )?;
@@ -989,8 +1033,18 @@ fn rollback_root_with_lock(
     if current_manifest.id != previous_manifest.id || current_manifest.id != plugin_id {
         return Err("插件 current/previous 身份不一致".into());
     }
+    // 同版本互换只会得到一次"看起来成功"的回滚：版本号没变，用户会以为功能已经恢复。
+    // 这里不限制方向——上一版本高于当前版本是合法的（例如组织策略把版本钉回旧版后，
+    // 回滚就是撤销这次降级），只有"没有变化"才是真的无事可做。
+    if compare_versions(&previous_manifest.version, &current_manifest.version) == Ordering::Equal {
+        return Err(format!(
+            "上一版本与当前版本同为 {}，没有可回滚的版本",
+            current_manifest.version
+        )
+        .into());
+    }
     ensure_agent_version_supported(&previous_manifest.min_agent_version)?;
-    swap_current_previous(&root)?;
+    swap_current_previous(&plugin_guard_for(root)?, &root)?;
     crate::app::extension_lock::record_local_plugin_at(
         lock_path,
         &previous_manifest,
@@ -1010,12 +1064,10 @@ pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
         return Err("核心或组织管理插件不允许卸载".into());
     }
     ensure_plugin_not_referenced(&root)?;
-    let existed = root.exists();
-    if existed {
-        fs::remove_dir_all(root)?;
-    }
+    let existed = plugin_registry_guard()?.remove_tree(&root, "卸载插件")?;
     remove_owner_references(&format!("plugin:{plugin_id}"));
     let _ = crate::app::extension_lock::remove("plugin", plugin_id);
+    crate::app::extension_source::remove_provenance("plugin", plugin_id);
     if existed {
         crate::capability::service::invalidate_capability_discovery();
     }
@@ -1028,12 +1080,10 @@ pub(crate) fn remove_for_policy(plugin_id: &str) -> Result<(), Box<dyn Error>> {
     }
     let root = plugin_root(plugin_id)?;
     ensure_plugin_not_referenced(&root)?;
-    let existed = root.exists();
-    if existed {
-        fs::remove_dir_all(root)?;
-    }
+    let existed = plugin_registry_guard()?.remove_tree(&root, "按分发策略移除插件")?;
     remove_owner_references(&format!("plugin:{plugin_id}"));
     let _ = crate::app::extension_lock::remove("plugin", plugin_id);
+    crate::app::extension_source::remove_provenance("plugin", plugin_id);
     if existed {
         crate::capability::service::invalidate_capability_discovery();
     }
@@ -1069,9 +1119,27 @@ pub(crate) fn apply_effective_policy(
     Ok(())
 }
 
+/// 清除插件的失败/熔断记录，让它立刻重新参与能力发现。
+///
+/// 熔断本身会在冷却窗口结束后自动放行（见 `capability::plugin`），这个入口是用户的
+/// 立即重试：插件已经修好，或者上一次失败只是一次偶发超时，都不必等冷却。
+/// 它不改动安装状态与启停状态——那些是 `install`/`set_enabled` 的职责，
+/// 所以组织统一管理的插件（不允许停用/卸载）同样可以修复。
+pub(crate) fn repair(plugin_id: &str) -> Result<(), Box<dyn Error>> {
+    let root = plugin_root(plugin_id)?;
+    if !root.exists() {
+        return Err("插件未安装".into());
+    }
+    crate::capability::plugin::reset_plugin_health(plugin_id)
+}
+
 pub(crate) fn set_enabled(plugin_id: &str, enabled: bool) -> Result<(), Box<dyn Error>> {
-    if !enabled && is_builtin_plugin(plugin_id) {
-        return Err("内置系统扩展不允许停用".into());
+    let development_ids: Vec<String> = crate::capability::plugin::development_plugin_entries()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if let Some(reason) = disable_rejection(plugin_id, enabled, &development_ids) {
+        return Err(reason.into());
     }
     let root = plugin_root(plugin_id)?;
     if !root.exists() {
@@ -1094,6 +1162,28 @@ pub(crate) fn set_enabled(plugin_id: &str, enabled: bool) -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// 停用请求应当被拒绝时返回原因。
+///
+/// 开发中的插件以「扩展开发」登记的源码目录为准参与扫描，安装目录里的 `disabled`
+/// 标记根本不会被读到——写进去只会得到一次"看起来成功"的停用。与其静默无效，
+/// 不如直接说明该走哪条路。
+fn disable_rejection(
+    plugin_id: &str,
+    enabled: bool,
+    development_ids: &[String],
+) -> Option<&'static str> {
+    if enabled {
+        return None;
+    }
+    if is_builtin_plugin(plugin_id) {
+        return Some("内置系统扩展不允许停用");
+    }
+    if development_ids.iter().any(|id| id == plugin_id) {
+        return Some("开发中的插件由「扩展开发」管理，请在那里停用或移除");
+    }
+    None
+}
+
 fn catalog_item(
     client: &Client,
     options: &Options,
@@ -1102,9 +1192,9 @@ fn catalog_item(
 ) -> Result<PluginCatalogItem, Box<dyn Error>> {
     let credential = options.agent_credential();
     if credential.is_empty() {
-        return Err("Agent 尚未完成 Dashboard 配对".into());
+        return Err("HiMind 账号尚未授权".into());
     }
-    plugin_catalog(client, &options.api_base, agent_id, &credential)?
+    plugin_catalog(client, &options.api_base(), agent_id, &credential)?
         .into_iter()
         .find(|item| item.plugin_id == plugin_id)
         .ok_or_else(|| "插件未上架或当前不可用".into())
@@ -1119,7 +1209,7 @@ fn download(
     if item.file_size == 0 || item.file_size > MAX_PLUGIN_ARCHIVE_BYTES {
         return Err("插件制品大小无效或超过 512 MiB 限制".into());
     }
-    let api = url::Url::parse(&options.api_base)?;
+    let api = url::Url::parse(&options.api_base())?;
     let url = url::Url::parse(&item.download_url)?;
     if api.scheme() != url.scheme()
         || api.host_str() != url.host_str()
@@ -1254,10 +1344,14 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
     if candidate_manifest.id != item.plugin_id || candidate_manifest.version != item.version {
         return Err("插件 Manifest ID 或版本与发布记录不一致".into());
     }
+    // 版本号马上要参与 `versions/<版本>` 的拼接，先挡住 `..` 这类会把安装落点
+    // 挪出插件目录的写法，再谈文件系统操作。
+    crate::capability::plugin::validate_plugin_version(&candidate_manifest.version)?;
     ensure_agent_version_supported(&candidate_manifest.min_agent_version)?;
     validate_local_dependencies(&candidate_manifest)?;
     let root = plugin_root(&item.plugin_id)?;
     fs::create_dir_all(root.join("versions"))?;
+    let root_guard = crate::path_guard::TrustedRoot::new(&root)?;
     let mut transaction = crate::app::extension_lock::InstallGuard::begin(
         "plugin",
         &item.plugin_id,
@@ -1304,14 +1398,25 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
             return Err("插件 Manifest ID 或版本与发布记录不一致".into());
         }
         validate_manifest_contributions(&staging, &manifest)?;
-        let version_dir = root.join("versions").join(&item.version);
+        // 台账里的 item 来自发布记录或本地包，拼接之前必须确认落点还在插件目录内：
+        // 版本号过了字符集校验也挡不住"插件目录被换成指向别处的联接"。
+        let version_dir = root_guard.ensure_within(
+            &root.join("versions").join(&item.version),
+            "写入插件版本目录",
+        )?;
         if version_dir.exists() {
             let existing =
                 parse_plugin_checksums(&fs::read_to_string(version_dir.join("checksums.sha256"))?)?;
             let incoming =
                 parse_plugin_checksums(&fs::read_to_string(staging.join("checksums.sha256"))?)?;
             if existing != incoming {
-                return Err("同一插件版本已存在且内容不同，请提升版本号".into());
+                // 这句话会原样出现在安装失败的提示里，所以要同时给发布者和安装者一条出路：
+                // 发布者需要提升版本号，安装者需要先卸载本机那一版才能换成这个来源的内容。
+                return Err(format!(
+                    "本机已有 v{}，内容与这个来源不一致，不能覆盖。请先卸载本机版本，或改用更高版本",
+                    item.version
+                )
+                .into());
             }
             fs::remove_dir_all(&staging)?;
         } else {
@@ -1361,23 +1466,83 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
     crate::app::extension_lock::record_plugin(item)?;
     transaction.stage("lock_committed")?;
     transaction.commit()?;
+    prune_plugin_versions(&root, TransientPolicy::Remove);
     Ok(())
 }
 
-fn swap_current_previous(root: &Path) -> Result<(), Box<dyn Error>> {
+/// 读插件目录里那一版的 `plugin.json` 版本号。
+fn directory_plugin_version(directory: &Path) -> Option<String> {
+    let content = fs::read_to_string(directory.join("plugin.json")).ok()?;
+    let manifest: PluginManifest =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
+    let version = manifest.version.trim().to_string();
+    (!version.is_empty()).then_some(version)
+}
+
+/// 收掉历史版本目录，只留 `current` 与 `previous` 对应的两版，返回删除的数量。
+///
+/// `versions/<v>` 只在安装时被写入，运行用的是 `current`，回退用的是
+/// `previous` 快照，所以更早的版本目录没有任何离线价值——留着只会让插件
+/// 目录随每次升级无限膨胀。两个版本号都从实际目录里读，不靠安装参数推断：
+/// 回退之后 `current` 可能比 `previous` 更旧，猜错就会把还在用的版本删掉。
+fn prune_plugin_versions(root: &Path, transient: TransientPolicy) -> usize {
+    let Some(current_version) = directory_plugin_version(&root.join("current")) else {
+        return 0;
+    };
+    let previous_directory = root.join("previous");
+    let previous_version = if previous_directory.exists() {
+        match directory_plugin_version(&previous_directory) {
+            Some(version) => Some(version),
+            // 读不出上一版就整体放弃：宁可留着旧版本，也不能删掉回退要用的那一份。
+            None => return 0,
+        }
+    } else {
+        None
+    };
+    let keep = match previous_version {
+        Some(version) => vec![current_version, version],
+        None => vec![current_version],
+    };
+    crate::app::extension_lock::prune_version_dirs(&root.join("versions"), &keep, transient)
+}
+
+/// 启动巡检：把所有已装插件的 `versions/` 收敛到 `current` + `previous` 两版，
+/// 返回删除的目录数。
+///
+/// 安装完成时的清理只覆盖刚装过的那一个插件，装完就不再更新的插件会一直带着
+/// 历史版本。巡检只删确定是历史版本的目录与确定放旧的暂存残留
+/// （`TransientPolicy::RemoveStale`），避免和并发安装抢文件。
+pub(crate) fn sweep_plugin_versions() -> usize {
+    let Ok(entries) = fs::read_dir(crate::capability::plugin::plugin_registry_dir()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        removed += prune_plugin_versions(&entry.path(), TransientPolicy::RemoveStale);
+    }
+    removed
+}
+
+fn swap_current_previous(
+    guard: &crate::path_guard::TrustedRoot,
+    root: &Path,
+) -> Result<(), Box<dyn Error>> {
     let current = root.join("current");
     let previous = root.join("previous");
     let temporary = root.join(format!("swap-{}", unique_suffix()));
-    fs::rename(&current, &temporary)?;
-    if let Err(error) = fs::rename(&previous, &current) {
-        let _ = fs::rename(&temporary, &current);
+    guard.rename_within(&current, &temporary, "回滚插件版本")?;
+    if let Err(error) = guard.rename_within(&previous, &current, "回滚插件版本") {
+        let _ = guard.rename_within(&temporary, &current, "撤销回滚");
         return Err(error.into());
     }
-    if let Err(error) = fs::rename(&temporary, &previous) {
+    if let Err(error) = guard.rename_within(&temporary, &previous, "回滚插件版本") {
         let restore_previous = root.join(format!("restore-{}", unique_suffix()));
-        let _ = fs::rename(&current, &restore_previous);
-        let _ = fs::rename(&temporary, &current);
-        let _ = fs::rename(&restore_previous, &previous);
+        let _ = guard.rename_within(&current, &restore_previous, "撤销回滚");
+        let _ = guard.rename_within(&temporary, &current, "撤销回滚");
+        let _ = guard.rename_within(&restore_previous, &previous, "撤销回滚");
         return Err(error.into());
     }
     Ok(())
@@ -1411,7 +1576,7 @@ fn parse_plugin_checksums(content: &str) -> Result<HashMap<String, String>, Box<
             return Err(format!("checksums.sha256 第 {} 行摘要无效", index + 1).into());
         }
         let relative_path = PathBuf::from(relative);
-        if relative == "checksums.sha256"
+        if crate::app::local_package::is_checksums_file(relative)
             || relative.is_empty()
             || relative_path.is_absolute()
             || relative_path
@@ -1477,6 +1642,16 @@ fn installed_governance(root: &Path) -> Result<String, Box<dyn Error>> {
     Ok(manifest.governance)
 }
 
+/// 已安装插件的策略治理级别；未安装或读不到策略时返回空串。
+///
+/// 批量更新用它区分「组织直接管理版本」的插件：这些插件的版本由组织推进，
+/// 手动更新会被安装层拒绝，UI 必须提前把它们排除在勾选范围之外。
+pub(crate) fn local_governance(plugin_id: &str) -> String {
+    plugin_root(plugin_id)
+        .and_then(|root| installed_governance(&root))
+        .unwrap_or_default()
+}
+
 fn plugin_root(plugin_id: &str) -> Result<PathBuf, Box<dyn Error>> {
     if plugin_id.is_empty()
         || !plugin_id
@@ -1486,6 +1661,31 @@ fn plugin_root(plugin_id: &str) -> Result<PathBuf, Box<dyn Error>> {
         return Err("插件 ID 无效".into());
     }
     Ok(plugin_registry_dir().join(plugin_id))
+}
+
+/// 插件目录的可信根。
+///
+/// 插件 ID 的字符集校验挡住了 `..`，但挡不住"插件目录被换成指向别处的联接"。
+/// 删除、改名一律先解析真实路径，再确认落在这个根里。
+fn plugin_registry_guard() -> Result<crate::path_guard::TrustedRoot, Box<dyn Error>> {
+    crate::path_guard::TrustedRoot::nearest_existing(&plugin_registry_dir())
+}
+
+/// 单个插件目录（`<注册表>/<插件 ID>`）的可信根。
+///
+/// 回滚只在插件目录内部改名，尺子就该是「拥有这个插件目录的那一层」：生产
+/// 路径下等于插件注册表目录，与卸载用的是同一层；自定义根或临时根（测试、
+/// 定制安装位置）也照样落在这层里，不会因为「和默认注册表不是同一个目录」
+/// 被误拒。反过来，插件目录本身被换成指向别处的联接时，解析结果会落到这一
+/// 层之外，依旧被拒 —— 这是 BUG-231 想要的语义。
+fn plugin_guard_for(root: &Path) -> Result<crate::path_guard::TrustedRoot, Box<dyn Error>> {
+    match root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => crate::path_guard::TrustedRoot::nearest_existing(parent),
+        None => crate::path_guard::TrustedRoot::nearest_existing(root),
+    }
 }
 
 fn copy_dir(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
@@ -1515,8 +1715,9 @@ mod tests {
     use super::*;
     use super::{
         add_dependency_reference_at, build_install_plan, build_install_plan_for_item,
-        compare_versions, dependency_references_at, ensure_plugin_not_referenced,
-        flush_status_outbox, owner_dependency_ids_in, remove_owner_references_from, report_status,
+        compare_versions, dependency_references_at, disable_rejection,
+        ensure_plugin_not_referenced, flush_status_outbox, owner_dependency_ids_in,
+        prune_plugin_versions, remove_owner_references_from, replay_status_outbox, report_status,
         rollback_root_with_lock, set_enabled, set_owner_references_in, uninstall,
         verify_plugin_checksums,
     };
@@ -1528,8 +1729,180 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, RwLock};
 
+    fn write_plugin_version_dir(root: &Path, directory: &str, version: &str) {
+        let target = root.join(directory);
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("plugin.json"),
+            format!(
+                r#"{{"id":"com.example.plugin","name":"示例","description":"测试","version":"{version}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn plugin_version_directories(root: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(root.join("versions"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// 只放 `plugin.json` 的最小包：本轮校验发生在解包之前，用不到 checksums。
+    fn write_plugin_manifest_archive(path: &Path, manifest: &serde_json::Value) {
+        let mut archive = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("plugin.json", options).unwrap();
+        archive
+            .write_all(serde_json::to_vec(manifest).unwrap().as_slice())
+            .unwrap();
+        archive.finish().unwrap();
+    }
+
+    /// 版本号会拼成 `versions/<版本>`。带上级目录引用的版本号等于把安装落点挪出
+    /// 插件目录，必须在碰文件系统之前就被拒。
     #[test]
-    fn packs_local_workspace_into_a_verifiable_archive_without_dependency_directories() {
+    fn refuses_plugin_package_whose_version_escapes_the_plugin_dir() {
+        let home = env::temp_dir().join(format!("himind-plugin-home-{}", unique_suffix()));
+        fs::create_dir_all(&home).unwrap();
+        env::set_var("HIMIND_AGENT_HOME", &home);
+
+        let traversal = "..\\..\\escaped";
+        assert!(
+            crate::capability::plugin::validate_plugin_version(traversal).is_err(),
+            "版本号校验必须挡住上级目录引用"
+        );
+        let archive =
+            env::temp_dir().join(format!("himind-plugin-escape-{}.hmpkg", unique_suffix()));
+        write_plugin_manifest_archive(
+            &archive,
+            &serde_json::json!({
+                "id": "com.himind.escape-test",
+                "name": "越界测试插件",
+                "description": "版本号带上级目录引用，安装必须失败",
+                "version": traversal,
+                "entry": "plugin.exe",
+                "runtime": "process-jsonrpc-stdio",
+            }),
+        );
+
+        let item = catalog_plugin(
+            "com.himind.escape-test",
+            "越界测试插件",
+            traversal,
+            Vec::new(),
+        );
+        let result = install_archive(&archive, &item);
+        assert!(result.is_err(), "安装必须失败，实际返回 {result:?}");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid plugin version"),
+            "失败原因应当是版本号不合法"
+        );
+        assert!(
+            !home.join("plugins").join("escaped").exists(),
+            "安装不能把目录写到插件目录之外"
+        );
+
+        env::remove_var("HIMIND_AGENT_HOME");
+        let _ = fs::remove_file(&archive);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn keeps_only_the_versions_current_and_previous_point_at() {
+        let root = env::temp_dir().join(format!("himind-plugin-versions-{}", unique_suffix()));
+        // 回退之后 current 比 previous 更旧，保留名单必须按实际目录读，不能靠安装顺序猜。
+        write_plugin_version_dir(&root, "current", "1.3.1");
+        write_plugin_version_dir(&root, "previous", "1.4.0");
+        for version in ["1.0.0", "1.3.1", "1.3.2", "1.4.0"] {
+            fs::create_dir_all(root.join("versions").join(version)).unwrap();
+        }
+        // 中断残留：版本目录名不会以点开头。
+        fs::create_dir_all(root.join("versions").join(".staging-abc")).unwrap();
+        fs::create_dir_all(root.join("versions").join("staging-1")).unwrap();
+
+        prune_plugin_versions(&root, TransientPolicy::Remove);
+
+        assert_eq!(plugin_version_directories(&root), vec!["1.3.1", "1.4.0"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn background_sweep_keeps_transient_directories_an_install_may_be_using() {
+        let root = env::temp_dir().join(format!("himind-plugin-versions-{}", unique_suffix()));
+        write_plugin_version_dir(&root, "current", "2.0.0");
+        for version in ["1.0.0", "2.0.0"] {
+            fs::create_dir_all(root.join("versions").join(version)).unwrap();
+        }
+        // 巡检与安装可能同时发生，暂存目录只能由安装收尾自己清。
+        fs::create_dir_all(root.join("versions").join(".staging-live")).unwrap();
+
+        prune_plugin_versions(&root, TransientPolicy::RemoveStale);
+
+        assert_eq!(
+            plugin_version_directories(&root),
+            vec![".staging-live", "2.0.0"]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drops_history_even_when_there_is_nothing_to_roll_back_to() {
+        let root = env::temp_dir().join(format!("himind-plugin-versions-{}", unique_suffix()));
+        write_plugin_version_dir(&root, "current", "2.0.0");
+        for version in ["1.0.0", "2.0.0"] {
+            fs::create_dir_all(root.join("versions").join(version)).unwrap();
+        }
+
+        prune_plugin_versions(&root, TransientPolicy::Remove);
+
+        assert_eq!(plugin_version_directories(&root), vec!["2.0.0"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn keeps_every_version_when_the_rollback_snapshot_is_unreadable() {
+        let root = env::temp_dir().join(format!("himind-plugin-versions-{}", unique_suffix()));
+        write_plugin_version_dir(&root, "current", "2.0.0");
+        fs::create_dir_all(root.join("previous")).unwrap();
+        for version in ["1.0.0", "2.0.0"] {
+            fs::create_dir_all(root.join("versions").join(version)).unwrap();
+        }
+
+        prune_plugin_versions(&root, TransientPolicy::Remove);
+
+        assert_eq!(plugin_version_directories(&root), vec!["1.0.0", "2.0.0"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disabling_a_development_plugin_is_rejected_instead_of_silently_ignored() {
+        let development = vec!["com.himind.short-video-creation".to_string()];
+        assert_eq!(
+            disable_rejection("com.himind.short-video-creation", false, &development),
+            Some("开发中的插件由「扩展开发」管理，请在那里停用或移除")
+        );
+        // 启用不需要拦：开发插件本来就没有停用标记需要清除。
+        assert_eq!(
+            disable_rejection("com.himind.short-video-creation", true, &development),
+            None
+        );
+        // 普通安装的插件照常允许停用。
+        assert_eq!(
+            disable_rejection("com.example.installed", false, &development),
+            None
+        );
+    }
+
+    #[test]
+    fn packs_local_workspace_into_the_same_payload_the_release_build_ships() {
         let source = env::temp_dir().join(format!("himind-local-plugin-{}", unique_suffix()));
         fs::create_dir_all(source.join("node_modules").join("left-pad")).unwrap();
         fs::create_dir_all(source.join(".git")).unwrap();
@@ -1575,7 +1948,10 @@ mod tests {
 
         verify_plugin_checksums(&staging).unwrap();
         assert!(staging.join("plugin.json").is_file());
-        assert!(staging.join("main.go").is_file());
+        // 本地源安装必须落成发布载荷那一份内容：Go 源码是构建输入，官方打包器不会
+        // 把它放进制品。少过滤一个文件，同一版本的插件就会因为安装来源不同而摘要
+        // 不同，工作流的依赖锁随之在任何另一台机器上校验失败。
+        assert!(!staging.join("main.go").exists());
         assert!(!staging.join("node_modules").exists());
         assert!(!staging.join(".git").exists());
 
@@ -1977,6 +2353,118 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// 起一个只应答一次的状态上报服务，返回它的地址。
+    fn status_report_server(
+        response: &'static str,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (address, handle)
+    }
+
+    fn status_test_options(state_path: &std::path::Path, api_base: String) -> crate::Options {
+        crate::Options {
+            api_base: crate::api_base_cell(api_base),
+            state_path: state_path.to_path_buf(),
+            workbench_mode: crate::app::runtime_mode::mode_cell(
+                crate::app::runtime_mode::AgentMode::Connected,
+            ),
+            once: false,
+            interval_seconds: 10,
+            local_app: false,
+            local_port: 18181,
+            reenroll: false,
+            enrollment_token: String::new(),
+            agent_credential: Arc::new(RwLock::new("credential".to_string())),
+            identity_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            platform_access: Arc::new(RwLock::new(None)),
+            task_execution: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[test]
+    fn permanent_status_response_drops_the_record_instead_of_blocking_the_queue() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-plugin-status-permanent-{}",
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let offline = status_test_options(&state_path, "http://127.0.0.1:1".to_string());
+        assert!(report_status(
+            &offline,
+            "agent-1",
+            "com.himind.unknown-product",
+            "install",
+            "1.0.0",
+            ""
+        )
+        .is_err());
+        assert_eq!(
+            crate::store::plugin_outbox::list(&state_path)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 工作台不认识这个产品时返回 404；重试不会改变结果，记录必须出队。
+        let (address, server) = status_report_server(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"error\":\"plugin product not found\"}",
+        );
+        let recovered = status_test_options(&state_path, format!("http://{address}"));
+        flush_status_outbox(&recovered, "agent-1");
+        server.join().unwrap();
+        assert!(
+            crate::store::plugin_outbox::list(&state_path)
+                .unwrap()
+                .is_empty(),
+            "永久失败必须丢弃记录"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transient_status_response_keeps_the_record_for_retry() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-plugin-status-transient-{}",
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("agent-state.json");
+        let offline = status_test_options(&state_path, "http://127.0.0.1:1".to_string());
+        assert!(report_status(
+            &offline,
+            "agent-1",
+            "com.himind.replay",
+            "install",
+            "1.0.0",
+            ""
+        )
+        .is_err());
+
+        // 5xx 属于暂时故障：保留记录等待下一次重放。
+        let (address, server) = status_report_server(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let recovered = status_test_options(&state_path, format!("http://{address}"));
+        flush_status_outbox(&recovered, "agent-1");
+        server.join().unwrap();
+        assert_eq!(
+            crate::store::plugin_outbox::list(&state_path)
+                .unwrap()
+                .len(),
+            1,
+            "暂时失败必须保留记录"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn queues_failed_status_and_replays_after_dashboard_recovers() {
         let root = std::env::temp_dir().join(format!(
@@ -1986,9 +2474,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let state_path = root.join("agent-state.json");
         let options = crate::Options {
-            api_base: "http://127.0.0.1:1".to_string(),
+            api_base: crate::api_base_cell("http://127.0.0.1:1"),
             state_path: state_path.clone(),
-            effective_mode: crate::app::runtime_mode::AgentMode::Connected,
+            workbench_mode: crate::app::runtime_mode::mode_cell(
+                crate::app::runtime_mode::AgentMode::Connected,
+            ),
             once: false,
             interval_seconds: 10,
             local_app: false,
@@ -2028,7 +2518,7 @@ mod tests {
                 .unwrap();
         });
         let recovered = crate::Options {
-            api_base: format!("http://{address}"),
+            api_base: crate::api_base_cell(format!("http://{address}")),
             ..options
         };
         flush_status_outbox(&recovered, "agent-1");
@@ -2037,6 +2527,87 @@ mod tests {
         assert!(crate::store::plugin_outbox::list(&state_path)
             .unwrap()
             .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn status_record(plugin_id: &str) -> crate::store::plugin_outbox::PluginStatusRecord {
+        crate::store::plugin_outbox::PluginStatusRecord {
+            agent_id: String::new(),
+            plugin_id: plugin_id.to_string(),
+            action: "install".to_string(),
+            from_version: String::new(),
+            current_version: "1.0.0".to_string(),
+            previous_version: String::new(),
+            enabled: true,
+            status: "installed".to_string(),
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn permanent_status_failures_are_dropped_and_queue_continues() {
+        let root = env::temp_dir().join(format!("himind-status-outbox-{}", unique_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let dropped = root.join("dropped.json");
+        let kept = root.join("kept.json");
+        fs::write(&dropped, "{}").unwrap();
+        fs::write(&kept, "{}").unwrap();
+        let mut handled = Vec::new();
+        replay_status_outbox(
+            vec![
+                (dropped.clone(), status_record("com.himind.unknown")),
+                (kept.clone(), status_record("com.himind.known")),
+            ],
+            "agt_test",
+            |record| {
+                handled.push(record.plugin_id.clone());
+                if record.plugin_id == "com.himind.unknown" {
+                    // 工作台没有这个产品时返回 404，重试不会改变结果。
+                    Err(
+                        crate::api::distribution::PluginStatusDeliveryError::Permanent(
+                            "HTTP 404".to_string(),
+                        ),
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        // 永久失败不会阻塞后面的记录，两条都已出队。
+        assert_eq!(handled.len(), 2);
+        assert!(!dropped.exists());
+        assert!(!kept.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transient_status_failures_keep_the_queue_in_order() {
+        let root = env::temp_dir().join(format!("himind-status-outbox-t-{}", unique_suffix()));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.json");
+        let second = root.join("second.json");
+        fs::write(&first, "{}").unwrap();
+        fs::write(&second, "{}").unwrap();
+        let mut handled = Vec::new();
+        replay_status_outbox(
+            vec![
+                (first.clone(), status_record("com.himind.first")),
+                (second.clone(), status_record("com.himind.second")),
+            ],
+            "agt_test",
+            |record| {
+                handled.push(record.plugin_id.clone());
+                Err(
+                    crate::api::distribution::PluginStatusDeliveryError::Transient(
+                        "HTTP 503".to_string(),
+                    ),
+                )
+            },
+        );
+        // 暂时失败按顺序停下，两条都保留等待下一次重放。
+        assert_eq!(handled, vec!["com.himind.first".to_string()]);
+        assert!(first.exists());
+        assert!(second.exists());
         let _ = fs::remove_dir_all(root);
     }
 }
