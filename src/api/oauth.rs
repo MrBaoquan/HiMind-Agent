@@ -522,8 +522,8 @@ where
     // 客户端不要在服务端的有效期上「卡点」放弃：本机时钟偏差、休眠唤醒、或者用户
     // 恰好在最后一秒点确认，都会让一次已经生效的确认白做。多给一个轮询周期以上
     // 的余量继续问，服务端仍然是唯一的裁判——真过期了它会回 expired_token。
-    let deadline =
-        unix_now().saturating_add(authorization.expires_in.max(1) as u64 + DEVICE_POLL_OVERRUN_SECS);
+    let deadline = unix_now()
+        .saturating_add(authorization.expires_in.max(1) as u64 + DEVICE_POLL_OVERRUN_SECS);
     let mut interval = authorization.interval.max(1);
     while unix_now() < deadline {
         if is_cancelled() {
@@ -957,9 +957,8 @@ mod tests {
                         Ok(0) | Err(_) => break,
                         Ok(read) => request.extend_from_slice(&chunk[..read]),
                     }
-                    let Some(head_end) = request
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
+                    let Some(head_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
                     else {
                         continue;
                     };

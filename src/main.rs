@@ -30,13 +30,22 @@ mod approval;
 mod business_integration;
 mod capability;
 mod development_checkpoint;
+#[allow(dead_code)]
+mod ecc_import;
 mod engineering_project;
+mod expert;
+mod expert_authoring;
 mod extension_authoring;
 mod extension_category;
 mod extension_contracts;
 mod extension_projects;
 mod extension_workspace;
 mod install_layout;
+mod instruction_pack;
+#[allow(dead_code)]
+mod instruction_projection;
+#[allow(dead_code)]
+mod instruction_targets;
 mod local_activity;
 mod mcp;
 mod path_guard;
@@ -54,6 +63,7 @@ mod worker;
 #[allow(dead_code)]
 mod workflow;
 mod workflow_handoff;
+mod workspace_instructions;
 mod workspace_lease;
 mod worktree_identity;
 
@@ -192,6 +202,11 @@ fn main() {
     } else if let Some(arguments) = market_cli_arguments() {
         if let Err(error) = run_market_cli(&options, &arguments) {
             eprintln!("market command failed: {error}");
+            std::process::exit(1);
+        }
+    } else if let Some(arguments) = instruction_pack_cli_arguments() {
+        if let Err(error) = run_instruction_pack_cli(&arguments) {
+            eprintln!("instruction pack command failed: {error}");
             std::process::exit(1);
         }
     } else if let Some(arguments) = credential_cli_arguments() {
@@ -679,6 +694,39 @@ fn market_cli_arguments() -> Option<Vec<String>> {
     cli_command_arguments("market")
 }
 
+fn instruction_pack_cli_arguments() -> Option<Vec<String>> {
+    cli_command_arguments("instruction-pack")
+}
+
+fn run_instruction_pack_cli(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let value = match arguments {
+        [action] if action == "list" => serde_json::to_value(crate::instruction_pack::list()?)?,
+          [action, path] if action == "import-file" => serde_json::to_value(
+              crate::instruction_pack::import_file(std::path::Path::new(path))?,
+          )?,
+          [action, path] if action == "import-package" => serde_json::to_value(
+              crate::instruction_pack::import_package(crate::instruction_pack::InstructionPackImportInput {
+                  package_path: std::path::PathBuf::from(path),
+                  source: "local_package".to_string(),
+              })?,
+          )?,
+        [action, id, version] if action == "test" => serde_json::to_value(
+            crate::instruction_pack::test(id, version)?,
+        )?,
+        [action, id, version] if action == "confirm" => serde_json::to_value(
+            crate::instruction_pack::confirm(id, version)?,
+        )?,
+        [action, id, version] if action == "publish-local" => serde_json::to_value(
+            crate::instruction_pack::publish_local(id, version)?,
+        )?,
+        _ => {
+              return Err("usage: himind-agent instruction-pack <list|import-file path|import-package path|test id version|confirm id version|publish-local id version>".into())
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 /// 市场命令行入口：搜索、盘点、计划、安装。
 ///
 /// 与 MCP 的 `market.*` 共用同一份 [`app::market`] 实现，CLI 不引入第二套安装语义。
@@ -828,7 +876,7 @@ fn run_market_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         )?,
         _ => {
             return Err(
-                "usage: himind-agent market <search|installed|plan|install> [--kind skill|plugin|workflow] [--id <id>] [--version <version>] [--source <source>] [--query <text>] [--category <name>] [--limit <n>] [--cursor <n>] [--client <client-id>] [--workspace <project-root>|--global] [--dry-run]".into(),
+                "usage: himind-agent market <search|installed|plan|install> [--kind skill|plugin|workflow|instruction_pack] [--id <id>] [--version <version>] [--source <source>] [--query <text>] [--category <name>] [--limit <n>] [--cursor <n>] [--client <client-id>] [--workspace <project-root>|--global] [--dry-run]".into(),
             )
         }
     };

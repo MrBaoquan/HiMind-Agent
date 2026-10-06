@@ -1249,12 +1249,12 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
                 </label>
                 {draft.kind === 'skill' && skills.length === 0 ? (
                   <div className="workflow-start-empty workflow-start-field-wide">
-                    还没有已安装的技能。<button type="button" className="btn" onClick={onOpenExtensions}><Store size={13} />去市场安装</button>
+                    还没有已安装的技能。<button type="button" className="btn" onClick={onOpenExtensions}><Store size={13} />去市场</button>
                   </div>
                 ) : null}
                 {draft.kind === 'workflow' && workflows.length === 0 ? (
                   <div className="workflow-start-empty workflow-start-field-wide">
-                    还没有可用的工作流。<button type="button" className="btn" onClick={onOpenExtensions}><Store size={13} />去市场安装</button>
+                    还没有可用的工作流。<button type="button" className="btn" onClick={onOpenExtensions}><Store size={13} />去市场</button>
                   </div>
                 ) : null}
                 {draft.kind === 'workflow' ? (

@@ -1,8 +1,9 @@
 import { ArrowUpRight, CheckCircle2, CircleAlert, Download, RefreshCw, Sparkles } from 'lucide-react';
+import { LocalUsagePanel } from '../components/LocalUsagePanel';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { PageHeader, Pill } from '../components/Common';
 import { DashboardIdentityPanel } from '../components/DashboardIdentityPanel';
-import type { AgentStatus, AgentUpdateStatus, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, McpTargetDescriptor, ProjectionSyncStatus, RemoteExecutionSettings } from '../services/agentApi';
+import type { AgentStatus, AgentUpdateStatus, AiUsageRange, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, InferenceGatewayStatus, LocalUsageOverview, McpTargetDescriptor, ProjectionSyncStatus, RemoteExecutionSettings } from '../services/agentApi';
 
 type DashboardPageProps = {
   status: AgentStatus | null;
@@ -10,6 +11,10 @@ type DashboardPageProps = {
   approvals: ApprovalItem[];
   remoteExecutionSettings: RemoteExecutionSettings | null;
   mcpTargets: McpTargetDescriptor[];
+  localUsage: LocalUsageOverview | null;
+  localUsageRange: AiUsageRange;
+  localUsageBusy: boolean;
+  inferenceGateway: InferenceGatewayStatus | null;
   identity: DashboardIdentityStatus | null;
   authorization: DashboardAuthorizationProgress | null;
   identityBusy: boolean;
@@ -23,6 +28,10 @@ type DashboardPageProps = {
   onOpenAuthorization: () => void;
   onRefreshIdentity: () => void;
   onRevokeAuthorization: () => void;
+  onLocalUsageRangeChange: (range: AiUsageRange) => void;
+  onRefreshLocalUsage: () => void;
+  onBindCodexToGateway: () => void;
+  bindingModeBusy: boolean;
   onCheckUpdate: () => void;
   onDownloadUpdate: () => void;
   onInstallUpdate: () => void;
@@ -34,6 +43,10 @@ export function DashboardPage({
   approvals,
   remoteExecutionSettings,
   mcpTargets,
+  localUsage,
+  localUsageRange,
+  localUsageBusy,
+  inferenceGateway,
   identity,
   authorization,
   identityBusy,
@@ -47,6 +60,10 @@ export function DashboardPage({
   onOpenAuthorization,
   onRefreshIdentity,
   onRevokeAuthorization,
+  onLocalUsageRangeChange,
+  onRefreshLocalUsage,
+  onBindCodexToGateway,
+  bindingModeBusy,
   onCheckUpdate,
   onDownloadUpdate,
   onInstallUpdate,
@@ -61,7 +78,7 @@ export function DashboardPage({
   if (independentMode) {
     return (
       <div className="dashboard-page">
-        <PageHeader title="Agent 状态" />
+        <PageHeader title="首页" />
         {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
         <ProjectionStatusPanel status={projectionSyncStatus} requeueBusy={projectionRequeueBusy} onRequeue={onRequeueProjectionDeadLetters} />
         <section className="workspace-status-panel ready independent-status-panel">
@@ -79,6 +96,16 @@ export function DashboardPage({
             <div><span>AI 工具</span><strong>{mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected && target.state === 'configured').length} 已连接</strong></div>
           </div>
         </section>
+        <LocalUsagePanel
+          overview={localUsage}
+          gateway={inferenceGateway}
+          range={localUsageRange}
+          busy={localUsageBusy}
+          onRangeChange={onLocalUsageRangeChange}
+          onRefresh={onRefreshLocalUsage}
+          onBindGateway={onBindCodexToGateway}
+          bindBusy={bindingModeBusy}
+        />
         <section className="overview-facts" aria-label="运行信息">
           <div><span>版本</span><strong>v{status.version}</strong></div>
           <div><span>AI 工作台</span><strong>未连接</strong></div>
@@ -94,8 +121,8 @@ export function DashboardPage({
   return (
     <div className="dashboard-page">
       <PageHeader
-        title="Agent 状态"
-        description="查看连接、运行、同步和更新状态。"
+        title="首页"
+        description="从这里开始使用 AI 对话、自动化工作流和能力拓展。"
         actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
@@ -118,6 +145,16 @@ export function DashboardPage({
         onRefresh={onRefreshIdentity}
         onRevoke={onRevokeAuthorization}
         authorizationDisabledReason={workerIssue.requiresEnrollment ? workerIssue.description : undefined}
+      />
+      <LocalUsagePanel
+        overview={localUsage}
+        gateway={inferenceGateway}
+        range={localUsageRange}
+        busy={localUsageBusy}
+        onRangeChange={onLocalUsageRangeChange}
+        onRefresh={onRefreshLocalUsage}
+        onBindGateway={onBindCodexToGateway}
+        bindBusy={bindingModeBusy}
       />
       <section className="overview-facts" aria-label="运行信息">
         <div><span>版本</span><strong>v{status.version}</strong></div>

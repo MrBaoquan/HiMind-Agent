@@ -320,10 +320,7 @@ mod tests {
         let build_output = Path::new(r"F:\build\himind-agent\target\release\himind-agent.exe");
         assert_eq!(
             resolve_profile(None, build_output),
-            (
-                "development".to_string(),
-                ProfileSource::DevelopmentDefault
-            )
+            ("development".to_string(), ProfileSource::DevelopmentDefault)
         );
         assert_eq!(
             resolve_profile(Some("ecs-staging"), build_output),
@@ -374,10 +371,7 @@ mod tests {
         fs::write(build_dir.join("himind-agent-updater.exe"), b"updater").unwrap();
         assert_eq!(
             resolve_profile(None, &build_dir.join("himind-agent.exe")),
-            (
-                "development".to_string(),
-                ProfileSource::DevelopmentDefault
-            )
+            ("development".to_string(), ProfileSource::DevelopmentDefault)
         );
         let _ = fs::remove_dir_all(&build_root);
 

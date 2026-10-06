@@ -171,6 +171,23 @@ export type UnityEditorSettings = {
     discovered_path?: string;
     source: 'agent' | 'environment' | 'discovered' | 'unset';
     valid: boolean;
+    unreal?: UnrealEditorSettings;
+};
+
+export type UnrealEditorSettings = {
+    unreal_editor_path: string;
+    environment_path: string;
+    discovered_path?: string;
+    source: 'agent' | 'environment' | 'discovered' | 'unset';
+    valid: boolean;
+};
+
+/** 本机已安装的引擎编辑器，供「工程构建」选版本。 */
+export type EngineInstallation = {
+    engine: 'unity' | 'unreal';
+    version: string;
+    path: string;
+    source: string;
 };
 
 export type ApprovalSettings = {
@@ -1061,6 +1078,120 @@ export type WorkflowCatalogItem = {
     extension_lock?: Record<string, unknown> | null;
 };
 
+export type InstructionPackCatalogItem = {
+  instruction_pack_id: string;
+  name: string;
+  description: string;
+  author_name: string;
+  categories: string[];
+  version: string;
+  release_notes: string;
+  published_at: string;
+  min_agent_version: string;
+  supported_clients: string[];
+  scope: string;
+  max_bytes: number;
+  channel: string;
+  product_id: string;
+  release_id: string;
+  artifact_id: string;
+  file_name: string;
+  file_size: number;
+  sha256: string;
+  signature: string;
+  signature_key_id: string;
+  signature_algorithm: string;
+  download_url: string;
+  source: string;
+  assignment: string;
+  management: string;
+  install_mode: string;
+  managed: boolean;
+  allow_disable: boolean;
+  allow_uninstall: boolean;
+};
+
+export type ExpertSummary = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  categories: string[];
+  supported_clients: string[];
+  skill_count: number;
+  workflow_count: number;
+  capability_count: number;
+  digest: string;
+  builtin: boolean;
+  active: boolean;
+};
+
+export type ExpertCatalogItem = {
+  expert_id: string;
+  name: string;
+  description: string;
+  author_name: string;
+  categories: string[];
+  version: string;
+  release_notes: string;
+  supported_clients: string[];
+  artifact_id: string;
+  sha256: string;
+  file_size: number;
+  source: string;
+  assignment: string;
+  management: string;
+  managed: boolean;
+};
+
+export type ExpertActivation = {
+  expert_id: string;
+  version: string;
+  digest: string;
+  activated_at: string;
+};
+
+export type ExpertPackageResult = {
+  expert: ExpertSummary;
+  package_path: string;
+  package_sha256: string;
+};
+
+export type ExpertProjectionReceipt = {
+  schema_version: string;
+  expert_id: string;
+  expert_version: string;
+  expert_digest: string;
+  client_id: string;
+  workspace_root: string;
+  target_path: string;
+  content_digest: string;
+  projected_at: string;
+};
+
+export type InstructionPackRef = {
+  id: string;
+  version: string;
+  digest: string;
+};
+
+export type WorkspaceInstructionPack = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  digest: string;
+  supported_clients: string[];
+  scope: string;
+};
+
+export type WorkspaceInstructionContext = {
+  workspace_root: string;
+  selected: InstructionPackRef[];
+  available: WorkspaceInstructionPack[];
+};
+
 export type ExtensionSourceSnapshot = {
     plugins: PluginCatalogItem[];
     skills: OrganizationSkillCatalogItem[];
@@ -1365,6 +1496,147 @@ export type McpProbeResult = McpConnectionTestResult & {
     tool_count: number;
     error_kind: string;
     error: string;
+};
+
+export type InstructionProjectionStatus =
+    | 'native_loaded'
+    | 'projected_managed'
+    | 'projected_degraded'
+    | 'conflict'
+    | 'blocked'
+    | string;
+
+export type InstructionProjectionTarget = {
+    adapter_id: string;
+    client_id: string;
+    path: string;
+    scope: string;
+    format: string;
+    supports_global: boolean;
+    supports_project: boolean;
+    supports_directory: boolean;
+    instruction_packs: Array<{ id: string; version: string; digest: string }>;
+};
+
+export type InstructionTargetDescriptor = {
+    target: InstructionProjectionTarget;
+    detected: boolean;
+    native: boolean;
+    degraded: boolean;
+    reason: string;
+    receipt?: InstructionProjectionReceipt | null;
+};
+
+export type InstructionProjectionPlan = {
+    schema_version: string;
+    adapter_id: string;
+    client_id: string;
+    target_path: string;
+    snapshot_digest: string;
+    expected_current_digest: string;
+    status: InstructionProjectionStatus;
+    writes: Array<{
+        path: string;
+        content_digest: string;
+        content_bytes: number;
+        managed_key: string;
+        content?: string;
+        backup_path: string;
+    }>;
+    conflicts: string[];
+    unsupported: string[];
+    warnings: string[];
+    managed_block?: string;
+};
+
+export type InstructionProjectionReceipt = {
+    schema_version: string;
+    adapter_id: string;
+    client_id: string;
+    target_path: string;
+    status: InstructionProjectionStatus;
+    changed: boolean;
+    backup_path: string;
+    previous_digest: string;
+    new_digest: string;
+    managed_digest: string;
+    managed_keys: string[];
+    message: string;
+};
+
+export type EccArtifact = {
+    path: string;
+    kind: 'workspace_instruction' | 'subagent_template' | 'instruction_pack' | 'skill' | 'workflow' | 'hook_candidate' | 'unknown' | string;
+    bytes: number;
+    digest: string;
+    title: string;
+    frontmatter: Record<string, unknown>;
+    warnings: string[];
+};
+
+export type EccInspection = {
+    root: string;
+    artifacts: EccArtifact[];
+    warnings: string[];
+    executable_files_ignored: number;
+};
+
+export type InstructionPackDraft = {
+    manifest: {
+        schema_version: string;
+        id: string;
+        name: string;
+        author: string;
+        categories: string[];
+        version: string;
+        description: string;
+        release_notes: string;
+        min_agent_version: string;
+        supported_clients: string[];
+        scope: 'global' | 'project' | 'directory' | string;
+        max_bytes: number;
+        skill_refs: string[];
+        workflow_refs: string[];
+        capability_refs: string[];
+        contents: string[];
+    };
+    instructions: string;
+    files: Record<string, string>;
+    candidate_path: string;
+    candidate_sha256: string;
+    source_path?: string | null;
+    source_sha256?: string | null;
+    source: string;
+    tested_at?: string | null;
+    confirmed_at?: string | null;
+    published_at?: string | null;
+    published_digest?: string | null;
+    test_report?: Record<string, unknown> | null;
+    updated_at: string;
+};
+
+export type InstructionPackTestResult = {
+    draft: InstructionPackDraft;
+    readiness: 'ready' | 'blocked' | string;
+    issues: string[];
+    client_status: Record<string, string>;
+};
+
+export type InstructionPackDraftInput = {
+    id: string;
+    name: string;
+    author?: string;
+    categories?: string[];
+    version: string;
+    description?: string;
+    release_notes: string;
+    min_agent_version?: string;
+    supported_clients?: string[];
+    scope?: 'global' | 'project' | 'directory' | string;
+    max_bytes?: number;
+    instructions: string;
+    files?: Record<string, string>;
+    source?: string;
 };
 
 export type PluginViewContribution = {
@@ -1836,7 +2108,39 @@ export type AuthoringSkillTestResult = {
     clients?: Record<string, CodexSkillActionResponse>;
 };
 
-export type ExtensionProjectKind = 'plugin' | 'skill' | 'workflow';
+export type ExtensionProjectKind = 'plugin' | 'skill' | 'workflow' | 'expert' | 'instruction';
+
+export type ExpertAuthoringDraft = {
+  definition: ExpertDefinitionSnapshot;
+  candidate_path: string;
+  candidate_sha256: string;
+  updated_at: string;
+  tested_at?: string | null;
+  confirmed_at?: string | null;
+  submitted_at?: string | null;
+  dashboard_release_id?: string | null;
+  test_report?: Record<string, unknown> | null;
+};
+
+export type ExpertDefinitionSnapshot = {
+  schema_version: string;
+  id: string;
+  name: string;
+  author: string;
+  categories: string[];
+  version: string;
+  release_notes: string;
+  min_agent_version: string;
+  description: string;
+  supported_clients: string[];
+  skill_refs: string[];
+  workflow_refs: string[];
+  capability_refs: string[];
+  contents: string[];
+  instructions: string;
+  output_contract: { required_sections: string[] };
+  harness: { behavior_phases: string[]; required_evidence: string[]; recovery_guidance: string[] };
+};
 
 export type ExtensionWorkspaceSettings = {
     configured: boolean;
@@ -2018,7 +2322,7 @@ export type ExtensionRemoteProject = {
     product_key: string;
     name: string;
     description: string;
-    product_type: 'agent_plugin' | 'organization_skill' | 'workflow_package' | string;
+    product_type: 'agent_plugin' | 'organization_skill' | 'workflow_package' | 'agent_expert' | string;
     role: ExtensionCollaborationRole;
     can_manage: boolean;
     can_submit: boolean;
@@ -2038,7 +2342,7 @@ export type CreateExtensionProjectInput = {
     template?: 'readonly-tool' | 'job-worker' | 'ui-tool' | 'strict' | 'segmented' | 'flexible' | 'development-loop' | 'capability-pipeline';
 };
 
-export type ExtensionCandidate = { kind: 'plugin'; draft: AuthoringPluginDraft } | { kind: 'skill'; draft: AuthoringSkillDraft } | { kind: 'workflow'; draft: AuthoringWorkflowDraft };
+export type ExtensionCandidate = { kind: 'plugin'; draft: AuthoringPluginDraft } | { kind: 'skill'; draft: AuthoringSkillDraft } | { kind: 'workflow'; draft: AuthoringWorkflowDraft } | { kind: 'expert'; draft: ExpertAuthoringDraft } | { kind: 'instruction'; draft: InstructionPackDraft };
 
 export type ExtensionCollaborationRole = 'owner' | 'contributor';
 
@@ -2323,6 +2627,64 @@ export type AIServiceModelListResult = {
     models: string[];
 };
 
+/** 用量窗口档位；今日只有日粒度单点，界面据此不出趋势图（ADR 0111）。 */
+export type AiUsageRange = 'today' | '7d' | '30d';
+
+/** 用量统计只做本机网关这一条口径（ADR 0113）：只有 Token 与调用次数，没有金额。 */
+export type LocalUsageGroup = {
+    key: string;
+    label: string;
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    tokens: number;
+};
+
+export type LocalUsageDimension = 'client' | 'model' | 'service';
+
+export type LocalUsageOverview = {
+    available: boolean;
+    range: string;
+    date_from: string;
+    date_to: string;
+    has_trend: boolean;
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    cached_tokens: number;
+    reasoning_tokens: number;
+    /** 上游没返回用量：只累加调用次数，不估算 Token。 */
+    usage_unreported: number;
+    /** 上游是平台托管服务：以平台口径为准，本机合计已排除。 */
+    platform_metered: number;
+    skipped_records: number;
+    labels: string[];
+    daily_requests: number[];
+    daily_tokens: number[];
+    breakdowns: Partial<Record<LocalUsageDimension, LocalUsageGroup[]>>;
+};
+
+export type InferenceGatewayStatus = {
+    running: boolean;
+    url: string;
+    port: number;
+    /** 固定端口；端口被占用且已有绑定时不会退让，只在 last_error 里说明。 */
+    preferred_port: number;
+    /** 启动失败的硬原因（端口不可用等）。 */
+    last_error: string;
+    /** 不足以失败、但用户该知道的事实（例如临时换了端口）。 */
+    notice: string;
+    gateway_clients: Array<{ client: string; service: string; protocol: string; models: string[] }>;
+    /** 直连注入的客户端：其用量不计入本机口径。 */
+    direct_clients: string[];
+};
+
+export type InferenceGatewayStopReport = {
+    stopped: boolean;
+    switched: string[];
+    failures: Array<{ client: string; error: string }>;
+};
+
 export function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
     return tauriInvoke<T>(command, args);
 }
@@ -2343,6 +2705,12 @@ export const agentApi = {
     installUpdate: () => invoke<AgentUpdateStatus>('install_agent_update'),
     dashboardIdentity: () => invoke<DashboardIdentityStatus>('get_dashboard_identity_status'),
     builtinAiActivity: () => invoke<{ items: BuiltinAIRuntimeActivity[] }>('get_builtin_ai_activity'),
+    localUsageOverview: (range: AiUsageRange) => invoke<LocalUsageOverview>('get_local_usage_overview', { range }),
+    inferenceGatewayStatus: () => invoke<InferenceGatewayStatus>('get_inference_gateway_status'),
+    restartInferenceGateway: () => invoke<InferenceGatewayStatus>('restart_inference_gateway'),
+    stopInferenceGatewayAndUnbind: () => invoke<InferenceGatewayStopReport>('stop_inference_gateway_and_unbind'),
+    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) =>
+        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null }),
     startDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('start_dashboard_authorization'),
     dashboardAuthorizationProgress: () => invoke<DashboardAuthorizationProgress>('get_dashboard_authorization_progress'),
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
@@ -2364,6 +2732,41 @@ export const agentApi = {
     testMcpConnection: () => invoke<McpConnectionTestResult>('test_mcp_connection'),
     mcpRegistry: () => invoke<McpRegistrySnapshot>('get_mcp_registry_snapshot'),
     mcpTargets: () => invoke<McpTargetDescriptor[]>('get_mcp_targets'),
+    experts: () => invoke<ExpertSummary[]>('list_experts'),
+    expertDrafts: () => invoke<ExpertAuthoringDraft[]>('list_expert_drafts'),
+    testExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('test_expert_draft', { expertId, version }),
+    confirmExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('confirm_expert_draft', { expertId, version }),
+    submitExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('submit_expert_draft', { expertId, version }),
+    expertCatalog: () => invoke<ExpertCatalogItem[]>('get_expert_catalog'),
+    activeExpert: (workspaceRoot?: string) => invoke<ExpertActivation | null>('active_expert', { workspaceRoot: workspaceRoot ?? null }),
+    activateExpert: (expertId: string, version?: string, workspaceRoot?: string) => invoke<ExpertActivation>('activate_expert', { expertId, version: version ?? null, workspaceRoot: workspaceRoot ?? null }),
+    saveExpert: (input: Record<string, unknown>) => invoke<ExpertSummary>('save_expert', { input }),
+    pickExpertPackage: () => invoke<string | null>('pick_expert_package'),
+    importExpertPackage: (path: string) => invoke<ExpertSummary>('import_expert_package', { path }),
+    exportExpertPackage: (expertId: string, version: string) => invoke<ExpertPackageResult>('export_expert_package', { expertId, version }),
+    projectExpertToClient: (expertId: string, clientId: string, workspaceRoot: string, version?: string) => invoke<ExpertProjectionReceipt>('project_expert_to_client', { expertId, clientId, workspaceRoot, version: version ?? null }),
+    materializeExpertProject: (workspaceRoot: string, expertId: string, version?: string) => invoke<ExtensionProject>('materialize_expert_project', { workspaceRoot, expertId, version: version ?? null }),
+    materializeInstructionProject: (workspaceRoot: string, instructionPackId: string, version?: string) => invoke<ExtensionProject>('materialize_instruction_project', { workspaceRoot, instructionPackId, version: version ?? null }),
+    instructionTargets: (workspaceRoot: string) => invoke<InstructionTargetDescriptor[]>('get_instruction_targets', { workspaceRoot }),
+    workspaceInstructionContext: (workspaceRoot: string) => invoke<WorkspaceInstructionContext>('get_workspace_instruction_context', { workspaceRoot }),
+    saveWorkspaceInstructionSelection: (workspaceRoot: string, selected: InstructionPackRef[]) =>
+      invoke<WorkspaceInstructionContext>('save_workspace_instruction_selection', { workspaceRoot, selected }),
+    inspectEccRepository: (root: string) => invoke<EccInspection>('inspect_ecc_repository', { root }),
+    pickInstructionFile: () => invoke<string | null>('pick_instruction_file'),
+    pickInstructionPackage: () => invoke<string | null>('pick_instruction_package'),
+    instructionPackDrafts: () => invoke<InstructionPackDraft[]>('list_instruction_pack_drafts'),
+    saveInstructionPackDraft: (input: InstructionPackDraftInput) => invoke<InstructionPackDraft>('save_instruction_pack_draft', { input }),
+    importInstructionFile: (path: string) => invoke<InstructionPackDraft>('import_instruction_file', { path }),
+    importInstructionPackage: (path: string) => invoke<InstructionPackDraft>('import_instruction_package', { path }),
+    testInstructionPackDraft: (id: string, version: string) => invoke<InstructionPackTestResult>('test_instruction_pack_draft', { id, version }),
+    confirmInstructionPackDraft: (id: string, version: string) => invoke<InstructionPackDraft>('confirm_instruction_pack_draft', { id, version }),
+    publishInstructionPackLocally: (id: string, version: string) => invoke<InstructionPackDraft>('publish_instruction_pack_locally', { id, version }),
+    planInstructionProjection: (workspaceRoot: string, target: InstructionProjectionTarget) =>
+        invoke<InstructionProjectionPlan>('plan_instruction_projection', { workspaceRoot, target }),
+    applyInstructionProjection: (plan: InstructionProjectionPlan) =>
+        invoke<InstructionProjectionReceipt>('apply_instruction_projection', { plan }),
+    rollbackInstructionProjection: (receipt: InstructionProjectionReceipt) =>
+        invoke<void>('rollback_instruction_projection', { receipt }),
     inspectMcpTarget: (targetId: string) => invoke<Record<string, unknown>>('inspect_mcp_target', { targetId }),
     planMcpRegistration: (targetId: string) => invoke<McpRegistrationPlan>('plan_mcp_registration', { targetId }),
     applyMcpRegistration: (targetId: string, resetInvalid = false) => invoke<McpTargetOperationResult>('apply_mcp_registration', { targetId, resetInvalid }),
@@ -2437,6 +2840,10 @@ export const agentApi = {
     revealSkillRun: (runId: string) => invoke<void>('reveal_skill_run', { runId }),
     queryWorkflowCatalog: (q: string, category: string, page = 1, pageSize = 50) => invoke<CatalogPage<WorkflowCatalogItem>>('query_workflow_catalog', { q, category, page, pageSize }),
     workflowVersions: (workflowId: string) => invoke<WorkflowCatalogItem[]>('get_workflow_versions', { workflowId }),
+    instructionPackCatalog: () => invoke<InstructionPackCatalogItem[]>('get_instruction_pack_catalog'),
+    instructionPackVersions: (instructionPackId: string) => invoke<InstructionPackCatalogItem[]>('get_instruction_pack_versions', { instructionPackId }),
+    installInstructionPackMarket: (instructionPackId: string, version?: string, artifactId?: string, sha256?: string) => invoke<Record<string, unknown>>('install_instruction_pack_market', { instructionPackId, version, artifactId, sha256 }),
+    installExpertMarket: (expertId: string, version?: string, artifactId?: string, sha256?: string) => invoke<Record<string, unknown>>('install_expert_market', { expertId, version, artifactId, sha256 }),
     connectorStates: () => invoke<ConnectorStateItem[]>('get_connector_states'),
     setConnectorEnabled: (connectorId: string, enabled: boolean) => invoke<Record<string, unknown>>('set_connector_enabled', { connectorId, enabled }),
     revokeConnector: (connectorId: string, reason = '') => invoke<Record<string, unknown>>('revoke_connector', { connectorId, reason }),
@@ -2636,6 +3043,9 @@ export const agentApi = {
     setAutoStart: (enabled: boolean) => invoke<{ auto_start: boolean }>('set_auto_start', { enabled }),
     pickUnityEditor: () => invoke<{ path?: string }>('pick_unity_editor'),
     saveUnityEditor: (path: string) => invoke<UnityEditorSettings>('save_unity_editor', { path }),
+    pickEngineEditor: (engine: 'unity' | 'unreal') => invoke<{ path?: string }>('pick_engine_editor', { engine }),
+    saveEngineEditor: (engine: 'unity' | 'unreal', path: string) => invoke<UnityEditorSettings>('save_engine_editor', { engine, path }),
+    engineInstallations: () => invoke<EngineInstallation[]>('list_engine_installations'),
     saveLogin: (username: string, password: string) => invoke<LoginState>('save_local_login', { username, password }),
     logoutLogin: () => invoke<LoginState>('logout_local_login'),
     svnConnections: () => invoke<{ items: SvnConnection[] }>('get_svn_connections'),

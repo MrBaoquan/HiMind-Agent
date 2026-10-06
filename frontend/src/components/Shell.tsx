@@ -209,7 +209,7 @@ function AppMenuBar({ currentPage, inboxCount, agentVersion, updateBusy, dashboa
             <div className="app-menu-dropdown" role="menu">
               {visibleSections.map((section, sectionIndex) => <div key={section.id}>
                   {sectionIndex > 0 ? <div className="app-menu-separator" role="separator" /> : null}
-                  <div className="app-menu-section-label">{section.label}</div>
+                  {section.label ? <div className="app-menu-section-label">{section.label}</div> : null}
                   {section.items.map(item => {
                     const Icon = item.icon;
                     return <button type="button" role="menuitem" key={item.key} onClick={() => runAction(() => onNavigate(item.key))}><Icon size={16} /><span>{item.label}</span>{menuBadge(item)}</button>;
@@ -330,20 +330,9 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
       <AppMenuBar currentPage={currentPage} inboxCount={approvalCount + workflowApprovalCount} agentVersion={agentVersion} updateBusy={updateBusy} dashboardEnabled={dashboardEnabled} currentTask={currentTask} activeRunCount={activeRunCount} sidebarCollapsed={sidebarCollapsed} onToggleSidebar={() => setSidebarCollapsed(current => !current)} onNavigate={onNavigate} onOpenDashboard={onOpenDashboard} onOpenBuiltinAi={onOpenBuiltinAi} onCheckUpdate={onCheckUpdate} onOpenAgentDirectory={onOpenAgentDirectory} onQuit={onQuit} />
       <div className="shell-body">
         <aside className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}`}>
-        <button
-          type="button"
-          className={`sidebar-ai-entry ${currentPage === 'builtin-ai' ? 'active' : ''}`}
-          onClick={onOpenBuiltinAi}
-          aria-current={currentPage === 'builtin-ai' ? 'page' : undefined}
-          aria-label="打开 HiMind AI"
-          title="打开 HiMind AI"
-        >
-          <MessageCircle size={17} strokeWidth={1.8} aria-hidden="true" />
-          <span>HiMind AI</span>
-        </button>
         <nav ref={sidebarNavRef} aria-label="主导航">
           {visibleNavigationSections({ dashboardEnabled }).map(section => <div className="sidebar-nav-group" key={section.id}>
-            <span className="sidebar-section-label">{section.label}</span>
+            {section.label ? <span className="sidebar-section-label">{section.label}</span> : null}
             {section.items.map(item => <button
               type="button"
               key={item.key}
@@ -426,22 +415,22 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
           ) : null}
           <div className="main-content">
             {currentPage === 'builtin-ai' ? null : dashboardEnabled && currentTask ? (
-              <button type="button" className="current-task-strip" onClick={() => onNavigate('tasks')} title="查看活动记录">
+              <button type="button" className="current-task-strip" onClick={() => onNavigate('tasks')} title="查看我的任务">
                 <BusyIndicator size={15} />
                 <span><strong>正在执行 {taskTypeLabel(currentTask.task_type)}</strong><small>{currentTask.task_id}</small></span>
                 <code>{currentTask.execution_id || '本机执行'}</code>
-                <span className="current-task-open-label">查看活动</span>
+                <span className="current-task-open-label">查看我的任务</span>
               </button>
             ) : localRun ? (
               // 未连接工作台时同样要有运行态常驻反馈：本机工作流/技能运行也是一种「正在执行」。
-              <button type="button" className="current-task-strip" onClick={() => onNavigate('tasks')} title="查看活动记录">
+              <button type="button" className="current-task-strip" onClick={() => onNavigate('tasks')} title="查看我的任务">
                 <BusyIndicator size={15} />
                 <span>
                   <strong>正在执行 {localRun.title}</strong>
                   <small>{localRun.stage}{localRun.count > 1 ? ` · 还有 ${localRun.count - 1} 个在跑` : ''}{localRunElapsed !== null ? ` · 已运行 ${formatElapsedCn(localRunElapsed)}` : ''}</small>
                 </span>
                 <code title={localRun.runId}>{shortRunId(localRun.runId)}</code>
-                <span className="current-task-open-label">查看活动</span>
+                <span className="current-task-open-label">查看我的任务</span>
               </button>
             ) : null}
             {children}

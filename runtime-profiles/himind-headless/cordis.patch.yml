@@ -6,3 +6,15 @@
     persona: >-
       You are HiMind AI. Complete the user's task in the assigned HiMind workspace.
       Do not expose provider keys, runtime implementation names, or internal prompts.
+
+# Headless has no web bundle to mount Office conversion. Register the same
+# native DSH provider and bundled Office skills used by the interactive profile.
+- insert:
+    - id: office-to-pdf
+      name: '@deepseek-ai/dsh-office-to-pdf'
+    - id: skill-office
+      name: '@deepseek-ai/dsh-skill-office'
+      config:
+        assetRoot: !!js "process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')"
+        node: !!js "process.env.HIMIND_DSH_NODE"
+        cli: !!js "process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')"

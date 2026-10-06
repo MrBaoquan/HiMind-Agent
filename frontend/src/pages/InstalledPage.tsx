@@ -19,10 +19,10 @@ export function InstalledPage({ kind, counts, dashboardEnabled, onSelectKind, ch
   children: ReactNode;
 }) {
   // 页签是同一份类型口径的另一处落点：图标跟着类型走，四类各一个。
-  const kinds: CapabilityKind[] = capabilityKindOrder.filter(item => item !== 'policy' || dashboardEnabled);
+  const kinds: InstalledKind[] = capabilityKindOrder.filter((item): item is InstalledKind => item !== 'policy' || dashboardEnabled);
   return (
     <div className="installed-page">
-      <PageHeader title="我的能力" description="自己安装的，也包括组织配发的。" />
+      <PageHeader title="我的能力" description="查看已安装、已连接和组织提供的能力。" />
       <div className="plugin-tabs installed-tabs" role="tablist" aria-label="我的能力类型">
         {kinds.map(item => {
           const KindIcon = capabilityKindIcons[item];

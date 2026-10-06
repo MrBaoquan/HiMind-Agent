@@ -142,6 +142,20 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     };
     let popup_approval_manager = Arc::clone(&state.approval_manager);
 
+    // 本机推理网关（ADR 0113）：进程级单例，绑定在每次请求时解析，
+    // 因此客户端切换注入模式后无需重启网关。
+    let gateway_options = options.clone();
+    match crate::app::inference_gateway::ensure_started(
+        Some(crate::app::inference_gateway::DEFAULT_GATEWAY_PORT),
+        Box::new(move || crate::app::ai_provider_import::gateway_bindings(&gateway_options)),
+    ) {
+        Ok(()) => println!(
+            "inference gateway listening on {}",
+            crate::app::inference_gateway::url().unwrap_or_default()
+        ),
+        Err(error) => eprintln!("本机推理网关未启动：{error}"),
+    }
+
     let builder = tauri::Builder::default();
     // 单实例键 = identifier + profile（见 app::single_instance）：生产 profile 与
     // 历史键逐字一致，其它 profile 各占一个键，开发实例与已安装产品互不顶替。
@@ -225,6 +239,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::workbench_connections::switch_workbench_connection,
             super::workbench_connections::enroll_workbench_connection,
             super::commands::get_builtin_ai_activity,
+            super::commands::get_local_usage_overview,
+            super::commands::get_inference_gateway_status,
+            super::commands::restart_inference_gateway,
+            super::commands::stop_inference_gateway_and_unbind,
+            super::commands::set_provider_binding_mode,
             super::commands::start_dashboard_authorization,
             super::commands::get_dashboard_authorization_progress,
             super::commands::cancel_dashboard_authorization,
@@ -232,7 +251,36 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::revoke_dashboard_authorization,
             super::commands::test_mcp_connection,
             super::commands::get_mcp_registry_snapshot,
+            super::commands::list_experts,
+            super::commands::active_expert,
+            super::commands::activate_expert,
+            super::commands::save_expert,
+            super::commands::pick_expert_package,
+            super::commands::import_expert_package,
+            super::commands::export_expert_package,
+            super::commands::project_expert_to_client,
+            super::commands::materialize_expert_project,
+            super::commands::list_expert_drafts,
+            super::commands::materialize_instruction_project,
+            super::commands::test_expert_draft,
+            super::commands::confirm_expert_draft,
+            super::commands::submit_expert_draft,
             super::commands::get_mcp_targets,
+            super::commands::get_instruction_targets,
+            super::commands::get_workspace_instruction_context,
+            super::commands::save_workspace_instruction_selection,
+            super::commands::inspect_ecc_repository,
+            super::commands::plan_instruction_projection,
+            super::commands::apply_instruction_projection,
+            super::commands::rollback_instruction_projection,
+            super::commands::list_instruction_pack_drafts,
+            super::commands::save_instruction_pack_draft,
+            super::commands::import_instruction_file,
+            super::commands::import_instruction_package,
+            super::commands::test_instruction_pack_draft,
+            super::commands::confirm_instruction_pack_draft,
+            super::commands::publish_instruction_pack_locally,
+            super::commands::pick_instruction_package,
             super::commands::inspect_mcp_target,
             super::commands::plan_mcp_registration,
             super::commands::apply_mcp_registration,
@@ -292,6 +340,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_auto_start,
             super::commands::pick_unity_editor,
             super::commands::save_unity_editor,
+            super::commands::pick_engine_editor,
+            super::commands::save_engine_editor,
+            super::commands::list_engine_installations,
             super::commands::get_agent_logs,
             super::commands::export_agent_diagnostics,
             super::commands::get_agent_backup_scope,
@@ -387,6 +438,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::import_github_skill,
             super::commands::import_github_skill_url,
             super::commands::get_organization_skill_catalog,
+            super::commands::get_instruction_pack_catalog,
+            super::commands::get_expert_catalog,
+            super::commands::get_instruction_pack_versions,
+            super::commands::install_instruction_pack_market,
+            super::commands::install_expert_market,
             super::commands::query_organization_skill_catalog,
             super::commands::get_skill_versions,
             super::commands::install_organization_skill,
@@ -396,6 +452,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_extension_workspace,
             super::commands::list_extension_workspaces,
             super::commands::pick_extension_workspace_dir,
+            super::commands::pick_instruction_file,
             super::commands::add_extension_workspace,
             super::commands::remove_extension_workspace,
             super::commands::open_extension_projects,

@@ -37,6 +37,7 @@ pub(crate) fn asset_extension(kind: &str) -> Result<&'static str, Box<dyn Error>
         "plugin" => Ok("hmpkg"),
         "skill" => Ok("hmskill"),
         "workflow" => Ok("hmwf"),
+        "expert" => Ok("hmexpert"),
         other => Err(format!("扩展类型无效: {other}").into()),
     }
 }

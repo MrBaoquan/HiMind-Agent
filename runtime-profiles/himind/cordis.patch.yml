@@ -12,6 +12,17 @@
     surfaceContext: false
     trustedHosts: []
 
+# Office skills are a provider row, not a DSH bundle.  Keeping the row here
+# preserves DSH's native skill registry and settings surfaces while making the
+# bundled resources available in the installed Runtime.
+- insert:
+    - id: skill-office
+      name: '@deepseek-ai/dsh-skill-office'
+      config:
+        assetRoot: !!js "process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')"
+        node: !!js "process.env.HIMIND_DSH_NODE"
+        cli: !!js "process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')"
+
 # HiMind supplies a ready-to-use provider, while DSH remains the owner of model
 # selection and provider settings. Keep DSH's preset/plugin management surface
 # available so developers can inspect and extend the runtime directly.

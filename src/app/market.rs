@@ -8,13 +8,22 @@
 //! 插件走 `plugin_manager` / `extension_source`，工作流走 `workflow_manager` /
 //! `extension_source`。市场只是把"我该调哪一条"这件事收敛掉。
 
+use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::distribution::{PluginCatalogItem, SkillCatalogItem, WorkflowCatalogItem};
+use crate::api::distribution::{
+    ExpertCatalogItem, InstructionPackCatalogItem, PluginCatalogItem, SkillCatalogItem,
+    WorkflowCatalogItem,
+};
 use crate::app::operation_plan::{OperationPlan, PlanDependency};
 use crate::app::plugin_manager::PluginDependencyAction;
 use crate::capability::types::InvocationSource;
@@ -23,8 +32,16 @@ use crate::{Options, VERSION};
 pub(crate) const KIND_SKILL: &str = "skill";
 pub(crate) const KIND_PLUGIN: &str = "plugin";
 pub(crate) const KIND_WORKFLOW: &str = "workflow";
+pub(crate) const KIND_INSTRUCTION_PACK: &str = "instruction_pack";
+pub(crate) const KIND_EXPERT: &str = "expert";
 
-const ALL_KINDS: [&str; 3] = [KIND_SKILL, KIND_PLUGIN, KIND_WORKFLOW];
+const ALL_KINDS: [&str; 5] = [
+    KIND_SKILL,
+    KIND_PLUGIN,
+    KIND_WORKFLOW,
+    KIND_INSTRUCTION_PACK,
+    KIND_EXPERT,
+];
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 50;
 
@@ -75,6 +92,8 @@ struct Catalog {
     skills: Vec<SkillCatalogItem>,
     plugins: Vec<PluginCatalogItem>,
     workflows: Vec<WorkflowCatalogItem>,
+    instruction_packs: Vec<InstructionPackCatalogItem>,
+    experts: Vec<ExpertCatalogItem>,
     errors: Vec<String>,
 }
 
@@ -113,7 +132,10 @@ fn normalized_kind(input: &Value) -> Result<Option<String>, Box<dyn Error>> {
         return Ok(None);
     }
     if !ALL_KINDS.contains(&kind.as_str()) {
-        return Err(format!("能力类型必须是 skill、plugin 或 workflow，收到: {kind}").into());
+        return Err(format!(
+            "能力类型必须是 skill、plugin、workflow、instruction_pack 或 expert，收到: {kind}"
+        )
+        .into());
     }
     Ok(Some(kind))
 }
@@ -150,12 +172,55 @@ fn load_catalog(options: &Options, agent_id: &str) -> Catalog {
     if !workflow_error.trim().is_empty() {
         errors.push(workflow_error);
     }
+    let instruction_packs = if unauthorized(options, agent_id) {
+        Vec::new()
+    } else {
+        match Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())
+            .and_then(|client| {
+                crate::api::distribution::instruction_pack_catalog(
+                    &client,
+                    &options.api_base(),
+                    agent_id,
+                    &options.agent_credential(),
+                )
+                .map_err(|error| error.to_string())
+            }) {
+            Ok(items) => items,
+            Err(error) => {
+                errors.push(format!("InstructionPack 目录读取失败: {error}"));
+                Vec::new()
+            }
+        }
+    };
+    let experts = if unauthorized(options, agent_id) {
+        Vec::new()
+    } else {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .ok()
+            .and_then(|client| {
+                crate::api::distribution::expert_catalog(
+                    &client,
+                    &options.api_base(),
+                    agent_id,
+                    &options.agent_credential(),
+                )
+                .ok()
+            })
+            .unwrap_or_default()
+    };
     errors.sort();
     errors.dedup();
     Catalog {
         skills,
         plugins,
         workflows,
+        instruction_packs,
+        experts,
         errors,
     }
 }
@@ -250,6 +315,54 @@ impl Catalog {
                 development: false,
             });
         }
+        for item in &self.instruction_packs {
+            items.push(MarketItem {
+                kind: KIND_INSTRUCTION_PACK.to_string(),
+                id: item.instruction_pack_id.clone(),
+                name: item.name.clone(),
+                version: item.version.clone(),
+                description: item.description.clone(),
+                author: item.author_name.clone(),
+                categories: item.categories.clone(),
+                source: item.source.clone(),
+                channel: item.channel.clone(),
+                artifact_id: item.artifact_id.clone(),
+                sha256: item.sha256.clone(),
+                size_bytes: item.file_size,
+                supported_clients: item.supported_clients.clone(),
+                capability_ids: Vec::new(),
+                assignment: item.assignment.clone(),
+                management: item.management.clone(),
+                installed: false,
+                installed_version: String::new(),
+                update_available: false,
+                development: false,
+            });
+        }
+        for item in &self.experts {
+            items.push(MarketItem {
+                kind: KIND_EXPERT.to_string(),
+                id: item.expert_id.clone(),
+                name: item.name.clone(),
+                version: item.version.clone(),
+                description: item.description.clone(),
+                author: item.author_name.clone(),
+                categories: item.categories.clone(),
+                source: item.source.clone(),
+                channel: String::new(),
+                artifact_id: item.artifact_id.clone(),
+                sha256: item.sha256.clone(),
+                size_bytes: item.file_size,
+                supported_clients: item.supported_clients.clone(),
+                capability_ids: Vec::new(),
+                assignment: item.assignment.clone(),
+                management: item.management.clone(),
+                installed: false,
+                installed_version: String::new(),
+                update_available: false,
+                development: false,
+            });
+        }
         items
     }
 
@@ -311,6 +424,34 @@ impl Catalog {
             |item| item.version.as_str(),
         )
     }
+
+    fn expert(&self, id: &str, version: Option<&str>) -> Option<ExpertCatalogItem> {
+        choose_version(
+            self.experts
+                .iter()
+                .filter(|item| item.expert_id == id)
+                .cloned()
+                .collect(),
+            version,
+            |item| item.version.as_str(),
+        )
+    }
+
+    fn instruction_pack(
+        &self,
+        id: &str,
+        version: Option<&str>,
+    ) -> Option<InstructionPackCatalogItem> {
+        choose_version(
+            self.instruction_packs
+                .iter()
+                .filter(|item| item.instruction_pack_id == id)
+                .cloned()
+                .collect(),
+            version,
+            |item| item.version.as_str(),
+        )
+    }
 }
 
 /// 「我已经拥有什么」的本地索引。
@@ -324,6 +465,8 @@ struct InstalledIndex {
     plugins: HashMap<String, String>,
     development_plugins: HashMap<String, String>,
     workflows: HashMap<String, String>,
+    instruction_packs: HashMap<String, String>,
+    experts: HashMap<String, String>,
 }
 
 impl InstalledIndex {
@@ -362,6 +505,39 @@ impl InstalledIndex {
                 }
             }
         }
+        if let Ok(drafts) = crate::instruction_pack::list() {
+            for draft in drafts {
+                let id = draft.manifest.id.clone();
+                let version = draft.manifest.version.clone();
+                let current = index
+                    .instruction_packs
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                if current.is_empty()
+                    || crate::skill::resolver::compare_versions(&version, &current)
+                        == Ordering::Greater
+                {
+                    index.instruction_packs.insert(id, version);
+                }
+            }
+        }
+        if let Ok(experts) = crate::expert::list() {
+            for expert in experts.into_iter().filter(|item| !item.builtin) {
+                let current = index.experts.get(&expert.id).cloned().unwrap_or_default();
+                if current.is_empty()
+                    || crate::skill::resolver::compare_versions(&expert.version, &current)
+                        == Ordering::Greater
+                {
+                    index.experts.insert(expert.id, expert.version);
+                }
+            }
+        }
+        if let Ok(experts) = crate::expert::list() {
+            for expert in experts {
+                index.experts.insert(expert.id, expert.version);
+            }
+        }
         index
     }
 
@@ -370,6 +546,8 @@ impl InstalledIndex {
             KIND_SKILL => &self.skills,
             KIND_PLUGIN => &self.plugins,
             KIND_WORKFLOW => &self.workflows,
+            KIND_INSTRUCTION_PACK => &self.instruction_packs,
+            KIND_EXPERT => &self.experts,
             _ => return String::new(),
         };
         bucket.get(id).cloned().unwrap_or_default()
@@ -591,10 +769,36 @@ pub(crate) fn installed(input: &Value) -> Result<Value, Box<dyn Error>> {
         }
     }
 
+    let mut instruction_packs = Vec::new();
+    if want(KIND_INSTRUCTION_PACK) {
+        for draft in crate::instruction_pack::list().unwrap_or_default() {
+            instruction_packs.push(json!({
+                "id": draft.manifest.id,
+                "name": draft.manifest.name,
+                "description": draft.manifest.description,
+                "version": draft.manifest.version,
+                "source": draft.source,
+                "scope": draft.manifest.scope,
+                "supported_clients": draft.manifest.supported_clients,
+                "tested_at": draft.tested_at,
+                "confirmed_at": draft.confirmed_at,
+                "published_at": draft.published_at,
+                "readiness": if draft.published_at.is_some() { "published_local" } else if draft.confirmed_at.is_some() { "confirmed" } else if draft.tested_at.is_some() { "tested" } else { "draft" },
+                "projection_required": draft.published_at.is_some(),
+            }));
+        }
+    }
+    let mut experts = Vec::new();
+    if want(KIND_EXPERT) {
+        experts = crate::expert::list()?.into_iter().filter(|item| !item.builtin).map(|item| json!({"id":item.id,"name":item.name,"description":item.description,"version":item.version,"categories":item.categories,"supported_clients":item.supported_clients,"source":"marketplace"})).collect();
+    }
+
     Ok(json!({
         "skills": skills,
         "plugins": plugins,
         "workflows": workflows,
+        "instruction_packs": instruction_packs,
+        "experts": experts,
         "issues": issues,
     }))
 }
@@ -648,6 +852,8 @@ pub(crate) fn install(
         KIND_SKILL => install_skill(options, agent_id, input, &item, source)?,
         KIND_PLUGIN => install_plugin(options, agent_id, input, &item)?,
         KIND_WORKFLOW => install_workflow(options, input, &item)?,
+        KIND_INSTRUCTION_PACK => install_instruction_pack(options, agent_id, input, &item)?,
+        KIND_EXPERT => install_expert(options, agent_id, input, &item)?,
         other => return Err(format!("未知的能力类型: {other}").into()),
     };
     // 装完能力就变了：不刷新目录的话，客户端 tools/list 里看不到刚装上的工具，
@@ -669,7 +875,8 @@ fn plan_operation(
     agent_id: &str,
     input: &Value,
 ) -> Result<OperationPlan, Box<dyn Error>> {
-    let kind = normalized_kind(input)?.ok_or("安装计划必须指定 kind：skill、plugin 或 workflow")?;
+    let kind = normalized_kind(input)?
+        .ok_or("安装计划必须指定 kind：skill、plugin、workflow、instruction_pack 或 expert")?;
     let id = text(input, "id");
     if id.is_empty() {
         return Err("安装计划必须指定 id".into());
@@ -711,6 +918,30 @@ fn plan_operation(
         KIND_WORKFLOW => {
             let item = resolve_workflow(&catalog, &id, version.as_deref(), source.as_deref())?;
             workflow_plan(
+                options,
+                agent_id,
+                &item,
+                artifact_id.as_deref(),
+                sha256.as_deref(),
+            )
+        }
+        KIND_INSTRUCTION_PACK => {
+            let item = catalog
+                .instruction_pack(&id, version.as_deref())
+                .ok_or_else(|| format!("市场中未找到 InstructionPack: {id}"))?;
+            instruction_pack_plan(
+                options,
+                agent_id,
+                &item,
+                artifact_id.as_deref(),
+                sha256.as_deref(),
+            )
+        }
+        KIND_EXPERT => {
+            let item = catalog
+                .expert(&id, version.as_deref())
+                .ok_or_else(|| format!("市场中未找到专家: {id}"))?;
+            expert_plan(
                 options,
                 agent_id,
                 &item,
@@ -976,6 +1207,66 @@ fn workflow_plan(
     ))
 }
 
+fn instruction_pack_plan(
+    options: &Options,
+    agent_id: &str,
+    item: &InstructionPackCatalogItem,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<OperationPlan, Box<dyn Error>> {
+    let mut blocked = Vec::new();
+    if unauthorized(options, agent_id) {
+        blocked.push("HiMind 账号尚未授权，无法安装工作台 InstructionPack".to_string());
+    }
+    if item.assignment == "blocked" {
+        blocked.push("该 InstructionPack 已被组织禁止安装".to_string());
+    }
+    if item.managed {
+        blocked.push("该 InstructionPack 由组织管理，不能从个人市场安装".to_string());
+    }
+    if !item.min_agent_version.trim().is_empty()
+        && crate::skill::resolver::compare_versions(VERSION, &item.min_agent_version)
+            == Ordering::Less
+    {
+        blocked.push(format!(
+            "当前 Agent {VERSION} 不满足该 InstructionPack 的最低版本 {}",
+            item.min_agent_version
+        ));
+    }
+    if expected_artifact_id.is_some_and(|value| value != item.artifact_id) {
+        blocked.push("InstructionPack 制品已变化，请重新读取市场目录".to_string());
+    }
+    if expected_sha256.is_some_and(|value| !value.eq_ignore_ascii_case(&item.sha256)) {
+        blocked.push("InstructionPack 摘要已变化，请重新读取市场目录".to_string());
+    }
+    Ok(crate::app::operation_plan::instruction_pack_install(
+        item, blocked,
+    ))
+}
+
+fn expert_plan(
+    options: &Options,
+    agent_id: &str,
+    item: &ExpertCatalogItem,
+    expected_artifact_id: Option<&str>,
+    expected_sha256: Option<&str>,
+) -> Result<OperationPlan, Box<dyn Error>> {
+    let mut blocked = Vec::new();
+    if unauthorized(options, agent_id) {
+        blocked.push("HiMind 账号尚未授权，无法安装工作台专家".to_string());
+    }
+    if item.assignment == "blocked" {
+        blocked.push("该专家已被组织禁止安装".to_string());
+    }
+    if expected_artifact_id.is_some_and(|value| value != item.artifact_id) {
+        blocked.push("专家制品已变化，请重新读取市场目录".to_string());
+    }
+    if expected_sha256.is_some_and(|value| !value.eq_ignore_ascii_case(&item.sha256)) {
+        blocked.push("专家摘要已变化，请重新读取市场目录".to_string());
+    }
+    Ok(crate::app::operation_plan::expert_install(item, blocked))
+}
+
 fn workflow_dependencies(item: &WorkflowCatalogItem) -> Vec<PlanDependency> {
     let Some(lock) = item.extension_lock.clone() else {
         return Vec::new();
@@ -1114,4 +1405,197 @@ fn install_workflow(
         sha256.as_deref(),
     )?;
     Ok(serde_json::to_value(installed)?)
+}
+
+fn install_instruction_pack(
+    options: &Options,
+    agent_id: &str,
+    input: &Value,
+    item: &crate::app::operation_plan::PlanItem,
+) -> Result<Value, Box<dyn Error>> {
+    let catalog = load_catalog(options, agent_id);
+    let remote = catalog
+        .instruction_pack(&item.id, Some(&item.version))
+        .ok_or_else(|| format!("市场中未找到 InstructionPack: {}", item.id))?;
+    if remote.source != "marketplace" && !remote.source.is_empty() {
+        return Err("InstructionPack 当前只支持 Dashboard 市场来源".into());
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let source = download_instruction_pack(&client, options, agent_id, &remote)?;
+    let draft = crate::instruction_pack::import_package(
+        crate::instruction_pack::InstructionPackImportInput {
+            package_path: source.clone(),
+            source: "marketplace".to_string(),
+        },
+    )?;
+    let tested = crate::instruction_pack::test(&draft.manifest.id, &draft.manifest.version)?;
+    let _ = fs::remove_file(source);
+    Ok(json!({
+        "draft": tested.draft,
+        "readiness": tested.readiness,
+        "issues": tested.issues,
+        "requires_confirmation": true,
+        "published_local": false,
+        "projection_required": true,
+        "confirmed": false,
+        "input": input,
+    }))
+}
+
+fn install_expert(
+    options: &Options,
+    agent_id: &str,
+    _input: &Value,
+    item: &crate::app::operation_plan::PlanItem,
+) -> Result<Value, Box<dyn Error>> {
+    let catalog = load_catalog(options, agent_id);
+    let remote = catalog
+        .expert(&item.id, Some(&item.version))
+        .ok_or_else(|| format!("市场中未找到专家: {}", item.id))?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let source = download_expert(&client, options, agent_id, &remote)?;
+    let summary = crate::expert::import_package(&source)?;
+    let _ = fs::remove_file(source);
+    Ok(json!({"expert": summary, "projection_required": false, "activated": false}))
+}
+
+fn download_expert(
+    client: &Client,
+    options: &Options,
+    agent_id: &str,
+    item: &ExpertCatalogItem,
+) -> Result<PathBuf, Box<dyn Error>> {
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    if item.file_size == 0 || item.file_size > MAX_BYTES {
+        return Err("专家制品大小无效或超过 16 MiB 限制".into());
+    }
+    let api = url::Url::parse(&options.api_base())?;
+    let url = url::Url::parse(&item.download_url)?;
+    if api.scheme() != url.scheme()
+        || api.host_str() != url.host_str()
+        || api.port_or_known_default() != url.port_or_known_default()
+    {
+        return Err("专家制品下载地址必须与 Dashboard 同源".into());
+    }
+    let mut response = client
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Agent {agent_id}:{}", options.agent_credential()),
+        )
+        .send()?
+        .error_for_status()?;
+    let path = std::env::temp_dir().join(format!("himind-expert-{}.hmexpert", unique_suffix()));
+    let mut file = File::create(&path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = response.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_BYTES || total > item.file_size {
+            let _ = fs::remove_file(&path);
+            return Err("专家制品实际大小超过发布记录".into());
+        }
+        file.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+    }
+    file.flush()?;
+    if total != item.file_size {
+        let _ = fs::remove_file(&path);
+        return Err("专家制品实际大小与发布记录不一致".into());
+    }
+    if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(&item.sha256) {
+        let _ = fs::remove_file(&path);
+        return Err("专家制品 SHA-256 校验失败".into());
+    }
+    crate::app::system::verify_extension_artifact_signature(
+        &path,
+        &item.signature,
+        &item.signature_key_id,
+        &item.signature_algorithm,
+        true,
+    )?;
+    Ok(path)
+}
+
+fn download_instruction_pack(
+    client: &Client,
+    options: &Options,
+    agent_id: &str,
+    item: &InstructionPackCatalogItem,
+) -> Result<PathBuf, Box<dyn Error>> {
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    if item.file_size == 0 || item.file_size > MAX_BYTES {
+        return Err("InstructionPack 制品大小无效或超过 16 MiB 限制".into());
+    }
+    let api = url::Url::parse(&options.api_base())?;
+    let url = url::Url::parse(&item.download_url)?;
+    if api.scheme() != url.scheme()
+        || api.host_str() != url.host_str()
+        || api.port_or_known_default() != url.port_or_known_default()
+    {
+        return Err("InstructionPack 制品下载地址必须与 Dashboard 同源".into());
+    }
+    let mut response = client
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Agent {agent_id}:{}", options.agent_credential()),
+        )
+        .send()?
+        .error_for_status()?;
+    let path = std::env::temp_dir().join(format!(
+        "himind-instruction-pack-{}.hminstruction",
+        unique_suffix()
+    ));
+    let mut file = File::create(&path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = response.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_BYTES || total > item.file_size {
+            let _ = fs::remove_file(&path);
+            return Err("InstructionPack 制品实际大小超过发布记录".into());
+        }
+        file.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+    }
+    file.flush()?;
+    if total != item.file_size {
+        let _ = fs::remove_file(&path);
+        return Err("InstructionPack 制品实际大小与发布记录不一致".into());
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&item.sha256) {
+        let _ = fs::remove_file(&path);
+        return Err("InstructionPack 制品 SHA-256 校验失败".into());
+    }
+    crate::app::system::verify_extension_artifact_signature(
+        &path,
+        &item.signature,
+        &item.signature_key_id,
+        &item.signature_algorithm,
+        true,
+    )?;
+    Ok(path)
+}
+
+fn unique_suffix() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }

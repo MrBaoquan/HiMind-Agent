@@ -1,0 +1,61 @@
+{
+  "schema_version": "workflow_package.v1",
+  "id": "com.himind.workflow.engine-build",
+  "version": "1.0.0",
+  "distribution_targets": ["workbench", "github"],
+  "name": "引擎工程构建",
+  "description": "用本机 Unity 或 Unreal 工具链构建工程。",
+  "release_notes": "首个版本：支持 Unity、Unreal 原生构建，可选引擎版本、目标平台、架构与配置。",
+  "min_agent_version": "0.3.48",
+  "local_requirements": {
+    "platform": "windows",
+    "required_tools": []
+  },
+  "execution_policy": "segmented",
+  "entrypoints": [
+    {
+      "id": "build",
+      "at_step": "ENGINE-BUILD",
+      "label": "构建工程"
+    }
+  ],
+  "default_entrypoint": "build",
+  "exits": [
+    {
+      "id": "built",
+      "at_step": "ENGINE-BUILD",
+      "label": "构建结束"
+    }
+  ],
+  "default_exitpoint": "built",
+  "capabilities": [
+    "exhibit.workspace.build"
+  ],
+  "dependencies": {
+    "skills": [],
+    "plugins": [],
+    "connectors": [],
+    "runtimes": []
+  },
+  "steps": [
+    {
+      "id": "ENGINE-BUILD",
+      "title": "按所选引擎与目标构建",
+      "kind": "capability",
+      "capability_id": "exhibit.workspace.build",
+      "execution_mode": "long_running",
+      "risk_level": "process",
+      "input": {
+        "wait": true
+      }
+    }
+  ],
+  "artifacts": [],
+  "ui": {
+    "mode": "declarative",
+    "surfaces": ["agent"],
+    "entry": "ui/workflow-view.json"
+  },
+  "supported_runtimes": [],
+  "created_at": "2026-10-06T00:00:00Z"
+}

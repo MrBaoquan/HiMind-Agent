@@ -160,7 +160,7 @@ export function SkillsWorkspacePage({ catalog, status, clientMatrix, workspace, 
       <div className="skill-toolbar-row"><div className="actions-row">
         <ActionMenu label="安装技能" icon={<Plus size={15} />} title="安装技能" panelWidth={208}>
           {close => <>
-            <ActionMenuItem icon={<Store size={15} />} label="浏览技能市场" onClick={() => { onOpenExtensions(); close(); }} />
+            <ActionMenuItem icon={<Store size={15} />} label="获取更多工具" onClick={() => { onOpenExtensions(); close(); }} />
             <div className="app-menu-separator" role="separator" />
             <ActionMenuItem icon={<Link2 size={15} />} label="从 GitHub 导入" onClick={() => { setGithubError(''); setGithubOpen(true); close(); }} />
             <ActionMenuItem icon={<FolderOpen size={15} />} label="从本地导入" onClick={() => { onImportLocal(); close(); }} />

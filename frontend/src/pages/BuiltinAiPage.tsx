@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Activity, ArrowUpRight, Blocks, CircleAlert, Download, LogIn, MessageCircle, MoreHorizontal, PlugZap, RefreshCw, Settings } from 'lucide-react';
-import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus } from '../services/agentApi';
+import { Activity, ArrowUpRight, Blocks, Check, CircleAlert, Download, FileText, LogIn, MessageCircle, MoreHorizontal, PlugZap, RefreshCw, Settings, X } from 'lucide-react';
+import type { RefObject } from 'react';
+import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertActivation, type ExpertSummary, type InstructionPackRef, type WorkspaceInstructionContext } from '../services/agentApi';
 import { errorDetail } from '../types';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
@@ -60,6 +61,16 @@ export function BuiltinAiPage({
   const [activityOpen, setActivityOpen] = useState(false);
   const [runtimeSessions, setRuntimeSessions] = useState<BuiltinAIRuntimeActivity[]>([]);
   const [activityError, setActivityError] = useState('');
+  const [instructionOpen, setInstructionOpen] = useState(false);
+  const [instructionContext, setInstructionContext] = useState<WorkspaceInstructionContext | null>(null);
+  const [instructionSelection, setInstructionSelection] = useState<InstructionPackRef[]>([]);
+  const [instructionBusy, setInstructionBusy] = useState(false);
+  const [instructionError, setInstructionError] = useState('');
+  const [instructionSaved, setInstructionSaved] = useState('');
+  const instructionTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const [experts, setExperts] = useState<ExpertSummary[]>([]);
+  const [activeExpert, setActiveExpert] = useState<ExpertActivation | null>(null);
+  const [expertBusy, setExpertBusy] = useState(false);
   const handledWorkspaceRequest = useRef(0);
   const probedWorkspaceTarget = useRef('');
   const independentMode = independentModeFromStatus;
@@ -68,6 +79,93 @@ export function BuiltinAiPage({
   // 会话不再以“登录工作台”为前提：工作台账号、本机自定义服务、运行时自带
   // 的 Provider 都可以支撑一次会话，能不能用交给启动结果来说。
   const canStartSession = runtimeReady;
+  const instructionRoot = builtinAiWorkspaceRoot(workspaceTarget);
+  const selectedInstructionCount = instructionRoot && instructionContext &&
+    normalizeWorkspacePath(instructionContext.workspace_root) === normalizeWorkspacePath(instructionRoot)
+    ? instructionContext.selected.length
+    : null;
+
+  useEffect(() => {
+    if (!instructionRoot) {
+      setInstructionContext(null);
+      return;
+    }
+    let cancelled = false;
+    void agentApi.workspaceInstructionContext(instructionRoot)
+      .then(context => { if (!cancelled) setInstructionContext(context); })
+      .catch(() => { if (!cancelled) setInstructionContext(null); });
+    return () => { cancelled = true; };
+  }, [instructionRoot]);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([agentApi.experts(), agentApi.activeExpert(builtinAiWorkspaceRoot(workspaceTarget) || undefined)]).then(([items, active]) => {
+      if (!cancelled) { setExperts(items); setActiveExpert(active); }
+    }).catch(() => { if (!cancelled) setExperts([]); });
+    return () => { cancelled = true; };
+  }, [workspaceTarget]);
+
+  const selectExpert = useCallback(async (expertId: string) => {
+    if (!expertId || expertBusy) return;
+    setExpertBusy(true);
+    try {
+      const workspaceRoot = builtinAiWorkspaceRoot(workspaceTarget) || undefined;
+      const activation = await agentApi.activateExpert(expertId, undefined, workspaceRoot);
+      setActiveExpert(activation);
+      // DSH keeps a prompt snapshot for the lifetime of a process. Stop only
+      // this workspace session so the next connection receives the new expert.
+      if (workspaceRoot) await agentApi.stopBuiltinAiSession(workspaceRoot);
+      setSessionUrl('');
+      setSessionNotice('');
+      setFrameLoaded(false);
+      setFrameKey(key => key + 1);
+    } catch (error) {
+      setConnectionError(errorDetail(error));
+    } finally {
+      setExpertBusy(false);
+    }
+  }, [expertBusy]);
+
+  const openInstructionContext = useCallback(async () => {
+    if (!instructionRoot) {
+      setInstructionError('请先选择一个项目，再配置项目规则。');
+      setInstructionOpen(true);
+      return;
+    }
+    setInstructionOpen(true);
+    setInstructionError('');
+    try {
+      const context = await agentApi.workspaceInstructionContext(instructionRoot);
+      setInstructionContext(context);
+      setInstructionSelection(context.selected);
+    } catch (error) {
+      setInstructionError(errorDetail(error));
+    }
+  }, [instructionRoot]);
+
+  const closeInstructionContext = useCallback(() => setInstructionOpen(false), []);
+
+  const saveInstructionSelection = useCallback(async () => {
+    if (!instructionRoot || instructionBusy) return;
+    setInstructionBusy(true);
+    setInstructionError('');
+    setInstructionSaved('');
+    try {
+      await agentApi.saveWorkspaceInstructionSelection(instructionRoot, instructionSelection);
+      setInstructionSaved('已保存，会话正在按新规则重启。');
+      setSessionUrl('');
+      setSessionNotice('');
+      setFrameLoaded(false);
+      setFrameKey(key => key + 1);
+      const context = await agentApi.workspaceInstructionContext(instructionRoot);
+      setInstructionContext(context);
+      setInstructionSelection(context.selected);
+    } catch (error) {
+      setInstructionError(errorDetail(error));
+    } finally {
+      setInstructionBusy(false);
+    }
+  }, [instructionBusy, instructionRoot, instructionSelection]);
 
   const refreshActivity = useCallback(async () => {
     if (!identity?.authorized || independentMode) return;
@@ -252,12 +350,20 @@ export function BuiltinAiPage({
         <div className="builtin-ai-title">
           <span className="builtin-ai-mark"><MessageCircle size={17} /></span>
           {/* 扩展工作区不是一个"项目"，它只是一个开发目录，文案必须跟着目标类型走。 */}
-          <div><h2>HiMind AI</h2><span>{workspaceTarget ? `${workspaceTarget.kind === 'extension-workspace' ? '当前工作区' : '当前项目'}：${workspaceTarget.name}` : 'AI 助手'}</span></div>
+          <div><h2>HiMind AI</h2><span>{workspaceTarget ? `${workspaceTarget.kind === 'extension-workspace' ? '当前工作区' : '当前项目'}：${workspaceTarget.name}` : 'AI 对话'}</span></div>
         </div>
         <div className="builtin-ai-toolbar-actions">
+          <label className="builtin-ai-expert-select" title="选择当前对话专家">
+            <span>专家</span>
+            <select value={activeExpert?.expert_id || ''} disabled={expertBusy || !experts.length} onChange={event => void selectExpert(event.target.value)} aria-label="当前专家">
+              <option value="">选择专家</option>
+              {experts.map(expert => <option key={`${expert.id}@${expert.version}`} value={expert.id}>{expert.name}</option>)}
+            </select>
+          </label>
           {/* 对话页只保留一个主入口：给 HiMind AI 加工具。打开网页版、同步模型、
               看活动、改模型服务都是次要动作，收进「更多」，避免标题栏变成按钮墙。 */}
           <button type="button" className={`builtin-ai-tools-button ${extensionsOpen ? 'active' : ''}`} onClick={() => setExtensionsOpen(true)} title="让 HiMind AI 在对话里使用本机工具" aria-label="AI 工具"><Blocks size={15} aria-hidden="true" />AI 工具</button>
+          <button ref={instructionTriggerRef} type="button" className={`builtin-ai-tools-button ${instructionOpen ? 'active' : ''}`} onClick={() => void openInstructionContext()} title={selectedInstructionCount === null ? '设置当前项目规则' : `设置当前项目规则，已选 ${selectedInstructionCount} 份`} aria-label={selectedInstructionCount === null ? '项目规则' : `项目规则，已选 ${selectedInstructionCount} 份`}><FileText size={15} aria-hidden="true" />项目规则{selectedInstructionCount !== null ? <span className="builtin-ai-instruction-count" aria-hidden="true">{selectedInstructionCount}</span> : null}</button>
           <ActionMenu className="builtin-ai-more" icon={<MoreHorizontal size={15} aria-hidden="true" />} title="更多">
             {close => <>
               <ActionMenuItem icon={<ArrowUpRight size={16} aria-hidden="true" />} label="在浏览器打开" title="在系统浏览器中打开 HiMind AI" disabled={!runtimeReady || !canStartSession || connecting || browserOpening} onClick={() => { close(); void openInBrowser(); }} />
@@ -367,6 +473,19 @@ export function BuiltinAiPage({
           <WorkspaceStatus icon={<BusyIndicator size={21} />} title="正在准备 HiMind AI" description="正在连接服务" />
         )}
       </div>
+      {instructionOpen ? <WorkspaceInstructionDialog
+        triggerRef={instructionTriggerRef}
+        context={instructionContext}
+        selected={instructionSelection}
+        busy={instructionBusy}
+        error={instructionError}
+        saved={instructionSaved}
+        onClose={closeInstructionContext}
+        onToggle={(item, checked) => setInstructionSelection(current => checked
+          ? [...current, { id: item.id, version: item.version, digest: item.digest }]
+          : current.filter(ref => `${ref.id}@${ref.version}` !== `${item.id}@${item.version}`))}
+        onSave={() => void saveInstructionSelection()}
+      /> : null}
       <BuiltinAiExtensionsDialog
         open={extensionsOpen}
         skillCount={skillCount}
@@ -382,6 +501,63 @@ export function BuiltinAiPage({
       />
     </section>
   );
+}
+
+function WorkspaceInstructionDialog({
+  triggerRef, context, selected, busy, error, saved, onClose, onToggle, onSave,
+}: {
+  triggerRef: RefObject<HTMLButtonElement | null>;
+  context: WorkspaceInstructionContext | null;
+  selected: InstructionPackRef[];
+  busy: boolean;
+  error: string;
+  saved: string;
+  onClose: () => void;
+  onToggle: (item: WorkspaceInstructionContext['available'][number], checked: boolean) => void;
+  onSave: () => void;
+}) {
+  const selectedKeys = new Set(selected.map(item => `${item.id}@${item.version}`));
+  const dialogRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>('button, input, textarea, select, [href], [tabindex]:not([tabindex="-1"])')).filter(item => !item.hasAttribute('disabled'));
+    focusable()[0]?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); onClose(); return; }
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      triggerRef.current?.focus();
+    };
+  }, [onClose, triggerRef]);
+  return <div className="skill-dialog-backdrop builtin-ai-instruction-backdrop" role="presentation">
+    <section ref={dialogRef} tabIndex={-1} className="skill-dialog builtin-ai-instruction-dialog" role="dialog" aria-modal="true" aria-labelledby="builtin-ai-instruction-title">
+      <div className="skill-dialog-head"><div><strong id="builtin-ai-instruction-title">项目规则</strong><small>{context?.workspace_root || '当前项目'}</small></div><button type="button" className="btn btn-icon" aria-label="关闭" onClick={onClose}><X size={16} /></button></div>
+      {error ? <div className="skill-dialog-warning"><CircleAlert size={16} />{error}</div> : null}
+      {saved ? <div className="skill-dialog-success"><Check size={16} />{saved}</div> : null}
+      <div className="builtin-ai-instruction-copy">选择 HiMind 在此项目中遵循的说明。不会增加工具或权限。</div>
+      <div className="builtin-ai-instruction-list">
+        {!context ? <div className="builtin-ai-instruction-empty">正在读取项目规则…</div> : context.available.length === 0 ? <div className="builtin-ai-instruction-empty">暂无已发布的项目规则。可在扩展开发的规则库中创建并发布。</div> : context.available.map(item => {
+          const key = `${item.id}@${item.version}`;
+          return <label className="builtin-ai-instruction-item" key={key}>
+            <input type="checkbox" checked={selectedKeys.has(key)} disabled={busy} onChange={event => onToggle(item, event.target.checked)} />
+            <span><strong>{item.name}</strong><small>{item.id} · v{item.version}</small><em>{item.description}</em></span>
+          </label>;
+        })}
+      </div>
+      <div className="skill-dialog-actions"><button type="button" className="btn" onClick={onClose}>关闭</button><button type="button" className="btn btn-primary" disabled={!context || busy} onClick={onSave}>{busy ? '保存中…' : '保存并重启会话'}</button></div>
+    </section>
+  </div>;
 }
 
 function RuntimeActivityPanel({ sessions, error, onRefresh }: { sessions: BuiltinAIRuntimeActivity[]; error: string; onRefresh: () => void }) {
@@ -494,7 +670,7 @@ function builtinAiSessionTarget(workspaceTarget: BuiltinAiWorkspaceTarget) {
 
 /** 扩展工作区的会话按目录复用，用于在页面重新挂载时找回已经跑着的会话。 */
 function builtinAiWorkspaceRoot(workspaceTarget: BuiltinAiWorkspaceTarget) {
-  return workspaceTarget?.kind === 'extension-workspace' ? workspaceTarget.path : undefined;
+  return workspaceTarget?.path;
 }
 
 /** 工作台回传的目录可能带大小写和分隔符差异，比较前先归一。 */

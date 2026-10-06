@@ -24,8 +24,12 @@
   --border: #e5e7eb;
   --border-strong: #d1d5db;
   --text: #111827;
+  --text-primary: var(--text);
   --text-muted: #6b7280;
+  --text-secondary: var(--text-muted);
   --text-subtle: #64748b;
+  --accent: var(--primary);
+  --danger-strong: #b91c1c;
   --sidebar: #f9f9f9;
   --sidebar-muted: #5d5d5d;
   --sidebar-text: #0d0d0d;
@@ -180,6 +184,8 @@
 .extension-kind-mark.plugin { color: #1d4ed8; background: #eff6ff; }
 .extension-kind-mark.skill { color: #047857; background: #ecfdf5; }
 .extension-kind-mark.workflow { color: #b45309; background: #fffbeb; }
+.extension-kind-mark.expert { color: #7c3aed; background: #f5f3ff; }
+.extension-kind-mark.instruction { color: #0f766e; background: #ecfeff; }
 .extension-kind-mark.mcp { color: #6d28d9; background: #f5f3ff; }
 .extension-installed-version { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-family: Consolas, monospace; font-size: 11px; white-space: nowrap; }
 
@@ -1221,7 +1227,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .sidebar-nav-group { display: grid; gap: 2px; }
 .sidebar-nav-group + .sidebar-nav-group { margin-top: 4px; }
 .sidebar-footer { position: relative; display: grid; gap: 6px; flex: 0 0 auto; padding: 8px; background: var(--sidebar); }
-.sidebar-section-label { display: block; padding: 0 9px 4px; color: #8f8f8f; font-size: 11px; font-weight: 500; }
+.sidebar-section-label { display: block; padding: 0 9px 4px; color: #64748b; font-size: 11px; font-weight: 600; }
 .sidebar-account { width: 100%; min-height: 48px; display: grid; grid-template-columns: 28px minmax(0, 1fr) 14px; align-items: center; gap: 9px; margin: 0; padding: 6px 8px; border: 0; border-radius: 8px; color: var(--sidebar-text); background: transparent; text-align: left; cursor: pointer; }
 .sidebar-account:hover, .sidebar-account.open { background: var(--sidebar-hover); }
 .sidebar-account-avatar { width: 28px; height: 28px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--sidebar-border); border-radius: 50%; color: var(--sidebar-text); background: #fff; font-size: 12px; font-weight: 600; }
@@ -1288,9 +1294,62 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .builtin-ai-title span { color: var(--text-muted); font-size: 11px; }
 .builtin-ai-mark { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; color: var(--success-strong); background: var(--success-soft); }
 .builtin-ai-toolbar-actions { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.builtin-ai-expert-select { min-width: 138px; display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; }
+.builtin-ai-expert-select select { min-width: 104px; height: 28px; padding: 0 24px 0 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-secondary); background: #fff; font-size: 11px; }
+.builtin-ai-expert-select select:focus { outline: 2px solid rgba(37, 99, 235, .18); outline-offset: 1px; }
+
+.expert-studio-panel { margin: 0 0 16px; border: 1px solid var(--border); background: #fff; }
+.expert-studio-panel.compact { margin-bottom: 12px; }
+.expert-studio-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.expert-studio-head h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 4px; font-size: 15px; }
+.expert-studio-head span { color: var(--text-muted); font-size: 12px; }
+.expert-studio-actions { display: flex; align-items: center; gap: 8px; }
+/* 专家卡片是竖向栈：名称、说明、来源在上，操作收在底部一行。
+   操作并排走的时候最小宽度约 260px（使用 + 同步到客户端 + 更多操作），
+   三列网格下留给标题的只有 60px 上下，中文名会被压成逐字折行。 */
+.expert-studio-item-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 12px; border-top: 1px solid var(--border); }
+.expert-projection-actions { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.expert-studio-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); align-items: stretch; gap: 12px; padding: 12px; }
+.expert-studio-item { display: flex; flex-direction: column; gap: 10px; padding: 14px; border: 1px solid var(--border); background: #fafbfc; }
+.expert-studio-item.active { border-color: var(--accent); background: rgba(37, 99, 235, .04); }
+.expert-studio-copy { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px; }
+.expert-studio-copy > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.expert-studio-copy strong { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.expert-studio-copy p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; word-break: keep-all; }
+.expert-studio-copy small { color: var(--text-muted); font-size: 11px; line-height: 1.5; word-break: keep-all; }
+.expert-market-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); align-items: stretch; gap: 12px; padding: 0 12px 12px; }
+.expert-market-title { grid-column: 1 / -1; margin: 0 0 2px; color: var(--text-muted); font-size: 12px; font-weight: 600; }
+/* 内容列降到单列后，头部让位给按钮组，避免标题和操作再互相挤。 */
+@container agent-main (max-width: 620px) {
+  .expert-studio-head { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .expert-studio-actions { width: 100%; justify-content: flex-end; }
+}
+.expert-studio-modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgb(15 23 42 / 28%); }
+.expert-studio-modal { width: min(520px, 100%); padding: 18px; border: 1px solid var(--border); background: #fff; box-shadow: 0 20px 50px rgb(15 23 42 / 18%); }
+.expert-studio-modal header, .expert-studio-modal footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.expert-studio-modal header { margin-bottom: 14px; }
+.expert-studio-modal footer { justify-content: flex-end; margin-top: 16px; }
+.expert-studio-modal label { display: grid; gap: 5px; margin-top: 10px; color: var(--text-muted); font-size: 12px; }
+.expert-studio-modal input, .expert-studio-modal textarea { width: 100%; box-sizing: border-box; padding: 8px 9px; border: 1px solid var(--border); color: var(--text-primary); background: #fff; font: inherit; resize: vertical; }
 .builtin-ai-tools-button { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-secondary); background: #fff; font-size: 11px; cursor: pointer; }
 .builtin-ai-tools-button:hover, .builtin-ai-tools-button.active { border-color: #94a3b8; color: var(--text); background: #f8fafc; }
 .builtin-ai-tools-button:disabled { opacity: .6; cursor: wait; }
+.builtin-ai-instruction-count { min-width: 16px; height: 16px; display: inline-grid; place-items: center; margin-left: 1px; padding: 0 4px; border-radius: 8px; color: #1d4ed8; background: #dbeafe; font-size: 10px; font-weight: 700; line-height: 16px; }
+.builtin-ai-instruction-backdrop { padding: 18px; }
+.builtin-ai-instruction-dialog { width: min(620px, 100%); max-height: min(680px, calc(100dvh - 36px)); display: flex; flex-direction: column; overflow: hidden; }
+.builtin-ai-instruction-dialog .skill-dialog-head > div { min-width: 0; display: grid; gap: 3px; }
+.builtin-ai-instruction-dialog .skill-dialog-head small { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.builtin-ai-instruction-copy { padding: 12px 16px; border-bottom: 1px solid var(--border); color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.builtin-ai-instruction-list { min-height: 0; flex: 1; overflow-y: auto; padding: 10px 16px; }
+.builtin-ai-instruction-item { display: flex; align-items: flex-start; gap: 10px; padding: 11px 0; border-bottom: 1px solid #eef2f6; cursor: pointer; }
+.builtin-ai-instruction-item:last-child { border-bottom: 0; }
+.builtin-ai-instruction-item input { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 2px; accent-color: var(--primary); }
+.builtin-ai-instruction-item > span { min-width: 0; display: grid; gap: 3px; }
+.builtin-ai-instruction-item strong { color: var(--text); font-size: 13px; font-weight: 650; }
+.builtin-ai-instruction-item small { color: var(--text-muted); font: 10px/1.4 Consolas, monospace; }
+.builtin-ai-instruction-item em { color: var(--text-secondary); font-size: 11px; font-style: normal; line-height: 1.5; }
+.builtin-ai-instruction-empty { padding: 32px 12px; color: var(--text-muted); font-size: 12px; text-align: center; }
+.skill-dialog-success { display: flex; align-items: center; gap: 7px; padding: 9px 14px; border-bottom: 1px solid #bbf7d0; color: #166534; background: #f0fdf4; font-size: 12px; }
 /* 「更多」是同一工具栏里的次要入口，必须和主按钮同高同形，不能长成系统按钮。 */
 .builtin-ai-toolbar-actions .action-menu > .btn { min-width: 0; min-height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-secondary); background: #fff; }
 .builtin-ai-toolbar-actions .action-menu > .btn:hover, .builtin-ai-toolbar-actions .action-menu > .btn.is-open { border-color: #94a3b8; color: var(--text); background: #f8fafc; }
@@ -2135,10 +2194,22 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .unity-editor-source small { min-width: 0; line-height: 1.5; text-align: right; }
 .unity-editor-source code { color: #374151; font-family: Consolas, monospace; }
 .unity-editor-field { display: grid; gap: 6px; color: #374151; font-size: 12px; font-weight: 500; }
-.unity-editor-input { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 7px; }
+.unity-editor-input { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 34px 34px; gap: 7px; }
 .unity-editor-input input { min-width: 0; width: 100%; font-family: Consolas, monospace; font-size: 12px; }
 .unity-editor-input .btn { width: 34px; height: 32px; }
 .unity-editor-footer { min-height: 40px; display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-top: 12px; }
+/* 引擎与编辑器：Unity / Unreal 两行 + 本机已安装版本清单。 */
+.engine-editor-row { display: grid; gap: 6px; }
+.engine-editor-row + .engine-editor-row { margin-top: 14px; }
+.engine-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.engine-editor-head strong { color: #374151; font-size: 12px; font-weight: 600; }
+.engine-installation-list { display: grid; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.engine-installation-list > span { color: var(--text-muted); font-size: 11px; }
+.engine-installation-list > div { display: flex; flex-wrap: wrap; gap: 6px; }
+.engine-installation { border: 1px solid var(--border); background: var(--surface-muted); border-radius: 6px; padding: 4px 9px; color: #374151; font-size: 11px; cursor: pointer; }
+.engine-installation:hover { border-color: #2563eb; color: #2563eb; }
+.engine-installation:disabled { opacity: .55; cursor: default; }
+
 .unity-editor-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .unity-editor-actions .btn-primary { min-width: 126px; }
 .remote-client-body { padding: 10px; }
@@ -2267,6 +2338,13 @@ select:disabled, input:disabled { color: var(--text-subtle); background: var(--s
 .ai-service-modal .ai-service-form-group:last-of-type { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
 .ai-service-modal .ai-service-presets { padding: 0 0 15px; margin-bottom: 15px; border-bottom: 1px solid var(--border); }
 .ai-service-modal .modal-actions { position: sticky; bottom: -16px; margin: 4px -16px -16px; padding: 12px 16px; background: #fff; border-top: 1px solid var(--border); }
+.ai-service-advanced { margin-top: 2px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-muted); }
+.ai-service-advanced-toggle { width: 100%; min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 11px; border: 0; color: var(--text-muted); background: transparent; cursor: pointer; font-size: 12px; font-weight: 600; text-align: left; }
+.ai-service-advanced-toggle:hover { color: var(--text); background: var(--surface); }
+.ai-service-advanced-toggle svg { transition: transform .16s ease; }
+.ai-service-advanced-toggle svg.open { transform: rotate(180deg); }
+.ai-service-advanced-body { padding: 0 11px 1px; border-top: 1px solid var(--border); background: var(--surface); }
+.ai-service-advanced-body .ai-service-form-group { padding-inline: 0; }
 
 /* 窄窗口给内容让出宽度：收紧 backdrop 内边距，弹窗本体用 100% 跟随可视区，
    这样两列字段在 460px 级别窗口下会自然退回单列，而不是被裁切。 */
@@ -2800,6 +2878,91 @@ tr:last-child td { border-bottom: 0; }
 .development-workspace-copy small { min-width: 0; overflow: hidden; color: var(--text-subtle); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .development-workspace-copy small.is-problem { color: #b45309; }
 .development-workspace-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.instruction-panel { flex: 0 0 auto; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); overflow: hidden; }
+.instruction-panel-head { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 8px 0 10px; }
+.instruction-panel-toggle { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 8px; padding: 6px 0; border: 0; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.instruction-panel-icon { width: 27px; height: 27px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 6px; color: #166534; background: #ecfdf5; }
+.instruction-panel-title { min-width: 0; display: grid; gap: 2px; }
+.instruction-panel-title strong { font-size: 12px; font-weight: 650; }
+.instruction-panel-title small { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.instruction-panel-actions { display: flex; align-items: center; gap: 5px; }
+.instruction-panel-actions .btn { min-height: 27px; padding: 0 8px; font-size: 11px; }
+/* 「项目规则」作为拓展开发的类型页签内容时，占满内容区并自己滚动，
+   外观与同级的 .development-workspace 保持一致。 */
+.instruction-panel.is-embedded { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin-bottom: 0; border-radius: 8px; }
+.instruction-panel.is-embedded .instruction-panel-body { padding: 12px; border-top: 0; background: var(--surface); }
+.instruction-panel-embedded-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.instruction-panel-body { display: grid; gap: 8px; padding: 0 10px 10px; border-top: 1px solid var(--border); background: var(--surface-muted); }
+.instruction-panel-tabs { margin: 2px -2px 0; border-bottom: 1px solid var(--border); }
+.instruction-panel-tabs button { min-height: 32px; }
+.instruction-section-intro { padding: 6px 4px 2px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.instruction-rule-library { display: grid; gap: 8px; }
+.instruction-rule-toolbar { display: flex; flex-wrap: wrap; gap: 6px; }
+.instruction-panel-loading, .instruction-panel-empty { min-height: 36px; display: flex; align-items: center; gap: 7px; color: var(--text-muted); font-size: 11px; }
+.instruction-panel-empty { padding: 0 4px; }
+.instruction-panel-error { display: flex; align-items: flex-start; gap: 7px; padding: 7px 8px; border-left: 3px solid var(--danger); color: #b91c1c; background: #fef2f2; font-size: 11px; line-height: 1.45; }
+.instruction-panel-notice { display: flex; align-items: flex-start; gap: 7px; padding: 7px 8px; border-left: 3px solid #22c55e; color: #166534; background: #f0fdf4; font-size: 11px; line-height: 1.45; }
+.instruction-target-list { display: grid; gap: 5px; }
+.instruction-target { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 9px; padding: 8px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.instruction-target.is-degraded { border-color: #fde68a; }
+.instruction-target-main { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.instruction-target-mark { width: 25px; height: 25px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 5px; color: var(--primary); background: #eff6ff; }
+.instruction-target-main > div { min-width: 0; display: grid; gap: 2px; }
+.instruction-target-main strong { min-width: 0; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.instruction-target-main small { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.instruction-target-main code { color: var(--text-subtle); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.instruction-target-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 5px; }
+.instruction-target-actions .btn { min-height: 25px; padding: 0 7px; font-size: 10px; }
+.instruction-plan { grid-column: 1 / -1; display: grid; gap: 2px; padding: 5px 7px; border-left: 2px solid #86efac; color: var(--text-muted); background: #f8fffb; font-size: 10px; line-height: 1.45; }
+.instruction-plan strong { color: #166534; font-weight: 650; }
+.instruction-plan small { color: var(--text-muted); overflow-wrap: anywhere; }
+.instruction-plan.is-danger { border-left-color: var(--danger); background: #fef2f2; }
+.instruction-plan.is-danger strong { color: #b91c1c; }
+.instruction-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--success); }
+.instruction-section-head > div { min-width: 0; display: grid; gap: 2px; }
+.instruction-section-head strong { color: var(--text); font-size: 11px; }
+.instruction-section-head small { color: var(--text-muted); font-size: 10px; }
+.instruction-pack-drafts { display: grid; gap: 7px; padding-top: 2px; border-top: 1px solid var(--border); }
+.instruction-pack-draft { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.instruction-pack-draft > div:first-child { min-width: 0; display: grid; gap: 2px; }
+.instruction-pack-draft strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.instruction-pack-draft small { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.instruction-pack-draft .instruction-target-actions { grid-column: auto; flex: 0 0 auto; }
+.instruction-pack-select { display: grid; gap: 8px; padding-top: 2px; border-top: 1px solid var(--border); }
+.instruction-pack-select .instruction-section-head { padding-bottom: 1px; }
+.instruction-pack-select-row { min-width: 0; display: grid; grid-template-columns: minmax(150px, .35fr) minmax(0, 1fr); gap: 10px; align-items: start; padding: 8px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.instruction-pack-select-row > strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 10px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.instruction-pack-select-row > div { min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.instruction-pack-select-row label { min-width: 0; display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 4px 7px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-muted); background: var(--surface-muted); font-size: 10px; line-height: 1.25; cursor: pointer; }
+.instruction-pack-select-row label:has(input:checked) { border-color: #93c5fd; color: #1d4ed8; background: #eff6ff; }
+.instruction-pack-select-row label:has(input:disabled) { cursor: default; opacity: .7; }
+.instruction-pack-select-row input { width: 12px; height: 12px; margin: 0; accent-color: var(--primary); }
+.instruction-pack-authoring { display: grid; gap: 8px; padding: 9px; border: 1px solid #bfdbfe; border-radius: 6px; background: #f8fbff; }
+.instruction-pack-authoring-head { display: grid; gap: 2px; }
+.instruction-pack-authoring-head strong { color: var(--text); font-size: 11px; }
+.instruction-pack-authoring-head small { color: var(--text-muted); font-size: 10px; }
+.instruction-pack-authoring-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.instruction-pack-authoring-grid label { min-width: 0; display: grid; gap: 3px; color: var(--text-muted); font-size: 10px; }
+.instruction-pack-authoring-grid input, .instruction-pack-authoring-grid textarea { width: 100%; box-sizing: border-box; padding: 6px 7px; border: 1px solid var(--border-strong); border-radius: 5px; color: var(--text); background: var(--surface); font: inherit; font-size: 11px; outline: 0; }
+.instruction-pack-authoring-grid textarea { min-height: 110px; resize: vertical; line-height: 1.45; }
+.instruction-pack-authoring-grid input:focus, .instruction-pack-authoring-grid textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 16%, transparent); }
+.instruction-pack-authoring-wide { grid-column: 1 / -1; }
+
+@media (max-width: 740px) {
+  .instruction-panel-head { align-items: flex-start; padding-top: 8px; padding-bottom: 8px; }
+  .instruction-panel-actions { flex: 0 0 auto; }
+  .instruction-panel-actions .btn:not(.btn-icon) { padding-inline: 6px; }
+  .instruction-target-main small { overflow: visible; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
+  .instruction-target-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .instruction-pack-draft { align-items: flex-start; flex-direction: column; }
+  .instruction-pack-draft small { overflow: visible; white-space: normal; overflow-wrap: anywhere; }
+  .instruction-pack-draft .instruction-target-actions { width: 100%; }
+  .instruction-pack-select-row { grid-template-columns: 1fr; gap: 6px; }
+  .instruction-pack-select-row > strong { overflow: visible; white-space: normal; }
+  .instruction-pack-authoring-grid { grid-template-columns: 1fr; }
+  .instruction-pack-authoring-wide { grid-column: auto; }
+}
+
 .development-workspace-empty { min-height: 0; flex: 1; display: grid; align-content: center; justify-items: center; gap: 14px; border: 1px dashed var(--border-strong); border-radius: 8px; background: var(--surface); }
 .development-workspace-empty-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 .development-invitations { flex: 0 0 auto; display: grid; grid-template-columns: 145px minmax(0, 1fr); margin-bottom: 12px; border: 1px solid #bfdbfe; border-radius: 6px; background: #f8fbff; overflow: hidden; }
@@ -3883,7 +4046,7 @@ tr:last-child td { border-bottom: 0; }
   .setting-control select { min-width: 0; }
   .unity-editor-body { padding: 12px; }
   .unity-editor-source { margin-inline: -12px; padding-inline: 12px; }
-  .unity-editor-input { grid-template-columns: minmax(0, 1fr) 32px; }
+.unity-editor-input { grid-template-columns: minmax(0, 1fr) 32px 32px; }
   .unity-editor-footer { gap: 9px; }
   .unity-editor-actions .btn { flex: 1 1 130px; min-width: 0; }
   .remote-client-actions { width: 100%; }
@@ -4446,3 +4609,68 @@ tr:last-child td { border-bottom: 0; }
   border-color: transparent;
   box-shadow: none;
 }
+
+/* AI 用量面板（ADR 0111）：读数 + 趋势 + 构成，口径与覆盖边界在脚注声明。 */
+.ai-usage-panel { margin-bottom: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.ai-usage-head { min-height: 46px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 14px; border-bottom: 1px solid var(--border); }
+.ai-usage-title { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.ai-usage-title svg { color: var(--text-muted); }
+.ai-usage-title strong { font-size: 13px; font-weight: 600; }
+.ai-usage-scope { padding: 1px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+.ai-usage-tools { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.ai-usage-segmented { display: flex; align-items: center; padding: 2px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-muted); }
+.ai-usage-segmented button { min-height: 24px; padding: 0 10px; border: 0; border-radius: 4px; background: transparent; color: var(--text-muted); font: inherit; font-size: 11px; white-space: nowrap; cursor: pointer; }
+.ai-usage-segmented button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(16, 24, 40, .08); }
+.ai-usage-segmented.small button { min-height: 22px; padding: 0 8px; }
+.ai-usage-loading { min-height: 64px; display: flex; align-items: center; gap: 8px; padding: 0 14px; color: var(--text-muted); font-size: 12px; }
+.ai-usage-notice { display: flex; align-items: center; gap: 8px; margin: 12px 14px 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-muted); color: var(--text-muted); font-size: 12px; }
+.ai-usage-notice svg { flex: 0 0 auto; }
+.ai-usage-notice.warning { border-color: var(--warning-border); background: var(--warning-soft); color: var(--warning-strong); }
+/* 列数跟着卡片数量走：固定 4 列时，只有 3 张卡会在右侧留一个灰格，
+   看起来像少了一张卡。 */
+.ai-usage-kpis { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 1px; margin: 12px 14px 0; overflow: hidden; border: 1px solid var(--border); border-radius: 6px; background: var(--border); }
+.ai-usage-kpi { position: relative; min-width: 0; display: grid; align-content: start; gap: 3px; padding: 10px 12px; background: var(--surface); }
+.ai-usage-kpi-label { color: var(--text-muted); font-size: 11px; }
+.ai-usage-kpi strong { font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
+.ai-usage-kpi-meta { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.ai-usage-kpi.warning strong { color: var(--warning-strong); }
+.ai-usage-delta { position: absolute; top: 10px; right: 12px; color: var(--text-muted); font-size: 11px; }
+.ai-usage-delta.up { color: var(--danger); }
+.ai-usage-delta.down { color: var(--success); }
+.ai-usage-trend { margin: 16px 14px 0; }
+.ai-usage-trend-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; color: var(--text-muted); font-size: 11px; }
+.ai-usage-trend-head > span:first-child { color: var(--text); font-size: 12px; font-weight: 600; }
+.ai-usage-breakdown-count { margin-left: auto; }
+.ai-usage-chart { display: grid; grid-template-columns: 46px minmax(0, 1fr); grid-template-rows: 96px auto; gap: 4px 8px; }
+.ai-usage-chart-scale { grid-row: 1; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; color: var(--text-muted); font-size: 10px; }
+.ai-usage-bars { grid-row: 1; display: flex; align-items: flex-end; gap: 2px; border-bottom: 1px solid var(--border); }
+/* 缺省高度就是「无数据」的细线：即使内联高度缺失也不会被别的规则撑高。 */
+.ai-usage-bar { flex: 1 1 0; min-width: 2px; height: 2px; border-radius: 2px 2px 0 0; background: var(--primary); opacity: .85; }
+.ai-usage-bar-empty { height: 2px; background: var(--border-strong); opacity: .5; }
+.ai-usage-chart-axis { grid-column: 2; display: flex; justify-content: space-between; color: var(--text-muted); font-size: 10px; }
+.ai-usage-trend-note { margin: 12px 14px 0; color: var(--text-muted); font-size: 11px; }
+.ai-usage-breakdown { margin: 16px 14px 0; }
+.ai-usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ai-usage-table th { padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-weight: 500; text-align: right; }
+.ai-usage-table th:first-child { text-align: left; }
+.ai-usage-table td { padding: 7px 8px; border-bottom: 1px solid #f0f1f3; text-align: right; white-space: nowrap; }
+.ai-usage-table td:first-child { max-width: 260px; overflow: hidden; font-weight: 500; text-align: left; text-overflow: ellipsis; }
+.ai-usage-table tr:last-child td { border-bottom: 0; }
+.ai-usage-share { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.ai-usage-share-track { width: 64px; height: 5px; overflow: hidden; border-radius: 3px; background: var(--surface-muted); }
+.ai-usage-share-track i { display: block; height: 100%; background: var(--primary); opacity: .7; }
+.ai-usage-footnote { margin: 12px 14px 14px; color: var(--text-muted); font-size: 11px; line-height: 1.6; }
+@container agent-main (max-width: 720px) {
+  .ai-usage-kpis { grid-auto-flow: row; grid-auto-columns: unset; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ai-usage-head { flex-wrap: wrap; padding: 8px 14px; }
+}
+
+/* 本机推理网关的状态条（ADR 0113）：状态、地址与恢复动作同屏。 */
+.ai-gateway-strip { min-height: 48px; display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 0 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.ai-gateway-strip .status-dot { flex: 0 0 auto; }
+.ai-gateway-strip-copy { min-width: 0; display: grid; gap: 1px; }
+.ai-gateway-strip-copy strong { font-size: 12px; font-weight: 600; }
+.ai-gateway-strip-copy span { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.ai-gateway-strip-error { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--warning-strong); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.ai-gateway-strip-actions { min-width: 0; flex: 0 0 auto; display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.ai-gateway-strip-copy span { max-width: min(520px, 48vw); }

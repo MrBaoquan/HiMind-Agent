@@ -18,8 +18,9 @@
     "check:runtime-providers": "node --experimental-strip-types scripts/check-runtime-providers.mts",
     "check:mcp-servers": "node --experimental-strip-types scripts/check-mcp-servers.mts",
     "check:settings-ia": "node --experimental-strip-types scripts/check-settings-ia.mts",
+    "check:engine": "node --experimental-strip-types scripts/check-engine.mts",
     "check:copy": "node --experimental-strip-types scripts/check-copy.mts",
-    "check:ui": "npm run check:start-form && npm run check:run-view && npm run check:workflow-graph && npm run check:market-catalog && npm run check:task-view && npm run check:shell-structure && npm run check:icon-version && npm run check:ai-service-presets && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:copy"
+    "check:ui": "npm run check:start-form && npm run check:run-view && npm run check:workflow-graph && npm run check:market-catalog && npm run check:task-view && npm run check:shell-structure && npm run check:icon-version && npm run check:ai-service-presets && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:engine && npm run check:copy"
   },
   "dependencies": {
     "@tauri-apps/api": "latest",

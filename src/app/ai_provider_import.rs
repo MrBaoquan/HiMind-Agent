@@ -490,6 +490,12 @@ pub(crate) struct AIProviderImportResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AIProviderImportBinding {
     service: String,
+    /// 注入模式：空串 = 直连（旧格式与默认）；`gateway` = 走本机推理网关。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    mode: String,
+    /// 网关模式的上游与令牌事实；直连模式为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway: Option<AIProviderGatewayBinding>,
     /// 最近一次写入该客户端配置的时间（RFC 3339）。旧簿记没有这个字段，
     /// 因此默认空串，UI 在没有时间可显示时就不显示这一行。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -790,6 +796,9 @@ pub(crate) fn import(
         target.to_string(),
         AIProviderImportBinding {
             service: service_source.to_string(),
+            // 走现有导入路径就是直连：真实凭据写进客户端，用量不计入本机口径。
+            mode: String::new(),
+            gateway: None,
             updated_at: now_rfc3339(),
             restore: snapshot,
         },
@@ -826,6 +835,298 @@ fn save_import_bindings(
     let _lock = crate::store::atomic_file::lock(&path)?;
     crate::store::atomic_file::atomic_write(&path, &serde_json::to_vec_pretty(bindings)?)?;
     Ok(())
+}
+
+/// 网关模式的上游事实：真实凭据只在 Agent 内保存（DPAPI 保护），客户端只拿到本机令牌。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AIProviderGatewayBinding {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    token_protected: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    api_key_protected: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    protocol: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<String>,
+    /// 翻译请求时的模型名兜底。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    default_model: String,
+}
+
+const BINDING_MODE_GATEWAY: &str = "gateway";
+
+fn new_binding_token() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// 切换到本机网关模式（ADR 0113）。P1 只落地 Codex：其余客户端要等各自的写入面
+/// 补齐，宁可不做，也不写半套配置。
+pub(crate) fn enable_gateway_binding(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    service: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let target = target.trim();
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let gateway_url =
+        crate::app::inference_gateway::url().ok_or("本机推理网关未启动，无法切换到网关模式")?;
+    let credential = resolve_credential(options, expected_user_id, "gateway-binding", service)?;
+    let models = available_models(&credential)?;
+    let preferred = preferred_model(&credential)?;
+    let token = new_binding_token();
+    // 客户端看到的是网关，网关再按上游真实协议转发或互译。
+    let proxy_protocol = gateway_proxy_protocol(adapter.id(), &credential.access.protocol)?;
+    let mut client_access = credential.access.clone();
+    client_access.base_url = gateway_url.clone();
+    client_access.protocol = proxy_protocol.to_string();
+    let client_credential = AIClientCredential {
+        access: client_access,
+        api_key: token.clone(),
+    };
+    let service_source = if service.trim().is_empty() {
+        "managed".to_string()
+    } else {
+        service.trim().to_string()
+    };
+    // 走客户端自己的写入面：把「客户端看到的凭据」临时替换成网关凭据，
+    // 各适配器的协议校验、备份、合并与还原逻辑全部原样复用。
+    let result = {
+        let _guard = set_gateway_override(&service_source, client_credential);
+        import(
+            options,
+            expected_user_id,
+            &AIProviderImportRequest {
+                target: target.to_string(),
+                service: if service_source == "managed" {
+                    String::new()
+                } else {
+                    service_source.clone()
+                },
+                replace: true,
+            },
+        )?
+    };
+
+    // 客户端配置已写好，再把绑定事实改成网关模式：真实凭据只留在 Agent。
+    let mut bindings = load_import_bindings(options);
+    bindings.clients.insert(
+        target.to_string(),
+        AIProviderImportBinding {
+            service: service_source.clone(),
+            mode: BINDING_MODE_GATEWAY.to_string(),
+            gateway: Some(AIProviderGatewayBinding {
+                token_protected: crate::store::credentials::protect_secret_for_current_user(
+                    &token,
+                )?,
+                base_url: credential.access.base_url.clone(),
+                api_key_protected: crate::store::credentials::protect_secret_for_current_user(
+                    &credential.api_key,
+                )?,
+                protocol: credential.access.protocol.clone(),
+                models: models.clone(),
+                default_model: preferred.clone(),
+            }),
+            updated_at: now_rfc3339(),
+            // 保留 import 刚写下的「用户原始配置」快照，切回直连时用它还原。
+            restore: bindings
+                .clients
+                .get(target)
+                .and_then(|binding| binding.restore.clone()),
+        },
+    );
+    save_import_bindings(options, &bindings)?;
+    Ok(result)
+}
+
+/// 客户端要求的入口协议与上游真实协议的组合是否有互译实现。
+///
+/// 只做本轮用得到的组合：Anthropic 入口 ↔ OpenAI Chat 上游。其它组合必须
+/// 明确报错，而不是让客户端拿到一个它读不懂的响应。
+fn gateway_proxy_protocol(
+    adapter_id: &str,
+    upstream_protocol: &str,
+) -> Result<&'static str, Box<dyn Error>> {
+    // Codex 0.150 起只讲 Responses（`wire_api = "chat"` 已被移除）：客户端看到
+    // Responses，Chat 类上游由网关互译，否则会写出一个 CLI 直接拒绝加载的配置。
+    if adapter_id == "codex" {
+        return match upstream_protocol {
+            "openai-responses" | "openai-chat" => Ok("openai-responses"),
+            other => Err(format!("Codex 暂不支持 {other} 上游").into()),
+        };
+    }
+    let anthropic_client = matches!(adapter_id, "claude-code" | "claude-desktop" | "zcode");
+    if anthropic_client {
+        if upstream_protocol == "openai-chat" {
+            return Ok("anthropic");
+        }
+        return Err(format!(
+            "该客户端只讲 Anthropic 协议，暂不支持接入 {upstream_protocol} 上游"
+        )
+        .into());
+    }
+    match upstream_protocol {
+        "openai-chat" => Ok("openai-chat"),
+        "openai-responses" => Ok("openai-responses"),
+        other => Err(format!("暂不支持把 {other} 上游接入这类客户端").into()),
+    }
+}
+
+/// 客户端配置里写入的凭据在导入期间被临时替换成网关凭据。
+///
+/// 单用户桌面应用，导入操作由界面串行化，所以这个窗口足够小；用锁而不是
+/// 全局变量是为了让并发调用下也不会读到半套状态。
+struct GatewayCredentialOverride {
+    service: String,
+    credential: AIClientCredential,
+}
+
+static GATEWAY_CREDENTIAL_OVERRIDE: OnceLock<Mutex<Option<GatewayCredentialOverride>>> =
+    OnceLock::new();
+
+fn gateway_override_slot() -> &'static Mutex<Option<GatewayCredentialOverride>> {
+    GATEWAY_CREDENTIAL_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn set_gateway_override(
+    service: &str,
+    credential: AIClientCredential,
+) -> GatewayOverrideGuard {
+    if let Ok(mut slot) = gateway_override_slot().lock() {
+        *slot = Some(GatewayCredentialOverride {
+            service: service.trim().to_string(),
+            credential,
+        });
+    }
+    GatewayOverrideGuard
+}
+
+struct GatewayOverrideGuard;
+
+impl Drop for GatewayOverrideGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = gateway_override_slot().lock() {
+            *slot = None;
+        }
+    }
+}
+
+fn gateway_override_for(service: &str) -> Option<AIClientCredential> {
+    let slot = gateway_override_slot().lock().ok()?;
+    let current = slot.as_ref()?;
+    if current.service != service.trim() {
+        return None;
+    }
+    Some(current.credential.clone())
+}
+
+/// 切回直连：丢弃本机令牌，把真实凭据按现有导入路径写回客户端。
+pub(crate) fn disable_gateway_binding(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let target = target.trim();
+    let bindings = load_import_bindings(options);
+    let service = bindings
+        .clients
+        .get(target)
+        .map(|binding| binding.service.clone())
+        .unwrap_or_else(|| "managed".to_string());
+    let result = import(
+        options,
+        expected_user_id,
+        &AIProviderImportRequest {
+            target: target.to_string(),
+            service: if service == "managed" {
+                String::new()
+            } else {
+                service
+            },
+            replace: true,
+        },
+    )?;
+    let mut bindings = load_import_bindings(options);
+    if let Some(binding) = bindings.clients.get_mut(target) {
+        binding.mode.clear();
+        binding.gateway = None;
+    }
+    save_import_bindings(options, &bindings)?;
+    Ok(result)
+}
+
+/// 网关启动时解析所有网关模式绑定。真实凭据在此解密，随后只留在内存。
+pub(crate) fn gateway_bindings(
+    options: &Options,
+) -> Vec<crate::app::inference_gateway::GatewayBinding> {
+    load_import_bindings(options)
+        .clients
+        .iter()
+        .filter_map(|(client, binding)| {
+            if binding.mode != BINDING_MODE_GATEWAY {
+                return None;
+            }
+            let gateway = binding.gateway.as_ref()?;
+            let token = crate::store::credentials::unprotect_secret_for_current_user(
+                &gateway.token_protected,
+            )
+            .ok()?;
+            let api_key = crate::store::credentials::unprotect_secret_for_current_user(
+                &gateway.api_key_protected,
+            )
+            .ok()?;
+            Some(crate::app::inference_gateway::GatewayBinding {
+                id: format!("{client}:{}", binding.service),
+                client: client.clone(),
+                service: binding.service.clone(),
+                models: gateway.models.clone(),
+                default_model: if gateway.default_model.trim().is_empty() {
+                    gateway
+                        .models
+                        .first()
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    gateway.default_model.clone()
+                },
+                protocol: if gateway.protocol.trim().is_empty() {
+                    "openai-responses".to_string()
+                } else {
+                    gateway.protocol.clone()
+                },
+                base_url: gateway.base_url.clone(),
+                api_key,
+                token,
+                platform_metered: binding.service == "managed",
+            })
+        })
+        .collect()
+}
+
+/// 直连注入的客户端清单：其用量不计入本机口径，面板据此点名。
+pub(crate) fn direct_bound_clients(options: &Options) -> Vec<String> {
+    let mut clients = load_import_bindings(options)
+        .clients
+        .into_iter()
+        .filter(|(_, binding)| binding.mode != BINDING_MODE_GATEWAY)
+        .map(|(client, _)| client)
+        .collect::<Vec<_>>();
+    clients.sort();
+    clients
+}
+
+/// 某客户端当前绑定的服务源；未绑定时为 `None`。
+pub(crate) fn binding_service(options: &Options, target: &str) -> Option<String> {
+    load_import_bindings(options)
+        .clients
+        .get(target.trim())
+        .map(|binding| binding.service.clone())
+        .filter(|service| !service.trim().is_empty())
 }
 
 /// 删除自定义 AI 服务前的占用检查。
@@ -908,6 +1209,10 @@ fn resolve_credential(
     service: &str,
 ) -> Result<AIClientCredential, Box<dyn Error>> {
     let service = service.trim();
+    // 网关模式下，写进客户端的是「网关地址 + 本机令牌」；真实凭据留在 Agent。
+    if let Some(credential) = gateway_override_for(service) {
+        return Ok(credential);
+    }
     if service.is_empty() || service == "managed" {
         if !options.mode().dashboard_enabled() {
             return Err(
@@ -1121,6 +1426,14 @@ fn import_codex(
         || config_path.join(CODEX_HIMIND_MODELS_FILE).is_file();
     let credential = resolve_credential(options, expected_user_id, "codex-import", service)?;
     ensure_openai_compatible(&credential, "Codex")?;
+    // Codex 0.150 起 `wire_api = "chat"` 已不再被接受；直接分发 chat 类服务
+    // 会写出一个 CLI 拒绝加载的 config.toml，必须在写入前拦住。
+    if openai_protocol_is_chat(&credential) {
+        return Err(
+            "Codex 只接受 Responses 协议的服务，当前服务是 chat 协议；请改用 Responses 类服务"
+                .into(),
+        );
+    }
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
     let catalog = build_codex_models_json(&models)?;
@@ -1184,7 +1497,9 @@ fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> 
             "minimal_client_version": "0.144.0",
             "supported_in_api": true,
             "truncation_policy": {"mode": "tokens", "limit": 10000},
-            "comp_hash": 3000,
+            // Codex 0.150 的模型目录把 comp_hash 当字符串读；写成整数会让整个
+            // 目录解析失败，客户端直接拒绝启动。
+            "comp_hash": "3000",
             "multi_agent_version": "v2",
             "use_responses_lite": false,
             "supports_reasoning_summaries": true,
@@ -6470,6 +6785,8 @@ mod tests {
             "opencode".to_string(),
             super::AIProviderImportBinding {
                 service: "custom:taken".to_string(),
+                mode: String::new(),
+                gateway: None,
                 updated_at: String::new(),
                 restore: None,
             },

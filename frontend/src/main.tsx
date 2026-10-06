@@ -16,6 +16,8 @@ import { DashboardPage } from './pages/DashboardPage';
 import { PluginsPage, userInstalledPlugins } from './pages/PluginsPage';
 import { SkillsWorkspacePage, installedSkills, skillClientDescriptors, targetForSkillClient } from './pages/SkillsWorkspacePage';
 import { InstalledPage } from './pages/InstalledPage';
+import { ExpertStudioPanel } from './components/ExpertStudioPanel';
+import { InstructionProjectionPanel } from './components/InstructionProjectionPanel';
 import { ManagedCapabilitiesPanel, managedItems } from './pages/ManagedCapabilitiesPage';
 import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
 import { ExtensionsPage, type MarketLoadError } from './pages/ExtensionsPage';
@@ -27,7 +29,7 @@ import type { WorkbenchConnectionDraft } from './components/WorkbenchConnections
 import { TaskCenterPage } from './pages/TaskCenterPage';
 import { WorkflowsPage } from './pages/WorkflowsPage';
 import { SchedulesPage } from './pages/SchedulesPage';
-import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
+import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -155,7 +157,7 @@ function initialInstalledKind(): InstalledKind {
     const saved = window.localStorage.getItem('himind.page');
     if (saved === 'skills') return 'skill';
     const stored = window.localStorage.getItem('himind-agent.installed-kind');
-    if (stored === 'plugin' || stored === 'skill' || stored === 'workflow' || stored === 'mcp' || stored === 'policy') return stored;
+    if (stored === 'plugin' || stored === 'skill' || stored === 'workflow' || stored === 'expert' || stored === 'mcp' || stored === 'policy') return stored;
   } catch {
     // Webview storage can be unavailable; fall back to plugins.
   }
@@ -206,6 +208,13 @@ function AgentApp() {
   const [aiServices, setAiServices] = useState<AIServiceListResult | null>(null);
   const [aiServiceTemplates, setAiServiceTemplates] = useState<AIServiceTemplateListResult | null>(null);
   const [acpRuntimeProfiles, setAcpRuntimeProfiles] = useState<AcpRuntimeProfileSnapshot | null>(null);
+  // 用量只做网关这一条口径（ADR 0113）：平台口径留在工作台，不在 Agent 重复展示。
+  const [localUsage, setLocalUsage] = useState<LocalUsageOverview | null>(null);
+  const [localUsageRange, setLocalUsageRange] = useState<AiUsageRange>('7d');
+  const [localUsageBusy, setLocalUsageBusy] = useState(false);
+  const [inferenceGateway, setInferenceGateway] = useState<InferenceGatewayStatus | null>(null);
+  const [bindingModeBusy, setBindingModeBusy] = useState(false);
+  const [gatewayBusy, setGatewayBusy] = useState(false);
   const [aiConnectionsTab, setAiConnectionsTab] = useState<AiConnectionsTab>(settingsWindow?.aiTab || 'mcp');
   const [aiOperation, setAiOperation] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
@@ -236,8 +245,15 @@ function AgentApp() {
   useEffect(() => { workflowCenterSnapshot.current = workflowCenter; }, [workflowCenter]);
   const [capabilities, setCapabilities] = useState<CapabilityItem[]>([]);
   const [pluginCatalog, setPluginCatalog] = useState<import('./services/agentApi').PluginCatalogItem[]>([]);
+  const [instructionPacks, setInstructionPacks] = useState<InstructionPackCatalogItem[]>([]);
+  const [instructionPackError, setInstructionPackError] = useState<string | null>(null);
+  const [experts, setExperts] = useState<ExpertSummary[]>([]);
+  const [expertCatalog, setExpertCatalog] = useState<ExpertCatalogItem[]>([]);
+  const [activeExpert, setActiveExpert] = useState<{ expert_id: string; version: string } | null>(null);
   const [pluginDrafts, setPluginDrafts] = useState<AuthoringPluginDraft[]>([]);
   const [workflowDrafts, setWorkflowDrafts] = useState<AuthoringWorkflowDraft[]>([]);
+  const [expertDrafts, setExpertDrafts] = useState<import('./services/agentApi').ExpertAuthoringDraft[]>([]);
+  const [instructionDrafts, setInstructionDrafts] = useState<InstructionPackDraft[]>([]);
   const [workflowSubmissions, setWorkflowSubmissions] = useState<AuthoringWorkflowDraft[]>([]);
   const [pluginSubmissions, setPluginSubmissions] = useState<PluginSubmissionStatus[]>([]);
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogResponse | null>(null);
@@ -383,6 +399,106 @@ function AgentApp() {
   }
   async function refreshAIServices() {
     return singleFlight('ai-services', async () => { setAiServices(await agentApi.listAIServices()); });
+  }
+  /**
+   * 本机用量与网关状态一起读：面板需要同时知道「有没有数据」和
+   * 「哪些客户端根本没走网关」，否则会把看不见读成没消耗。
+   */
+  async function refreshLocalUsage(options?: { force?: boolean; range?: AiUsageRange }) {
+    const range = options?.range ?? localUsageRange;
+    setLocalUsageBusy(true);
+    try {
+      await singleFlight(`local-usage:${range}`, async () => {
+        const [usage, gateway] = await Promise.all([
+          agentApi.localUsageOverview(range),
+          agentApi.inferenceGatewayStatus(),
+        ]);
+        setLocalUsage(usage);
+        setInferenceGateway(gateway);
+      }, { force: options?.force });
+    } catch (error) {
+      console.error('本机用量读取失败', error);
+      setLocalUsage(null);
+    } finally {
+      setLocalUsageBusy(false);
+    }
+  }
+  function changeLocalUsageRange(range: AiUsageRange) {
+    setLocalUsageRange(range);
+    void refreshLocalUsage({ range, force: true });
+  }
+  /**
+   * P1 的最小入口：把 Codex 切到本机网关。真正的「服务 × 客户端」矩阵
+   * 属 P2（ADR 0113 分期），这里先让这条链路可用、可验证。
+   */
+  async function bindCodexToGateway() {
+    setBindingModeBusy(true);
+    try {
+      await setClientBindingMode('codex', 'gateway');
+    } finally {
+      setBindingModeBusy(false);
+    }
+  }
+  /** 注入模式切换：客户端配置、网关绑定与用量口径会同时变化，一起回读。 */
+  async function setClientBindingMode(target: string, mode: 'gateway' | 'direct', service?: string) {
+    try {
+      await agentApi.setProviderBindingMode(target, mode, service);
+      notify('success', mode === 'gateway' ? `${target} 已切换到本机网关` : `${target} 已切回直连`);
+      await Promise.all([refreshInferenceGateway(), refreshAIServices(), refreshLocalUsage({ force: true })]);
+    } catch (error) {
+      notify('error', formatError(error, mode === 'gateway' ? '切换到本机网关失败' : '切回直连失败'));
+    }
+  }
+  async function refreshInferenceGateway() {
+    try {
+      setInferenceGateway(await agentApi.inferenceGatewayStatus());
+    } catch (error) {
+      console.error('本机网关状态读取失败', error);
+    }
+  }
+  /**
+   * 重启用于端口被释放或异常退出之后的恢复；失败不弹成功，只把真实原因带回界面。
+   */
+  async function restartGateway() {
+    setGatewayBusy(true);
+    try {
+      setInferenceGateway(await agentApi.restartInferenceGateway());
+      notify('success', '本机网关已重启');
+    } catch (error) {
+      notify('error', formatError(error, '重启本机网关失败'));
+      await refreshInferenceGateway();
+    } finally {
+      setGatewayBusy(false);
+    }
+  }
+  /**
+   * 停用网关必须先把客户端切回直连：先停监听会留下一批指向空端口、
+   * 连不上上游的客户端，而用户看不出这两件事的因果关系。
+   */
+  async function stopGatewayAndUnbind() {
+    const affected = inferenceGateway?.gateway_clients.length ?? 0;
+    const accepted = await confirm({
+      title: '停用本机网关？',
+      description: affected
+        ? `会把 ${affected} 个走网关的工具切回直连，然后停止监听。`
+        : '当前没有工具走网关，将只停止监听。',
+      confirmText: '停用',
+    });
+    if (!accepted) return;
+    setGatewayBusy(true);
+    try {
+      const report = await agentApi.stopInferenceGatewayAndUnbind();
+      if (report.failures.length) {
+        notify('error', `${report.failures.length} 个工具没能切回直连，网关保持运行`);
+      } else {
+        notify('success', report.stopped ? '本机网关已停用' : '本机网关本来就没有运行');
+      }
+      await Promise.all([refreshInferenceGateway(), refreshAIServices(), refreshLocalUsage({ force: true })]);
+    } catch (error) {
+      notify('error', formatError(error, '停用本机网关失败'));
+    } finally {
+      setGatewayBusy(false);
+    }
   }
   // 预设目录读不到时回落内置兜底列表，不让它拖垮 AI 页其他数据。
   async function refreshAIServiceTemplates() {
@@ -543,10 +659,33 @@ function AgentApp() {
           setPluginCatalogError(formatError(catalogResult.reason, '插件市场暂不可用'));
           console.error('Plugin catalog unavailable', catalogResult.reason);
         }
+        // 项目规则目录由工作台提供。独立模式仍可使用本地市场能力，
+        // 但不应把工作台连接错误暴露成市场页错误。
+        if (dashboardEnabled()) {
+          try {
+            const instructionCatalog = await withTimeout(agentApi.instructionPackCatalog(), '项目规则市场', 30000);
+            setInstructionPacks(Array.isArray(instructionCatalog) ? instructionCatalog : []);
+            setInstructionPackError(null);
+          } catch (error) {
+            setInstructionPacks([]);
+            setInstructionPackError(formatError(error, '项目规则市场暂不可用'));
+            console.error('InstructionPack catalog unavailable', error);
+          }
+        } else {
+          setInstructionPacks([]);
+          setInstructionPackError(null);
+        }
       } finally {
         setPluginsLoading(false);
       }
     });
+  }
+
+  async function refreshExperts() {
+    const [items, active, catalog] = await Promise.all([agentApi.experts(), agentApi.activeExpert(), agentApi.expertCatalog().catch(() => [])]);
+    setExperts(Array.isArray(items) ? items : []);
+    setActiveExpert(active ? { expert_id: active.expert_id, version: active.version } : null);
+    setExpertCatalog(Array.isArray(catalog) ? catalog : []);
   }
 
   async function refreshWorkflowCenter(light = false) {
@@ -730,11 +869,13 @@ function AgentApp() {
   async function refreshDevelopment(force = false) {
     return singleFlight('development', async () => {
       try {
-      const [projects, pluginDraftResult, skillDraftResult, workflowDraftResult] = await Promise.allSettled([
+      const [projects, pluginDraftResult, skillDraftResult, workflowDraftResult, expertDraftResult, instructionDraftResult] = await Promise.allSettled([
       withTimeout(agentApi.extensionProjects(), '扩展项目'),
       withTimeout(agentApi.pluginDrafts(), '插件草稿'),
       withTimeout(agentApi.skillDrafts(), '技能草稿'),
       withTimeout(agentApi.workflowDrafts(), '工作流草稿'),
+      withTimeout(agentApi.expertDrafts(), '专家草稿'),
+      withTimeout(agentApi.instructionPackDrafts(), '项目规则草稿'),
     ]);
     try { setExtensionWorkspace(await agentApi.extensionWorkspace()); }
     catch (error) { console.error('Extension workspace unavailable', error); }
@@ -756,6 +897,8 @@ function AgentApp() {
     if (pluginDraftResult.status === 'fulfilled') setPluginDrafts(pluginDraftResult.value || []);
     if (skillDraftResult.status === 'fulfilled') setSkillDrafts(skillDraftResult.value || []);
     if (workflowDraftResult.status === 'fulfilled') setWorkflowDrafts(workflowDraftResult.value || []);
+    if (expertDraftResult.status === 'fulfilled') setExpertDrafts(expertDraftResult.value || []);
+    if (instructionDraftResult.status === 'fulfilled') setInstructionDrafts(instructionDraftResult.value || []);
     if (!dashboardEnabled()) {
       setExtensionRemoteProjects([]);
       setPluginSubmissions([]);
@@ -909,6 +1052,7 @@ function AgentApp() {
       refreshExtensionSourceSettings(),
       refreshPluginRegistry(),
       refreshWorkflowCenter(),
+      refreshExperts(),
     ]);
     for (const result of results) {
       if (result.status === 'rejected') throw result.reason;
@@ -990,9 +1134,9 @@ function AgentApp() {
 
   useEffect(() => {
     const operation = page === 'dashboard'
-      ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings(), refreshProjectionSyncStatus()])
+      ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings(), refreshProjectionSyncStatus(), refreshLocalUsage()])
       : page === 'ai'
-        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext()])
+        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext(), refreshInferenceGateway()])
         : page === 'inbox'
           ? Promise.all([refreshApprovals(), refreshWorkflowCenter()])
         : page === 'approvals'
@@ -1028,7 +1172,9 @@ function AgentApp() {
       // 设置窗口里 F5 只刷当前这一块：运行日志页签和主窗口用的是同一份数据。
       if (page === 'settings' && settingsTab === 'logs') tasks.push(refreshLogs());
       if (page === 'dashboard' || page === 'ai') tasks.push(refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings());
+      if (page === 'dashboard') tasks.push(refreshLocalUsage({ force: true }));
       if (page === 'ai') tasks.push(refreshAIServices(), refreshAIServiceTemplates(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext());
+      if (page === 'ai') tasks.push(refreshInferenceGateway());
       if (page === 'installed') tasks.push(refreshPlugins(), refreshSkills(), refreshExtensionDesiredState());
       if (page === 'extensions') tasks.push(refreshExtensionSurfaces(), refreshExtensionDesiredState());
       if (page === 'development') tasks.push(refreshDevelopment());
@@ -1718,6 +1864,10 @@ function AgentApp() {
       approvals={approvals}
       remoteExecutionSettings={remoteExecutionSettings}
       mcpTargets={mcpTargets}
+      localUsage={localUsage}
+      localUsageRange={localUsageRange}
+      localUsageBusy={localUsageBusy}
+      inferenceGateway={inferenceGateway}
       identity={dashboardIdentity}
       authorization={dashboardAuthorization}
       identityBusy={aiOperation === 'identity'}
@@ -1731,6 +1881,10 @@ function AgentApp() {
       onOpenAuthorization={() => run(agentApi.openDashboardAuthorizationPage)}
       onRefreshIdentity={() => run(refreshDashboardIdentity)}
       onRevokeAuthorization={revokeDashboardAuthorization}
+      onLocalUsageRangeChange={changeLocalUsageRange}
+      onRefreshLocalUsage={() => void refreshLocalUsage({ force: true })}
+      onBindCodexToGateway={() => void bindCodexToGateway()}
+      bindingModeBusy={bindingModeBusy}
       onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')}
       onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)}
       onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)}
@@ -1746,6 +1900,11 @@ function AgentApp() {
       busyAction={aiOperation}
       aiServices={aiServices}
       aiServiceTemplates={aiServiceTemplates}
+      gatewayStatus={inferenceGateway}
+      onSetBindingMode={setClientBindingMode}
+      gatewayBusy={gatewayBusy}
+      onRestartGateway={() => void restartGateway()}
+      onStopGateway={() => void stopGatewayAndUnbind()}
       acpProfiles={acpRuntimeProfiles}
       onOpenAccount={() => setPage('dashboard')}
       targets={mcpTargets}
@@ -1804,12 +1963,27 @@ function AgentApp() {
       loading={pluginsLoading || workflowLoading || extensionSourcesLoading}
       errors={[
         pluginCatalogError ? { module: '插件', message: pluginCatalogError } : null,
+        instructionPackError ? { module: '项目规则', message: instructionPackError } : null,
         skillMarketError ? { module: '技能市场', message: skillMarketError } : null,
         workflowError ? { module: '工作流', message: workflowError } : null,
         skillError ? { module: '技能', message: skillError } : null,
         extensionSourcesError ? { module: '来源', message: extensionSourcesError } : null,
       ].filter((item): item is MarketLoadError => item !== null)}
       plugins={pluginCatalog}
+      instructionPacks={instructionPacks}
+      experts={experts}
+      expertCatalog={expertCatalog}
+      activeExpert={activeExpert ? `${activeExpert.expert_id}@${activeExpert.version}` : ''}
+      onRefreshExperts={refreshExperts}
+      onActivateExpert={async (id, version) => {
+        try {
+          const activation = await agentApi.activateExpert(id, version);
+          setActiveExpert({ expert_id: activation.expert_id, version: activation.version });
+          notify('success', '专家已切换');
+        } catch (error) { notify('error', formatError(error, '切换专家失败')); throw error; }
+      }}
+      onNotify={(message, tone = 'success') => notify(tone, message)}
+      onInstallMarketExpert={async item => { try { await agentApi.installExpertMarket(item.expert_id, item.version, item.artifact_id, item.sha256); await refreshExperts(); notify('success', '专家已安装'); } catch (error) { notify('error', formatError(error, '安装专家失败')); throw error; } }}
       installedPlugins={pluginRegistry?.items || []}
       skills={organizationSkills}
       installedSkills={skillStatus?.items || []}
@@ -1836,7 +2010,7 @@ function AgentApp() {
       onMcpRequestHandled={() => setOpenMcpRequest(0)}
       onManageMcp={() => openInstalled('mcp')}
       onInstallUnit={installExtensionUnit}
-      onOpenKind={(kind) => openInstalled(kind === 'plugin' ? 'plugin' : kind === 'skill' ? 'skill' : 'workflow')}
+      onOpenKind={(kind) => openInstalled(kind === 'plugin' ? 'plugin' : kind === 'skill' ? 'skill' : kind === 'expert' ? 'expert' : 'workflow')}
       onPlanPlugin={agentApi.planPluginInstall}
       onInstallPlugin={async (pluginId, version, source, artifactId, sha256) => { try { await agentApi.installPlugin(pluginId, version, source, artifactId, sha256); await refreshExtensionSurfaces(); await invalidateBuiltinAiToolContext(); notify('success', `已安装插件${version ? ` v${version}` : ''}`); } catch (error) { notify('error', formatError(error, '安装插件失败')); } }}
       onPlanSkill={agentApi.planOrganizationSkillInstall}
@@ -1847,6 +2021,14 @@ function AgentApp() {
       onLoadSkillVersions={agentApi.skillVersions}
       onLoadWorkflowVersions={agentApi.workflowVersions}
       onInstallWorkflow={async (workflowId, version, source, artifactId, sha256) => { try { await agentApi.installWorkflowCatalogItem(workflowId, version, source, artifactId, sha256); await refreshWorkflowCenter(); notify('success', `已安装工作流 v${version}`); } catch (error) { notify('error', formatError(error, '安装工作流失败')); } }}
+      onInstallInstructionPack={async (id, version, artifactId, sha256) => {
+        try {
+          await agentApi.installInstructionPackMarket(id, version, artifactId, sha256);
+          notify('success', '已导入项目规则草稿，请前往扩展开发的规则库完成确认和发布');
+        } catch (error) {
+          notify('error', formatError(error, '导入项目规则失败'));
+        }
+      }}
       onBatchUpdateFinished={async () => { await refreshExtensionSurfaces(); await refreshExtensionDesiredState(); await invalidateBuiltinAiToolContext(); }}
     />;
     if (page === 'workflows') return <WorkflowsPage
@@ -1935,11 +2117,13 @@ function AgentApp() {
         plugin: userInstalledPlugins(pluginRegistry?.items || [], extensionDesiredState, dashboardEnabled()).length,
         skill: installedSkills(skillStatus, extensionDesiredState, organizationSkills, dashboardEnabled()).length,
         workflow: (workflowCenter?.workflows || []).length,
+        expert: experts.length,
+        instruction: instructionDrafts.length,
         mcp: mcp.servers.length,
         policy: managedItems(extensionDesiredState, pluginRegistry, skillStatus).length,
       }}
     >
-      {installedKind === 'plugin' ? <PluginsPage
+      {installedKind === 'instruction' ? <InstructionProjectionPanel embedded clientsTab={false} workspaceRoot="" onLibraryChanged={() => { void refreshDevelopment(); }} onMaterializeToWorkspace={async (draft) => { await agentApi.materializeInstructionProject(extensionWorkspace.root, draft.manifest.id, draft.manifest.version); await Promise.all([refreshDevelopment(), refreshExtensionProjects()]); }} /> : installedKind === 'expert' ? <ExpertStudioPanel experts={experts} activeExpert={activeExpert ? `${activeExpert.expert_id}@${activeExpert.version}` : ''} onRefresh={refreshExperts} onActivate={async (id, version) => { const activation = await agentApi.activateExpert(id, version); setActiveExpert({ expert_id: activation.expert_id, version: activation.version }); notify('success', '专家已切换'); }} onNotify={(message, tone = 'success') => notify(tone, message)} onMaterializeToWorkspace={async (expert) => { await agentApi.materializeExpertProject(extensionWorkspace.root, expert.id, expert.version); await Promise.all([refreshDevelopment(), refreshExtensionProjects()]); }} workspaceRoot={extensionWorkspace.root} showProjection showAuthoring={false} showMarket={false} /> : installedKind === 'plugin' ? <PluginsPage
       loading={pluginsLoading}
       registry={pluginRegistry}
       catalog={pluginCatalog}
@@ -2134,7 +2318,18 @@ function AgentApp() {
       pluginDrafts={pluginDrafts}
       skillDrafts={skillDrafts}
       workflowDrafts={workflowDrafts}
+      expertDrafts={expertDrafts}
+      instructionDrafts={instructionDrafts}
       workflowSubmissions={workflowSubmissions}
+      experts={experts}
+      activeExpert={activeExpert ? `${activeExpert.expert_id}@${activeExpert.version}` : ''}
+      onRefreshExperts={refreshExperts}
+      onActivateExpert={async (id, version) => {
+        const activation = await agentApi.activateExpert(id, version);
+        setActiveExpert({ expert_id: activation.expert_id, version: activation.version });
+        notify('success', '专家已切换');
+      }}
+      onNotify={(message, tone = 'success') => notify(tone, message)}
       pluginSubmissions={pluginSubmissions}
       skillSubmissions={skillSubmissions}
       availablePlugins={availablePlugins}
@@ -2167,16 +2362,23 @@ function AgentApp() {
         } else if (candidate.kind === 'skill') {
           await agentApi.testSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
           await agentApi.confirmSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-        } else {
+        } else if (candidate.kind === 'workflow') {
           await agentApi.testWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
           await agentApi.confirmWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
+        } else if (candidate.kind === 'expert') {
+          await agentApi.testExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
+          await agentApi.confirmExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
+        } else {
+          await agentApi.testInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+          await agentApi.confirmInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
         }
         onProgress?.('refreshing');
         await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
       }, '构建完成，已在本机启用', '构建或启用失败')}
       onDevelopWithAi={(project) => { void openBuiltinAi(project); }}
       onDevelopWorkspaceWithAi={(root: string) => { void openExtensionWorkspaceAi(root); }}
-       onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else if (kind === 'skill') await agentApi.submitSkillDraft(extensionId, version); else await agentApi.submitWorkflowDraft(extensionId, version); await refreshDevelopment(); }, '已提交审核', '提交审核失败')}
+       onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else if (kind === 'skill') await agentApi.submitSkillDraft(extensionId, version); else if (kind === 'workflow') await agentApi.submitWorkflowDraft(extensionId, version); else if (kind === 'expert') await agentApi.submitExpertDraft(extensionId, version); else throw new Error('项目规则请发布到本机规则库'); await refreshDevelopment(); }, '已提交审核', '提交审核失败')}
+      onPublishInstruction={(extensionId: string, version: string) => runDevelopmentOperation(`publish-instruction:${extensionId}`, async () => { await agentApi.publishInstructionPackLocally(extensionId, version); await Promise.all([refreshDevelopment(), refreshPlugins()]); }, '已发布到本机规则库', '发布项目规则失败')}
       onOpenFolder={(path) => run(() => agentApi.openFolder(path), '项目目录已打开', '打开项目目录失败')}
       onAddWorkspace={addExtensionWorkspace}
       onRemoveWorkspace={removeExtensionWorkspace}

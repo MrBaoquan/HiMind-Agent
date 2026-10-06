@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::types::{StoredInnerAdminCredentials, StoredSvnConnection};
 
 const UNITY_EDITOR_WORKFLOW_ENV: &str = "unity_art_editor";
+const UNREAL_EDITOR_ENV: &str = "HIMIND_UNREAL_EDITOR";
 /// DPAPI 保护值的落盘前缀。备份要识别并重新封装这些值，所以它是 crate 内可见的。
 pub(crate) const DPAPI_PREFIX: &str = "dpapi:v1:";
 
@@ -16,9 +17,12 @@ pub(crate) fn protected_secret_is_current(value: &str) -> bool {
     value.starts_with(DPAPI_PREFIX)
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 struct LocalEditorSettings {
+    #[serde(default)]
     unity_editor_path: String,
+    #[serde(default)]
+    unreal_editor_path: String,
 }
 
 pub(crate) fn local_unity_editor_settings() -> Result<Value, Box<dyn Error>> {
@@ -46,7 +50,8 @@ pub(crate) fn local_unity_editor_settings() -> Result<Value, Box<dyn Error>> {
         "workflow_default_path": workflow_default_path,
         "discovered_path": discovered_path,
         "source": source,
-        "valid": !path.is_empty() && PathBuf::from(&path).is_file()
+        "valid": !path.is_empty() && PathBuf::from(&path).is_file(),
+        "unreal": unreal_editor_settings_value()?,
     }))
 }
 
@@ -56,7 +61,58 @@ pub(crate) fn configured_unity_editor_path() -> Option<String> {
     (!path.is_empty() && PathBuf::from(path).is_file()).then(|| path.to_string())
 }
 
+pub(crate) fn configured_unreal_editor_path() -> Option<String> {
+    let settings = load_local_editor_settings().ok()?;
+    let path = settings.unreal_editor_path.trim();
+    (!path.is_empty() && PathBuf::from(path).is_file()).then(|| path.to_string())
+}
+
+/// Unreal 编辑器没有团队环境变量之外的默认值，这里只描述「当前生效路径」，
+/// 让设置页能用和 Unity 一样的口径展示来源。
+fn unreal_editor_settings_value() -> Result<Value, Box<dyn Error>> {
+    let saved = load_local_editor_settings()?.unreal_editor_path;
+    let environment_path = unreal_editor_environment_path().unwrap_or_default();
+    let environment_valid =
+        !environment_path.is_empty() && PathBuf::from(&environment_path).is_file();
+    let saved_valid = !saved.trim().is_empty() && PathBuf::from(&saved).is_file();
+    let discovered_path = if !environment_valid && !saved_valid {
+        discovered_unreal_editor_path().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (path, source) = if environment_valid {
+        (environment_path.clone(), "environment")
+    } else if saved_valid {
+        (saved, "agent")
+    } else if !discovered_path.is_empty() {
+        (discovered_path.clone(), "discovered")
+    } else {
+        (String::new(), "unset")
+    };
+    Ok(json!({
+        "unreal_editor_path": path,
+        "environment_path": environment_path,
+        "discovered_path": discovered_path,
+        "source": source,
+        "valid": !path.is_empty() && PathBuf::from(&path).is_file(),
+    }))
+}
+
 pub(crate) fn save_local_unity_editor_path(path: &str) -> Result<Value, Box<dyn Error>> {
+    save_local_engine_editor_path("unity", path)
+}
+
+/// 引擎编辑器路径只覆盖「本机默认值」：团队环境变量优先级更高，不会被这里改写。
+pub(crate) fn save_local_engine_editor_path(
+    engine: &str,
+    path: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let engine = engine.trim().to_ascii_lowercase();
+    let expected = match engine.as_str() {
+        "unity" => "Unity.exe",
+        "unreal" => "UnrealEditor.exe",
+        other => return Err(format!("不支持的引擎类型：{other}").into()),
+    };
     let normalized = path.trim();
     if !normalized.is_empty() {
         let editor = PathBuf::from(normalized);
@@ -64,18 +120,19 @@ pub(crate) fn save_local_unity_editor_path(path: &str) -> Result<Value, Box<dyn 
             || !editor
                 .file_name()
                 .and_then(|value| value.to_str())
-                .map(|value| value.eq_ignore_ascii_case("Unity.exe"))
+                .map(|value| value.eq_ignore_ascii_case(expected))
                 .unwrap_or(false)
         {
-            return Err("请选择有效的 Unity.exe".into());
+            return Err(format!("请选择有效的 {expected}").into());
         }
     }
-    fs::write(
-        editor_settings_path()?,
-        serde_json::to_vec(&LocalEditorSettings {
-            unity_editor_path: normalized.to_string(),
-        })?,
-    )?;
+    let mut settings = load_local_editor_settings()?;
+    if engine == "unity" {
+        settings.unity_editor_path = normalized.to_string();
+    } else {
+        settings.unreal_editor_path = normalized.to_string();
+    }
+    fs::write(editor_settings_path()?, serde_json::to_vec_pretty(&settings)?)?;
     local_unity_editor_settings()
 }
 
@@ -124,6 +181,118 @@ fn unity_editor_path_matches_version(path: &Path, version: &str) -> bool {
             .to_string_lossy()
             .eq_ignore_ascii_case(version)
     })
+}
+
+pub(crate) fn unreal_editor_environment_path() -> Option<String> {
+    env::var(UNREAL_EDITOR_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn discovered_unreal_editor_path() -> Option<String> {
+    unreal_editor_candidates()
+        .into_iter()
+        .max_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()))
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn unreal_editor_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in [
+        PathBuf::from(r"C:\Program Files\Epic Games"),
+        PathBuf::from(r"C:\Program Files (x86)\Epic Games"),
+    ] {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path().join(r"Engine\Binaries\Win64\UnrealEditor.exe");
+            if path.is_file() {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    candidates.dedup();
+    candidates
+}
+
+/// 本机引擎清单只做只读枚举，供设置页展示「装了哪些版本」。
+/// 顺序保持稳定，Unity 在前、Unreal 在后，同引擎内按路径排序。
+pub(crate) fn engine_installations_value() -> Value {
+    let mut items = Vec::new();
+    for path in unity_editor_candidates_all() {
+        items.push(json!({
+            "engine": "unity",
+            "version": unity_version_from_path(&path),
+            "path": path.to_string_lossy(),
+            "source": "discovered",
+        }));
+    }
+    for path in unreal_editor_candidates() {
+        items.push(json!({
+            "engine": "unreal",
+            "version": unreal_version_from_path(&path),
+            "path": path.to_string_lossy(),
+            "source": "discovered",
+        }));
+    }
+    Value::Array(items)
+}
+
+fn unity_editor_candidates_all() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in unity_editor_install_roots() {
+        for path in unity_editor_candidates(&root) {
+            if path.is_file() {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    candidates.dedup();
+    candidates
+}
+
+fn unity_version_from_path(path: &Path) -> String {
+    for component in path.components().rev() {
+        let raw = component.as_os_str().to_string_lossy().to_string();
+        if raw.eq_ignore_ascii_case("Editor")
+            || raw.eq_ignore_ascii_case("Hub")
+            || raw.eq_ignore_ascii_case("Unity.exe")
+        {
+            continue;
+        }
+        let value = raw.strip_prefix("Unity ").unwrap_or(&raw);
+        if value.chars().next().is_some_and(|first| first.is_ascii_digit())
+            && value.contains('.')
+        {
+            return value.to_string();
+        }
+    }
+    String::new()
+}
+
+fn unreal_version_from_path(path: &Path) -> String {
+    for component in path.components().rev() {
+        let raw = component.as_os_str().to_string_lossy().to_string();
+        if raw.eq_ignore_ascii_case("UnrealEditor.exe")
+            || raw.eq_ignore_ascii_case("Win64")
+            || raw.eq_ignore_ascii_case("Binaries")
+            || raw.eq_ignore_ascii_case("Engine")
+        {
+            continue;
+        }
+        let value = raw
+            .strip_prefix("UE_")
+            .or_else(|| raw.strip_prefix("ue_"))
+            .unwrap_or(&raw);
+        if value.chars().next().is_some_and(|first| first.is_ascii_digit()) {
+            return value.to_string();
+        }
+    }
+    String::new()
 }
 
 fn find_unity_editor_in_roots(roots: &[PathBuf]) -> Option<PathBuf> {
@@ -354,9 +523,7 @@ fn editor_settings_path() -> Result<PathBuf, Box<dyn Error>> {
 fn load_local_editor_settings() -> Result<LocalEditorSettings, Box<dyn Error>> {
     let path = editor_settings_path()?;
     if !path.exists() {
-        return Ok(LocalEditorSettings {
-            unity_editor_path: String::new(),
-        });
+        return Ok(LocalEditorSettings::default());
     }
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }

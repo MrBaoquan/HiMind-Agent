@@ -220,8 +220,8 @@ export function TaskCenterPage({ currentTask, dashboardEnabled, onLoadTaskHistor
   return (
     <div className="task-center-page">
       <PageHeader
-        title="活动"
-        description={dashboardEnabled ? '查看工作台任务与本机运行记录。' : '查看本机运行记录。'}
+        title="我的任务"
+        description={dashboardEnabled ? '查看 AI 对话、自动化工作流和工作台发起的任务。' : '查看 AI 对话和本机自动化工作流发起的任务。'}
         actions={dashboardEnabled ? <button type="button" className="btn btn-primary" onClick={onOpenDashboard}><ExternalLink size={15} />打开工作台</button> : undefined}
       />
 

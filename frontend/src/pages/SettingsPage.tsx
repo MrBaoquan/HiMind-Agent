@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { agentApi, type AgentBackupExportReport, type AgentBackupInspectReport, type AgentBackupRestoreReport, type AgentBackupScope, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type GithubAccountStatus, type GithubAppAuthorization, type GithubAppInstallation, type LogItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe } from '../services/agentApi';
+import { agentApi, type AgentBackupExportReport, type AgentBackupInspectReport, type AgentBackupRestoreReport, type AgentBackupScope, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type EngineInstallation, type GithubAccountStatus, type GithubAppAuthorization, type GithubAppInstallation, type LogItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe } from '../services/agentApi';
 import { Bell, BellOff, Bot, Check, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Github, Globe2, Inbox, KeyRound, Link2, LockKeyhole, LogIn, Monitor, MoreHorizontal, PencilLine, PlugZap, Power, RefreshCw, RotateCcw, ScanSearch, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { useConfirm } from '../components/ConfirmDialog';
@@ -442,6 +442,8 @@ export function SettingsPage({
   };
   const [unityEditorPath, setUnityEditorPath] = useState('');
   const [unityEditorSettings, setUnityEditorSettings] = useState<UnityEditorSettings | null>(null);
+  const [unrealEditorPath, setUnrealEditorPath] = useState('');
+  const [engineInstallations, setEngineInstallations] = useState<EngineInstallation[]>([]);
   const [editorFeedback, setEditorFeedback] = useState('');
   const [editorSaving, setEditorSaving] = useState(false);
   const [pendingRemoteRuntimeUnrestricted, setPendingRemoteRuntimeUnrestricted] = useState<RemoteExecutionSettings | null>(null);
@@ -476,7 +478,17 @@ export function SettingsPage({
   useEffect(() => {
     setUnityEditorSettings(settings?.editors || null);
     setUnityEditorPath(settings?.editors?.unity_editor_path || '');
+    setUnrealEditorPath(settings?.editors?.unreal?.unreal_editor_path || '');
   }, [settings?.editors]);
+  // 本机引擎清单要扫安装目录，只在真正打开「开发工具」时读一次，避免每次设置刷新都扫盘。
+  useEffect(() => {
+    if (section !== 'tooling' || settingsSectionTabFor(section, tab) !== 'tools') return;
+    let cancelled = false;
+    void agentApi.engineInstallations()
+      .then(items => { if (!cancelled) setEngineInstallations(items); })
+      .catch(() => { if (!cancelled) setEngineInstallations([]); });
+    return () => { cancelled = true; };
+  }, [section, tab]);
   // GitHub 授权状态只在账号页出现时才读取，避免设置窗口打开就产生额外 IPC。
   useEffect(() => {
     if (section !== 'accounts') return;
@@ -638,26 +650,29 @@ export function SettingsPage({
       setBackupBusy('');
     }
   };
-  async function chooseUnityEditor() {
-    const result = await agentApi.pickUnityEditor();
-    if (result.path) {
-      setUnityEditorPath(result.path);
-      // 选择路径即保存，不再要求用户再点一次保存按钮。
-      await saveUnityEditor(result.path);
-    }
+  async function chooseEngineEditor(engine: 'unity' | 'unreal') {
+    const result = await agentApi.pickEngineEditor(engine);
+    if (!result.path) return;
+    if (engine === 'unity') setUnityEditorPath(result.path);
+    else setUnrealEditorPath(result.path);
+    // 选择路径即保存，不再要求用户再点一次保存按钮。
+    await saveEngineEditor(engine, result.path);
   }
 
-  async function saveUnityEditor(path = unityEditorPath) {
+  async function saveEngineEditor(engine: 'unity' | 'unreal', path: string) {
     setEditorSaving(true);
     setEditorFeedback('');
+    const label = engine === 'unity' ? 'Unity 编辑器' : 'Unreal 编辑器';
     try {
-      const result = await agentApi.saveUnityEditor(path);
+      const result = await agentApi.saveEngineEditor(engine, path);
       onUnityEditorSettingsChange(result);
       setUnityEditorSettings(result);
       setUnityEditorPath(result.unity_editor_path);
-      setEditorFeedback(path ? '已保存' : ['environment', 'discovered'].includes(result.source) ? '已恢复默认编辑器' : '已清除设置，当前没有可用编辑器');
+      setUnrealEditorPath(result.unreal?.unreal_editor_path || '');
+      const source = engine === 'unity' ? result.source : result.unreal?.source;
+      setEditorFeedback(path ? `${label}已保存` : ['environment', 'discovered'].includes(source || '') ? `${label}已恢复默认` : `${label}已清除`);
     } catch {
-      setEditorFeedback('无法保存，请确认 Unity.exe 路径后重试');
+      setEditorFeedback(engine === 'unity' ? '无法保存，请确认 Unity.exe 路径' : '无法保存，请确认 UnrealEditor.exe 路径');
     } finally {
       setEditorSaving(false);
     }
@@ -710,9 +725,11 @@ export function SettingsPage({
   if (!settings || !remoteExecutionSettings || !loginState) return <div className="page-loading"><BusyIndicator size={15} />正在读取应用设置</div>;
   const configured = loginState.status === 'credentials_configured';
   const editorState = unityEditorSettings || settings.editors;
+  const unrealState = editorState?.unreal;
   const editorDirty = unityEditorPath.trim() !== (editorState?.unity_editor_path || '');
-  const editorStatus = editorState?.valid ? '可用' : editorState?.source === 'unset' ? '未配置' : '路径不可用';
-  const editorSource = editorState?.source === 'agent' ? '自定义' : editorState?.source === 'environment' ? '团队默认' : editorState?.source === 'discovered' ? '本机安装' : '未设置';
+  const unrealDirty = unrealEditorPath.trim() !== (unrealState?.unreal_editor_path || '');
+  const editorStatus = editorState?.valid && unrealState?.valid ? '可用' : editorState?.valid || unrealState?.valid ? '部分可用' : '未配置';
+  const engineSourceLabel = (source?: string) => source === 'agent' ? '自定义' : source === 'environment' ? '团队默认' : source === 'discovered' ? '本机安装' : '未设置';
   const updateRemoteExecution = (patch: Partial<RemoteExecutionSettings>) => {
     const next = { ...remoteExecutionSettings, ...patch };
     const enteringFullAccess = next.access_mode === 'full_access'
@@ -1052,24 +1069,30 @@ export function SettingsPage({
           </section> : null}
 
           {section === 'tooling' && activeTab === 'tools' ? <section className="card settings-section unity-editor-card">
-            <div className="card-header"><span>Unity 编辑器</span><Pill kind={editorState?.valid ? 'success' : 'warn'}>{editorStatus}</Pill></div>
+            <div className="card-header"><span>引擎与编辑器</span><Pill kind={editorState?.valid || unrealState?.valid ? 'success' : 'warn'}>{editorStatus}</Pill></div>
             <div className="unity-editor-body">
-              <div className="unity-editor-source">
-                <div><span>当前来源</span><strong>{editorSource}</strong></div>
-                <small>{editorState?.source === 'environment' ? '当前使用团队提供的默认编辑器。' : editorState?.source === 'discovered' ? '已从本机常规安装目录发现 Unity 编辑器。' : '没有团队默认编辑器时，可以在此选择 Unity.exe。'}</small>
-              </div>
-              <label className="unity-editor-field" htmlFor="unity-editor-path">
-                <span>Unity.exe 路径</span>
+              <div className="engine-editor-row">
+                <div className="engine-editor-head"><strong>Unity</strong><Pill kind={editorState?.valid ? 'success' : 'warn'}>{engineSourceLabel(editorState?.source)}</Pill></div>
                 <div className="unity-editor-input">
-                  <input id="unity-editor-path" value={unityEditorPath} onChange={event => { setUnityEditorPath(event.target.value); setEditorFeedback(''); }} onBlur={() => { if (editorDirty && unityEditorPath.trim()) void saveUnityEditor(); }} placeholder="请选择 Unity.exe" />
-                  <button className="btn btn-icon" title="选择 Unity.exe" aria-label="选择 Unity.exe" disabled={editorSaving} onClick={chooseUnityEditor}>{editorSaving ? <BusyIndicator size={16} /> : <FolderOpen size={16} />}</button>
+                  <input aria-label="Unity.exe 路径" value={unityEditorPath} onChange={event => { setUnityEditorPath(event.target.value); setEditorFeedback(''); }} onBlur={() => { if (editorDirty && unityEditorPath.trim()) void saveEngineEditor('unity', unityEditorPath); }} placeholder="请选择 Unity.exe" />
+                  <button type="button" className="btn btn-icon" title="选择 Unity.exe" aria-label="选择 Unity.exe" disabled={editorSaving} onClick={() => void chooseEngineEditor('unity')}><FolderOpen size={16} /></button>
+                  <button type="button" className="btn btn-icon" title="恢复 Unity 默认" aria-label="恢复 Unity 默认" disabled={editorSaving || (!editorDirty && editorState?.source !== 'agent')} onClick={() => void saveEngineEditor('unity', '')}><RotateCcw size={16} /></button>
                 </div>
-              </label>
+              </div>
+              <div className="engine-editor-row">
+                <div className="engine-editor-head"><strong>Unreal</strong><Pill kind={unrealState?.valid ? 'success' : 'warn'}>{engineSourceLabel(unrealState?.source)}</Pill></div>
+                <div className="unity-editor-input">
+                  <input aria-label="UnrealEditor.exe 路径" value={unrealEditorPath} onChange={event => { setUnrealEditorPath(event.target.value); setEditorFeedback(''); }} onBlur={() => { if (unrealDirty && unrealEditorPath.trim()) void saveEngineEditor('unreal', unrealEditorPath); }} placeholder="请选择 UnrealEditor.exe" />
+                  <button type="button" className="btn btn-icon" title="选择 UnrealEditor.exe" aria-label="选择 UnrealEditor.exe" disabled={editorSaving} onClick={() => void chooseEngineEditor('unreal')}><FolderOpen size={16} /></button>
+                  <button type="button" className="btn btn-icon" title="恢复 Unreal 默认" aria-label="恢复 Unreal 默认" disabled={editorSaving || (!unrealDirty && unrealState?.source !== 'agent')} onClick={() => void saveEngineEditor('unreal', '')}><RotateCcw size={16} /></button>
+                </div>
+              </div>
+              {engineInstallations.length ? <div className="engine-installation-list">
+                <span>本机已安装</span>
+                <div>{engineInstallations.map(item => <button type="button" key={`${item.engine}-${item.version}-${item.path}`} className="engine-installation" title={item.path} disabled={editorSaving} onClick={() => void saveEngineEditor(item.engine, item.path)}>{item.engine === 'unity' ? 'Unity' : 'Unreal'} {item.version || '未知版本'}</button>)}</div>
+              </div> : null}
               <div className="unity-editor-footer">
                 <span className={editorFeedback ? 'inline-feedback visible' : 'inline-feedback'}>{editorFeedback}</span>
-                <div className="unity-editor-actions">
-                  <button className="btn" disabled={editorSaving || (!editorDirty && editorState?.source !== 'agent')} onClick={() => saveUnityEditor('')}><RotateCcw size={15} />恢复默认</button>
-                </div>
               </div>
             </div>
           </section> : null}

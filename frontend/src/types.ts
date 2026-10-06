@@ -4,7 +4,7 @@ export type PageKey = 'dashboard' | 'builtin-ai' | 'ai' | 'approvals' | 'inbox' 
  * 「我的能力」页内的类型页签：三类可安装能力 + 组织策略。
  * 类型是页内页签，不再是侧栏项——市场负责获得，我的能力负责拥有。
  */
-  export type InstalledKind = 'plugin' | 'skill' | 'workflow' | 'mcp' | 'policy';
+export type InstalledKind = 'plugin' | 'skill' | 'workflow' | 'expert' | 'instruction' | 'mcp' | 'policy';
 
 /**
  * 页面级导航仍可直接传 PageKey；需要恢复任务上下文时传结构化目标。

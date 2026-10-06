@@ -2020,8 +2020,8 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                   /* 一个都没装时，右侧就是唯一的下一步：不写字面意义上的「请选择」，
                      而是在用户注意力最大的区域直接给出安装入口。 */
                   <div className="workflow-detail-body workflow-detail-empty">
-                    <EmptyState icon={Workflow} title="还没有安装工作流" text="到「市场」里浏览并安装，装好后就能在这里运行。" />
-                    <button type="button" className="btn btn-primary" onClick={onOpenExtensions}><Store size={14} />浏览市场里的工作流</button>
+                  <EmptyState icon={Workflow} title="还没有安装工作流" text="到「市场」里浏览并安装，装好后就能在这里运行。" />
+                    <button type="button" className="btn btn-primary" onClick={onOpenExtensions}><Store size={14} />去市场</button>
                   </div>
                 ) : <div className="workflow-detail-body"><EmptyState
                   icon={Workflow}

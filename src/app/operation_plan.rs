@@ -19,6 +19,8 @@ pub(crate) const OPERATION_PUBLISH: &str = "publish";
 pub(crate) const CAPABILITY_SKILL: &str = "skill";
 pub(crate) const CAPABILITY_PLUGIN: &str = "plugin";
 pub(crate) const CAPABILITY_WORKFLOW: &str = "workflow";
+pub(crate) const CAPABILITY_INSTRUCTION_PACK: &str = "instruction_pack";
+pub(crate) const CAPABILITY_EXPERT: &str = "expert";
 
 /// 写入 Agent 本机能力库（技能库 / 插件目录），没有额外投影目标。
 pub(crate) const STRATEGY_STORE: &str = "store";
@@ -377,6 +379,105 @@ pub(crate) fn workflow_install(
         id: "preflight".to_string(),
         title: "登记启动前检查".to_string(),
         detail: "记录依赖锁与制品摘要，供启动前检查与自动更新使用".to_string(),
+        mutating: true,
+    });
+    plan.blocked_reasons = blocked_reasons;
+    plan.finish()
+}
+
+/// InstructionPack 安装只进入本机草稿库，随后必须经过预检和用户确认。
+pub(crate) fn instruction_pack_install(
+    item: &crate::api::distribution::InstructionPackCatalogItem,
+    blocked_reasons: Vec<String>,
+) -> OperationPlan {
+    let mut plan = OperationPlan::new(
+        OPERATION_INSTALL,
+        CAPABILITY_INSTRUCTION_PACK,
+        PlanItem {
+            id: item.instruction_pack_id.clone(),
+            name: item.name.clone(),
+            version: item.version.clone(),
+            description: item.description.clone(),
+            source: item.source.clone(),
+            artifact_id: item.artifact_id.clone(),
+            sha256: item.sha256.clone(),
+            size_bytes: item.file_size,
+        },
+    );
+    plan.targets.push(PlanTarget {
+        kind: TARGET_KIND_AGENT.to_string(),
+        id: "himind-agent".to_string(),
+        label: "HiMind Agent 指令包草稿库".to_string(),
+        destination: "instruction-pack-drafts".to_string(),
+        scope: SCOPE_AGENT.to_string(),
+        strategy: STRATEGY_STORE.to_string(),
+        detected: false,
+    });
+    plan.steps.push(PlanStep {
+        id: "resolve".to_string(),
+        title: "校验来源与摘要".to_string(),
+        detail: format!(
+            "下载 {} {} 并校验 SHA-256 与发布签名",
+            item.name, item.version
+        ),
+        mutating: false,
+    });
+    plan.steps.push(PlanStep {
+        id: "import".to_string(),
+        title: "导入指令包草稿".to_string(),
+        detail: "写入本机 InstructionPack 草稿库并执行包完整性校验".to_string(),
+        mutating: true,
+    });
+    plan.steps.push(PlanStep {
+        id: "confirm".to_string(),
+        title: "等待用户确认".to_string(),
+        detail: "市场安装不会自动发布或写入 AGENTS.md/CLAUDE.md；确认后才能发布到本机".to_string(),
+        mutating: false,
+    });
+    plan.blocked_reasons = blocked_reasons;
+    plan.finish()
+}
+
+pub(crate) fn expert_install(
+    item: &crate::api::distribution::ExpertCatalogItem,
+    blocked_reasons: Vec<String>,
+) -> OperationPlan {
+    let mut plan = OperationPlan::new(
+        OPERATION_INSTALL,
+        CAPABILITY_EXPERT,
+        PlanItem {
+            id: item.expert_id.clone(),
+            name: item.name.clone(),
+            version: item.version.clone(),
+            description: item.description.clone(),
+            source: item.source.clone(),
+            artifact_id: item.artifact_id.clone(),
+            sha256: item.sha256.clone(),
+            size_bytes: item.file_size,
+        },
+    );
+    plan.targets.push(PlanTarget {
+        kind: TARGET_KIND_AGENT.to_string(),
+        id: "himind-experts".to_string(),
+        label: "HiMind Agent 专家库".to_string(),
+        destination: "experts".to_string(),
+        scope: SCOPE_AGENT.to_string(),
+        strategy: STRATEGY_STORE.to_string(),
+        detected: false,
+    });
+    plan.steps.push(PlanStep {
+        id: "resolve".to_string(),
+        title: "校验来源与摘要".to_string(),
+        detail: format!(
+            "下载 {} {} 并校验 SHA-256 与发布签名",
+            item.name, item.version
+        ),
+        mutating: false,
+    });
+    plan.steps.push(PlanStep {
+        id: "import".to_string(),
+        title: "导入专家".to_string(),
+        detail: "写入本机专家库，随后可在 AI 对话中选择".to_string(),
         mutating: true,
     });
     plan.blocked_reasons = blocked_reasons;

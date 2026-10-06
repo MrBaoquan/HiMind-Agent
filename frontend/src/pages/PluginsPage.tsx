@@ -124,7 +124,7 @@ export function PluginsPage({ loading, registry, catalog, desired, capabilities,
       {/* 页面标题归「我的能力」容器，这里只出这个类型自己的动作区。 */}
       <div className="plugin-toolbar"><div className="actions-row">
         <ActionMenu label="安装插件" icon={<Plus size={15} />} title="安装插件" panelWidth={208}>{close => <>
-          <ActionMenuItem icon={<Store size={15} />} label="浏览插件市场" onClick={() => { onOpenExtensions(); close(); }} />
+          <ActionMenuItem icon={<Store size={15} />} label="获取更多工具" onClick={() => { onOpenExtensions(); close(); }} />
           <div className="app-menu-separator" role="separator" />
           <ActionMenuItem icon={<ExternalLink size={15} />} label="从 GitHub 导入" onClick={() => { setGithubError(''); setGithubOpen(true); close(); }} />
           <ActionMenuItem icon={<FolderOpen size={15} />} label="从本地导入" onClick={() => { onImportLocal(); close(); }} />

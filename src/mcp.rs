@@ -445,6 +445,14 @@ fn handle_request_with_session(
         "prompts/list" => {
             let facts = mcp_capability_facts(gateway)?;
             let mut result = crate::skill::mcp_prompts_json(VERSION, &facts)?;
+            if let Some(items) = result.get_mut("prompts").and_then(Value::as_array_mut) {
+                if let Some(experts) = crate::expert::mcp_prompts_json()?
+                    .get("prompts")
+                    .and_then(Value::as_array)
+                {
+                    items.extend(experts.iter().cloned());
+                }
+            }
             result["_meta"] =
                 json!({ "himind": { "registryGeneration": mcp_registry_generation(gateway)? } });
             Ok(result)
@@ -455,6 +463,9 @@ fn handle_request_with_session(
                 .and_then(Value::as_str)
                 .ok_or("MCP prompt name is required")?;
             let facts = mcp_capability_facts(gateway)?;
+            if name.starts_with("expert.") {
+                return crate::expert::mcp_prompt_get(name);
+            }
             crate::skill::mcp_prompt_get(name, VERSION, &facts)
         }
         "tools/list" => {
@@ -969,6 +980,7 @@ fn mcp_registry_generation(gateway: &CapabilityGateway) -> Result<String, Box<dy
     let resources = crate::skill::mcp_resources_json(VERSION, &facts)?;
     hasher.update(serde_json::to_vec(&prompts)?);
     hasher.update(serde_json::to_vec(&resources)?);
+    hasher.update(serde_json::to_vec(&crate::expert::mcp_prompts_json()?)?);
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 

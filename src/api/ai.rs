@@ -214,6 +214,7 @@ where
     Ok(Option::<Vec<AiProviderTemplateModel>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+#[derive(Clone)]
 pub(crate) struct AIClientCredential {
     pub access: AIUserCredential,
     pub api_key: String,

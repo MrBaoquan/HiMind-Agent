@@ -13,6 +13,7 @@ param(
     [string]$ExtensionPublicKeyPath,
     [string]$ExtensionSigningKeyId,
     [string]$VSCodeExtensionPath,
+    [string]$RuntimeReleaseDirectory,
     [string]$WindowsCodeSigningCertificateThumbprint,
     [string]$WindowsTimestampUrl = "http://timestamp.sectigo.com",
     [switch]$SkipWindowsTimestamp,
@@ -49,6 +50,35 @@ $VSCodeExtension = if ($VSCodeExtensionPath) { [IO.Path]::GetFullPath($VSCodeExt
     $DefaultExtension
 }
 if (-not (Test-Path -LiteralPath $VSCodeExtension -PathType Leaf)) { throw "VS Code integration package is missing." }
+
+$RuntimeRelease = $null
+if ($RuntimeReleaseDirectory) {
+    $RuntimeRelease = [IO.Path]::GetFullPath($RuntimeReleaseDirectory)
+    if (-not (Test-Path -LiteralPath $RuntimeRelease -PathType Container)) { throw "Bundled Runtime release directory is missing: $RuntimeRelease" }
+    $RuntimeManifestPath = Join-Path $RuntimeRelease "himind-runtime-release.json"
+    if (-not (Test-Path -LiteralPath $RuntimeManifestPath -PathType Leaf)) { throw "Bundled Runtime release manifest is missing: $RuntimeManifestPath" }
+    $RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$RuntimeManifest.product_id -ne "com.himind.runtime.deepseek-harness" -or
+        [string]$RuntimeManifest.channel -ne "stable" -or
+        [string]$RuntimeManifest.platform -ne "windows" -or
+        [string]$RuntimeManifest.architecture -ne "x64" -or
+        [string]$RuntimeManifest.package_type -ne "directory-zip") {
+        throw "Bundled Runtime release manifest does not match the Windows Runtime contract."
+    }
+    $RuntimePackageName = [string]$RuntimeManifest.file_name
+    if ($RuntimePackageName -notmatch '^[A-Za-z0-9._-]+\.zip$') { throw "Bundled Runtime package file name is unsafe." }
+    foreach ($RuntimeFile in @($RuntimeManifestPath, (Join-Path $RuntimeRelease $RuntimePackageName), (Join-Path $RuntimeRelease "$RuntimePackageName.signature.json"))) {
+        if (-not (Test-Path -LiteralPath $RuntimeFile -PathType Leaf)) { throw "Bundled Runtime file is missing: $RuntimeFile" }
+    }
+    $RuntimeSignature = Get-Content -LiteralPath (Join-Path $RuntimeRelease "$RuntimePackageName.signature.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$RuntimeSignature.file_name -ne $RuntimePackageName -or
+        [string]$RuntimeSignature.sha256 -ne [string]$RuntimeManifest.sha256 -or
+        [string]$RuntimeSignature.signature_algorithm -ne "rsa-pss-sha256" -or
+        [string]::IsNullOrWhiteSpace([string]$RuntimeSignature.signature) -or
+        [string]::IsNullOrWhiteSpace([string]$RuntimeSignature.signature_key_id)) {
+        throw "Bundled Runtime signature metadata does not match the release manifest."
+    }
+}
 
 $MakeNsis = Get-Command makensis.exe -ErrorAction SilentlyContinue
 $MakeNsisPath = if ($MakeNsis) { $MakeNsis.Source } else {
@@ -94,6 +124,9 @@ $CompilerArguments = @(
     "/DASSET_DIR=$AssetPath",
     "/DVSCODE_EXTENSION_VSIX=$VSCodeExtension"
 )
+if ($RuntimeRelease) {
+    $CompilerArguments += @("/DRUNTIME_DIR=$RuntimeRelease", "/DRUNTIME_PACKAGE=$RuntimePackageName")
+}
 if ($PublicKey) { $CompilerArguments += @("/DTRUSTED_PUBLIC_KEY=$PublicKey", "/DSIGNING_KEY_ID=$SigningKeyId") }
 if ($ExtensionPublicKey) { $CompilerArguments += @("/DTRUSTED_EXTENSION_PUBLIC_KEY=$ExtensionPublicKey", "/DEXTENSION_SIGNING_KEY_ID=$ExtensionSigningKeyId") }
 & $MakeNsisPath @CompilerArguments (Join-Path $Root "installer\himind-agent.nsi")

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::agent_core_contracts::{
-    InteractionEnvelope, LocalRun, LocalRunStatus, RuntimeEvent, RuntimeEventType,
+    InteractionEnvelope, LocalRun, LocalRunStatus, LocalStepStatus, RuntimeEvent, RuntimeEventType,
 };
 
 pub(crate) const LOCAL_RUN_DB_FILE: &str = "local-runs.sqlite3";
@@ -240,6 +240,65 @@ impl LocalRunLedger {
         payload
             .map(|value| serde_json::from_str(&value).map_err(Into::into))
             .transpose()
+    }
+
+    /// 收尾后台执行线程的非业务异常。
+    ///
+    /// 工作流执行器通常会把业务错误写回 Run；但启动失败、线程 panic 或
+    /// 运行时边界错误可能在执行器之外发生。这里统一把它们转换成可见的
+    /// 终态，避免等待 stale-run sweep 后丢失真正原因。
+    pub(crate) fn mark_run_failed(
+        &self,
+        run_id: &str,
+        reason: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let Some(mut run) = self.get_run(run_id)? else {
+            return Ok(false);
+        };
+        if run.status.is_terminal() {
+            return Ok(false);
+        }
+        let reason = reason.trim();
+        let reason = if reason.is_empty() {
+            "workflow execution failed"
+        } else {
+            reason
+        };
+        let step_id = run.current_step_id.clone();
+        for step in &mut run.steps {
+            if step.status == LocalStepStatus::Running {
+                step.status = LocalStepStatus::Failed;
+                step.finished_at = unix_now_string();
+                step.error = reason.to_string();
+            }
+        }
+        run.status = LocalRunStatus::Failed;
+        run.error = reason.to_string();
+        run.current_step_id.clear();
+        run.updated_at = unix_now_string();
+        self.save_run(&run)?;
+        self.clear_run_lease(run_id)?;
+        let sequence = self.next_runtime_sequence(run_id)?;
+        self.append_event(&RuntimeEvent {
+            schema_version: crate::agent_core_contracts::RUNTIME_EVENT_SCHEMA_VERSION.to_string(),
+            event_id: format!("{run_id}:failed:{sequence}"),
+            run_id: run_id.to_string(),
+            step_id,
+            capability_id: String::new(),
+            sequence,
+            occurred_at: run.updated_at.clone(),
+            provider: if run.runtime_provider.trim().is_empty() {
+                "himind.workflow".to_string()
+            } else {
+                run.runtime_provider.clone()
+            },
+            event_type: RuntimeEventType::Error,
+            payload: serde_json::json!({
+                "background_failure": true,
+                "error": reason,
+            }),
+        })?;
+        Ok(true)
     }
 
     pub(crate) fn get_interaction(

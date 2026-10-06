@@ -634,6 +634,7 @@ mod tests {
         for source in [
             include_str!("../contracts/agent-core/v1/examples/workflow-package.legacy-v1.json"),
             include_str!("../workflows/wechat-experience-upload/workflow.json"),
+            include_str!("../workflows/engine-build/workflow.json"),
         ] {
             let fixture: Value = serde_json::from_str(source).unwrap();
             assert!(

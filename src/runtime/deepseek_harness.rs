@@ -464,6 +464,8 @@ struct RuntimePackageManifest {
     runtime_contract: String,
     engine_id: String,
     version: String,
+    #[serde(default)]
+    engine_version: String,
     executable: String,
     #[serde(default)]
     min_agent_version: String,
@@ -845,7 +847,7 @@ fn prepare_interactive_launch_with(
     let credential =
         crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
             .map_err(|error| error.to_string())?;
-    let home = dsh_home(&version)?;
+    let home = workspace_dsh_home(&version, &workspace)?;
     let models = managed_model_catalog(&credential.access)?;
     let model = credential.access.model.trim().to_string();
     let sync_snapshot =
@@ -999,7 +1001,8 @@ fn prepare_independent_interactive_launch(
     version: String,
     workspace: PathBuf,
 ) -> Result<InteractiveLaunch, String> {
-    let home = native_dsh_home(&version)?;
+    let shared_home = native_dsh_home(&version)?;
+    let home = workspace_dsh_home(&version, &workspace)?;
     let (provider_config, api_key, service_source, route_source) =
         match active_independent_provider_config().map_err(|error| error.to_string())? {
             Some(projection) => (
@@ -1009,7 +1012,7 @@ fn prepare_independent_interactive_launch(
                 ModelRouteSource::LocalService,
             ),
             None => {
-                let provider_config = native_dsh_provider_config(&home);
+                let provider_config = native_dsh_provider_config(&shared_home);
                 let api_key = match provider_config.api_key_env.as_deref() {
                     Some(api_key_env) => env::var(api_key_env).unwrap_or_default(),
                     None => String::new(),
@@ -1430,7 +1433,7 @@ fn install_runtime_archive(
     fs::create_dir_all(&versions).map_err(|error| format!("创建 Runtime 安装目录失败: {error}"))?;
     let suffix = &update.sha256[..12.min(update.sha256.len())];
     let target = versions.join(format!("{}-{}", safe_segment(&update.version)?, suffix));
-    let temporary = target.with_extension("installing");
+    let temporary = runtime_staging_path(&target);
     if temporary.exists() {
         let _ = fs::remove_dir_all(&temporary);
     }
@@ -1463,26 +1466,35 @@ fn install_runtime_archive(
         let _ = fs::remove_dir_all(&temporary);
         return Err("Runtime manifest 与 Runtime Distribution 发布信息不一致。".to_string());
     }
+    let engine_version = if manifest.engine_version.trim().is_empty() {
+        manifest.version.as_str()
+    } else {
+        manifest.engine_version.as_str()
+    };
     if let Err(error) =
-        verify_staged_runtime(&temporary.join(&executable), &temporary, &manifest.version)
+        verify_staged_runtime(&temporary.join(&executable), &temporary, engine_version)
     {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
-    let previous = target.with_extension("previous");
-    if previous.exists() {
-        let _ = fs::remove_dir_all(&previous);
+    // Runtime versions are content-addressed (`version-sha256prefix`) and
+    // immutable. Never rename the currently active version out of the way:
+    // Windows keeps running executables/directories open, so doing so makes
+    // reinstall/update fail with ERROR_ACCESS_DENIED and can disrupt a live
+    // session. Reuse a complete directory for idempotent installer runs;
+    // otherwise publish the new version alongside the old one.
+    let target_is_complete =
+        target.join("runtime.json").is_file() && target.join(&executable).is_file();
+    if target.exists() && !target_is_complete {
+        remove_directory_with_retry(&target)
+            .map_err(|error| format!("清理不完整的 HiMind AI 运行时失败: {error}"))?;
     }
-    if target.exists() {
-        fs::rename(&target, &previous)
-            .map_err(|error| format!("备份当前 HiMind AI 运行时失败: {error}"))?;
-    }
-    report_progress("installing", 97, "正在完成 HiMind AI 运行时安装");
-    if let Err(error) = fs::rename(&temporary, &target) {
-        if previous.exists() {
-            let _ = fs::rename(&previous, &target);
-        }
-        return Err(format!("提交 HiMind AI 运行时安装失败: {error}"));
+    if target_is_complete {
+        let _ = fs::remove_dir_all(&temporary);
+    } else {
+        report_progress("installing", 97, "正在完成 HiMind AI 运行时安装");
+        rename_directory_with_retry(&temporary, &target)
+            .map_err(|error| format!("提交 HiMind AI 运行时安装失败: {error}"))?;
     }
     let state = InstalledRuntimeState {
         schema_version: 2,
@@ -1495,16 +1507,63 @@ fn install_runtime_archive(
         capabilities: manifest.capabilities,
     };
     if let Err(error) = write_runtime_state(&state) {
-        let _ = fs::remove_dir_all(&target);
-        if previous.exists() {
-            let _ = fs::rename(&previous, &target);
+        if !target_is_complete {
+            let _ = remove_directory_with_retry(&target);
         }
         return Err(error);
     }
-    if previous.exists() {
-        let _ = fs::remove_dir_all(previous);
-    }
     Ok(())
+}
+
+fn rename_directory_with_retry(source: &Path, target: &Path) -> Result<(), std::io::Error> {
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match fs::rename(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                );
+                last_error = Some(error);
+                if !retryable || attempt == 19 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        }
+    }
+    Err(last_error.expect("rename retry must record an error"))
+}
+
+fn runtime_staging_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("runtime");
+    target.with_file_name(format!("{name}.installing"))
+}
+
+fn remove_directory_with_retry(path: &Path) -> Result<(), std::io::Error> {
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                let retryable = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                );
+                last_error = Some(error);
+                if !retryable || attempt == 19 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        }
+    }
+    Err(last_error.expect("remove retry must record an error"))
 }
 
 fn verify_staged_runtime(
@@ -1519,6 +1578,7 @@ fn verify_staged_runtime(
         let run = |arguments: &[&str]| -> Result<String, String> {
             let mut command = Command::new(executable);
             process::remove_himind_secret_environment(&mut command);
+            configure_runtime_environment(&mut command, executable);
             command
                 .args(arguments)
                 .current_dir(workspace)
@@ -1565,11 +1625,109 @@ fn verify_staged_runtime(
         }
         run(&["--profile", "headless", "--help"])?;
         run(&["--profile", "headless", "--dump-default-config"])?;
+
+        // Capabilities in runtime.json are a contract, not an optimistic
+        // label.  Verify the files that make the bundled Windows features
+        // usable before committing the staged directory.  This prevents a
+        // partially published ZIP (for example one missing the optional
+        // LibreOffice package) from being reported as installed and ready.
+        let manifest: RuntimePackageManifest = serde_json::from_slice(
+            &fs::read(workspace.join("runtime.json"))
+                .map_err(|error| format!("读取 Runtime manifest 失败: {error}"))?,
+        )
+        .map_err(|error| format!("Runtime manifest 无效: {error}"))?;
+        if manifest.capabilities.iter().any(|value| value == "office") {
+            verify_staged_office_bundle(workspace)?;
+        }
+        if manifest
+            .capabilities
+            .iter()
+            .any(|value| value == "computer-use")
+        {
+            verify_staged_computer_use_bundle(workspace)?;
+        }
         Ok(())
     })();
     let cleanup = fs::remove_dir_all(&preflight_home)
         .map_err(|error| format!("清理 Runtime 预检目录失败: {error}"));
     result.and(cleanup)
+}
+
+fn verify_staged_office_bundle(workspace: &Path) -> Result<(), String> {
+    let native_root = workspace.join("node_modules/@deepseek-ai/libreoffice-kit-win32-x64");
+    let executable = native_root.join("bin/libreoffice-kit.exe");
+    if !executable.is_file() {
+        return Err(
+            "Runtime 声明支持 Office，但缺少 LibreOfficeKit Windows 原生 helper。".to_string(),
+        );
+    }
+    // The helper is built with the x64 VC143 CRT.  Keep this list in sync
+    // with the packaging script so an incomplete extraction cannot pass.
+    const MSVC_FILES: &[&str] = &[
+        "concrt140.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "msvcp140_atomic_wait.dll",
+        "msvcp140_codecvt_ids.dll",
+        "vccorlib140.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "vcruntime140_threads.dll",
+    ];
+    for file in MSVC_FILES {
+        if !native_root.join("bin").join(file).is_file() {
+            return Err(format!(
+                "Runtime 声明支持 Office，但 LibreOfficeKit 缺少随包 MSVC 运行库 {file}。"
+            ));
+        }
+    }
+    if !workspace
+        .join("node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js")
+        .is_file()
+    {
+        return Err("Runtime 声明支持 Office，但缺少 Office 转换 CLI。".to_string());
+    }
+    Ok(())
+}
+
+fn verify_staged_computer_use_bundle(workspace: &Path) -> Result<(), String> {
+    let package = workspace.join("node_modules/dsh-computer-use-win");
+    if !package.join("mcp/server.mjs").is_file()
+        || !package.join("scripts/windows-uia.ps1").is_file()
+    {
+        return Err(
+            "Runtime 声明支持屏幕控制，但缺少 dsh-computer-use-win Windows 控制包。".to_string(),
+        );
+    }
+    let node = workspace.join("node.exe");
+    let mut command = Command::new(node);
+    command
+        .arg(package.join("mcp/server.mjs"))
+        .arg("--self-test")
+        .current_dir(workspace)
+        .env(DSH_HOME_ENV, workspace.join(".himind-preflight"))
+        .env("DSH_TELEMETRY_MODE", "DISABLED")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process::configure_hidden_process(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("启动 Windows 屏幕控制预检失败: {error}"))?;
+    if !output.status.success() {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(format!(
+            "Windows 屏幕控制预检失败: {}",
+            process::summarize_output(combined.trim(), 2_000)
+        ));
+    }
+    Ok(())
 }
 
 fn extract_runtime_archive(archive_path: &Path, target: &Path) -> Result<(), String> {
@@ -1729,6 +1887,8 @@ fn execute_claimed(
     process::verify_command(&invocation.executable, &["--version"])
         .map_err(|error| format!("DeepSeek Harness CLI is unavailable: {error}"))?;
     ensure_home_config(&invocation, options)?;
+    let instruction_snapshot =
+        crate::workspace_instructions::load_dsh_snapshot(&invocation.home, &invocation.workspace)?;
     update_agent_run_status(
         client,
         &options.api_base(),
@@ -1778,7 +1938,8 @@ fn execute_claimed(
         "runtime_provider": PROVIDER_BUILTIN,
         "completed": true,
         "final_message": process::summarize_output(&final_message, OUTPUT_CAPTURE_LIMIT),
-        "billing_owner": "himind"
+        "billing_owner": "himind",
+        "instruction_snapshot": instruction_snapshot
     }))
 }
 
@@ -1879,11 +2040,37 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
 }
 
 fn dsh_command(executable: &std::ffi::OsStr) -> Command {
-    #[cfg(target_os = "windows")]
-    if let Some(command) = windows_node_command(executable) {
-        return command;
-    }
-    process::hidden_command(executable)
+    let executable_path = PathBuf::from(executable);
+    let mut command = {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(command) = windows_node_command(executable) {
+                command
+            } else {
+                process::hidden_command(executable)
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            process::hidden_command(executable)
+        }
+    };
+    configure_runtime_environment(&mut command, &executable_path);
+    command
+}
+
+/// Point DSH's native Office configuration at the immutable Runtime that is
+/// actually launching this process.  No PATH mutation or system executable
+/// discovery is involved, and external Runtime paths remain supported.
+fn configure_runtime_environment(command: &mut Command, executable: &Path) {
+    let Some(runtime_root) = executable.parent().and_then(Path::parent) else {
+        return;
+    };
+    let runtime_root = runtime_root.to_path_buf();
+    command.env("HIMIND_DSH_RUNTIME_ROOT", &runtime_root).env(
+        "HIMIND_DSH_NODE",
+        runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -1931,6 +2118,12 @@ fn ensure_home_config(
     }
     ensure_himind_profile(&invocation.home, options, invocation)?;
     ensure_himind_headless_profile(&invocation.home, options, invocation)?;
+    crate::workspace_instructions::record_dsh_snapshot_for_profile(
+        &invocation.home,
+        &invocation.workspace,
+        Some(Path::new(invocation.executable.as_os_str())),
+        HIMIND_HEADLESS_PROFILE,
+    )?;
     ensure_agent_overlay(&invocation.home, options, invocation)
 }
 
@@ -1948,7 +2141,43 @@ fn ensure_himind_profile(
         include_str!("../../runtime-profiles/himind/pnpm-workspace.yaml"),
         include_str!("../../runtime-profiles/himind/cordis.yml"),
         include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
-    )
+    )?;
+    // 专家库随会话刷新，失败不阻断会话：DSH 侧仍能用自带预设启动。
+    if let Err(error) = sync_expert_presets(&home.join("profiles").join(HIMIND_PROFILE)) {
+        eprintln!("同步 DSH 专家预设失败：{error}");
+    }
+    Ok(())
+}
+
+/// 把专家库渲染成 DSH 的 Agent 预设声明。
+///
+/// DSH 0.2.x 起，用户预设是 profile 里的 `@deepseek-ai/dsh-agent-preset` 声明行，
+/// 旧的 `$DSH_HOME/.agent-presets/` 目录不再被读取。声明写在独立文件里、由
+/// `cordis:include` 引入：每次会话启动整体刷新，同时不动用户手写的 patch 行。
+fn sync_expert_presets(profile: &Path) -> Result<(), Box<dyn Error>> {
+    let document = crate::expert::dsh_preset_document()?;
+    crate::store::atomic_file::atomic_write(
+        &profile.join(crate::expert::DSH_EXPERT_PRESETS_FILE),
+        document.as_bytes(),
+    )?;
+    ensure_expert_presets_include(&profile.join("cordis.patch.yml"))
+}
+
+fn ensure_expert_presets_include(path: &Path) -> Result<(), Box<dyn Error>> {
+    let Ok(source) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    if source.contains(&format!("id: {}", crate::expert::DSH_EXPERT_PRESETS_ROW_ID)) {
+        return Ok(());
+    }
+    let mut updated = source.trim_end().to_string();
+    updated.push_str(&format!(
+        "\n\n# HiMind 专家库：由 Agent 生成的 DSH Agent 预设声明。\n- insert:\n    - id: {}\n      name: cordis:include\n      config:\n        path: ./{}\n",
+        crate::expert::DSH_EXPERT_PRESETS_ROW_ID,
+        crate::expert::DSH_EXPERT_PRESETS_FILE
+    ));
+    crate::store::atomic_file::atomic_write(path, updated.as_bytes())?;
+    Ok(())
 }
 
 fn ensure_himind_headless_profile(
@@ -1999,7 +2228,35 @@ fn ensure_profile_patch(path: &Path, base_patch: &str) -> Result<(), Box<dyn Err
         fs::write(path, base_patch)?;
         return Ok(());
     }
-    migrate_managed_profile_patch(path)
+    migrate_managed_profile_patch(path)?;
+    ensure_managed_capability_rows(path)
+}
+
+/// Upgrade profiles created by older Agent versions without replacing the
+/// user's DSH patch rows.  The rows are deliberately ordinary DSH rows so the
+/// native plugin inventory and settings UI remain the source of truth.
+fn ensure_managed_capability_rows(path: &Path) -> Result<(), Box<dyn Error>> {
+    let source = fs::read_to_string(path)?;
+    let mut additions = String::new();
+    if !source.contains("id: skill-office") {
+        additions.push_str(
+            "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')\"\n        node: !!js \"process.env.HIMIND_DSH_NODE\"\n        cli: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')\"\n",
+        );
+    }
+    if path.to_string_lossy().contains(HIMIND_HEADLESS_PROFILE)
+        && !source.contains("id: office-to-pdf")
+    {
+        additions.push_str(
+            "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n",
+        );
+    }
+    if !additions.is_empty() {
+        let mut updated = source.trim_end().to_string();
+        updated.push_str(&additions);
+        updated.push('\n');
+        fs::write(path, updated)?;
+    }
+    Ok(())
 }
 
 fn migrate_managed_profile_patch(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -2274,6 +2531,14 @@ fn merge_profile_package(path: &Path, defaults: &str) -> Result<(), Box<dyn Erro
         .unwrap_or_default();
     if let Some(existing) = profile.get("bundles").and_then(Value::as_array) {
         for bundle in existing {
+            // These entries were incorrectly shipped as bundles before the
+            // Office provider moved to its native DSH row.  Remove only the
+            // managed mistakes; preserve all other user-installed bundles.
+            if bundle == "@deepseek-ai/dsh-skill-office"
+                || bundle == "@deepseek-ai/dsh-office-to-pdf"
+            {
+                continue;
+            }
             if !bundles.contains(bundle) {
                 bundles.push(bundle.clone());
             }
@@ -2361,6 +2626,7 @@ fn render_himind_profile_patch_from_base(
         }
         ModelRouteSource::Native => append_native_route_comment(&mut patch),
     }
+    append_active_expert_persona(&mut patch, workspace)?;
     patch.push_str("\n\n# Agent-owned context. This layer is regenerated for each new HiMind AI session.\n- insert:\n");
     patch.push_str(&format!(
         "    - id: {HIMIND_MCP_ROW_ID}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        transport: stdio\n"
@@ -2403,6 +2669,78 @@ fn render_himind_profile_patch_from_base(
 /// DSH 桥的默认工具等待时间只有 60 秒，但下游连接可以配到 10 分钟。
 /// 桥是所有下游工具的唯一出口：桥先超时，用户看到的是「工具没跑起来」，
 /// 而实际原因只是等待时间被上游截断。所以这里取已启用下游里最长的超时。
+/// Project the selected expert into DSH's persona surface. Permissions remain
+/// owned by DSH and the user; this overlay only supplies working behavior.
+fn append_active_expert_persona(
+    patch: &mut String,
+    workspace: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(expert) = crate::expert::active_definition_for_workspace(workspace)? else {
+        return Ok(());
+    };
+    let mut lines = patch.lines().map(str::to_string).collect::<Vec<_>>();
+    let system_prompt = lines
+        .iter()
+        .position(|line| line.trim() == "- id: system-prompt");
+    let content = expert_persona_lines(&expert);
+    if let Some(system_prompt) = system_prompt {
+        let persona = lines[system_prompt..]
+            .iter()
+            .position(|line| line.trim_start().starts_with("persona:"))
+            .map(|offset| system_prompt + offset);
+        if let Some(persona) = persona {
+            let persona_indent = lines[persona]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .count();
+            let content_indent = " ".repeat(persona_indent + 2);
+            let mut end = persona + 1;
+            while end < lines.len() {
+                let line = &lines[end];
+                if !line.trim().is_empty()
+                    && line.chars().take_while(|c| c.is_whitespace()).count() <= persona_indent
+                {
+                    break;
+                }
+                end += 1;
+            }
+            lines.splice(
+                end..end,
+                content.iter().map(|line| format!("{content_indent}{line}")),
+            );
+            *patch = lines.join("\n");
+            return Ok(());
+        }
+    }
+    patch.push_str(
+        "\n\n# HiMind selected expert behavior overlay. Permissions remain client-owned.\n- id: system-prompt\n  config:\n    persona: |-\n",
+    );
+    for line in content {
+        patch.push_str("      ");
+        patch.push_str(&line);
+        patch.push('\n');
+    }
+    Ok(())
+}
+
+fn expert_persona_lines(expert: &crate::expert::ExpertDefinition) -> Vec<String> {
+    let mut lines = vec![format!("你是 HiMind 的{}专家。", expert.name)];
+    lines.extend(expert.instructions.lines().map(str::to_string));
+    if !expert.output_contract.required_sections.is_empty() {
+        lines.push(format!(
+            "输出至少包含：{}",
+            expert.output_contract.required_sections.join("、")
+        ));
+    }
+    if !expert.harness.behavior_phases.is_empty() {
+        lines.push(format!(
+            "工作阶段：{}",
+            expert.harness.behavior_phases.join(" → ")
+        ));
+    }
+    lines
+}
+
 fn himind_mcp_bridge_tool_timeout_ms(state_path: &Path) -> u64 {
     const BRIDGE_DEFAULT_TOOL_TIMEOUT_MS: u64 = 60_000;
     const DOWNSTREAM_MAX_TOOL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
@@ -3077,6 +3415,99 @@ fn dsh_home(version: &str) -> Result<PathBuf, String> {
         .unwrap_or_else(|| runtime_root().join("homes"));
     ensure_interactive_home(&root, version)?;
     Ok(root.join(INTERACTIVE_HOME_DIRECTORY))
+}
+
+/// Return a DSH home isolated to one workspace.
+///
+/// DSH reads its global `AGENTS.md` from `$DSH_HOME`. A shared interactive home
+/// would make concurrent workspaces overwrite each other's selected
+/// InstructionPacks, so each workspace gets a stable home with its own mutable
+/// session state. Runtime profile files are regenerated by `ensure_home_config`
+/// and static dependencies remain resolved from the installed runtime.
+fn workspace_dsh_home(version: &str, workspace: &Path) -> Result<PathBuf, String> {
+    let shared = dsh_home(version)?;
+    let target = shared
+        .join("workspaces")
+        .join(workspace_fingerprint(workspace));
+    fs::create_dir_all(&target)
+        .map_err(|error| format!("创建工作区 DSH 用户数据目录失败: {error}"))?;
+    let managed = target.join(".himind");
+    fs::create_dir_all(&managed)
+        .map_err(|error| format!("创建工作区 DSH 管理目录失败: {error}"))?;
+    ensure_workspace_profiles(&shared, &target, &managed)?;
+
+    // Preserve the user's shared DSH global instructions as a source snapshot.
+    // The generated target AGENTS.md is owned by HiMind and is rebuilt before
+    // every session, so a stale selection can never survive a restart.
+    let source = shared.join("AGENTS.md");
+    let base = managed.join("base-global-AGENTS.md");
+    if source.is_file() {
+        fs::copy(&source, &base).map_err(|error| format!("保存 DSH 全局指令快照失败: {error}"))?;
+    } else if base.is_file() {
+        fs::remove_file(&base)
+            .map_err(|error| format!("清理已失效的 DSH 全局指令快照失败: {error}"))?;
+    }
+
+    // Independent mode reads provider selection from the shared DSH settings;
+    // copy only non-secret user config into the isolated home. Credentials are
+    // passed through the process environment by the launch descriptor.
+    for name in [
+        "settings.yaml",
+        "settings.yaml.imported",
+        ".anonymous-user-id",
+    ] {
+        let source = shared.join(name);
+        let destination = target.join(name);
+        if source.is_file() {
+            fs::copy(&source, &destination)
+                .map_err(|error| format!("复制 DSH 配置失败: {error}"))?;
+        }
+    }
+    Ok(target)
+}
+
+fn ensure_workspace_profiles(shared: &Path, target: &Path, managed: &Path) -> Result<(), String> {
+    let source = shared.join("profiles").join("node_modules");
+    fs::create_dir_all(&source)
+        .map_err(|error| format!("创建共享 DSH Profile 依赖目录失败: {error}"))?;
+    let destination = target.join("profiles");
+    let marker = managed.join("profiles-link");
+    if marker.is_file() && destination.exists() {
+        let linked_to_source = destination
+            .canonicalize()
+            .ok()
+            .zip(source.parent().and_then(|path| path.canonicalize().ok()))
+            .is_some_and(|(current, expected)| current == expected);
+        if linked_to_source {
+            #[cfg(windows)]
+            let _ = fs::remove_dir(&destination);
+            #[cfg(not(windows))]
+            let _ = fs::remove_file(&destination);
+        }
+    }
+    fs::create_dir_all(&destination)
+        .map_err(|error| format!("创建工作区 DSH Profile 目录失败: {error}"))?;
+    let node_modules = destination.join("node_modules");
+    if !node_modules.exists() {
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(&node_modules)
+                .arg(&source)
+                .status()
+                .map_err(|error| format!("创建 DSH Profile 隔离目录失败: {error}"))?;
+            if !status.success() {
+                return Err("无法创建工作区 DSH Profile 目录联接，请检查本机文件权限".to_string());
+            }
+        }
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(&source, &node_modules)
+            .map_err(|error| format!("创建 DSH Profile 隔离目录失败: {error}"))?;
+        fs::write(&marker, source.to_string_lossy().as_bytes())
+            .map_err(|error| format!("写入 DSH Profile 隔离记录失败: {error}"))?;
+    }
+    Ok(())
 }
 
 fn native_dsh_home(version: &str) -> Result<PathBuf, String> {
@@ -4616,6 +5047,31 @@ mod tests {
     }
 
     #[test]
+    fn expert_preset_include_row_is_added_once_and_keeps_user_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-expert-preset-include-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let patch = root.join("cordis.patch.yml");
+        std::fs::write(&patch, "- id: system-prompt\n  config:\n    persona: keep-me\n").unwrap();
+
+        super::ensure_expert_presets_include(&patch).unwrap();
+        super::ensure_expert_presets_include(&patch).unwrap();
+
+        let content = std::fs::read_to_string(&patch).unwrap();
+        assert_eq!(content.matches("id: himind-expert-presets").count(), 1);
+        assert!(content.contains("name: cordis:include"));
+        assert!(content.contains("path: ./himind-expert-presets.yml"));
+        assert!(content.contains("persona: keep-me"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn managed_headless_profile_reuses_himind_services_without_web_surface() {
         let mut options = crate::Options::from_env();
         options.set_api_base("https://dashboard.example");
@@ -4682,6 +5138,18 @@ mod tests {
         assert!(safe_relative_path("C:\\dsh.cmd").is_err());
         assert_eq!(safe_segment("0.1.0-rc.6").unwrap(), "0.1.0-rc.6");
         assert!(safe_segment("0.1.0/bad").is_err());
+    }
+
+    #[test]
+    fn runtime_staging_path_preserves_version_and_digest() {
+        let target =
+            Path::new("C:/HiMind/runtimes/deepseek-harness/versions/0.2.0-rc.3-d8985739bd97");
+        assert_eq!(
+            super::runtime_staging_path(target),
+            PathBuf::from(
+                "C:/HiMind/runtimes/deepseek-harness/versions/0.2.0-rc.3-d8985739bd97.installing"
+            )
+        );
     }
 
     #[test]

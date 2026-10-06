@@ -1,11 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChevronDown, CircleDashed, CircleX, ExternalLink, MoreHorizontal, Pencil, PlugZap, RefreshCw, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
 import { Pill } from '../components/Common';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { useConfirm } from '../components/ConfirmDialog';
 import { fallbackAiServicePresets, type AiServicePreset } from './aiServicePresets';
-import type { AIProviderImportStatus, AIServiceListResult, AIServiceProtocol, AIServiceTemplateListResult, CustomAIService, ManagedAIServiceSummary } from '../services/agentApi';
+import type { AIProviderImportStatus, AIServiceListResult, AIServiceProtocol, AIServiceTemplateListResult, CustomAIService, InferenceGatewayStatus, ManagedAIServiceSummary } from '../services/agentApi';
 
 const protocolOptions: Array<{ value: AIServiceProtocol; label: string }> = [
   { value: 'openai-responses', label: 'OpenAI Responses' },
@@ -39,6 +39,11 @@ type AiServicesPanelProps = {
   onOpenAccount: () => void;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
+  gatewayStatus: InferenceGatewayStatus | null;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) => Promise<void>;
+  gatewayBusy: boolean;
+  onRestartGateway: () => void;
+  onStopGateway: () => void;
 };
 
 const emptyDraft = {
@@ -56,7 +61,7 @@ const emptyDraft = {
  * 所以这里按「目标」而不是「整个页面」记忙闲：一个工具在写配置时，
  * 其它工具行仍然可以操作，出错也只影响这一行的反馈。
  */
-type ClientPending = { target: string; action: 'import' | 'remove' };
+type ClientPending = { target: string; action: 'import' | 'remove' | 'gateway' | 'direct' };
 
 export function AiServicesPanel({
   aiServices,
@@ -70,6 +75,11 @@ export function AiServicesPanel({
   onOpenAccount,
   onFetchModels,
   onFetchSavedModels,
+  gatewayStatus,
+  onSetBindingMode,
+  gatewayBusy,
+  onRestartGateway,
+  onStopGateway,
 }: AiServicesPanelProps) {
   const [formOpen, setFormOpen] = useState(false);
   const [editingServiceId, setEditingServiceId] = useState<string | null>(null);
@@ -80,6 +90,9 @@ export function AiServicesPanel({
   const [pendingClient, setPendingClient] = useState<ClientPending | null>(null);
   const [settingActive, setSettingActive] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState<string>('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const modalRef = useRef<HTMLElement | null>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   const customServices = aiServices?.custom?.services ?? [];
   const activeServiceId = aiServices?.custom?.active_service_id ?? '';
@@ -88,8 +101,55 @@ export function AiServicesPanel({
   const clientStatuses = aiServices?.clients?.targets ?? [];
   const importedClientCount = clientStatuses.filter((client) => client.state === 'imported').length;
   const pendingClientCount = clientStatuses.filter((client) => client.state !== 'imported' && client.client_detected).length;
+  // 注入模式不在 aiServices 里，而在网关快照里：状态只有一个事实源，
+  // 页面按客户端名把两者对齐。
+  const gatewayClientIds = (gatewayStatus?.gateway_clients ?? []).map((client) => client.client);
   const serviceCount = customServices.length + (independentMode ? 0 : 1);
   const editing = editingServiceId !== null;
+
+  useEffect(() => {
+    if (!formOpen) {
+      restoreFocusRef.current?.focus();
+      restoreFocusRef.current = null;
+      return;
+    }
+    const modal = modalRef.current;
+    if (!modal) return;
+    const focusable = () => Array.from(modal.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )).filter((element) => element.offsetParent !== null);
+    window.setTimeout(() => focusable()[0]?.focus(), 0);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !saving) {
+        setFormOpen(false);
+        setEditingServiceId(null);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const elements = focusable();
+      if (!elements.length) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [formOpen, saving]);
+
+  async function setBindingMode(target: string, mode: 'gateway' | 'direct', service?: string) {
+    setPendingClient({ target, action: mode });
+    try {
+      await onSetBindingMode(target, mode, service);
+    } finally {
+      setPendingClient(null);
+    }
+  }
   // 服务来源 → 展示名，用于在展开区说明某个工具当前用的是哪个服务。
   const serviceNames: Record<string, string> = { managed: '工作台模型服务' };
   for (const service of customServices) serviceNames[`custom:${service.id}`] = service.display_name;
@@ -123,6 +183,7 @@ export function AiServicesPanel({
     const preset = presetEntries.find((item) => item.id === presetId);
     if (!preset) return;
     setSelectedPreset(presetId);
+    setAdvancedOpen(false);
     setFormError('');
     setDraft({
       id: preset.id,
@@ -211,14 +272,17 @@ export function AiServicesPanel({
   }
 
   function openNewService() {
+    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedPreset('');
     setEditingServiceId(null);
     setDraft(emptyDraft);
     setFormError('');
+    setAdvancedOpen(false);
     setFormOpen(true);
   }
 
   function openEditService(service: CustomAIService) {
+    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedPreset('');
     setEditingServiceId(service.id);
     setDraft({
@@ -231,7 +295,14 @@ export function AiServicesPanel({
       api_key: '',
     });
     setFormError('');
+    setAdvancedOpen(true);
     setFormOpen(true);
+  }
+
+  function closeForm() {
+    if (saving) return;
+    setFormOpen(false);
+    setEditingServiceId(null);
   }
 
   return (
@@ -242,8 +313,8 @@ export function AiServicesPanel({
               还没分发的工具数。原先把「已连接 AI 工具」按客户端总数统计，和每个
               服务行里的数字对不上，所以这里按「工具」口径统一。 */}
           <div title="本机可用的模型服务数量（含工作台服务）"><span>模型服务</span><strong>{serviceCount}</strong></div>
-          <div title="已分发到某个模型服务的本机 AI 工具数量"><span>已分发工具</span><strong>{importedClientCount}</strong></div>
-          <div title="本机已检测到、但还没有分发任何模型服务的 AI 工具数量"><span>待分发工具</span><strong className={pendingClientCount ? 'warning-text' : ''}>{pendingClientCount}</strong></div>
+          <div title="已连接模型服务的本机客户端数量"><span>已连接客户端</span><strong>{importedClientCount}</strong></div>
+          <div title="本机已检测到、但还没有连接模型服务的客户端数量"><span>待连接</span><strong className={pendingClientCount ? 'warning-text' : ''}>{pendingClientCount}</strong></div>
         </div>
         <div className="ai-services-summary-actions">
           <button className="btn btn-primary" onClick={openNewService}>
@@ -252,15 +323,44 @@ export function AiServicesPanel({
         </div>
       </section>
 
+      {/* 网关是本页所有分发的统一入口：状态、地址和两个恢复动作必须同屏可见。
+          端口不给手编——改动它要连带重写所有引用它的客户端配置。 */}
+      <section className="ai-gateway-strip" aria-label="本机推理网关">
+        <span className={`status-dot ${gatewayStatus?.running ? 'ok' : 'idle'}`} aria-hidden="true" />
+        <div className="ai-gateway-strip-copy">
+          <strong>本机网关</strong>
+          <span title={gatewayStatus?.last_error || gatewayStatus?.notice || gatewayStatus?.url}>
+            {gatewayStatus?.running
+              ? `${gatewayStatus.url} · 网关 ${gatewayStatus.gateway_clients.length} · 直连 ${Math.max(0, importedClientCount - gatewayStatus.gateway_clients.length)}`
+              : gatewayStatus?.last_error || '未启动'}
+          </span>
+        </div>
+        <Pill kind={gatewayStatus?.running ? 'success' : 'neutral'}>{gatewayStatus?.running ? '运行中' : '未启动'}</Pill>
+        <div className="ai-gateway-strip-actions">
+          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy} aria-busy={gatewayBusy} onClick={onRestartGateway}>
+            {gatewayBusy ? <BusyIndicator size={11} /> : null}重启
+          </button>
+          <button
+            type="button"
+            className="btn ai-service-tool-btn"
+            disabled={gatewayBusy || !gatewayStatus?.running}
+            title={gatewayStatus?.gateway_clients.length ? '停止监听前，走网关的客户端会暂时失去连接' : '当前没有客户端使用网关，将停止本机监听'}
+            onClick={onStopGateway}
+          >
+            停用
+          </button>
+        </div>
+      </section>
+
       {formOpen ? (
         <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setFormOpen(false); }}>
-          <section className="modal ai-service-modal" role="dialog" aria-modal="true" aria-label={editing ? '编辑模型服务' : '新增模型服务'}>
+          <section ref={modalRef} className="modal ai-service-modal" role="dialog" aria-modal="true" aria-labelledby="ai-service-modal-title">
             <div className="modal-header">
               <div>
-                <h3>{editing ? '编辑模型服务' : '新增模型服务'}</h3>
-                <p>{editing ? '更新连接信息；API Key 留空表示继续使用已保存凭据。' : '添加模型服务；API Key 会加密保存在本机。'}</p>
+                <h3 id="ai-service-modal-title">{editing ? '编辑模型服务' : '新增模型服务'}</h3>
+                <p>{editing ? 'API Key 留空则保留当前凭据。' : '凭据仅保存在本机。'}</p>
               </div>
-              <button className="btn btn-icon" title="关闭" aria-label="关闭" disabled={saving} onClick={() => setFormOpen(false)}><X size={16} /></button>
+              <button className="btn btn-icon" title="关闭" aria-label="关闭" disabled={saving} onClick={closeForm}><X size={16} /></button>
             </div>
             <div className="modal-body ai-service-modal-body">
               {formError ? <div className="ai-service-form-error" role="alert"><CircleX size={15} /><span>{formError}</span></div> : null}
@@ -270,7 +370,7 @@ export function AiServicesPanel({
                   {usingFallbackPresets ? <span className="ai-service-preset-source" title="连接 AI 工作台后会改用工作台目录里的服务与模型">未连接 AI 工作台，使用内置预设</span> : null}
                 </div>
                 <div className="ai-service-preset-tabs">
-                  <button type="button" className={`ai-service-preset-tab${!selectedPreset ? ' active' : ''}`} onClick={() => { setSelectedPreset(''); setDraft(emptyDraft); }}>
+                  <button type="button" className={`ai-service-preset-tab${!selectedPreset ? ' active' : ''}`} onClick={() => { setSelectedPreset(''); setDraft(emptyDraft); setAdvancedOpen(true); }}>
                     <Pencil size={13} />手动配置
                   </button>
                   {presetGroups.map((group) => (
@@ -292,37 +392,55 @@ export function AiServicesPanel({
                 )}
               </div>
 
-              <div className="ai-service-form-group">
-                <div className="ai-service-group-label">连接信息</div>
-                <div className="ai-service-form-grid">
-                  <label className="field-label ai-service-field"><span>服务 ID</span><input value={draft.id} disabled={editing} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))} placeholder="如 my-gateway" /></label>
-                  <label className="field-label ai-service-field"><span>显示名称</span><input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} placeholder="我的网关" /></label>
-                  <label className="field-label ai-service-field ai-service-field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} placeholder="https://api.example.com/v1" /></label>
-                  <label className="field-label ai-service-field"><span>协议</span><select value={draft.protocol} onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as AIServiceProtocol }))}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                <div className="ai-service-form-group">
+                  <div className="ai-service-group-label">服务</div>
+                  <div className="ai-service-form-grid">
+                    <label className="field-label ai-service-field ai-service-field-wide"><span>服务名称</span><input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} placeholder="例如：公司模型" /></label>
+                  </div>
                 </div>
-              </div>
 
-              <div className="ai-service-form-group">
+                <div className="ai-service-form-group">
                 <div className="ai-service-group-label">模型</div>
                 <div className="ai-service-form-grid">
-                  <label className="field-label ai-service-field"><span>默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-test" /></label>
-                  <label className="field-label ai-service-field"><span>模型列表</span><input value={draft.models} onChange={(event) => setDraft((current) => ({ ...current, models: event.target.value }))} placeholder="gpt-test, gpt-test-2" /></label>
+                  <label className="field-label ai-service-field ai-service-field-wide"><span>默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-test" /></label>
                 </div>
-                <button className="btn ai-service-fetch-models" title={!draft.api_key.trim() && !editing ? '请输入 API Key 后再获取模型' : '获取服务提供的模型列表'} disabled={fetchingModels || !draft.base_url.trim() || (!draft.api_key.trim() && !editing)} onClick={() => void fetchModels()}>
-                  {fetchingModels ? <BusyIndicator size={14} /> : <RefreshCw size={14} />}{fetchingModels ? '获取中' : '获取模型列表'}
-                </button>
-                {!draft.api_key.trim() ? <span className="ai-service-fetch-hint">{editing ? '会使用本机已保存的 API Key 获取模型列表，Key 不会显示在页面上。' : '请输入 API Key 后才可获取模型。'}</span> : null}
               </div>
 
               <div className="ai-service-form-group">
                 <div className="ai-service-group-label">凭据</div>
                 <div className="ai-service-form-grid">
-                  <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input type="password" value={draft.api_key} onChange={(event) => setDraft((current) => ({ ...current, api_key: event.target.value }))} placeholder={editing ? '留空以保留当前 Key；输入新 Key 可轮换' : 'sk-...'} /></label>
+                  <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input type="password" value={draft.api_key} onChange={(event) => setDraft((current) => ({ ...current, api_key: event.target.value }))} placeholder={editing ? '留空以保留当前 Key' : 'sk-...'} /></label>
                 </div>
               </div>
 
+              <div className="ai-service-advanced">
+                <button type="button" className="ai-service-advanced-toggle" aria-expanded={advancedOpen} onClick={() => setAdvancedOpen((value) => !value)}>
+                  <span>高级连接设置</span><ChevronDown size={14} className={advancedOpen ? 'open' : ''} />
+                </button>
+                {advancedOpen ? <div className="ai-service-advanced-body">
+                  <div className="ai-service-form-group">
+                    <div className="ai-service-group-label">连接</div>
+                    <div className="ai-service-form-grid">
+                      <label className="field-label ai-service-field"><span>服务 ID</span><input value={draft.id} disabled={editing} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))} placeholder="如 my-gateway" /></label>
+                      <label className="field-label ai-service-field"><span>协议</span><select value={draft.protocol} onChange={(event) => setDraft((current) => ({ ...current, protocol: event.target.value as AIServiceProtocol }))}>{protocolOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                      <label className="field-label ai-service-field ai-service-field-wide"><span>Base URL</span><input value={draft.base_url} onChange={(event) => setDraft((current) => ({ ...current, base_url: event.target.value }))} placeholder="https://api.example.com/v1" /></label>
+                    </div>
+                  </div>
+                  <div className="ai-service-form-group">
+                    <div className="ai-service-group-label">模型列表</div>
+                    <div className="ai-service-form-grid">
+                      <label className="field-label ai-service-field ai-service-field-wide"><span>可用模型</span><input value={draft.models} onChange={(event) => setDraft((current) => ({ ...current, models: event.target.value }))} placeholder="多个模型用逗号分隔" /></label>
+                    </div>
+                    <button className="btn ai-service-fetch-models" title={!draft.api_key.trim() && !editing ? '请输入 API Key 后再获取模型' : '获取服务提供的模型列表'} disabled={fetchingModels || !draft.base_url.trim() || (!draft.api_key.trim() && !editing)} onClick={() => void fetchModels()}>
+                      {fetchingModels ? <BusyIndicator size={14} /> : <RefreshCw size={14} />}{fetchingModels ? '获取中' : '同步模型'}
+                    </button>
+                    {!draft.api_key.trim() ? <span className="ai-service-fetch-hint">{editing ? '使用已保存的 API Key，同步时不会显示 Key。' : '填写 API Key 后可同步模型。'}</span> : null}
+                  </div>
+                </div> : null}
+              </div>
+
               <div className="modal-actions">
-                <button className="btn" disabled={saving} onClick={() => { setFormOpen(false); setEditingServiceId(null); }}>取消</button>
+                <button className="btn" disabled={saving} onClick={closeForm}>取消</button>
                 <button className="btn btn-primary" disabled={saving || !draft.id.trim() || !draft.display_name.trim() || !draft.base_url.trim() || !draft.model.trim() || (!editing && !draft.api_key.trim())} onClick={() => void saveService()}>
                   {saving ? '保存中...' : editing ? '保存修改' : '保存服务'}
                 </button>
@@ -334,16 +452,16 @@ export function AiServicesPanel({
 
       <section className="ai-services-section">
         <div className="ai-section-heading ai-services-heading">
-          <div><h3>模型服务</h3><span>可同时分发给多个 AI 工具</span></div>
+          <div><h3>模型服务</h3><span>连接到 HiMind AI 或其他客户端</span></div>
           <Pill kind="neutral">{serviceCount}</Pill>
         </div>
 
         {serviceCount ? (
           <div className="ai-service-route">
-            <span className="ai-service-route-label">HiMind AI 对话使用</span>
+            <span className="ai-service-route-label">HiMind AI 默认服务</span>
             <select
               className="ai-service-route-select"
-              aria-label="HiMind AI 对话使用的模型服务"
+              aria-label="HiMind AI 默认模型服务"
               value={chatRouteValue}
               disabled={settingActive}
               onChange={(event) => void changeChatRoute(event.target.value)}
@@ -352,15 +470,15 @@ export function AiServicesPanel({
               {customServices.map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
             </select>
             {settingActive ? <BusyIndicator size={13} /> : null}
-            <span className="ai-service-route-hint">只影响 HiMind AI 对话，不改动已分发的工具。</span>
+            <span className="ai-service-route-hint">只影响 HiMind AI 对话，不影响客户端连接。</span>
           </div>
         ) : null}
 
         {serviceCount ? (
           <div className="ai-client-list">
-            {!independentMode ? <ManagedServiceCard managed={managed} active={!chatRouteValue} clientStatuses={clientStatuses} serviceNames={serviceNames} pending={pendingClient} onImport={(targets, replace) => importToClients(targets, 'managed', replace)} onRemove={removeFromClient} onOpenAccount={onOpenAccount} onRefresh={onRefresh} /> : null}
+            {!independentMode ? <ManagedServiceCard managed={managed} active={!chatRouteValue} clientStatuses={clientStatuses} serviceNames={serviceNames} pending={pendingClient} onImport={(targets, replace) => importToClients(targets, 'managed', replace)} onRemove={removeFromClient} onOpenAccount={onOpenAccount} onRefresh={onRefresh} gatewayClients={gatewayClientIds} onSetBindingMode={setBindingMode} /> : null}
             {customServices.map((service) => (
-              <AiServiceRow key={service.id} service={service} active={chatRouteValue === service.id} clientStatuses={clientStatuses} serviceNames={serviceNames} pending={pendingClient} onImport={(targets, replace) => importToClients(targets, `custom:${service.id}`, replace)} onRemoveFromClient={removeFromClient} onEdit={openEditService} onRemove={(id) => void onRemoveAIService(id)} />
+              <AiServiceRow key={service.id} service={service} active={chatRouteValue === service.id} clientStatuses={clientStatuses} serviceNames={serviceNames} pending={pendingClient} onImport={(targets, replace) => importToClients(targets, `custom:${service.id}`, replace)} onRemoveFromClient={removeFromClient} onEdit={openEditService} onRemove={(id) => void onRemoveAIService(id)} gatewayClients={gatewayClientIds} onSetBindingMode={setBindingMode} />
             ))}
           </div>
         ) : (
@@ -421,7 +539,7 @@ function ClientUsageChips({ clients }: { clients: ClientStatus[] }) {
   const names = clients.map((client) => clientLabel(client.target));
   const shown = names.slice(0, 4);
   return (
-    <span className="ai-service-imported-clients" title={`已分发到：${names.join('、')}`}>
+    <span className="ai-service-imported-clients" title={`已连接：${names.join('、')}`}>
       {shown.map((name) => <span className="ai-service-client-chip" key={name}>{name}</span>)}
       {names.length > shown.length ? <span className="ai-service-client-chip more">+{names.length - shown.length}</span> : null}
     </span>
@@ -436,7 +554,7 @@ function ClientUsageChips({ clients }: { clients: ClientStatus[] }) {
  * 写本机配置要一秒左右，按下的那个按钮会就地换成「分发中…」并转圈，
  * 同页其它工具不受影响，用户不用猜是不是点空了。
  */
-function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNames, pending, onImport, onRemoveFromClient }: {
+function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNames, pending, onImport, onRemoveFromClient, gatewayClients, onSetBindingMode }: {
   id: string;
   source: string;
   subject: string;
@@ -446,9 +564,12 @@ function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNam
   pending: ClientPending | null;
   onImport: (targets: string[], replace?: boolean) => Promise<void>;
   onRemoveFromClient: (target: string) => Promise<void>;
+  gatewayClients: string[];
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) => Promise<void>;
 }) {
   const confirm = useConfirm();
   const label = clientLabel;
+  const gatewayClientSet = new Set(gatewayClients);
   // 没有服务的 imported 客户端来自旧版本或外部写入，簿记里查不到来源；
   // 这里如实标注，避免和「其他服务」混为一谈。
   const sourceLabel = (client: ClientStatus) => (client.service ? serviceNames[client.service] ?? '其他服务' : '来源不明的服务');
@@ -460,12 +581,15 @@ function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNam
       <div className="ai-service-detail-block">
         {/* 展开按钮已经写着「分发给 AI 工具」，这里只给清单命名，
             同一个说法连出现两次会让人以为要点两下。 */}
-        <div className="ai-service-block-title">本机 AI 工具</div>
+        <div className="ai-service-block-title">客户端</div>
         {detected.length ? (
           <ul className="ai-service-binding-list">
             {detected.map((client) => {
               const usingThis = client.state === 'imported' && client.service === source;
               const usingOther = client.state === 'imported' && !usingThis;
+              // 是否可走网关由后端按「客户端协议 × 上游协议」判定，界面不做
+              // 白名单：硬编码的允许列表一旦落后于后端就会变成点不动的按钮。
+              const gatewayMode = gatewayClientSet.has(client.target);
               // 只有正在被写的那个工具变忙：其它行的按钮不该陪着一起灰掉。
               const rowAction = pending?.target === client.target ? pending.action : null;
               const rowBusy = rowAction !== null;
@@ -474,11 +598,24 @@ function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNam
                   <span className="ai-service-binding-name">{label(client.target)}</span>
                   <span className="ai-service-binding-meta" title={client.config_path || undefined}>
                     {usingThis
-                      ? ['正在使用本服务', client.synced_at ? `最近同步 ${formatSyncTime(client.synced_at)}` : ''].filter(Boolean).join(' · ')
+                      ? [gatewayMode ? '本机网关' : '直连', client.synced_at ? formatSyncTime(client.synced_at) : ''].filter(Boolean).join(' · ')
                       : usingOther ? `当前使用 ${sourceLabel(client)}` : '未分发'}
                   </span>
                   <span className="ai-service-binding-actions">
                     {usingThis ? (
+                      <>
+                        <button
+                          type="button"
+                          className="btn ai-service-tool-btn"
+                          disabled={rowBusy}
+                          aria-busy={rowAction === 'gateway' || rowAction === 'direct'}
+                          title={gatewayMode ? '切回直连：把真实地址与密钥写回该工具' : '切到网关：密钥留在 Agent，用量计入本机口径'}
+                          onClick={() => void onSetBindingMode(client.target, gatewayMode ? 'direct' : 'gateway')}
+                        >
+                          {rowAction === 'gateway' || rowAction === 'direct'
+                            ? <><BusyIndicator size={11} />切换中</>
+                            : gatewayMode ? '切回直连' : '切到网关'}
+                        </button>
                       <button
                         type="button"
                         className="btn ai-service-tool-btn"
@@ -488,7 +625,8 @@ function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNam
                       >
                         {rowAction === 'remove' ? <><BusyIndicator size={11} />取消分发中</> : '取消分发'}
                       </button>
-                    ) : (
+                      </>
+                    ) : usingOther ? (
                       <button
                         type="button"
                         className="btn ai-service-tool-btn"
@@ -502,6 +640,29 @@ function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNam
                       >
                         {rowAction === 'import' ? <><BusyIndicator size={11} />分发中</> : usingOther ? '改用本服务' : '分发'}
                       </button>
+                    ) : (
+                      <>
+                        {/* 未分发的工具也给出网关入口：Anthropic 客户端（如 Claude Code）
+                            接 OpenAI 服务只能经过网关，直连分发会被协议守卫挡住。 */}
+                        <button
+                          type="button"
+                          className="btn ai-service-tool-btn"
+                          disabled={rowBusy}
+                          aria-busy={rowAction === 'gateway'}
+                          title="切到网关：由网关完成协议互译，密钥留在 Agent"
+                          onClick={() => void onSetBindingMode(client.target, 'gateway', source)}
+                        >
+                          {rowAction === 'gateway' ? <><BusyIndicator size={11} />切换中</> : '切到网关'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn ai-service-tool-btn"
+                          disabled={rowBusy}
+                          onClick={() => void onImport([client.target])}
+                        >
+                          {rowAction === 'import' ? <><BusyIndicator size={11} />分发中</> : '分发'}
+                        </button>
+                      </>
                     )}
                     {/* 已登记来源的工具在它自己的服务行里取消分发；来源不明的注册没有那一行，
                         只能在这里取消，否则这个状态在应用内无法消解。 */}
@@ -544,7 +705,7 @@ function AiServiceDetail({ id, source, subject, meta, clientStatuses, serviceNam
   );
 }
 
-function AiServiceRow({ service, active, clientStatuses, serviceNames, pending, onImport, onRemoveFromClient, onEdit, onRemove }: {
+function AiServiceRow({ service, active, clientStatuses, serviceNames, pending, onImport, onRemoveFromClient, onEdit, onRemove, gatewayClients, onSetBindingMode }: {
   service: CustomAIService;
   active: boolean;
   clientStatuses: ClientStatus[];
@@ -554,6 +715,8 @@ function AiServiceRow({ service, active, clientStatuses, serviceNames, pending, 
   onRemoveFromClient: (target: string) => Promise<void>;
   onEdit: (service: CustomAIService) => void;
   onRemove: (id: string) => void;
+  gatewayClients: string[];
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct') => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const confirm = useConfirm();
@@ -577,7 +740,7 @@ function AiServiceRow({ service, active, clientStatuses, serviceNames, pending, 
         <span title={summary}>{summary}</span>
         <ClientUsageChips clients={boundClients} />
       </div>
-      <Pill kind={boundClients.length ? 'success' : 'neutral'}>{boundClients.length ? `已分发 ${boundClients.length} 个工具` : '未分发'}</Pill>
+      <Pill kind={boundClients.length ? 'success' : 'neutral'}>{boundClients.length ? `已连接 ${boundClients.length} 个客户端` : '未连接'}</Pill>
       <div className="ai-client-registration-actions ai-service-row-actions">
         {/* 主行只留「分发给 AI 工具」这一个文字按钮：分发是这个页面的主操作，
             按钮名字直接写清点开能做什么，再靠箭头表示它是展开而不是跳转。
@@ -589,7 +752,7 @@ function AiServiceRow({ service, active, clientStatuses, serviceNames, pending, 
           aria-controls={detailId}
           onClick={() => setExpanded((value) => !value)}
         >
-          分发给 AI 工具
+          连接客户端
           <ChevronDown className="ai-service-row-chevron" size={14} />
         </button>
         <ActionMenu className="ai-service-row-menu" icon={<MoreHorizontal size={15} aria-hidden="true" />} title={`${service.display_name} 的更多操作`} variant="icon">
@@ -623,6 +786,8 @@ function AiServiceRow({ service, active, clientStatuses, serviceNames, pending, 
           pending={pending}
           onImport={onImport}
           onRemoveFromClient={onRemoveFromClient}
+          gatewayClients={gatewayClients}
+          onSetBindingMode={onSetBindingMode}
         />
       ) : null}
     </article>
@@ -645,7 +810,7 @@ function formatAIServiceError(error: unknown, fallback: string) {
   return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
 }
 
-function ManagedServiceCard({ managed, active, clientStatuses, serviceNames, pending, onImport, onRemove, onOpenAccount, onRefresh }: { managed: ManagedAIServiceSummary; active: boolean; clientStatuses: ClientStatus[]; serviceNames: Record<string, string>; pending: ClientPending | null; onImport: (targets: string[], replace?: boolean) => Promise<void>; onRemove: (target: string) => Promise<void>; onOpenAccount: () => void; onRefresh: () => void }) {
+function ManagedServiceCard({ managed, active, clientStatuses, serviceNames, pending, onImport, onRemove, onOpenAccount, onRefresh, gatewayClients, onSetBindingMode }: { managed: ManagedAIServiceSummary; active: boolean; clientStatuses: ClientStatus[]; serviceNames: Record<string, string>; pending: ClientPending | null; onImport: (targets: string[], replace?: boolean) => Promise<void>; onRemove: (target: string) => Promise<void>; onOpenAccount: () => void; onRefresh: () => void; gatewayClients: string[]; onSetBindingMode: (target: string, mode: 'gateway' | 'direct') => Promise<void> }) {
   const [expanded, setExpanded] = useState(false);
   if (managed.available) {
     const models = managed.models?.length ? `${managed.models.length} 个模型` : '未返回模型列表';
@@ -660,7 +825,7 @@ function ManagedServiceCard({ managed, active, clientStatuses, serviceNames, pen
           <span>{managed.model} · {models} · {managed.base_url}</span>
           <ClientUsageChips clients={boundClients} />
         </div>
-        <Pill kind={boundClients.length ? 'success' : 'neutral'}>{boundClients.length ? `已分发 ${boundClients.length} 个工具` : '未分发'}</Pill>
+        <Pill kind={boundClients.length ? 'success' : 'neutral'}>{boundClients.length ? `已连接 ${boundClients.length} 个客户端` : '未连接'}</Pill>
         <div className="ai-client-registration-actions ai-service-row-actions">
           <button
             type="button"
@@ -669,7 +834,7 @@ function ManagedServiceCard({ managed, active, clientStatuses, serviceNames, pen
             aria-controls={detailId}
             onClick={() => setExpanded((value) => !value)}
           >
-            分发给 AI 工具
+            连接客户端
             <ChevronDown className="ai-service-row-chevron" size={14} />
           </button>
         </div>
@@ -688,6 +853,8 @@ function ManagedServiceCard({ managed, active, clientStatuses, serviceNames, pen
             pending={pending}
             onImport={onImport}
             onRemoveFromClient={onRemove}
+            gatewayClients={gatewayClients}
+            onSetBindingMode={onSetBindingMode}
           />
         ) : null}
       </article>
@@ -695,21 +862,21 @@ function ManagedServiceCard({ managed, active, clientStatuses, serviceNames, pen
   }
   const reason = managed.reason ?? 'unknown';
   const reasonText: Record<string, string> = {
-    not_authorized: '尚未连接工作台账号，连接后可使用工作台提供的模型服务',
-    user_mismatch: '桌面端与当前工作台账号不一致，请重新连接',
-    independent: '未对接 AI 工作台时不使用工作台提供的模型服务',
-    no_credential: '工作台尚未生成 AI 凭据，请先选择服务渠道',
-    not_ready: '当前 AI 凭据不可用，请先在工作台选择有效渠道',
-    network_error: '无法连接工作台，稍后会自动重试',
-    dashboard_error: '无法读取工作台模型服务，请稍后重试',
-    parse_error: '暂时无法读取工作台模型服务，请刷新后重试',
+    not_authorized: '工作台服务未连接',
+    user_mismatch: '工作台账号不一致',
+    independent: '未连接工作台服务',
+    no_credential: '工作台服务未配置',
+    not_ready: '工作台服务暂不可用',
+    network_error: '工作台连接失败',
+    dashboard_error: '工作台服务读取失败',
+    parse_error: '工作台服务读取失败',
   };
   return (
     <section className="ai-managed-strip">
       <div className="ai-managed-icon muted">{reason === 'not_authorized' ? <CircleDashed size={18} /> : <CircleX size={18} />}</div>
       <div className="ai-managed-copy">
-        <strong>工作台模型服务未就绪</strong>
-        <span>{reasonText[reason] ?? '工作台暂未提供可用的模型服务'}</span>
+        <strong>{reasonText[reason] ?? '工作台服务不可用'}</strong>
+        <span>{reason === 'not_authorized' || reason === 'user_mismatch' ? '连接账号后即可使用' : reason === 'network_error' || reason === 'dashboard_error' || reason === 'parse_error' ? '请稍后重试' : '请在工作台完成配置'}</span>
       </div>
       <div className="ai-managed-actions">
         {reason === 'not_authorized' || reason === 'user_mismatch' ? <button className="btn" onClick={onOpenAccount}><ExternalLink size={13} />连接账号</button> : null}

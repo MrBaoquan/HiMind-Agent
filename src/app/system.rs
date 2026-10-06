@@ -3,22 +3,29 @@ use base64::Engine;
 use reqwest::Url;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Pss, RsaPublicKey};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::app::types::RemoteConnectRequest;
+use crate::app::types::{RemoteConnectRequest, WorkspaceBuildRequest};
 use crate::store::credentials::{
-    configured_unity_editor_path, discovered_unity_editor_path, unity_editor_environment_path,
-    unity_editor_path_for_version,
+    configured_unity_editor_path, configured_unreal_editor_path, discovered_unity_editor_path,
+    unity_editor_environment_path, unity_editor_path_for_version, unreal_editor_environment_path,
 };
 use crate::Options;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+/// 工作流步骤要等构建结束，默认给 30 分钟，最长 2 小时。
+const DEFAULT_BUILD_WAIT_SECONDS: u64 = 1800;
+const MAX_BUILD_WAIT_SECONDS: u64 = 7200;
 const AUTO_START_REG_PATH: &str = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTO_START_VALUE: &str = "ProjectDashboardAgent";
 const EMBEDDED_UPDATE_PUBLIC_KEY_PEM: &str =
@@ -789,6 +796,18 @@ pub(crate) fn inspect_project_workspace(
     let build_script = path_exists
         .then(|| find_workspace_build_script(&folder))
         .flatten();
+    let build_job = if path_exists {
+        active_workspace_build_job(&folder)?
+    } else {
+        None
+    };
+    let native_build = native_build_info(
+        &folder,
+        &engine,
+        engine_version,
+        project_file.as_deref(),
+        launcher.as_deref(),
+    );
     let open_project_reason = if !path_exists {
         "本机工程目录不存在"
     } else if engine.is_empty() {
@@ -800,18 +819,40 @@ pub(crate) fn inspect_project_workspace(
     } else {
         ""
     };
+    let native_available = native_build["available"].as_bool().unwrap_or(false);
+    let script_available = build_script.is_some();
+    let build_reason = if !path_exists {
+        "本机工程目录不存在".to_string()
+    } else if native_available {
+        String::new()
+    } else if script_available {
+        String::new()
+    } else {
+        native_build["blockers"]
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(Value::as_str)
+            .unwrap_or("未找到原生引擎或项目构建入口")
+            .to_string()
+    };
     Ok(json!({
         "path_exists": path_exists,
         "engine_type": engine,
         "project_file": project_file,
         "editor_path": launcher,
         "build_script": build_script,
+        "build_job": build_job,
         "can_open_folder": path_exists,
         "can_open_project": open_project_reason.is_empty(),
-        "can_build": build_script.is_some(),
+        "can_build": native_available || script_available,
+        "native_build": native_build,
+        "script_build": {
+            "available": script_available,
+            "path": build_script,
+        },
         "open_folder_reason": if path_exists { "" } else { "本机工程目录不存在" },
         "open_project_reason": open_project_reason,
-        "build_reason": if !path_exists { "本机工程目录不存在" } else if build_script.is_none() { "需在工程的 .himind 目录配置 build.ps1、build.cmd 或 build.bat" } else { "" },
+        "build_reason": build_reason,
     }))
 }
 
@@ -844,56 +885,470 @@ pub(crate) fn launch_project_workspace(
     Ok(json!({ "ok": true, "engine_type": engine, "editor_path": editor, "project_file": project }))
 }
 
-pub(crate) fn launch_workspace_build(path: &str) -> Result<Value, Box<dyn Error>> {
-    let workspace = PathBuf::from(path.trim()).canonicalize()?;
+pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<Value, Box<dyn Error>> {
+    let workspace = PathBuf::from(request.target_path.trim()).canonicalize()?;
     if !workspace.is_dir() {
         return Err("本机工程目录不存在".into());
     }
-    let script = find_workspace_build_script(&workspace)
-        .ok_or("需在工程的 .himind 目录配置 build.ps1、build.cmd 或 build.bat")?
-        .canonicalize()?;
-    if !script.starts_with(&workspace) {
-        return Err("构建脚本必须位于当前工程目录内".into());
+    if let Some(active) = active_workspace_build(&workspace)? {
+        return Err(format!("该工程已有构建任务正在执行：{active}").into());
     }
 
-    let extension = script
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
+    let engine = normalized_engine_type(
+        request.engine_type.as_deref().unwrap_or_default(),
+        &workspace,
+    );
+    let requested_version = request
+        .engine_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let provider = request
+        .provider
+        .as_deref()
+        .or(request.build_method.as_deref())
+        .unwrap_or("auto")
+        .trim()
         .to_ascii_lowercase();
-    let mut command = if extension == "ps1" {
-        let mut command = Command::new("powershell.exe");
-        command
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(&script);
-        command
-    } else if matches!(extension.as_str(), "cmd" | "bat") {
-        let mut command = Command::new("cmd.exe");
-        command.args(["/D", "/S", "/C"]).arg(&script);
-        command
+    if !matches!(provider.as_str(), "auto" | "native" | "script") {
+        return Err("provider 只能是 native、script 或 auto".into());
+    }
+    let project_file = resolve_project_launcher(&workspace, &engine, requested_version).0;
+    let launcher = resolve_project_launcher(&workspace, &engine, requested_version).1;
+    let native = native_build_info(
+        &workspace,
+        &engine,
+        requested_version,
+        project_file.as_deref(),
+        launcher.as_deref(),
+    );
+    let native_available = native["available"].as_bool().unwrap_or(false);
+    let script = find_workspace_build_script(&workspace).map(|path| path.canonicalize()).transpose()?;
+    let selected_provider = if provider == "native" {
+        if !native_available {
+            return Err(native_build_error(&native).into());
+        }
+        "native"
+    } else if provider == "script" {
+        if script.is_none() {
+            return Err("需在工程的 .himind 目录配置 build.ps1、build.cmd 或 build.bat".into());
+        }
+        "script"
+    } else if native_available {
+        "native"
     } else {
-        return Err("不支持的构建脚本类型".into());
+        return Err(format!(
+            "原生构建不可用：{}；如需兼容构建，请显式传入 provider=script",
+            native_build_error(&native)
+        )
+        .into());
     };
+
+    let target_platform = normalize_target_platform(
+        request.target_platform.as_deref(),
+        &engine,
+        &native,
+        selected_provider == "native",
+    )?;
+    let architecture = normalize_architecture(request.architecture.as_deref())?;
+    let configuration = normalize_configuration(request.configuration.as_deref())?;
+    let output_path = resolve_build_output_path(
+        &workspace,
+        &engine,
+        &target_platform,
+        &configuration,
+        request.output_path.as_deref(),
+    )?;
+    let output_item_count_before = output_item_count(&output_path);
+    let output_modified_before = output_latest_modified(&output_path);
+    if request.clean.unwrap_or(false) && output_path.exists() {
+        if output_path.is_dir() {
+            fs::remove_dir_all(&output_path)?;
+        } else {
+            fs::remove_file(&output_path)?;
+        }
+    }
+    fs::create_dir_all(&output_path)?;
+
+    let mut command = if selected_provider == "native" {
+        native_build_command(
+            &workspace,
+            &engine,
+            project_file.as_deref(),
+            launcher.as_deref(),
+            &target_platform,
+            &architecture,
+            &configuration,
+            &output_path,
+        )?
+    } else {
+        script_build_command(script.as_deref().expect("script checked above"))?
+    };
+    command
+        .env("HIMIND_BUILD_OUTPUT", &output_path)
+        .env("HIMIND_BUILD_PLATFORM", &target_platform)
+        .env("HIMIND_BUILD_ARCHITECTURE", &architecture)
+        .env("HIMIND_BUILD_CONFIGURATION", &configuration)
+        .env("HIMIND_BUILD_PROVIDER", selected_provider);
+
+    let job_id = format!(
+        "wb-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let jobs_root = workspace_build_jobs_root();
+    fs::create_dir_all(&jobs_root)?;
+    let log_path = jobs_root.join(format!("{job_id}.log"));
+    let job_path = jobs_root.join(format!("{job_id}.json"));
+    let command_display = command_display(&command);
+    let log = OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let error_log = log.try_clone()?;
     let child = command
         .current_dir(&workspace)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(error_log))
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
-    Ok(json!({
+
+    let job = WorkspaceBuildJob {
+        job_id: job_id.clone(),
+        state: "running".to_string(),
+        process_id: child.id(),
+        workspace: workspace.to_string_lossy().to_string(),
+        build_script: script.as_ref().map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
+        provider: selected_provider.to_string(),
+        engine_type: engine.clone(),
+        target_platform: target_platform.clone(),
+        architecture: architecture.clone(),
+        configuration: configuration.clone(),
+        output_path: output_path.to_string_lossy().to_string(),
+        output_item_count_before,
+        output_modified_before,
+        command: command_display,
+        log_path: log_path.to_string_lossy().to_string(),
+        started_at: now_rfc3339(),
+        finished_at: None,
+        exit_code: None,
+        error: None,
+        cancel_requested: false,
+    };
+    write_workspace_build_job(&job_path, &job)?;
+    let thread_job_path = job_path.clone();
+    let thread_job_id = job_id.clone();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let result = child.wait();
+        let mut job = read_workspace_build_job(&thread_job_path).unwrap_or_else(|_| WorkspaceBuildJob::legacy(thread_job_id.clone()));
+        job.finished_at = Some(now_rfc3339());
+        match result {
+            Ok(status) if job.cancel_requested => {
+                job.state = "canceled".to_string();
+                job.exit_code = status.code();
+            }
+            Ok(status) if status.success() => {
+                if job.provider == "native" && !output_has_new_artifacts(Path::new(&job.output_path), job.output_item_count_before, job.output_modified_before) {
+                    job.state = "failed".to_string();
+                    job.exit_code = status.code();
+                    job.error = Some(format!("构建进程成功退出，但未找到预期产物：{}", job.output_path));
+                } else {
+                    job.state = "succeeded".to_string();
+                    job.exit_code = status.code();
+                }
+            }
+            Ok(status) => {
+                job.state = "failed".to_string();
+                job.exit_code = status.code();
+                job.error = Some(format!("构建进程退出码 {}", status.code().map_or_else(|| "unknown".to_string(), |code| code.to_string())));
+            }
+            Err(error) => {
+                job.state = "failed".to_string();
+                job.error = Some(error.to_string());
+            }
+        }
+        let _ = write_workspace_build_job(&thread_job_path, &job);
+    });
+    let mut payload = json!({
         "ok": true,
         "started": true,
-        "process_id": child.id(),
+        "job_id": job_id,
+        "process_id": job.process_id,
         "workspace": workspace,
+        "provider": selected_provider,
+        "engine_type": engine,
+        "target_platform": target_platform,
+        "architecture": architecture,
+        "configuration": configuration,
+        "output_path": output_path,
         "build_script": script,
-    }))
+        "command": job.command,
+        "log_path": log_path,
+    });
+    if request.wait.unwrap_or(false) {
+        let timeout_seconds = request
+            .timeout_seconds
+            .unwrap_or(DEFAULT_BUILD_WAIT_SECONDS)
+            .clamp(1, MAX_BUILD_WAIT_SECONDS);
+        let final_status = wait_for_workspace_build(
+            payload["job_id"].as_str().unwrap_or_default(),
+            timeout_seconds,
+        )?;
+        payload["waited"] = json!(true);
+        payload["job"] = final_status["job"].clone();
+        payload["log_tail"] = final_status["log_tail"].clone();
+    }
+    Ok(payload)
+}
+
+/// 阻塞等待某次构建结束。工作流把「构建」当成一个步骤，步骤不结束运行态就
+/// 一直是进行中，所以必须等真实的终态，而不是拿启动回执当成功。
+fn wait_for_workspace_build(job_id: &str, timeout_seconds: u64) -> Result<Value, Box<dyn Error>> {
+    if job_id.trim().is_empty() {
+        return Err("构建任务 ID 缺失，无法等待结果".into());
+    }
+    let path = workspace_build_job_path(job_id)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut ticks: u32 = 0;
+    loop {
+        // 构建线程退出时会自己落终态，所以常规轮询只读文件。
+        let job = read_workspace_build_job(&path)?;
+        if !matches!(job.state.as_str(), "running" | "canceling") {
+            return workspace_build_status(job_id);
+        }
+        // Agent 重启导致的「假运行」靠进程核对兜底，但没必要每 2 秒拉一次 tasklist。
+        ticks = ticks.saturating_add(1);
+        if ticks % 15 == 0 {
+            let reconciled = reconcile_workspace_build_job(&path)?;
+            if !matches!(reconciled.state.as_str(), "running" | "canceling") {
+                return workspace_build_status(job_id);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("等待构建超时（{timeout_seconds}s），任务仍在运行：{job_id}").into());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[cfg(windows)]
+fn command_path(path: &Path) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(stripped) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{stripped}"));
+    }
+    value
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(not(windows))]
+fn command_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceBuildJob {
+    job_id: String,
+    state: String,
+    process_id: u32,
+    workspace: String,
+    build_script: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    engine_type: String,
+    #[serde(default)]
+    target_platform: String,
+    #[serde(default)]
+    architecture: String,
+    #[serde(default)]
+    configuration: String,
+    #[serde(default)]
+    output_path: String,
+    #[serde(default)]
+    output_item_count_before: u64,
+    #[serde(default)]
+    output_modified_before: u128,
+    #[serde(default)]
+    command: String,
+    log_path: String,
+    started_at: String,
+    finished_at: Option<String>,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    cancel_requested: bool,
+}
+
+impl WorkspaceBuildJob {
+    fn legacy(job_id: String) -> Self {
+        Self {
+            job_id,
+            state: "running".to_string(),
+            process_id: 0,
+            workspace: String::new(),
+            build_script: String::new(),
+            provider: "script".to_string(),
+            engine_type: String::new(),
+            target_platform: String::new(),
+            architecture: String::new(),
+            configuration: String::new(),
+            output_path: String::new(),
+            output_item_count_before: 0,
+            output_modified_before: 0,
+            command: String::new(),
+            log_path: String::new(),
+            started_at: now_rfc3339(),
+            finished_at: None,
+            exit_code: None,
+            error: None,
+            cancel_requested: false,
+        }
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn workspace_build_jobs_root() -> PathBuf {
+    crate::store::paths::agent_home()
+        .join("data")
+        .join("workspace-builds")
+}
+
+fn valid_workspace_build_job_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn workspace_build_job_path(job_id: &str) -> Result<PathBuf, Box<dyn Error>> {
+    if !valid_workspace_build_job_id(job_id) {
+        return Err("构建任务 ID 无效".into());
+    }
+    Ok(workspace_build_jobs_root().join(format!("{job_id}.json")))
+}
+
+fn read_workspace_build_job(path: &Path) -> Result<WorkspaceBuildJob, Box<dyn Error>> {
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+fn write_workspace_build_job(path: &Path, job: &WorkspaceBuildJob) -> Result<(), Box<dyn Error>> {
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(job)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn active_workspace_build(workspace: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    Ok(active_workspace_build_job(workspace)?.map(|job| job.job_id))
+}
+
+fn active_workspace_build_job(
+    workspace: &Path,
+) -> Result<Option<WorkspaceBuildJob>, Box<dyn Error>> {
+    let root = workspace_build_jobs_root();
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let expected = workspace.to_string_lossy();
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(job) = reconcile_workspace_build_job(&entry.path()) {
+            if job.workspace == expected && matches!(job.state.as_str(), "running" | "canceling") {
+                return Ok(Some(job));
+            }
+        }
+    }
+    Ok(None)
+}
+
+// Jobs are persisted because the Agent can be restarted while an engine build
+// is running. Reconcile stale records before exposing them to the UI so a
+// missing child process cannot leave an infinite "running" indicator.
+fn reconcile_workspace_build_job(path: &Path) -> Result<WorkspaceBuildJob, Box<dyn Error>> {
+    let mut job = read_workspace_build_job(path)?;
+    if !matches!(job.state.as_str(), "running" | "canceling") {
+        return Ok(job);
+    }
+    if job.process_id == 0 || !process_is_running(job.process_id) {
+        job.state = if job.cancel_requested {
+            "canceled"
+        } else {
+            "failed"
+        }
+        .to_string();
+        job.finished_at.get_or_insert_with(now_rfc3339);
+        job.error.get_or_insert_with(|| {
+            if job.cancel_requested {
+                "构建任务在 Agent 重启或进程退出时被取消".to_string()
+            } else {
+                "构建进程已退出，但未能读取最终退出码".to_string()
+            }
+        });
+        write_workspace_build_job(path, &job)?;
+    }
+    Ok(job)
+}
+
+#[cfg(windows)]
+fn process_is_running(process_id: u32) -> bool {
+    if process_id == 0 {
+        return false;
+    }
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {process_id}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .filter(|value| value.status.success())
+        .map(|value| {
+            String::from_utf8_lossy(&value.stdout)
+                .lines()
+                .any(|line| line.contains(&format!("\"{process_id}\"")))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn process_is_running(process_id: u32) -> bool {
+    process_id != 0 && Path::new(&format!("/proc/{process_id}")).exists()
+}
+
+pub(crate) fn workspace_build_status(job_id: &str) -> Result<Value, Box<dyn Error>> {
+    let job = reconcile_workspace_build_job(&workspace_build_job_path(job_id)?)?;
+    let log_tail = fs::read_to_string(&job.log_path)
+        .unwrap_or_default()
+        .chars()
+        .rev()
+        .take(16_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    Ok(json!({ "job": job, "log_tail": log_tail }))
+}
+
+pub(crate) fn cancel_workspace_build(job_id: &str) -> Result<Value, Box<dyn Error>> {
+    let path = workspace_build_job_path(job_id)?;
+    let mut job = reconcile_workspace_build_job(&path)?;
+    if !matches!(job.state.as_str(), "running" | "canceling") {
+        return Ok(json!({ "job": job, "canceled": false }));
+    }
+    job.cancel_requested = true;
+    job.state = "canceling".to_string();
+    write_workspace_build_job(&path, &job)?;
+    let _ = Command::new("taskkill")
+        .args(["/PID", &job.process_id.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    Ok(json!({ "job": job, "canceled": true }))
 }
 
 fn find_workspace_build_script(workspace: &Path) -> Option<PathBuf> {
@@ -901,6 +1356,315 @@ fn find_workspace_build_script(workspace: &Path) -> Option<PathBuf> {
         .into_iter()
         .map(|name| workspace.join(".himind").join(name))
         .find(|candidate| candidate.is_file())
+}
+
+fn native_build_error(info: &Value) -> String {
+    info["blockers"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("；")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "未找到可用的原生引擎工具链".to_string())
+}
+
+fn native_build_info(
+    workspace: &Path,
+    engine: &str,
+    engine_version: Option<&str>,
+    project_file: Option<&str>,
+    launcher: Option<&str>,
+) -> Value {
+    let mut supported_platforms = Vec::new();
+    let mut missing_components = Vec::new();
+    let mut blockers = Vec::new();
+    let requested_or_project_version = engine_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            if engine == "unity" {
+                read_unity_project_version(workspace)
+            } else {
+                project_file
+                    .and_then(|path| read_unreal_engine_association(Path::new(path)))
+            }
+        });
+    if engine.is_empty() {
+        blockers.push("未配置或识别工程引擎".to_string());
+    } else if project_file.is_none() {
+        blockers.push("未找到与引擎匹配的工程文件".to_string());
+    } else if launcher.is_none() {
+        blockers.push(match engine {
+            "unity" => "未找到匹配版本的 Unity.exe".to_string(),
+            "unreal" => "未找到匹配版本的 UnrealEditor.exe".to_string(),
+            _ => "未找到引擎编辑器".to_string(),
+        });
+    } else if engine == "unity" {
+        let editor = Path::new(launcher.unwrap_or_default());
+        for (platform, module) in [
+            ("windows", "WindowsStandaloneSupport"),
+            ("linux", "LinuxStandaloneSupport"),
+            ("macos", "MacStandaloneSupport"),
+            ("webgl", "WebGLSupport"),
+            ("android", "AndroidPlayer"),
+            ("ios", "iOSSupport"),
+        ] {
+            if unity_module_available(editor, module) {
+                supported_platforms.push(platform.to_string());
+            } else {
+                missing_components.push(format!("Unity {module} ({platform})"));
+            }
+        }
+        if supported_platforms.is_empty() {
+            blockers.push("Unity 未安装任何目标平台模块".to_string());
+        }
+    } else if engine == "unreal" {
+        let editor = Path::new(launcher.unwrap_or_default());
+        if find_unreal_automation_tool(editor).is_none() {
+            blockers.push("未找到 Unreal RunUAT 构建工具".to_string());
+        } else {
+            supported_platforms = unreal_supported_platforms();
+        }
+    }
+    let available = blockers.is_empty() && !supported_platforms.is_empty();
+    json!({
+        "available": available,
+        "provider": if engine.is_empty() { Value::Null } else { json!(engine) },
+        "engine_version": requested_or_project_version,
+        "editor_path": launcher,
+        "supported_platforms": supported_platforms,
+        "missing_components": missing_components,
+        "blockers": blockers,
+    })
+}
+
+fn unity_module_available(editor: &Path, module: &str) -> bool {
+    let data = editor.parent().map(Path::to_path_buf).unwrap_or_default().join("Data");
+    data.join("PlaybackEngines").join(module).is_dir()
+        || data.join("PlaybackEngines").join(module).is_file()
+}
+
+fn find_unreal_automation_tool(editor: &Path) -> Option<PathBuf> {
+    let engine_root = editor.parent()?.parent()?.parent()?;
+    let batch = engine_root.join("Build").join("BatchFiles");
+    for name in if cfg!(windows) { ["RunUAT.bat", "RunUAT.sh"] } else { ["RunUAT.sh", "RunUAT.bat"] } {
+        let candidate = batch.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn unreal_supported_platforms() -> Vec<String> {
+    if cfg!(windows) {
+        vec!["windows".to_string(), "linux".to_string(), "android".to_string()]
+    } else if cfg!(target_os = "macos") {
+        vec!["macos".to_string(), "ios".to_string(), "linux".to_string(), "android".to_string()]
+    } else {
+        vec!["linux".to_string(), "android".to_string()]
+    }
+}
+
+fn normalize_target_platform(
+    requested: Option<&str>,
+    engine: &str,
+    native: &Value,
+    validate_native: bool,
+) -> Result<String, Box<dyn Error>> {
+    let value = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" });
+    let value = match value.to_ascii_lowercase().as_str() {
+        "win" | "win64" | "windows" | "standalonewindows64" => "windows",
+        "linux" | "linux64" | "standalonelinux64" => "linux",
+        "mac" | "macos" | "osx" | "standaloneosx" => "macos",
+        "web" | "webgl" => "webgl",
+        "android" => "android",
+        "ios" | "iphone" => "ios",
+        other => return Err(format!("不支持的目标平台：{other}").into()),
+    };
+    let supported = native["supported_platforms"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if validate_native && engine == "unity" && !supported.iter().any(|item| *item == value) {
+        return Err(format!("Unity 未安装目标平台模块：{value}").into());
+    }
+    if validate_native && value == "ios" && !cfg!(target_os = "macos") {
+        return Err("iOS 原生构建需要 macOS 主机".into());
+    }
+    if validate_native && engine == "unreal" && !supported.iter().any(|item| *item == value) {
+        return Err(format!("当前主机或 Unreal 工具链不支持目标平台：{value}").into());
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_architecture(requested: Option<&str>) -> Result<String, Box<dyn Error>> {
+    let value = requested.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("x64").to_ascii_lowercase();
+    match value.as_str() {
+        "x64" | "amd64" => Ok("x64".to_string()),
+        "arm64" | "aarch64" => Ok("arm64".to_string()),
+        _ => Err(format!("不支持的目标架构：{value}").into()),
+    }
+}
+
+fn normalize_configuration(requested: Option<&str>) -> Result<String, Box<dyn Error>> {
+    let value = requested.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("development").to_ascii_lowercase();
+    match value.as_str() {
+        "development" | "dev" => Ok("Development".to_string()),
+        "shipping" => Ok("Shipping".to_string()),
+        "test" => Ok("Test".to_string()),
+        "release" => Ok("Release".to_string()),
+        _ => Err(format!("不支持的构建配置：{value}").into()),
+    }
+}
+
+fn resolve_build_output_path(
+    workspace: &Path,
+    engine: &str,
+    platform: &str,
+    configuration: &str,
+    requested: Option<&str>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let output = if let Some(value) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err("output_path 必须是绝对路径".into());
+        }
+        path
+    } else {
+        workspace.join(".himind").join("build-output").join(engine).join(platform).join(configuration.to_ascii_lowercase())
+    };
+    fs::create_dir_all(&output)?;
+    Ok(output)
+}
+
+fn native_build_command(
+    workspace: &Path,
+    engine: &str,
+    project_file: Option<&str>,
+    launcher: Option<&str>,
+    platform: &str,
+    architecture: &str,
+    configuration: &str,
+    output: &Path,
+) -> Result<Command, Box<dyn Error>> {
+    let launcher = launcher.ok_or("原生引擎编辑器路径缺失")?;
+    if engine == "unity" {
+        let mut command = Command::new(launcher);
+        command.args(["-batchmode", "-nographics", "-quit", "-projectPath"])
+            .arg(command_path(workspace));
+        let target = match platform {
+            "windows" => Some(("StandaloneWindows64", "-buildWindows64Player", "game.exe")),
+            "linux" => Some(("StandaloneLinux64", "-buildLinux64Player", "game.x86_64")),
+            "macos" => Some(("StandaloneOSX", "-buildOSXUniversalPlayer", "game.app")),
+            "webgl" => Some(("WebGL", "-buildWebGLPlayer", "webgl")),
+            "android" => Some(("Android", "-buildAndroidPlayer", "game.apk")),
+            "ios" => Some(("iOS", "-buildIOSPlayer", "ios")),
+            _ => None,
+        };
+        let (target_name, output_flag, file_name) = target.ok_or_else(|| format!("Unity 不支持目标平台：{platform}"))?;
+        command.args(["-buildTarget", target_name, output_flag])
+            .arg(command_path(&output.join(file_name)));
+        return Ok(command);
+    }
+    if engine == "unreal" {
+        let project_file = project_file.ok_or("Unreal 工程文件缺失")?;
+        let uat = find_unreal_automation_tool(Path::new(launcher)).ok_or("未找到 Unreal RunUAT 构建工具")?;
+        let mut command = if uat.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("bat")) {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C"]).arg(command_path(&uat));
+            command
+        } else {
+            Command::new(uat)
+        };
+        let uat_platform = match platform { "windows" => "Win64", "linux" => "Linux", "macos" => "Mac", "android" => "Android", "ios" => "IOS", _ => return Err(format!("Unreal 不支持目标平台：{platform}").into()) };
+        command.args([
+            "BuildCookRun".to_string(),
+            format!("-project={}", command_path(Path::new(project_file)).to_string_lossy()),
+            "-noP4".to_string(),
+            "-build".to_string(),
+            "-cook".to_string(),
+            "-stage".to_string(),
+            "-pak".to_string(),
+            "-archive".to_string(),
+            format!("-archivedirectory={}", command_path(output).to_string_lossy()),
+            format!("-platform={uat_platform}"),
+            format!("-clientconfig={configuration}"),
+            format!("-targetplatform={uat_platform}"),
+            format!("-architecture={architecture}"),
+        ]);
+        return Ok(command);
+    }
+    Err("未识别的工程引擎".into())
+}
+
+fn script_build_command(script: &Path) -> Result<Command, Box<dyn Error>> {
+    let extension = script.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+    if extension == "ps1" {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(command_path(script));
+        Ok(command)
+    } else if matches!(extension.as_str(), "cmd" | "bat") {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C"]).arg(command_path(script));
+        Ok(command)
+    } else {
+        Err("不支持的构建脚本类型".into())
+    }
+}
+
+fn command_display(command: &Command) -> String {
+    std::iter::once(command.get_program().to_string_lossy().to_string())
+        .chain(command.get_args().map(|value| value.to_string_lossy().to_string()))
+        .map(|value| if value.contains(' ') { format!("\"{value}\"") } else { value })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn output_item_count(path: &Path) -> u64 {
+    if path.is_file() {
+        return 1;
+    }
+    fs::read_dir(path)
+        .map(|entries| entries.flatten().count() as u64)
+        .unwrap_or(0)
+}
+
+fn output_latest_modified(path: &Path) -> u128 {
+    if path.is_file() {
+        return path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+    }
+    fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| output_latest_modified(&entry.path()))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn output_has_new_artifacts(path: &Path, before: u64, modified_before: u128) -> bool {
+    if path.is_file() {
+        return path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false)
+            && output_latest_modified(path) >= modified_before;
+    }
+    output_item_count(path) > before || output_latest_modified(path) > modified_before
 }
 
 fn normalized_engine_type(configured: &str, folder: &Path) -> String {
@@ -936,20 +1700,24 @@ fn resolve_project_launcher(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .or(project_version.as_deref());
-        let launcher = unity_editor_path_for_version(version)
-            .or_else(|| unity_editor_environment_path().filter(|value| Path::new(value).is_file()))
-            .or_else(configured_unity_editor_path)
-            .or_else(discovered_unity_editor_path)
-            .filter(|value| Path::new(value).is_file());
+        let launcher = if version.is_some() {
+            unity_editor_path_for_version(version)
+        } else {
+            unity_editor_environment_path()
+                .filter(|value| Path::new(value).is_file())
+                .or_else(configured_unity_editor_path)
+                .or_else(discovered_unity_editor_path)
+                .filter(|value| Path::new(value).is_file())
+        };
         return (project_file, launcher);
     }
     if engine == "unreal" {
         let project_file = first_file_with_extension(folder, "uproject")
             .map(|value| value.to_string_lossy().to_string());
-        let launcher = std::env::var("HIMIND_UNREAL_EDITOR")
-            .ok()
-            .filter(|value| Path::new(value).is_file())
-            .or_else(find_unreal_editor);
+        let association = project_file
+            .as_deref()
+            .and_then(|value| read_unreal_engine_association(Path::new(value)));
+        let launcher = find_unreal_editor_for_association(association.as_deref());
         return (project_file, launcher);
     }
     (None, None)
@@ -987,6 +1755,34 @@ fn first_file_with_extension(folder: &Path, extension: &str) -> Option<PathBuf> 
 }
 
 fn find_unreal_editor() -> Option<String> {
+    find_unreal_editor_for_association(None)
+}
+
+fn read_unreal_engine_association(project_file: &Path) -> Option<String> {
+    let contents = fs::read_to_string(project_file).ok()?;
+    serde_json::from_str::<Value>(&contents)
+        .ok()?
+        .get("EngineAssociation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn find_unreal_editor_for_association(association: Option<&str>) -> Option<String> {
+    // 优先级：团队环境变量 → 本机设置页指定 → 常规安装目录。
+    // 只有版本能对上工程关联时才采用，避免多版本机器上盖错版本。
+    for candidate in [unreal_editor_environment_path(), configured_unreal_editor_path()] {
+        let Some(path) = candidate else {
+            continue;
+        };
+        if Path::new(&path).is_file()
+            && association
+                .is_none_or(|value| path_matches_engine_association(Path::new(&path), value))
+        {
+            return Some(path);
+        }
+    }
     let root = Path::new(r"C:\Program Files\Epic Games");
     let mut candidates = std::fs::read_dir(root)
         .ok()?
@@ -995,9 +1791,25 @@ fn find_unreal_editor() -> Option<String> {
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     candidates.sort();
-    candidates
-        .pop()
-        .map(|path| path.to_string_lossy().to_string())
+    if let Some(association) = association {
+        candidates
+            .into_iter()
+            .rev()
+            .find(|path| path_matches_engine_association(path, association))
+            .map(|path| path.to_string_lossy().to_string())
+    } else {
+        candidates
+            .pop()
+            .map(|path| path.to_string_lossy().to_string())
+    }
+}
+
+fn path_matches_engine_association(path: &Path, association: &str) -> bool {
+    let needle = association.trim().to_ascii_lowercase();
+    path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        value == needle || value.trim_start_matches("ue_") == needle.trim_start_matches("ue_")
+    })
 }
 
 pub(crate) fn launch_remote_connection(

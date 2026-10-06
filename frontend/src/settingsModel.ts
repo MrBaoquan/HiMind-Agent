@@ -52,7 +52,7 @@ export const SETTINGS_RAIL_GROUPS: Array<{ label: string; items: SettingsRailIte
     label: '应用与数据',
     items: [
       { key: 'general', label: '通用', description: '配置软件更新和开机启动。', keywords: ['更新', '版本', '开机启动', '自启', '启动'], icon: Power, panel: 'settings' },
-      { key: 'tooling', label: '本机工具与技能', description: '配置本机开发工具路径，以及技能的写入方式。', keywords: ['工具', '路径', 'unity', '技能', '目录', '写入', '安装'], icon: Wrench, panel: 'settings' },
+      { key: 'tooling', label: '本机工具与技能', description: '配置本机开发工具路径，以及技能的写入方式。', keywords: ['工具', '路径', 'unity', 'unreal', '引擎', '编辑器', '技能', '目录', '写入', '安装'], icon: Wrench, panel: 'settings' },
       { key: 'diagnostics', label: '数据与诊断', description: '导出备份包与诊断信息，查看运行日志。', keywords: ['备份', '恢复', '日志', '诊断', '导出', '排查'], icon: Database, panel: 'settings' },
     ],
   },

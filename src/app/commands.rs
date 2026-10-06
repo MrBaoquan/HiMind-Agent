@@ -3,6 +3,7 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -40,6 +41,161 @@ pub(crate) struct AgentState {
     pub state_path: PathBuf,
     pub options: Options,
     pub dashboard_authorization: Arc<Mutex<crate::app::identity::DashboardAuthorizationFlow>>,
+}
+
+#[tauri::command]
+pub(crate) fn list_experts() -> Result<Vec<crate::expert::ExpertSummary>, String> {
+    crate::expert::list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn active_expert(
+    workspace_root: Option<String>,
+) -> Result<Option<crate::expert::ExpertActivation>, String> {
+    let workspace = workspace_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    crate::expert::active_for_workspace(workspace.as_deref()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn activate_expert(
+    expert_id: String,
+    version: Option<String>,
+    workspace_root: Option<String>,
+) -> Result<crate::expert::ExpertActivation, String> {
+    let workspace = workspace_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    crate::expert::activate(&expert_id, version.as_deref(), workspace.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn save_expert(
+    input: crate::expert::ExpertDraftInput,
+) -> Result<crate::expert::ExpertSummary, String> {
+    crate::expert::save(input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn pick_expert_package() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("选择 HiMind 专家包")
+        .add_filter("HiMind 专家包", &["hmexpert", "zip"])
+        .pick_file()
+        .map(|path| crate::extension_workspace::display_path(&path))
+}
+
+#[tauri::command]
+pub(crate) fn import_expert_package(path: String) -> Result<crate::expert::ExpertSummary, String> {
+    crate::expert::import_package(std::path::Path::new(path.trim()))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn export_expert_package(
+    expert_id: String,
+    version: String,
+) -> Result<crate::expert::ExpertPackageResult, String> {
+    let file_name = format!("{}-{}.hmexpert", expert_id.trim(), version.trim());
+    let Some(destination) = rfd::FileDialog::new()
+        .set_title("导出专家包")
+        .set_file_name(&file_name)
+        .add_filter("HiMind 专家包", &["hmexpert"])
+        .save_file()
+    else {
+        return Err("已取消导出".into());
+    };
+    crate::expert::export_package(&expert_id, &version, &destination)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn project_expert_to_client(
+    expert_id: String,
+    version: Option<String>,
+    client_id: String,
+    workspace_root: String,
+) -> Result<crate::expert::ExpertProjectionReceipt, String> {
+    crate::expert::project_to_client(
+        &expert_id,
+        version.as_deref(),
+        &client_id,
+        std::path::Path::new(workspace_root.trim()),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn materialize_expert_project(
+    workspace_root: String,
+    expert_id: String,
+    version: Option<String>,
+) -> Result<crate::extension_projects::ExtensionProject, String> {
+    let parent = crate::extension_workspace::validate_authoring_root(workspace_root.trim())?;
+    crate::extension_projects::materialize_expert_project(
+        &parent,
+        &expert_id,
+        version.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn materialize_instruction_project(
+    workspace_root: String,
+    instruction_pack_id: String,
+    version: Option<String>,
+) -> Result<crate::extension_projects::ExtensionProject, String> {
+    let parent = crate::extension_workspace::validate_authoring_root(workspace_root.trim())?;
+    crate::extension_projects::materialize_instruction_project(
+        &parent,
+        &instruction_pack_id,
+        version.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_expert_drafts() -> Result<Vec<crate::expert::ExpertAuthoringDraft>, String> {
+    crate::expert_authoring::list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn test_expert_draft(
+    expert_id: String,
+    version: String,
+) -> Result<crate::expert::ExpertAuthoringDraft, String> {
+    crate::expert_authoring::test(&expert_id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn confirm_expert_draft(
+    expert_id: String,
+    version: String,
+) -> Result<crate::expert::ExpertAuthoringDraft, String> {
+    crate::expert_authoring::confirm(&expert_id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn submit_expert_draft(
+    expert_id: String,
+    version: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::expert::ExpertAuthoringDraft, String> {
+    require_dashboard(&state)?;
+    let agent_id = local_worker_snapshot(&state.worker_status)
+        .get("dashboard_agent_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    crate::expert_authoring::submit(&state.options, &agent_id, &expert_id, &version)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -339,6 +495,136 @@ pub(crate) async fn get_mcp_targets(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_instruction_targets(
+    workspace_root: String,
+) -> Result<Vec<crate::instruction_targets::InstructionTargetDescriptor>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::instruction_targets::discover_instruction_targets(std::path::Path::new(
+            workspace_root.trim(),
+        ))
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_workspace_instruction_context(
+    workspace_root: String,
+) -> Result<crate::instruction_pack::WorkspaceInstructionContext, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace = crate::extension_workspace::validate_authoring_root(workspace_root.trim())?;
+        crate::instruction_pack::workspace_context(&workspace).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn save_workspace_instruction_selection(
+    state: State<'_, AgentState>,
+    workspace_root: String,
+    selected: Vec<crate::instruction_pack::InstructionPackRef>,
+) -> Result<crate::instruction_pack::WorkspaceInstructionContext, String> {
+    let workspace = crate::extension_workspace::validate_authoring_root(workspace_root.trim())?;
+    let result = crate::instruction_pack::save_workspace_selection(&workspace, selected)
+        .map_err(|error| error.to_string())?;
+    // Instruction context is immutable for a running DSH process. Stop only
+    // this workspace so other open workspaces keep their sessions untouched.
+    crate::app::ui::stop_builtin_ai_session(&workspace);
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "已更新工作区指令选择，会话将在下次启动时加载: {}",
+            crate::extension_workspace::display_path(&workspace)
+        ),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) async fn inspect_ecc_repository(
+    root: String,
+) -> Result<crate::ecc_import::EccInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::ecc_import::inspect_repository(std::path::Path::new(root.trim()))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn plan_instruction_projection(
+    workspace_root: String,
+    target: crate::instruction_projection::ProjectionTarget,
+) -> Result<crate::instruction_projection::ProjectionPlan, String> {
+    use crate::instruction_projection::InstructionAdapter;
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace = std::path::Path::new(workspace_root.trim());
+        let home = crate::instruction_targets::instruction_home_for_client(&target.client_id);
+        let overlays = crate::instruction_projection::overlays_from_target(&target)
+            .map_err(|error| error.to_string())?;
+        let snapshot =
+            crate::workspace_instructions::resolve_with_overlays(workspace, &home, &overlays)
+                .map_err(|error| error.to_string())?;
+        let adapter = crate::instruction_projection::ManagedMarkdownAdapter::himind(
+            target.adapter_id.clone(),
+        );
+        let mut observation = adapter
+            .inspect(&target)
+            .map_err(|error| error.to_string())?;
+        if let Some(receipt) = crate::instruction_targets::load_projection_receipt(&target)
+            .map_err(|error| error.to_string())?
+        {
+            observation.expected_managed_digest = receipt.managed_digest;
+        }
+        adapter
+            .plan(&snapshot, &target, &observation)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn apply_instruction_projection(
+    state: State<'_, AgentState>,
+    plan: crate::instruction_projection::ProjectionPlan,
+) -> Result<crate::instruction_projection::ProjectionReceipt, String> {
+    use crate::instruction_projection::InstructionAdapter;
+    let adapter =
+        crate::instruction_projection::ManagedMarkdownAdapter::himind(plan.adapter_id.clone());
+    let receipt = adapter.apply(&plan).map_err(|error| error.to_string())?;
+    crate::instruction_targets::save_projection_receipt(&receipt)
+        .map_err(|error| error.to_string())?;
+    state
+        .approval_manager
+        .add_log("info", &format!("已应用工作区指令投影: {}", plan.client_id));
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub(crate) fn rollback_instruction_projection(
+    state: State<'_, AgentState>,
+    receipt: crate::instruction_projection::ProjectionReceipt,
+) -> Result<(), String> {
+    use crate::instruction_projection::InstructionAdapter;
+    let adapter =
+        crate::instruction_projection::ManagedMarkdownAdapter::himind(receipt.adapter_id.clone());
+    adapter
+        .rollback(&receipt)
+        .map_err(|error| error.to_string())?;
+    crate::instruction_targets::remove_projection_receipt(&receipt)
+        .map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!("已回滚工作区指令投影: {}", receipt.client_id),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1629,6 +1915,49 @@ pub(crate) fn save_unity_editor(
 }
 
 #[tauri::command]
+pub(crate) fn pick_engine_editor(engine: String) -> Result<serde_json::Value, String> {
+    let unreal = engine.trim().eq_ignore_ascii_case("unreal");
+    let (title, filter) = if unreal {
+        ("选择 Unreal 编辑器", "UnrealEditor.exe")
+    } else {
+        ("选择 Unity 编辑器", "Unity.exe")
+    };
+    let path = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter(filter, &["exe"])
+        .pick_file()
+        .map(|value| value.to_string_lossy().to_string());
+    Ok(json!({ "path": path }))
+}
+
+#[tauri::command]
+pub(crate) fn save_engine_editor(
+    engine: String,
+    path: String,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let label = if engine.trim().eq_ignore_ascii_case("unreal") {
+        "Unreal 编辑器"
+    } else {
+        "Unity 编辑器"
+    };
+    let settings = crate::store::credentials::save_local_engine_editor_path(&engine, &path)
+        .map_err(|error| error.to_string())?;
+    let message = if path.trim().is_empty() {
+        format!("{label}已恢复为自动发现")
+    } else {
+        format!("{label}本机覆盖已更新")
+    };
+    state.approval_manager.add_log("info", &message);
+    Ok(settings)
+}
+
+#[tauri::command]
+pub(crate) fn list_engine_installations() -> serde_json::Value {
+    crate::store::credentials::engine_installations_value()
+}
+
+#[tauri::command]
 pub(crate) fn get_agent_logs(
     state: State<'_, AgentState>,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -2186,6 +2515,146 @@ pub(crate) async fn get_agent_capabilities(
     .map_err(|error| error.to_string())?
 }
 
+/// 本机推理网关的用量（ADR 0113）。来源是网关台账，与平台口径完全分开：
+/// 这里只有 Token 与调用次数，没有金额。
+#[tauri::command]
+pub(crate) async fn get_local_usage_overview(
+    range: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let days = match range.as_deref().unwrap_or("7d") {
+        "today" => 1,
+        "30d" => 30,
+        _ => 7,
+    };
+    tauri::async_runtime::spawn_blocking(move || Ok(crate::store::local_usage::overview(days)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 网关状态与注入矩阵的只读快照。
+#[tauri::command]
+pub(crate) fn get_inference_gateway_status(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    Ok(inference_gateway_status_value(&state.options))
+}
+
+fn inference_gateway_status_value(options: &Options) -> serde_json::Value {
+    let (running, url, port, last_error, notice) = crate::app::inference_gateway::status();
+    let bindings = crate::app::ai_provider_import::gateway_bindings(options);
+    json!({
+        "running": running,
+        "url": url,
+        "port": port,
+        "preferred_port": crate::app::inference_gateway::DEFAULT_GATEWAY_PORT,
+        "last_error": last_error,
+        "notice": notice,
+        "gateway_clients": bindings
+            .iter()
+            .map(|binding| json!({
+                "client": binding.client,
+                "service": binding.service,
+                "protocol": binding.protocol,
+                "models": binding.models,
+            }))
+            .collect::<Vec<serde_json::Value>>(),
+        "direct_clients": crate::app::ai_provider_import::direct_bound_clients(options),
+    })
+}
+
+/// 重启本机网关：端口被释放、或异常退出后用它恢复。
+#[tauri::command]
+pub(crate) async fn restart_inference_gateway(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolver_options = options.clone();
+        crate::app::inference_gateway::restart(
+            Some(crate::app::inference_gateway::DEFAULT_GATEWAY_PORT),
+            Box::new(move || crate::app::ai_provider_import::gateway_bindings(&resolver_options)),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(inference_gateway_status_value(&options))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 停用网关：先把所有走网关的客户端切回直连，全部成功后才停监听。
+///
+/// 顺序不能反——先停监听会留下一批指向空端口、连不上上游的客户端，
+/// 而用户看不出这两件事的因果关系。
+#[tauri::command]
+pub(crate) async fn stop_inference_gateway_and_unbind(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let user_id = crate::app::identity::identity_status(&options).user_id;
+        let clients = crate::app::ai_provider_import::gateway_bindings(&options)
+            .into_iter()
+            .map(|binding| binding.client)
+            .collect::<Vec<String>>();
+        let mut switched = Vec::new();
+        let mut failures = Vec::new();
+        for client in &clients {
+            match crate::app::ai_provider_import::disable_gateway_binding(
+                &options, &user_id, client,
+            ) {
+                Ok(_) => switched.push(client.clone()),
+                Err(error) => failures.push(json!({ "client": client, "error": error.to_string() })),
+            }
+        }
+        let stopped = if failures.is_empty() {
+            crate::app::inference_gateway::stop()
+        } else {
+            false
+        };
+        Ok(json!({
+            "stopped": stopped,
+            "switched": switched,
+            "failures": failures,
+        }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 切换某个客户端的模型注入模式：`gateway` 走本机网关（用量计入本机口径），
+/// `direct` 写真实凭据（用量不计入）。P1 只支持 Codex。
+#[tauri::command]
+pub(crate) async fn set_provider_binding_mode(
+    state: State<'_, AgentState>,
+    target: String,
+    mode: String,
+    service: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let user_id = crate::app::identity::identity_status(&options).user_id;
+        let result = match mode.trim() {
+            "gateway" => {
+                let service = service
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| crate::app::ai_provider_import::binding_service(&options, &target))
+                    .unwrap_or_else(|| "managed".to_string());
+                crate::app::ai_provider_import::enable_gateway_binding(
+                    &options, &user_id, &target, &service,
+                )
+            }
+            "direct" => {
+                crate::app::ai_provider_import::disable_gateway_binding(&options, &user_id, &target)
+            }
+            other => return Err(format!("注入模式只支持 gateway 或 direct，收到：{other}")),
+        }
+        .map_err(|error| error.to_string())?;
+        serde_json::to_value(result).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub(crate) async fn list_ai_services(
     state: State<'_, AgentState>,
@@ -2666,6 +3135,138 @@ pub(crate) async fn get_organization_skill_catalog(
 }
 
 #[tauri::command]
+pub(crate) async fn get_instruction_pack_catalog(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::InstructionPackCatalogItem>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        require_dashboard(&state)?;
+        let snapshot = local_worker_snapshot(&state.worker_status);
+        let agent_id = snapshot
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if agent_id.is_empty() || state.options.agent_credential().is_empty() {
+            return Err("HiMind 账号尚未授权".to_string());
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())?;
+        crate::api::distribution::instruction_pack_catalog(
+            &client,
+            &state.options.api_base(),
+            agent_id,
+            &state.options.agent_credential(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_expert_catalog(
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::ExpertCatalogItem>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        require_dashboard(&state)?;
+        let snapshot = local_worker_snapshot(&state.worker_status);
+        let agent_id = snapshot
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if agent_id.is_empty() || state.options.agent_credential().is_empty() {
+            return Err("HiMind 账号尚未授权".to_string());
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())?;
+        crate::api::distribution::expert_catalog(
+            &client,
+            &state.options.api_base(),
+            agent_id,
+            &state.options.agent_credential(),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_instruction_pack_versions(
+    instruction_pack_id: String,
+    state: State<'_, AgentState>,
+) -> Result<Vec<crate::api::distribution::InstructionPackCatalogItem>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        require_dashboard(&state)?;
+        let snapshot = local_worker_snapshot(&state.worker_status);
+        let agent_id = snapshot
+            .get("dashboard_agent_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if agent_id.is_empty() || state.options.agent_credential().is_empty() {
+            return Err("HiMind 账号尚未授权".to_string());
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| error.to_string())?;
+        crate::api::distribution::instruction_pack_versions(
+            &client,
+            &state.options.api_base(),
+            agent_id,
+            &state.options.agent_credential(),
+            &instruction_pack_id,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn install_instruction_pack_market(
+    instruction_pack_id: String,
+    version: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let options = gateway.options().clone();
+        let state = crate::api::client::load_agent_state(&options.state_path).map_err(|error| error.to_string())?;
+        options.set_agent_credential(&state.credential);
+        let input = serde_json::json!({"kind":"instruction_pack","id":instruction_pack_id,"version":version,"artifact_id":artifact_id,"sha256":sha256});
+        crate::app::market::install(&options, &state.agent_id, &input, crate::capability::types::InvocationSource::Tauri)
+            .map_err(|error| error.to_string())
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn install_expert_market(
+    expert_id: String,
+    version: Option<String>,
+    artifact_id: Option<String>,
+    sha256: Option<String>,
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let gateway = state.capability_gateway.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let options = gateway.options().clone();
+        let state = crate::api::client::load_agent_state(&options.state_path).map_err(|error| error.to_string())?;
+        options.set_agent_credential(&state.credential);
+        let input = serde_json::json!({"kind":"expert","id":expert_id,"version":version,"artifact_id":artifact_id,"sha256":sha256});
+        crate::app::market::install(&options, &state.agent_id, &input, crate::capability::types::InvocationSource::Tauri).map_err(|error| error.to_string())
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub(crate) async fn query_organization_skill_catalog(
     q: String,
     category: String,
@@ -2685,6 +3286,62 @@ pub(crate) async fn query_organization_skill_catalog(
 #[tauri::command]
 pub(crate) fn list_skill_drafts() -> Result<Vec<crate::skill::authoring::AuthoringDraft>, String> {
     crate::skill::authoring::list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_instruction_pack_drafts(
+) -> Result<Vec<crate::instruction_pack::InstructionPackDraft>, String> {
+    crate::instruction_pack::list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn save_instruction_pack_draft(
+    input: crate::instruction_pack::InstructionPackDraftInput,
+) -> Result<crate::instruction_pack::InstructionPackDraft, String> {
+    crate::instruction_pack::save(input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_instruction_file(
+    path: String,
+) -> Result<crate::instruction_pack::InstructionPackDraft, String> {
+    crate::instruction_pack::import_file(std::path::Path::new(path.trim()))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn import_instruction_package(
+    path: String,
+) -> Result<crate::instruction_pack::InstructionPackDraft, String> {
+    crate::instruction_pack::import_package(crate::instruction_pack::InstructionPackImportInput {
+        package_path: std::path::PathBuf::from(path.trim()),
+        source: "local_package".to_string(),
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn test_instruction_pack_draft(
+    id: String,
+    version: String,
+) -> Result<crate::instruction_pack::InstructionPackTestResult, String> {
+    crate::instruction_pack::test(&id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn confirm_instruction_pack_draft(
+    id: String,
+    version: String,
+) -> Result<crate::instruction_pack::InstructionPackDraft, String> {
+    crate::instruction_pack::confirm(&id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn publish_instruction_pack_locally(
+    id: String,
+    version: String,
+) -> Result<crate::instruction_pack::InstructionPackDraft, String> {
+    crate::instruction_pack::publish_local(&id, &version).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2725,6 +3382,24 @@ pub(crate) fn pick_extension_workspace_dir() -> Option<String> {
     rfd::FileDialog::new()
         .set_title("选择扩展开发目录")
         .pick_folder()
+        .map(|path| crate::extension_workspace::display_path(&path))
+}
+
+#[tauri::command]
+pub(crate) fn pick_instruction_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("选择 AGENTS.md 或 CLAUDE.md")
+        .add_filter("客户端指令", &["md"])
+        .pick_file()
+        .map(|path| crate::extension_workspace::display_path(&path))
+}
+
+#[tauri::command]
+pub(crate) fn pick_instruction_package() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("选择 HiMind 指令包")
+        .add_filter("HiMind 指令包", &["hminstruction", "zip"])
+        .pick_file()
         .map(|path| crate::extension_workspace::display_path(&path))
 }
 
@@ -5973,26 +6648,56 @@ pub(crate) fn dispatch_run_in_background(
     thread::Builder::new()
         .name(format!("workflow-run-{run_id}"))
         .spawn(move || {
-            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
-                let executor = crate::workflow::WorkflowGatewayExecutor::new(
-                    gateway,
-                    context,
-                    ledger,
-                    run_id.clone(),
-                );
-                let queued = crate::store::local_runs::LocalRunLedger::open_default()?
-                    .get_run(&run_id)?
-                    .ok_or("workflow run disappeared before execution")?;
-                crate::workflow::WorkflowRunner::open_default()?
-                    .run_ready(&package, queued, &input, &executor)?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                eprintln!("workflow run {run_id} failed to start: {error}");
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+                    let executor = crate::workflow::WorkflowGatewayExecutor::new(
+                        gateway,
+                        context,
+                        ledger,
+                        run_id.clone(),
+                    );
+                    let queued = crate::store::local_runs::LocalRunLedger::open_default()?
+                        .get_run(&run_id)?
+                        .ok_or("workflow run disappeared before execution")?;
+                    crate::workflow::WorkflowRunner::open_default()?
+                        .run_ready(&package, queued, &input, &executor)?;
+                    Ok(())
+                })()
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("workflow run {run_id} failed: {error}");
+                    record_background_workflow_failure(&run_id, &error.to_string());
+                }
+                Err(payload) => {
+                    let reason = panic_reason(payload);
+                    eprintln!("workflow run {run_id} panicked: {reason}");
+                    record_background_workflow_failure(&run_id, &reason);
+                }
             }
         })?;
     Ok(())
+}
+
+fn record_background_workflow_failure(run_id: &str, reason: &str) {
+    match crate::store::local_runs::LocalRunLedger::open_default()
+        .and_then(|ledger| ledger.mark_run_failed(run_id, reason))
+    {
+        Ok(true) | Ok(false) => {}
+        Err(error) => eprintln!("workflow run {run_id} failure could not be persisted: {error}"),
+    }
+}
+
+fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "workflow execution thread panicked".to_string()
 }
 
 fn start_workflow_with_gateway(

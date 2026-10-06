@@ -1058,6 +1058,7 @@ const PATH_KEYS: &[&str] = &[
     "project_root",
     "catalog_path",
     "unity_editor_path",
+    "unreal_editor_path",
     "editor_path",
     "roots",
 ];

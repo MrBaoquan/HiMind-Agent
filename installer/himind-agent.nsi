@@ -22,6 +22,12 @@ Unicode true
 !ifndef VSCODE_EXTENSION_VSIX
   !error "VSCODE_EXTENSION_VSIX is required"
 !endif
+!ifndef RUNTIME_DIR
+  !error "RUNTIME_DIR is required: installer must carry the signed HiMind AI Runtime"
+!endif
+!ifndef RUNTIME_PACKAGE
+  !error "RUNTIME_PACKAGE is required: installer must carry the signed HiMind AI Runtime"
+!endif
 
 !define PRODUCT_NAME "HiMind Agent"
 !define PRODUCT_PUBLISHER "HiMind"
@@ -170,6 +176,13 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   SetOutPath "$INSTDIR\resources\vscode"
   File /oname=himind-ai.vsix "${VSCODE_EXTENSION_VSIX}"
 
+  ; Runtime is shipped with the installer. First launch does not depend on
+  ; Dashboard availability or a separate Node/Office installation.
+  SetOutPath "$INSTDIR\resources\runtime"
+  File "${RUNTIME_DIR}\himind-runtime-release.json"
+  File "${RUNTIME_DIR}\${RUNTIME_PACKAGE}"
+  File "${RUNTIME_DIR}\${RUNTIME_PACKAGE}.signature.json"
+
   SetOutPath "$INSTDIR\data"
   ; Installation source only selects the first-run default. Reinstall and
   ; update must preserve the user's persisted mode choice.
@@ -178,6 +191,17 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   FileWrite $0 "{$\r$\n  $\"mode$\": $\"${DEFAULT_MODE}$\"$\r$\n}$\r$\n"
   FileClose $0
   mode_preferences_done:
+
+  ; Import the bundled signed Runtime before installation reports success.
+  ; Agent performs SHA-256, RSA-PSS, compatibility, CLI, Office and screen
+  ; control preflight checks and fails closed if any capability is incomplete.
+  SetOutPath "$INSTDIR"
+  nsExec::ExecToLog /TIMEOUT=900000 '"$INSTDIR\versions\${PRODUCT_VERSION}\himind-agent.exe" runtime install --manifest "$INSTDIR\resources\runtime\himind-runtime-release.json"'
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装或能力预检失败。安装已中止，Agent 未启动。"
+    Abort
+  ${EndIf}
   SetOutPath "$INSTDIR\previous"
   SetOutPath "$INSTDIR\logs"
   WriteUninstaller "$INSTDIR\uninstall.exe"

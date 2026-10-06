@@ -318,6 +318,8 @@ pub(crate) struct WorkflowRuntimeStep {
     pub input_artifacts: Vec<String>,
     /// 允许该步骤使用哪些工具：`default`（沿用 Runtime 默认）或 `none`（不挂载任何
     /// 模型可见工具）。`none` 由 Runtime Provider 强制，无法保证时预检失败。
+    /// 选择 `none` 时，平台会把声明的 input_artifacts 作为只读内容注入提示上下文，
+    /// 不需要模型再调用文件工具。
     #[serde(default)]
     pub tool_policy: String,
     #[serde(default)]
@@ -1212,13 +1214,6 @@ fn validate_runtime_step(step: &WorkflowStep) -> Result<(), String> {
             ));
         }
     }
-    if !runtime.input_artifacts.is_empty() && runtime.tool_policy.trim() == "none" {
-        // 读文件需要工具；声明矛盾时直接拒绝，避免运行时必然失败。
-        return Err(format!(
-            "workflow runtime step {} cannot combine input_artifacts with tool_policy=none",
-            step.id
-        ));
-    }
     if runtime.timeout_seconds > 86_400 {
         return Err(format!(
             "workflow runtime step {} timeout_seconds must not exceed 86400",
@@ -1549,6 +1544,26 @@ mod tests {
             .steps
             .iter()
             .any(|step| step.candidate_action == "freeze"));
+    }
+
+    #[test]
+    fn shipped_engine_build_workflow_waits_for_the_build() {
+        // 引擎构建是长任务：步骤必须显式要求阻塞等待，否则运行会「秒完成」，
+        // 用户看到成功而构建还在后台跑。
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("engine-build");
+        let package = load_from_directory(&root).unwrap();
+        assert_eq!(package.id, "com.himind.workflow.engine-build");
+        let step = package
+            .steps
+            .iter()
+            .find(|step| step.id == "ENGINE-BUILD")
+            .expect("engine build step");
+        assert_eq!(step.capability_id, "exhibit.workspace.build");
+        assert_eq!(step.execution_mode, "long_running");
+        assert_eq!(step.input["wait"], serde_json::json!(true));
+        assert_eq!(package.ui.mode, "declarative");
     }
 
     #[test]

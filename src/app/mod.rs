@@ -1,6 +1,8 @@
 pub(crate) mod ai_clients;
 pub(crate) mod ai_provider_import;
 pub(crate) mod ai_service_templates;
+pub(crate) mod anthropic_openai;
+pub(crate) mod responses_chat;
 pub(crate) mod backup;
 pub(crate) mod builtin_ai_gateway;
 pub(crate) mod builtin_ai_model_sync;
@@ -23,6 +25,7 @@ pub(crate) mod github_publisher;
 pub(crate) mod github_source;
 pub mod http;
 pub(crate) mod identity;
+pub(crate) mod inference_gateway;
 pub(crate) mod local_package;
 pub(crate) mod market;
 pub(crate) mod mcp_catalog;

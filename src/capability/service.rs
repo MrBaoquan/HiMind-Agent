@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
-    inspect_project_workspace, launch_project_workspace, launch_remote_connection,
-    launch_workspace_build, local_agent_executable_metadata, open_folder,
-    signed_agent_updates_required, trusted_agent_update_key_ids,
+    cancel_workspace_build, inspect_project_workspace, launch_project_workspace,
+    launch_remote_connection, launch_workspace_build, local_agent_executable_metadata, open_folder,
+    signed_agent_updates_required, trusted_agent_update_key_ids, workspace_build_status,
 };
-use crate::app::types::{ProjectWorkspaceRequest, RemoteConnectRequest};
+use crate::app::types::{ProjectWorkspaceRequest, RemoteConnectRequest, WorkspaceBuildRequest};
 use crate::app::{mcp_downstream::DownstreamMcpManager, mcp_registry, mcp_targets};
 use crate::approval::manager::ApprovalManager;
 use crate::approval::policy;
@@ -145,6 +145,8 @@ enum CapabilityHandler {
     SystemOpenFolder,
     FilesystemDelete,
     WorkspaceBuild,
+    WorkspaceBuildStatus,
+    WorkspaceBuildCancel,
     WorkspaceStatus,
     WorkspaceOpen,
     RemoteConnect,
@@ -1707,15 +1709,53 @@ impl CapabilityGateway {
             registration(
                 "exhibit.workspace.build",
                 "构建展项工作区",
-                "仅执行展项工程 .himind 目录内固定命名的 build.ps1、build.cmd 或 build.bat。",
+                "使用检测到的 Unity/Unreal 原生工具链构建工程；项目脚本仅在显式选择 script 时执行。",
                 "local_action",
                 json!({
                     "type": "object",
-                    "properties": { "target_path": { "type": "string" } },
+                    "properties": {
+                        "target_path": { "type": "string" },
+                        "engine_type": { "type": ["string", "null"] },
+                        "engine_version": { "type": ["string", "null"] },
+                        "provider": { "type": "string", "enum": ["auto", "native", "script"] },
+                        "target_platform": { "type": "string", "enum": ["windows", "linux", "macos", "webgl", "android", "ios"] },
+                        "architecture": { "type": "string", "enum": ["x64", "arm64"] },
+                        "configuration": { "type": "string", "enum": ["development", "shipping", "test", "release"] },
+                        "output_path": { "type": ["string", "null"] },
+                        "clean": { "type": "boolean" },
+                        "wait": { "type": "boolean", "description": "为 true 时等待构建结束再返回，工作流步骤用；交互式调用保持默认异步。" },
+                        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 7200 }
+                    },
                     "required": ["target_path"],
                     "additionalProperties": false
                 }),
                 CapabilityHandler::WorkspaceBuild,
+            ),
+            registration(
+                "exhibit.workspace.build.status",
+                "读取工程构建状态",
+                "读取本机工程构建任务的状态和最近日志。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": { "job_id": { "type": "string" } },
+                    "required": ["job_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceBuildStatus,
+            ),
+            registration(
+                "exhibit.workspace.build.cancel",
+                "取消工程构建",
+                "停止本机工程构建任务及其子进程。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": { "job_id": { "type": "string" } },
+                    "required": ["job_id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::WorkspaceBuildCancel,
             ),
             registration(
                 "exhibit.workspace.status.local",
@@ -3365,6 +3405,20 @@ impl CapabilityGateway {
             CapabilityHandler::SystemOpenFolder => self.open_folder(input),
             CapabilityHandler::FilesystemDelete => self.filesystem_delete(input),
             CapabilityHandler::WorkspaceBuild => self.build_workspace(input),
+            CapabilityHandler::WorkspaceBuildStatus => {
+                let job_id = input
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or("job_id is required")?;
+                workspace_build_status(job_id)
+            }
+            CapabilityHandler::WorkspaceBuildCancel => {
+                let job_id = input
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or("job_id is required")?;
+                cancel_workspace_build(job_id)
+            }
             CapabilityHandler::WorkspaceStatus => self.workspace_status(input),
             CapabilityHandler::WorkspaceOpen => self.workspace_open(input),
             CapabilityHandler::RemoteConnect => self.remote_connect(input),
@@ -4835,15 +4889,11 @@ impl CapabilityGateway {
     }
 
     fn build_workspace(&self, input: Value) -> Result<Value, Box<dyn Error>> {
-        let target_path = input
-            .get("target_path")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .trim();
-        if target_path.is_empty() {
+        let request: WorkspaceBuildRequest = serde_json::from_value(input)?;
+        if request.target_path.trim().is_empty() {
             return Err("target_path is required".into());
         }
-        launch_workspace_build(target_path)
+        launch_workspace_build(&request)
     }
 
     fn workspace_status(&self, input: Value) -> Result<Value, Box<dyn Error>> {
@@ -5671,7 +5721,8 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
 
     let long_running = matches!(
         handler,
-        CapabilityHandler::SvnWorkspaceCheckout
+        CapabilityHandler::WorkspaceBuild
+            | CapabilityHandler::SvnWorkspaceCheckout
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout
             | CapabilityHandler::SoftwareDistributionPublish
             | CapabilityHandler::MediaSubmit(_, _)
@@ -5681,7 +5732,8 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
     descriptor.supports_progress = long_running;
     descriptor.supports_cancel = matches!(
         handler,
-        CapabilityHandler::SvnWorkspaceCheckout
+        CapabilityHandler::WorkspaceBuild
+            | CapabilityHandler::SvnWorkspaceCheckout
             | CapabilityHandler::MediaSubmit(_, _)
             | CapabilityHandler::MediaJobCancel
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout

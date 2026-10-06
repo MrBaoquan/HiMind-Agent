@@ -45,13 +45,13 @@ export function InboxPage({ approvals, workflowRuns, onRefresh, onRespond, onOpe
   return (
     <>
       <PageHeader
-        title="待处理"
+        title="需要我处理"
         actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenApprovalHistory}><ClipboardCheck size={14} />审批记录</button></div>}
       />
       {/* 全为 0 时这排统计只是三个零：空态文案已经说清这里会出现什么，
           数字没有信息量还占掉首屏。有内容时才给出分项计数。 */}
-      {total > 0 ? <div className="inbox-summary" aria-label="待处理摘要">
-        <div><strong>{total}</strong><span>全部待处理</span></div>
+      {total > 0 ? <div className="inbox-summary" aria-label="需要我处理摘要">
+        <div><strong>{total}</strong><span>全部事项</span></div>
         <div><strong>{approvals.length}</strong><span>操作审批</span></div>
         <div><strong>{workflowRuns.length}</strong><span>工作流等待</span></div>
       </div> : null}

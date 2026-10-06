@@ -1,4 +1,4 @@
-import { BookOpen, Cable, Puzzle, ShieldCheck, Workflow, type LucideIcon } from 'lucide-react';
+import { BookOpen, Cable, FileText, Puzzle, ShieldCheck, Workflow, GraduationCap, type LucideIcon } from 'lucide-react';
 import type { CapabilityKind, ExtensionKind } from '../data/extensionKinds';
 
 /**
@@ -13,6 +13,9 @@ export const extensionKindIcons: Record<ExtensionKind, LucideIcon> = {
   plugin: Puzzle,
   skill: BookOpen,
   workflow: Workflow,
+  expert: GraduationCap,
+  /// 项目规则是写进客户端上下文的文本约定，用文档形状与「技能手册」区分开。
+  instruction: FileText,
 };
 
 /// 「组织管理」是治理口径，不是一类能力，只在页签里出现，用的是这一带已经在用的盾牌。

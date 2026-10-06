@@ -23,6 +23,8 @@ pub(crate) enum ExtensionProjectKind {
     Plugin,
     Skill,
     Workflow,
+    Expert,
+    Instruction,
 }
 
 impl ExtensionProjectKind {
@@ -31,6 +33,8 @@ impl ExtensionProjectKind {
             Self::Plugin => "plugin",
             Self::Skill => "skill",
             Self::Workflow => "workflow",
+            Self::Expert => "expert",
+            Self::Instruction => "instruction",
         }
     }
 
@@ -39,7 +43,12 @@ impl ExtensionProjectKind {
             "plugin" => Ok(Self::Plugin),
             "skill" => Ok(Self::Skill),
             "workflow" => Ok(Self::Workflow),
-            other => Err(format!("扩展类型必须是 plugin、skill 或 workflow，收到: {other}").into()),
+            "expert" => Ok(Self::Expert),
+            "instruction" => Ok(Self::Instruction),
+            other => Err(format!(
+                "扩展类型必须是 plugin、skill、workflow、expert 或 instruction，收到: {other}"
+            )
+            .into()),
         }
     }
 }
@@ -158,6 +167,8 @@ pub(crate) enum ExtensionCandidate {
     Plugin(crate::plugin_authoring::PluginDraft),
     Skill(crate::skill::authoring::AuthoringDraft),
     Workflow(crate::workflow::WorkflowDraft),
+    Expert(crate::expert::ExpertAuthoringDraft),
+    Instruction(crate::instruction_pack::InstructionPackDraft),
 }
 
 pub(crate) fn list() -> Result<Vec<ExtensionProject>, Box<dyn Error>> {
@@ -722,12 +733,166 @@ pub(crate) fn create(
                 }
             }
         }
+        ExtensionProjectKind::Expert => create_expert_skeleton(parent.as_path(), &slug, &input, author)?,
+        ExtensionProjectKind::Instruction => {
+            create_instruction_skeleton(parent.as_path(), &slug, &input, author)?
+        }
     };
     let root = result
         .get("root")
         .and_then(Value::as_str)
         .ok_or("扩展开发工具未返回项目目录")?;
     register(Path::new(root))
+}
+
+fn create_expert_skeleton(
+    parent: &Path,
+    slug: &str,
+    input: &CreateExtensionProjectInput,
+    author: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let root = parent.join("experts").join(slug);
+    if root.exists() {
+        return Err(format!("专家项目目录已存在: {}", root.display()).into());
+    }
+    let id = if input.extension_id.trim().is_empty() {
+        format!("com.himind.expert.{slug}")
+    } else {
+        input.extension_id.trim().to_string()
+    };
+    let definition = json!({
+        "schema_version": crate::expert::EXPERT_SCHEMA_VERSION,
+        "id": id,
+        "name": input.name.trim(),
+        "author": author.trim(),
+        "categories": [if input.category.trim().is_empty() { "software-engineering" } else { input.category.trim() }],
+        "version": "0.1.0",
+        "release_notes": "创建初始版本。",
+        "min_agent_version": crate::VERSION,
+        "description": input.description.trim(),
+        "supported_clients": ["portable", "himind-dsh", "codex", "github-copilot", "claude-code", "cursor", "windsurf", "cline"],
+        "skill_refs": [],
+        "workflow_refs": [],
+        "capability_refs": [],
+        "contents": ["EXPERT.md"],
+        "instructions": "先理解任务目标与约束，再按阶段推进并验证结果。",
+        "output_contract": { "required_sections": ["结论", "下一步"] },
+        "harness": { "behavior_phases": ["plan", "execute", "verify", "deliver"], "required_evidence": ["summary", "next_steps"], "recovery_guidance": ["遇到不确定性时先说明并请求补充信息"] }
+    });
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("expert.json"), serde_json::to_vec_pretty(&definition)?)?;
+    fs::write(root.join("EXPERT.md"), "先理解任务目标与约束，再按阶段推进并验证结果。")?;
+    fs::write(root.join("README.md"), format!("# {}\n\n{}\n\n专家项目由 expert.json 与 EXPERT.md 组成。\n", input.name.trim(), input.description.trim()))?;
+    Ok(json!({ "root": root.to_string_lossy(), "expert_id": definition["id"], "version": "0.1.0" }))
+}
+
+/// 取某个项目规则在本机规则库里的最新草稿版本。
+fn latest_instruction_draft(
+    id: &str,
+) -> Result<crate::instruction_pack::InstructionPackDraft, Box<dyn Error>> {
+    let mut candidates = crate::instruction_pack::list()?
+        .into_iter()
+        .filter(|draft| draft.manifest.id == id.trim())
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        crate::skill::resolver::compare_versions(&left.manifest.version, &right.manifest.version)
+    });
+    candidates
+        .pop()
+        .ok_or_else(|| format!("未找到项目规则: {id}").into())
+}
+
+/// 把本机规则库里的一个项目规则落地成可编辑的工作区项目（`rules/<slug>/`）。
+///
+/// 写的是当前草稿版本的快照：清单、正文和附加文件都按原样落盘，
+/// 之后改的是这个工作区项目，发布动作仍回到规则库。
+pub(crate) fn materialize_instruction_project(
+    parent: &Path,
+    instruction_pack_id: &str,
+    version: Option<&str>,
+) -> Result<ExtensionProject, Box<dyn Error>> {
+    let parent = parent.canonicalize()?;
+    let draft = match version.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(version) => crate::instruction_pack::read(instruction_pack_id, version)?,
+        None => latest_instruction_draft(instruction_pack_id)?,
+    };
+    let slug = project_slug_from_id(&draft.manifest.id);
+    let root = parent.join("rules").join(&slug);
+    if root.exists() {
+        return Err(format!("项目规则项目目录已存在: {}", root.display()).into());
+    }
+    fs::create_dir_all(&root)?;
+    fs::write(
+        root.join("instruction.json"),
+        serde_json::to_vec_pretty(&draft.manifest)?,
+    )?;
+    fs::write(root.join("INSTRUCTIONS.md"), &draft.instructions)?;
+    for (path, content) in &draft.files {
+        let target = root.join(path);
+        if let Some(directory) = target.parent() {
+            fs::create_dir_all(directory)?;
+        }
+        fs::write(target, content.as_bytes())?;
+    }
+    fs::write(
+        root.join("README.md"),
+        format!(
+            "# {}\n\n{}\n\n项目规则项目由 instruction.json 与 INSTRUCTIONS.md 组成。\n",
+            draft.manifest.name, draft.manifest.description
+        ),
+    )?;
+    register(&root)
+}
+
+/// 项目规则项目：清单在 `instruction.json`，正文在 `INSTRUCTIONS.md`。
+///
+/// 目录放在 `rules/<slug>`，与插件、技能、工作流、专家共用同一份工作区登记与构建链路。
+fn create_instruction_skeleton(
+    parent: &Path,
+    slug: &str,
+    input: &CreateExtensionProjectInput,
+    author: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let root = parent.join("rules").join(slug);
+    if root.exists() {
+        return Err(format!("项目规则项目目录已存在: {}", root.display()).into());
+    }
+    let id = if input.extension_id.trim().is_empty() {
+        format!("com.himind.instruction.{slug}")
+    } else {
+        input.extension_id.trim().to_string()
+    };
+    let instructions = "# 工作规则\n\n先确认目标与约束，再按步骤推进，并在完成前说明验证方式。\n";
+    let manifest = json!({
+        "schema_version": crate::instruction_pack::INSTRUCTION_PACK_SCHEMA_VERSION,
+        "id": id,
+        "name": input.name.trim(),
+        "author": author.trim(),
+        "categories": [if input.category.trim().is_empty() { "software-engineering" } else { input.category.trim() }],
+        "version": "0.1.0",
+        "description": input.description.trim(),
+        "release_notes": "创建初始版本。",
+        "min_agent_version": crate::VERSION,
+        "supported_clients": ["codex", "claude-code", "github-copilot"],
+        "scope": "project",
+        "max_bytes": 65536,
+        "skill_refs": [],
+        "workflow_refs": [],
+        "capability_refs": [],
+        "contents": ["instruction.json", "INSTRUCTIONS.md"]
+    });
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("instruction.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(root.join("INSTRUCTIONS.md"), instructions)?;
+    fs::write(
+        root.join("README.md"),
+        format!(
+            "# {}\n\n{}\n\n项目规则项目由 instruction.json 与 INSTRUCTIONS.md 组成。\n",
+            input.name.trim(),
+            input.description.trim()
+        ),
+    )?;
+    Ok(json!({ "root": root.to_string_lossy(), "instruction_pack_id": manifest["id"], "version": "0.1.0" }))
 }
 
 fn create_workflow_skeleton(
@@ -835,10 +1000,20 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
             crate::workflow::save_authoring_candidate(&workspace)?,
         ));
     }
+    if project.kind == ExtensionProjectKind::Expert {
+        return Ok(ExtensionCandidate::Expert(crate::expert::build_workspace_candidate(&workspace)?));
+    }
+    if project.kind == ExtensionProjectKind::Instruction {
+        return Ok(ExtensionCandidate::Instruction(
+            crate::instruction_pack::build_workspace_candidate(&workspace)?,
+        ));
+    }
     let extension = match project.kind {
         ExtensionProjectKind::Plugin => "hmpkg",
         ExtensionProjectKind::Skill => "hmskill",
-        ExtensionProjectKind::Workflow => unreachable!("workflow candidate returned above"),
+        ExtensionProjectKind::Workflow
+        | ExtensionProjectKind::Expert
+        | ExtensionProjectKind::Instruction => unreachable!("handled above"),
     };
     let temporary = workspace.join(format!(".himind-candidate-{}.{}", now_stamp(), extension));
     let result = (|| -> Result<ExtensionCandidate, Box<dyn Error>> {
@@ -852,7 +1027,9 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
             match project.kind {
                 ExtensionProjectKind::Plugin => "extension.plugin.package",
                 ExtensionProjectKind::Skill => "extension.skill.package",
-                ExtensionProjectKind::Workflow => unreachable!("workflow candidate returned above"),
+                ExtensionProjectKind::Workflow
+                | ExtensionProjectKind::Expert
+                | ExtensionProjectKind::Instruction => unreachable!("handled above"),
             },
             json!({"workspace_root": workspace, "path": workspace, "output": temporary}),
         )?;
@@ -883,6 +1060,8 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
             ExtensionProjectKind::Workflow => {
                 unreachable!("workflow candidate returned above")
             }
+            ExtensionProjectKind::Expert => unreachable!("handled above"),
+            ExtensionProjectKind::Instruction => unreachable!("handled above"),
         }
     })();
     if temporary.exists() {
@@ -1003,10 +1182,14 @@ fn project_record_from_path(path: &Path, source: &str) -> Result<ProjectRecord, 
     let plugin_path = path.join("plugin.json");
     let skill_path = path.join("skill.json");
     let workflow_path = path.join("workflow.json");
+    let expert_path = path.join("expert.json");
+    let instruction_path = path.join("instruction.json");
     let marker_count = [
         plugin_path.is_file(),
         skill_path.is_file() || path.join("SKILL.md").is_file(),
         workflow_path.is_file(),
+        expert_path.is_file() && path.join("EXPERT.md").is_file(),
+        instruction_path.is_file() && path.join("INSTRUCTIONS.md").is_file(),
     ]
     .into_iter()
     .filter(|value| *value)
@@ -1043,7 +1226,26 @@ fn project_record_from_path(path: &Path, source: &str) -> Result<ProjectRecord, 
             source,
         ));
     }
-    Err("所选目录不是 HiMind 插件、Skill 或 Workflow 项目".into())
+    if expert_path.is_file() && path.join("EXPERT.md").is_file() {
+        let definition: crate::expert::ExpertDefinition = serde_json::from_slice(&fs::read(expert_path)?)?;
+        crate::expert::validate_definition(&definition)?;
+        return Ok(record(ExtensionProjectKind::Expert, definition.id, definition.name, definition.description, definition.version, path, source));
+    }
+    if instruction_path.is_file() && path.join("INSTRUCTIONS.md").is_file() {
+        let manifest: crate::instruction_pack::InstructionPackManifest =
+            serde_json::from_slice(&fs::read(instruction_path)?)?;
+        manifest.validate()?;
+        return Ok(record(
+            ExtensionProjectKind::Instruction,
+            manifest.id,
+            manifest.name,
+            manifest.description,
+            manifest.version,
+            path,
+            source,
+        ));
+    }
+    Err("所选目录不是 HiMind 插件、Skill、Workflow、专家或项目规则项目".into())
 }
 
 fn skill_record(manifest: SkillManifest, path: &Path, source: &str) -> ProjectRecord {
@@ -1102,6 +1304,51 @@ fn validate_plugin_identity(manifest: &PluginManifest) -> Result<(), Box<dyn Err
         return Err("plugin.json 缺少名称或版本".into());
     }
     Ok(())
+}
+
+/// 从扩展 ID 派生工作区目录名：取最后一段并归一成小写连字符。
+fn project_slug_from_id(id: &str) -> String {
+    let tail = id.rsplit('.').next().unwrap_or(id);
+    let mut slug = String::new();
+    for ch in tail.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() { "expert".to_string() } else { slug }
+}
+
+/// 把专家库里的一个专家落地成可编辑的工作区项目（`experts/<slug>/`）。
+///
+/// 落地写的是当前定义的快照：内置专家也能落地，之后改的是这个工作区项目，
+/// 不会回写专家库，避免把内置角色悄悄改成团队资产却没有版本记录。
+pub(crate) fn materialize_expert_project(
+    parent: &Path,
+    expert_id: &str,
+    version: Option<&str>,
+) -> Result<ExtensionProject, Box<dyn Error>> {
+    let parent = parent.canonicalize()?;
+    let definition = crate::expert::get(expert_id, version)?;
+    let slug = project_slug_from_id(&definition.id);
+    let root = parent.join("experts").join(&slug);
+    if root.exists() {
+        return Err(format!("专家项目目录已存在: {}", root.display()).into());
+    }
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("expert.json"), serde_json::to_vec_pretty(&definition)?)?;
+    // 工作区校验要求 EXPERT.md 与 expert.json 的 instructions 完全一致。
+    fs::write(root.join("EXPERT.md"), &definition.instructions)?;
+    fs::write(
+        root.join("README.md"),
+        format!(
+            "# {}\n\n{}\n\n专家项目由 expert.json 与 EXPERT.md 组成。\n",
+            definition.name, definition.description
+        ),
+    )?;
+    register(&root)
 }
 
 fn normalize_slug(value: &str) -> Result<String, Box<dyn Error>> {
@@ -1579,6 +1826,8 @@ fn read_declared_distribution_targets(record: &ProjectRecord) -> Vec<Distributio
         ExtensionProjectKind::Plugin => record.workspace_path.join("plugin.json"),
         ExtensionProjectKind::Skill => record.workspace_path.join("skill.json"),
         ExtensionProjectKind::Workflow => record.workspace_path.join("workflow.json"),
+        ExtensionProjectKind::Expert => record.workspace_path.join("expert.json"),
+        ExtensionProjectKind::Instruction => record.workspace_path.join("instruction.json"),
     };
     let Ok(source) = fs::read_to_string(&manifest) else {
         return Vec::new();

@@ -380,6 +380,7 @@ pub(super) fn normalize_execution_result(value: Value, runtime_provider: &str) -
         "remaining_risks": remaining_risks,
         "provider_session_id": value.get("session_id").and_then(Value::as_str).unwrap_or_default(),
         "provider_version": value.get("version").and_then(Value::as_str).unwrap_or_default(),
+        "instruction_snapshot": value.get("instruction_snapshot").cloned().unwrap_or(Value::Null),
         "output_artifacts": output_artifacts,
     })
 }

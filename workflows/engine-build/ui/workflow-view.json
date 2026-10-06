@@ -1,0 +1,109 @@
+{
+  "schema_version": "workflow_view.v1",
+  "title": "引擎工程构建",
+  "sections": [
+    {
+      "id": "engine",
+      "title": "引擎",
+      "fields": [
+        {
+          "id": "target_path",
+          "label": "工程目录",
+          "type": "text",
+          "required": true,
+          "picker": "directory",
+          "placeholder": "选择 Unity 或 Unreal 工程目录",
+          "hint": "含 Assets/ProjectSettings 或 .uproject 的目录。",
+          "span": "full"
+        },
+        {
+          "id": "engine_type",
+          "label": "引擎",
+          "type": "select",
+          "default": "auto",
+          "options": [
+            { "value": "auto", "label": "自动识别" },
+            { "value": "unity", "label": "Unity" },
+            { "value": "unreal", "label": "Unreal" }
+          ]
+        },
+        {
+          "id": "engine_version",
+          "label": "引擎版本",
+          "type": "text",
+          "placeholder": "留空按工程自动匹配",
+          "hint": "多版本机器上用来指定编辑器版本。"
+        }
+      ]
+    },
+    {
+      "id": "output",
+      "title": "产物",
+      "fields": [
+        {
+          "id": "provider",
+          "label": "构建方式",
+          "type": "select",
+          "default": "auto",
+          "options": [
+            { "value": "auto", "label": "自动" },
+            { "value": "native", "label": "原生引擎" },
+            { "value": "script", "label": "项目脚本" }
+          ]
+        },
+        {
+          "id": "target_platform",
+          "label": "目标平台",
+          "type": "select",
+          "default": "windows",
+          "options": [
+            { "value": "windows", "label": "Windows" },
+            { "value": "linux", "label": "Linux" },
+            { "value": "macos", "label": "macOS" },
+            { "value": "webgl", "label": "WebGL" },
+            { "value": "android", "label": "Android" },
+            { "value": "ios", "label": "iOS" }
+          ],
+          "hint": "需引擎已装对应平台模块。"
+        },
+        {
+          "id": "architecture",
+          "label": "架构",
+          "type": "select",
+          "default": "x64",
+          "options": [
+            { "value": "x64", "label": "x64" },
+            { "value": "arm64", "label": "arm64" }
+          ]
+        },
+        {
+          "id": "configuration",
+          "label": "配置",
+          "type": "select",
+          "default": "development",
+          "options": [
+            { "value": "development", "label": "Development" },
+            { "value": "shipping", "label": "Shipping" },
+            { "value": "test", "label": "Test" },
+            { "value": "release", "label": "Release" }
+          ]
+        },
+        {
+          "id": "output_path",
+          "label": "输出目录",
+          "type": "text",
+          "picker": "directory",
+          "placeholder": "留空使用工程默认输出",
+          "span": "full"
+        },
+        {
+          "id": "clean",
+          "label": "构建前清理输出目录",
+          "type": "boolean",
+          "default": false
+        }
+      ]
+    }
+  ],
+  "actions": ["build"]
+}

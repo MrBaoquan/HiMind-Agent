@@ -10,6 +10,7 @@ pub mod credentials;
 pub(crate) mod github_credentials;
 #[allow(dead_code)]
 pub(crate) mod local_runs;
+pub(crate) mod local_usage;
 pub mod outbox;
 pub(crate) mod paths;
 pub mod plugin_outbox;

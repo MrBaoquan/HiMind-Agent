@@ -27,11 +27,14 @@ pub(crate) fn execute_runtime_step(
     let workspace = resolve_workspace(&runtime.workspace_path, input)?;
     // 声明了 input_artifacts 的步骤不从提示词里带上游输出：数据已经以文件路径
     // 注入 input_artifacts，提示词长度因此与 Artifact 体量无关。
-    let prompt_input = if runtime.input_artifacts.is_empty() {
+    let mut prompt_input = if runtime.input_artifacts.is_empty() {
         input.clone()
     } else {
         without_step_outputs(input)
     };
+    if disable_tools && !runtime.input_artifacts.is_empty() {
+        inline_input_artifacts(&mut prompt_input)?;
+    }
     let prompt = build_prompt(&runtime.prompt, &prompt_input);
     // 运行时提示是通过命令行传给 Runtime 的，Windows 上整条命令行有 ~32KB 上限；
     // 超了会以 "os error 206" 这种看不出原因的方式失败，这里提前给出可读错误。
@@ -364,6 +367,100 @@ fn build_prompt(base: &str, input: &Value) -> String {
     // 缩进展开会让大 Artifact 白白多花三成体积。
     prompt.push_str(&serde_json::to_string(&redact_runtime_context(input)).unwrap_or_default());
     prompt
+}
+
+/// 无工具 Runtime 不能再通过文件工具读取 Artifact，因此由 Agent 在启动前
+/// 以只读方式把声明过的 JSON Artifact 注入上下文。对科技雷达这类列表型
+/// Artifact 只保留提示词真正需要的字段，避免 Windows 命令行长度上限。
+fn inline_input_artifacts(input: &mut Value) -> Result<(), Box<dyn Error>> {
+    const MAX_INLINE_ARTIFACT_CHARS: usize = 16_000;
+    let Some(artifacts) = input
+        .get_mut("input_artifacts")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    for (artifact_id, value) in artifacts.iter_mut() {
+        let Some(path) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let raw = std::fs::read_to_string(path).map_err(|error| {
+            format!("workflow runtime cannot inline artifact {artifact_id}: {error}")
+        })?;
+        let parsed = serde_json::from_str::<Value>(&raw).map_err(|error| {
+            format!("workflow runtime artifact {artifact_id} is not valid JSON: {error}")
+        })?;
+        let compact = compact_artifact_for_prompt(&parsed);
+        let encoded = serde_json::to_string(&compact)?;
+        if encoded.chars().count() > MAX_INLINE_ARTIFACT_CHARS {
+            return Err(format!(
+                "workflow runtime artifact {artifact_id} is too large for no-tools execution ({} chars, limit {}); reduce the upstream artifact or use an interactive Runtime",
+                encoded.chars().count(),
+                MAX_INLINE_ARTIFACT_CHARS
+            )
+            .into());
+        }
+        *value = compact;
+    }
+    Ok(())
+}
+
+fn compact_artifact_for_prompt(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    // Tech Radar 快照包含 URL、主题和趋势辅助字段；这些字段对解读不是必需，
+    // 且会把原本可控的 headless prompt 撑过 Windows 命令行限制。
+    if let Some(entries) = object.get("entries").and_then(Value::as_array) {
+        let mut result = serde_json::Map::new();
+        for key in [
+            "generated_at",
+            "rule_version",
+            "window_days",
+            "domains",
+            "lanes",
+            "min_stars",
+            "new_min_stars",
+        ] {
+            if let Some(value) = object.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
+        }
+        let entries = entries
+            .iter()
+            .map(|entry| {
+                let Some(entry) = entry.as_object() else {
+                    return entry.clone();
+                };
+                let mut compact = serde_json::Map::new();
+                for key in [
+                    "entry_id",
+                    "full_name",
+                    "description",
+                    "language",
+                    "stars",
+                    "stars_gained",
+                    "pushed_at",
+                    "license",
+                    "domains",
+                    "lanes",
+                    "is_new",
+                ] {
+                    if let Some(value) = entry.get(key) {
+                        compact.insert(key.to_string(), value.clone());
+                    }
+                }
+                Value::Object(compact)
+            })
+            .collect();
+        result.insert("entries".to_string(), Value::Array(entries));
+        return Value::Object(result);
+    }
+    value.clone()
 }
 
 fn redact_runtime_context(value: &Value) -> Value {

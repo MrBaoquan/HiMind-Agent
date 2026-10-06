@@ -29,6 +29,7 @@ import type {
   DashboardIdentityStatus,
   McpConnectionTestResult,
   McpTargetDescriptor,
+  InferenceGatewayStatus,
 } from '../services/agentApi';
 
 type AiConnectionsPageProps = {
@@ -40,6 +41,11 @@ type AiConnectionsPageProps = {
   busyAction: string | null;
   aiServices: AIServiceListResult | null;
   aiServiceTemplates: AIServiceTemplateListResult | null;
+  gatewayStatus: InferenceGatewayStatus | null;
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) => Promise<void>;
+  gatewayBusy: boolean;
+  onRestartGateway: () => void;
+  onStopGateway: () => void;
   acpProfiles: AcpRuntimeProfileSnapshot | null;
   onOpenAccount: () => void;
   onRefresh: () => void;
@@ -78,6 +84,11 @@ export function AiConnectionsPage({
   busyAction,
   aiServices,
   aiServiceTemplates,
+  gatewayStatus,
+  onSetBindingMode,
+  gatewayBusy,
+  onRestartGateway,
+  onStopGateway,
   acpProfiles,
   onOpenAccount,
   onRefresh,
@@ -144,11 +155,11 @@ export function AiConnectionsPage({
 
       <div className="ai-tabs" role="tablist" aria-label="AI 连接分类">
         {/* 三个 tab 各自回答一个问题，名称直接写清「做什么」：
-            「MCP 接入」= 把 HiMind 能力给别的工具用，「模型服务」= HiMind 用谁的模型，
+            「客户端接入」= 把 HiMind 能力给别的工具用，「模型服务」= HiMind 用谁的模型，
             「运行环境」= 谁来执行 AI 步骤。ACP 只是其中一种执行方，同屏还会列本机已装的
             Codex / Copilot / 内置引擎，所以页签不能写成「工作流 AI 客户端」。
             id 保持稳定，外部脚本与深链依赖它。 */}
-        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>MCP 接入</button>
+        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>客户端接入</button>
         <button type="button" id="ai-tab-services" role="tab" aria-selected={activeTab === 'services'} aria-controls="ai-panel-services" className={`ai-tab${activeTab === 'services' ? ' active' : ''}`} onClick={() => setActiveTab('services')}>模型服务</button>
          <button type="button" id="ai-tab-acp" role="tab" aria-selected={activeTab === 'acp'} aria-controls="ai-panel-acp" className={`ai-tab${activeTab === 'acp' ? ' active' : ''}`} onClick={() => setActiveTab('acp')}>运行环境</button>
       </div>
@@ -175,6 +186,11 @@ export function AiConnectionsPage({
             onOpenAccount={onOpenAccount}
             onFetchModels={onFetchModels}
             onFetchSavedModels={onFetchSavedModels}
+            gatewayStatus={gatewayStatus}
+            onSetBindingMode={onSetBindingMode}
+            gatewayBusy={gatewayBusy}
+            onRestartGateway={onRestartGateway}
+            onStopGateway={onStopGateway}
           />
         </div>
       ) : (
@@ -183,7 +199,7 @@ export function AiConnectionsPage({
             <div className="ai-overview-main">
               <div className="ai-overview-icon">{attentionCount ? <CircleAlert size={20} /> : <ShieldCheck size={20} />}</div>
               <div className="ai-overview-copy">
-                <span className="ai-overview-eyebrow">MCP 接入</span>
+                <span className="ai-overview-eyebrow">客户端接入</span>
                 <strong>{headline}</strong>
                 <span>{headlineDescription}</span>
               </div>

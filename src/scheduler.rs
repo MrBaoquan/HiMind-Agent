@@ -454,6 +454,43 @@ fn compact_overrides(items: &mut [Schedule]) -> bool {
     changed
 }
 
+/// 计划文件只记录派发结果；真实执行状态以本地 Run 台账为准。
+/// 读计划时同步一次，避免 UI 长期显示 accepted 而运行早已失败或完成。
+fn sync_last_run_states(items: &mut [Schedule]) -> Result<bool, Box<dyn Error>> {
+    let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
+    let mut changed = false;
+    for item in items.iter_mut() {
+        if item.last_run_id.trim().is_empty() {
+            continue;
+        }
+        let Some(run) = ledger.get_run(&item.last_run_id)? else {
+            continue;
+        };
+        let status = serde_json::to_value(&run.status)?
+            .as_str()
+            .unwrap_or("failed")
+            .to_string();
+        if item.last_status != status {
+            item.last_status = status.clone();
+            changed = true;
+        }
+        let error = if status == "failed" {
+            run.error.clone()
+        } else {
+            String::new()
+        };
+        if item.last_error != error {
+            item.last_error = error;
+            changed = true;
+        }
+        if item.last_run_at.is_empty() {
+            item.last_run_at = run.updated_at.clone();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// 列出计划，并按需要补齐 `next_run_at`（例如计划写入后 Agent 重启过）。
 pub(crate) fn list(now: i64) -> Result<Value, Box<dyn Error>> {
     let mut items = load()?;
@@ -468,6 +505,7 @@ pub(crate) fn list(now: i64) -> Result<Value, Box<dyn Error>> {
     }
     // 顺手把「抄自预设」的键清掉：这样用户改一次预设，所有引用它的计划都跟上。
     changed |= compact_overrides(&mut items);
+    changed |= sync_last_run_states(&mut items)?;
     if changed {
         save(&items)?;
     }

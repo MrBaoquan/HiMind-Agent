@@ -156,7 +156,7 @@ pub(crate) fn resolve_asset(
                 return Err("插件候选包尚未完成测试，无法发布".into());
             }
             if draft.confirmed_at.is_none() {
-                return Err("插件 Candidate 尚未确认，无法发布".into());
+                return Err("插件候选版本尚未确认，无法发布".into());
             }
             let declared = draft
                 .manifest
@@ -188,7 +188,7 @@ pub(crate) fn resolve_asset(
                 return Err("Skill 候选包尚未完成测试，无法发布".into());
             }
             if draft.confirmed_at.is_none() {
-                return Err("Skill Candidate 尚未确认，无法发布".into());
+                return Err("技能候选版本尚未确认，无法发布".into());
             }
             let declared = draft
                 .manifest
@@ -217,7 +217,7 @@ pub(crate) fn resolve_asset(
         ExtensionProjectKind::Workflow => {
             let draft = crate::workflow::read_authoring_draft(id, version)?;
             if draft.state != crate::extension_contracts::ExtensionCandidateState::Confirmed {
-                return Err("Workflow Candidate 尚未确认，无法发布".into());
+                return Err("工作流候选版本尚未确认，无法发布".into());
             }
             // Workflow 锁里的依赖已经带精确版本与摘要，直接作为声明层输入。
             let declared = draft
@@ -248,6 +248,17 @@ pub(crate) fn resolve_asset(
                 pin_dependencies(&declared),
             )
         }
+        ExtensionProjectKind::Expert => {
+            let draft = crate::expert::read_authoring_draft(id, version)?;
+            if draft.tested_at.is_none() { return Err("专家候选包尚未完成测试，无法发布".into()); }
+            if draft.confirmed_at.is_none() { return Err("专家候选版本尚未确认，无法发布".into()); }
+            build_asset("expert", id, version, &draft.definition.name, &draft.definition.release_notes, &draft.definition.min_agent_version, &draft.candidate_path, &draft.candidate_sha256, PinnedDependencies::default())
+        }
+        // 项目规则的收敛动作是发布到本机规则库，仓库与工作台分发都还没有对应端点。
+        // 这里显式报错，避免落到默认分支后把规则当成插件发出去。
+        ExtensionProjectKind::Instruction => Err(
+            "项目规则请在「规则库」完成预检、确认和发布；仓库分发暂未接入".into(),
+        ),
     }
 }
 
@@ -421,6 +432,8 @@ fn publish_github(asset: &DistributionAsset) -> Result<TargetOutcome, Box<dyn Er
         match asset.kind.as_str() {
             "skill" => ExtensionProjectKind::Skill,
             "workflow" => ExtensionProjectKind::Workflow,
+            "expert" => ExtensionProjectKind::Expert,
+            "instruction" => ExtensionProjectKind::Instruction,
             _ => ExtensionProjectKind::Plugin,
         },
         &asset.id,
@@ -594,6 +607,10 @@ fn publish_workbench(
             &asset.version,
         )
         .map(|draft| draft.dashboard_submission_id.unwrap_or_default()),
+        ExtensionProjectKind::Expert => Err("专家扩展暂未接入工作台发布端点".into()),
+        ExtensionProjectKind::Instruction => {
+            Err("项目规则暂未接入工作台发布端点，请先在「规则库」发布到本机".into())
+        }
     };
     match result {
         Ok(submission_id) => {
@@ -638,6 +655,8 @@ fn entry_shell(
         match asset.kind.as_str() {
             "skill" => ExtensionProjectKind::Skill,
             "workflow" => ExtensionProjectKind::Workflow,
+            "expert" => ExtensionProjectKind::Expert,
+            "instruction" => ExtensionProjectKind::Instruction,
             _ => ExtensionProjectKind::Plugin,
         },
         &asset.id,

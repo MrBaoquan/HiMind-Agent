@@ -85,11 +85,11 @@ assert.ok(
 
 // 4. 每类能力的默认图标：市场、我的能力、扩展开发三处都要能一眼指认「这是什么」，
 //    所以每类必须解析得出一个图标，图标位（形状 + 配色）也必须在 styles.css 里齐备。
-const kinds = ['plugin', 'skill', 'workflow'] as const;
+const kinds = ['plugin', 'skill', 'workflow', 'expert', 'instruction'] as const;
 const kindsSource = readFileSync(join(root, 'src', 'data', 'extensionKinds.ts'), 'utf8');
 assert.ok(
-  /export type ExtensionKind = 'plugin' \| 'skill' \| 'workflow';/.test(kindsSource),
-  '能力类型口径变了：图标位按 plugin / skill / workflow 三类定义，加类型要同步改这里',
+  /export type ExtensionKind = 'plugin' \| 'skill' \| 'workflow' \| 'expert' \| 'instruction';/.test(kindsSource),
+  '能力类型口径变了：图标位按 plugin / skill / workflow / expert / instruction 定义，加类型要同步改这里',
 );
 const markSource = readFileSync(join(root, 'src', 'components', 'ExtensionKindMark.tsx'), 'utf8');
 assert.ok(!/from 'lucide'/.test(markSource), 'ExtensionKindMark 是静态图标位，只能从 lucide-react 取图标');

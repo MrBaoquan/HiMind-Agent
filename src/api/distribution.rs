@@ -367,6 +367,106 @@ pub struct WorkflowCatalogItem {
     pub extension_lock: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InstructionPackCatalogItem {
+    pub instruction_pack_id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub categories: Vec<String>,
+    pub version: String,
+    #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
+    pub published_at: String,
+    #[serde(default)]
+    pub min_agent_version: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub supported_clients: Vec<String>,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub max_bytes: usize,
+    #[serde(default)]
+    pub channel: String,
+    pub product_id: String,
+    pub release_id: String,
+    pub artifact_id: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub signature_key_id: String,
+    #[serde(default)]
+    pub signature_algorithm: String,
+    pub download_url: String,
+    #[serde(default = "default_marketplace_source")]
+    pub source: String,
+    #[serde(default = "default_optional_assignment")]
+    pub assignment: String,
+    #[serde(default = "default_user_management")]
+    pub management: String,
+    #[serde(default = "default_prompt_mode")]
+    pub install_mode: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default = "default_true")]
+    pub allow_disable: bool,
+    #[serde(default = "default_true")]
+    pub allow_uninstall: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExpertCatalogItem {
+    pub expert_id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub categories: Vec<String>,
+    pub version: String,
+    #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
+    pub published_at: String,
+    #[serde(default)]
+    pub min_agent_version: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub supported_clients: Vec<String>,
+    pub product_id: String,
+    pub release_id: String,
+    pub artifact_id: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub sha256: String,
+    #[serde(default)]
+    pub signature: String,
+    #[serde(default)]
+    pub signature_key_id: String,
+    #[serde(default)]
+    pub signature_algorithm: String,
+    pub download_url: String,
+    #[serde(default = "default_marketplace_source")]
+    pub source: String,
+    #[serde(default = "default_optional_assignment")]
+    pub assignment: String,
+    #[serde(default = "default_user_management")]
+    pub management: String,
+    #[serde(default = "default_prompt_mode")]
+    pub install_mode: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default = "default_true")]
+    pub allow_disable: bool,
+    #[serde(default = "default_true")]
+    pub allow_uninstall: bool,
+}
+
 fn default_marketplace_source() -> String {
     "marketplace".to_string()
 }
@@ -483,6 +583,8 @@ pub struct CatalogPage<T> {
 pub type PluginCatalogPage = CatalogPage<PluginCatalogItem>;
 pub type SkillCatalogPage = CatalogPage<SkillCatalogItem>;
 pub type WorkflowCatalogPage = CatalogPage<WorkflowCatalogItem>;
+pub type InstructionPackCatalogPage = CatalogPage<InstructionPackCatalogItem>;
+pub type ExpertCatalogPage = CatalogPage<ExpertCatalogItem>;
 
 #[derive(Debug, Deserialize)]
 struct SkillCatalogResponse {
@@ -494,6 +596,18 @@ struct SkillCatalogResponse {
 struct WorkflowCatalogResponse {
     #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     items: Vec<WorkflowCatalogItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstructionPackCatalogResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    items: Vec<InstructionPackCatalogItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpertCatalogResponse {
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    items: Vec<ExpertCatalogItem>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -877,6 +991,74 @@ pub fn workflow_versions(
         .items)
 }
 
+pub fn instruction_pack_catalog(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<Vec<InstructionPackCatalogItem>, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/instruction-packs/catalog"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<InstructionPackCatalogResponse>()?
+        .items)
+}
+
+pub fn instruction_pack_versions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    id: &str,
+) -> Result<Vec<InstructionPackCatalogItem>, Box<dyn Error>> {
+    let id = url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>();
+    Ok(client
+        .get(format!(
+            "{api_base}/api/agent/instruction-packs/catalog/{id}/versions"
+        ))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<InstructionPackCatalogResponse>()?
+        .items)
+}
+
+pub fn expert_catalog(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+) -> Result<Vec<ExpertCatalogItem>, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{api_base}/api/agent/experts/catalog"))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<ExpertCatalogResponse>()?
+        .items)
+}
+
+pub fn expert_versions(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    credential: &str,
+    id: &str,
+) -> Result<Vec<ExpertCatalogItem>, Box<dyn Error>> {
+    let id = url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>();
+    Ok(client
+        .get(format!(
+            "{api_base}/api/agent/experts/catalog/{id}/versions"
+        ))
+        .header("Authorization", format!("Agent {agent_id}:{credential}"))
+        .send()?
+        .error_for_status()?
+        .json::<ExpertCatalogResponse>()?
+        .items)
+}
+
 pub fn distribution_trust_bundle(
     client: &Client,
     api_base: &str,
@@ -1132,6 +1314,37 @@ pub fn submit_plugin(
         .header("X-HiMind-AI-Client", ai_client_id())
         .multipart(form)
         .send()?;
+    parse_submission_response(response)
+}
+
+pub fn submit_expert(
+    client: &Client,
+    api_base: &str,
+    agent_id: &str,
+    access_token: &str,
+    package_path: &Path,
+    test_report: &serde_json::Value,
+    source: &crate::extension_projects::ExtensionSubmissionSource,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let file_name = package_path.file_name().and_then(|v| v.to_str()).unwrap_or("expert.hmexpert").to_string();
+    let package = Part::file(package_path)?.file_name(file_name).mime_str("application/vnd.himind.expert+zip")?;
+    let source_type = if source.source_repository.trim().is_empty() { "local" } else { "repository" };
+    let form = Form::new()
+        .part("file", package)
+        .text("test_report", serde_json::to_string(test_report)?)
+        .text("source_type", source_type)
+        .text("source_repository", source.source_repository.clone())
+        .text("source_branch", source.source_default_branch.clone())
+        .text("source_subdirectory", source.source_subdirectory.clone())
+        .text("source_commit", source.source_commit.clone())
+        .text("distribution_id", source.distribution_id.clone())
+        .text("channel", source.channel.clone())
+        .text("catalog_id", source.catalog_id.clone());
+    let response = client.post(format!("{api_base}/api/agent/experts/submissions"))
+        .bearer_auth(access_token)
+        .header("X-HiMind-Agent-ID", agent_id)
+        .header("X-HiMind-AI-Client", ai_client_id())
+        .multipart(form).send()?;
     parse_submission_response(response)
 }
 
