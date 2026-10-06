@@ -5,6 +5,7 @@ import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
 import { useConfirm } from '../components/ConfirmDialog';
 import { ExtensionKindMark, extensionKindIcons } from '../components/ExtensionKindMark';
+import { ExpertStudioPanel } from '../components/ExpertStudioPanel';
 import { InstructionProjectionPanel } from '../components/InstructionProjectionPanel';
 import { OperationPlanCard } from '../components/OperationPlanCard';
 import { FUNCTIONAL_CATEGORIES } from '../data/categoryCatalog';
@@ -335,6 +336,24 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
         </header>
         {/* 规则库是工作区级的：预检、确认、发布和落地都作用在本机规则库，不绑某个扩展项目。 */}
         {activeItem && !showingUnmanaged ? <InstructionProjectionPanel workspaceRoot={activeItem.root} onMaterializeToWorkspace={(draft) => materializeInstruction(activeItem.root, draft)} /> : null}
+        {/* 内置专家属于本机能力库，不会自动写入用户仓库；在开发工作区里提供同一个入口，
+            需要源码项目时由用户明确执行“复制到工作区”。 */}
+        {activeItem && !showingUnmanaged && kindFilter === 'expert' ? <ExpertStudioPanel
+          experts={props.experts}
+          activeExpert={props.activeExpert}
+          compact
+          onRefresh={props.onRefreshExperts}
+          onActivate={props.onActivateExpert}
+          onNotify={props.onNotify}
+          onMaterializeToWorkspace={async expert => {
+            await agentApi.materializeExpertProject(activeItem.root, expert.id, expert.version);
+            await props.onRefresh();
+          }}
+          workspaceRoot={activeItem.root}
+          showAuthoring={false}
+          showMarket={false}
+          showProjection={false}
+        /> : null}
         {activeItem && !showingUnmanaged ? <div className="development-toolbar">
           <div className="plugin-tabs" role="tablist" aria-label="扩展类型">
             <button className={kindFilter === 'all' ? 'active' : ''} onClick={() => setKindFilter('all')}>全部 <span>{workspaceProjects.length}</span></button>
