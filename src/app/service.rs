@@ -144,21 +144,48 @@ pub(crate) fn start_background_services(
         let projection_options = options.clone();
         let _ = thread::Builder::new()
             .name("himind-agent-core-projection-loop".to_string())
-            .spawn(move || loop {
-                match crate::agent_core_projection::flush_pending_projections(&projection_options) {
-                    Ok(report) if report != Default::default() => {
-                        eprintln!(
-                            "agent core projections projected={} retried={} dead_letter={} skipped={}",
-                            report.projected,
-                            report.retried,
-                            report.dead_letter,
-                            report.skipped
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => eprintln!("agent core projection flush failed: {error}"),
+            .spawn(move || {
+                let normal_interval = Duration::from_secs(30);
+                let auth_retry_interval = Duration::from_secs(120);
+                let mut last_error = String::new();
+                loop {
+                    let retry_interval = match crate::agent_core_projection::flush_pending_projections(&projection_options) {
+                        Ok(report) if report != Default::default() => {
+                            last_error.clear();
+                            eprintln!(
+                                "agent core projections projected={} retried={} dead_letter={} skipped={}",
+                                report.projected,
+                                report.retried,
+                                report.dead_letter,
+                                report.skipped
+                            );
+                            normal_interval
+                        }
+                        Ok(_) => {
+                            last_error.clear();
+                            normal_interval
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            // Missing login is an expected idle state, not a new
+                            // failure every 30 seconds. Keep one diagnostic line,
+                            // back off token checks, and resume the fast loop once
+                            // a successful projection confirms the session.
+                            if message != last_error {
+                                eprintln!("agent core projection flush failed: {message}");
+                                last_error = message.clone();
+                            }
+                            if message.contains("请先登录")
+                                || message.contains("401 Unauthorized")
+                            {
+                                auth_retry_interval
+                            } else {
+                                Duration::from_secs(60)
+                            }
+                        }
+                    };
+                    thread::sleep(retry_interval);
                 }
-                thread::sleep(Duration::from_secs(30));
             });
     }
     if options.mode().dashboard_enabled() {

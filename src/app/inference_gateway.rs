@@ -203,7 +203,9 @@ impl GatewayError {
             Self::UnknownToken => "本机令牌无效，请在 AI 连接页重新注入",
             Self::AmbiguousModel => "请求没有携带可识别的本机令牌，且模型名对应多个绑定",
             Self::ProtocolMismatch => "请求协议与绑定的服务协议不一致，本机网关暂不互译",
-            Self::UnsupportedPath => "本机网关只转发 /v1/chat/completions、/v1/responses、/v1/messages 与 /v1/models",
+            Self::UnsupportedPath => {
+                "本机网关只转发 /v1/chat/completions、/v1/responses、/v1/messages 与 /v1/models"
+            }
             Self::Answered => "",
         }
     }
@@ -244,9 +246,7 @@ impl InferenceGateway {
                         .local_addr()
                         .map(|address| address.port())
                         .unwrap_or(0);
-                    notice = format!(
-                        "端口 {port} 被占用，已临时改用 {actual}。"
-                    );
+                    notice = format!("端口 {port} 被占用，已临时改用 {actual}。");
                     listener
                 }
             },
@@ -278,7 +278,12 @@ impl InferenceGateway {
                                 .is_err()
                             {
                                 let mut stream = stream;
-                                let _ = write_json_error(&mut stream, 503, "himind_gateway_busy", "本机推理网关连接数已满");
+                                let _ = write_json_error(
+                                    &mut stream,
+                                    503,
+                                    "himind_gateway_busy",
+                                    "本机推理网关连接数已满",
+                                );
                                 continue;
                             }
                             let connection_active = Arc::clone(&worker_active);
@@ -286,7 +291,9 @@ impl InferenceGateway {
                             let spawn = thread::Builder::new()
                                 .name("himind-inference-gateway-connection".to_string())
                                 .spawn(move || {
-                                    if let Err(error) = handle_connection(stream, &connection_resolver) {
+                                    if let Err(error) =
+                                        handle_connection(stream, &connection_resolver)
+                                    {
                                         let kind = error.kind();
                                         if kind != std::io::ErrorKind::ConnectionReset
                                             && kind != std::io::ErrorKind::BrokenPipe
@@ -363,10 +370,18 @@ fn handle_connection(stream: TcpStream, resolver: &BindingResolver) -> std::io::
     match route(&mut stream, resolver, &head, &body) {
         Ok(()) => Ok(()),
         Err(GatewayError::Answered) => Ok(()),
-        Err(GatewayError::UnsupportedPath) => {
-            write_json_error(&mut stream, 404, GatewayError::UnsupportedPath.code(), GatewayError::UnsupportedPath.message())
-        }
-        Err(GatewayError::UnknownToken) => write_json_error(&mut stream, 401, GatewayError::UnknownToken.code(), GatewayError::UnknownToken.message()),
+        Err(GatewayError::UnsupportedPath) => write_json_error(
+            &mut stream,
+            404,
+            GatewayError::UnsupportedPath.code(),
+            GatewayError::UnsupportedPath.message(),
+        ),
+        Err(GatewayError::UnknownToken) => write_json_error(
+            &mut stream,
+            401,
+            GatewayError::UnknownToken.code(),
+            GatewayError::UnknownToken.message(),
+        ),
         Err(error) => write_json_error(&mut stream, 400, error.code(), error.message()),
     }
 }
@@ -388,7 +403,8 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(RequestHead, 
         buffer.extend_from_slice(&chunk[..read]);
     };
     let head_text = String::from_utf8_lossy(&buffer[..head_end]).to_string();
-    let head = parse_head(&head_text).ok_or_else(|| std::io::Error::other("malformed request head"))?;
+    let head =
+        parse_head(&head_text).ok_or_else(|| std::io::Error::other("malformed request head"))?;
     // .NET 系客户端（HttpClient 默认）会先发 `Expect: 100-continue` 再等应答；
     // 不回 100 就会被判定为连接错误，请求根本到不了转发逻辑。
     if head
@@ -436,7 +452,11 @@ fn parse_head(text: &str) -> Option<RequestHead> {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
         }
     }
-    Some(RequestHead { method, path, headers })
+    Some(RequestHead {
+        method,
+        path,
+        headers,
+    })
 }
 
 /// 入口路径 → 该路径要求的协议族。互译属 P2，因此这里只接受同族请求。
@@ -499,9 +519,9 @@ fn authorize(
             .ok_or(GatewayError::UnknownToken);
     }
     let model = model_from_body(body).ok_or(GatewayError::UnknownToken)?;
-    let mut matches = bindings
-        .iter()
-        .filter(|binding| binding.protocol == required_protocol && binding_has_model(binding, &model));
+    let mut matches = bindings.iter().filter(|binding| {
+        binding.protocol == required_protocol && binding_has_model(binding, &model)
+    });
     let first = matches.next().cloned().ok_or(GatewayError::UnknownToken)?;
     if matches.next().is_some() {
         return Err(GatewayError::AmbiguousModel);
@@ -556,9 +576,7 @@ fn inject_stream_usage_flag(body: &[u8]) -> Vec<u8> {
     let Some(object) = value.as_object_mut() else {
         return body.to_vec();
     };
-    let options = object
-        .entry("stream_options")
-        .or_insert_with(|| json!({}));
+    let options = object.entry("stream_options").or_insert_with(|| json!({}));
     if let Some(options) = options.as_object_mut() {
         options.insert("include_usage".to_string(), json!(true));
     }
@@ -597,13 +615,19 @@ fn extract_usage(protocol: &str, value: &Value) -> Usage {
             input: number(value, &["usage", "prompt_tokens"]),
             output: number(value, &["usage", "completion_tokens"]),
             cached: number(value, &["usage", "prompt_tokens_details", "cached_tokens"]),
-            reasoning: number(value, &["usage", "completion_tokens_details", "reasoning_tokens"]),
+            reasoning: number(
+                value,
+                &["usage", "completion_tokens_details", "reasoning_tokens"],
+            ),
         },
         "openai-responses" => Usage {
             input: number(value, &["usage", "input_tokens"]),
             output: number(value, &["usage", "output_tokens"]),
             cached: number(value, &["usage", "input_tokens_details", "cached_tokens"]),
-            reasoning: number(value, &["usage", "output_tokens_details", "reasoning_tokens"]),
+            reasoning: number(
+                value,
+                &["usage", "output_tokens_details", "reasoning_tokens"],
+            ),
         },
         "anthropic" => Usage {
             input: number(value, &["usage", "input_tokens"]),
@@ -666,7 +690,9 @@ fn route(
     if head.method == "GET" && normalize_api_path(&head.path) == "/models" {
         let binding = bindings
             .iter()
-            .find(|binding| token_from_headers(&head.headers).as_deref() == Some(binding.token.as_str()))
+            .find(|binding| {
+                token_from_headers(&head.headers).as_deref() == Some(binding.token.as_str())
+            })
             .cloned()
             .ok_or(GatewayError::UnknownToken)?;
         return forward(stream, &binding, head, body, "models");
@@ -709,8 +735,8 @@ fn forward(
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|_| GatewayError::Answered)?;
-    let method = reqwest::Method::from_bytes(head.method.as_bytes())
-        .unwrap_or(reqwest::Method::POST);
+    let method =
+        reqwest::Method::from_bytes(head.method.as_bytes()).unwrap_or(reqwest::Method::POST);
     let mut request = client
         .request(method, &upstream_url)
         .header("accept-encoding", "identity");
@@ -767,7 +793,14 @@ fn forward(
         let _ = stream.flush();
         let usage = scanner.usage;
         if kind != "models" {
-            record_usage(binding, &model, true, status.as_u16(), usage, usage.is_empty());
+            record_usage(
+                binding,
+                &model,
+                true,
+                status.as_u16(),
+                usage,
+                usage.is_empty(),
+            );
         }
         return Ok(());
     }
@@ -778,15 +811,28 @@ fn forward(
     if raw.len() > BODY_LIMIT {
         raw.truncate(BODY_LIMIT);
     }
-    write_buffered_head(stream, status.as_u16(), &content_type, &binding.id, raw.len())
-        .map_err(|_| GatewayError::Answered)?;
+    write_buffered_head(
+        stream,
+        status.as_u16(),
+        &content_type,
+        &binding.id,
+        raw.len(),
+    )
+    .map_err(|_| GatewayError::Answered)?;
     let _ = stream.write_all(&raw);
     let _ = stream.flush();
     if kind != "models" {
         let usage = serde_json::from_slice::<Value>(&raw)
             .map(|value| extract_usage(&binding.protocol, &value))
             .unwrap_or_default();
-        record_usage(binding, &model, false, status.as_u16(), usage, usage.is_empty());
+        record_usage(
+            binding,
+            &model,
+            false,
+            status.as_u16(),
+            usage,
+            usage.is_empty(),
+        );
     }
     Ok(())
 }
@@ -814,13 +860,11 @@ fn forward_translated(
         .filter(|value| !value.is_empty())
         .unwrap_or(binding.default_model.as_str())
         .to_string();
-    let openai_body = match crate::app::anthropic_openai::request_to_openai(
-        &request,
-        &binding.default_model,
-    ) {
-        Ok(openai_body) => openai_body,
-        Err(error) => return Err(translate_error(stream, &error)),
-    };
+    let openai_body =
+        match crate::app::anthropic_openai::request_to_openai(&request, &binding.default_model) {
+            Ok(openai_body) => openai_body,
+            Err(error) => return Err(translate_error(stream, &error)),
+        };
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -854,7 +898,14 @@ fn forward_translated(
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(payload.as_bytes());
         let _ = stream.flush();
-        record_usage(binding, &model, streaming, status.as_u16(), Usage::default(), true);
+        record_usage(
+            binding,
+            &model,
+            streaming,
+            status.as_u16(),
+            Usage::default(),
+            true,
+        );
         return Ok(());
     }
 
@@ -894,7 +945,12 @@ fn forward_translated(
             &model,
             true,
             status.as_u16(),
-            Usage { input, output, cached: 0, reasoning: 0 },
+            Usage {
+                input,
+                output,
+                cached: 0,
+                reasoning: 0,
+            },
             input == 0 && output == 0,
         );
         return Ok(());
@@ -917,7 +973,14 @@ fn forward_translated(
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(payload.as_bytes());
     let _ = stream.flush();
-    record_usage(binding, &model, false, status.as_u16(), usage, usage.is_empty());
+    record_usage(
+        binding,
+        &model,
+        false,
+        status.as_u16(),
+        usage,
+        usage.is_empty(),
+    );
     Ok(())
 }
 
@@ -945,11 +1008,11 @@ fn forward_responses_translated(
         .filter(|value| !value.is_empty())
         .unwrap_or(binding.default_model.as_str())
         .to_string();
-    let chat_body = match crate::app::responses_chat::request_to_chat(&request, &binding.default_model)
-    {
-        Ok(chat_body) => chat_body,
-        Err(error) => return Err(translate_error(stream, &error)),
-    };
+    let chat_body =
+        match crate::app::responses_chat::request_to_chat(&request, &binding.default_model) {
+            Ok(chat_body) => chat_body,
+            Err(error) => return Err(translate_error(stream, &error)),
+        };
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -978,7 +1041,14 @@ fn forward_responses_translated(
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.write_all(payload.as_bytes());
         let _ = stream.flush();
-        record_usage(binding, &model, streaming, status.as_u16(), Usage::default(), true);
+        record_usage(
+            binding,
+            &model,
+            streaming,
+            status.as_u16(),
+            Usage::default(),
+            true,
+        );
         return Ok(());
     }
 
@@ -1042,7 +1112,14 @@ fn forward_responses_translated(
     let _ = stream.write_all(payload.as_bytes());
     let _ = stream.flush();
     let usage = extract_usage("openai-chat", &chat);
-    record_usage(binding, &model, false, status.as_u16(), usage, usage.is_empty());
+    record_usage(
+        binding,
+        &model,
+        false,
+        status.as_u16(),
+        usage,
+        usage.is_empty(),
+    );
     Ok(())
 }
 
@@ -1081,7 +1158,10 @@ fn write_stream_head(
     content_type: &str,
     binding_id: &str,
 ) -> std::io::Result<()> {
-    let head = format!("{}\r\n", gateway_response_head(status, content_type, binding_id));
+    let head = format!(
+        "{}\r\n",
+        gateway_response_head(status, content_type, binding_id)
+    );
     stream.write_all(head.as_bytes())
 }
 
@@ -1232,7 +1312,10 @@ mod tests {
         assert_eq!(head.method, "POST");
         assert_eq!(head.path, "/v1/chat/completions");
         assert_eq!(head.headers.get("authorization").unwrap(), "Bearer abc");
-        assert_eq!(head.headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            head.headers.get("content-type").unwrap(),
+            "application/json"
+        );
     }
 
     #[test]
@@ -1245,15 +1328,28 @@ mod tests {
             token_from_headers(&headers(&[("x-api-key", "tok-2")])),
             Some("tok-2".to_string())
         );
-        assert_eq!(token_from_headers(&headers(&[("authorization", "Basic zz")])), None);
+        assert_eq!(
+            token_from_headers(&headers(&[("authorization", "Basic zz")])),
+            None
+        );
     }
 
     #[test]
     fn authorize_prefers_token_and_rejects_unknown_tokens() {
         let bindings = vec![binding("codex", "openai-chat", "tok-1")];
-        let ok = authorize(&bindings, &headers(&[("authorization", "Bearer tok-1")]), b"", "openai-chat");
+        let ok = authorize(
+            &bindings,
+            &headers(&[("authorization", "Bearer tok-1")]),
+            b"",
+            "openai-chat",
+        );
         assert_eq!(ok.unwrap().client, "codex");
-        let unknown = authorize(&bindings, &headers(&[("authorization", "Bearer nope")]), b"", "openai-chat");
+        let unknown = authorize(
+            &bindings,
+            &headers(&[("authorization", "Bearer nope")]),
+            b"",
+            "openai-chat",
+        );
         assert_eq!(unknown.unwrap_err(), GatewayError::UnknownToken);
     }
 
@@ -1315,7 +1411,9 @@ mod tests {
         let value: Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(value["stream_options"]["include_usage"], true);
 
-        let untouched = inject_stream_usage_flag(br#"{"model":"m","stream":true,"stream_options":{"include_usage":true}}"#);
+        let untouched = inject_stream_usage_flag(
+            br#"{"model":"m","stream":true,"stream_options":{"include_usage":true}}"#,
+        );
         let value: Value = serde_json::from_slice(&untouched).unwrap();
         assert_eq!(value["stream_options"]["include_usage"], true);
 
@@ -1332,7 +1430,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             extract_usage("openai-chat", &chat),
-            Usage { input: 100, output: 20, cached: 64, reasoning: 7 }
+            Usage {
+                input: 100,
+                output: 20,
+                cached: 64,
+                reasoning: 7
+            }
         );
 
         let responses: Value = serde_json::from_str(
@@ -1341,7 +1444,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             extract_usage("openai-responses", &responses),
-            Usage { input: 11, output: 2, cached: 3, reasoning: 0 }
+            Usage {
+                input: 11,
+                output: 2,
+                cached: 3,
+                reasoning: 0
+            }
         );
 
         let anthropic: Value = serde_json::from_str(
@@ -1350,7 +1458,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             extract_usage("anthropic", &anthropic),
-            Usage { input: 5, output: 6, cached: 7, reasoning: 0 }
+            Usage {
+                input: 5,
+                output: 6,
+                cached: 7,
+                reasoning: 0
+            }
         );
     }
 
@@ -1361,7 +1474,12 @@ mod tests {
         scanner.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n");
         assert_eq!(
             scanner.usage,
-            Usage { input: 12, output: 9, cached: 30, reasoning: 0 }
+            Usage {
+                input: 12,
+                output: 9,
+                cached: 30,
+                reasoning: 0
+            }
         );
     }
 
@@ -1369,7 +1487,15 @@ mod tests {
     fn sse_scanner_reads_responses_completed_usage() {
         let mut scanner = StreamScanner::new("openai-responses".to_string());
         scanner.push(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":4}}}\n\n");
-        assert_eq!(scanner.usage, Usage { input: 8, output: 4, cached: 0, reasoning: 0 });
+        assert_eq!(
+            scanner.usage,
+            Usage {
+                input: 8,
+                output: 4,
+                cached: 0,
+                reasoning: 0
+            }
+        );
     }
 
     #[test]
@@ -1379,7 +1505,15 @@ mod tests {
         scanner.push(b"data: {\"usa");
         assert!(scanner.usage.is_empty());
         scanner.push(b"ge\":{\"prompt_tokens\":4,\"completion_tokens\":1}}\n\n");
-        assert_eq!(scanner.usage, Usage { input: 4, output: 1, cached: 0, reasoning: 0 });
+        assert_eq!(
+            scanner.usage,
+            Usage {
+                input: 4,
+                output: 1,
+                cached: 0,
+                reasoning: 0
+            }
+        );
     }
 
     /// 已有客户端走网关时，优先端口被占用必须失败：换端口会让那些客户端
@@ -1390,7 +1524,10 @@ mod tests {
         let port = occupied.local_addr().unwrap().port();
         let result = InferenceGateway::start(Some(port), Box::new(Vec::new), true);
         let error = result.err().expect("端口被占用时不应静默换端口");
-        assert!(error.contains("不换端口"), "错误应说明为什么不换端口：{error}");
+        assert!(
+            error.contains("不换端口"),
+            "错误应说明为什么不换端口：{error}"
+        );
     }
 
     /// 还没有任何绑定时允许退到临时端口，但必须把这件事记成提示。

@@ -985,10 +985,12 @@ export type ExtensionDistributionUnit = {
     plugin_count: number;
     skill_count: number;
     workflow_count: number;
+    expert_count: number;
     state: 'ready' | 'empty' | string;
     plugin_ids: string[];
     skill_ids: string[];
     workflow_ids: string[];
+    expert_ids: string[];
     project_ids: string[];
     installed: ExtensionUnitInstallation[];
     assets: ExtensionUnitAsset[];
@@ -1012,6 +1014,7 @@ export type ExtensionUnitInstallReport = {
     plugins: ExtensionUnitAsset[];
     skills: ExtensionUnitAsset[];
     workflows: ExtensionUnitAsset[];
+    experts: ExtensionUnitAsset[];
     errors: string[];
     failures?: { asset_kind: string; asset_id: string; message: string; retryable: boolean }[];
     retryable?: boolean;
@@ -1028,6 +1031,7 @@ export type ExtensionSourceStatus = {
     plugin_count: number;
     skill_count: number;
     workflow_count: number;
+    expert_count: number;
     generation: string;
     using_cache: boolean;
     error: string;
@@ -1143,6 +1147,7 @@ export type ExpertCatalogItem = {
   assignment: string;
   management: string;
   managed: boolean;
+  download_url?: string;
 };
 
 export type ExpertActivation = {
@@ -1167,6 +1172,12 @@ export type ExpertProjectionReceipt = {
   workspace_root: string;
   target_path: string;
   content_digest: string;
+  changed?: boolean;
+  previous_digest?: string;
+  backup_path?: string;
+  sync_status?: string;
+  verification_status?: string;
+  message?: string;
   projected_at: string;
 };
 
@@ -1196,6 +1207,7 @@ export type ExtensionSourceSnapshot = {
     plugins: PluginCatalogItem[];
     skills: OrganizationSkillCatalogItem[];
     workflows: WorkflowCatalogItem[];
+    experts: ExpertCatalogItem[];
     feature_packs: ExtensionFeaturePack[];
     sources: ExtensionSourceStatus[];
     units?: ExtensionDistributionUnit[];

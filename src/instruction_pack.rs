@@ -228,8 +228,8 @@ pub(crate) struct PublishedInstructionPack {
 /// 这些内容是能直接用的真实规则，不是占位：用户可以预检、确认、发布到本机，
 /// 也可以落地到工作区改成团队自己的版本。
 fn builtin_starters() -> Vec<InstructionPackDraftInput> {
-    let starter = |id: &str, name: &str, description: &str, instructions: &str| {
-        InstructionPackDraftInput {
+    let starter =
+        |id: &str, name: &str, description: &str, instructions: &str| InstructionPackDraftInput {
             id: id.to_string(),
             name: name.to_string(),
             author: "HiMind".to_string(),
@@ -247,8 +247,7 @@ fn builtin_starters() -> Vec<InstructionPackDraftInput> {
             workflow_refs: Vec::new(),
             capability_refs: Vec::new(),
             source: "builtin_starter".to_string(),
-        }
-    };
+        };
     vec![
         starter(
             "com.himind.instruction.delivery-gate",

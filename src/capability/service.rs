@@ -25,6 +25,7 @@ use crate::business_integration::{
     BusinessCapabilityContract, BusinessIntegrationProvider, DASHBOARD_BUSINESS_PROVIDER_ID,
 };
 use crate::capability::dashboard_catalog::DashboardCatalogProvider;
+use crate::capability::execution::CapabilityExecutionContext;
 use crate::capability::plugin::{
     find_plugin, invoke_plugin_capability, invoke_plugin_capability_for_plugin,
     registry_json_for_control_plane, scan_plugins,
@@ -150,6 +151,11 @@ enum CapabilityHandler {
     WorkspaceStatus,
     WorkspaceOpen,
     RemoteConnect,
+    ScanProjects,
+    InnerAdminSyncExhibits,
+    UploadCode,
+    UploadPlaceholder,
+    SmbUpload,
     SvnConnectionList,
     SvnConnectionTest,
     SvnWorkspaceCheckout,
@@ -160,7 +166,12 @@ enum CapabilityHandler {
     SvnRepositoryCreate,
     SvnExhibitRepositoryPathCreate,
     SvnExhibitRepositoryInitialize,
+    SvnExhibitRepositoryClone,
+    SvnExhibitRepositoryImportLocal,
     SvnProjectExhibitsAccessEnsure,
+    SvnProjectAclPreview,
+    SvnProjectAclApply,
+    SvnProjectAclReconcile,
     PluginList,
     PluginManifest,
     PluginInvoke,
@@ -1677,6 +1688,96 @@ impl CapabilityGateway {
                 CapabilityHandler::InnerAdminLoginStatus,
             ),
             registration(
+                "scan.projects",
+                "扫描本机项目",
+                "按本机扫描根目录和可选项目目标识别 Unity、Unreal 或通用工程候选。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "source_roots": { "type": "array", "items": { "type": "string" } },
+                        "release_roots": { "type": "array", "items": { "type": "string" } },
+                        "scan_targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "project_name": { "type": "string" },
+                                    "exhibit_name": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ScanProjects,
+            ),
+            registration(
+                "inner_admin.sync_exhibits",
+                "同步内网展项",
+                "登录内网管理系统并同步当前用户待上传展项及工程信息。",
+                "network_write",
+                json!({ "type": "object", "additionalProperties": false }),
+                CapabilityHandler::InnerAdminSyncExhibits,
+            ),
+            registration(
+                "upload.code",
+                "上传代码包",
+                "按工程目录生成代码归档并分片上传到内网管理系统。",
+                "network_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "pid": { "type": "string" },
+                        "exhibit_name": { "type": "string" },
+                        "package_type": { "type": "string", "enum": ["source", "release"] },
+                        "source_path": { "type": "string" },
+                        "release_path": { "type": "string" }
+                    },
+                    "required": ["pid"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::UploadCode,
+            ),
+            registration(
+                "upload.placeholder",
+                "上传占位文件",
+                "生成占位说明文件并上传到内网管理系统。",
+                "network_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "pid": { "type": "string" },
+                        "exhibit_name": { "type": "string" },
+                        "file_name": { "type": "string" },
+                        "content": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["pid", "content"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::UploadPlaceholder,
+            ),
+            registration(
+                "storage.smb.upload",
+                "上传到 SMB",
+                "将本机文件安全复制到指定 SMB 目录，并提供可取消的文件级进度。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target_dir": { "type": "string" },
+                        "source_paths": { "type": "array", "items": { "type": "string" } },
+                        "relative_paths": { "type": "array", "items": { "type": "string" } },
+                        "conflict_policy": { "type": "string", "enum": ["replace", "skip"] },
+                        "category": {}
+                    },
+                    "required": ["target_dir", "source_paths"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SmbUpload,
+            ),
+            registration(
                 "system.open_folder",
                 "打开本机文件夹",
                 "用系统文件管理器打开指定本机目录。",
@@ -1947,6 +2048,67 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnExhibitRepositoryInitialize,
             ),
             registration(
+                "exhibit.repository.clone",
+                "克隆展项 SVN 仓库",
+                "在同一 SVN 服务中将源展项仓库复制到目标展项目录。",
+                "admin_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "exhibit_id": { "type": "string" },
+                        "source_repository_url": { "type": "string", "format": "uri" }
+                    },
+                    "required": ["project_id", "exhibit_id", "source_repository_url"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SvnExhibitRepositoryClone,
+            ),
+            registration(
+                "exhibit.repository.import_local",
+                "导入本地展项工程",
+                "将本地工程迁移到目标展项 SVN 仓库，并保留可验证的忽略规则、属性和外部依赖。",
+                "admin_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": { "type": "string" },
+                        "exhibit_id": { "type": "string" },
+                        "source_path": { "type": "string" },
+                        "force_migration": { "type": "boolean" },
+                        "expected_source_fingerprint": { "type": "string" },
+                        "ignore_policy": { "type": "object" }
+                    },
+                    "required": ["project_id", "exhibit_id", "source_path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::SvnExhibitRepositoryImportLocal,
+            ),
+            registration(
+                "project.repository.acl.preview",
+                "预览项目 SVN 权限",
+                "读取项目受管 SVN 路径的当前权限，并生成待应用的差异计划。",
+                "read_only",
+                project_acl_preview_schema(),
+                CapabilityHandler::SvnProjectAclPreview,
+            ),
+            registration(
+                "project.repository.acl.apply",
+                "应用项目 SVN 权限",
+                "校验预览摘要后应用项目 SVN 权限计划。",
+                "R3",
+                project_acl_apply_schema(),
+                CapabilityHandler::SvnProjectAclApply,
+            ),
+            registration(
+                "project.repository.acl.reconcile",
+                "收敛项目 SVN 权限",
+                "按期望状态收敛项目受管 SVN 路径的访问权限。",
+                "R3",
+                project_acl_reconcile_schema(),
+                CapabilityHandler::SvnProjectAclReconcile,
+            ),
+            registration(
                 "project.repository.create",
                 "创建项目 SVN 仓库",
                 "由当前内网 Agent 使用本机加密保存的 SvnAdmin 管理凭据，按项目唯一 ID 创建物理仓库。",
@@ -1955,9 +2117,11 @@ impl CapabilityGateway {
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string" },
-                        "project_name": { "type": "string" }
+                        "project_name": { "type": "string" },
+                        "hook_endpoint": { "type": "string", "format": "uri" },
+                        "repository_access": { "type": "string" }
                     },
-                    "required": ["project_id"],
+                    "required": ["project_id", "hook_endpoint"],
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SvnRepositoryCreate,
@@ -2711,6 +2875,26 @@ impl CapabilityGateway {
         capability_id: &str,
         input: Value,
     ) -> Result<Value, Box<dyn Error>> {
+        self.invoke_internal(context, capability_id, input, None)
+    }
+
+    pub(crate) fn invoke_with_execution_context(
+        &self,
+        context: &InvocationContext,
+        capability_id: &str,
+        input: Value,
+        execution: &mut CapabilityExecutionContext<'_>,
+    ) -> Result<Value, Box<dyn Error>> {
+        self.invoke_internal(context, capability_id, input, Some(execution))
+    }
+
+    fn invoke_internal(
+        &self,
+        context: &InvocationContext,
+        capability_id: &str,
+        input: Value,
+        mut execution: Option<&mut CapabilityExecutionContext<'_>>,
+    ) -> Result<Value, Box<dyn Error>> {
         let registration = self
             .registry()?
             .remove(capability_id)
@@ -3422,6 +3606,73 @@ impl CapabilityGateway {
             CapabilityHandler::WorkspaceStatus => self.workspace_status(input),
             CapabilityHandler::WorkspaceOpen => self.workspace_open(input),
             CapabilityHandler::RemoteConnect => self.remote_connect(input),
+            CapabilityHandler::ScanProjects => crate::scan::service::execute_scan(Some(&input)),
+            CapabilityHandler::InnerAdminSyncExhibits => {
+                let mut fallback = CapabilityExecutionContext::detached(
+                    input
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("capability-sync"),
+                    capability_id,
+                    "inner_admin",
+                );
+                let execution = execution.as_deref_mut().unwrap_or(&mut fallback);
+                crate::remote::sync::execute_sync_exhibits_with_context(&self.options, execution)
+            }
+            CapabilityHandler::UploadCode => {
+                let mut fallback = CapabilityExecutionContext::detached(
+                    input
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("capability-upload"),
+                    capability_id,
+                    input
+                        .get("source_path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+                let execution = execution.as_deref_mut().unwrap_or(&mut fallback);
+                crate::upload::tasks::execute_upload_code_with_context(
+                    &self.options,
+                    execution,
+                    Some(&input),
+                )
+            }
+            CapabilityHandler::UploadPlaceholder => {
+                let mut fallback = CapabilityExecutionContext::detached(
+                    input
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("capability-placeholder"),
+                    capability_id,
+                    input.get("pid").and_then(Value::as_str).unwrap_or_default(),
+                );
+                let execution = execution.as_deref_mut().unwrap_or(&mut fallback);
+                crate::upload::tasks::execute_upload_placeholder_with_context(
+                    &self.options,
+                    execution,
+                    Some(&input),
+                )
+            }
+            CapabilityHandler::SmbUpload => {
+                let mut fallback = CapabilityExecutionContext::detached(
+                    input
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("capability-smb-upload"),
+                    capability_id,
+                    input
+                        .get("target_dir")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                );
+                let execution = execution.as_deref_mut().unwrap_or(&mut fallback);
+                crate::upload::smb::execute_smb_upload_with_context(
+                    &self.options,
+                    execution,
+                    Some(&input),
+                )
+            }
             CapabilityHandler::SvnConnectionList => Ok(json!({ "items": list_connections()? })),
             CapabilityHandler::SvnConnectionTest => self.test_svn_connection(input),
             CapabilityHandler::SvnWorkspaceCheckout => {
@@ -3454,9 +3705,52 @@ impl CapabilityGateway {
                     InitializeExhibitRepositoryRequest,
                 >(input)?)
             }
+            CapabilityHandler::SvnExhibitRepositoryClone => {
+                crate::svn::service::clone_exhibit_repository(serde_json::from_value::<
+                    crate::svn::types::CloneExhibitRepositoryRequest,
+                >(input)?)
+            }
+            CapabilityHandler::SvnExhibitRepositoryImportLocal => {
+                let request =
+                    serde_json::from_value::<crate::svn::types::ImportLocalExhibitRequest>(input)?;
+                let mut fallback = CapabilityExecutionContext::detached(
+                    execution
+                        .as_deref()
+                        .map(|value| value.task_id().to_string())
+                        .unwrap_or_else(|| "capability-import-local".to_string()),
+                    capability_id,
+                    &request.source_path,
+                );
+                let execution = execution.as_deref_mut().unwrap_or(&mut fallback);
+                let execution = std::cell::RefCell::new(execution);
+                let mut check_cancelled = || execution.borrow_mut().check_cancelled();
+                let mut report_progress = |progress: i32, detail: &str| {
+                    execution.borrow_mut().report_progress(progress, detail)
+                };
+                crate::svn::service::import_local_exhibit_with_cancel_and_progress(
+                    request,
+                    &mut check_cancelled,
+                    &mut report_progress,
+                )
+            }
             CapabilityHandler::SvnProjectExhibitsAccessEnsure => {
                 ensure_project_exhibits_access(serde_json::from_value::<
                     EnsureProjectExhibitsAccessRequest,
+                >(input)?)
+            }
+            CapabilityHandler::SvnProjectAclPreview => {
+                crate::svn::service::preview_project_acl(serde_json::from_value::<
+                    crate::svn::types::PreviewProjectAclRequest,
+                >(input)?)
+            }
+            CapabilityHandler::SvnProjectAclApply => {
+                crate::svn::service::apply_project_acl(serde_json::from_value::<
+                    crate::svn::types::ApplyProjectAclRequest,
+                >(input)?)
+            }
+            CapabilityHandler::SvnProjectAclReconcile => {
+                crate::svn::service::reconcile_project_acl(serde_json::from_value::<
+                    crate::svn::types::ReconcileProjectAclRequest,
                 >(input)?)
             }
             CapabilityHandler::PluginList => {
@@ -5481,7 +5775,70 @@ fn is_svn_admin_capability(capability_id: &str) -> bool {
             | "project.repository.exhibits_access.ensure"
             | "exhibit.repository_path.create"
             | "exhibit.repository.initialize_template"
+            | "exhibit.repository.clone"
+            | "exhibit.repository.import_local"
+            | "project.repository.acl.preview"
+            | "project.repository.acl.apply"
+            | "project.repository.acl.reconcile"
     )
+}
+
+fn project_acl_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string" },
+            "username": { "type": "string" },
+            "access": { "type": "string" }
+        },
+        "required": ["path", "username", "access"],
+        "additionalProperties": false
+    })
+}
+
+fn project_acl_preview_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "plan_id": { "type": "string" },
+            "project_id": { "type": "string" },
+            "managed_paths": { "type": ["array", "null"], "items": { "type": "string" } },
+            "desired_entries": { "type": ["array", "null"], "items": project_acl_entry_schema() },
+            "repository_access": { "type": "string" }
+        },
+        "required": ["plan_id", "project_id"],
+        "additionalProperties": false
+    })
+}
+
+fn project_acl_apply_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "plan_id": { "type": "string" },
+            "project_id": { "type": "string" },
+            "managed_paths": { "type": ["array", "null"], "items": { "type": "string" } },
+            "desired_entries": { "type": ["array", "null"], "items": project_acl_entry_schema() },
+            "expected_current_digest": { "type": "string" },
+            "repository_access": { "type": "string" }
+        },
+        "required": ["plan_id", "project_id", "expected_current_digest"],
+        "additionalProperties": false
+    })
+}
+
+fn project_acl_reconcile_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project_id": { "type": "string" },
+            "managed_paths": { "type": ["array", "null"], "items": { "type": "string" } },
+            "desired_entries": { "type": ["array", "null"], "items": project_acl_entry_schema() },
+            "repository_access": { "type": "string" }
+        },
+        "required": ["project_id"],
+        "additionalProperties": false
+    })
 }
 
 fn authoring_operation_error(
@@ -5723,6 +6080,11 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
         handler,
         CapabilityHandler::WorkspaceBuild
             | CapabilityHandler::SvnWorkspaceCheckout
+            | CapabilityHandler::InnerAdminSyncExhibits
+            | CapabilityHandler::UploadCode
+            | CapabilityHandler::UploadPlaceholder
+            | CapabilityHandler::SmbUpload
+            | CapabilityHandler::SvnExhibitRepositoryImportLocal
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout
             | CapabilityHandler::SoftwareDistributionPublish
             | CapabilityHandler::MediaSubmit(_, _)
@@ -5734,6 +6096,11 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
         handler,
         CapabilityHandler::WorkspaceBuild
             | CapabilityHandler::SvnWorkspaceCheckout
+            | CapabilityHandler::InnerAdminSyncExhibits
+            | CapabilityHandler::UploadCode
+            | CapabilityHandler::UploadPlaceholder
+            | CapabilityHandler::SmbUpload
+            | CapabilityHandler::SvnExhibitRepositoryImportLocal
             | CapabilityHandler::MediaSubmit(_, _)
             | CapabilityHandler::MediaJobCancel
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout
@@ -6479,7 +6846,16 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         CapabilityHandler::SvnRepositoryCreate
         | CapabilityHandler::SvnExhibitRepositoryPathCreate
         | CapabilityHandler::SvnExhibitRepositoryInitialize
-        | CapabilityHandler::SvnProjectExhibitsAccessEnsure => CapabilityAvailability::ControlPlane,
+        | CapabilityHandler::SvnExhibitRepositoryClone
+        | CapabilityHandler::SvnProjectExhibitsAccessEnsure
+        | CapabilityHandler::SvnProjectAclPreview
+        | CapabilityHandler::SvnProjectAclApply
+        | CapabilityHandler::SvnProjectAclReconcile => CapabilityAvailability::ControlPlane,
+        CapabilityHandler::InnerAdminSyncExhibits
+        | CapabilityHandler::UploadCode
+        | CapabilityHandler::UploadPlaceholder => CapabilityAvailability::NetworkService,
+        CapabilityHandler::SmbUpload => CapabilityAvailability::Local,
+        CapabilityHandler::SvnExhibitRepositoryImportLocal => CapabilityAvailability::ControlPlane,
         CapabilityHandler::PluginCapability(_) => CapabilityAvailability::Local,
         _ => CapabilityAvailability::Local,
     }
@@ -7700,6 +8076,29 @@ mod tests {
         assert_eq!(item.descriptor.execution_mode, "long_running");
         assert!(item.descriptor.supports_progress);
         assert!(item.descriptor.supports_cancel);
+    }
+
+    #[test]
+    fn migrated_dashboard_long_tasks_report_progress_and_cancel_contracts() {
+        let handlers = [
+            (
+                "inner_admin.sync_exhibits",
+                CapabilityHandler::InnerAdminSyncExhibits,
+            ),
+            ("upload.code", CapabilityHandler::UploadCode),
+            ("upload.placeholder", CapabilityHandler::UploadPlaceholder),
+            ("storage.smb.upload", CapabilityHandler::SmbUpload),
+            (
+                "exhibit.repository.import_local",
+                CapabilityHandler::SvnExhibitRepositoryImportLocal,
+            ),
+        ];
+        for (id, handler) in handlers {
+            let item = registration(id, id, id, "network_write", json!({}), handler);
+            assert_eq!(item.descriptor.execution_mode, "long_running", "{id}");
+            assert!(item.descriptor.supports_progress, "{id}");
+            assert!(item.descriptor.supports_cancel, "{id}");
+        }
     }
 
     #[test]

@@ -81,7 +81,10 @@ pub(crate) fn request_to_chat(body: &Value, default_model: &str) -> Result<Value
         .unwrap_or(false);
     translated.insert("stream".to_string(), json!(streaming));
     if streaming {
-        translated.insert("stream_options".to_string(), json!({ "include_usage": true }));
+        translated.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
     }
     Ok(Value::Object(translated))
 }
@@ -216,7 +219,10 @@ fn message_item(text: &str) -> Value {
 
 fn response_envelope(chat: &Value, model: &str, output: Vec<Value>, status: &str) -> Value {
     let usage = chat.get("usage").cloned().unwrap_or_else(|| json!({}));
-    let input = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let output_tokens = usage
         .get("completion_tokens")
         .and_then(Value::as_u64)
@@ -538,7 +544,10 @@ mod tests {
         assert_eq!(chat["model"], "gpt-6.1-sol");
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][1]["content"], "你好");
-        assert_eq!(chat["messages"][2]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            chat["messages"][2]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
         assert_eq!(chat["messages"][3]["role"], "tool");
         assert_eq!(chat["messages"][3]["content"], "文件内容");
         assert_eq!(chat["tools"][0]["function"]["name"], "read");
@@ -586,7 +595,10 @@ mod tests {
         assert_eq!(response["output"][0]["content"][0]["text"], "回答");
         assert_eq!(response["usage"]["input_tokens"], 9);
         assert_eq!(response["usage"]["output_tokens"], 4);
-        assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            response["usage"]["input_tokens_details"]["cached_tokens"],
+            3
+        );
     }
 
     #[test]

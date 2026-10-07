@@ -308,6 +308,18 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
       document.removeEventListener('keydown', closeOnEscape);
     };
   }, []);
+  useEffect(() => {
+    // 桌面 WebView 不应把浏览器的默认菜单带进应用；编辑控件仍保留
+    // 系统菜单，避免复制、粘贴和输入法操作退化。
+    const suppressBrowserContextMenu = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      event.preventDefault();
+    };
+    document.addEventListener('contextmenu', suppressBrowserContextMenu, true);
+    return () => document.removeEventListener('contextmenu', suppressBrowserContextMenu, true);
+  }, []);
 
   const runAccountAction = (action: () => void) => {
     setAccountMenuOpen(false);

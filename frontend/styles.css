@@ -1293,10 +1293,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .builtin-ai-title h2 { margin: 0; overflow: hidden; color: var(--text); font-size: 14px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .builtin-ai-title span { color: var(--text-muted); font-size: 11px; }
 .builtin-ai-mark { width: 30px; height: 30px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 7px; color: var(--success-strong); background: var(--success-soft); }
-.builtin-ai-toolbar-actions { min-width: 0; display: flex; align-items: center; gap: 10px; }
-.builtin-ai-expert-select { min-width: 138px; display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; }
-.builtin-ai-expert-select select { min-width: 104px; height: 28px; padding: 0 24px 0 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-secondary); background: #fff; font-size: 11px; }
-.builtin-ai-expert-select select:focus { outline: 2px solid rgba(37, 99, 235, .18); outline-offset: 1px; }
+.builtin-ai-toolbar-actions { min-width: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.builtin-ai-session-actions, .builtin-ai-capability-actions { min-width: 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.builtin-ai-capability-actions { margin-left: auto; padding-left: 8px; border-left: 1px solid var(--border); }
 
 .expert-studio-panel { margin: 0 0 16px; border: 1px solid var(--border); background: #fff; }
 .expert-studio-panel.compact { margin-bottom: 12px; }
@@ -3903,8 +3902,12 @@ tr:last-child td { border-bottom: 0; }
 }
 
 @container agent-main (max-width: 520px) {
-  .builtin-ai-toolbar { min-height: 86px; flex-basis: 86px; align-items: flex-start; flex-direction: column; gap: 7px; padding-block: 10px; }
-  .builtin-ai-toolbar-actions { width: 100%; gap: 7px; }
+  .builtin-ai-toolbar { min-height: 96px; flex-basis: 96px; align-items: flex-start; flex-direction: column; gap: 7px; padding-block: 10px; }
+  .builtin-ai-toolbar-actions { width: 100%; align-items: stretch; gap: 7px; }
+  .builtin-ai-session-actions, .builtin-ai-capability-actions { min-width: 0; flex: 1 1 auto; }
+  .builtin-ai-capability-actions { margin-left: 0; padding-left: 0; border-left: 0; }
+  .builtin-ai-tools-button, .builtin-ai-toolbar-actions .action-menu > .btn { min-height: 30px; }
+  .builtin-ai-sync-message { display: none; }
   .builtin-ai-extension-backdrop { padding: 8px; }
   .builtin-ai-extension-dialog { height: calc(100dvh - 16px); min-height: 0; border-radius: 7px; }
   .builtin-ai-extension-header { min-height: 56px; padding-inline: 12px; }

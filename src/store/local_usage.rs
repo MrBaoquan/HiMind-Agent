@@ -52,8 +52,7 @@ pub(crate) struct LocalUsageRecord {
 
 impl LocalUsageRecord {
     pub(crate) fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 }
 
@@ -146,7 +145,11 @@ pub(crate) fn overview(days: i64) -> Value {
     let mut by_service: BTreeMap<String, Totals> = BTreeMap::new();
 
     for record in &records {
-        let day = record.occurred_at.get(0..10).unwrap_or_default().to_string();
+        let day = record
+            .occurred_at
+            .get(0..10)
+            .unwrap_or_default()
+            .to_string();
         if day.is_empty() || day < from.to_string() || day > today.to_string() {
             continue;
         }

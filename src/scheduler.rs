@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STORE_FILE: &str = "schedules.json";
@@ -29,6 +30,9 @@ const MAX_SEARCH_MINUTES: i64 = 366 * 24 * 60;
 const SUPPORTED_TARGET_KINDS: &[&str] = &["workflow", "skill"];
 /// 收尾僵尸运行前的宽限期：避开刚启动、还没取到租约的运行。
 const STALE_RUN_GRACE_SECONDS: i64 = 120;
+/// 调度触发可能与 UI 查询或运行收尾同时写本地 SQLite；短暂锁冲突应自动重试，
+/// 避免一条计划被错误记成失败并等到下一天。
+const DISPATCH_LOCK_RETRIES: usize = 4;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ScheduleExecution {
@@ -682,6 +686,44 @@ fn dispatch(
     }
 }
 
+fn is_transient_database_lock(error: &dyn Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("sqlite_busy")
+        || message.contains("sqlite_locked")
+}
+
+fn dispatch_with_retry(
+    gateway: CapabilityGateway,
+    item: &Schedule,
+    run_input: Value,
+    context: InvocationContext,
+) -> Result<Value, Box<dyn Error>> {
+    let mut attempt = 0;
+    loop {
+        match dispatch(gateway.clone(), item, run_input.clone(), context.clone()) {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if is_transient_database_lock(error.as_ref())
+                    && attempt < DISPATCH_LOCK_RETRIES =>
+            {
+                let delay_seconds = 1_u64 << attempt;
+                eprintln!(
+                    "scheduler dispatch for {} hit a database lock; retrying in {}s ({}/{})",
+                    item.id,
+                    delay_seconds,
+                    attempt + 1,
+                    DISPATCH_LOCK_RETRIES
+                );
+                thread::sleep(std::time::Duration::from_secs(delay_seconds));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// 同目标是否还有没跑完的运行？
 ///
 /// 计划到点就派发只看时间，不看上一次是否还在跑。对会改工作区的目标来说，上一次
@@ -810,7 +852,7 @@ pub(crate) fn run_due(gateway: CapabilityGateway, now: i64) -> Result<Value, Box
             item.last_status = "failed".to_string();
             item.last_error = skip_reason;
         } else {
-            let outcome = dispatch(gateway.clone(), item, run_input, context);
+            let outcome = dispatch_with_retry(gateway.clone(), item, run_input, context);
             match outcome {
                 Ok(value) => {
                     item.last_run_id = value

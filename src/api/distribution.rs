@@ -1326,9 +1326,19 @@ pub fn submit_expert(
     test_report: &serde_json::Value,
     source: &crate::extension_projects::ExtensionSubmissionSource,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let file_name = package_path.file_name().and_then(|v| v.to_str()).unwrap_or("expert.hmexpert").to_string();
-    let package = Part::file(package_path)?.file_name(file_name).mime_str("application/vnd.himind.expert+zip")?;
-    let source_type = if source.source_repository.trim().is_empty() { "local" } else { "repository" };
+    let file_name = package_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("expert.hmexpert")
+        .to_string();
+    let package = Part::file(package_path)?
+        .file_name(file_name)
+        .mime_str("application/vnd.himind.expert+zip")?;
+    let source_type = if source.source_repository.trim().is_empty() {
+        "local"
+    } else {
+        "repository"
+    };
     let form = Form::new()
         .part("file", package)
         .text("test_report", serde_json::to_string(test_report)?)
@@ -1340,11 +1350,13 @@ pub fn submit_expert(
         .text("distribution_id", source.distribution_id.clone())
         .text("channel", source.channel.clone())
         .text("catalog_id", source.catalog_id.clone());
-    let response = client.post(format!("{api_base}/api/agent/experts/submissions"))
+    let response = client
+        .post(format!("{api_base}/api/agent/experts/submissions"))
         .bearer_auth(access_token)
         .header("X-HiMind-Agent-ID", agent_id)
         .header("X-HiMind-AI-Client", ai_client_id())
-        .multipart(form).send()?;
+        .multipart(form)
+        .send()?;
     parse_submission_response(response)
 }
 

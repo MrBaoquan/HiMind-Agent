@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::client::TaskCancelGuard;
 use crate::api::types::Task;
+use crate::capability::execution::CapabilityExecutionContext;
 use crate::scan::service::detect_engine;
 use crate::{report_task, Options};
 
@@ -19,6 +20,29 @@ pub(crate) fn execute_upload_code(
     options: &Options,
     agent_id: &str,
     task: &Task,
+    payload: Option<&Value>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut cancel_guard = TaskCancelGuard::new();
+    let mut execution_context = CapabilityExecutionContext::new(
+        task.id.clone(),
+        "upload.code",
+        payload
+            .and_then(|value| value.get("source_path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        || cancel_guard.check(client, options, agent_id, &task.id),
+        |progress, detail| {
+            report_task(
+                client, options, agent_id, &task.id, "running", progress, detail, None, None,
+            )
+        },
+    );
+    execute_upload_code_with_context(options, &mut execution_context, payload)
+}
+
+pub(crate) fn execute_upload_code_with_context(
+    options: &Options,
+    execution: &mut CapabilityExecutionContext<'_>,
     payload: Option<&Value>,
 ) -> Result<Value, Box<dyn Error>> {
     let pid = payload
@@ -73,19 +97,8 @@ pub(crate) fn execute_upload_code(
         }
     }
 
-    report_task(
-        client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        25,
-        "检查待打包目录",
-        None,
-        None,
-    )?;
-    let mut cancel_guard = TaskCancelGuard::new();
-    cancel_guard.check(client, options, agent_id, &task.id)?;
+    execution.report_progress(25, "检查待打包目录")?;
+    execution.check_cancelled()?;
     let engine_type = inputs
         .iter()
         .map(|input| detect_engine(input))
@@ -97,38 +110,13 @@ pub(crate) fn execute_upload_code(
     fs::create_dir_all(&cache_dir)?;
     let safe_name = sanitize_file_name(exhibit_name);
     let zip_path = output_dir.join(format!("{}-{}-{}.zip", pid, safe_name, package_type));
-    report_task(
-        client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        32,
-        "检查本地压缩缓存",
-        None,
-        None,
-    )?;
+    execution.report_progress(32, "检查本地压缩缓存")?;
     let snapshot = collect_package_snapshot(&inputs, &engine_type, package_type)?;
     let cache_path = cache_dir.join(format!("{}-{}.zip", snapshot.cache_key, package_type));
-    report_task(
-        client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        40,
-        "压缩发布包",
-        None,
-        None,
-    )?;
+    execution.report_progress(40, "压缩发布包")?;
     let (stats, cache_reused) = if cache_path.exists() {
         fs::copy(&cache_path, &zip_path)?;
-        report_task(
-            client,
-            options,
-            agent_id,
-            &task.id,
-            "running",
+        execution.report_progress(
             69,
             &format!(
                 "复用本地缓存压缩包：{} 个文件，{:.1} MB，跳过 {} 个",
@@ -136,8 +124,6 @@ pub(crate) fn execute_upload_code(
                 snapshot.included_bytes as f64 / 1024.0 / 1024.0,
                 snapshot.excluded_files
             ),
-            None,
-            None,
         )?;
         (
             ZipStats {
@@ -155,7 +141,7 @@ pub(crate) fn execute_upload_code(
             &engine_type,
             package_type,
             |stats, current| {
-                cancel_guard.check(client, options, agent_id, &task.id)?;
+                execution.check_cancelled()?;
                 if stats.included_files == 1
                     || stats.included_files % 50 == 0
                     || last_zip_report.elapsed() >= Duration::from_secs(2)
@@ -163,19 +149,12 @@ pub(crate) fn execute_upload_code(
                     last_zip_report = Instant::now();
                     let mb = stats.included_bytes as f64 / 1024.0 / 1024.0;
                     let progress = std::cmp::min(69, 40 + (stats.included_files as i32 / 50));
-                    report_task(
-                        client,
-                        options,
-                        agent_id,
-                        &task.id,
-                        "running",
+                    execution.report_progress(
                         progress,
                         &format!(
                             "压缩中：已写入 {} 个文件，{:.1} MB，跳过 {} 个，当前 {}",
                             stats.included_files, mb, stats.excluded_files, current
                         ),
-                        None,
-                        None,
                     )?;
                 }
                 Ok(())
@@ -184,35 +163,20 @@ pub(crate) fn execute_upload_code(
         fs::copy(&zip_path, &cache_path)?;
         (stats, false)
     };
-    cancel_guard.check(client, options, agent_id, &task.id)?;
-    report_task(
-        client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        70,
-        "上传到内网管理系统",
-        None,
-        None,
-    )?;
+    execution.check_cancelled()?;
+    execution.report_progress(70, "上传到内网管理系统")?;
     let upload = upload_inner_admin_package(
         pid,
         &zip_path,
         !options.local_app,
         |chunk_index, chunk_count, uploaded_bytes, total_bytes| {
-            cancel_guard.check(client, options, agent_id, &task.id)?;
+            execution.check_cancelled()?;
             let progress = if chunk_count == 0 {
                 95
             } else {
                 70 + ((chunk_index as i32 * 25) / chunk_count as i32)
             };
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
+            execution.report_progress(
                 std::cmp::min(95, progress),
                 &format!(
                     "上传分片 {}/{}，{:.1}/{:.1} MB",
@@ -221,8 +185,6 @@ pub(crate) fn execute_upload_code(
                     uploaded_bytes as f64 / 1024.0 / 1024.0,
                     total_bytes as f64 / 1024.0 / 1024.0
                 ),
-                None,
-                None,
             )
         },
     )?;
@@ -554,6 +516,29 @@ pub(crate) fn execute_upload_placeholder(
     task: &Task,
     payload: Option<&Value>,
 ) -> Result<Value, Box<dyn Error>> {
+    let mut cancel_guard = TaskCancelGuard::new();
+    let mut execution_context = CapabilityExecutionContext::new(
+        task.id.clone(),
+        "upload.placeholder",
+        payload
+            .and_then(|value| value.get("pid"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        || cancel_guard.check(client, options, agent_id, &task.id),
+        |progress, detail| {
+            report_task(
+                client, options, agent_id, &task.id, "running", progress, detail, None, None,
+            )
+        },
+    );
+    execute_upload_placeholder_with_context(options, &mut execution_context, payload)
+}
+
+pub(crate) fn execute_upload_placeholder_with_context(
+    options: &Options,
+    execution: &mut CapabilityExecutionContext<'_>,
+    payload: Option<&Value>,
+) -> Result<Value, Box<dyn Error>> {
     let pid = payload
         .and_then(|value| value.get("pid"))
         .and_then(|value| value.as_str())
@@ -574,20 +559,9 @@ pub(crate) fn execute_upload_placeholder(
     if content.is_empty() {
         return Err("placeholder content is empty".into());
     }
-    let mut cancel_guard = TaskCancelGuard::new();
-    cancel_guard.check(client, options, agent_id, &task.id)?;
+    execution.check_cancelled()?;
 
-    report_task(
-        client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        35,
-        "生成占位说明文件",
-        None,
-        None,
-    )?;
+    execution.report_progress(35, "生成占位说明文件")?;
     let output_dir = env::temp_dir().join("project-dashboard-packages");
     fs::create_dir_all(&output_dir)?;
     let safe_exhibit = sanitize_file_name(exhibit_name);
@@ -598,34 +572,19 @@ pub(crate) fn execute_upload_placeholder(
     let placeholder_path = output_dir.join(format!("{}-{}-{}", pid, safe_exhibit, safe_file_name));
     fs::write(&placeholder_path, content.as_bytes())?;
 
-    report_task(
-        client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        70,
-        "上传占位说明文件到内网管理系统",
-        None,
-        None,
-    )?;
+    execution.report_progress(70, "上传占位说明文件到内网管理系统")?;
     let upload = upload_inner_admin_package(
         pid,
         &placeholder_path,
         !options.local_app,
         |chunk_index, chunk_count, uploaded_bytes, total_bytes| {
-            cancel_guard.check(client, options, agent_id, &task.id)?;
+            execution.check_cancelled()?;
             let progress = if chunk_count == 0 {
                 95
             } else {
                 70 + ((chunk_index as i32 * 25) / chunk_count as i32)
             };
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
+            execution.report_progress(
                 std::cmp::min(95, progress),
                 &format!(
                     "上传分片 {}/{}，{:.1}/{:.1} KB",
@@ -634,8 +593,6 @@ pub(crate) fn execute_upload_placeholder(
                     uploaded_bytes as f64 / 1024.0,
                     total_bytes as f64 / 1024.0
                 ),
-                None,
-                None,
             )
         },
     )?;

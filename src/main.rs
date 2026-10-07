@@ -13,7 +13,7 @@ use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -71,27 +71,22 @@ use api::client::{is_task_canceled_error, TaskCancelGuard};
 use api::types::Task;
 use approval::manager::ApprovalManager;
 use approval::types::RequestType;
+use capability::execution::CapabilityExecutionContext;
 use capability::service::CapabilityGateway;
-use remote::sync::execute_sync_exhibits;
-use scan::service::execute_scan;
+use capability::types::{InvocationContext, InvocationSource};
 use store::outbox::{
     list_reports, remove_report, remove_reports_for_execution, store_report, TaskReportRecord,
 };
 use svn::service::{
-    apply_project_acl, checkout_workspace, clone_exhibit_repository,
-    create_exhibit_repository_path, create_repository_with_post_commit_hook,
-    ensure_project_exhibits_access, import_local_exhibit_with_cancel_and_progress,
-    initialize_exhibit_repository_with_cancel, preview_project_acl, reconcile_project_acl,
-    task_failure_result, SvnDiagnosticContextGuard,
+    initialize_exhibit_repository_with_cancel, task_failure_result, SvnDiagnosticContextGuard,
 };
 use svn::types::{
     ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
-    CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
+    CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest,
     InitializeExhibitRepositoryRequest, PreviewProjectAclRequest, ReconcileProjectAclRequest,
     SvnCheckoutRequest,
 };
-use upload::smb::execute_smb_upload;
-use upload::tasks::{execute_backup_run, execute_upload_code, execute_upload_placeholder};
+use upload::tasks::execute_backup_run;
 
 // Keep the runtime health version aligned with the version stamped into the
 // updater package. Cargo is the source of truth for both binaries.
@@ -3276,6 +3271,8 @@ mod tests {
         should_run_acp, should_run_mcp, workflow_dispatch_limit, PluginViewLaunch,
         SHIPPED_DASHBOARD_API_BASE,
     };
+    use crate::api::types::Task;
+    use serde_json::json;
     use std::env;
 
     fn cli_args(values: &[&str]) -> Vec<String> {
@@ -3348,6 +3345,65 @@ mod tests {
         assert_eq!(
             workflow_dispatch_limit(&["dispatch".to_string(), "999".to_string()]),
             100
+        );
+    }
+
+    #[test]
+    fn explicit_task_capability_accepts_prefixed_and_plain_ids() {
+        let mut task: Task = serde_json::from_value(json!({
+            "id": "task-1",
+            "type": "agent_run"
+        }))
+        .unwrap();
+        assert_eq!(super::explicit_task_capability(&task), None);
+        task.capability = "capability:exhibit.workspace.checkout".to_string();
+        assert_eq!(
+            super::explicit_task_capability(&task),
+            Some("exhibit.workspace.checkout")
+        );
+        task.capability = "remote.connect".to_string();
+        assert_eq!(
+            super::explicit_task_capability(&task),
+            Some("remote.connect")
+        );
+    }
+
+    #[test]
+    fn legacy_task_capability_mapping_covers_migrated_queue_tasks() {
+        let expected = [
+            ("scan_projects", "scan.projects"),
+            ("sync_exhibits", "inner_admin.sync_exhibits"),
+            ("upload_code", "upload.code"),
+            ("upload_placeholder", "upload.placeholder"),
+            ("smb_upload", "storage.smb.upload"),
+            (
+                "exhibit_repository_import_local",
+                "exhibit.repository.import_local",
+            ),
+            ("project_repository_create", "project.repository.create"),
+            (
+                "project_repository_exhibits_access_ensure",
+                "project.repository.exhibits_access.ensure",
+            ),
+            (
+                "exhibit_repository_path_create",
+                "exhibit.repository_path.create",
+            ),
+            ("exhibit_workspace_checkout", "exhibit.workspace.checkout"),
+            ("exhibit_repository_clone", "exhibit.repository.clone"),
+            ("project_acl_preview", "project.repository.acl.preview"),
+            ("project_acl_apply", "project.repository.acl.apply"),
+            ("project_acl_reconcile", "project.repository.acl.reconcile"),
+        ];
+        for (task_type, capability_id) in expected {
+            assert_eq!(
+                super::legacy_task_capability(task_type),
+                Some(capability_id)
+            );
+        }
+        assert_eq!(
+            super::legacy_task_capability("upload_code"),
+            Some("upload.code")
         );
     }
 
@@ -3485,6 +3541,142 @@ impl Options {
     }
 }
 
+/// Execute a Dashboard task through the same Capability Gateway used by MCP,
+/// Tauri and native Agent Runs. Legacy task types are translated at this
+/// boundary so their wire format stays compatible while governance converges.
+fn invoke_dashboard_capability(
+    options: &Options,
+    agent_id: &str,
+    task: &Task,
+    capability_id: &str,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    invoke_dashboard_capability_inner(options, agent_id, task, capability_id, input, None)
+}
+
+fn invoke_dashboard_capability_with_execution(
+    options: &Options,
+    agent_id: &str,
+    task: &Task,
+    capability_id: &str,
+    input: Value,
+    execution: &mut CapabilityExecutionContext<'_>,
+) -> Result<Value, Box<dyn Error>> {
+    invoke_dashboard_capability_inner(
+        options,
+        agent_id,
+        task,
+        capability_id,
+        input,
+        Some(execution),
+    )
+}
+
+fn invoke_dashboard_capability_inner(
+    options: &Options,
+    agent_id: &str,
+    task: &Task,
+    capability_id: &str,
+    input: Value,
+    execution: Option<&mut CapabilityExecutionContext<'_>>,
+) -> Result<Value, Box<dyn Error>> {
+    let workspace_ref = input
+        .get("workspace_root")
+        .or_else(|| input.get("target_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let principal = if task.created_by_user_id.trim().is_empty() {
+        format!("dashboard-worker:{agent_id}")
+    } else {
+        format!("dashboard-user:{}", task.created_by_user_id.trim())
+    };
+    let context = InvocationContext::new(InvocationSource::DashboardWorker, principal)
+        .with_device_id(agent_id)
+        .with_workspace_ref(workspace_ref)
+        .with_business_context(json!({
+            "task_id": task.id,
+            "task_type": task.task_type,
+            "source": task.source,
+            "execution_role": task.execution_role,
+            "capability": task.capability,
+            "dedupe_key": task.dedupe_key,
+            "execution_id": task.execution_id,
+            "lease_id": task.lease_id,
+        }));
+    let gateway = CapabilityGateway::new(
+        options.clone(),
+        Arc::new(Mutex::new(store::types::LocalWorkerStatus::default())),
+    );
+    match execution {
+        Some(execution) => {
+            gateway.invoke_with_execution_context(&context, capability_id, input, execution)
+        }
+        None => gateway.invoke(&context, capability_id, input),
+    }
+}
+
+fn task_execution_context<'a>(
+    client: &'a Client,
+    options: &'a Options,
+    agent_id: &'a str,
+    task: &'a Task,
+    capability_id: &str,
+    input: &Value,
+) -> CapabilityExecutionContext<'a> {
+    let mut cancel_guard = TaskCancelGuard::new();
+    let workspace_scope = input
+        .get("workspace_root")
+        .or_else(|| input.get("target_path"))
+        .or_else(|| input.get("source_path"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    CapabilityExecutionContext::new(
+        task.id.clone(),
+        capability_id.to_string(),
+        workspace_scope,
+        move || cancel_guard.check(client, options, agent_id, &task.id),
+        move |progress, detail| {
+            report_task(
+                client, options, agent_id, &task.id, "running", progress, detail, None, None,
+            )
+        },
+    )
+}
+
+fn explicit_task_capability(task: &Task) -> Option<&str> {
+    let capability = task.capability.trim();
+    let capability = capability.strip_prefix("capability:").unwrap_or(capability);
+    (!capability.trim().is_empty()).then_some(capability)
+}
+
+/// Stable translation for Dashboard's legacy task queue. The queue keeps its
+/// old `type` values for compatibility, while migrated tasks use the
+/// Capability ID as the policy and execution owner.
+fn legacy_task_capability(task_type: &str) -> Option<&'static str> {
+    match task_type {
+        "scan_projects" => Some("scan.projects"),
+        "sync_exhibits" => Some("inner_admin.sync_exhibits"),
+        "upload_code" => Some("upload.code"),
+        "upload_placeholder" => Some("upload.placeholder"),
+        "smb_upload" => Some("storage.smb.upload"),
+        "exhibit_repository_import_local" => Some("exhibit.repository.import_local"),
+        "project_repository_create" => Some("project.repository.create"),
+        "project_repository_exhibits_access_ensure" => {
+            Some("project.repository.exhibits_access.ensure")
+        }
+        "exhibit_repository_path_create" => Some("exhibit.repository_path.create"),
+        "exhibit_workspace_checkout" => Some("exhibit.workspace.checkout"),
+        "exhibit_repository_clone" => Some("exhibit.repository.clone"),
+        "project_acl_preview" => Some("project.repository.acl.preview"),
+        "project_acl_apply" => Some("project.repository.acl.apply"),
+        "project_acl_reconcile" => Some("project.repository.acl.reconcile"),
+        _ => None,
+    }
+}
+
 fn execute_task(
     client: &Client,
     options: &Options,
@@ -3563,7 +3755,6 @@ fn execute_task(
         None,
         None,
     )?;
-    let mut last_task_detail = initial_detail;
 
     if task.task_type == "upload_code"
         || task.task_type == "upload_placeholder"
@@ -3580,331 +3771,512 @@ fn execute_task(
             }
         }
     }
-    let result = match task.task_type.as_str() {
-        "svn_user_provision" => {
-            #[derive(serde::Deserialize)]
-            struct SvnUserProvisionRequest {
-                user_id: String,
-                svn_username: String,
-            }
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "正在创建并验证 SVN 用户账号",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<SvnUserProvisionRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            let mut result =
-                svn::service::provision_default_svn_user_account(&request.svn_username)?;
-            result["user_id"] = json!(request.user_id);
-            Ok(result)
-        }
-        "sync_exhibits" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                20,
-                "登录内网并读取未上传展项",
-                None,
-                None,
-            )?;
-            execute_sync_exhibits(client, options, agent_id, &task)
-        }
-        "scan_projects" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                25,
-                "读取扫描目标并检查目录索引缓存",
-                None,
-                None,
-            )?;
-            execute_scan(task.payload.as_ref())
-        }
-        "upload_code" => {
-            execute_upload_code(client, options, agent_id, &task, task.payload.as_ref())
-        }
-        "backup_run" => execute_backup_run(client, options, agent_id, &task, task.payload.as_ref()),
-        "upload_placeholder" => {
-            execute_upload_placeholder(client, options, agent_id, &task, task.payload.as_ref())
-        }
-        "smb_upload" => execute_smb_upload(client, options, agent_id, &task, task.payload.as_ref()),
-        "project_repository_create" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "Agent 正在连接内网 SvnAdmin 并创建项目仓库",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<CreateRepositoryRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            let project_id = request.project_id.clone();
-            let repository_access = request.repository_access.clone();
-            let repository = create_repository_with_post_commit_hook(request)?;
-            let access = ensure_project_exhibits_access(EnsureProjectExhibitsAccessRequest {
-                project_id,
-                repository_access,
-            })?;
-            Ok(json!({ "repository": repository, "exhibits_access": access }))
-        }
-        "project_repository_exhibits_access_ensure" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "Agent 正在配置 TortoiseSVN 兼容且按展项隔离的访问权限",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<EnsureProjectExhibitsAccessRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            ensure_project_exhibits_access(request)
-        }
-        "exhibit_repository_path_create" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "Agent 正在项目仓库中创建展项目录",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<CreateExhibitRepositoryPathRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            create_exhibit_repository_path(request)
-        }
-        "exhibit_repository_initialize" => {
-            if let Some(manager) = approval_mgr {
-                manager.add_log("info", &format!("{}: 正在创建展项目录", task.id));
-            }
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                35,
-                "Agent 正在创建展项目录并初始化工程模板",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<InitializeExhibitRepositoryRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            create_exhibit_repository_path(CreateExhibitRepositoryPathRequest {
-                project_id: request.project_id.clone(),
-                exhibit_id: request.exhibit_id.clone(),
-            })?;
-            if let Some(manager) = approval_mgr {
-                manager.add_log("info", &format!("{}: 正在读取并应用工程模板", task.id));
-            }
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                55,
-                "展项目录已就绪，正在应用模板和 SVN 忽略属性",
-                None,
-                None,
-            )?;
-            let mut cancel_guard = TaskCancelGuard::new();
-            let mut check_cancel = || cancel_guard.check(client, options, agent_id, &task.id);
-            initialize_exhibit_repository_with_cancel(request, &mut check_cancel)
-        }
-        "exhibit_repository_clone" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                45,
-                "Agent 正在从源展项复制 SVN 仓库",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<CloneExhibitRepositoryRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            clone_exhibit_repository(request)
-        }
-        "exhibit_repository_import_local" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                8,
-                "Agent 正在预检本地展项工程",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<ImportLocalExhibitRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            let mut cancel_guard = TaskCancelGuard::new();
-            let mut check_cancel = || cancel_guard.check(client, options, agent_id, &task.id);
-            let mut report_progress = |progress: i32, detail: &str| {
-                last_task_detail = detail.to_string();
-                if let Some(manager) = approval_mgr {
-                    manager.add_log("info", &format!("{}: {}", task.id, detail));
+    let result = if let Some(capability_id) = explicit_task_capability(&task) {
+        report_task(
+            client,
+            options,
+            agent_id,
+            &task.id,
+            "running",
+            20,
+            &format!("通过能力网关执行 {}", capability_id),
+            None,
+            None,
+        )?;
+        let input = task.payload.clone().unwrap_or_else(|| json!({}));
+        let mut execution =
+            task_execution_context(client, options, agent_id, &task, capability_id, &input);
+        invoke_dashboard_capability_with_execution(
+            options,
+            agent_id,
+            &task,
+            capability_id,
+            input,
+            &mut execution,
+        )
+    } else {
+        match task.task_type.as_str() {
+            "svn_user_provision" => {
+                #[derive(serde::Deserialize)]
+                struct SvnUserProvisionRequest {
+                    user_id: String,
+                    svn_username: String,
                 }
-                if let Err(error) = report_task(
-                    client, options, agent_id, &task.id, "running", progress, detail, None, None,
-                ) {
-                    if let Some(manager) = approval_mgr {
-                        manager.add_log(
-                            "warn",
-                            &format!(
-                                "{}: 进度上报暂时失败，SVN 操作继续执行 - {}",
-                                task.id, error
-                            ),
-                        );
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "正在创建并验证 SVN 用户账号",
+                    None,
+                    None,
+                )?;
+                let request = serde_json::from_value::<SvnUserProvisionRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                let mut result =
+                    svn::service::provision_default_svn_user_account(&request.svn_username)?;
+                result["user_id"] = json!(request.user_id);
+                Ok(result)
+            }
+            "sync_exhibits" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    20,
+                    "登录内网并读取未上传展项",
+                    None,
+                    None,
+                )?;
+                let input = task.payload.clone().unwrap_or_else(|| json!({}));
+                let mut execution = task_execution_context(
+                    client,
+                    options,
+                    agent_id,
+                    &task,
+                    "inner_admin.sync_exhibits",
+                    &input,
+                );
+                invoke_dashboard_capability_with_execution(
+                    options,
+                    agent_id,
+                    &task,
+                    "inner_admin.sync_exhibits",
+                    input,
+                    &mut execution,
+                )
+            }
+            "scan_projects" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    25,
+                    "读取扫描目标并检查目录索引缓存",
+                    None,
+                    None,
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("scan_projects capability mapping"),
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            "upload_code" => {
+                let input = task.payload.clone().unwrap_or_else(|| json!({}));
+                let mut execution =
+                    task_execution_context(client, options, agent_id, &task, "upload.code", &input);
+                invoke_dashboard_capability_with_execution(
+                    options,
+                    agent_id,
+                    &task,
+                    "upload.code",
+                    input,
+                    &mut execution,
+                )
+            }
+            "backup_run" => {
+                execute_backup_run(client, options, agent_id, &task, task.payload.as_ref())
+            }
+            "upload_placeholder" => {
+                let input = task.payload.clone().unwrap_or_else(|| json!({}));
+                let mut execution = task_execution_context(
+                    client,
+                    options,
+                    agent_id,
+                    &task,
+                    "upload.placeholder",
+                    &input,
+                );
+                invoke_dashboard_capability_with_execution(
+                    options,
+                    agent_id,
+                    &task,
+                    "upload.placeholder",
+                    input,
+                    &mut execution,
+                )
+            }
+            "smb_upload" => {
+                let input = task.payload.clone().unwrap_or_else(|| json!({}));
+                let mut execution = task_execution_context(
+                    client,
+                    options,
+                    agent_id,
+                    &task,
+                    "storage.smb.upload",
+                    &input,
+                );
+                invoke_dashboard_capability_with_execution(
+                    options,
+                    agent_id,
+                    &task,
+                    "storage.smb.upload",
+                    input,
+                    &mut execution,
+                )
+            }
+            "project_repository_create" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "Agent 正在连接内网 SvnAdmin 并创建项目仓库",
+                    None,
+                    None,
+                )?;
+                let request = serde_json::from_value::<CreateRepositoryRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                let project_id = request.project_id.clone();
+                let repository_access = request.repository_access.clone();
+                let repository = invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    "project.repository.create",
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    70,
+                    "项目仓库已创建，正在配置展项目录访问权限",
+                    None,
+                    None,
+                )?;
+                let access = invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("project repository access capability mapping"),
+                    json!({
+                        "project_id": project_id,
+                        "repository_access": repository_access,
+                    }),
+                )?;
+                Ok(json!({ "repository": repository, "exhibits_access": access }))
+            }
+            "project_repository_exhibits_access_ensure" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "Agent 正在配置 TortoiseSVN 兼容且按展项隔离的访问权限",
+                    None,
+                    None,
+                )?;
+                let _request = serde_json::from_value::<EnsureProjectExhibitsAccessRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    "project.repository.exhibits_access.ensure",
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            "exhibit_repository_path_create" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "Agent 正在项目仓库中创建展项目录",
+                    None,
+                    None,
+                )?;
+                let _request = serde_json::from_value::<CreateExhibitRepositoryPathRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("exhibit repository path capability mapping"),
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            "exhibit_repository_initialize" => {
+                if let Some(manager) = approval_mgr {
+                    manager.add_log("info", &format!("{}: 正在创建展项目录", task.id));
+                }
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    35,
+                    "Agent 正在创建展项目录并初始化工程模板",
+                    None,
+                    None,
+                )?;
+                let request = serde_json::from_value::<InitializeExhibitRepositoryRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    "exhibit.repository_path.create",
+                    json!({
+                        "project_id": request.project_id,
+                        "exhibit_id": request.exhibit_id,
+                    }),
+                )?;
+                if let Some(manager) = approval_mgr {
+                    manager.add_log("info", &format!("{}: 正在读取并应用工程模板", task.id));
+                }
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    55,
+                    "展项目录已就绪，正在应用模板和 SVN 忽略属性",
+                    None,
+                    None,
+                )?;
+                let mut cancel_guard = TaskCancelGuard::new();
+                let mut execution_context = CapabilityExecutionContext::new(
+                    task.id.clone(),
+                    "exhibit.repository.initialize_template",
+                    request.exhibit_id.clone(),
+                    || cancel_guard.check(client, options, agent_id, &task.id),
+                    |progress, detail| {
+                        report_task(
+                            client, options, agent_id, &task.id, "running", progress, detail, None,
+                            None,
+                        )
+                    },
+                );
+                execution_context
+                    .report_progress(55, "展项目录已就绪，正在应用模板和 SVN 忽略属性")?;
+                initialize_exhibit_repository_with_cancel(request, &mut || {
+                    execution_context.check_cancelled()
+                })
+            }
+            "exhibit_repository_clone" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    45,
+                    "Agent 正在从源展项复制 SVN 仓库",
+                    None,
+                    None,
+                )?;
+                let _request = serde_json::from_value::<CloneExhibitRepositoryRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("exhibit clone capability mapping"),
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            "exhibit_repository_import_local" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    8,
+                    "Agent 正在预检本地展项工程",
+                    None,
+                    None,
+                )?;
+                let input = task.payload.clone().unwrap_or_else(|| json!({}));
+                let mut execution = task_execution_context(
+                    client,
+                    options,
+                    agent_id,
+                    &task,
+                    "exhibit.repository.import_local",
+                    &input,
+                );
+                invoke_dashboard_capability_with_execution(
+                    options,
+                    agent_id,
+                    &task,
+                    "exhibit.repository.import_local",
+                    input,
+                    &mut execution,
+                )
+            }
+            "exhibit_workspace_checkout" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    30,
+                    "正在准备检出工作区",
+                    None,
+                    None,
+                )?;
+                let request = serde_json::from_value::<SvnCheckoutRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                let mut cancel_guard = TaskCancelGuard::new();
+                cancel_guard.check(client, options, agent_id, &task.id)?;
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    45,
+                    "正在检出 SVN 工作区",
+                    None,
+                    None,
+                )?;
+                let mut checkout_input = json!({
+                    "project_id": request.project_id,
+                    "exhibit_id": request.exhibit_id,
+                    "target_path": request.target_path,
+                });
+                if let Some(repository_url) = request.repository_url {
+                    checkout_input["repository_url"] = json!(repository_url);
+                }
+                let mut result = invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("exhibit workspace checkout capability mapping"),
+                    checkout_input,
+                )?;
+                cancel_guard.check(client, options, agent_id, &task.id)?;
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    85,
+                    "正在同步工作区外部依赖",
+                    None,
+                    None,
+                )?;
+                if result.get("target_path").is_none() {
+                    if let Some(target_path) = task
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("target_path"))
+                    {
+                        result["target_path"] = target_path.clone();
                     }
                 }
-                Ok(())
-            };
-            import_local_exhibit_with_cancel_and_progress(
-                request,
-                &mut check_cancel,
-                &mut report_progress,
-            )
-        }
-        "exhibit_workspace_checkout" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                30,
-                "正在准备检出工作区",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<SvnCheckoutRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            let mut cancel_guard = TaskCancelGuard::new();
-            cancel_guard.check(client, options, agent_id, &task.id)?;
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                45,
-                "正在检出 SVN 工作区",
-                None,
-                None,
-            )?;
-            let mut result = checkout_workspace(request)?;
-            cancel_guard.check(client, options, agent_id, &task.id)?;
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                85,
-                "正在同步工作区外部依赖",
-                None,
-                None,
-            )?;
-            if result.get("target_path").is_none() {
-                if let Some(target_path) = task
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("target_path"))
-                {
-                    result["target_path"] = target_path.clone();
-                }
+                Ok(result)
             }
-            Ok(result)
+            "agent_run" => runtime::execute(client, options, agent_id, &task),
+            "project_acl_preview" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "Agent 正在读取并比对项目 SVN 权限",
+                    None,
+                    None,
+                )?;
+                let _request = serde_json::from_value::<PreviewProjectAclRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("ACL preview capability mapping"),
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            "project_acl_apply" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "Agent 正在校验并应用已批准的项目 SVN 权限",
+                    None,
+                    None,
+                )?;
+                let _request = serde_json::from_value::<ApplyProjectAclRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type).expect("ACL apply capability mapping"),
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            "project_acl_reconcile" => {
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    40,
+                    "Agent 正在自动收敛项目 SVN 权限",
+                    None,
+                    None,
+                )?;
+                let _request = serde_json::from_value::<ReconcileProjectAclRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                invoke_dashboard_capability(
+                    options,
+                    agent_id,
+                    &task,
+                    legacy_task_capability(&task.task_type)
+                        .expect("ACL reconcile capability mapping"),
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )
+            }
+            _ => Ok(json!({ "message": "unsupported task type", "task_type": task.task_type })),
         }
-        "agent_run" => runtime::execute(client, options, agent_id, &task),
-        "project_acl_preview" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "Agent 正在读取并比对项目 SVN 权限",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<PreviewProjectAclRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            preview_project_acl(request)
-        }
-        "project_acl_apply" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "Agent 正在校验并应用已批准的项目 SVN 权限",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<ApplyProjectAclRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            apply_project_acl(request)
-        }
-        "project_acl_reconcile" => {
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
-                40,
-                "Agent 正在自动收敛项目 SVN 权限",
-                None,
-                None,
-            )?;
-            let request = serde_json::from_value::<ReconcileProjectAclRequest>(
-                task.payload.clone().unwrap_or_else(|| json!({})),
-            )?;
-            reconcile_project_acl(request)
-        }
-        _ => Ok(json!({ "message": "unsupported task type", "task_type": task.task_type })),
     };
 
     match result {
@@ -3956,13 +4328,6 @@ fn execute_task(
                     Some(error_text),
                 )?
             } else {
-                let failure_detail = if task.task_type == "exhibit_repository_import_local"
-                    && !last_task_detail.trim().is_empty()
-                {
-                    format!("失败于：{}", last_task_detail)
-                } else {
-                    "任务失败".to_string()
-                };
                 report_task(
                     client,
                     options,
@@ -3970,7 +4335,7 @@ fn execute_task(
                     &task.id,
                     "failed",
                     100,
-                    &failure_detail,
+                    "任务失败",
                     failure_result,
                     Some(error_text),
                 )?

@@ -885,7 +885,9 @@ pub(crate) fn launch_project_workspace(
     Ok(json!({ "ok": true, "engine_type": engine, "editor_path": editor, "project_file": project }))
 }
 
-pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn launch_workspace_build(
+    request: &WorkspaceBuildRequest,
+) -> Result<Value, Box<dyn Error>> {
     let workspace = PathBuf::from(request.target_path.trim()).canonicalize()?;
     if !workspace.is_dir() {
         return Err("本机工程目录不存在".into());
@@ -922,7 +924,9 @@ pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<
         launcher.as_deref(),
     );
     let native_available = native["available"].as_bool().unwrap_or(false);
-    let script = find_workspace_build_script(&workspace).map(|path| path.canonicalize()).transpose()?;
+    let script = find_workspace_build_script(&workspace)
+        .map(|path| path.canonicalize())
+        .transpose()?;
     let selected_provider = if provider == "native" {
         if !native_available {
             return Err(native_build_error(&native).into());
@@ -1000,7 +1004,10 @@ pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<
     let log_path = jobs_root.join(format!("{job_id}.log"));
     let job_path = jobs_root.join(format!("{job_id}.json"));
     let command_display = command_display(&command);
-    let log = OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     let error_log = log.try_clone()?;
     let child = command
         .current_dir(&workspace)
@@ -1015,7 +1022,10 @@ pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<
         state: "running".to_string(),
         process_id: child.id(),
         workspace: workspace.to_string_lossy().to_string(),
-        build_script: script.as_ref().map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
+        build_script: script
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
         provider: selected_provider.to_string(),
         engine_type: engine.clone(),
         target_platform: target_platform.clone(),
@@ -1038,7 +1048,8 @@ pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<
     std::thread::spawn(move || {
         let mut child = child;
         let result = child.wait();
-        let mut job = read_workspace_build_job(&thread_job_path).unwrap_or_else(|_| WorkspaceBuildJob::legacy(thread_job_id.clone()));
+        let mut job = read_workspace_build_job(&thread_job_path)
+            .unwrap_or_else(|_| WorkspaceBuildJob::legacy(thread_job_id.clone()));
         job.finished_at = Some(now_rfc3339());
         match result {
             Ok(status) if job.cancel_requested => {
@@ -1046,10 +1057,19 @@ pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<
                 job.exit_code = status.code();
             }
             Ok(status) if status.success() => {
-                if job.provider == "native" && !output_has_new_artifacts(Path::new(&job.output_path), job.output_item_count_before, job.output_modified_before) {
+                if job.provider == "native"
+                    && !output_has_new_artifacts(
+                        Path::new(&job.output_path),
+                        job.output_item_count_before,
+                        job.output_modified_before,
+                    )
+                {
                     job.state = "failed".to_string();
                     job.exit_code = status.code();
-                    job.error = Some(format!("构建进程成功退出，但未找到预期产物：{}", job.output_path));
+                    job.error = Some(format!(
+                        "构建进程成功退出，但未找到预期产物：{}",
+                        job.output_path
+                    ));
                 } else {
                     job.state = "succeeded".to_string();
                     job.exit_code = status.code();
@@ -1058,7 +1078,12 @@ pub(crate) fn launch_workspace_build(request: &WorkspaceBuildRequest) -> Result<
             Ok(status) => {
                 job.state = "failed".to_string();
                 job.exit_code = status.code();
-                job.error = Some(format!("构建进程退出码 {}", status.code().map_or_else(|| "unknown".to_string(), |code| code.to_string())));
+                job.error = Some(format!(
+                    "构建进程退出码 {}",
+                    status
+                        .code()
+                        .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                ));
             }
             Err(error) => {
                 job.state = "failed".to_string();
@@ -1123,7 +1148,9 @@ fn wait_for_workspace_build(job_id: &str, timeout_seconds: u64) -> Result<Value,
             }
         }
         if Instant::now() >= deadline {
-            return Err(format!("等待构建超时（{timeout_seconds}s），任务仍在运行：{job_id}").into());
+            return Err(
+                format!("等待构建超时（{timeout_seconds}s），任务仍在运行：{job_id}").into(),
+            );
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -1390,8 +1417,7 @@ fn native_build_info(
             if engine == "unity" {
                 read_unity_project_version(workspace)
             } else {
-                project_file
-                    .and_then(|path| read_unreal_engine_association(Path::new(path)))
+                project_file.and_then(|path| read_unreal_engine_association(Path::new(path)))
             }
         });
     if engine.is_empty() {
@@ -1444,7 +1470,11 @@ fn native_build_info(
 }
 
 fn unity_module_available(editor: &Path, module: &str) -> bool {
-    let data = editor.parent().map(Path::to_path_buf).unwrap_or_default().join("Data");
+    let data = editor
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join("Data");
     data.join("PlaybackEngines").join(module).is_dir()
         || data.join("PlaybackEngines").join(module).is_file()
 }
@@ -1452,7 +1482,11 @@ fn unity_module_available(editor: &Path, module: &str) -> bool {
 fn find_unreal_automation_tool(editor: &Path) -> Option<PathBuf> {
     let engine_root = editor.parent()?.parent()?.parent()?;
     let batch = engine_root.join("Build").join("BatchFiles");
-    for name in if cfg!(windows) { ["RunUAT.bat", "RunUAT.sh"] } else { ["RunUAT.sh", "RunUAT.bat"] } {
+    for name in if cfg!(windows) {
+        ["RunUAT.bat", "RunUAT.sh"]
+    } else {
+        ["RunUAT.sh", "RunUAT.bat"]
+    } {
         let candidate = batch.join(name);
         if candidate.is_file() {
             return Some(candidate);
@@ -1463,9 +1497,18 @@ fn find_unreal_automation_tool(editor: &Path) -> Option<PathBuf> {
 
 fn unreal_supported_platforms() -> Vec<String> {
     if cfg!(windows) {
-        vec!["windows".to_string(), "linux".to_string(), "android".to_string()]
+        vec![
+            "windows".to_string(),
+            "linux".to_string(),
+            "android".to_string(),
+        ]
     } else if cfg!(target_os = "macos") {
-        vec!["macos".to_string(), "ios".to_string(), "linux".to_string(), "android".to_string()]
+        vec![
+            "macos".to_string(),
+            "ios".to_string(),
+            "linux".to_string(),
+            "android".to_string(),
+        ]
     } else {
         vec!["linux".to_string(), "android".to_string()]
     }
@@ -1480,7 +1523,13 @@ fn normalize_target_platform(
     let value = requested
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" });
+        .unwrap_or(if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        });
     let value = match value.to_ascii_lowercase().as_str() {
         "win" | "win64" | "windows" | "standalonewindows64" => "windows",
         "linux" | "linux64" | "standalonelinux64" => "linux",
@@ -1507,7 +1556,11 @@ fn normalize_target_platform(
 }
 
 fn normalize_architecture(requested: Option<&str>) -> Result<String, Box<dyn Error>> {
-    let value = requested.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("x64").to_ascii_lowercase();
+    let value = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("x64")
+        .to_ascii_lowercase();
     match value.as_str() {
         "x64" | "amd64" => Ok("x64".to_string()),
         "arm64" | "aarch64" => Ok("arm64".to_string()),
@@ -1516,7 +1569,11 @@ fn normalize_architecture(requested: Option<&str>) -> Result<String, Box<dyn Err
 }
 
 fn normalize_configuration(requested: Option<&str>) -> Result<String, Box<dyn Error>> {
-    let value = requested.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("development").to_ascii_lowercase();
+    let value = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("development")
+        .to_ascii_lowercase();
     match value.as_str() {
         "development" | "dev" => Ok("Development".to_string()),
         "shipping" => Ok("Shipping".to_string()),
@@ -1540,7 +1597,12 @@ fn resolve_build_output_path(
         }
         path
     } else {
-        workspace.join(".himind").join("build-output").join(engine).join(platform).join(configuration.to_ascii_lowercase())
+        workspace
+            .join(".himind")
+            .join("build-output")
+            .join(engine)
+            .join(platform)
+            .join(configuration.to_ascii_lowercase())
     };
     fs::create_dir_all(&output)?;
     Ok(output)
@@ -1559,7 +1621,8 @@ fn native_build_command(
     let launcher = launcher.ok_or("原生引擎编辑器路径缺失")?;
     if engine == "unity" {
         let mut command = Command::new(launcher);
-        command.args(["-batchmode", "-nographics", "-quit", "-projectPath"])
+        command
+            .args(["-batchmode", "-nographics", "-quit", "-projectPath"])
             .arg(command_path(workspace));
         let target = match platform {
             "windows" => Some(("StandaloneWindows64", "-buildWindows64Player", "game.exe")),
@@ -1570,32 +1633,52 @@ fn native_build_command(
             "ios" => Some(("iOS", "-buildIOSPlayer", "ios")),
             _ => None,
         };
-        let (target_name, output_flag, file_name) = target.ok_or_else(|| format!("Unity 不支持目标平台：{platform}"))?;
-        command.args(["-buildTarget", target_name, output_flag])
+        let (target_name, output_flag, file_name) =
+            target.ok_or_else(|| format!("Unity 不支持目标平台：{platform}"))?;
+        command
+            .args(["-buildTarget", target_name, output_flag])
             .arg(command_path(&output.join(file_name)));
         return Ok(command);
     }
     if engine == "unreal" {
         let project_file = project_file.ok_or("Unreal 工程文件缺失")?;
-        let uat = find_unreal_automation_tool(Path::new(launcher)).ok_or("未找到 Unreal RunUAT 构建工具")?;
-        let mut command = if uat.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case("bat")) {
+        let uat = find_unreal_automation_tool(Path::new(launcher))
+            .ok_or("未找到 Unreal RunUAT 构建工具")?;
+        let mut command = if uat
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("bat"))
+        {
             let mut command = Command::new("cmd.exe");
             command.args(["/D", "/S", "/C"]).arg(command_path(&uat));
             command
         } else {
             Command::new(uat)
         };
-        let uat_platform = match platform { "windows" => "Win64", "linux" => "Linux", "macos" => "Mac", "android" => "Android", "ios" => "IOS", _ => return Err(format!("Unreal 不支持目标平台：{platform}").into()) };
+        let uat_platform = match platform {
+            "windows" => "Win64",
+            "linux" => "Linux",
+            "macos" => "Mac",
+            "android" => "Android",
+            "ios" => "IOS",
+            _ => return Err(format!("Unreal 不支持目标平台：{platform}").into()),
+        };
         command.args([
             "BuildCookRun".to_string(),
-            format!("-project={}", command_path(Path::new(project_file)).to_string_lossy()),
+            format!(
+                "-project={}",
+                command_path(Path::new(project_file)).to_string_lossy()
+            ),
             "-noP4".to_string(),
             "-build".to_string(),
             "-cook".to_string(),
             "-stage".to_string(),
             "-pak".to_string(),
             "-archive".to_string(),
-            format!("-archivedirectory={}", command_path(output).to_string_lossy()),
+            format!(
+                "-archivedirectory={}",
+                command_path(output).to_string_lossy()
+            ),
             format!("-platform={uat_platform}"),
             format!("-clientconfig={configuration}"),
             format!("-targetplatform={uat_platform}"),
@@ -1607,10 +1690,22 @@ fn native_build_command(
 }
 
 fn script_build_command(script: &Path) -> Result<Command, Box<dyn Error>> {
-    let extension = script.extension().and_then(|value| value.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let extension = script
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if extension == "ps1" {
         let mut command = Command::new("powershell.exe");
-        command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(command_path(script));
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(command_path(script));
         Ok(command)
     } else if matches!(extension.as_str(), "cmd" | "bat") {
         let mut command = Command::new("cmd.exe");
@@ -1623,8 +1718,18 @@ fn script_build_command(script: &Path) -> Result<Command, Box<dyn Error>> {
 
 fn command_display(command: &Command) -> String {
     std::iter::once(command.get_program().to_string_lossy().to_string())
-        .chain(command.get_args().map(|value| value.to_string_lossy().to_string()))
-        .map(|value| if value.contains(' ') { format!("\"{value}\"") } else { value })
+        .chain(
+            command
+                .get_args()
+                .map(|value| value.to_string_lossy().to_string()),
+        )
+        .map(|value| {
+            if value.contains(' ') {
+                format!("\"{value}\"")
+            } else {
+                value
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1661,7 +1766,10 @@ fn output_latest_modified(path: &Path) -> u128 {
 
 fn output_has_new_artifacts(path: &Path, before: u64, modified_before: u128) -> bool {
     if path.is_file() {
-        return path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false)
+        return path
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
             && output_latest_modified(path) >= modified_before;
     }
     output_item_count(path) > before || output_latest_modified(path) > modified_before
@@ -1772,7 +1880,10 @@ fn read_unreal_engine_association(project_file: &Path) -> Option<String> {
 fn find_unreal_editor_for_association(association: Option<&str>) -> Option<String> {
     // 优先级：团队环境变量 → 本机设置页指定 → 常规安装目录。
     // 只有版本能对上工程关联时才采用，避免多版本机器上盖错版本。
-    for candidate in [unreal_editor_environment_path(), configured_unreal_editor_path()] {
+    for candidate in [
+        unreal_editor_environment_path(),
+        configured_unreal_editor_path(),
+    ] {
         let Some(path) = candidate else {
             continue;
         };

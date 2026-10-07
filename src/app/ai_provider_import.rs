@@ -965,10 +965,9 @@ fn gateway_proxy_protocol(
         if upstream_protocol == "openai-chat" {
             return Ok("anthropic");
         }
-        return Err(format!(
-            "该客户端只讲 Anthropic 协议，暂不支持接入 {upstream_protocol} 上游"
-        )
-        .into());
+        return Err(
+            format!("该客户端只讲 Anthropic 协议，暂不支持接入 {upstream_protocol} 上游").into(),
+        );
     }
     match upstream_protocol {
         "openai-chat" => Ok("openai-chat"),
@@ -993,10 +992,7 @@ fn gateway_override_slot() -> &'static Mutex<Option<GatewayCredentialOverride>> 
     GATEWAY_CREDENTIAL_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
-fn set_gateway_override(
-    service: &str,
-    credential: AIClientCredential,
-) -> GatewayOverrideGuard {
+fn set_gateway_override(service: &str, credential: AIClientCredential) -> GatewayOverrideGuard {
     if let Ok(mut slot) = gateway_override_slot().lock() {
         *slot = Some(GatewayCredentialOverride {
             service: service.trim().to_string(),
@@ -1086,11 +1082,7 @@ pub(crate) fn gateway_bindings(
                 service: binding.service.clone(),
                 models: gateway.models.clone(),
                 default_model: if gateway.default_model.trim().is_empty() {
-                    gateway
-                        .models
-                        .first()
-                        .cloned()
-                        .unwrap_or_default()
+                    gateway.models.first().cloned().unwrap_or_default()
                 } else {
                     gateway.default_model.clone()
                 },

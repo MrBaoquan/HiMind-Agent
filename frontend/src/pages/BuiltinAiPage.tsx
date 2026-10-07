@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Activity, ArrowUpRight, Blocks, Check, CircleAlert, Download, FileText, LogIn, MessageCircle, MoreHorizontal, PlugZap, RefreshCw, Settings, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Check, CircleAlert, Download, LogIn, MessageCircle, PlugZap, RefreshCw, Settings, X } from 'lucide-react';
 import type { RefObject } from 'react';
-import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertActivation, type ExpertSummary, type InstructionPackRef, type WorkspaceInstructionContext } from '../services/agentApi';
+import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type InstructionPackRef, type WorkspaceInstructionContext } from '../services/agentApi';
 import { errorDetail } from '../types';
-import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 import { BusyIndicator } from '../components/BusyIndicator';
 
@@ -68,9 +67,6 @@ export function BuiltinAiPage({
   const [instructionError, setInstructionError] = useState('');
   const [instructionSaved, setInstructionSaved] = useState('');
   const instructionTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const [experts, setExperts] = useState<ExpertSummary[]>([]);
-  const [activeExpert, setActiveExpert] = useState<ExpertActivation | null>(null);
-  const [expertBusy, setExpertBusy] = useState(false);
   const handledWorkspaceRequest = useRef(0);
   const probedWorkspaceTarget = useRef('');
   const independentMode = independentModeFromStatus;
@@ -96,35 +92,6 @@ export function BuiltinAiPage({
       .catch(() => { if (!cancelled) setInstructionContext(null); });
     return () => { cancelled = true; };
   }, [instructionRoot]);
-
-  useEffect(() => {
-    let cancelled = false;
-    Promise.all([agentApi.experts(), agentApi.activeExpert(builtinAiWorkspaceRoot(workspaceTarget) || undefined)]).then(([items, active]) => {
-      if (!cancelled) { setExperts(items); setActiveExpert(active); }
-    }).catch(() => { if (!cancelled) setExperts([]); });
-    return () => { cancelled = true; };
-  }, [workspaceTarget]);
-
-  const selectExpert = useCallback(async (expertId: string) => {
-    if (!expertId || expertBusy) return;
-    setExpertBusy(true);
-    try {
-      const workspaceRoot = builtinAiWorkspaceRoot(workspaceTarget) || undefined;
-      const activation = await agentApi.activateExpert(expertId, undefined, workspaceRoot);
-      setActiveExpert(activation);
-      // DSH keeps a prompt snapshot for the lifetime of a process. Stop only
-      // this workspace session so the next connection receives the new expert.
-      if (workspaceRoot) await agentApi.stopBuiltinAiSession(workspaceRoot);
-      setSessionUrl('');
-      setSessionNotice('');
-      setFrameLoaded(false);
-      setFrameKey(key => key + 1);
-    } catch (error) {
-      setConnectionError(errorDetail(error));
-    } finally {
-      setExpertBusy(false);
-    }
-  }, [expertBusy]);
 
   const openInstructionContext = useCallback(async () => {
     if (!instructionRoot) {
@@ -352,29 +319,6 @@ export function BuiltinAiPage({
           {/* 扩展工作区不是一个"项目"，它只是一个开发目录，文案必须跟着目标类型走。 */}
           <div><h2>HiMind AI</h2><span>{workspaceTarget ? `${workspaceTarget.kind === 'extension-workspace' ? '当前工作区' : '当前项目'}：${workspaceTarget.name}` : 'AI 对话'}</span></div>
         </div>
-        <div className="builtin-ai-toolbar-actions">
-          <label className="builtin-ai-expert-select" title="选择当前对话专家">
-            <span>专家</span>
-            <select value={activeExpert?.expert_id || ''} disabled={expertBusy || !experts.length} onChange={event => void selectExpert(event.target.value)} aria-label="当前专家">
-              <option value="">选择专家</option>
-              {experts.map(expert => <option key={`${expert.id}@${expert.version}`} value={expert.id}>{expert.name}</option>)}
-            </select>
-          </label>
-          {/* 对话页只保留一个主入口：给 HiMind AI 加工具。打开网页版、同步模型、
-              看活动、改模型服务都是次要动作，收进「更多」，避免标题栏变成按钮墙。 */}
-          <button type="button" className={`builtin-ai-tools-button ${extensionsOpen ? 'active' : ''}`} onClick={() => setExtensionsOpen(true)} title="让 HiMind AI 在对话里使用本机工具" aria-label="AI 工具"><Blocks size={15} aria-hidden="true" />AI 工具</button>
-          <button ref={instructionTriggerRef} type="button" className={`builtin-ai-tools-button ${instructionOpen ? 'active' : ''}`} onClick={() => void openInstructionContext()} title={selectedInstructionCount === null ? '设置当前项目规则' : `设置当前项目规则，已选 ${selectedInstructionCount} 份`} aria-label={selectedInstructionCount === null ? '项目规则' : `项目规则，已选 ${selectedInstructionCount} 份`}><FileText size={15} aria-hidden="true" />项目规则{selectedInstructionCount !== null ? <span className="builtin-ai-instruction-count" aria-hidden="true">{selectedInstructionCount}</span> : null}</button>
-          <ActionMenu className="builtin-ai-more" icon={<MoreHorizontal size={15} aria-hidden="true" />} title="更多">
-            {close => <>
-              <ActionMenuItem icon={<ArrowUpRight size={16} aria-hidden="true" />} label="在浏览器打开" title="在系统浏览器中打开 HiMind AI" disabled={!runtimeReady || !canStartSession || connecting || browserOpening} onClick={() => { close(); void openInBrowser(); }} />
-              {!independentMode ? <ActionMenuItem icon={<RefreshCw size={16} aria-hidden="true" />} label="同步模型" title="把工作台可用的模型同步到 HiMind AI" state={syncingModels ? '同步中…' : modelSyncMessage || undefined} disabled={!sessionUrl || syncingModels} onClick={() => { close(); void syncModels(); }} /> : null}
-              {!independentMode ? <ActionMenuItem icon={<Activity size={16} aria-hidden="true" />} label="活动" title="查看 HiMind AI 的协同活动" state={activityOpen ? '已展开' : undefined} onClick={() => { close(); setActivityOpen(open => !open); void refreshActivity(); }} /> : null}
-              <div className="app-menu-separator" role="separator" />
-              <ActionMenuItem icon={<Settings size={16} aria-hidden="true" />} label="模型服务" title="管理模型凭据与运行环境" onClick={() => { close(); onOpenAiConnections(); }} />
-            </>}
-          </ActionMenu>
-          {modelSyncMessage ? <span className="builtin-ai-sync-message" role="status">{modelSyncMessage}</span> : null}
-        </div>
       </header>
 
       <div className="builtin-ai-workspace">
@@ -437,8 +381,6 @@ export function BuiltinAiPage({
               <button type="button" className="btn" onClick={onCancelAuthorization}>取消</button>
             </>}
           />
-        ) : identity === null && !independentMode ? (
-          <WorkspaceStatus icon={<BusyIndicator size={21} />} title="正在准备 HiMind AI" description="正在检查账号状态" />
         ) : !runtimeInstallation ? (
           <WorkspaceStatus icon={<BusyIndicator size={21} />} title="正在检查 HiMind AI" description="正在确认 HiMind AI 是否可用。" />
         ) : runtimeInstallation.state === 'working' ? (

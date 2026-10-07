@@ -733,7 +733,9 @@ pub(crate) fn create(
                 }
             }
         }
-        ExtensionProjectKind::Expert => create_expert_skeleton(parent.as_path(), &slug, &input, author)?,
+        ExtensionProjectKind::Expert => {
+            create_expert_skeleton(parent.as_path(), &slug, &input, author)?
+        }
         ExtensionProjectKind::Instruction => {
             create_instruction_skeleton(parent.as_path(), &slug, &input, author)?
         }
@@ -780,9 +782,22 @@ fn create_expert_skeleton(
         "harness": { "behavior_phases": ["plan", "execute", "verify", "deliver"], "required_evidence": ["summary", "next_steps"], "recovery_guidance": ["遇到不确定性时先说明并请求补充信息"] }
     });
     fs::create_dir_all(&root)?;
-    fs::write(root.join("expert.json"), serde_json::to_vec_pretty(&definition)?)?;
-    fs::write(root.join("EXPERT.md"), "先理解任务目标与约束，再按阶段推进并验证结果。")?;
-    fs::write(root.join("README.md"), format!("# {}\n\n{}\n\n专家项目由 expert.json 与 EXPERT.md 组成。\n", input.name.trim(), input.description.trim()))?;
+    fs::write(
+        root.join("expert.json"),
+        serde_json::to_vec_pretty(&definition)?,
+    )?;
+    fs::write(
+        root.join("EXPERT.md"),
+        "先理解任务目标与约束，再按阶段推进并验证结果。",
+    )?;
+    fs::write(
+        root.join("README.md"),
+        format!(
+            "# {}\n\n{}\n\n专家项目由 expert.json 与 EXPERT.md 组成。\n",
+            input.name.trim(),
+            input.description.trim()
+        ),
+    )?;
     Ok(json!({ "root": root.to_string_lossy(), "expert_id": definition["id"], "version": "0.1.0" }))
 }
 
@@ -882,7 +897,10 @@ fn create_instruction_skeleton(
         "contents": ["instruction.json", "INSTRUCTIONS.md"]
     });
     fs::create_dir_all(&root)?;
-    fs::write(root.join("instruction.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(
+        root.join("instruction.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
     fs::write(root.join("INSTRUCTIONS.md"), instructions)?;
     fs::write(
         root.join("README.md"),
@@ -892,7 +910,9 @@ fn create_instruction_skeleton(
             input.description.trim()
         ),
     )?;
-    Ok(json!({ "root": root.to_string_lossy(), "instruction_pack_id": manifest["id"], "version": "0.1.0" }))
+    Ok(
+        json!({ "root": root.to_string_lossy(), "instruction_pack_id": manifest["id"], "version": "0.1.0" }),
+    )
 }
 
 fn create_workflow_skeleton(
@@ -1001,7 +1021,9 @@ pub(crate) fn build(project_id: &str) -> Result<ExtensionCandidate, Box<dyn Erro
         ));
     }
     if project.kind == ExtensionProjectKind::Expert {
-        return Ok(ExtensionCandidate::Expert(crate::expert::build_workspace_candidate(&workspace)?));
+        return Ok(ExtensionCandidate::Expert(
+            crate::expert::build_workspace_candidate(&workspace)?,
+        ));
     }
     if project.kind == ExtensionProjectKind::Instruction {
         return Ok(ExtensionCandidate::Instruction(
@@ -1227,9 +1249,18 @@ fn project_record_from_path(path: &Path, source: &str) -> Result<ProjectRecord, 
         ));
     }
     if expert_path.is_file() && path.join("EXPERT.md").is_file() {
-        let definition: crate::expert::ExpertDefinition = serde_json::from_slice(&fs::read(expert_path)?)?;
+        let definition: crate::expert::ExpertDefinition =
+            serde_json::from_slice(&fs::read(expert_path)?)?;
         crate::expert::validate_definition(&definition)?;
-        return Ok(record(ExtensionProjectKind::Expert, definition.id, definition.name, definition.description, definition.version, path, source));
+        return Ok(record(
+            ExtensionProjectKind::Expert,
+            definition.id,
+            definition.name,
+            definition.description,
+            definition.version,
+            path,
+            source,
+        ));
     }
     if instruction_path.is_file() && path.join("INSTRUCTIONS.md").is_file() {
         let manifest: crate::instruction_pack::InstructionPackManifest =
@@ -1318,7 +1349,11 @@ fn project_slug_from_id(id: &str) -> String {
         }
     }
     let slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() { "expert".to_string() } else { slug }
+    if slug.is_empty() {
+        "expert".to_string()
+    } else {
+        slug
+    }
 }
 
 /// 把专家库里的一个专家落地成可编辑的工作区项目（`experts/<slug>/`）。
@@ -1338,7 +1373,10 @@ pub(crate) fn materialize_expert_project(
         return Err(format!("专家项目目录已存在: {}", root.display()).into());
     }
     fs::create_dir_all(&root)?;
-    fs::write(root.join("expert.json"), serde_json::to_vec_pretty(&definition)?)?;
+    fs::write(
+        root.join("expert.json"),
+        serde_json::to_vec_pretty(&definition)?,
+    )?;
     // 工作区校验要求 EXPERT.md 与 expert.json 的 instructions 完全一致。
     fs::write(root.join("EXPERT.md"), &definition.instructions)?;
     fs::write(

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { RefreshCw, ShieldAlert } from 'lucide-react';
 import '../styles.css';
@@ -8,27 +8,30 @@ import { NotificationCenter, PageHeader } from './components/Common';
 import { Shell, type ActiveRunSummary } from './components/Shell';
 import { SettingsWindow } from './components/SettingsWindow';
 import { isSettingsRailKey, settingsRailKey, settingsRailNavigation, settingsRoute, type SettingsSection, type SettingsTab, type SettingsWindowPanel } from './settingsModel';
-import { ApprovalsPage } from './pages/ApprovalsPage';
-import { AiConnectionsPage } from './pages/AiConnectionsPage';
-import { clientLabel } from './pages/AiServicesPanel';
+import { lazyNamed } from './utils/lazyNamed';
+import { managedItems } from './utils/managedItems';
+const ApprovalsPage = lazyNamed(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
+const AiConnectionsPage = lazyNamed(() => import('./pages/AiConnectionsPage'), 'AiConnectionsPage');
+import { clientLabel } from './utils/clientLabels';
 import { BuiltinAiPage } from './pages/BuiltinAiPage';
-import { DashboardPage } from './pages/DashboardPage';
+const DashboardPage = lazyNamed(() => import('./pages/DashboardPage'), 'DashboardPage');
 import { PluginsPage, userInstalledPlugins } from './pages/PluginsPage';
 import { SkillsWorkspacePage, installedSkills, skillClientDescriptors, targetForSkillClient } from './pages/SkillsWorkspacePage';
-import { InstalledPage } from './pages/InstalledPage';
-import { ExpertStudioPanel } from './components/ExpertStudioPanel';
-import { InstructionProjectionPanel } from './components/InstructionProjectionPanel';
-import { ManagedCapabilitiesPanel, managedItems } from './pages/ManagedCapabilitiesPage';
-import { ExtensionDevelopmentPage } from './pages/ExtensionDevelopmentPage';
-import { ExtensionsPage, type MarketLoadError } from './pages/ExtensionsPage';
-import { InboxPage } from './pages/InboxPage';
-import { SettingsPage } from './pages/SettingsPage';
+const InstalledPage = lazyNamed(() => import('./pages/InstalledPage'), 'InstalledPage');
+const ExpertStudioPanel = lazyNamed(() => import('./components/ExpertStudioPanel'), 'ExpertStudioPanel');
+const InstructionProjectionPanel = lazyNamed(() => import('./components/InstructionProjectionPanel'), 'InstructionProjectionPanel');
+const ManagedCapabilitiesPanel = lazyNamed(() => import('./pages/ManagedCapabilitiesPage'), 'ManagedCapabilitiesPanel');
+const ExtensionDevelopmentPage = lazyNamed(() => import('./pages/ExtensionDevelopmentPage'), 'ExtensionDevelopmentPage');
+const ExtensionsPage = lazyNamed(() => import('./pages/ExtensionsPage'), 'ExtensionsPage');
+import type { MarketLoadError } from './pages/ExtensionsPage';
+const InboxPage = lazyNamed(() => import('./pages/InboxPage'), 'InboxPage');
+const SettingsPage = lazyNamed(() => import('./pages/SettingsPage'), 'SettingsPage');
 import { McpConnectionsPanel } from './components/McpConnectionsPanel';
 import { useMcpManager } from './components/useMcpManager';
 import type { WorkbenchConnectionDraft } from './components/WorkbenchConnectionsPanel';
-import { TaskCenterPage } from './pages/TaskCenterPage';
-import { WorkflowsPage } from './pages/WorkflowsPage';
-import { SchedulesPage } from './pages/SchedulesPage';
+const TaskCenterPage = lazyNamed(() => import('./pages/TaskCenterPage'), 'TaskCenterPage');
+const WorkflowsPage = lazyNamed(() => import('./pages/WorkflowsPage'), 'WorkflowsPage');
+const SchedulesPage = lazyNamed(() => import('./pages/SchedulesPage'), 'SchedulesPage');
 import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
 import { listen } from '@tauri-apps/api/event';
@@ -585,7 +588,11 @@ function AgentApp() {
       }
     });
   }
-  async function refreshLogs() { setLogs(await agentApi.logs()); }
+  async function refreshLogs(force = false) {
+    return singleFlight('logs', async () => {
+      setLogs(await agentApi.logs());
+    }, { force });
+  }
   async function refreshExtensionProjects() {
     try {
       setExtensionProjects(await agentApi.extensionProjects());
@@ -633,11 +640,15 @@ function AgentApp() {
       try {
         // Registry, capability list and market catalog fail independently: a slow
         // capabilities call must not leave the market catalog empty.
-        const [registryResult, capabilityResult, catalogResult] = await Promise.allSettled([
+        const instructionCatalogPromise = dashboardEnabled()
+          ? withTimeout(agentApi.instructionPackCatalog(), '项目规则市场', 30000)
+          : Promise.resolve([] as InstructionPackCatalogItem[]);
+        const [registryResult, capabilityResult, catalogResult, instructionCatalogResult] = await Promise.allSettled([
           withTimeout(agentApi.plugins(), '本机插件'),
           withTimeout(agentApi.capabilities(), '本机能力清单'),
           // 目录需要等待 Dashboard 侧返回，慢于常规本地读取；12s 会把它整体丢弃。
           withTimeout(agentApi.pluginCatalog(), '插件市场', 30000),
+          instructionCatalogPromise,
         ]);
         if (registryResult.status === 'fulfilled') {
           setPluginRegistry(registryResult.value);
@@ -659,21 +670,15 @@ function AgentApp() {
           setPluginCatalogError(formatError(catalogResult.reason, '插件市场暂不可用'));
           console.error('Plugin catalog unavailable', catalogResult.reason);
         }
-        // 项目规则目录由工作台提供。独立模式仍可使用本地市场能力，
+        // 项目规则目录与其它市场数据并行读取。独立模式返回空列表，
         // 但不应把工作台连接错误暴露成市场页错误。
-        if (dashboardEnabled()) {
-          try {
-            const instructionCatalog = await withTimeout(agentApi.instructionPackCatalog(), '项目规则市场', 30000);
-            setInstructionPacks(Array.isArray(instructionCatalog) ? instructionCatalog : []);
-            setInstructionPackError(null);
-          } catch (error) {
-            setInstructionPacks([]);
-            setInstructionPackError(formatError(error, '项目规则市场暂不可用'));
-            console.error('InstructionPack catalog unavailable', error);
-          }
-        } else {
-          setInstructionPacks([]);
+        if (instructionCatalogResult.status === 'fulfilled') {
+          setInstructionPacks(Array.isArray(instructionCatalogResult.value) ? instructionCatalogResult.value : []);
           setInstructionPackError(null);
+        } else {
+          // 保留上一份目录，错误提示单独呈现，避免网络抖动把市场闪成空态。
+          setInstructionPackError(formatError(instructionCatalogResult.reason, '项目规则市场暂不可用'));
+          console.error('InstructionPack catalog unavailable', instructionCatalogResult.reason);
         }
       } finally {
         setPluginsLoading(false);
@@ -681,23 +686,47 @@ function AgentApp() {
     });
   }
 
-  async function refreshExperts() {
-    const [items, active, catalog] = await Promise.all([agentApi.experts(), agentApi.activeExpert(), agentApi.expertCatalog().catch(() => [])]);
-    setExperts(Array.isArray(items) ? items : []);
-    setActiveExpert(active ? { expert_id: active.expert_id, version: active.version } : null);
-    setExpertCatalog(Array.isArray(catalog) ? catalog : []);
+  async function refreshExperts(force = false) {
+    return singleFlight('experts', async () => {
+      const [items, active, catalog] = await Promise.all([agentApi.experts(), agentApi.activeExpert(), agentApi.expertCatalog().catch(() => [])]);
+      setExperts(Array.isArray(items) ? items : []);
+      setActiveExpert(active ? { expert_id: active.expert_id, version: active.version } : null);
+      setExpertCatalog(Array.isArray(catalog) ? catalog : []);
+    }, { force });
   }
 
-  async function refreshWorkflowCenter(light = false) {
+  async function refreshWorkflowCenter(light = false, force = false) {
     // 轮询用轻量快照：完整快照会去控制面拉工作流目录，不能每个轮询周期都打网络。
-    return singleFlight(light ? 'workflow-center-light' : 'workflow-center', async () => {
+    // Light and full reads share one flight. Mutations opt into a forced full
+    // read so a poll that started before the mutation cannot win the race.
+    return singleFlight('workflow-center', async () => {
       setWorkflowLoading(true);
       try {
         const next = await withTimeout(agentApi.workflowCenter(light), '工作流中心');
         workflowCenterFailures.current = 0;
         setWorkflowError('');
-        // 轻量快照的目录为空，保留已有目录，避免轮询把刚加载的目录清空。
-        setWorkflowCenter(current => light && current ? { ...next, catalog: current.catalog, catalog_error: current.catalog_error } : next);
+        // 轻量快照不包含目录、工作流定义或投影明细。保留完整快照，
+        // 只替换运行状态，避免轮询反复解析磁盘和重绘整页。
+        setWorkflowCenter(current => {
+          if (!light || !current) return next;
+          const previousByRunId = new Map(current.runs.map(item => [item.run.run_id, item]));
+          return {
+            ...next,
+            catalog: current.catalog,
+            catalog_error: current.catalog_error,
+            workflows: current.workflows,
+            library_issues: current.library_issues,
+            runs: next.runs.map(run => {
+              const previous = previousByRunId.get(run.run.run_id);
+              return previous ? {
+                ...run,
+                workflow_name: run.workflow_name || previous.workflow_name,
+                projection_count: run.projection_count || previous.projection_count,
+                projection_status: run.projection_status === 'none' ? previous.projection_status : run.projection_status,
+              } : run;
+            }),
+          };
+        });
       } catch (error) {
         // 已经有快照就保留它：列表停在上一份数据上，远好过整页变成红色错误条。
         workflowCenterFailures.current += 1;
@@ -711,7 +740,7 @@ function AgentApp() {
       } finally {
         setWorkflowLoading(false);
       }
-    });
+    }, { force });
   }
 
   async function loadWorkflowRun(runId: string): Promise<WorkflowRunSnapshot> {
@@ -723,7 +752,7 @@ function AgentApp() {
   // together. Refreshing only the kind that was "expected" is how the Workflow
   // list silently went stale after a unit install.
   async function refreshExtensionSurfaces() {
-    await Promise.all([refreshPlugins(), refreshSkills(), refreshWorkflowCenter()]);
+    await Promise.all([refreshPlugins(), refreshSkills(), refreshWorkflowCenter(false, true)]);
   }
 
   async function verifyWorkflowRun(runId: string): Promise<WorkflowRunVerification> {
@@ -734,25 +763,25 @@ function AgentApp() {
     await agentApi.approveWorkflowStep(runId, stepId);
     notify('success', '审批已批准，工作流将由统一审批流程自动继续');
     await refreshApprovals();
-    await refreshWorkflowCenter();
+    await refreshWorkflowCenter(false, true);
   }
 
   async function rejectWorkflowRun(runId: string, stepId: string) {
     await agentApi.rejectWorkflowStep(runId, stepId);
     notify('info', '工作流审批已拒绝');
     await refreshApprovals();
-    await refreshWorkflowCenter();
+    await refreshWorkflowCenter(false, true);
   }
 
   async function resumeWorkflowRun(runId: string, feedback: string) {
     const outcome = await agentApi.resumeWorkflowRun(runId, feedback);
     notify('success', outcome.blocked_step_id ? '已继续执行，正在等待下一步处理' : '工作流已继续执行');
-    await refreshWorkflowCenter();
+    await refreshWorkflowCenter(false, true);
   }
 
   async function startWorkflowRun(packageId: string, input: Record<string, unknown>) {
     const outcome = await agentApi.startWorkflowRun(packageId, input);
-    await refreshWorkflowCenter();
+    await refreshWorkflowCenter(false, true);
     // 启动失败要当场说清楚：等一次必然失败的执行、再去运行详情里翻错误，
     // 是上一版最难受的地方。
     if (outcome.run.status === 'failed') {
@@ -771,7 +800,7 @@ function AgentApp() {
     try {
       await agentApi.installWorkflowCatalogItem(workflowId, version, source, artifactId, sha256);
       notify('success', version ? `工作流已更新到 v${version}` : '工作流已安装');
-      await refreshWorkflowCenter();
+      await refreshWorkflowCenter(false, true);
     } catch (error) {
       notify('error', formatError(error, '安装工作流失败'));
       throw error;
@@ -783,7 +812,7 @@ function AgentApp() {
   async function cancelWorkflowRun(runId: string) {
     await agentApi.cancelWorkflowRun(runId);
     notify('info', '工作流已取消');
-    await refreshWorkflowCenter();
+    await refreshWorkflowCenter(false, true);
   }
 
   // Plugin views can be installed or rebuilt while the Agent window remains
@@ -854,8 +883,8 @@ function AgentApp() {
 	if (marketResult.status === 'fulfilled') {
 	  setOrganizationSkills(Array.isArray(marketResult.value) ? marketResult.value : []);
 	  setSkillMarketError(null);
-	} else {
-	  setOrganizationSkills([]);
+    } else {
+      // Keep the last usable market snapshot while exposing the read error.
 	  setSkillMarketError(formatError(marketResult.reason, '技能市场暂不可用'));
 	}
 	if (workspaceResult.status === 'fulfilled') setSkillWorkspace(workspaceResult.value);
@@ -926,8 +955,10 @@ function AgentApp() {
       }
     }, { force });
   }
-  async function refreshExtensionSourceSettings() {
-    setExtensionSources(await agentApi.extensionSources());
+  async function refreshExtensionSourceSettings(force = false) {
+    return singleFlight('extension-source-settings', async () => {
+      setExtensionSources(await agentApi.extensionSources());
+    }, { force });
   }
   async function refreshExtensionSources() {
     setExtensionSourcesLoading(true);
@@ -936,7 +967,15 @@ function AgentApp() {
       const settings = await agentApi.extensionSources();
       setExtensionSources(settings);
       try {
-        setExtensionSourceSnapshot(await agentApi.extensionSourceSnapshot());
+        const snapshot = await agentApi.extensionSourceSnapshot();
+        setExtensionSourceSnapshot(snapshot);
+        if (Array.isArray(snapshot.experts) && snapshot.experts.length) {
+          setExpertCatalog(current => {
+            const merged = new Map(current.map(item => [`${item.expert_id}@${item.version}@${item.source}`, item]));
+            snapshot.experts.forEach(item => merged.set(`${item.expert_id}@${item.version}@${item.source}`, item));
+            return [...merged.values()];
+          });
+        }
       } catch (error) {
         // 刷新失败时保留上一份可用快照：来源列表、分发单元都从快照派生，
         // 清空会让整个「来源管理」看起来"一条来源都没有"，比数据稍旧更糟。
@@ -1040,6 +1079,10 @@ function AgentApp() {
     } catch (error) {
       console.error('Agent status unavailable during initialization', error);
     }
+    // Settings is a separate native window sharing this entry point. It loads
+    // only its selected surface and must not duplicate the main window's
+    // global catalogs, approvals, and workflow reads.
+    if (isSettingsWindow) return;
     const results = await Promise.allSettled([
       refreshUpdateStatus(),
       refreshDashboardIdentity(),
@@ -1060,6 +1103,7 @@ function AgentApp() {
   }
 
   useEffect(() => {
+    if (isSettingsWindow) return;
     refreshInitialPage().catch(error => notify('error', formatError(error, '应用初始化失败')));
     const timer = window.setInterval(() => {
       if (document.visibilityState !== 'hidden') Promise.all([refreshStatus(), refreshApprovals(), refreshWorkflowCenter(true), refreshProjectionSyncStatus()]).catch(console.error);
@@ -1123,6 +1167,7 @@ function AgentApp() {
   }, [workflowCenter]);
 
   useEffect(() => {
+    if (isSettingsWindow) return;
     const hasActiveRuns = workflowCenter?.runs.some(item => ['queued', 'running', 'waiting'].includes(item.run.status));
     if (!hasActiveRuns) return;
     // 有在跑的任务时收紧到 2.5 秒：本地调用开销很小，换来的是「能看见它在动」。
@@ -1946,7 +1991,7 @@ function AgentApp() {
       approvals={approvals}
       workflowRuns={(workflowCenter?.runs || []).filter(item => item.run.status === 'waiting')}
       onRefresh={() => { void run(async () => { await Promise.all([refreshApprovals(), refreshWorkflowCenter()]); }); }}
-      onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await Promise.all([refreshApprovals(), refreshWorkflowCenter(), refreshStatus()]); }, undefined, '审批处理失败')}
+      onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await Promise.all([refreshApprovals(), refreshWorkflowCenter(false, true), refreshStatus()]); }, undefined, '审批处理失败')}
       onOpenWorkflowRun={(runId) => navigate({ page: 'workflows', runId })}
       onOpenApprovalHistory={() => navigate('approvals')}
     />;
@@ -2020,7 +2065,7 @@ function AgentApp() {
       onLoadPluginVersions={agentApi.pluginVersions}
       onLoadSkillVersions={agentApi.skillVersions}
       onLoadWorkflowVersions={agentApi.workflowVersions}
-      onInstallWorkflow={async (workflowId, version, source, artifactId, sha256) => { try { await agentApi.installWorkflowCatalogItem(workflowId, version, source, artifactId, sha256); await refreshWorkflowCenter(); notify('success', `已安装工作流 v${version}`); } catch (error) { notify('error', formatError(error, '安装工作流失败')); } }}
+      onInstallWorkflow={async (workflowId, version, source, artifactId, sha256) => { try { await agentApi.installWorkflowCatalogItem(workflowId, version, source, artifactId, sha256); await refreshWorkflowCenter(false, true); notify('success', `已安装工作流 v${version}`); } catch (error) { notify('error', formatError(error, '安装工作流失败')); } }}
       onInstallInstructionPack={async (id, version, artifactId, sha256) => {
         try {
           await agentApi.installInstructionPackMarket(id, version, artifactId, sha256);
@@ -2051,9 +2096,9 @@ function AgentApp() {
       onPreflight={agentApi.preflightWorkflowRun}
       onSaveCredentialFile={async (connectorId, handle) => { try { const result = await agentApi.saveConnectorFileCredential(connectorId, handle); if (!result.cancelled) notify('success', '凭据文件已保存'); return !result.cancelled; } catch (error) { notify('error', formatError(error, '保存凭据文件失败')); throw error; } }}
       onSaveCredentialSecret={async (connectorId, handle, secret) => { try { await agentApi.saveConnectorSecretCredential(connectorId, handle, secret); notify('success', '连接密钥已保存'); } catch (error) { notify('error', formatError(error, '保存连接密钥失败')); throw error; } }}
-      onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
-      onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
-      onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(); }, '工作流已移除', '移除工作流失败')}
+      onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(false, true); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
+      onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(false, true); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
+      onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(false, true); }, '工作流已移除', '移除工作流失败')}
       onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
       onOpenExtensions={() => setPage('extensions')}
       onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
@@ -2287,9 +2332,9 @@ function AgentApp() {
         onPreflight={agentApi.preflightWorkflowRun}
         onSaveCredentialFile={async (connectorId, handle) => { try { const result = await agentApi.saveConnectorFileCredential(connectorId, handle); if (!result.cancelled) notify('success', '凭据文件已保存'); return !result.cancelled; } catch (error) { notify('error', formatError(error, '保存凭据文件失败')); throw error; } }}
         onSaveCredentialSecret={async (connectorId, handle, secret) => { try { await agentApi.saveConnectorSecretCredential(connectorId, handle, secret); notify('success', '连接密钥已保存'); } catch (error) { notify('error', formatError(error, '保存连接密钥失败')); throw error; } }}
-        onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
-        onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
-        onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(); }, '工作流已移除', '移除工作流失败')}
+        onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(false, true); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
+        onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(false, true); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
+        onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(false, true); }, '工作流已移除', '移除工作流失败')}
         onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
         onOpenExtensions={() => setPage('extensions')}
         onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
@@ -2302,7 +2347,7 @@ function AgentApp() {
         // 这些工具是 HiMind AI 在对话里调用的本机能力，和其他已安装能力的口吻保持一致。
         note="这些工具会在对话里提供给 HiMind AI 调用，停用后不再加载。"
       /></div>
-      : <ManagedCapabilitiesPanel assetKind="all" desired={extensionDesiredState} loading={extensionDesiredLoading} error={extensionDesiredError} registry={pluginRegistry} skillStatus={skillStatus} workflows={workflowCenter?.workflows || []} onRepairPlugin={(pluginId) => run(async () => { await agentApi.repairPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已修复，正在重试', '修复插件失败')} />}
+      : <ManagedCapabilitiesPanel assetKind="all" desired={extensionDesiredState} loading={extensionDesiredLoading} error={extensionDesiredError} registry={pluginRegistry} skillStatus={skillStatus} workflows={workflowCenter?.workflows || []} onRepairPlugin={(pluginId: string) => run(async () => { await agentApi.repairPlugin(pluginId); await refreshPlugins(); await invalidateBuiltinAiToolContext(); }, '插件已修复，正在重试', '修复插件失败')} />}
     </InstalledPage>;
     if (page === 'development') return <ExtensionDevelopmentPage
       dashboardEnabled={dashboardEnabled()}
@@ -2321,15 +2366,6 @@ function AgentApp() {
       expertDrafts={expertDrafts}
       instructionDrafts={instructionDrafts}
       workflowSubmissions={workflowSubmissions}
-      experts={experts}
-      activeExpert={activeExpert ? `${activeExpert.expert_id}@${activeExpert.version}` : ''}
-      onRefreshExperts={refreshExperts}
-      onActivateExpert={async (id, version) => {
-        const activation = await agentApi.activateExpert(id, version);
-        setActiveExpert({ expert_id: activation.expert_id, version: activation.version });
-        notify('success', '专家已切换');
-      }}
-      onNotify={(message, tone = 'success') => notify(tone, message)}
       pluginSubmissions={pluginSubmissions}
       skillSubmissions={skillSubmissions}
       availablePlugins={availablePlugins}
@@ -2434,7 +2470,7 @@ function AgentApp() {
         }}
       >
         <NotificationCenter messages={messages} onClose={dismissNotification} />
-        {content}
+        <Suspense fallback={<PageLoadingState />}>{content}</Suspense>
       </SettingsWindow>
     );
   }
@@ -2465,7 +2501,7 @@ function AgentApp() {
       <div className={`builtin-ai-page-host ${page === 'builtin-ai' ? 'active' : 'inactive'}`} aria-hidden={page !== 'builtin-ai'}>
         {builtinAiActivated ? builtinAiContent : null}
       </div>
-      {page !== 'builtin-ai' ? content : null}
+      {page !== 'builtin-ai' ? <Suspense fallback={<PageLoadingState />}>{content}</Suspense> : null}
     </Shell>
   );
 }
@@ -2483,6 +2519,10 @@ function SettingsLoadState({ loading, error, onRetry }: { loading: boolean; erro
           </div>}
     </>
   );
+}
+
+function PageLoadingState() {
+  return <div className="page-loading"><BusyIndicator size={15} />正在打开页面</div>;
 }
 
 function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 12000): Promise<T> {

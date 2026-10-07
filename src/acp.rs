@@ -8,7 +8,7 @@ use std::error::Error;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,14 @@ struct AcpSession {
     cancel: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     history: Arc<Mutex<Vec<AcpTurn>>>,
+}
+
+fn lock_sessions<'a>(
+    sessions: &'a Arc<Mutex<HashMap<String, AcpSession>>>,
+) -> Result<MutexGuard<'a, HashMap<String, AcpSession>>, Box<dyn Error>> {
+    sessions
+        .lock()
+        .map_err(|_| "ACP sessions state is unavailable after a worker failure".into())
 }
 
 pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
@@ -121,7 +129,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 line.clear();
                                 continue;
                             }
-                            sessions.lock().expect("ACP sessions lock").insert(
+                            lock_sessions(&sessions)?.insert(
                                 session_id.clone(),
                                 AcpSession {
                                     cwd,
@@ -179,9 +187,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 .map(str::trim)
                                 .filter(|value| !value.is_empty())
                                 .unwrap_or_default();
-                            let active = sessions
-                                .lock()
-                                .expect("ACP sessions lock")
+                            let active = lock_sessions(&sessions)?
                                 .get(session_id)
                                 .is_some_and(|session| session.active.load(Ordering::SeqCst));
                             if active {
@@ -194,10 +200,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 line.clear();
                                 continue;
                             }
-                            sessions
-                                .lock()
-                                .expect("ACP sessions lock")
-                                .remove(session_id);
+                            lock_sessions(&sessions)?.remove(session_id);
                             if let Err(error) = acp_sessions::delete(session_id) {
                                 write_error(&writer, id, -32000, &error.to_string())?;
                                 line.clear();
@@ -228,9 +231,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                     continue;
                                 }
                             };
-                            let existing_active = sessions
-                                .lock()
-                                .expect("ACP sessions lock")
+                            let existing_active = lock_sessions(&sessions)?
                                 .get(&loaded.session_id)
                                 .is_some_and(|session| session.active.load(Ordering::SeqCst));
                             if existing_active {
@@ -244,7 +245,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 continue;
                             }
                             let history = Arc::new(Mutex::new(loaded.history.clone()));
-                            sessions.lock().expect("ACP sessions lock").insert(
+                            lock_sessions(&sessions)?.insert(
                                 loaded.session_id.clone(),
                                 AcpSession {
                                     cwd: loaded.cwd.clone(),
@@ -282,10 +283,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 .get("sessionId")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default();
-                            let removed = sessions
-                                .lock()
-                                .expect("ACP sessions lock")
-                                .remove(session_id);
+                            let removed = lock_sessions(&sessions)?.remove(session_id);
                             let Some(session) = removed else {
                                 write_error(&writer, id, -32602, "unknown ACP session")?;
                                 line.clear();
@@ -321,11 +319,8 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string();
-                            let session = sessions
-                                .lock()
-                                .expect("ACP sessions lock")
-                                .get(&session_id)
-                                .map(|session| {
+                            let session =
+                                lock_sessions(&sessions)?.get(&session_id).map(|session| {
                                     (
                                         session.cwd.clone(),
                                         session.created_at,
@@ -370,8 +365,19 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                                     continue;
                                 }
                             };
-                            let history_snapshot =
-                                history.lock().expect("ACP session history lock").clone();
+                            let history_snapshot = match history.lock() {
+                                Ok(history) => history.clone(),
+                                Err(_) => {
+                                    write_error(
+                                        &writer,
+                                        Some(id),
+                                        -32000,
+                                        "ACP session history is unavailable",
+                                    )?;
+                                    line.clear();
+                                    continue;
+                                }
+                            };
                             let runtime_prompt =
                                 match render_prompt_with_history(&history_snapshot, &prompt) {
                                     Ok(prompt) => prompt,
@@ -385,9 +391,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                             let writer_for_prompt = Arc::clone(&writer);
                             let options_for_prompt = options.clone();
                             let session_id_for_prompt = session_id.clone();
-                            let ai_client_id_for_prompt = sessions
-                                .lock()
-                                .expect("ACP sessions lock")
+                            let ai_client_id_for_prompt = lock_sessions(&sessions)?
                                 .get(&session_id_for_prompt)
                                 .map(|session| session.ai_client_id.clone())
                                 .filter(|value| !value.trim().is_empty())
@@ -597,9 +601,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
                             if let Some(session_id) =
                                 params.get("sessionId").and_then(Value::as_str)
                             {
-                                if let Some(session) =
-                                    sessions.lock().expect("ACP sessions lock").get(session_id)
-                                {
+                                if let Some(session) = lock_sessions(&sessions)?.get(session_id) {
                                     if session.active.load(Ordering::SeqCst) {
                                         session.cancel.store(true, Ordering::SeqCst);
                                     }
@@ -625,7 +627,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
         }
         line.clear();
     }
-    for session in sessions.lock().expect("ACP sessions lock").values() {
+    for session in lock_sessions(&sessions)?.values() {
         if session.active.load(Ordering::SeqCst) {
             session.cancel.store(true, Ordering::SeqCst);
         }
@@ -903,7 +905,10 @@ fn persist_session_turn(
     user: &str,
     assistant: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let mut updated = history.lock().expect("ACP session history lock").clone();
+    let mut updated = history
+        .lock()
+        .map_err(|_| "ACP session history is unavailable")?
+        .clone();
     updated.push(AcpTurn {
         user: user.to_string(),
         assistant: assistant.to_string(),
@@ -923,7 +928,9 @@ fn persist_session_turn(
             .collect(),
     };
     acp_sessions::save(&stored)?;
-    *history.lock().expect("ACP session history lock") = updated;
+    *history
+        .lock()
+        .map_err(|_| "ACP session history is unavailable")? = updated;
     Ok(())
 }
 
@@ -938,7 +945,9 @@ fn write_message(
     writer: &Arc<Mutex<BufWriter<std::io::Stdout>>>,
     message: Value,
 ) -> Result<(), Box<dyn Error>> {
-    let mut writer = writer.lock().expect("ACP writer lock");
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "ACP writer is unavailable after a worker failure")?;
     serde_json::to_writer(&mut *writer, &message)?;
     writer.write_all(b"\n")?;
     writer.flush()?;

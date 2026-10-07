@@ -250,15 +250,29 @@ pub(crate) fn resolve_asset(
         }
         ExtensionProjectKind::Expert => {
             let draft = crate::expert::read_authoring_draft(id, version)?;
-            if draft.tested_at.is_none() { return Err("专家候选包尚未完成测试，无法发布".into()); }
-            if draft.confirmed_at.is_none() { return Err("专家候选版本尚未确认，无法发布".into()); }
-            build_asset("expert", id, version, &draft.definition.name, &draft.definition.release_notes, &draft.definition.min_agent_version, &draft.candidate_path, &draft.candidate_sha256, PinnedDependencies::default())
+            if draft.tested_at.is_none() {
+                return Err("专家候选包尚未完成测试，无法发布".into());
+            }
+            if draft.confirmed_at.is_none() {
+                return Err("专家候选版本尚未确认，无法发布".into());
+            }
+            build_asset(
+                "expert",
+                id,
+                version,
+                &draft.definition.name,
+                &draft.definition.release_notes,
+                &draft.definition.min_agent_version,
+                &draft.candidate_path,
+                &draft.candidate_sha256,
+                PinnedDependencies::default(),
+            )
         }
         // 项目规则的收敛动作是发布到本机规则库，仓库与工作台分发都还没有对应端点。
         // 这里显式报错，避免落到默认分支后把规则当成插件发出去。
-        ExtensionProjectKind::Instruction => Err(
-            "项目规则请在「规则库」完成预检、确认和发布；仓库分发暂未接入".into(),
-        ),
+        ExtensionProjectKind::Instruction => {
+            Err("项目规则请在「规则库」完成预检、确认和发布；仓库分发暂未接入".into())
+        }
     }
 }
 

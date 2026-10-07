@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::client::TaskCancelGuard;
 use crate::api::types::Task;
+use crate::capability::execution::CapabilityExecutionContext;
 use crate::{report_task, Options};
 
 pub(crate) fn execute_smb_upload(
@@ -15,6 +16,29 @@ pub(crate) fn execute_smb_upload(
     options: &Options,
     agent_id: &str,
     task: &Task,
+    payload: Option<&Value>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut cancel_guard = TaskCancelGuard::new();
+    let mut execution_context = CapabilityExecutionContext::new(
+        task.id.clone(),
+        "upload.smb",
+        payload
+            .and_then(|value| value.get("target_dir"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        || cancel_guard.check(client, options, agent_id, &task.id),
+        |progress, detail| {
+            report_task(
+                client, options, agent_id, &task.id, "running", progress, detail, None, None,
+            )
+        },
+    );
+    execute_smb_upload_with_context(options, &mut execution_context, payload)
+}
+
+pub(crate) fn execute_smb_upload_with_context(
+    _options: &Options,
+    execution: &mut CapabilityExecutionContext<'_>,
     payload: Option<&Value>,
 ) -> Result<Value, Box<dyn Error>> {
     let payload = payload.ok_or("missing SMB upload payload")?;
@@ -79,13 +103,12 @@ pub(crate) fn execute_smb_upload(
     let total_bytes = source_sizes.iter().copied().sum::<u64>();
     let target = Path::new(target_dir);
     fs::create_dir_all(target)?;
-    let mut cancel_guard = TaskCancelGuard::new();
     let mut files = Vec::with_capacity(sources.len());
     let mut skipped = Vec::new();
     let mut transferred_bytes = 0_u64;
     let transfer_started = Instant::now();
     for (index, (source, selected_relative_path)) in sources.iter().enumerate() {
-        cancel_guard.check(client, options, agent_id, &task.id)?;
+        execution.check_cancelled()?;
         let file_name = source
             .file_name()
             .and_then(|value| value.to_str())
@@ -111,35 +134,24 @@ pub(crate) fn execute_smb_upload(
             }));
             let progress =
                 transfer_progress(transferred_bytes, total_bytes, index + 1, sources.len());
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
+            execution.report_progress(
                 progress,
                 &format!("已跳过 {}/{}：{}", index + 1, sources.len(), file_name),
-                None,
-                None,
             )?;
             continue;
         }
-        let temporary = destination.with_file_name(format!(".{}.{}.uploading", file_name, task.id));
+        let temporary =
+            destination.with_file_name(format!(".{}.{}.uploading", file_name, execution.task_id()));
         let file_size = source_sizes[index];
         let file_start_bytes = transferred_bytes;
         let copy_result = copy_with_progress(source, &temporary, |file_bytes| {
             transferred_bytes = file_start_bytes.saturating_add(file_bytes);
-            cancel_guard.check(client, options, agent_id, &task.id)?;
+            execution.check_cancelled()?;
             let elapsed = transfer_started.elapsed();
             let speed = transfer_speed(transferred_bytes, elapsed);
             let progress =
                 transfer_progress(transferred_bytes, total_bytes, index + 1, sources.len());
-            report_task(
-                client,
-                options,
-                agent_id,
-                &task.id,
-                "running",
+            execution.report_progress(
                 progress,
                 &transfer_detail(
                     index + 1,
@@ -149,8 +161,6 @@ pub(crate) fn execute_smb_upload(
                     total_bytes,
                     speed,
                 ),
-                None,
-                None,
             )
         });
         let size = match copy_result {
@@ -161,7 +171,7 @@ pub(crate) fn execute_smb_upload(
             }
         };
         transferred_bytes = file_start_bytes.saturating_add(file_size);
-        if let Err(error) = commit_temporary_file(&temporary, &destination, &task.id) {
+        if let Err(error) = commit_temporary_file(&temporary, &destination, execution.task_id()) {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
@@ -172,12 +182,7 @@ pub(crate) fn execute_smb_upload(
             "action": if existed { "replaced" } else { "new" },
         }));
         let progress = transfer_progress(transferred_bytes, total_bytes, index + 1, sources.len());
-        report_task(
-            client,
-            options,
-            agent_id,
-            &task.id,
-            "running",
+        execution.report_progress(
             progress,
             &format!(
                 "已上传 {}/{}：{} · {}/{}",
@@ -187,8 +192,6 @@ pub(crate) fn execute_smb_upload(
                 format_bytes(transferred_bytes),
                 format_bytes(total_bytes)
             ),
-            None,
-            None,
         )?;
     }
 

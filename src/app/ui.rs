@@ -35,7 +35,7 @@ struct BuiltinAiSession {
     notice: Option<String>,
     proxy: BuiltinAiProxy,
     event_sync: BuiltinAiEventSync,
-    model_sync: BuiltinAiModelSync,
+    model_sync: Arc<BuiltinAiModelSync>,
     command_gateway: Option<BuiltinAiCommandGateway>,
 }
 
@@ -1264,7 +1264,11 @@ fn start_builtin_ai_session_inner(
     let mut child = command
         .spawn()
         .map_err(|error| format!("无法启动 HiMind AI：{error}"))?;
-    let stdout = child.stdout.take().ok_or("HiMind AI 没有返回启动输出")?;
+    let Some(stdout) = child.stdout.take() else {
+        crate::runtime::process::terminate_process_tree(&mut child);
+        let _ = child.wait();
+        return Err("HiMind AI 没有返回启动输出".to_string());
+    };
     let stderr = child.stderr.take();
     let (url_sender, url_receiver) = std::sync::mpsc::channel::<String>();
     let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1378,7 +1382,7 @@ fn start_builtin_ai_session_inner(
         notice,
         proxy,
         event_sync,
-        model_sync,
+        model_sync: Arc::new(model_sync),
         command_gateway,
     })
 }
@@ -1535,21 +1539,21 @@ pub(crate) fn sync_builtin_ai_models(
     let mut model_count = 0usize;
     let mut restart_required = false;
     let mut updated = false;
-    {
-        let sessions = builtin_ai_sessions()
+    for (key, _, _) in &plan {
+        let Some((model_sync, proxy)) = builtin_ai_sessions()
             .lock()
-            .map_err(|_| "HiMind AI 会话状态不可用")?;
-        for (key, _, _) in &plan {
-            let Some(session) = sessions.get(key) else {
-                continue;
-            };
-            let result = session
-                .model_sync
-                .sync_now(options, &session.proxy.control())?;
-            model_count = model_count.max(result.model_count);
-            updated |= result.status == "updated";
-            restart_required |= result.status == "restart_required";
-        }
+            .map_err(|_| "HiMind AI 会话状态不可用")?
+            .get(key)
+            .map(|session| (Arc::clone(&session.model_sync), session.proxy.control()))
+        else {
+            continue;
+        };
+        // 远程凭据/模型目录读取不在会话总锁内执行，否则网络抖动会阻塞
+        // 其它工作区的启动、停止和状态读取。
+        let result = model_sync.sync_now(options, &proxy)?;
+        model_count = model_count.max(result.model_count);
+        updated |= result.status == "updated";
+        restart_required |= result.status == "restart_required";
     }
     if restart_required {
         stop_builtin_ai_process();

@@ -132,7 +132,10 @@ pub(crate) fn save_local_engine_editor_path(
     } else {
         settings.unreal_editor_path = normalized.to_string();
     }
-    fs::write(editor_settings_path()?, serde_json::to_vec_pretty(&settings)?)?;
+    fs::write(
+        editor_settings_path()?,
+        serde_json::to_vec_pretty(&settings)?,
+    )?;
     local_unity_editor_settings()
 }
 
@@ -265,7 +268,10 @@ fn unity_version_from_path(path: &Path) -> String {
             continue;
         }
         let value = raw.strip_prefix("Unity ").unwrap_or(&raw);
-        if value.chars().next().is_some_and(|first| first.is_ascii_digit())
+        if value
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_digit())
             && value.contains('.')
         {
             return value.to_string();
@@ -288,7 +294,11 @@ fn unreal_version_from_path(path: &Path) -> String {
             .strip_prefix("UE_")
             .or_else(|| raw.strip_prefix("ue_"))
             .unwrap_or(&raw);
-        if value.chars().next().is_some_and(|first| first.is_ascii_digit()) {
+        if value
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_digit())
+        {
             return value.to_string();
         }
     }

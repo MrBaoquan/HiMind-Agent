@@ -186,7 +186,7 @@ export function InstructionProjectionPanel({ workspaceRoot, disabled = false, em
     try {
       const next = await agentApi.publishInstructionPackLocally(draft.manifest.id, draft.manifest.version);
       setPackDrafts(current => current.map(item => item.manifest.id === draft.manifest.id && item.manifest.version === draft.manifest.version ? next : item));
-      setPackMessage('已发布到本机规则库，可供 HiMind 会话选择或同步到其他 AI 客户端。');
+      setPackMessage('已发布到本机规则库，可同步到 AI 客户端。');
       onLibraryChanged?.();
     } catch (reason) { setError(typeof reason === 'string' ? reason : '发布项目规则失败'); }
     finally { setPackBusy(false); }
@@ -274,7 +274,7 @@ export function InstructionProjectionPanel({ workspaceRoot, disabled = false, em
       {error ? <div className="instruction-panel-error"><CircleAlert size={15} /><span>{error}</span></div> : null}
       {packMessage ? <div className="instruction-panel-notice"><CheckCircle2 size={15} /><span>{packMessage}</span></div> : null}
       {activeView === 'rules' ? <div className="instruction-rule-library">
-        <div className="instruction-section-intro">把项目说明、输出要求和团队约定保存下来，供 HiMind 会话复用。</div>
+        <div className="instruction-section-intro">把项目说明、输出要求和团队约定保存下来，供 AI 客户端加载。</div>
       <div className="instruction-rule-toolbar">
         <button type="button" className="btn" disabled={packBusy || disabled} onClick={() => void importInstructionPack()}><PackagePlus size={14} />导入规则文件</button>
         <button type="button" className="btn" disabled={packBusy || disabled} onClick={() => void importInstructionPackage()}><PackagePlus size={14} />导入安装包</button>

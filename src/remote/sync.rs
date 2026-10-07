@@ -5,6 +5,7 @@ use std::error::Error;
 use std::time::Instant;
 
 use crate::api::types::Task;
+use crate::capability::execution::CapabilityExecutionContext;
 use crate::scan::service::normalize_scan_text;
 use crate::{report_task, Options};
 
@@ -36,36 +37,47 @@ pub(crate) fn execute_sync_exhibits(
     agent_id: &str,
     task: &Task,
 ) -> Result<Value, Box<dyn Error>> {
+    let mut cancel_guard = crate::api::client::TaskCancelGuard::new();
+    let mut execution_context = CapabilityExecutionContext::new(
+        task.id.clone(),
+        "inner_admin.sync_exhibits",
+        "inner_admin",
+        || cancel_guard.check(dashboard_client, options, agent_id, &task.id),
+        |progress, detail| {
+            report_task(
+                dashboard_client,
+                options,
+                agent_id,
+                &task.id,
+                "running",
+                progress,
+                detail,
+                None,
+                None,
+            )
+        },
+    );
+    execute_sync_exhibits_with_context(options, &mut execution_context)
+}
+
+pub(crate) fn execute_sync_exhibits_with_context(
+    options: &Options,
+    execution: &mut CapabilityExecutionContext<'_>,
+) -> Result<Value, Box<dyn Error>> {
     let base = inner_admin_base();
     let client = inner_admin_client()?;
     let started = Instant::now();
     inner_admin_login(&client, &base, !options.local_app)?;
-    report_task(
-        dashboard_client,
-        options,
-        agent_id,
-        &task.id,
-        "running",
-        22,
-        "内网登录成功，读取个人待上传展项",
-        None,
-        None,
-    )?;
+    execution.report_progress(22, "内网登录成功，读取个人待上传展项")?;
     let mut exhibits = Vec::new();
     let mut pages_read = 0;
     for page in 1..=100 {
         pages_read = page;
         let progress = std::cmp::min(60, 24 + page * 3);
-        report_task(
-            dashboard_client,
-            options,
-            agent_id,
-            &task.id,
-            "running",
+        execution.check_cancelled()?;
+        execution.report_progress(
             progress,
             &format!("读取未上传展项第 {} 页，已同步 {} 个", page, exhibits.len()),
-            None,
-            None,
         )?;
         let url = if page == 1 {
             format!("{}/admin/personal/software_code", base)
@@ -80,20 +92,13 @@ pub(crate) fn execute_sync_exhibits(
         if page_items.is_empty() {
             break;
         }
-        report_task(
-            dashboard_client,
-            options,
-            agent_id,
-            &task.id,
-            "running",
+        execution.report_progress(
             progress,
             &format!(
                 "第 {} 页完成：累计 {} 个待上传展项",
                 page,
                 exhibits.len() + page_items.len()
             ),
-            None,
-            None,
         )?;
         exhibits.extend(page_items);
         if !html.contains(&format!("software_code?page={}", page + 1)) {

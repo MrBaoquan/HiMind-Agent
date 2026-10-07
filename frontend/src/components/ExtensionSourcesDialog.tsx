@@ -478,6 +478,7 @@ function unitAssetCounts(unit: ExtensionDistributionUnit) {
   if (unit.plugin_count) parts.push(`${unit.plugin_count} 插件`);
   if (unit.skill_count) parts.push(`${unit.skill_count} 技能`);
   if (unit.workflow_count) parts.push(`${unit.workflow_count} 工作流`);
+  if (unit.expert_count) parts.push(`${unit.expert_count} 专家`);
   return parts;
 }
 
@@ -489,6 +490,7 @@ function memberAssetCounts(group: UnitGroup, statuses: Map<string, ExtensionSour
   if (status.plugin_count) parts.push(`${status.plugin_count} 插件`);
   if (status.skill_count) parts.push(`${status.skill_count} 技能`);
   if (status.workflow_count) parts.push(`${status.workflow_count} 工作流`);
+  if (status.expert_count) parts.push(`${status.expert_count} 专家`);
   return parts;
 }
 

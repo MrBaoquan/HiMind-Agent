@@ -476,6 +476,11 @@ mod tests {
         let task = Task {
             id: "task-1".to_string(),
             task_type: "agent_run".to_string(),
+            created_by_user_id: String::new(),
+            source: String::new(),
+            execution_role: String::new(),
+            capability: String::new(),
+            dedupe_key: String::new(),
             detail: None,
             payload: Some(json!({
                 "run_id":"run-1",
@@ -500,6 +505,11 @@ mod tests {
         let task = Task {
             id: "tsk_1".to_string(),
             task_type: "agent_run".to_string(),
+            created_by_user_id: String::new(),
+            source: String::new(),
+            execution_role: String::new(),
+            capability: String::new(),
+            dedupe_key: String::new(),
             detail: None,
             payload: Some(json!({})),
             execution_id: String::new(),

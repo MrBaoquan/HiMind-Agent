@@ -138,12 +138,8 @@ pub(crate) fn materialize_expert_project(
     version: Option<String>,
 ) -> Result<crate::extension_projects::ExtensionProject, String> {
     let parent = crate::extension_workspace::validate_authoring_root(workspace_root.trim())?;
-    crate::extension_projects::materialize_expert_project(
-        &parent,
-        &expert_id,
-        version.as_deref(),
-    )
-    .map_err(|error| error.to_string())
+    crate::extension_projects::materialize_expert_project(&parent, &expert_id, version.as_deref())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2603,7 +2599,9 @@ pub(crate) async fn stop_inference_gateway_and_unbind(
                 &options, &user_id, client,
             ) {
                 Ok(_) => switched.push(client.clone()),
-                Err(error) => failures.push(json!({ "client": client, "error": error.to_string() })),
+                Err(error) => {
+                    failures.push(json!({ "client": client, "error": error.to_string() }))
+                }
             }
         }
         let stopped = if failures.is_empty() {
@@ -3259,6 +3257,22 @@ pub(crate) async fn install_expert_market(
     let gateway = state.capability_gateway.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let options = gateway.options().clone();
+        if let Ok(snapshot) = crate::app::extension_source::snapshot() {
+            if let Some(item) = snapshot.experts.iter().find(|item| {
+                item.expert_id == expert_id
+                    && version.as_deref().map(|value| value == item.version).unwrap_or(true)
+                    && item.source.starts_with("local:")
+            }) {
+                let source_id = item.source.strip_prefix("local:").unwrap_or_default();
+                let summary = crate::app::extension_source::install_expert_bound(
+                    &item.expert_id,
+                    &item.version,
+                    source_id,
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(serde_json::json!({"expert": summary, "projection_required": false, "activated": false}));
+            }
+        }
         let state = crate::api::client::load_agent_state(&options.state_path).map_err(|error| error.to_string())?;
         options.set_agent_credential(&state.credential);
         let input = serde_json::json!({"kind":"expert","id":expert_id,"version":version,"artifact_id":artifact_id,"sha256":sha256});
@@ -6867,28 +6881,33 @@ fn workflow_center_snapshot(
     options: &crate::Options,
     light: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let store = crate::workflow::WorkflowStore::open_default()?;
     let ledger = crate::store::local_runs::LocalRunLedger::open_default()?;
-    let metrics = crate::workflow::workflow_metrics_by_package(&ledger)?;
     let mut workflows = Vec::new();
     let mut workflow_names = std::collections::HashMap::<String, String>::new();
-    // 坏包降级成一条 issue 输出给 UI，不再让单个读取失败的制品把整份「我的能力」打空。
-    let (installed, library_issues) = store.list_with_issues()?;
-    for item in installed {
-        let view = store.view_json(&item.package)?;
-        workflow_names.insert(item.package.id.clone(), item.package.name.clone());
-        workflows.push(json!({
-            "package": item.package,
-            "enabled": item.enabled,
-            "previous_version": item.previous_version,
-            "package_digest": item.package_digest,
-            "source": item.source,
-            "installed_at": item.installed_at,
-            "updated_at": item.updated_at,
-            "view": view,
-            "metrics": metrics.get(&item.package.id).cloned().unwrap_or_default(),
-        }));
-    }
+    let library_issues = if light {
+        Vec::new()
+    } else {
+        let store = crate::workflow::WorkflowStore::open_default()?;
+        let metrics = crate::workflow::workflow_metrics_by_package(&ledger)?;
+        // 坏包降级成一条 issue 输出给 UI，不再让单个读取失败的制品把整份「我的能力」打空。
+        let (installed, issues) = store.list_with_issues()?;
+        for item in installed {
+            let view = store.view_json(&item.package)?;
+            workflow_names.insert(item.package.id.clone(), item.package.name.clone());
+            workflows.push(json!({
+                "package": item.package,
+                "enabled": item.enabled,
+                "previous_version": item.previous_version,
+                "package_digest": item.package_digest,
+                "source": item.source,
+                "installed_at": item.installed_at,
+                "updated_at": item.updated_at,
+                "view": view,
+                "metrics": metrics.get(&item.package.id).cloned().unwrap_or_default(),
+            }));
+        }
+        issues
+    };
     let mut runs = Vec::new();
     for run in ledger
         .list_runs(100)?
@@ -6935,7 +6954,11 @@ fn workflow_center_snapshot(
             .and_then(|request| request.get("required_action"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let projections = ledger.projections_for_aggregate(&run.run_id, 100)?;
+        let projections = if light {
+            Vec::new()
+        } else {
+            ledger.projections_for_aggregate(&run.run_id, 100)?
+        };
         let projection_status = projections
             .first()
             .map(|projection| projection.status.clone())

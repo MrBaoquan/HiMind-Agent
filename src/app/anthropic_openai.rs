@@ -65,7 +65,10 @@ pub(crate) fn request_to_openai(body: &Value, default_model: &str) -> Result<Val
     translated.insert("stream".to_string(), json!(streaming));
     if streaming {
         // OpenAI 的流式响应默认不带用量，必须显式要求。
-        translated.insert("stream_options".to_string(), json!({ "include_usage": true }));
+        translated.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
     }
     Ok(Value::Object(translated))
 }
@@ -101,7 +104,10 @@ fn translate_message(message: &Value, out: &mut Vec<Value>) -> Result<(), String
                     }
                     Some("tool_use") => {
                         let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
                         let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
                         tool_calls.push(json!({
                             "id": id,
@@ -535,10 +541,16 @@ mod tests {
         });
         let translated = request_to_openai(&request, "fallback").unwrap();
         assert_eq!(translated["model"], "fallback");
-        assert_eq!(translated["messages"][0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(
+            translated["messages"][0]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
         assert_eq!(translated["messages"][1]["role"], "tool");
         assert_eq!(translated["messages"][1]["content"], "内容");
-        assert_eq!(translated["tools"][0]["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            translated["tools"][0]["function"]["parameters"]["type"],
+            "object"
+        );
         assert_eq!(translated["tool_choice"], "auto");
     }
 
@@ -547,7 +559,9 @@ mod tests {
         let request = json!({
             "messages": [{ "role": "user", "content": [{ "type": "image", "source": {} }] }]
         });
-        assert!(request_to_openai(&request, "m").unwrap_err().contains("图片"));
+        assert!(request_to_openai(&request, "m")
+            .unwrap_err()
+            .contains("图片"));
     }
 
     #[test]
@@ -592,7 +606,10 @@ mod tests {
         let block = out.find("event: content_block_start").unwrap();
         let stop = out.find("event: content_block_stop").unwrap();
         let delta = out.find("event: message_delta").unwrap();
-        assert!(start < block && block < stop && stop < delta, "事件顺序必须是 Anthropic 的规范序");
+        assert!(
+            start < block && block < stop && stop < delta,
+            "事件顺序必须是 Anthropic 的规范序"
+        );
         assert_eq!(stream.usage(), (7, 2));
     }
 

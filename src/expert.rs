@@ -178,6 +178,19 @@ pub(crate) struct ExpertProjectionReceipt {
     pub workspace_root: String,
     pub target_path: String,
     pub content_digest: String,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub previous_digest: String,
+    #[serde(default)]
+    pub backup_path: String,
+    /// 文件已经写入并校验，不代表外部客户端已经在会话中加载。
+    #[serde(default)]
+    pub sync_status: String,
+    #[serde(default)]
+    pub verification_status: String,
+    #[serde(default)]
+    pub message: String,
     pub projected_at: String,
 }
 
@@ -281,18 +294,50 @@ pub(crate) fn project_to_client(
         _ => unreachable!("target client was validated above"),
     };
     let marker = "<!-- HiMind managed expert projection -->";
-    if target.is_file() {
-        let existing = fs::read_to_string(&target)?;
+    let existing = if target.is_file() {
+        Some(fs::read_to_string(&target)?)
+    } else {
+        None
+    };
+    if let Some(existing) = existing.as_ref() {
         if !existing.contains(marker) {
             return Err("客户端专家文件已存在且不是 HiMind 管理内容".into());
         }
     }
+    let expert_digest = digest(&definition)?;
+    let content_digest = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+    let previous_digest = existing
+        .as_ref()
+        .map(|value| format!("sha256:{:x}", Sha256::digest(value.as_bytes())))
+        .unwrap_or_default();
+    let changed = existing.as_deref() != Some(content.as_str());
+    let backup_path = if changed && target.is_file() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or_default();
+        let backup = target.with_file_name(format!(
+            "{}.himind-expert-backup-{stamp}.bak",
+            target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("expert")
+        ));
+        fs::copy(&target, &backup)?;
+        backup.to_string_lossy().to_string()
+    } else {
+        String::new()
+    };
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::store::atomic_file::atomic_write(&target, content.as_bytes())?;
-    let expert_digest = digest(&definition)?;
-    let content_digest = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+    if changed {
+        crate::store::atomic_file::atomic_write(&target, content.as_bytes())?;
+    }
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(fs::read(&target)?));
+    if actual_digest != content_digest {
+        return Err("客户端专家文件写入校验失败".into());
+    }
     let receipt = ExpertProjectionReceipt {
         schema_version: "expert_projection.v1".to_string(),
         expert_id: definition.id,
@@ -302,6 +347,16 @@ pub(crate) fn project_to_client(
         workspace_root: workspace.to_string_lossy().to_string(),
         target_path: target.to_string_lossy().to_string(),
         content_digest,
+        changed,
+        previous_digest,
+        backup_path,
+        sync_status: if changed {
+            "file_written".to_string()
+        } else {
+            "file_unchanged".to_string()
+        },
+        verification_status: "file_verified_client_load_unverified".to_string(),
+        message: "文件已写入并校验；外部客户端会话是否加载由客户端负责".to_string(),
         projected_at: now_stamp(),
     };
     let receipt_key = format!(
@@ -508,17 +563,7 @@ fn yaml_block_scalar(value: &str, indent: usize) -> String {
 /// 每个专家一条 `@deepseek-ai/dsh-agent-preset` 声明；预设 id 冲突时追加摘要
 /// 后缀，因为 DSH 遇到重复预设 id 会拒绝加载整份声明。
 pub(crate) fn dsh_preset_document() -> Result<String, Box<dyn Error>> {
-    let mut definitions = builtin_definitions();
-    for definition in stored_definitions()? {
-        if let Some(existing) = definitions
-            .iter_mut()
-            .find(|item| item.id == definition.id && item.version == definition.version)
-        {
-            *existing = definition;
-        } else {
-            definitions.push(definition);
-        }
-    }
+    let mut definitions = stored_definitions()?;
     definitions.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -573,20 +618,10 @@ pub(crate) fn dsh_preset_document() -> Result<String, Box<dyn Error>> {
 
 pub(crate) fn list() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
     let active = active()?;
-    let mut definitions = builtin_definitions();
-    for definition in stored_definitions()? {
-        if let Some(existing) = definitions
-            .iter_mut()
-            .find(|item| item.id == definition.id && item.version == definition.version)
-        {
-            *existing = definition;
-        } else {
-            definitions.push(definition);
-        }
-    }
+    let mut definitions = stored_definitions()?;
     let mut result = definitions
         .into_iter()
-        .map(|definition| summary(&definition, active.as_ref(), is_builtin(&definition)))
+        .map(|definition| summary(&definition, active.as_ref(), false))
         .collect::<Vec<_>>();
     result.sort_by(|left, right| {
         left.name
@@ -598,9 +633,8 @@ pub(crate) fn list() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
 
 pub(crate) fn get(id: &str, version: Option<&str>) -> Result<ExpertDefinition, Box<dyn Error>> {
     let id = validate_id(id)?;
-    let candidates = builtin_definitions()
+    let candidates = stored_definitions()?
         .into_iter()
-        .chain(stored_definitions()?.into_iter())
         .filter(|item| item.id == id && version.map(|v| v == item.version).unwrap_or(true))
         .collect::<Vec<_>>();
     candidates
@@ -631,9 +665,6 @@ pub(crate) fn save(input: ExpertDraftInput) -> Result<ExpertSummary, Box<dyn Err
     };
     validate(&definition)?;
     let root = store_version_root(&definition.id, &definition.version);
-    if is_builtin(&definition) {
-        return Err("不能覆盖 HiMind 内置专家".into());
-    }
     if root.exists() {
         let existing: ExpertDefinition =
             serde_json::from_slice(&fs::read(root.join("expert.json"))?)?;
@@ -653,6 +684,31 @@ pub(crate) fn save(input: ExpertDraftInput) -> Result<ExpertSummary, Box<dyn Err
 
 pub(crate) fn validate_definition(definition: &ExpertDefinition) -> Result<(), Box<dyn Error>> {
     validate(definition)
+}
+
+/// Install an expert definition discovered from a trusted local extension source.
+/// The source remains authoritative; this only copies the version into the
+/// Agent store so it becomes available to sessions and DSH presets.
+pub(crate) fn install_local_definition(
+    definition: ExpertDefinition,
+) -> Result<ExpertSummary, Box<dyn Error>> {
+    validate(&definition)?;
+    let root = store_version_root(&definition.id, &definition.version);
+    if root.exists() {
+        let existing: ExpertDefinition =
+            serde_json::from_slice(&fs::read(root.join("expert.json"))?)?;
+        if digest(&existing)? != digest(&definition)? {
+            return Err("本机已存在相同版本的不同专家内容".into());
+        }
+        return Ok(summary(&existing, active()?.as_ref(), false));
+    }
+    fs::create_dir_all(&root)?;
+    fs::write(
+        root.join("expert.json"),
+        serde_json::to_vec_pretty(&definition)?,
+    )?;
+    fs::write(root.join("EXPERT.md"), definition.instructions.as_bytes())?;
+    Ok(summary(&definition, active()?.as_ref(), false))
 }
 
 pub(crate) fn build_workspace_candidate(
@@ -815,7 +871,7 @@ pub(crate) fn export_package(
     archive.write_all(checksums.as_bytes())?;
     archive.finish()?;
     Ok(ExpertPackageResult {
-        expert: summary(&definition, active()?.as_ref(), is_builtin(&definition)),
+        expert: summary(&definition, active()?.as_ref(), false),
         package_sha256: format!("sha256:{:x}", Sha256::digest(fs::read(package_path)?)),
         package_path: package_path.to_path_buf(),
     })
@@ -898,9 +954,6 @@ pub(crate) fn import_package(package_path: &Path) -> Result<ExpertSummary, Box<d
         return Err("expert.json 与 EXPERT.md 内容不一致".into());
     }
     validate(&definition)?;
-    if is_builtin(&definition) {
-        return Err("不能导入覆盖 HiMind 内置专家".into());
-    }
     let root = store_version_root(&definition.id, &definition.version);
     if root.exists() {
         let existing: ExpertDefinition =
@@ -975,12 +1028,36 @@ pub(crate) fn active_definition() -> Result<Option<ExpertDefinition>, Box<dyn Er
 pub(crate) fn active_definition_for_workspace(
     workspace: Option<&Path>,
 ) -> Result<Option<ExpertDefinition>, Box<dyn Error>> {
-    let Some(active) = active_for_workspace(workspace)? else {
+    let activation_path = workspace
+        .map(workspace_active_path)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(active_path);
+    let Some(active) = active_from_path(&activation_path)? else {
         return Ok(None);
     };
-    let definition = get(&active.expert_id, Some(&active.version))?;
+    let definition = match get(&active.expert_id, Some(&active.version)) {
+        Ok(definition) => definition,
+        Err(error) if error.to_string().contains("未找到专家") => {
+            // An expert can be removed or replaced after a client persisted its
+            // selection. A stale optional persona must never prevent DSH from
+            // starting; remove only the managed activation marker and continue
+            // with the normal no-expert session.
+            let _ = fs::remove_file(&activation_path);
+            eprintln!(
+                "HiMind: 已清理失效专家选择 {}@{}",
+                active.expert_id, active.version
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     if digest(&definition)? != active.digest {
-        return Err("当前专家版本摘要不匹配，请重新选择专家".into());
+        let _ = fs::remove_file(&activation_path);
+        eprintln!(
+            "HiMind: 已清理摘要失效的专家选择 {}@{}",
+            active.expert_id, active.version
+        );
+        return Ok(None);
     }
     Ok(Some(definition))
 }
@@ -1041,72 +1118,6 @@ fn summary(
     }
 }
 
-fn builtin_definitions() -> Vec<ExpertDefinition> {
-    vec![
-        builtin(
-            "com.himind.expert.software-engineer",
-            "软件工程师",
-            "负责代码修改、测试验证和工程交付。",
-            "先理解现状，再修改、验证并交付可复现结果。",
-        ),
-        builtin(
-            "com.himind.expert.project-architect",
-            "项目架构师",
-            "负责系统边界、技术方案和长期演进判断。",
-            "先澄清目标与约束，再给出可实施、可演进的方案。",
-        ),
-        builtin(
-            "com.himind.expert.senior-system-architect",
-            "高级系统架构师",
-            "负责复杂系统的边界、架构权衡、可靠性和长期演进。",
-            "先建立问题和约束模型，再划分边界、比较方案、识别风险，并给出可验证的演进路径。优先保护数据一致性、可观测性、故障恢复和团队交付效率。",
-        ),
-        builtin(
-            "com.himind.expert.senior-ui-designer",
-            "高级 UI 设计师",
-            "负责复杂产品的信息架构、交互流程、视觉层级和可用性。",
-            "先理解用户目标和使用场景，再设计信息架构、关键路径、状态和组件规范。减少解释性噪音，确保界面可扫描、可操作、可恢复，并用真实交互验证设计结论。",
-        ),
-        builtin(
-            "com.himind.expert.senior-test-engineer",
-            "高级测试工程师",
-            "负责风险建模、测试策略、自动化验证和发布质量判断。",
-            "先识别高风险行为和验收标准，再设计最小充分的测试矩阵。优先验证真实用户路径、边界条件、失败恢复和回归风险，报告必须包含可复现证据和未覆盖范围。",
-        ),
-    ]
-}
-
-fn builtin(id: &str, name: &str, description: &str, instructions: &str) -> ExpertDefinition {
-    ExpertDefinition {
-        schema_version: EXPERT_SCHEMA_VERSION.into(),
-        id: id.into(),
-        name: name.into(),
-        author: "HiMind".into(),
-        categories: vec!["内置专家".into()],
-        version: "1.0.0".into(),
-        release_notes: "HiMind 内置专家。".into(),
-        min_agent_version: crate::VERSION.into(),
-        description: description.into(),
-        supported_clients: vec![
-            "himind-dsh".into(),
-            "codex".into(),
-            "github-copilot".into(),
-            "claude-code".into(),
-            "cursor".into(),
-            "windsurf".into(),
-            "cline".into(),
-            "portable".into(),
-        ],
-        skill_refs: Vec::new(),
-        workflow_refs: Vec::new(),
-        capability_refs: Vec::new(),
-        contents: vec!["EXPERT.md".into()],
-        instructions: instructions.into(),
-        output_contract: ExpertOutputContract::default(),
-        harness: ExpertHarness::default(),
-    }
-}
-
 fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
     let root = store_root();
     if !root.is_dir() {
@@ -1117,7 +1128,16 @@ fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
         .flatten()
         .filter(|entry| entry.path().is_dir())
     {
-        for version_dir in fs::read_dir(id_dir.path())?
+        // Versioned experts are stored under `<id>/versions/<version>`. Keep
+        // reading the legacy `<id>/<version>` layout so upgrades do not make
+        // previously installed assets disappear.
+        let versions_root = id_dir.path().join("versions");
+        let versions_root = if versions_root.is_dir() {
+            versions_root
+        } else {
+            id_dir.path()
+        };
+        for version_dir in fs::read_dir(versions_root)?
             .flatten()
             .filter(|entry| entry.path().is_dir())
         {
@@ -1184,11 +1204,6 @@ fn workspace_active_path(workspace: &Path) -> PathBuf {
     store_root()
         .join("workspaces")
         .join(format!("{digest}.json"))
-}
-fn is_builtin(definition: &ExpertDefinition) -> bool {
-    builtin_definitions()
-        .iter()
-        .any(|item| item.id == definition.id && item.version == definition.version)
 }
 fn now_stamp() -> String {
     SystemTime::now()
@@ -1260,25 +1275,55 @@ mod tests {
     use super::*;
     use crate::store::paths::test_env_lock;
 
-    #[test]
-    fn builtins_are_listed_and_have_stable_digest() {
-        let items = builtin_definitions();
-        assert_eq!(items.len(), 5);
-        assert_eq!(digest(&items[0]).unwrap(), digest(&items[0]).unwrap());
-        assert!(items
-            .iter()
-            .all(|item| item.supported_clients.contains(&"codex".to_string())));
+    fn test_definition(id: &str, name: &str, instructions: &str) -> ExpertDefinition {
+        ExpertDefinition {
+            schema_version: EXPERT_SCHEMA_VERSION.into(),
+            id: id.into(),
+            name: name.into(),
+            author: "测试扩展".into(),
+            categories: vec!["software-engineering".into()],
+            version: "1.0.0".into(),
+            release_notes: "测试版本".into(),
+            min_agent_version: crate::VERSION.into(),
+            description: format!("{name}测试定义"),
+            supported_clients: vec!["codex".into(), "portable".into()],
+            skill_refs: Vec::new(),
+            workflow_refs: Vec::new(),
+            capability_refs: Vec::new(),
+            contents: vec!["EXPERT.md".into()],
+            instructions: instructions.into(),
+            output_contract: ExpertOutputContract::default(),
+            harness: ExpertHarness::default(),
+        }
+    }
+
+    fn store_test_definition(definition: &ExpertDefinition) {
+        let root = store_version_root(&definition.id, &definition.version);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("expert.json"),
+            serde_json::to_vec_pretty(definition).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("EXPERT.md"), definition.instructions.as_bytes()).unwrap();
     }
 
     #[test]
-    fn builtins_include_core_delivery_roles() {
-        let names = builtin_definitions()
-            .into_iter()
-            .map(|item| item.name)
-            .collect::<Vec<_>>();
-        assert!(names.iter().any(|name| name == "高级系统架构师"));
-        assert!(names.iter().any(|name| name == "高级 UI 设计师"));
-        assert!(names.iter().any(|name| name == "高级测试工程师"));
+    fn experts_are_empty_until_an_extension_is_installed() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!("himind-expert-empty-{}", std::process::id()));
+        let old = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        assert!(list().unwrap().is_empty());
+        assert_eq!(
+            dsh_preset_document().unwrap(),
+            format!("{DSH_PRESET_FILE_HEADER}[]\n")
+        );
+        match old {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1300,9 +1345,7 @@ mod tests {
         ] {
             assert!(value
                 .chars()
-                .all(|item| item.is_ascii_lowercase()
-                    || item.is_ascii_digit()
-                    || item == '-'));
+                .all(|item| item.is_ascii_lowercase() || item.is_ascii_digit() || item == '-'));
             assert!(!value.starts_with('-') && !value.ends_with('-'));
         }
     }
@@ -1310,17 +1353,21 @@ mod tests {
     #[test]
     fn dsh_preset_document_declares_each_expert_once() {
         let _guard = test_env_lock();
-        let root = std::env::temp_dir().join(format!(
-            "himind-expert-dsh-preset-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("himind-expert-dsh-preset-{}", std::process::id()));
         let old = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         fs::create_dir_all(&root).unwrap();
 
+        let definitions = vec![
+            test_definition("com.himind.expert.one", "专家一", "第一条"),
+            test_definition("com.himind.expert.two", "专家二", "第二条"),
+        ];
+        for definition in &definitions {
+            store_test_definition(definition);
+        }
         let document = dsh_preset_document().unwrap();
-        let builtins = builtin_definitions();
-        for definition in &builtins {
+        for definition in &definitions {
             let preset_id = dsh_preset_id(&definition.id);
             assert_eq!(
                 document
@@ -1334,7 +1381,7 @@ mod tests {
         }
         assert_eq!(
             document.matches("- id: preset-").count(),
-            builtins.len(),
+            definitions.len(),
             "每个专家一条声明，不能多也不能少"
         );
         // 专家预设自带完整能力面，不依赖 profile 里的 HiMind 私有行。
@@ -1358,10 +1405,9 @@ mod tests {
 
     #[test]
     fn dsh_persona_neutralizes_user_template_braces() {
-        let definition = builtin(
+        let definition = test_definition(
             "com.himind.expert.brace-probe",
             "括号探针",
-            "探针",
             "正文包含 {{model}} 模板片段",
         );
         let persona = dsh_expert_persona(&definition);
@@ -1377,6 +1423,17 @@ mod tests {
         let old = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         fs::create_dir_all(&root).unwrap();
+
+        for (id, name) in [
+            ("com.himind.expert.senior-ui-designer", "高级 UI 设计师"),
+            ("com.himind.expert.senior-test-engineer", "高级测试工程师"),
+            (
+                "com.himind.expert.senior-system-architect",
+                "高级系统架构师",
+            ),
+        ] {
+            store_test_definition(&test_definition(id, name, "测试专家说明"));
+        }
 
         let copilot = project_to_client(
             "com.himind.expert.senior-ui-designer",
@@ -1435,6 +1492,29 @@ mod tests {
             .contains("kind: skill"));
         assert!(root.join(".himind").join("experts.md").is_file());
 
+        let unchanged = project_to_client(
+            "com.himind.expert.senior-ui-designer",
+            None,
+            "github-copilot",
+            &root,
+        )
+        .unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(
+            unchanged.verification_status,
+            "file_verified_client_load_unverified"
+        );
+
+        fs::write(&copilot.target_path, "user-owned expert file\n").unwrap();
+        let conflict = project_to_client(
+            "com.himind.expert.senior-ui-designer",
+            None,
+            "github-copilot",
+            &root,
+        )
+        .unwrap_err();
+        assert!(conflict.to_string().contains("不是 HiMind 管理内容"));
+
         match old {
             Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
             None => std::env::remove_var("HIMIND_AGENT_HOME"),
@@ -1448,6 +1528,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("himind-expert-test-{}", std::process::id()));
         let old = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &root);
+        store_test_definition(&test_definition(
+            "com.himind.expert.software-engineer",
+            "软件工程师",
+            "测试工程师说明",
+        ));
         let activated = activate("com.himind.expert.software-engineer", None, None).unwrap();
         assert_eq!(active().unwrap(), Some(activated.clone()));
         assert_eq!(
@@ -1472,6 +1557,17 @@ mod tests {
         std::env::set_var("HIMIND_AGENT_HOME", &root);
         fs::create_dir_all(&workspace_a).unwrap();
         fs::create_dir_all(&workspace_b).unwrap();
+
+        store_test_definition(&test_definition(
+            "com.himind.expert.software-engineer",
+            "软件工程师",
+            "软件工程师说明",
+        ));
+        store_test_definition(&test_definition(
+            "com.himind.expert.senior-system-architect",
+            "高级系统架构师",
+            "系统架构师说明",
+        ));
 
         let global = activate("com.himind.expert.software-engineer", None, None).unwrap();
         let scoped = activate(

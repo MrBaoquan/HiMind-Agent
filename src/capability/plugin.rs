@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -24,6 +24,15 @@ const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 由能力改成分页或返回引用，而不是继续抬高上限。
 const DEFAULT_MAX_PLUGIN_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLUGIN_STDERR_BYTES: usize = 64 * 1024;
+const PLUGIN_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+struct ActiveInvocationGuard;
+
+impl Drop for ActiveInvocationGuard {
+    fn drop(&mut self) {
+        ACTIVE_INVOCATIONS.fetch_sub(1, Ordering::Release);
+    }
+}
 
 /// "最近失败"作为降级信号的有效窗口。
 ///
@@ -408,10 +417,12 @@ fn merge_development_items(
         {
             continue;
         }
-        let index = items
-            .iter()
-            .position(|item| item.id == development_item.id)
-            .expect("已安装副本在上面已经确认存在");
+        let Some(index) = items.iter().position(|item| item.id == development_item.id) else {
+            // 条目可能在扫描期间被移除；把这次开发登记视为独立条目，
+            // 不让一个目录竞争把 Agent 线程打崩。
+            items.push(development_item);
+            continue;
+        };
         let mut taken_over = development_item;
         taken_over.overrides_installed_version = Some(installed_version);
         items[index] = taken_over;
@@ -1198,6 +1209,7 @@ fn invoke_plugin_capability_for_item(
         ACTIVE_INVOCATIONS.fetch_sub(1, Ordering::Release);
         return Err("plugin invocation limit reached".into());
     }
+    let _active_invocation = ActiveInvocationGuard;
 
     let result = invoke_plugin_process(
         &plugin,
@@ -1224,7 +1236,6 @@ fn invoke_plugin_capability_for_item(
             record_plugin_failure(&health_root, &error.to_string());
         }
     }
-    ACTIVE_INVOCATIONS.fetch_sub(1, Ordering::Release);
     result
 }
 
@@ -1290,21 +1301,24 @@ fn invoke_plugin_process(
     // `child.wait()` blocks until the plugin timeout because the server keeps
     // waiting for another request.
     {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("plugin stdin unavailable: {}", plugin.id))?;
-        writeln!(stdin, "{}", request)?;
+        let Some(mut stdin) = child.stdin.take() else {
+            terminate_plugin_child(&mut child);
+            return Err(format!("plugin stdin unavailable: {}", plugin.id).into());
+        };
+        if let Err(error) = writeln!(stdin, "{}", request) {
+            terminate_plugin_child(&mut child);
+            return Err(error.into());
+        }
     }
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("plugin stdout unavailable: {}", plugin.id))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("plugin stderr unavailable: {}", plugin.id))?;
+    let Some(stdout) = child.stdout.take() else {
+        terminate_plugin_child(&mut child);
+        return Err(format!("plugin stdout unavailable: {}", plugin.id).into());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_plugin_child(&mut child);
+        return Err(format!("plugin stderr unavailable: {}", plugin.id).into());
+    };
     let (response_tx, response_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -1323,10 +1337,13 @@ fn invoke_plugin_process(
     });
 
     let response_bytes = match response_rx.recv_timeout(timeout) {
-        Ok(result) => result?,
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            terminate_plugin_child(&mut child);
+            return Err(error.into());
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_plugin_child(&mut child);
             return Err(format!(
                 "plugin timed out after {} seconds: {}",
                 timeout.as_secs(),
@@ -1335,13 +1352,26 @@ fn invoke_plugin_process(
             .into());
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_plugin_child(&mut child);
             return Err(format!("plugin output channel closed: {}", plugin.id).into());
         }
     };
 
-    let status = child.wait()?;
+    let status = match wait_plugin_child(&mut child) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            terminate_plugin_child(&mut child);
+            return Err(format!(
+                "plugin did not exit after returning a response: {}",
+                plugin.id
+            )
+            .into());
+        }
+        Err(error) => {
+            terminate_plugin_child(&mut child);
+            return Err(error.into());
+        }
+    };
     if !status.success() {
         return Err(format!("plugin exited with status: {status}").into());
     }
@@ -1371,6 +1401,26 @@ fn invoke_plugin_process(
         .into());
     }
     Ok(response.get("result").cloned().unwrap_or(response))
+}
+
+fn terminate_plugin_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_plugin_child(
+    child: &mut std::process::Child,
+) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
+    let deadline = Instant::now() + PLUGIN_EXIT_GRACE_PERIOD;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn trusted_plugin_dashboard_url<'a>(

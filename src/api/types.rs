@@ -80,6 +80,16 @@ pub struct Task {
     pub id: String,
     #[serde(rename = "type")]
     pub task_type: String,
+    #[serde(default)]
+    pub created_by_user_id: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub execution_role: String,
+    #[serde(default)]
+    pub capability: String,
+    #[serde(default)]
+    pub dedupe_key: String,
     pub detail: Option<String>,
     pub payload: Option<Value>,
     #[serde(default)]
@@ -88,6 +98,25 @@ pub struct Task {
     pub lease_id: String,
     #[serde(default)]
     pub lease_expires_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Task;
+
+    #[test]
+    fn task_metadata_is_backward_compatible_with_legacy_poll_payloads() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "task-1",
+            "type": "scan_projects"
+        }))
+        .unwrap();
+        assert!(task.created_by_user_id.is_empty());
+        assert!(task.source.is_empty());
+        assert!(task.execution_role.is_empty());
+        assert!(task.capability.is_empty());
+        assert!(task.dedupe_key.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

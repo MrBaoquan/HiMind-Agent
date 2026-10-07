@@ -143,8 +143,10 @@ export function ExpertStudioPanel({ experts, expertCatalog = [], activeExpert, c
     }
     setBusy(`project:${expert.id}:${clientId}`);
     try {
-      await agentApi.projectExpertToClient(expert.id, clientId, workspaceRoot, expert.version);
-      onNotify(`${expert.name} 已同步到 ${clientLabel(clientId)}`, 'success');
+      const receipt = await agentApi.projectExpertToClient(expert.id, clientId, workspaceRoot, expert.version);
+      onNotify(receipt.changed === false
+        ? `${expert.name} 已是最新文件`
+        : `${expert.name} 已同步到 ${clientLabel(clientId)}；客户端加载状态由客户端确认`, 'success');
     } catch (error) {
       onNotify(readableError(error), 'error');
     } finally { setBusy(''); }
@@ -152,7 +154,7 @@ export function ExpertStudioPanel({ experts, expertCatalog = [], activeExpert, c
 
   return <section className={`expert-studio-panel${compact ? ' compact' : ''}`}>
     <div className="expert-studio-head">
-      <div><h3><GraduationCap size={15} />专家</h3><span>在对话中选择，或导入自己的工作方法。</span></div>
+      <div><h3><GraduationCap size={15} />专家</h3><span>供 AI 客户端选择的工作角色和工作标准。</span></div>
       <div className="expert-studio-actions">
         <button type="button" className="btn" disabled={busy === 'import'} onClick={() => void importPackage()}><FileUp size={14} />导入</button>
         {showAuthoring ? <button ref={createTriggerRef} type="button" className="btn btn-primary" onClick={() => setAuthoring(true)}><Plus size={14} />创建专家</button> : null}
@@ -163,7 +165,7 @@ export function ExpertStudioPanel({ experts, expertCatalog = [], activeExpert, c
       // 专家没有"启用/停用"这种持久状态：用不用由会话里的 AI 客户端按任务决定，
       // 所以卡片只描述这个专家是什么，以及能同步到哪些客户端。
       return <article className="expert-studio-item" key={`${expert.id}@${expert.version}`}>
-        <div className="expert-studio-copy"><div><strong title={expert.name}>{expert.name}</strong><Pill kind="neutral">v{expert.version}</Pill></div><p title={expert.description || undefined}>{expert.description || '可复用的专业工作方法。'}</p><small>{expertMeta(expert)}</small></div>
+        <div className="expert-studio-copy"><div><strong title={expert.name}>{expert.name}</strong><Pill kind="neutral">v{expert.version}</Pill></div><p title={expert.description || undefined}>{expert.description || '可复用的专家工作标准。'}</p><small>{expertMeta(expert)}</small></div>
         <div className="expert-studio-item-actions">
           {showProjection ? <ActionMenu label="同步到客户端" icon={<Send size={14} />} title={`同步${expert.name}到客户端`} disabled={Boolean(busy)}>
             {close => <>

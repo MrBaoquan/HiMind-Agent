@@ -27,7 +27,7 @@ pub(crate) struct SaveSvnConnectionRequest {
     pub password: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct SvnCheckoutRequest {
     pub project_id: String,
     pub exhibit_id: String,
@@ -42,7 +42,7 @@ pub(crate) struct CreateExhibitRepositoryPathRequest {
     pub exhibit_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct InitializeExhibitRepositoryRequest {
     pub project_id: String,
     pub exhibit_id: String,

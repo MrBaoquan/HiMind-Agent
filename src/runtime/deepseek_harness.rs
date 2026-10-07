@@ -821,69 +821,74 @@ fn prepare_interactive_launch_with(
             workspace,
         );
     }
-    let delegated = match crate::api::oauth::platform_access_token(
-        options,
-        crate::api::oauth::AI_CONVERSATION_SCOPE,
-    ) {
-        Ok(token) => token,
-        Err(error) => {
-            if fallback == ControlPlaneFallback::Fail {
-                return Err(error.to_string());
-            }
-            // HiMind AI 是主入口而不是准入门槛：工作台登录态缺失或过期时，
-            // 会话仍要按本机 Runtime 配置启动，让用户看到自己的工作区和会话
-            // 记录（这些属于本机 DSH 数据），并把真实原因原样带出去。
+    // The Dashboard is an optional control plane. A live OAuth token is not
+    // proof that its AI access endpoints are healthy: credential lookup can
+    // still return 500/502 while the local model configuration is usable.
+    // Keep the whole managed path inside the fallback boundary so every
+    // control-plane failure has the same independent-session behavior.
+    let managed_launch = (|| -> Result<InteractiveLaunch, String> {
+        let delegated = crate::api::oauth::platform_access_token(
+            options,
+            crate::api::oauth::AI_CONVERSATION_SCOPE,
+        )
+        .map_err(|error| error.to_string())?;
+        let credential =
+            crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
+                .map_err(|error| error.to_string())?;
+        let home = workspace_dsh_home(&version, &workspace)?;
+        let models = managed_model_catalog(&credential.access)?;
+        let model = credential.access.model.trim().to_string();
+        let sync_snapshot =
+            crate::app::builtin_ai_model_sync::snapshot(&delegated.user_id, &credential);
+        let invocation = Invocation {
+            executable: executable.clone(),
+            args: Vec::new(),
+            workspace: workspace.clone(),
+            home: home.clone(),
+            api_key: credential.api_key.clone(),
+            base_url: credential.access.base_url.clone(),
+            model: model.clone(),
+            models: models.clone(),
+            permission_mode: INTERACTIVE_PERMISSION_MODE,
+            run_id: "interactive".to_string(),
+            route_source: ModelRouteSource::Managed,
+        };
+        let agent_patch =
+            ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
+        Ok(InteractiveLaunch {
+            executable: PathBuf::from(executable.clone()),
+            home,
+            workspace: workspace.clone(),
+            user_id: delegated.user_id,
+            api_key: credential.api_key,
+            api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            base_url: credential.access.base_url,
+            agent_patch,
+            default_model: model,
+            models,
+            credential_fingerprint: sync_snapshot.credential_fingerprint,
+            catalog_fingerprint: sync_snapshot.catalog_fingerprint,
+            permission_mode: INTERACTIVE_PERMISSION_MODE,
+            service_source: "managed",
+            control_plane_notice: String::new(),
+        })
+    })();
+
+    match managed_launch {
+        Ok(launch) => Ok(launch),
+        Err(error) if fallback == ControlPlaneFallback::Degrade => {
             let mut launch = prepare_independent_interactive_launch(
                 options,
                 executable.to_string_lossy().to_string(),
                 version,
                 workspace,
             )?;
-            launch.control_plane_notice = degraded_notice(&error.to_string(), &launch);
+            launch.control_plane_notice = degraded_notice(&error, &launch);
             eprintln!("{}", launch.control_plane_notice);
-            return Ok(launch);
+            Ok(launch)
         }
-    };
-    let credential =
-        crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
-            .map_err(|error| error.to_string())?;
-    let home = workspace_dsh_home(&version, &workspace)?;
-    let models = managed_model_catalog(&credential.access)?;
-    let model = credential.access.model.trim().to_string();
-    let sync_snapshot =
-        crate::app::builtin_ai_model_sync::snapshot(&delegated.user_id, &credential);
-    let invocation = Invocation {
-        executable: executable.clone(),
-        args: Vec::new(),
-        workspace: workspace.clone(),
-        home: home.clone(),
-        api_key: credential.api_key.clone(),
-        base_url: credential.access.base_url.clone(),
-        model: model.clone(),
-        models: models.clone(),
-        permission_mode: INTERACTIVE_PERMISSION_MODE,
-        run_id: "interactive".to_string(),
-        route_source: ModelRouteSource::Managed,
-    };
-    let agent_patch =
-        ensure_home_config(&invocation, options).map_err(|error| error.to_string())?;
-    Ok(InteractiveLaunch {
-        executable: PathBuf::from(executable),
-        home,
-        workspace,
-        user_id: delegated.user_id,
-        api_key: credential.api_key,
-        api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
-        base_url: credential.access.base_url,
-        agent_patch,
-        default_model: model.clone(),
-        models: models.clone(),
-        credential_fingerprint: sync_snapshot.credential_fingerprint,
-        catalog_fingerprint: sync_snapshot.catalog_fingerprint,
-        permission_mode: INTERACTIVE_PERMISSION_MODE,
-        service_source: "managed",
-        control_plane_notice: String::new(),
-    })
+        Err(error) => Err(error),
+    }
 }
 
 /// 一次 Runtime 执行的产出与它实际用到的模型/服务。
@@ -5058,7 +5063,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let patch = root.join("cordis.patch.yml");
-        std::fs::write(&patch, "- id: system-prompt\n  config:\n    persona: keep-me\n").unwrap();
+        std::fs::write(
+            &patch,
+            "- id: system-prompt\n  config:\n    persona: keep-me\n",
+        )
+        .unwrap();
 
         super::ensure_expert_presets_include(&patch).unwrap();
         super::ensure_expert_presets_include(&patch).unwrap();

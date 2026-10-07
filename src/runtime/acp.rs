@@ -282,17 +282,24 @@ struct AcpSessionShared {
 
 impl AcpSessionShared {
     fn set_phase(&self, phase: &str) {
-        *self.phase.lock().unwrap() = phase.to_string();
+        if let Ok(mut current) = self.phase.lock() {
+            *current = phase.to_string();
+        }
     }
 
     fn phase(&self) -> String {
-        self.phase.lock().unwrap().clone()
+        self.phase
+            .lock()
+            .map(|phase| phase.clone())
+            .unwrap_or_else(|_| "unknown".to_string())
     }
 
     /// 第一条失败原因说了算：等待线程判定取消/超时时先落文案，随后连接线程
     /// 因进程被终止而收到的传输层报错不会覆盖它。
     fn fail(&self, message: String) -> String {
-        let mut slot = self.failure.lock().unwrap();
+        let Ok(mut slot) = self.failure.lock() else {
+            return message;
+        };
         if slot.is_none() {
             *slot = Some(message);
         }
@@ -300,11 +307,14 @@ impl AcpSessionShared {
     }
 
     fn failure_text(&self) -> Option<String> {
-        self.failure.lock().unwrap().clone()
+        self.failure.lock().ok().and_then(|failure| failure.clone())
     }
 
     fn take_state(&self) -> AcpSessionState {
-        std::mem::take(&mut *self.state.lock().unwrap())
+        self.state
+            .lock()
+            .map(|mut state| std::mem::take(&mut *state))
+            .unwrap_or_default()
     }
 }
 
@@ -840,7 +850,9 @@ impl AcpProcess {
             thread::spawn(move || {
                 while let Some(line) = futures::executor::block_on(outgoing_rx.next()) {
                     {
-                        let mut guard = writer_stdin.lock().unwrap();
+                        let Ok(mut guard) = writer_stdin.lock() else {
+                            return;
+                        };
                         let Some(stdin) = guard.as_mut() else {
                             return;
                         };
@@ -884,7 +896,10 @@ impl AcpProcess {
                                 // 都按报文字段判定，避免跟着 SDK 的枚举变体改口径。
                                 let update = serde_json::to_value(&notification.update)
                                     .unwrap_or(Value::Null);
-                                let mut state = notification_shared.state.lock().unwrap();
+                                let Ok(mut state) = notification_shared.state.lock() else {
+                                    return Err(AcpSdkError::internal_error()
+                                        .data(json!("ACP session state is unavailable")));
+                                };
                                 apply_session_update(&update, &mut state);
                                 Ok(())
                             },
@@ -911,22 +926,23 @@ impl AcpProcess {
                                         );
                                     }
                                 };
-                                permission_shared
-                                    .state
-                                    .lock()
-                                    .unwrap()
-                                    .permission_requests
-                                    .push(json!({
-                                        "tool_call": params
-                                            .get("toolCall")
-                                            .cloned()
-                                            .unwrap_or(Value::Null),
-                                        "options": params
-                                            .get("options")
-                                            .cloned()
-                                            .unwrap_or_else(|| json!([])),
-                                        "outcome": outcome.clone(),
-                                    }));
+                                let Ok(mut state) = permission_shared.state.lock() else {
+                                    return responder.respond_with_error(
+                                        AcpSdkError::internal_error()
+                                            .data(json!("ACP session state is unavailable")),
+                                    );
+                                };
+                                state.permission_requests.push(json!({
+                                    "tool_call": params
+                                        .get("toolCall")
+                                        .cloned()
+                                        .unwrap_or(Value::Null),
+                                    "options": params
+                                        .get("options")
+                                        .cloned()
+                                        .unwrap_or_else(|| json!([])),
+                                    "outcome": outcome.clone(),
+                                }));
                                 responder.respond(RequestPermissionResponse::new(
                                     permission_response_outcome(&outcome),
                                 ))
@@ -938,12 +954,9 @@ impl AcpProcess {
                             // 会被压进 pending 永久等待，连内置的 -32601 都等不到。
                             // 这里显式兜底，仍然回「不支持该方法」，与自研报文一致。
                             async move |request: UntypedMessage, responder, _cx| {
-                                fallback_shared
-                                    .state
-                                    .lock()
-                                    .unwrap()
-                                    .denied_client_methods
-                                    .push(request.method.clone());
+                                if let Ok(mut state) = fallback_shared.state.lock() {
+                                    state.denied_client_methods.push(request.method.clone());
+                                }
                                 responder.respond_with_error(
                                     AcpSdkError::method_not_found().data(json!(request.method)),
                                 )
@@ -956,7 +969,16 @@ impl AcpProcess {
                                 let trace = main_trace;
                                 let plan = plan;
                                 async move {
-                                    *shared.connection.lock().unwrap() = Some(cx.clone());
+                                    let Ok(mut connection_slot) = shared.connection.lock() else {
+                                        let message =
+                                            "ACP connection state is unavailable".to_string();
+                                        shared.fail(message.clone());
+                                        let _ = outcome_from_main.send(Err(message.clone()));
+                                        return Err(
+                                            AcpSdkError::internal_error().data(json!(message))
+                                        );
+                                    };
+                                    *connection_slot = Some(cx.clone());
                                     let result = drive_session(&cx, &shared, &trace, &plan).await;
                                     if let Err(message) = &result {
                                         shared.fail(message.clone());
@@ -1048,8 +1070,18 @@ impl AcpProcess {
     fn abort(&mut self, reason: &str, message: String) -> Box<dyn Error> {
         self.shared.fail(message.clone());
         self.shared.aborted.store(true, Ordering::SeqCst);
-        let session_id = self.shared.session_id.lock().unwrap().clone();
-        let connection = self.shared.connection.lock().unwrap().clone();
+        let session_id = self
+            .shared
+            .session_id
+            .lock()
+            .ok()
+            .and_then(|session_id| session_id.clone());
+        let connection = self
+            .shared
+            .connection
+            .lock()
+            .ok()
+            .and_then(|connection| connection.clone());
         if let (Some(session_id), Some(connection)) = (session_id, connection) {
             let _ = connection.send_notification(CancelNotification::new(session_id));
         }
@@ -1070,7 +1102,9 @@ impl AcpProcess {
         // 先松开 SDK 的出站通道与 stdin：连接线程要等 stdout EOF 才返回，
         // 先关掉 stdin 让对端退出，再终止进程，join 才不会挂住。
         self.outgoing.take();
-        let _ = self.stdin.lock().unwrap().take();
+        if let Ok(mut stdin) = self.stdin.lock() {
+            let _ = stdin.take();
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         if let Some(child) = self.child.as_mut() {
             while Instant::now() < deadline {
@@ -1151,7 +1185,11 @@ async fn drive_session(
         .await
         .map_err(|error| process::summarize_output(&error.to_string(), 2_000))?;
     let session_id = session.session_id.0.to_string();
-    *shared.session_id.lock().unwrap() = Some(session_id.clone());
+    let mut session_slot = shared
+        .session_id
+        .lock()
+        .map_err(|_| "ACP session state is unavailable".to_string())?;
+    *session_slot = Some(session_id.clone());
 
     shared.set_phase("session/prompt");
     let prompt = cx
