@@ -52,7 +52,18 @@ $Arguments += $Artifact
 if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed: $Artifact" }
 
 $Signature = Get-AuthenticodeSignature -LiteralPath $Artifact
-if ($Signature.Status -ne "Valid" -or -not $Signature.SignerCertificate) {
+if (-not $Signature.SignerCertificate) {
     throw "Authenticode verification failed: $($Signature.StatusMessage)"
+}
+$SignedThumbprint = ($Signature.SignerCertificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+$ExpectedThumbprint = ($Thumbprint -replace '\s', '').ToUpperInvariant()
+if ($SignedThumbprint -ne $ExpectedThumbprint) {
+    throw "Authenticode verification failed: signer thumbprint does not match the requested certificate."
+}
+if ($Signature.Status -notin @("Valid", "NotTrusted")) {
+    throw "Authenticode verification failed: $($Signature.StatusMessage)"
+}
+if ($Signature.Status -eq "NotTrusted") {
+    Write-Warning "Authenticode signature is cryptographically valid but the signing chain is not trusted by this runner: $Artifact"
 }
 Write-Host "Authenticode signed: $Artifact"
