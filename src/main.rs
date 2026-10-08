@@ -143,9 +143,11 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(error) = svn::service::bootstrap_svn_admin_credentials() {
-            eprintln!("SVN administrator credential initialization failed: {error}");
-            std::process::exit(1);
+        // Central SVN administration is owned by himind-edge-worker. Remove
+        // any legacy desktop copy once, then keep this process limited to the
+        // signed-in user's own SVN connection.
+        if let Err(error) = svn::service::remove_svn_admin_credentials() {
+            eprintln!("legacy desktop SVN admin credential cleanup deferred: {error}");
         }
         if !svn_credentials_from_environment {
             if let Ok(Some(snapshot)) = api::oauth::authorization_snapshot(&options.state_path) {
@@ -3408,6 +3410,38 @@ mod tests {
     }
 
     #[test]
+    fn central_svn_tasks_are_rejected_by_the_desktop_executor() {
+        for task_type in [
+            "svn_user_provision",
+            "project_repository_create",
+            "exhibit_repository_initialize",
+            "project_acl_apply",
+            "project_repository_archive",
+            "project_repository_prune",
+        ] {
+            let task: Task = serde_json::from_value(json!({
+                "id": "task-central",
+                "type": task_type,
+                "capability": ""
+            }))
+            .unwrap();
+            assert!(super::is_central_svn_management_task(&task), "{task_type}");
+        }
+        let personal: Task = serde_json::from_value(json!({
+            "id": "task-personal",
+            "type": "exhibit_workspace_checkout"
+        }))
+        .unwrap();
+        assert!(!super::is_central_svn_management_task(&personal));
+        let personal_template: Task = serde_json::from_value(json!({
+            "id": "task-personal-template",
+            "type": "exhibit_repository_initialize_template"
+        }))
+        .unwrap();
+        assert!(!super::is_central_svn_management_task(&personal_template));
+    }
+
+    #[test]
     fn selects_mcp_mode_by_binary_target_or_explicit_argument() {
         assert!(should_run_mcp("himind-agent-mcp", &[]));
         assert!(should_run_mcp(
@@ -3604,6 +3638,10 @@ fn invoke_dashboard_capability_inner(
             "dedupe_key": task.dedupe_key,
             "execution_id": task.execution_id,
             "lease_id": task.lease_id,
+            "prerequisite_task_id": input
+                .get("prerequisite_task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
         }));
     let gateway = CapabilityGateway::new(
         options.clone(),
@@ -3675,6 +3713,67 @@ fn legacy_task_capability(task_type: &str) -> Option<&'static str> {
         "project_acl_reconcile" => Some("project.repository.acl.reconcile"),
         _ => None,
     }
+}
+
+/// Central SVN administration is an Edge Worker-only boundary. Keep this
+/// guard in the desktop executor as a final defense for stale or forged queue
+/// entries; Dashboard task routing remains the primary enforcement point.
+fn is_central_svn_management_task(task: &Task) -> bool {
+    const CENTRAL_TASK_TYPES: &[&str] = &[
+        "svn_user_provision",
+        "project_repository_create",
+        "project_repository_exhibits_access_ensure",
+        "exhibit_repository_path_create",
+        "exhibit_repository_initialize",
+        "exhibit_repository_clone",
+        "project_acl_preview",
+        "project_acl_apply",
+        "project_acl_reconcile",
+        "project_repository_archive",
+        "exhibit_repository_restore",
+        "project_repository_prune",
+        "project_repository_archive_drill",
+    ];
+    if CENTRAL_TASK_TYPES.contains(&task.task_type.as_str()) {
+        return true;
+    }
+    matches!(
+        explicit_task_capability(task),
+        Some(
+            "project.repository.create"
+                | "project.repository.exhibits_access.ensure"
+                | "exhibit.repository_path.create"
+                | "exhibit.repository.initialize"
+                | "exhibit.repository.clone"
+                | "project.repository.acl.preview"
+                | "project.repository.acl.apply"
+                | "project.repository.acl.reconcile"
+                | "project.repository.archive"
+                | "exhibit.repository.restore"
+                | "project.repository.prune"
+                | "project.repository.archive_drill"
+                | "svn.user.provision"
+        )
+    )
+}
+
+fn validate_released_template_task(
+    task: &Task,
+    request: &InitializeExhibitRepositoryRequest,
+) -> Result<(), Box<dyn Error>> {
+    if task.task_type != "exhibit_repository_initialize_template"
+        || task.source.trim() != "dashboard"
+        || task.created_by_user_id.trim().is_empty()
+    {
+        return Err("展项模板任务必须来自已登录用户创建的 Dashboard 任务".into());
+    }
+    if request.svn_username.trim().is_empty() {
+        return Err("展项模板任务缺少当前用户的 SVN 身份".into());
+    }
+    if request.prerequisite_task_id.trim().is_empty() {
+        return Err("展项模板任务缺少 Edge 前置任务凭据".into());
+    }
+    Ok(())
 }
 
 fn execute_task(
@@ -3755,6 +3854,26 @@ fn execute_task(
         None,
         None,
     )?;
+
+    if is_central_svn_management_task(&task) {
+        let detail = "集中 SVN 管理任务必须由 himind-edge-worker 执行";
+        eprintln!(
+            "rejecting desktop execution of central SVN task {} ({})",
+            task.id, task.task_type
+        );
+        report_task(
+            client,
+            options,
+            agent_id,
+            &task.id,
+            "failed",
+            100,
+            detail,
+            None,
+            Some(detail.to_string()),
+        )?;
+        return Ok(());
+    }
 
     if task.task_type == "upload_code"
         || task.task_type == "upload_placeholder"
@@ -3934,7 +4053,7 @@ fn execute_task(
                     &task.id,
                     "running",
                     40,
-                    "Agent 正在连接内网 SvnAdmin 并创建项目仓库",
+                    "Edge Worker 正在连接内网 SvnAdmin 并创建项目仓库",
                     None,
                     None,
                 )?;
@@ -4081,6 +4200,48 @@ fn execute_task(
                 initialize_exhibit_repository_with_cancel(request, &mut || {
                     execution_context.check_cancelled()
                 })
+            }
+            "exhibit_repository_initialize_template" => {
+                if let Some(manager) = approval_mgr {
+                    manager.add_log("info", &format!("{}: 正在应用工程模板", task.id));
+                }
+                report_task(
+                    client,
+                    options,
+                    agent_id,
+                    &task.id,
+                    "running",
+                    35,
+                    "正在使用当前 SVN 账号应用工程模板",
+                    None,
+                    None,
+                )?;
+                let request = serde_json::from_value::<InitializeExhibitRepositoryRequest>(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
+                validate_released_template_task(&task, &request)?;
+                let mut cancel_guard = TaskCancelGuard::new();
+                let mut execution_context = CapabilityExecutionContext::new(
+                    task.id.clone(),
+                    "exhibit.repository.initialize_template".to_string(),
+                    request.exhibit_id.clone(),
+                    || cancel_guard.check(client, options, agent_id, &task.id),
+                    |progress, detail| {
+                        report_task(
+                            client, options, agent_id, &task.id, "running", progress, detail, None,
+                            None,
+                        )
+                    },
+                );
+                execution_context.report_progress(45, "目标目录已准备，正在读取工程模板")?;
+                invoke_dashboard_capability_with_execution(
+                    options,
+                    agent_id,
+                    &task,
+                    "exhibit.repository.initialize_template",
+                    serde_json::to_value(request)?,
+                    &mut execution_context,
+                )
             }
             "exhibit_repository_clone" => {
                 report_task(

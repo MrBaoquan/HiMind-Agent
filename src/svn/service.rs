@@ -173,38 +173,15 @@ pub(crate) fn bootstrap_svn_credentials() -> Result<bool, Box<dyn Error>> {
 }
 
 pub(crate) fn bootstrap_svn_admin_credentials() -> Result<bool, Box<dyn Error>> {
-    let username = std::env::var("SVN_ADMIN_USERNAME").unwrap_or_default();
-    let password = std::env::var("SVN_ADMIN_PASSWORD").unwrap_or_default();
-    if username.trim().is_empty() && password.is_empty() {
-        return Ok(false);
-    }
-    if username.trim().is_empty() || password.is_empty() {
-        return Err("SVN_ADMIN_USERNAME and SVN_ADMIN_PASSWORD must be configured together".into());
-    }
-    install_svn_admin_credentials(username.trim(), &password)?;
-    unsafe {
-        std::env::remove_var("SVN_ADMIN_USERNAME");
-        std::env::remove_var("SVN_ADMIN_PASSWORD");
-    }
-    Ok(true)
+    Err("shared SvnAdmin credentials are Edge Worker-only".into())
 }
 
 pub(crate) fn install_svn_admin_credentials(
     username: &str,
     password: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if username.trim().is_empty() || password.is_empty() {
-        return Err("SVN management credentials are incomplete".into());
-    }
-    save_local_svn_connection(
-        SVN_ADMIN_CONNECTION_ID,
-        "公司 SVN 管理",
-        SVN_ADMIN_URL,
-        username.trim(),
-        password,
-        "svnadmin_v2",
-    )?;
-    Ok(())
+    let _ = (username, password);
+    Err("shared SvnAdmin credentials are Edge Worker-only".into())
 }
 
 pub(crate) fn default_svn_username(display_name: &str) -> Result<String, Box<dyn Error>> {
@@ -252,20 +229,15 @@ pub(crate) fn ensure_default_svn_credentials(username: &str) -> Result<bool, Box
 }
 
 pub(crate) fn svn_admin_ready() -> bool {
-    load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)
-        .map(|(connection, _)| connection.status == "ready")
-        .unwrap_or(false)
+    false
 }
 
 pub(crate) fn svn_admin_credentials_configured() -> bool {
-    load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID).is_ok()
+    false
 }
 
 pub(crate) fn verify_svn_admin_credentials() -> Result<(), Box<dyn Error>> {
-    let (connection, password) = load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)?;
-    let _ = login_svnadmin(&connection.username, &password)?;
-    update_local_svn_connection_status(SVN_ADMIN_CONNECTION_ID, "ready", "")?;
-    Ok(())
+    Err("shared SvnAdmin credentials are Edge Worker-only".into())
 }
 
 pub(crate) fn remove_svn_admin_credentials() -> Result<bool, Box<dyn Error>> {
@@ -273,36 +245,12 @@ pub(crate) fn remove_svn_admin_credentials() -> Result<bool, Box<dyn Error>> {
 }
 
 pub(crate) fn svn_admin_status() -> &'static str {
-    let connections = match list_local_svn_connections() {
-        Ok(connections) => connections,
-        Err(_) => return "unreadable",
-    };
-    let Some(connection) = connections.iter().find(|item| {
-        item.id == SVN_ADMIN_CONNECTION_ID && !item.encrypted_password.trim().is_empty()
-    }) else {
-        return "missing";
-    };
-    if load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID).is_err() {
-        return "unreadable";
-    }
-    if connection.status == "ready" {
-        "ready"
-    } else {
-        "unknown"
-    }
+    "edge_worker_only"
 }
 
 pub(crate) fn provision_default_svn_user_account(username: &str) -> Result<Value, Box<dyn Error>> {
-    let username = default_svn_username(username)?;
-    if !ensure_svn_user_account(&username, DEFAULT_SVN_USER_PASSWORD)? {
-        return Err("SvnAdmin credentials are not configured on this Agent".into());
-    }
-    Ok(json!({
-        "ok": true,
-        "svn_username": username,
-        "verified": true,
-        "password_policy": "default-v1"
-    }))
+    let _ = username;
+    Err("SVN user provisioning is Edge Worker-only".into())
 }
 
 pub(crate) fn list_connections() -> Result<Vec<SvnConnectionSummary>, Box<dyn Error>> {
@@ -483,76 +431,6 @@ fn login_svn_user_over_http_at(
         "username": username,
         "verification": "http"
     }))
-}
-
-fn ensure_svn_user_account(username: &str, password: &str) -> Result<bool, Box<dyn Error>> {
-    let Ok((admin, admin_password)) = load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)
-    else {
-        return Ok(false);
-    };
-    let token = login_svnadmin(&admin.username, &admin_password)?;
-    let list = svnadmin_post_read(
-        "Svnuser",
-        "GetUserList",
-        Some(&token),
-        json!({
-            "pageSize": 10000,
-            "currentPage": 1,
-            "searchKeyword": "",
-            "sortName": "svn_user_name",
-            "sortType": "asc",
-            "sync": false,
-            "page": true
-        }),
-    )?;
-    ensure_svnadmin_success(&list)?;
-    let existing = list
-        .pointer("/data/data")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("svn_user_name").and_then(Value::as_str) == Some(username))
-        });
-    if login_svn_user(username, password).is_ok() {
-        return Ok(true);
-    }
-    if existing.is_some() {
-        return Err(
-            "SVN account already exists but its password is not the initial default; refusing to reset it"
-                .into(),
-        );
-    }
-    let mutation_error = svnadmin_post(
-        "Svnuser",
-        "CreateUser",
-        Some(&token),
-        json!({
-            "svn_user_name": username,
-            "svn_user_pass": password,
-            "svn_user_note": "HiMind 用户"
-        }),
-    )
-    .and_then(|response| ensure_svnadmin_success(&response))
-    .err();
-    if let Some(error) = mutation_error {
-        if login_svn_user(username, password).is_ok() {
-            record_svn_diagnostic_event(
-                "svnadmin",
-                "CreateUser",
-                "recovered_by_login",
-                "write_response_uncertain",
-                1,
-                1,
-                None,
-                0,
-            );
-            return Ok(true);
-        }
-        return Err(error);
-    }
-    login_svn_user(username, password)?;
-    Ok(true)
 }
 
 pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, Box<dyn Error>> {
@@ -991,12 +869,6 @@ pub(crate) fn create_exhibit_repository_path(
     }))
 }
 
-pub(crate) fn initialize_exhibit_repository(
-    request: InitializeExhibitRepositoryRequest,
-) -> Result<Value, Box<dyn Error>> {
-    initialize_exhibit_repository_with_cancel(request, &mut || Ok(()))
-}
-
 pub(crate) fn clone_exhibit_repository(
     request: CloneExhibitRepositoryRequest,
 ) -> Result<Value, Box<dyn Error>> {
@@ -1275,14 +1147,13 @@ where
         );
     }
 
-    progress(22, "本地工程预检完成，正在创建目标展项仓库")?;
-    create_exhibit_repository_path(CreateExhibitRepositoryPathRequest {
-        project_id: project_id.clone(),
-        exhibit_id: exhibit_id.clone(),
-    })?;
+    // The target exhibit path is provisioned by the Edge Worker before this
+    // user-bound task is released. The desktop Agent must only use the
+    // signed-in user's SVN identity here; it never creates paths or mutates
+    // centralized ACLs with SvnAdmin credentials.
+    progress(22, "本地工程预检完成，正在使用当前 SVN 账号接管目标展项")?;
     let repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
     let (connection, password) = load_company_svn_secret()?;
-    ensure_exhibit_writer_access(&project_id, &exhibit_id, &connection.username)?;
     let target_uuid = svn_remote_item(
         &repository_url,
         "repos-uuid",
@@ -1740,7 +1611,14 @@ where
         resolve_template(&request.engine_type, &request.template_id)?;
     let repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
     let (connection, password) = load_company_svn_secret()?;
-    ensure_exhibit_writer_access(&project_id, &exhibit_id, &connection.username)?;
+    if !request.svn_username.trim().is_empty()
+        && !connection
+            .username
+            .trim()
+            .eq_ignore_ascii_case(request.svn_username.trim())
+    {
+        return Err("当前本机 SVN 账号与任务绑定的用户身份不一致".into());
+    }
     let temp_root = std::env::temp_dir().join(format!(
         "himind-svn-template-{}-{}-{}",
         std::process::id(),
@@ -3877,18 +3755,6 @@ fn ensure_principal_path_access(
     Ok(action)
 }
 
-fn ensure_exhibit_writer_access(
-    project_id: &str,
-    exhibit_id: &str,
-    username: &str,
-) -> Result<(), Box<dyn Error>> {
-    let path = format!("/trunk/exhibits/{exhibit_id}");
-    let (connection, password) = load_svn_admin_secret()?;
-    let token = login_svnadmin(&connection.username, &password)?;
-    ensure_principal_path_access(project_id, &path, "user", username, "rw", &token)?;
-    Ok(())
-}
-
 pub(crate) fn preview_project_acl(
     request: PreviewProjectAclRequest,
 ) -> Result<Value, Box<dyn Error>> {
@@ -4942,16 +4808,7 @@ fn load_company_svn_secret(
 
 fn load_svn_admin_secret(
 ) -> Result<(crate::store::types::StoredSvnConnection, String), Box<dyn Error>> {
-    if let Ok(secret) = load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID) {
-        return Ok(secret);
-    }
-    let username = std::env::var("SVN_ADMIN_USERNAME").unwrap_or_default();
-    let password = std::env::var("SVN_ADMIN_PASSWORD").unwrap_or_default();
-    if username.trim().is_empty() || password.is_empty() {
-        return Err("SvnAdmin credentials are not configured on this Agent".into());
-    }
-    bootstrap_svn_admin_credentials()?;
-    load_local_svn_connection_secret(SVN_ADMIN_CONNECTION_ID)
+    Err("shared SvnAdmin credentials are Edge Worker-only".into())
 }
 
 fn login_svnadmin(username: &str, password: &str) -> Result<String, Box<dyn Error>> {

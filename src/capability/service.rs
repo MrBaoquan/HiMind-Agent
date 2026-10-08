@@ -41,7 +41,7 @@ use crate::store::credentials::{local_login_status_json, local_login_status_valu
 use crate::store::types::LocalWorkerStatus;
 use crate::svn::service::{
     checkout_workspace, create_exhibit_repository_path, create_repository_with_post_commit_hook,
-    ensure_project_exhibits_access, initialize_exhibit_repository, list_connections,
+    ensure_project_exhibits_access, initialize_exhibit_repository_with_cancel, list_connections,
     open_workspace, scan_migration_source, test_connection, update_workspace, workspace_status,
 };
 use crate::svn::types::{
@@ -332,6 +332,14 @@ impl CapabilityGateway {
                         .availability
                         .available_without_control_plane();
                 if !visible_for_mode {
+                    return false;
+                }
+                if is_svn_admin_capability(&registration.descriptor.id) {
+                    return false;
+                }
+                if is_task_scoped_capability(&registration.descriptor.id)
+                    && context.source != crate::capability::types::InvocationSource::DashboardWorker
+                {
                     return false;
                 }
                 // Once a fresh catalog is available, catalog-owned business
@@ -2015,7 +2023,7 @@ impl CapabilityGateway {
             registration(
                 "exhibit.repository_path.create",
                 "创建展项 SVN 目录",
-                "使用本机个人 SVN 凭据在项目仓库的 trunk/exhibits 下创建固定展项 ID 目录。",
+                "由 Edge Worker 使用受管 SVN 管理账号在项目仓库的 trunk/exhibits 下创建固定展项 ID 目录。",
                 "admin_action",
                 json!({
                     "type": "object",
@@ -2032,17 +2040,19 @@ impl CapabilityGateway {
             registration(
                 "exhibit.repository.initialize_template",
                 "初始化展项工程模板",
-                "从受控 Unity 或 Unreal 模板初始化固定展项目录，并应用模板中的 SVN 忽略属性。",
-                "admin_action",
+                "使用当前用户的个人 SVN 凭据，将受控 Unity 或 Unreal 模板写入已准备好的展项目录并应用忽略属性。",
+                "network_write",
                 json!({
                     "type": "object",
                     "properties": {
                         "project_id": { "type": "string" },
                         "exhibit_id": { "type": "string" },
                         "engine_type": { "type": "string", "enum": ["Unity3D", "Unreal Engine"] },
-                        "template_id": { "type": "string", "enum": ["unity-uniart", "unreal-blank-4.27", "unreal-blank-5.3", "unreal-blank-5.4", "unreal-blank-5.5", "unreal-picoxr-5.3", "unreal-picoxr-5.5"] }
+                        "template_id": { "type": "string", "enum": ["unity-uniart", "unreal-blank-4.27", "unreal-blank-5.3", "unreal-blank-5.4", "unreal-blank-5.5", "unreal-picoxr-5.3", "unreal-picoxr-5.5"] },
+                        "svn_username": { "type": "string", "minLength": 1 },
+                        "prerequisite_task_id": { "type": "string", "minLength": 1 }
                     },
-                    "required": ["project_id", "exhibit_id", "engine_type", "template_id"],
+                    "required": ["project_id", "exhibit_id", "engine_type", "template_id", "svn_username", "prerequisite_task_id"],
                     "additionalProperties": false
                 }),
                 CapabilityHandler::SvnExhibitRepositoryInitialize,
@@ -2050,7 +2060,7 @@ impl CapabilityGateway {
             registration(
                 "exhibit.repository.clone",
                 "克隆展项 SVN 仓库",
-                "在同一 SVN 服务中将源展项仓库复制到目标展项目录。",
+                "由 Edge Worker 在同一 SVN 服务中将源展项仓库复制到目标展项目录。",
                 "admin_action",
                 json!({
                     "type": "object",
@@ -2067,8 +2077,8 @@ impl CapabilityGateway {
             registration(
                 "exhibit.repository.import_local",
                 "导入本地展项工程",
-                "将本地工程迁移到目标展项 SVN 仓库，并保留可验证的忽略规则、属性和外部依赖。",
-                "admin_action",
+                "使用当前用户的个人 SVN 凭据将本地工程迁移到目标展项 SVN 仓库，并保留可验证的忽略规则、属性和外部依赖。",
+                "network_write",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2111,7 +2121,7 @@ impl CapabilityGateway {
             registration(
                 "project.repository.create",
                 "创建项目 SVN 仓库",
-                "由当前内网 Agent 使用本机加密保存的 SvnAdmin 管理凭据，按项目唯一 ID 创建物理仓库。",
+                "由 Edge Worker 使用节点安全存储中的 SvnAdmin 管理凭据，按项目唯一 ID 创建物理仓库。",
                 "admin_action",
                 json!({
                     "type": "object",
@@ -2129,7 +2139,7 @@ impl CapabilityGateway {
             registration(
                 "project.repository.exhibits_access.ensure",
                 "配置项目展项目录访问权限",
-                "使用隐藏 SvnAdmin 凭据开放仓库祖先节点只读遍历、默认隔离展项目录，并保留具体展项用户 ACL。",
+                "由 Edge Worker 使用受管 SvnAdmin 凭据开放仓库祖先节点只读遍历、默认隔离展项目录，并保留具体展项用户 ACL。",
                 "admin_action",
                 json!({
                     "type": "object",
@@ -2895,6 +2905,16 @@ impl CapabilityGateway {
         input: Value,
         mut execution: Option<&mut CapabilityExecutionContext<'_>>,
     ) -> Result<Value, Box<dyn Error>> {
+        if is_svn_admin_capability(capability_id) {
+            return Err("集中 SVN 管理能力仅由 Edge Worker 执行".into());
+        }
+        if capability_id == "exhibit.repository.initialize_template"
+            && !is_edge_prepared_template_invocation(context, &input)
+        {
+            return Err(
+                "展项模板写入必须由 Dashboard 创建的 Edge 前置任务释放后执行；请通过展项仓库初始化任务发起".into(),
+            );
+        }
         let registration = self
             .registry()?
             .remove(capability_id)
@@ -3016,13 +3036,6 @@ impl CapabilityGateway {
                 return Err(format!("受控能力 {capability_id} 未获批准，未执行实际副作用").into());
             }
             approval_proof = remote_approval_id.map(ApprovalProof::Approval);
-        }
-        if is_svn_admin_capability(capability_id)
-            && context.source != crate::capability::types::InvocationSource::DashboardWorker
-        {
-            return Err(
-                "SVN management capabilities are restricted to Dashboard Worker tasks".into(),
-            );
         }
         if let Some(scope) = required_platform_scope(capability_id) {
             crate::api::oauth::platform_access_token(&self.options, scope)?;
@@ -3701,9 +3714,19 @@ impl CapabilityGateway {
                 >(input)?)
             }
             CapabilityHandler::SvnExhibitRepositoryInitialize => {
-                initialize_exhibit_repository(serde_json::from_value::<
-                    InitializeExhibitRepositoryRequest,
-                >(input)?)
+                let request = serde_json::from_value::<InitializeExhibitRepositoryRequest>(input)?;
+                let mut fallback = CapabilityExecutionContext::detached(
+                    execution
+                        .as_deref()
+                        .map(|value| value.task_id().to_string())
+                        .unwrap_or_else(|| "capability-template-init".to_string()),
+                    capability_id,
+                    request.exhibit_id.clone(),
+                );
+                let execution = execution.as_deref_mut().unwrap_or(&mut fallback);
+                let execution = std::cell::RefCell::new(execution);
+                let mut check_cancelled = || execution.borrow_mut().check_cancelled();
+                initialize_exhibit_repository_with_cancel(request, &mut check_cancelled)
             }
             CapabilityHandler::SvnExhibitRepositoryClone => {
                 crate::svn::service::clone_exhibit_repository(serde_json::from_value::<
@@ -4277,8 +4300,11 @@ impl CapabilityGateway {
             "dashboard_worker_reason_code": worker_reason_code,
             "mcp_transport": mcp_transport,
             "local_service_expected": local_service_expected,
-            "svn_admin_ready": crate::svn::service::svn_admin_ready(),
-            "svn_admin_status": crate::svn::service::svn_admin_status(),
+            // The desktop Agent no longer owns the shared SvnAdmin account.
+            // Keep explicit internal markers for older clients while making
+            // the ownership boundary unambiguous.
+            "svn_admin_ready": false,
+            "svn_admin_status": "edge_worker_only",
             "local_service_online": worker["local_service_online"],
             "local_service_error": worker["local_service_error"],
             "capability_gateway": true,
@@ -5771,16 +5797,72 @@ fn parse_capability_catalog_cursor(
 fn is_svn_admin_capability(capability_id: &str) -> bool {
     matches!(
         capability_id,
-        "project.repository.create"
+        "svn.user.provision"
+            | "project.repository.create"
             | "project.repository.exhibits_access.ensure"
             | "exhibit.repository_path.create"
-            | "exhibit.repository.initialize_template"
+            | "exhibit.repository.initialize"
             | "exhibit.repository.clone"
-            | "exhibit.repository.import_local"
             | "project.repository.acl.preview"
             | "project.repository.acl.apply"
             | "project.repository.acl.reconcile"
+            | "project.repository.archive"
+            | "exhibit.repository.restore"
+            | "project.repository.prune"
+            | "project.repository.archive_drill"
     )
+}
+
+fn is_task_scoped_capability(capability_id: &str) -> bool {
+    capability_id == "exhibit.repository.initialize_template"
+}
+
+/// Template writes use the signed-in user's SVN account, but the target path
+/// and ACL are prepared centrally. Keep this capability task-scoped so an MCP,
+/// Tauri or local HTTP caller cannot guess a repository ID and bypass Edge.
+fn is_edge_prepared_template_invocation(context: &InvocationContext, input: &Value) -> bool {
+    if context.source != crate::capability::types::InvocationSource::DashboardWorker {
+        return false;
+    }
+    let task_type = context
+        .business_context
+        .get("task_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if task_type != "exhibit_repository_initialize_template" {
+        return false;
+    }
+    if context
+        .business_context
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        != Some("dashboard")
+    {
+        return false;
+    }
+    let task_id = context
+        .business_context
+        .get("task_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let context_prerequisite_task_id = context
+        .business_context
+        .get("prerequisite_task_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let prerequisite_task_id = input
+        .get("prerequisite_task_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let svn_username = input
+        .get("svn_username")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !task_id.trim().is_empty()
+        && !prerequisite_task_id.trim().is_empty()
+        && !svn_username.trim().is_empty()
+        && prerequisite_task_id.trim() == context_prerequisite_task_id.trim()
 }
 
 fn project_acl_entry_schema() -> Value {
@@ -6845,12 +6927,12 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::SvnWorkspaceOpen => CapabilityAvailability::NetworkService,
         CapabilityHandler::SvnRepositoryCreate
         | CapabilityHandler::SvnExhibitRepositoryPathCreate
-        | CapabilityHandler::SvnExhibitRepositoryInitialize
         | CapabilityHandler::SvnExhibitRepositoryClone
         | CapabilityHandler::SvnProjectExhibitsAccessEnsure
         | CapabilityHandler::SvnProjectAclPreview
         | CapabilityHandler::SvnProjectAclApply
         | CapabilityHandler::SvnProjectAclReconcile => CapabilityAvailability::ControlPlane,
+        CapabilityHandler::SvnExhibitRepositoryInitialize => CapabilityAvailability::NetworkService,
         CapabilityHandler::InnerAdminSyncExhibits
         | CapabilityHandler::UploadCode
         | CapabilityHandler::UploadPlaceholder => CapabilityAvailability::NetworkService,
@@ -7503,10 +7585,58 @@ mod tests {
     #[test]
     fn svn_admin_capabilities_are_worker_only() {
         assert!(is_svn_admin_capability("project.repository.create"));
-        assert!(is_svn_admin_capability(
+        assert!(is_svn_admin_capability("svn.user.provision"));
+        assert!(is_svn_admin_capability("project.repository.archive"));
+        assert!(!is_svn_admin_capability("exhibit.workspace.checkout"));
+        assert!(!is_svn_admin_capability("exhibit.repository.import_local"));
+        assert!(!is_svn_admin_capability(
             "exhibit.repository.initialize_template"
         ));
-        assert!(!is_svn_admin_capability("exhibit.workspace.checkout"));
+    }
+
+    #[test]
+    fn template_capability_requires_edge_task_context_and_user_identity() {
+        let mut options = Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let input = json!({
+            "project_id": "prj_1",
+            "exhibit_id": "EX-1",
+            "engine_type": "Unity3D",
+            "template_id": "unity-uniart",
+            "svn_username": "alice",
+            "prerequisite_task_id": "tsk-edge"
+        });
+        let direct_error = gateway
+            .invoke(
+                &InvocationContext::new(InvocationSource::Mcp, "ai-client:test"),
+                "exhibit.repository.initialize_template",
+                input.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(direct_error.contains("Edge 前置任务"), "{direct_error}");
+        let context =
+            InvocationContext::new(InvocationSource::DashboardWorker, "dashboard-user:user-1")
+                .with_business_context(json!({
+                    "task_id": "tsk-user",
+                    "task_type": "exhibit_repository_initialize_template",
+                    "source": "dashboard",
+                    "prerequisite_task_id": "tsk-edge"
+                }));
+        let missing_identity = gateway
+            .invoke(&context, "exhibit.repository.initialize_template", {
+                let mut value = input.clone();
+                value["svn_username"] = json!("");
+                value
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_identity.contains("展项模板写入"),
+            "{missing_identity}"
+        );
     }
 
     #[test]
@@ -8156,8 +8286,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(error.contains("control_plane_required"));
-        assert!(error.contains("AI 工作台"));
+        assert!(error.contains("仅由 Edge Worker 执行"));
         let local_error = gateway
             .invoke(
                 &InvocationContext::new(
@@ -8183,7 +8312,38 @@ mod tests {
         assert!(visible.iter().any(|item| item.id == "svn.connection.test"));
         assert!(!visible.iter().any(|item| item.id == "context.resolve"));
         assert!(!visible.iter().any(|item| item.id == "media.image.generate"));
+        for capability_id in [
+            "svn.user.provision",
+            "project.repository.create",
+            "exhibit.repository_path.create",
+            "project.repository.acl.apply",
+        ] {
+            assert!(
+                !visible.iter().any(|item| item.id == capability_id),
+                "central SVN capability must not be exposed: {capability_id}"
+            );
+        }
+        assert!(!visible
+            .iter()
+            .any(|item| item.id == "exhibit.repository.initialize_template"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn central_svn_capability_invocation_fails_before_any_approval_or_execution() {
+        let mut options = Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let error = gateway
+            .invoke(
+                &InvocationContext::new(InvocationSource::Mcp, "ai-client:test"),
+                "project.repository.create",
+                json!({}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("仅由 Edge Worker 执行"), "{error}");
     }
 
     #[test]
@@ -8207,6 +8367,9 @@ mod tests {
                 "local-user",
             ))
             .unwrap();
+        assert!(!visible
+            .iter()
+            .any(|item| { is_svn_admin_capability(&item.id) }));
         assert!(visible.iter().any(|item| item.id == "system.health"));
         assert!(visible.iter().any(|item| item.id == "context.resolve"));
         assert!(visible.iter().any(|item| item.id == "media.image.generate"));

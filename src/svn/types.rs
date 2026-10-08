@@ -48,6 +48,12 @@ pub(crate) struct InitializeExhibitRepositoryRequest {
     pub exhibit_id: String,
     pub engine_type: String,
     pub template_id: String,
+    /// Dashboard-created user-write tasks carry the Edge preflight proof.
+    /// Legacy combined tasks deserialize with an empty value.
+    #[serde(default)]
+    pub svn_username: String,
+    #[serde(default)]
+    pub prerequisite_task_id: String,
 }
 
 #[derive(Debug, Deserialize)]

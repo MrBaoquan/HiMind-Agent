@@ -677,8 +677,8 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
     vec![
         builtin_plugin(
             "com.himind.builtin.svn",
-            "SVN 工作区与仓库",
-            "受控 SVN 账号、工作区、建仓、模板和权限能力。",
+            "SVN 个人账号与工作区",
+            "管理当前用户自己的 SVN 凭据和本机展项工作区。",
             &[
                 "svn.connection.list",
                 "svn.connection.test",
@@ -687,10 +687,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
                 "exhibit.migration_source.scan",
                 "exhibit.workspace.update",
                 "exhibit.workspace.open",
-                "exhibit.repository_path.create",
-                "exhibit.repository.initialize_template",
-                "project.repository.create",
-                "project.repository.exhibits_access.ensure",
+                "exhibit.repository.import_local",
             ],
             &["secret.svn.broker", "network.svn", "process.tortoisesvn"],
         ),

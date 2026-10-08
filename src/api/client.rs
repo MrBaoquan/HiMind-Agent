@@ -396,45 +396,6 @@ pub fn heartbeat(
     heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None)
 }
 
-#[derive(serde::Deserialize)]
-struct SvnManagementBootstrapResponse {
-    username: String,
-    password: String,
-}
-
-pub fn sync_svn_management_credentials(
-    client: &Client,
-    api_base: &str,
-    agent_id: &str,
-    credential: &str,
-) -> Result<bool, Box<dyn Error>> {
-    if crate::svn::service::svn_admin_ready() {
-        return Ok(false);
-    }
-    if crate::svn::service::svn_admin_credentials_configured() {
-        if crate::svn::service::verify_svn_admin_credentials().is_ok() {
-            return Ok(true);
-        }
-        let _ = crate::svn::service::remove_svn_admin_credentials();
-    }
-    let response = client
-        .get(format!("{}/api/agent/svn-management/bootstrap", api_base))
-        .header("Authorization", agent_authorization(agent_id, credential))
-        .send()?;
-    if response.status() == StatusCode::NO_CONTENT {
-        return Ok(false);
-    }
-    let bootstrap = response
-        .error_for_status()?
-        .json::<SvnManagementBootstrapResponse>()?;
-    crate::svn::service::install_svn_admin_credentials(&bootstrap.username, &bootstrap.password)?;
-    if let Err(error) = crate::svn::service::verify_svn_admin_credentials() {
-        let _ = crate::svn::service::remove_svn_admin_credentials();
-        return Err(format!("SvnAdmin credentials verification failed: {error}").into());
-    }
-    Ok(true)
-}
-
 pub fn heartbeat_with_runtime_installations(
     client: &Client,
     api_base: &str,
@@ -446,8 +407,6 @@ pub fn heartbeat_with_runtime_installations(
     let mut payload = json!({
         "agent_id": agent_id,
         "status": "online",
-        "svn_admin_ready": crate::svn::service::svn_admin_ready(),
-        "svn_admin_status": crate::svn::service::svn_admin_status(),
     });
     if let Some(items) = runtime_installations {
         payload["runtime_installations"] = serde_json::to_value(items)?;

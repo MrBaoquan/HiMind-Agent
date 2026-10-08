@@ -115,14 +115,6 @@ pub(crate) fn run_loop(
     }
     options.set_agent_credential(&state.credential);
     let identity_generation = options.identity_generation();
-    if let Err(error) = crate::api::client::sync_svn_management_credentials(
-        &client,
-        &options.api_base(),
-        &state.agent_id,
-        &state.credential,
-    ) {
-        eprintln!("SVN management capability bootstrap deferred: {error}");
-    }
     let distribution_state =
         match load_distribution_client(&client, &options, &state.device_id, &state.agent_id) {
             Ok(value) => value,
@@ -229,14 +221,6 @@ pub(crate) fn run_loop(
                 break;
             }
             let heartbeat_credential = heartbeat_options.agent_credential();
-            if let Err(error) = crate::api::client::sync_svn_management_credentials(
-                &heartbeat_client,
-                &heartbeat_options.api_base(),
-                &heartbeat_agent_id,
-                &heartbeat_credential,
-            ) {
-                eprintln!("SVN management capability bootstrap deferred: {error}");
-            }
             let remote_execution =
                 crate::app::remote_execution::load(&heartbeat_options.state_path)
                     .unwrap_or_default()
