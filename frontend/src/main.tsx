@@ -1877,6 +1877,11 @@ function AgentApp() {
   function navigate(target: NavigationTarget) {
     const nextPage = typeof target === 'string' ? target : target.page;
     if (typeof target !== 'string' && target.kind) setInstalledKind(target.kind);
+    // 从侧栏/「查看」菜单进入 AI 对话时必须同时点亮激活标记：页面内容由
+    // builtinAiActivated 门控，只有 openBuiltinAi() 系列入口会设置它。
+    // 漏掉这一步，当应用上次停在别的页面（标记初值为 false）时，从菜单进来
+    // 会渲染成整片空白——连页面自带的工具栏都没有，只有外层导航还在。
+    if (nextPage === 'builtin-ai') setBuiltinAiActivated(true);
     if (!isSettingsWindow && nextPage === 'ai') {
       setAiConnectionsTab('mcp');
       openSettingsWindow('ai');
@@ -2499,7 +2504,7 @@ function AgentApp() {
     >
       <NotificationCenter messages={messages} onClose={dismissNotification} />
       <div className={`builtin-ai-page-host ${page === 'builtin-ai' ? 'active' : 'inactive'}`} aria-hidden={page !== 'builtin-ai'}>
-        {builtinAiActivated ? builtinAiContent : null}
+        {builtinAiActivated || page === 'builtin-ai' ? builtinAiContent : null}
       </div>
       {page !== 'builtin-ai' ? <Suspense fallback={<PageLoadingState />}>{content}</Suspense> : null}
     </Shell>
