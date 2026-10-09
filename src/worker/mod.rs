@@ -236,6 +236,7 @@ pub(crate) fn run_loop(
                 &heartbeat_credential,
                 Some(&runtime_installations),
                 Some(&remote_execution),
+                crate::svn::service::local_svn_username().as_deref(),
             ) {
                 Ok(true) => {
                     heartbeat_failures = 0;
@@ -246,27 +247,31 @@ pub(crate) fn run_loop(
                         last_heartbeat_error.clear();
                     }
                     set_status(&heartbeat_status, "online", true, &heartbeat_agent_id, "");
-                    match crate::app::identity::sync_svn_credentials(&heartbeat_options) {
-                        Ok(_) => {
+                    // The SVN account is chosen locally by the user and is
+                    // deliberately unrelated to the Dashboard session user, so
+                    // the worker only reports whether one is configured. Nothing
+                    // is derived from the Dashboard identity any more.
+                    match crate::svn::service::local_svn_username() {
+                        Some(username) => {
                             if !last_identity_error.is_empty() {
                                 if let Some(logs) = heartbeat_logs.as_ref() {
-                                    logs.add_log("info", "Dashboard 用户授权连接已恢复");
+                                    logs.add_log(
+                                        "info",
+                                        &format!("本机 SVN 账号已配置：{username}"),
+                                    );
                                 }
                                 last_identity_error.clear();
                             }
                         }
-                        Err(error) => {
-                            let message = error.to_string();
+                        None => {
+                            let message =
+                                "本机尚未配置 SVN 账号，展项仓库相关任务无法执行".to_string();
                             if message != last_identity_error {
                                 if let Some(logs) = heartbeat_logs.as_ref() {
-                                    logs.add_log(
-                                        "warn",
-                                        &format!("Dashboard 用户授权同步暂缓: {message}"),
-                                    );
+                                    logs.add_log("warn", &message);
                                 }
                                 last_identity_error = message.clone();
                             }
-                            eprintln!("SVN identity synchronization deferred: {message}");
                         }
                     }
                     crate::app::plugin_manager::flush_status_outbox(

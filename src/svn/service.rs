@@ -38,7 +38,6 @@ const SVN_CONNECTION_ID: &str = "company-svn";
 const SVN_ADMIN_CONNECTION_ID: &str = "company-svn-admin";
 const SVN_ADMIN_URL: &str = "http://svn.andcrane.com";
 const SVN_SERVICE_URL: &str = "http://svn.andcrane.com/repo";
-const DEFAULT_SVN_USER_PASSWORD: &str = "123456";
 const UNITY_TEMPLATE_URL: &str = "http://svn.andcrane.com/repo/UNIArtTemplate";
 const UNREAL_TEMPLATE_ROOT_URL: &str = "http://svn.andcrane.com/repo/repo_UETemplates";
 const TEMPLATE_MARKER_FILE: &str = ".himind-template.json";
@@ -71,7 +70,6 @@ static SVN_DIAGNOSTIC_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 // desktop's HTTP proxy settings for this client: a proxy can route the
 // request outside the LAN and turn a healthy service into a connect timeout.
 static SVN_ADMIN_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
-static SVN_DEFAULT_CREDENTIALS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) struct SvnDiagnosticContextGuard {
     previous: SvnDiagnosticContext,
@@ -184,50 +182,6 @@ pub(crate) fn install_svn_admin_credentials(
     Err("shared SvnAdmin credentials are Edge Worker-only".into())
 }
 
-pub(crate) fn default_svn_username(display_name: &str) -> Result<String, Box<dyn Error>> {
-    let mut username = display_name.trim();
-    for suffix in ["（软件）", "(软件)"] {
-        if let Some(value) = username.strip_suffix(suffix) {
-            username = value.trim();
-            break;
-        }
-    }
-    if username.is_empty() || username.len() > 200 || username.contains(['\r', '\n']) {
-        return Err("HiMind user name cannot be used as an SVN username".into());
-    }
-    Ok(username.to_string())
-}
-
-pub(crate) fn ensure_default_svn_credentials(username: &str) -> Result<bool, Box<dyn Error>> {
-    let _guard = SVN_DEFAULT_CREDENTIALS_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "SVN credential synchronization lock is poisoned")?;
-    let username = default_svn_username(username)?;
-    // 已配置的公司 SVN 凭据以用户手动设置为准：无论当前是 configured
-    // （用户刚保存、未验证）还是 ready（已通过连接验证），只要用户名和
-    // 密码非空就不被自动同步覆盖；仅当完全缺失时才按 Dashboard 身份播种。
-    if list_local_svn_connections()?.into_iter().any(|item| {
-        item.id == SVN_CONNECTION_ID
-            && !item.username.trim().is_empty()
-            && !item.encrypted_password.is_empty()
-    }) {
-        return Ok(false);
-    }
-    let password = DEFAULT_SVN_USER_PASSWORD.to_string();
-    login_svn_user(&username, &password)?;
-    save_local_svn_connection(
-        SVN_CONNECTION_ID,
-        "公司 SVN",
-        SVN_SERVICE_URL,
-        &username,
-        &password,
-        "svn",
-    )?;
-    update_local_svn_connection_status(SVN_CONNECTION_ID, "ready", "")?;
-    Ok(true)
-}
-
 pub(crate) fn svn_admin_ready() -> bool {
     false
 }
@@ -283,6 +237,9 @@ pub(crate) fn save_connection(
     request: SaveSvnConnectionRequest,
 ) -> Result<SvnConnectionSummary, Box<dyn Error>> {
     let username = required_value(&request.username, "SVN username")?;
+    if let Some(previous) = local_svn_username().filter(|value| value != &username) {
+        crate::svn::auth_cache::clear(SVN_SERVICE_URL, &previous);
+    }
     save_local_svn_connection(
         SVN_CONNECTION_ID,
         "公司 SVN",
@@ -303,7 +260,29 @@ pub(crate) fn save_connection(
     })
 }
 
+/// The SVN account this machine actually signs in with.
+///
+/// The account is chosen locally by the user and is intentionally unrelated to
+/// the Dashboard session user, so this value is what other components report
+/// and authorize against.
+pub(crate) fn local_svn_username() -> Option<String> {
+    let connections = list_local_svn_connections().ok()?;
+    let selected = connections
+        .iter()
+        .find(|item| item.id == SVN_CONNECTION_ID)
+        .or_else(|| connections.iter().find(|item| item.provider == "svn"))?;
+    let username = selected.username.trim();
+    if username.is_empty() {
+        None
+    } else {
+        Some(username.to_string())
+    }
+}
+
 pub(crate) fn remove_connection() -> Result<bool, Box<dyn Error>> {
+    if let Some(username) = local_svn_username() {
+        crate::svn::auth_cache::clear(SVN_SERVICE_URL, &username);
+    }
     if remove_local_svn_connection(SVN_CONNECTION_ID)? {
         return Ok(true);
     }
@@ -358,18 +337,20 @@ pub(crate) fn test_connection() -> Result<Value, Box<dyn Error>> {
 
 fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error>> {
     let executable = find_svn_executable().ok_or("SVN CLI was not found")?;
+    let (auth_arguments, stdin_payload) = svn_auth_arguments(Some(SVN_SERVICE_URL), username, password)?;
+    let mut arguments = vec![
+        "info".to_string(),
+        SVN_SERVICE_URL.to_string(),
+    ];
+    arguments.extend(auth_arguments);
     let mut child = match Command::new(&executable)
-        .args([
-            "info".to_string(),
-            SVN_SERVICE_URL.to_string(),
-            "--non-interactive".to_string(),
-            "--no-auth-cache".to_string(),
-            "--username".to_string(),
-            username.to_string(),
-            "--password-from-stdin".to_string(),
-        ])
+        .args(&arguments)
         .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::piped())
+        .stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -380,8 +361,9 @@ fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error
         }
         Err(error) => return Err(error.into()),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(password.as_bytes())?;
+    if let Some(payload) = stdin_payload {
+        let mut stdin = child.stdin.take().ok_or("failed to open SVN stdin")?;
+        stdin.write_all(payload.as_bytes())?;
         stdin.write_all(b"\r\n")?;
     }
     let output = child.wait_with_output()?;
@@ -439,14 +421,27 @@ pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, B
     let (connection, password) = load_company_svn_secret()?;
     let repository_url =
         checkout_repository_url(request.repository_url.as_deref(), &project_id, &exhibit_id)?;
-    let candidate = absolute_path(&request.target_path)?;
-    reject_sensitive_path(&candidate)?;
-    let target_uuid = svn_remote_item(
+    checkout_workspace_at_url(
+        &request,
+        &project_id,
+        &exhibit_id,
         &repository_url,
-        "repos-uuid",
         &connection.username,
         &password,
-    )?;
+    )
+}
+
+fn checkout_workspace_at_url(
+    request: &SvnCheckoutRequest,
+    project_id: &str,
+    exhibit_id: &str,
+    repository_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let candidate = absolute_path(&request.target_path)?;
+    reject_sensitive_path(&candidate)?;
+    let target_uuid = svn_remote_item(repository_url, "repos-uuid", username, password)?;
     if target_uuid.trim().is_empty() {
         return Err("SVN target repository did not return a repository UUID".into());
     }
@@ -469,8 +464,8 @@ pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, B
                             "--ignore-externals".to_string(),
                             candidate.to_string_lossy().to_string(),
                         ],
-                        &connection.username,
-                        &password,
+                        username,
+                        password,
                     )?;
                     (candidate, output, "update", false, 0)
                 } else {
@@ -488,19 +483,19 @@ pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, B
                     let output = switch_same_repository_workspace(
                         &candidate,
                         current_url,
-                        &repository_url,
-                        &connection.username,
-                        &password,
+                        repository_url,
+                        username,
+                        password,
                     )?;
                     (candidate, output, "switch", false, 0)
                 }
             } else {
                 takeover_non_empty_workspace(
                     &candidate,
-                    &repository_url,
+                    repository_url,
                     &target_uuid,
-                    &connection.username,
-                    &password,
+                    username,
+                    password,
                 )?
             }
         } else {
@@ -510,26 +505,26 @@ pub(crate) fn checkout_workspace(request: SvnCheckoutRequest) -> Result<Value, B
             if non_empty {
                 takeover_non_empty_workspace(
                     &target,
-                    &repository_url,
+                    repository_url,
                     &target_uuid,
-                    &connection.username,
-                    &password,
+                    username,
+                    password,
                 )?
             } else {
                 let output = run_svn_authenticated(
                     [
                         "checkout".to_string(),
                         "--ignore-externals".to_string(),
-                        repository_url.clone(),
+                        repository_url.to_string(),
                         target.to_string_lossy().to_string(),
                     ],
-                    &connection.username,
-                    &password,
+                    username,
+                    password,
                 )?;
                 (target, output, "checkout", false, 0)
             }
         };
-    let external_sync = sync_workspace_externals(&target, &connection.username, &password);
+    let external_sync = sync_workspace_externals(&target, username, password);
     let status = workspace_status_path(&target)?;
     Ok(json!({
         "ok": true,
@@ -1611,14 +1606,11 @@ where
         resolve_template(&request.engine_type, &request.template_id)?;
     let repository_url = exhibit_repository_url(&project_id, &exhibit_id)?;
     let (connection, password) = load_company_svn_secret()?;
-    if !request.svn_username.trim().is_empty()
-        && !connection
-            .username
-            .trim()
-            .eq_ignore_ascii_case(request.svn_username.trim())
-    {
-        return Err("当前本机 SVN 账号与任务绑定的用户身份不一致".into());
-    }
+    // The SVN account is chosen by the user on this machine and is deliberately
+    // not tied to the Dashboard session user, so a task that carries a
+    // different `svn_username` is informational rather than an authorization
+    // boundary. The Edge Worker has already granted this machine's own account
+    // access to the target path before the task was released.
     let temp_root = std::env::temp_dir().join(format!(
         "himind-svn-template-{}-{}-{}",
         std::process::id(),
@@ -3358,16 +3350,25 @@ fn probe_svn_remote(url: &str, timeout: Duration) -> String {
         return "temporarily_unreachable".to_string();
     };
     let credentials = load_company_svn_secret().ok();
-    let arguments = svn_remote_probe_arguments(
-        url,
-        credentials
-            .as_ref()
-            .map(|(connection, _)| connection.username.as_str()),
-    );
+    let (auth_arguments, stdin_payload) = match credentials.as_ref() {
+        Some((connection, password)) => {
+            match svn_auth_arguments(Some(url), &connection.username, password) {
+                Ok(value) => value,
+                Err(_) => return "temporarily_unreachable".to_string(),
+            }
+        }
+        None => (Vec::new(), None),
+    };
+    let mut arguments = vec![
+        "info".to_string(),
+        url.to_string(),
+        "--non-interactive".to_string(),
+    ];
+    arguments.extend(auth_arguments);
     let child = Command::new(executable)
         .args(arguments)
         .creation_flags(CREATE_NO_WINDOW)
-        .stdin(if credentials.is_some() {
+        .stdin(if stdin_payload.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -3378,13 +3379,13 @@ fn probe_svn_remote(url: &str, timeout: Duration) -> String {
     let Ok(mut child) = child else {
         return "temporarily_unreachable".to_string();
     };
-    if let Some((_, password)) = credentials {
+    if let Some(payload) = stdin_payload {
         let Some(mut stdin) = child.stdin.take() else {
             let _ = child.kill();
             let _ = child.wait();
             return "temporarily_unreachable".to_string();
         };
-        if stdin.write_all(password.as_bytes()).is_err() || stdin.write_all(b"\r\n").is_err() {
+        if stdin.write_all(payload.as_bytes()).is_err() || stdin.write_all(b"\r\n").is_err() {
             let _ = child.kill();
             let _ = child.wait();
             return "temporarily_unreachable".to_string();
@@ -3412,23 +3413,6 @@ fn probe_svn_remote(url: &str, timeout: Duration) -> String {
             Err(_) => return "temporarily_unreachable".to_string(),
         }
     }
-}
-
-fn svn_remote_probe_arguments(url: &str, username: Option<&str>) -> Vec<String> {
-    let mut arguments = vec![
-        "info".to_string(),
-        url.to_string(),
-        "--non-interactive".to_string(),
-    ];
-    if let Some(username) = username.filter(|value| !value.trim().is_empty()) {
-        arguments.extend([
-            "--no-auth-cache".to_string(),
-            "--username".to_string(),
-            username.to_string(),
-            "--password-from-stdin".to_string(),
-        ]);
-    }
-    arguments
 }
 
 fn classify_svn_remote_error(message: &str) -> String {
@@ -4729,6 +4713,83 @@ where
     run_svn_authenticated_cancelable(arguments, username, password, &mut || Ok(()))
 }
 
+/// Find the repository URL inside an SVN argument list.
+fn svn_url_argument(arguments: &[String]) -> Option<String> {
+    arguments
+        .iter()
+        .find(|argument| {
+            let value = argument.trim();
+            value.starts_with("http://")
+                || value.starts_with("https://")
+                || value.starts_with("svn://")
+                || value.starts_with("svn+ssh://")
+        })
+        .cloned()
+}
+
+/// Seed the private authentication cache for a repository URL and account.
+fn prepare_svn_auth_cache(
+    url: &str,
+    username: &str,
+    password: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let config_dir = crate::svn::auth_cache::config_dir(url, username);
+    let realmstring = crate::svn::auth_cache::realmstring(url)?;
+    crate::svn::auth_cache::seed(&config_dir, &realmstring, username, password)?;
+    Ok(config_dir)
+}
+
+/// Build the authentication arguments for one SVN invocation.
+///
+/// Returns the extra arguments plus the value, when any, that the child process
+/// expects on stdin. The password itself is never placed on the command line.
+///
+/// The Windows `svn.exe` client mangles non-ASCII `--username` values, and the
+/// CLI cannot store credentials non-interactively. Company SVN accounts are
+/// routinely Chinese display names, so those accounts authenticate through a
+/// private `--config-dir` seeded with a DPAPI-protected cache entry. Pure
+/// ASCII accounts keep the `--username`/`--password-from-stdin` path, which is
+/// already known to work for them.
+fn svn_auth_arguments(
+    url: Option<&str>,
+    username: &str,
+    password: &str,
+) -> Result<(Vec<String>, Option<String>), Box<dyn Error>> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Ok((
+            vec![
+                "--non-interactive".to_string(),
+                "--no-auth-cache".to_string(),
+            ],
+            None,
+        ));
+    }
+    if !username.is_ascii() {
+        if let Some(url) = url.map(str::trim).filter(|value| !value.is_empty()) {
+            let config_dir = prepare_svn_auth_cache(url, username, password)?;
+            return Ok((
+                vec![
+                    "--non-interactive".to_string(),
+                    "--config-dir".to_string(),
+                    config_dir.to_string_lossy().to_string(),
+                ],
+                None,
+            ));
+        }
+    }
+    Ok((
+        vec![
+            "--non-interactive".to_string(),
+            "--no-auth-cache".to_string(),
+            "--username".to_string(),
+            username.to_string(),
+            "--password-from-stdin".to_string(),
+        ],
+        Some(password.to_string()),
+    ))
+}
+
 fn run_svn_authenticated_cancelable<I, F>(
     arguments: I,
     username: &str,
@@ -4741,22 +4802,23 @@ where
 {
     let executable = find_svn_executable().ok_or("SVN CLI was not found")?;
     let mut command_arguments: Vec<String> = arguments.into_iter().collect();
-    command_arguments.extend([
-        "--non-interactive".to_string(),
-        "--no-auth-cache".to_string(),
-        "--username".to_string(),
-        username.to_string(),
-        "--password-from-stdin".to_string(),
-    ]);
+    let (auth_arguments, stdin_payload) =
+        svn_auth_arguments(svn_url_argument(&command_arguments).as_deref(), username, password)?;
+    command_arguments.extend(auth_arguments);
     let mut child = Command::new(&executable)
         .args(&command_arguments)
         .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::piped())
+        .stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(password.as_bytes())?;
+    if let Some(payload) = stdin_payload {
+        let mut stdin = child.stdin.take().ok_or("failed to open SVN stdin")?;
+        stdin.write_all(payload.as_bytes())?;
         stdin.write_all(b"\r\n")?;
     }
     let mut stdout = child.stdout.take().ok_or("failed to capture SVN stdout")?;
@@ -5327,14 +5389,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_svn_username_from_himind_name() {
-        assert_eq!(default_svn_username("马宝全").unwrap(), "马宝全");
-        assert_eq!(default_svn_username(" 李鹏（软件） ").unwrap(), "李鹏");
-        assert_eq!(default_svn_username("陈晨(软件)").unwrap(), "陈晨");
-        assert!(default_svn_username("\n").is_err());
-    }
-
-    #[test]
     fn validates_repository_paths_and_names() {
         assert_eq!(normalize_repository_name("Project_1").unwrap(), "Project_1");
         assert!(normalize_repository_name("bad/name").is_err());
@@ -5421,6 +5475,110 @@ mod tests {
         ] {
             assert!(checkout_repository_url(Some(url), "prj_current", "EX-1").is_err());
         }
+    }
+
+    #[test]
+    fn checkout_workspace_checks_out_a_real_exhibit_repository_and_updates_it_idempotently() {
+        let Some(svn) = find_svn_executable() else {
+            eprintln!("skipping local SVN checkout integration test: svn CLI was not found");
+            return;
+        };
+        let svnadmin_name = if cfg!(windows) {
+            "svnadmin.exe"
+        } else {
+            "svnadmin"
+        };
+        let svnadmin = svn.with_file_name(svnadmin_name);
+        if !svnadmin.is_file() {
+            eprintln!("skipping local SVN checkout integration test: svnadmin CLI was not found");
+            return;
+        }
+
+        struct TestDirectory(PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "himind-svn-checkout-workflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _cleanup = TestDirectory(root.clone());
+        let repository = root.join("repository");
+        let target = root.join("working-copy");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let created = Command::new(&svnadmin)
+            .args(["create", repository.to_string_lossy().as_ref()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap();
+        assert!(created.success(), "svnadmin create failed");
+
+        let repository_root_url = Url::from_file_path(&repository).unwrap().to_string();
+        let exhibit_url = format!("{repository_root_url}/trunk/exhibits/EX-9001");
+        for path in [
+            format!("{repository_root_url}/trunk"),
+            format!("{repository_root_url}/trunk/exhibits"),
+            exhibit_url.clone(),
+        ] {
+            let created = Command::new(&svn)
+                .args(["mkdir", "-m", "seed exhibit path", &path])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .unwrap();
+            assert!(created.success(), "svn mkdir failed for {path}");
+        }
+
+        let request = SvnCheckoutRequest {
+            project_id: "prj_test".to_string(),
+            exhibit_id: "EX-9001".to_string(),
+            repository_url: Some(exhibit_url.clone()),
+            target_path: target.to_string_lossy().to_string(),
+        };
+        let result = checkout_workspace_at_url(
+            &request,
+            "prj_test",
+            "EX-9001",
+            &exhibit_url,
+            "test-user",
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(result["checkout_mode"], "checkout");
+        assert!(
+            target.join(".svn").is_dir(),
+            "working copy metadata is missing"
+        );
+        assert!(same_svn_url(
+            result["workspace"]["repository_url"]
+                .as_str()
+                .unwrap_or_default(),
+            &exhibit_url
+        ));
+        assert_eq!(
+            result["workspace"]["repository_uuid"],
+            result["repository_uuid"]
+        );
+
+        let updated = checkout_workspace_at_url(
+            &request,
+            "prj_test",
+            "EX-9001",
+            &exhibit_url,
+            "test-user",
+            "",
+        )
+        .unwrap();
+        assert_eq!(updated["checkout_mode"], "update");
+        assert_eq!(updated["workspace"]["change_count"], 0);
     }
 
     #[test]
@@ -6247,14 +6405,64 @@ mod tests {
     }
 
     #[test]
-    fn remote_probe_uses_username_and_password_stdin_without_exposing_password() {
-        let arguments =
-            svn_remote_probe_arguments("http://svn.example/repo/project", Some("SVN User"));
+    fn ascii_accounts_authenticate_through_username_and_password_stdin() {
+        let (arguments, stdin) =
+            svn_auth_arguments(Some("http://svn.example/repo/project"), "svn-user", "secret")
+                .unwrap();
         assert!(arguments
             .windows(2)
-            .any(|pair| pair == ["--username", "SVN User"]));
+            .any(|pair| pair == ["--username", "svn-user"]));
         assert!(arguments.contains(&"--password-from-stdin".to_string()));
         assert!(!arguments.iter().any(|argument| argument == "secret"));
+        assert_eq!(stdin.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn empty_accounts_authenticate_anonymously() {
+        let (arguments, stdin) = svn_auth_arguments(Some("http://svn.example/repo"), "", "").unwrap();
+        assert!(arguments.contains(&"--no-auth-cache".to_string()));
+        assert!(!arguments.iter().any(|argument| argument == "--username"));
+        assert!(stdin.is_none());
+    }
+
+    #[test]
+    fn non_ascii_accounts_never_reach_the_command_line() {
+        let config_dir = crate::svn::auth_cache::config_dir("http://svn.example/repo", "马宝全");
+        assert!(
+            config_dir.to_string_lossy().is_ascii(),
+            "the SVN config directory must stay on an ASCII path"
+        );
+        let (arguments, stdin) =
+            svn_auth_arguments(Some("http://svn.example/repo"), "马宝全", "secret").unwrap();
+        assert!(!arguments.iter().any(|argument| argument == "--username"));
+        assert!(!arguments.iter().any(|argument| argument == "马宝全"));
+        assert!(!arguments.iter().any(|argument| argument == "secret"));
+        assert!(stdin.is_none());
+        assert_eq!(
+            svn_url_argument(&[
+                "checkout".to_string(),
+                "http://svn.example/repo/project".to_string(),
+                "C:\\work".to_string(),
+            ]),
+            Some("http://svn.example/repo/project".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_basic_auth_realm_from_a_challenge() {
+        assert_eq!(
+            crate::svn::auth_cache::parse_basic_realm("Basic realm=\"SVN Repo\"").as_deref(),
+            Some("SVN Repo")
+        );
+        assert_eq!(
+            crate::svn::auth_cache::parse_basic_realm("Basic realm=SVN, charset=\"UTF-8\"")
+                .as_deref(),
+            Some("SVN")
+        );
+        assert_eq!(
+            crate::svn::auth_cache::parse_basic_realm("Negotiate"),
+            None
+        );
     }
 
     #[test]

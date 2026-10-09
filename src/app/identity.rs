@@ -175,20 +175,6 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
 
     match oauth::fetch_user_info(options) {
         Ok(info) => {
-            let local_svn_error = ensure_svn_credentials_for_identity(&info)
-                .err()
-                .map(|error| error.to_string());
-            let svn_provisioning_status =
-                if local_svn_error.is_some() && info.svn_provisioning_status == "ready" {
-                    "local_error".to_string()
-                } else {
-                    info.svn_provisioning_status.clone()
-                };
-            let svn_provisioning_error = match local_svn_error {
-                Some(error) if info.svn_provisioning_error.trim().is_empty() => error,
-                Some(error) => format!("{}；本机配置失败：{}", info.svn_provisioning_error, error),
-                None => info.svn_provisioning_error.clone(),
-            };
             DashboardIdentityStatus {
                 state: if info.active {
                     "authorized"
@@ -206,8 +192,8 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
                 refresh_expires_at: snapshot.refresh_expires_at,
                 last_verified_at: unix_now(),
                 svn_username: info.svn_username,
-                svn_provisioning_status,
-                svn_provisioning_error,
+                svn_provisioning_status: info.svn_provisioning_status,
+                svn_provisioning_error: info.svn_provisioning_error,
                 error: if info.active {
                     String::new()
                 } else {
@@ -319,7 +305,6 @@ pub(crate) fn start_authorization(
         match result {
             Ok(access) => {
                 let info = oauth::fetch_user_info(&options).ok();
-                let svn_result = info.as_ref().map(ensure_svn_credentials_for_identity);
                 let access_user_id = access.user_id.clone();
                 let access_agent_id = access.agent_id.clone();
                 let Ok(mut state) = flow_for_thread.lock() else {
@@ -352,14 +337,8 @@ pub(crate) fn start_authorization(
                     crate::app::runtime_mode::AgentMode::Connected,
                 );
                 options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
-                match svn_result {
-                    Some(Ok(true)) => logs.add_log("info", "已按 HiMind 姓名配置 SVN 账号"),
-                    Some(Err(error)) => logs.add_log(
-                        "error",
-                        &format!("自动配置 SVN 账号失败，可在设置中重试: {error}"),
-                    ),
-                    _ => {}
-                }
+                // The company SVN account is picked by the user on this machine;
+                // it is no longer derived from the Dashboard account name.
             }
             Err(error) => {
                 let message = error.to_string();
@@ -380,32 +359,6 @@ pub(crate) fn start_authorization(
     });
 
     Ok(authorization_progress(&flow))
-}
-
-fn ensure_svn_credentials_for_identity(
-    info: &oauth::AgentUserInfo,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if !info.active
-        || info.svn_identity_status == "disabled"
-        || info.svn_identity_status == "ambiguous"
-        || info.svn_provisioning_status != "ready"
-    {
-        return Ok(false);
-    }
-    let username = if info.svn_username.trim().is_empty() {
-        crate::svn::service::default_svn_username(&info.name)?
-    } else {
-        info.svn_username.trim().to_string()
-    };
-    crate::svn::service::ensure_default_svn_credentials(&username)
-}
-
-pub(crate) fn sync_svn_credentials(options: &Options) -> Result<bool, Box<dyn std::error::Error>> {
-    if oauth::authorization_snapshot(&options.state_path)?.is_none() {
-        return Ok(false);
-    }
-    let info = oauth::fetch_user_info(options)?;
-    ensure_svn_credentials_for_identity(&info)
 }
 
 pub(crate) fn cancel_authorization(

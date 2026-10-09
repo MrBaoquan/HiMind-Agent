@@ -393,7 +393,7 @@ pub fn heartbeat(
     agent_id: &str,
     credential: &str,
 ) -> Result<bool, Box<dyn Error>> {
-    heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None)
+    heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None, None)
 }
 
 pub fn heartbeat_with_runtime_installations(
@@ -403,11 +403,17 @@ pub fn heartbeat_with_runtime_installations(
     credential: &str,
     runtime_installations: Option<&[RuntimeInstallationReport]>,
     remote_execution: Option<&RemoteExecutionReport>,
+    svn_username: Option<&str>,
 ) -> Result<bool, Box<dyn Error>> {
     let mut payload = json!({
         "agent_id": agent_id,
         "status": "online",
     });
+    // The SVN account is chosen on this machine and is not derived from the
+    // Dashboard session user. Always report it, including an empty value, so
+    // the Dashboard can clear a stale account when the operator removes the
+    // local SVN configuration instead of authorizing Edge against a ghost.
+    payload["svn_username"] = json!(svn_username.map(str::trim).unwrap_or(""));
     if let Some(items) = runtime_installations {
         payload["runtime_installations"] = serde_json::to_value(items)?;
     }

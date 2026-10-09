@@ -136,29 +136,15 @@ fn main() {
         eprintln!("extension transaction recovery failed: {error}");
     }
     if !mcp_mode && !acp_mode {
-        let svn_credentials_from_environment = match svn::service::bootstrap_svn_credentials() {
-            Ok(configured) => configured,
-            Err(error) => {
-                eprintln!("SVN credential initialization failed: {error}");
-                std::process::exit(1);
-            }
-        };
+        if let Err(error) = svn::service::bootstrap_svn_credentials() {
+            eprintln!("SVN credential initialization failed: {error}");
+            std::process::exit(1);
+        }
         // Central SVN administration is owned by himind-edge-worker. Remove
         // any legacy desktop copy once, then keep this process limited to the
-        // signed-in user's own SVN connection.
+        // signed-in user's own SVN connection, which the user picks in the app.
         if let Err(error) = svn::service::remove_svn_admin_credentials() {
             eprintln!("legacy desktop SVN admin credential cleanup deferred: {error}");
-        }
-        if !svn_credentials_from_environment {
-            if let Ok(Some(snapshot)) = api::oauth::authorization_snapshot(&options.state_path) {
-                if !snapshot.display_name.trim().is_empty() {
-                    if let Err(error) =
-                        svn::service::ensure_default_svn_credentials(&snapshot.display_name)
-                    {
-                        eprintln!("SVN user credential initialization failed: {error}");
-                    }
-                }
-            }
         }
     }
     if acp_mode {
@@ -619,16 +605,6 @@ fn run_auth_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn E
             println!("Authorization code: {}", authorization.user_code);
             let _ = app::system::open_url(&authorization.verification_uri_complete);
             let access = api::oauth::wait_for_device_authorization(options, &authorization)?;
-            if let Ok(info) = api::oauth::fetch_user_info(options) {
-                let svn_username = if info.svn_username.trim().is_empty() {
-                    svn::service::default_svn_username(&info.name)?
-                } else {
-                    info.svn_username
-                };
-                if info.svn_provisioning_status == "ready" {
-                    svn::service::ensure_default_svn_credentials(&svn_username)?;
-                }
-            }
             println!(
                 "Agent {} is authorized as Dashboard user {} with scopes: {}",
                 access.agent_id, access.user_id, access.scope
@@ -3768,7 +3744,7 @@ fn validate_released_template_task(
         return Err("展项模板任务必须来自已登录用户创建的 Dashboard 任务".into());
     }
     if request.svn_username.trim().is_empty() {
-        return Err("展项模板任务缺少当前用户的 SVN 身份".into());
+        return Err("展项模板任务缺少本机 SVN 账号，请先在 Agent 中配置 SVN 连接".into());
     }
     if request.prerequisite_task_id.trim().is_empty() {
         return Err("展项模板任务缺少 Edge 前置任务凭据".into());

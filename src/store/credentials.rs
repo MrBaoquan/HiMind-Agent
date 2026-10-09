@@ -573,6 +573,20 @@ pub(crate) fn protect_secret_for_current_user(secret: &str) -> Result<String, Bo
     Ok(format!("{DPAPI_PREFIX}{}", STANDARD.encode(protected)))
 }
 
+/// DPAPI-protect arbitrary bytes with an explicit data description.
+///
+/// HiMind's own credential files wrap UTF-16 text, but foreign credential
+/// stores have their own on-disk contract. The SVN CLI's `auth/svn.simple`
+/// cache stores the password as raw UTF-8 bytes and stamps the blob with the
+/// description `auth_svn.simple.wincrypt`, which it verifies before use, so
+/// seeding that cache needs a byte-level entry point.
+pub(crate) fn protect_bytes_for_current_user(
+    bytes: &[u8],
+    description: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    crypt_protect_bytes(bytes, description)
+}
+
 pub(crate) fn unprotect_secret_for_current_user(secret: &str) -> Result<String, Box<dyn Error>> {
     let blob = if let Some(encoded) = secret.strip_prefix(DPAPI_PREFIX) {
         STANDARD.decode(encoded.trim())?
@@ -645,6 +659,50 @@ fn crypt_protect(secret: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 #[cfg(windows)]
+fn crypt_protect_bytes(bytes: &[u8], description: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let mut plaintext = bytes.to_vec();
+    let description: Vec<u16> = description.encode_utf16().chain([0]).collect();
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: plaintext.len().try_into()?,
+        pbData: plaintext.as_mut_ptr(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let succeeded = unsafe {
+        CryptProtectData(
+            &input,
+            description.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    plaintext.fill(0);
+    if succeeded == 0 {
+        return Err(format!(
+            "failed to protect local credential: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    let protected = unsafe {
+        let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        LocalFree(output.pbData.cast());
+        bytes
+    };
+    Ok(protected)
+}
+
+#[cfg(windows)]
 fn crypt_unprotect(protected: &[u8]) -> Result<String, Box<dyn Error>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
@@ -693,6 +751,11 @@ fn crypt_unprotect(protected: &[u8]) -> Result<String, Box<dyn Error>> {
 
 #[cfg(not(windows))]
 fn crypt_protect(_secret: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    Err("Windows DPAPI is unavailable on this platform".into())
+}
+
+#[cfg(not(windows))]
+fn crypt_protect_bytes(_bytes: &[u8], _description: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     Err("Windows DPAPI is unavailable on this platform".into())
 }
 
