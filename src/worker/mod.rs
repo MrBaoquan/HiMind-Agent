@@ -474,13 +474,33 @@ pub(crate) fn run_loop(
             Err(error) => return Err(error),
         };
         for task in tasks {
-            execute_task(
+            // 一个任务失败不能拖垮整个 Worker。任务级失败（例如后台任务缺少已批准的
+            // Dashboard Grant、载荷解析失败）只是这个任务的条件不成立，旧实现在这里用
+            // `?` 直接结束 run_loop，Worker 断开重连，同一批次里排在后面的任务被丢弃，
+            // Dashboard 侧只能等到租约过期。只有连接本身不可用时才重连。
+            let task_id = task.id.clone();
+            let task_type = task.task_type.clone();
+            if let Err(error) = execute_task(
                 &client,
                 &options,
                 &state.agent_id,
                 task,
                 approval_mgr.as_deref(),
-            )?;
+            ) {
+                if is_transient_dashboard_error(error.as_ref()) {
+                    return Err(error);
+                }
+                let message = error.to_string();
+                if let Some(logs) = approval_mgr.as_ref() {
+                    logs.add_log(
+                        "error",
+                        &format!(
+                            "任务未完成，继续处理后续任务: {task_id} ({task_type}) - {message}"
+                        ),
+                    );
+                }
+                eprintln!("task {task_id} ({task_type}) did not finish: {message}");
+            }
         }
         if options.once {
             break;
