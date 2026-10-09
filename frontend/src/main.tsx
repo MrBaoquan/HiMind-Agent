@@ -545,6 +545,9 @@ function AgentApp() {
       const independent = statusRef.current?.mode === 'independent' || statusRef.current?.dashboard_enabled === false;
       // 账号设置页的主数据是连接清单，和审批设置并行拉，谁先到谁先渲染。
       void refreshWorkbenchConnections();
+      // 本机 SVN 账号也是账号页的主数据。它由本机用户自己选择并写在本地加密存储，
+      // 与工作台登录身份无关；漏掉这一步，已配置的账号会显示成「待配置」。
+      void refreshSvnConnections().catch(error => console.error(error));
       try {
         const [settingsResult, remoteExecutionResult, loginResult, remoteClientsResult] = await Promise.allSettled([
           withTimeout(agentApi.settings(), '审批设置'),

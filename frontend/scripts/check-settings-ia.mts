@@ -130,4 +130,21 @@ assert.ok(formOpen >= 0 && formClose > formOpen, '备份口令输入必须包在
 assert.ok(passwordInput > formOpen && passwordInput < formClose, '备份口令 input 要落在 <form> 开闭之间');
 assert.ok(/type="submit"[\s\S]{0,240}导出备份包/.test(backupPane), '「导出备份包」要是 form 的提交按钮，回车才有落点');
 
+// 12. 账号页的 SVN 账号是本机用户自己选的、和工作台登录身份无关的本地配置。
+//     设置窗口是独立入口，不会跑主窗口的 refreshDashboardIdentity，所以账号页的数据
+//     加载必须自己带上 refreshSvnConnections；漏掉就会出现「文件里已配置、界面显示待配置」。
+const settingsDataLoader = main.slice(
+  main.indexOf('async function refreshSettingsPageData()'),
+  main.indexOf('async function refreshLogs('),
+);
+assert.ok(settingsDataLoader.length > 0, 'main.tsx 必须保留 refreshSettingsPageData');
+assert.ok(
+  /refreshSvnConnections\(\)/.test(settingsDataLoader),
+  '账号设置页加载数据时要一起读本机 SVN 账号，否则设置窗口会把已配置的账号显示成「待配置」',
+);
+assert.ok(
+  /refreshSettingsPageData\(\)/.test(main.slice(main.indexOf("page === 'settings'"), main.indexOf("page === 'settings'") + 1200)),
+  '进入设置页必须走 refreshSettingsPageData',
+);
+
 console.log(`settings IA: ${groups.length} 组 / ${totalItems} 条，深链白名单、窄窗折叠与样式约定校验通过`);
