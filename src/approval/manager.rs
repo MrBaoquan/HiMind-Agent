@@ -562,19 +562,41 @@ impl ApprovalManager {
         }
         let previous = settings.clone();
         let previous_profile = settings.profile.clone();
+        // An empty binding is the normal state after logout, independent-mode
+        // startup, or a transient authorization recovery. It does not prove
+        // that another user is taking over this Agent, so keep the locally
+        // confirmed posture when the same user binds again. Only a switch
+        // between two concrete identities invalidates elevated approval.
+        let (previous_user_id, previous_agent_id) =
+            if !settings.owner_user_id.trim().is_empty() && !settings.agent_id.trim().is_empty() {
+                (settings.owner_user_id.as_str(), settings.agent_id.as_str())
+            } else {
+                (
+                    settings.last_bound_user_id.as_str(),
+                    settings.last_bound_agent_id.as_str(),
+                )
+            };
+        let had_previous_identity =
+            !previous_user_id.trim().is_empty() && !previous_agent_id.trim().is_empty();
+        let identity_changed =
+            had_previous_identity && (previous_user_id != user_id || previous_agent_id != agent_id);
         settings.owner_user_id = user_id.to_string();
         settings.agent_id = agent_id.to_string();
+        settings.last_bound_user_id = user_id.to_string();
+        settings.last_bound_agent_id = agent_id.to_string();
         settings.binding_updated_at = unix_now();
-        settings.risk_acknowledged_at = 0;
-        settings.risk_acknowledged_duration_seconds = 0;
-        reset_identity_sensitive_rules(&mut settings);
-        if matches!(
-            previous_profile.as_str(),
-            "relaxed" | "trusted" | "full_access" | "focus"
-        ) {
-            settings.profile = "balanced".to_string();
-            if previous_profile == "focus" {
-                settings.notification_mode = "popup".to_string();
+        if identity_changed {
+            settings.risk_acknowledged_at = 0;
+            settings.risk_acknowledged_duration_seconds = 0;
+            reset_identity_sensitive_rules(&mut settings);
+            if matches!(
+                previous_profile.as_str(),
+                "relaxed" | "trusted" | "full_access" | "focus"
+            ) {
+                settings.profile = "balanced".to_string();
+                if previous_profile == "focus" {
+                    settings.notification_mode = "popup".to_string();
+                }
             }
         }
         if let Err(error) = persist_settings(&self.settings_path, &settings) {
@@ -582,12 +604,16 @@ impl ApprovalManager {
             return Err(error);
         }
         drop(settings);
-        self.add_log(
-            "warn",
-            &format!(
+        let message = if identity_changed {
+            format!(
                 "审批身份已切换为 Dashboard 用户 {user_id} / Agent {agent_id}；宽松档位已回到平衡，请重新确认风险"
-            ),
-        );
+            )
+        } else {
+            format!(
+                "审批身份已绑定为 Dashboard 用户 {user_id} / Agent {agent_id}；保留本机审批档位"
+            )
+        };
+        self.add_log("warn", &message);
         Ok(true)
     }
 
@@ -604,6 +630,10 @@ impl ApprovalManager {
             return Ok(false);
         }
         let previous = settings.clone();
+        if !settings.owner_user_id.trim().is_empty() && !settings.agent_id.trim().is_empty() {
+            settings.last_bound_user_id = settings.owner_user_id.clone();
+            settings.last_bound_agent_id = settings.agent_id.clone();
+        }
         settings.owner_user_id.clear();
         settings.agent_id.clear();
         settings.binding_updated_at = unix_now();
@@ -1866,7 +1896,25 @@ mod destructive_tests {
             ApprovalMode::AutoApprove
         ));
 
+        // Reconnecting the same Dashboard identity after logout must not
+        // turn an explicit local full-access choice back into manual review.
+        manager.bind_identity("user-a", "agent-a").unwrap();
+        assert_eq!(manager.get_settings().profile, "full_access");
+        assert!(manager
+            .get_settings()
+            .risk_acknowledgement_valid(super::unix_now()));
+        assert!(matches!(
+            manager.get_mode_for_key(
+                "wechat.miniprogram.upload",
+                ApprovalMode::Manual,
+                true,
+                Some("R3")
+            ),
+            ApprovalMode::AutoApprove
+        ));
+
         // 换成另一个工作台账号才需要重新确认，避免继承他人档位。
+        manager.clear_identity().unwrap();
         fs::write(
             home.join("data").join("agent-user-authorization.json"),
             serde_json::json!({
@@ -1883,6 +1931,9 @@ mod destructive_tests {
         .unwrap();
         manager.bind_identity("user-b", "agent-a").unwrap();
         assert_eq!(manager.get_settings().profile, "balanced");
+        assert!(!manager
+            .get_settings()
+            .risk_acknowledgement_valid(super::unix_now()));
         drop(manager);
         let _ = fs::remove_dir_all(home);
     }

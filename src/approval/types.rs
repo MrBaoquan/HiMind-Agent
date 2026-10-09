@@ -137,6 +137,12 @@ pub struct ApprovalSettings {
     pub owner_user_id: String,
     #[serde(default)]
     pub agent_id: String,
+    /// Retained after logout so a different account cannot inherit a
+    /// previously confirmed elevated profile on the same machine.
+    #[serde(default)]
+    pub last_bound_user_id: String,
+    #[serde(default)]
+    pub last_bound_agent_id: String,
     #[serde(default)]
     pub binding_updated_at: u64,
     /// Unix timestamp of the last explicit elevated-approval risk acknowledgement.
@@ -203,6 +209,8 @@ impl Default for ApprovalSettings {
             notification_mode: default_notification_mode(),
             owner_user_id: String::new(),
             agent_id: String::new(),
+            last_bound_user_id: String::new(),
+            last_bound_agent_id: String::new(),
             binding_updated_at: 0,
             risk_acknowledged_at: 0,
             risk_acknowledged_duration_seconds: default_risk_acknowledged_duration_seconds(),
