@@ -1767,7 +1767,11 @@ mod tests {
     /// 插件目录，必须在碰文件系统之前就被拒。
     #[test]
     fn refuses_plugin_package_whose_version_escapes_the_plugin_dir() {
+        // `HIMIND_AGENT_HOME` 是进程级变量：不持锁改写会让并行用例读到本用例的
+        // 临时 home，或在恢复时把别人的 home 清掉，从而读到真实数据目录。
         let home = env::temp_dir().join(format!("himind-plugin-home-{}", unique_suffix()));
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = env::var_os("HIMIND_AGENT_HOME");
         fs::create_dir_all(&home).unwrap();
         env::set_var("HIMIND_AGENT_HOME", &home);
 
@@ -1810,7 +1814,10 @@ mod tests {
             "安装不能把目录写到插件目录之外"
         );
 
-        env::remove_var("HIMIND_AGENT_HOME");
+        match previous_home {
+            Some(value) => env::set_var("HIMIND_AGENT_HOME", value),
+            None => env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = fs::remove_file(&archive);
         let _ = fs::remove_dir_all(&home);
     }
