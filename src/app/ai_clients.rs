@@ -12,7 +12,13 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 use crate::runtime::process::configure_hidden_process;
 use crate::Options;
 
-const SERVER_ID: &str = "himind-agent";
+/// The MCP server key this profile owns in each client config. Production keeps
+/// the historical `himind-agent`; other profiles scope it (see
+/// [`super::mcp_registry::agent_server_id`]) so the installed Agent's
+/// registration is never overwritten by a development run.
+fn server_id() -> String {
+    super::mcp_registry::agent_server_id()
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentMcpLaunchSpec {
@@ -193,7 +199,7 @@ pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
                 let Some(server) = document
                     .get_mut("mcp_servers")
                     .and_then(Item::as_table_mut)
-                    .and_then(|servers| servers.get_mut(SERVER_ID))
+                    .and_then(|servers| servers.get_mut(server_id().as_str()))
                     .and_then(Item::as_table_mut)
                 else {
                     continue;
@@ -213,7 +219,7 @@ pub(crate) fn migrate_legacy_agent_commands() -> Result<usize, Box<dyn Error>> {
                 let Some(server) = root_value
                     .get_mut("mcpServers")
                     .and_then(Value::as_object_mut)
-                    .and_then(|servers| servers.get_mut(SERVER_ID))
+                    .and_then(|servers| servers.get_mut(&server_id()))
                     .and_then(Value::as_object_mut)
                 else {
                     continue;
@@ -407,7 +413,7 @@ fn configuration_matches(
             let Some(server) = document
                 .get("mcp_servers")
                 .and_then(Item::as_table_like)
-                .and_then(|servers| servers.get(SERVER_ID))
+                .and_then(|servers| servers.get(server_id().as_str()))
                 .and_then(Item::as_table_like)
             else {
                 return Ok(false);
@@ -445,7 +451,7 @@ fn configuration_matches(
             let Some(server) = root
                 .get("mcpServers")
                 .and_then(Value::as_object)
-                .and_then(|servers| servers.get(SERVER_ID))
+                .and_then(|servers| servers.get(&server_id()))
             else {
                 return Ok(false);
             };
@@ -507,8 +513,28 @@ fn merge_codex_config(
         value(crate::store::paths::profile_name()),
     );
     server.insert("env", Item::Table(environment));
-    servers.insert(SERVER_ID, Item::Table(server));
+    servers.insert(server_id().as_str(), Item::Table(server));
+    reclaim_legacy_codex_entry(servers);
     Ok(document.to_string())
+}
+
+/// Drop a pre-scope singleton `himind-agent` entry that this same
+/// non-production profile wrote, so it cannot shadow the installed Agent.
+fn reclaim_legacy_codex_entry(servers: &mut Table) {
+    let Some(profile) = super::mcp_registry::legacy_singleton_profile() else {
+        return;
+    };
+    let owned_by_us = servers
+        .get(super::mcp_registry::AGENT_SERVER_ID)
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("env"))
+        .and_then(Item::as_table_like)
+        .and_then(|env| env.get("HIMIND_AGENT_PROFILE"))
+        .and_then(Item::as_str)
+        == Some(profile.as_str());
+    if owned_by_us {
+        servers.remove(super::mcp_registry::AGENT_SERVER_ID);
+    }
 }
 
 fn merge_client_config(
@@ -539,7 +565,8 @@ fn merge_client_config(
 fn remove_codex_config(content: &str) -> Result<String, Box<dyn Error>> {
     let mut document = content.parse::<DocumentMut>()?;
     if let Some(servers) = document.get_mut("mcp_servers").and_then(Item::as_table_mut) {
-        servers.remove(SERVER_ID);
+        servers.remove(server_id().as_str());
+        reclaim_legacy_codex_entry(servers);
         if servers.is_empty() {
             document.as_table_mut().remove("mcp_servers");
         }
@@ -582,14 +609,34 @@ fn merge_json_config(
         server["timeout"] = json!(60);
         server["disabled"] = json!(false);
     }
-    servers.insert(SERVER_ID.to_string(), server);
+    servers.insert(server_id(), server);
+    reclaim_legacy_json_entry(servers);
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
+}
+
+/// JSON counterpart of [`reclaim_legacy_codex_entry`].
+fn reclaim_legacy_json_entry(servers: &mut Map<String, Value>) {
+    let Some(profile) = super::mcp_registry::legacy_singleton_profile() else {
+        return;
+    };
+    let owned_by_us = servers
+        .get(super::mcp_registry::AGENT_SERVER_ID)
+        .and_then(Value::as_object)
+        .and_then(|server| server.get("env"))
+        .and_then(Value::as_object)
+        .and_then(|env| env.get("HIMIND_AGENT_PROFILE"))
+        .and_then(Value::as_str)
+        == Some(profile.as_str());
+    if owned_by_us {
+        servers.remove(super::mcp_registry::AGENT_SERVER_ID);
+    }
 }
 
 fn remove_json_config(content: &str) -> Result<String, Box<dyn Error>> {
     let mut root = serde_json::from_str::<Value>(content)?;
     if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
-        servers.remove(SERVER_ID);
+        servers.remove(server_id().as_str());
+        reclaim_legacy_json_entry(servers);
     }
     Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
 }
@@ -966,7 +1013,7 @@ mod tests {
     use super::{
         command_output_indicates_client, default_workbuddy_mcp_config_path, mcp_arguments,
         merge_client_config, merge_codex_config, merge_json_config, remove_codex_config,
-        remove_json_config, ConfigKind, SERVER_ID,
+        remove_json_config, server_id, ConfigKind,
     };
     use serde_json::Value;
     use std::env;
@@ -985,6 +1032,7 @@ mod tests {
 
     #[test]
     fn merges_codex_server_without_removing_existing_configuration() {
+        let _guard = crate::store::paths::test_env_lock();
         let source = "model = \"gpt-test\"\n[mcp_servers.existing]\ncommand = \"node\"\n";
         let updated = merge_codex_config(
             source,
@@ -997,7 +1045,7 @@ mod tests {
         assert_eq!(document["model"].as_str(), Some("gpt-test"));
         assert!(document["mcp_servers"]["existing"].is_table());
         assert_eq!(
-            document["mcp_servers"][SERVER_ID]["env"]["HIMIND_AI_CLIENT_ID"].as_str(),
+            document["mcp_servers"][server_id().as_str()]["env"]["HIMIND_AI_CLIENT_ID"].as_str(),
             Some("codex")
         );
         let removed = remove_codex_config(&updated).unwrap();
@@ -1006,12 +1054,13 @@ mod tests {
         assert!(document["mcp_servers"]
             .as_table()
             .unwrap()
-            .get(SERVER_ID)
+            .get(server_id().as_str())
             .is_none());
     }
 
     #[test]
     fn merges_json_server_without_removing_existing_configuration() {
+        let _guard = crate::store::paths::test_env_lock();
         let source =
             r#"{"mcpServers":{"existing":{"type":"stdio","command":"node"}},"setting":true}"#;
         let updated = merge_json_config(
@@ -1026,13 +1075,13 @@ mod tests {
         assert_eq!(value["setting"], true);
         assert_eq!(value["mcpServers"]["existing"]["command"], "node");
         assert_eq!(
-            value["mcpServers"][SERVER_ID]["env"]["HIMIND_AI_CLIENT_ID"],
+            value["mcpServers"][server_id().as_str()]["env"]["HIMIND_AI_CLIENT_ID"],
             "workbuddy"
         );
-        assert_eq!(value["mcpServers"][SERVER_ID]["disabled"], false);
+        assert_eq!(value["mcpServers"][server_id().as_str()]["disabled"], false);
         let removed = remove_json_config(&updated).unwrap();
         let value: Value = serde_json::from_str(&removed).unwrap();
-        assert!(value["mcpServers"].get(SERVER_ID).is_none());
+        assert!(value["mcpServers"].get(server_id().as_str()).is_none());
         assert!(value["mcpServers"].get("existing").is_some());
     }
 
@@ -1054,6 +1103,7 @@ mod tests {
 
     #[test]
     fn invalid_configuration_requires_explicit_reset() {
+        let _guard = crate::store::paths::test_env_lock();
         let executable = Path::new(r"C:\HiMind\himind-agent.exe");
         let error = merge_client_config(
             ConfigKind::McpJson,
@@ -1078,8 +1128,40 @@ mod tests {
         assert!(reset);
         let value: Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(
-            value["mcpServers"][SERVER_ID]["env"]["HIMIND_AI_CLIENT_ID"],
+            value["mcpServers"][server_id().as_str()]["env"]["HIMIND_AI_CLIENT_ID"],
             "github-copilot"
+        );
+    }
+
+    /// Layer 1: a development run must add its own key and leave the installed
+    /// Agent's `himind-agent` entry untouched. Before this the singleton key let
+    /// a development registration silently overwrite production.
+    #[test]
+    fn development_registration_coexists_with_the_production_entry() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous = env::var_os("HIMIND_AGENT_PROFILE");
+        env::set_var("HIMIND_AGENT_PROFILE", "development");
+        let source =
+            r#"{"mcpServers":{"himind-agent":{"type":"stdio","command":"prod.exe","args":["--mcp"]}}}"#;
+        let updated = merge_json_config(
+            source,
+            Path::new(r"C:\dev\target\release\himind-agent-mcp.exe"),
+            &["--mcp".to_string()],
+            "codex",
+            false,
+        )
+        .unwrap();
+        match previous {
+            Some(value) => env::set_var("HIMIND_AGENT_PROFILE", value),
+            None => env::remove_var("HIMIND_AGENT_PROFILE"),
+        }
+        let value: Value = serde_json::from_str(&updated).unwrap();
+        // The installed Agent's entry is preserved verbatim...
+        assert_eq!(value["mcpServers"]["himind-agent"]["command"], "prod.exe");
+        // ...and the development run has its own scoped entry.
+        assert_eq!(
+            value["mcpServers"]["himind-agent-development"]["env"]["HIMIND_AGENT_PROFILE"],
+            "development"
         );
     }
 
@@ -1089,6 +1171,31 @@ mod tests {
             "cannot find github copilot cli"
         ));
         assert!(command_output_indicates_client("github copilot 1.2.3"));
+    }
+
+    /// Layer 1 cleanup: when a development run registers, it also drops a stale
+    /// singleton entry left by a previous development build of the same profile.
+    #[test]
+    fn development_registration_reclaims_a_stale_singleton_entry() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous = env::var_os("HIMIND_AGENT_PROFILE");
+        env::set_var("HIMIND_AGENT_PROFILE", "development");
+        let source = r#"{"mcpServers":{"himind-agent":{"type":"stdio","command":"old-dev.exe","args":["--mcp"],"env":{"HIMIND_AGENT_PROFILE":"development"}}}}"#;
+        let updated = merge_json_config(
+            source,
+            Path::new(r"C:\dev\target\release\himind-agent-mcp.exe"),
+            &["--mcp".to_string()],
+            "codex",
+            false,
+        )
+        .unwrap();
+        match previous {
+            Some(value) => env::set_var("HIMIND_AGENT_PROFILE", value),
+            None => env::remove_var("HIMIND_AGENT_PROFILE"),
+        }
+        let value: Value = serde_json::from_str(&updated).unwrap();
+        assert!(value["mcpServers"].get("himind-agent").is_none());
+        assert!(value["mcpServers"].get("himind-agent-development").is_some());
     }
 
     #[test]

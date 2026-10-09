@@ -16,6 +16,40 @@ pub(crate) use super::mcp_settings::McpServerConfig;
 
 pub(crate) const AGENT_SERVER_ID: &str = "himind-agent";
 
+/// The MCP server key the *current* profile registers into every AI client.
+///
+/// `production` (and the legacy `default`) keep the historical
+/// [`AGENT_SERVER_ID`] so an upgrade never orphans an installed registration.
+/// Any other profile registers under `himind-agent-<profile>`: a development
+/// Agent then adds its own entry instead of overwriting the installed Agent's,
+/// and the two coexist until one side deliberately removes its own.
+pub(crate) fn agent_server_id() -> String {
+    agent_server_id_for(&crate::store::paths::profile_name())
+}
+
+/// Pure form of [`agent_server_id`], so callers and tests can reason about a
+/// profile without reading (or mutating) the process environment.
+pub(crate) fn agent_server_id_for(profile: &str) -> String {
+    if crate::store::paths::is_production_profile(profile) {
+        AGENT_SERVER_ID.to_string()
+    } else {
+        format!("{AGENT_SERVER_ID}-{profile}")
+    }
+}
+
+/// The profile name to reclaim a stale singleton registration for, if any.
+///
+/// Before registrations were profile-scoped, a development Agent wrote its own
+/// launch line under the historical [`AGENT_SERVER_ID`] key. New builds use the
+/// scoped key instead, so that old entry is now an orphan that would shadow the
+/// installed Agent for whichever client reads it. A non-production run returns
+/// its own profile so writers can drop a legacy entry that carries exactly that
+/// profile; a production run returns `None` and never touches anything.
+pub(crate) fn legacy_singleton_profile() -> Option<String> {
+    let profile = crate::store::paths::profile_name();
+    (!crate::store::paths::is_production_profile(&profile)).then_some(profile)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum McpTransport {
@@ -373,6 +407,22 @@ mod tests {
         let loaded = get(&path, "example-tools").unwrap().unwrap();
         assert_eq!(loaded.env.get("TOKEN"), Some(&"secret".to_string()));
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn server_key_is_scoped_to_non_production_profiles() {
+        // Production keeps the historical key so an upgrade never orphans the
+        // installed Agent's registration...
+        assert_eq!(agent_server_id_for("production"), AGENT_SERVER_ID);
+        assert_eq!(agent_server_id_for("default"), AGENT_SERVER_ID);
+        assert_eq!(agent_server_id_for(""), AGENT_SERVER_ID);
+        // ...while every other profile gets its own so the two can coexist.
+        assert_eq!(
+            agent_server_id_for("development"),
+            "himind-agent-development"
+        );
+        assert_eq!(agent_server_id_for("ecs-staging"), "himind-agent-ecs-staging");
+        assert_ne!(agent_server_id_for("development"), AGENT_SERVER_ID);
     }
 
     #[test]

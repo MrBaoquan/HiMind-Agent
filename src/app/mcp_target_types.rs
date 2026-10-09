@@ -66,7 +66,7 @@ pub(crate) fn manual_snippet(command: &str, args: &[String], target_id: &str) ->
     }
     let payload = json!({
         servers_key: {
-            super::mcp_registry::AGENT_SERVER_ID: server
+            super::mcp_registry::agent_server_id(): server
         }
     });
     serde_json::to_string_pretty(&json!({

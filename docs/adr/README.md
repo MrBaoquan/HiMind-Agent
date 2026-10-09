@@ -16,6 +16,7 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0008](0008-workbench-connections.md) | Workbench connections are first-class local records | accepted | 2026-09-30 |
 | [0009](0009-local-multi-instance-topology.md) | The profile owns the data root, and a build output never opens the installed one | accepted | 2026-09-30 |
 | [0010](0010-user-visible-copy-states-consequences.md) | User-visible copy states consequences, and a label is not a manual | accepted | 2026-10-01 |
+| [0011](0011-mcp-registration-key-follows-the-profile.md) | The MCP registration key follows the profile | accepted | 2026-10-09 |
 
 ## How these relate
 
@@ -34,6 +35,12 @@ once the active connection changes.
 the identity; 0009 says which *process* is allowed to touch the root those
 files live in, and it is what keeps a second Agent on the same machine from
 materialising into the first one's root.
+
+0011 completes 0009 on the client surface. 0009 isolated the data root, the
+port and the WebView2 directory but left the MCP registration key shared; 0011
+makes that key follow the profile too, so the two Agents can be registered into
+one client at once and a development run can no longer overwrite — or be
+mistaken for — the installed Agent's registration.
 
 0010 is about the words on the screen and touches only the frontend. It has no
 dependency on the MCP catalog series: it leaves 0007's market discovery and the

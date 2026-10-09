@@ -72,7 +72,7 @@ pub(crate) fn plan(
             write_required: false,
             backup_required: false,
             restart_required: true,
-            configured_server_id: super::mcp_registry::AGENT_SERVER_ID.to_string(),
+            configured_server_id: super::mcp_registry::agent_server_id(),
             warnings: vec![
                 "HiMind AI 使用 Agent 管理的会话覆盖层，保存 MCP 设置后会在下一次会话生效。"
                     .to_string(),
@@ -103,7 +103,7 @@ pub(crate) fn plan(
         write_required,
         backup_required: write_required,
         restart_required: true,
-        configured_server_id: super::mcp_registry::AGENT_SERVER_ID.to_string(),
+        configured_server_id: super::mcp_registry::agent_server_id(),
         warnings,
     })
 }
@@ -621,9 +621,10 @@ fn json_target_state(
     args: &[String],
 ) -> Option<bool> {
     let target_id = definition.id;
+    let server_id = super::mcp_registry::agent_server_id();
     if definition.layout == JsonTargetLayout::OpenCode {
         let Some(server) = server_collection(root, definition)
-            .and_then(|servers| servers.get(super::mcp_registry::AGENT_SERVER_ID))
+            .and_then(|servers| servers.get(&server_id))
         else {
             return None;
         };
@@ -643,7 +644,7 @@ fn json_target_state(
         return Some(command_matches && type_matches && enabled_matches);
     }
     let Some(server) = server_collection(root, definition)
-        .and_then(|servers| servers.get(super::mcp_registry::AGENT_SERVER_ID))
+        .and_then(|servers| servers.get(&server_id))
     else {
         return None;
     };
@@ -717,13 +718,14 @@ fn apply_json_target(
         .ok_or("MCP client JSON root must be an object")?;
     let launch = super::ai_clients::launch_spec(options)?;
     let entry = json_entry(&definition, &launch.command, &launch.args);
+    let server_id = super::mcp_registry::agent_server_id();
     if definition.layout == JsonTargetLayout::OpenCode {
         let servers = object
             .entry("mcp")
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .ok_or("OpenCode mcp collection must be an object")?;
-        servers.insert(super::mcp_registry::AGENT_SERVER_ID.to_string(), entry);
+        servers.insert(server_id.clone(), entry);
     } else if definition.layout == JsonTargetLayout::NestedMcp {
         let mcp = object
             .entry("mcp")
@@ -735,15 +737,16 @@ fn apply_json_target(
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .ok_or("ZCode mcp.servers collection must be an object")?;
-        servers.insert(super::mcp_registry::AGENT_SERVER_ID.to_string(), entry);
+        servers.insert(server_id.clone(), entry);
     } else {
         let servers = object
             .entry(definition.servers_key)
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .ok_or("MCP client MCP server collection must be an object")?;
-        servers.insert(super::mcp_registry::AGENT_SERVER_ID.to_string(), entry);
+        servers.insert(server_id.clone(), entry);
     }
+    reclaim_legacy_target_entry(&mut root, &definition);
     let updated = format!("{}\n", serde_json::to_string_pretty(&root)?);
     let changed = normalized_text(&original) != normalized_text(&updated);
     let backup_path = if changed {
@@ -780,10 +783,11 @@ fn remove_json_target(
     let original = fs::read_to_string(&definition.path)?;
     let launch = super::ai_clients::launch_spec(options)?;
     let mut root = parse_json_document(&original, definition.config_format)?;
-    let removed = server_collection_mut(&mut root, &definition)
-        .and_then(|servers| servers.remove(super::mcp_registry::AGENT_SERVER_ID))
+    let removed_scoped = server_collection_mut(&mut root, &definition)
+        .and_then(|servers| servers.remove(&super::mcp_registry::agent_server_id()))
         .is_some();
-    if !removed {
+    let removed_legacy = reclaim_legacy_target_entry(&mut root, &definition);
+    if !removed_scoped && !removed_legacy {
         return Ok(McpTargetOperationResult {
             target: target.clone(),
             changed: false,
@@ -846,13 +850,13 @@ fn manual_snippet_for_definition(
     let entry = json_entry(definition, command, args);
     let payload = match definition.layout {
         JsonTargetLayout::OpenCode => json!({
-            "mcp": { super::mcp_registry::AGENT_SERVER_ID: entry }
+            "mcp": { super::mcp_registry::agent_server_id(): entry }
         }),
         JsonTargetLayout::NestedMcp => json!({
-            "mcp": { "servers": { super::mcp_registry::AGENT_SERVER_ID: entry } }
+            "mcp": { "servers": { super::mcp_registry::agent_server_id(): entry } }
         }),
         _ => json!({
-            definition.servers_key: { super::mcp_registry::AGENT_SERVER_ID: entry }
+            definition.servers_key: { super::mcp_registry::agent_server_id(): entry }
         }),
     };
     serde_json::to_string_pretty(&payload).unwrap_or_default()
@@ -888,6 +892,40 @@ fn server_collection_mut<'a>(
             .get_mut(definition.servers_key)
             .and_then(Value::as_object_mut),
     }
+}
+
+/// The `HIMIND_AGENT_PROFILE` an existing entry declares, if any. The profile
+/// key lives under `environment` for OpenCode and `env` for every other JSON
+/// target.
+fn entry_profile(entry: &Value, layout: JsonTargetLayout) -> Option<&str> {
+    let key = if layout == JsonTargetLayout::OpenCode {
+        "environment"
+    } else {
+        "env"
+    };
+    entry
+        .get(key)
+        .and_then(Value::as_object)
+        .and_then(|env| env.get("HIMIND_AGENT_PROFILE"))
+        .and_then(Value::as_str)
+}
+
+/// Drop a pre-scope singleton `himind-agent` entry that this same
+/// non-production profile wrote. Returns `true` when an entry was removed.
+fn reclaim_legacy_target_entry(root: &mut Value, definition: &JsonTargetDefinition) -> bool {
+    let Some(profile) = super::mcp_registry::legacy_singleton_profile() else {
+        return false;
+    };
+    let legacy_key = super::mcp_registry::AGENT_SERVER_ID;
+    let owned_by_us = server_collection(root, definition)
+        .and_then(|servers| servers.get(legacy_key))
+        .is_some_and(|entry| entry_profile(entry, definition.layout) == Some(profile.as_str()));
+    if !owned_by_us {
+        return false;
+    }
+    server_collection_mut(root, definition)
+        .and_then(|servers| servers.remove(legacy_key))
+        .is_some()
 }
 
 fn parse_json_document(content: &str, format: &str) -> Result<Value, serde_json::Error> {
@@ -1032,6 +1070,7 @@ mod tests {
 
     #[test]
     fn json_adapter_distinguishes_missing_and_stale_registration() {
+        let _guard = crate::store::paths::test_env_lock();
         let missing = json!({ "mcpServers": {} });
         let definition = json_target_definitions(Path::new("C:\\Users\\test"))
             .into_iter()
@@ -1066,6 +1105,7 @@ mod tests {
 
     #[test]
     fn json_adapter_rejects_wrong_identity_and_vscode_layout() {
+        let _guard = crate::store::paths::test_env_lock();
         let wrong_identity = json!({
             "mcpServers": {
                 "himind-agent": {
@@ -1111,6 +1151,7 @@ mod tests {
 
     #[test]
     fn qoder_uses_standard_mcp_servers_and_exposes_skills() {
+        let _guard = crate::store::paths::test_env_lock();
         let definition = json_target_definitions(Path::new("C:\\Users\\test"))
             .into_iter()
             .find(|item| item.id == "qoder")
@@ -1155,6 +1196,7 @@ mod tests {
 
     #[test]
     fn zcode_uses_nested_mcp_servers_layout() {
+        let _guard = crate::store::paths::test_env_lock();
         let definition = json_target_definitions(Path::new("C:\\Users\\test"))
             .into_iter()
             .find(|item| item.id == "zcode")
@@ -1183,6 +1225,73 @@ mod tests {
         ))
         .unwrap();
         assert!(snippet.pointer("/mcp/servers/himind-agent").is_some());
+    }
+
+    /// Layer 1: the manual snippet a non-production Agent shows must name its
+    /// own scoped server key so it never collides with the installed Agent's.
+    #[test]
+    fn non_production_manual_snippet_is_scoped_to_the_profile() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous = std::env::var_os("HIMIND_AGENT_PROFILE");
+        std::env::set_var("HIMIND_AGENT_PROFILE", "development");
+        let definition = json_target_definitions(Path::new("C:\\Users\\test"))
+            .into_iter()
+            .find(|item| item.id == "cursor")
+            .unwrap();
+        let snippet: Value =
+            serde_json::from_str(&manual_snippet_for_definition(&definition, "agent.exe", &[]))
+                .unwrap();
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_PROFILE", value),
+            None => std::env::remove_var("HIMIND_AGENT_PROFILE"),
+        }
+        assert!(snippet.pointer("/mcpServers/himind-agent-development").is_some());
+        assert!(snippet.pointer("/mcpServers/himind-agent").is_none());
+    }
+
+    /// Layer 1 cleanup: a stale singleton entry written by *this* development
+    /// profile is reclaimed, while one that still carries production is left
+    /// alone.
+    #[test]
+    fn non_production_reclaims_only_its_own_stale_singleton() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous = std::env::var_os("HIMIND_AGENT_PROFILE");
+        std::env::set_var("HIMIND_AGENT_PROFILE", "development");
+        let cursor = json_target_definitions(Path::new("C:\\Users\\test"))
+            .into_iter()
+            .find(|item| item.id == "cursor")
+            .unwrap();
+        let opencode = json_target_definitions(Path::new("C:\\Users\\test"))
+            .into_iter()
+            .find(|item| item.id == "opencode")
+            .unwrap();
+
+        let mut owned = json!({ "mcpServers": { "himind-agent": {
+            "command": "old-dev.exe",
+            "env": { "HIMIND_AGENT_PROFILE": "development" }
+        } } });
+        assert!(reclaim_legacy_target_entry(&mut owned, &cursor));
+        assert!(owned.pointer("/mcpServers/himind-agent").is_none());
+
+        // OpenCode stores the profile under `environment`.
+        let mut owned_opencode = json!({ "mcp": { "himind-agent": {
+            "type": "local",
+            "environment": { "HIMIND_AGENT_PROFILE": "development" }
+        } } });
+        assert!(reclaim_legacy_target_entry(&mut owned_opencode, &opencode));
+        assert!(owned_opencode.pointer("/mcp/himind-agent").is_none());
+
+        let mut foreign = json!({ "mcpServers": { "himind-agent": {
+            "command": "prod.exe",
+            "env": { "HIMIND_AGENT_PROFILE": "production" }
+        } } });
+        assert!(!reclaim_legacy_target_entry(&mut foreign, &cursor));
+        assert!(foreign.pointer("/mcpServers/himind-agent").is_some());
+
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_PROFILE", value),
+            None => std::env::remove_var("HIMIND_AGENT_PROFILE"),
+        }
     }
 
     #[test]
