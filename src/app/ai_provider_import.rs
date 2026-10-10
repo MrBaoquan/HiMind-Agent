@@ -581,6 +581,11 @@ pub(crate) struct AIProviderImportStatus {
     /// 持有的凭据是否仍是当前接入来源（Key 轮换 / 来源切换后应显示为待同步）。
     #[serde(skip_serializing_if = "String::is_empty")]
     pub service_revision: String,
+    /// 自检告警：条目「看起来已注册、实际会失败」时的可读修复建议（当前用于
+    /// Claude Desktop 的 3P 网关档案）。为空表示自检通过。与 `detail` 分开是因为
+    /// `detail` 只在未注册时渲染，已注册的告警需要一个独立通道才可见。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub warning: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3430,6 +3435,16 @@ fn claude_desktop_status_in(
         .as_ref()
         .map(claude_desktop_entry_models)
         .unwrap_or_default();
+    // 自检：条目存在但结构不完整 / 缺来源标记 / 声明了客户端不认的模型时，
+    // 主动报出可读修复建议，避免「看起来已注册、实际选择器为空」的静默失败。
+    let warning = if imported {
+        entry
+            .as_ref()
+            .and_then(|entry| claude_desktop_entry_health(entry).warning())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     AIProviderImportStatus {
         target: "claude-desktop".to_string(),
         state: if imported { "imported" } else { "not_imported" }.to_string(),
@@ -3451,6 +3466,7 @@ fn claude_desktop_status_in(
         models,
         synced_at: String::new(),
         service: String::new(),
+        warning,
         ..Default::default()
     }
 }
@@ -3489,6 +3505,108 @@ fn claude_desktop_entry_models(entry: &serde_json::Map<String, Value>) -> Vec<St
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 生效 3P 条目的自检结论。对齐 cc-switch 对网关类条目做的 expected/actual 与
+/// stale 检查：注册动作本身正确，但条目可能被其它工具改写、或由旧版本 Agent 写入，
+/// 于是出现「状态看起来已注册、实际会失败」的配置。
+///
+/// 最典型的是漏掉来源标记头（`X-Himind-Surface`）：网关会回规范模型名
+/// （`deepseek-*`），而 Claude Desktop 的选择器只保留 Anthropic 形态的名字，
+/// 表现为「能发现模型但选择器为空」。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ClaudeDesktopEntryHealth {
+    provider_ok: bool,
+    base_url_ok: bool,
+    api_key_ok: bool,
+    auth_ok: bool,
+    surface_ok: bool,
+    stale_models: bool,
+}
+
+impl ClaudeDesktopEntryHealth {
+    fn is_healthy(&self) -> bool {
+        self.provider_ok
+            && self.base_url_ok
+            && self.api_key_ok
+            && self.auth_ok
+            && self.surface_ok
+            && !self.stale_models
+    }
+
+    /// 首个问题的用户可读修复建议；自检通过时返回 `None`。
+    fn warning(&self) -> Option<String> {
+        if !(self.provider_ok && self.base_url_ok && self.api_key_ok && self.auth_ok) {
+            return Some(
+                "HiMind 网关档案字段不完整（缺少提供方/网关地址/凭据/认证方式），\
+                 可能已被其它工具改写；请在 Claude Desktop 停止使用该档案后重新注册"
+                    .to_string(),
+            );
+        }
+        if !self.surface_ok {
+            return Some(
+                "HiMind 网关档案缺少来源标记（X-Himind-Surface），网关会回规范模型名，\
+                 Claude Desktop 的模型选择器可能为空；请重新注册 Claude Desktop"
+                    .to_string(),
+            );
+        }
+        if self.stale_models {
+            return Some(
+                "HiMind 网关档案声明了非 Anthropic 形态的模型名，客户端可能整组拒收；\
+                 请重新注册 Claude Desktop"
+                    .to_string(),
+            );
+        }
+        None
+    }
+}
+
+fn claude_desktop_entry_health(entry: &serde_json::Map<String, Value>) -> ClaudeDesktopEntryHealth {
+    let surface_ok = entry
+        .get("inferenceCustomHeaders")
+        .and_then(Value::as_object)
+        .is_some_and(|headers| {
+            headers.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case(CLAUDE_DESKTOP_SURFACE_HEADER)
+                    && value.as_str().map(str::trim) == Some(CLAUDE_DESKTOP_SURFACE_VALUE)
+            })
+        });
+    let stale_models = entry
+        .get("inferenceModels")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| !claude_desktop_model_is_safe(item)));
+    ClaudeDesktopEntryHealth {
+        provider_ok: entry.get("inferenceProvider").and_then(Value::as_str) == Some("gateway"),
+        base_url_ok: claude_desktop_entry_text(entry, "inferenceGatewayBaseUrl").is_some(),
+        api_key_ok: claude_desktop_entry_text(entry, "inferenceGatewayApiKey").is_some(),
+        auth_ok: entry
+            .get("inferenceGatewayAuthScheme")
+            .and_then(Value::as_str)
+            == Some("bearer"),
+        surface_ok,
+        stale_models,
+    }
+}
+
+/// 条目声明的模型名只有 Anthropic 形态才不会被 Claude Desktop 的校验器丢弃或拒收。
+/// 与 [cc-switch] 的 `is_claude_safe_model_id` 同口径：`claude-<角色>-<标识>`，角色限
+/// sonnet/opus/haiku/fable（客户端 fail-all 校验器的角色白名单）。
+fn claude_desktop_model_is_safe(item: &Value) -> bool {
+    let name = match item {
+        Value::String(name) => name.as_str(),
+        Value::Object(object) => object.get("name").and_then(Value::as_str).unwrap_or(""),
+        _ => "",
+    };
+    let normalized = name.trim().to_ascii_lowercase();
+    let Some(tail) = normalized
+        .strip_prefix("anthropic/claude-")
+        .or_else(|| normalized.strip_prefix("claude-"))
+    else {
+        return false;
+    };
+    ["sonnet-", "opus-", "haiku-", "fable-"]
+        .iter()
+        .any(|role| tail.strip_prefix(role).is_some_and(|rest| !rest.is_empty()))
 }
 
 fn claude_himind_env_present(path: &Path) -> bool {
@@ -7416,7 +7534,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             third.join("configLibrary").join(format!("{entry_id}.json")),
-            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer","inferenceCredentialKind":"static"}"#,
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer","inferenceCredentialKind":"static","inferenceCustomHeaders":{"X-Himind-Surface":"claude-desktop"}}"#,
         )
         .unwrap();
 
@@ -7429,6 +7547,8 @@ mod tests {
         );
         assert!(active.detail.contains("自动发现"), "{}", active.detail);
         assert!(active.config_path.ends_with("claude_desktop_config.json"));
+        // 本 Agent 写入的条目带来源标记，自检应通过（无告警）。
+        assert!(active.warning.is_empty(), "{}", active.warning);
 
         // 已写入但客户端未切到 3P：仍算已导入，只是提示需要完整重启。
         let inactive = super::claude_desktop_status_in(&third, &first, false);
@@ -7470,6 +7590,67 @@ mod tests {
             parsed.get("inferenceModels").is_none(),
             "模型列表交给 /v1/models 自动发现"
         );
+    }
+
+    /// 条目结构完整、带来源标记且不声明非 Anthropic 模型时，自检通过。
+    #[test]
+    fn claude_desktop_entry_health_passes_for_native_entry() {
+        let entry: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer","inferenceCredentialKind":"static","inferenceCustomHeaders":{"x-himind-surface":"claude-desktop"},"inferenceModels":[{"name":"claude-haiku-himind-1"}]}"#,
+        )
+        .unwrap();
+        let health = super::claude_desktop_entry_health(&entry);
+        assert!(health.is_healthy());
+        assert_eq!(health.warning(), None);
+    }
+
+    /// 漏掉来源标记头 = 选择器会空；声明非 Anthropic 模型 = 客户端可能整组拒收。
+    /// 两种情况都必须自检出来并给出修复建议，而不是静默报「已注册」。
+    #[test]
+    fn claude_desktop_entry_health_flags_surface_and_stale_models() {
+        let missing_surface: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer"}"#,
+        )
+        .unwrap();
+        let health = super::claude_desktop_entry_health(&missing_surface);
+        assert!(!health.is_healthy());
+        assert!(health.warning().unwrap().contains("来源标记"));
+
+        let stale: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer","inferenceCustomHeaders":{"X-Himind-Surface":"claude-desktop"},"inferenceModels":["deepseek-v4-pro"]}"#,
+        )
+        .unwrap();
+        let health = super::claude_desktop_entry_health(&stale);
+        assert!(health.stale_models);
+        assert!(health.warning().unwrap().contains("非 Anthropic"));
+    }
+
+    /// 已注册但条目缺来源标记时，状态要带上告警（`state` 仍是 imported）。
+    #[test]
+    fn claude_desktop_status_warns_on_entry_missing_surface_header() {
+        let root = claude_temp_root("status-warn");
+        let third = root.join("Claude-3p");
+        let first = root.join("Claude");
+        std::fs::create_dir_all(third.join("configLibrary")).unwrap();
+        let entry_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        std::fs::write(
+            third.join("configLibrary/_meta.json"),
+            format!(
+                r#"{{"appliedId":"{entry_id}","entries":[{{"id":"{entry_id}","name":"HiMind","provider":"gateway","note":"himind-agent"}}],"isManaged":false,"platform":"win32"}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            third.join("configLibrary").join(format!("{entry_id}.json")),
+            r#"{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://ai.internal","inferenceGatewayApiKey":"secret","inferenceGatewayAuthScheme":"bearer"}"#,
+        )
+        .unwrap();
+
+        let status = super::claude_desktop_status_in(&third, &first, true);
+        assert_eq!(status.state, "imported");
+        assert!(status.warning.contains("来源标记"), "{}", status.warning);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 复刻客户端判据：生效条目要带 `inference`/`bootstrap`/`selfHosted` 开关，
