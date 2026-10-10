@@ -46,7 +46,7 @@ type AiToolsPanelProps = {
   onRemoveAcpProfile: (providerId: string) => Promise<void>;
 };
 
-type Filter = 'all' | 'attention' | 'ready';
+type Filter = 'all' | 'attention' | 'idle' | 'ready';
 
 export function AiToolsPanel({
   targets,
@@ -97,12 +97,13 @@ export function AiToolsPanel({
   );
 
   const detected = connections.filter((item) => item.detected);
-  const attention = detected.filter((item) => item.attention);
-  const ready = detected.filter((item) => !item.attention);
+  const attention = detected.filter((item) => item.state === 'attention');
+  const ready = detected.filter((item) => item.state === 'ready');
+  const idle = detected.filter((item) => item.state === 'idle');
   const undetected = connections.filter((item) => !item.detected);
   const actionable = connections.filter((item) => item.mcp && item.mcp.detected && item.mcp.state !== 'configured' && item.mcp.supports_auto_configure);
 
-  const visible = filter === 'attention' ? attention : filter === 'ready' ? ready : detected;
+  const visible = filter === 'attention' ? attention : filter === 'ready' ? ready : filter === 'idle' ? idle : detected;
 
   const headline = attention.length ? `${attention.length} 个工具待处理` : '本机工具已就绪';
   const headlineDescription = attention.length
@@ -155,6 +156,7 @@ export function AiToolsPanel({
         <div className="ai-overview-stats" aria-label="本机工具统计">
           <div><span>已就绪</span><strong>{ready.length}</strong></div>
           <div><span>待处理</span><strong className={attention.length ? 'warning-text' : ''}>{attention.length}</strong></div>
+          <div><span>未接入</span><strong>{idle.length}</strong></div>
           <div><span>已发现</span><strong>{detected.length}</strong></div>
         </div>
         <div className="ai-overview-actions">
@@ -185,6 +187,7 @@ export function AiToolsPanel({
             <div className="ai-binding-filter" role="group" aria-label="筛选工具">
               <button type="button" aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>全部 <span>{detected.length}</span></button>
               <button type="button" aria-pressed={filter === 'attention'} onClick={() => setFilter('attention')}>待处理 <span>{attention.length}</span></button>
+              <button type="button" aria-pressed={filter === 'idle'} onClick={() => setFilter('idle')}>未接入 <span>{idle.length}</span></button>
               <button type="button" aria-pressed={filter === 'ready'} onClick={() => setFilter('ready')}>已就绪 <span>{ready.length}</span></button>
             </div>
           ) : null}
@@ -224,7 +227,7 @@ export function AiToolsPanel({
             />
           ))}
           {!visible.length ? (
-            <div className="ai-empty-row"><span className="ai-empty-icon"><CircleCheck size={14} /></span><span>{filter === 'attention' ? '没有待处理的工具' : '还没有检测到本机工具'}</span></div>
+            <div className="ai-empty-row"><span className="ai-empty-icon"><CircleCheck size={14} /></span><span>{filter === 'attention' ? '没有待处理的工具' : filter === 'idle' ? '没有未接入的工具' : filter === 'ready' ? '还没有已就绪的工具' : '还没有检测到本机工具'}</span></div>
           ) : null}
         </div>
       </section>
@@ -256,7 +259,12 @@ export function AiToolsPanel({
             <Pill kind="neutral">{undetected.length}</Pill>
           </summary>
           <ul className="ai-service-supported-list">
-            {undetected.map((item) => <li className="undetected" key={item.key}><span>{item.name}</span><span>未检测到本机安装</span></li>)}
+            {undetected.map((item) => (
+              <li className="undetected" key={item.key}>
+                <span>{item.name}</span>
+                <span>{item.mcp?.detection_message || '未检测到本机安装'}</span>
+              </li>
+            ))}
           </ul>
         </details>
       ) : null}
@@ -295,6 +303,16 @@ function mcpState(target: McpTargetDescriptor): { label: string; kind: 'success'
   return { label: target.supports_auto_configure ? '可接入' : '需手动', kind: 'neutral' };
 }
 
+/**
+ * 主按钮用动词，不要拿状态当按钮文案：状态（可接入 / 需更新 / 配置异常）是「现在怎样」，
+ * 按钮要说「点下去会做什么」。两者分开，用户才不会对着一个写着「配置异常」的按钮发懵。
+ */
+function mcpActionLabel(target: McpTargetDescriptor): string {
+  if (target.state === 'invalid_config') return '修复';
+  if (target.state === 'needs_repair') return '更新';
+  return '接入';
+}
+
 function toolSummary(item: ToolConnection, services: CustomAIService[], managed: ManagedAIServiceSummary, gatewayClientSet: Set<string>): string {
   if (item.builtin) return '会话自动加载本机插件和技能';
   const parts: string[] = [];
@@ -324,15 +342,6 @@ function toolIconClass(item: ToolConnection) {
   if (item.key === 'codex' || item.key === 'claude-code' || item.key === 'opencode') return 'code';
   if (item.key === 'vscode' || item.key === 'cursor' || item.key.startsWith('vscode')) return 'editor';
   return 'target';
-}
-
-function CapabilityTags({ item }: { item: ToolConnection }) {
-  const tags: Array<{ label: string; on: boolean }> = [
-    { label: '接入', on: item.capabilities.mcp },
-    { label: '模型', on: item.capabilities.model },
-    { label: '执行', on: item.capabilities.exec },
-  ];
-  return <span className="ai-tool-caps">{tags.map((tag) => <span className={`ai-tool-cap${tag.on ? '' : ' off'}`} key={tag.label}>{tag.label}</span>)}</span>;
 }
 
 function ToolRow(props: {
@@ -375,6 +384,8 @@ function ToolRow(props: {
   const modelState = item.model?.state ?? '';
   const modelImported = modelState === 'imported';
   const gatewayMode = gatewayClientSet.has(item.key);
+  const summary = toolSummary(item, customServices, managed, gatewayClientSet);
+  const rowState = item.state;
 
   const sourceOptions: Array<{ value: string; label: string; disabled?: boolean }> = [
     { value: 'managed', label: managedLabel, disabled: !managed.available },
@@ -391,16 +402,17 @@ function ToolRow(props: {
   }
 
   return (
-    <article className={`ai-client-row ai-tool-row${item.builtin ? ' builtin' : ''}${item.attention ? ' has-attention' : ''}${expanded ? ' expanded' : ''}`}>
+    <article className={`ai-client-row ai-tool-row${item.builtin ? ' builtin' : ''}${rowState === 'attention' ? ' has-attention' : ''}${expanded ? ' expanded' : ''}`}>
       <div className={`ai-client-icon ${toolIconClass(item)}`}><ToolIcon item={item} /></div>
       <div className="ai-client-copy">
-        <strong>{item.name}</strong>
-        <span title={toolSummary(item, customServices, managed, gatewayClientSet)}>{toolSummary(item, customServices, managed, gatewayClientSet)}</span>
-        <CapabilityTags item={item} />
+        <span className="ai-tool-head">
+          <strong>{item.name}</strong>
+          <Pill kind={item.builtin ? 'neutral' : rowState === 'attention' ? 'warn' : rowState === 'ready' ? 'success' : 'neutral'}>
+            {item.builtin ? '内置' : rowState === 'attention' ? '待处理' : rowState === 'ready' ? '已就绪' : '未接入'}
+          </Pill>
+        </span>
+        <span title={summary}>{summary}</span>
       </div>
-      <Pill kind={item.builtin ? 'neutral' : item.attention ? 'warn' : 'success'}>
-        {item.builtin ? '内置' : item.attention ? '待处理' : '已就绪'}
-      </Pill>
       <div className="ai-client-registration-actions">
         {item.builtin ? <span className="ai-target-managed"><ShieldCheck size={13} /> 无需配置</span>
           : <button type="button" className="btn ai-service-tool-btn" aria-expanded={expanded} onClick={onToggle}>{expanded ? '收起' : '管理'}</button>}
@@ -415,6 +427,7 @@ function ToolRow(props: {
                 <span className={`status-dot ${item.mcp.state === 'configured' ? 'success' : item.mcp.state === 'needs_repair' || item.mcp.state === 'invalid_config' ? 'warn' : ''}`} />
                 {mcpState(item.mcp).label}
                 {item.mcp.supports_auto_configure ? null : <span className="muted">· 需手动粘贴配置</span>}
+                {item.mcp.state === 'configured' && item.mcp.restart_required ? <span className="muted">· 重启客户端后生效</span> : null}
               </span>
               <span className="ai-tool-wire-actions">
                 {!item.mcp.supports_auto_configure && item.mcp.state !== 'configured' ? <>
@@ -423,7 +436,7 @@ function ToolRow(props: {
                 </> : item.mcp.state === 'configured' ? (
                   <button type="button" className="btn ai-service-tool-btn" disabled={mcpPending} onClick={() => onRemoveTarget(item.mcp!.id)}><Unplug size={14} />断开</button>
                 ) : (
-                  <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={mcpPending} onClick={() => onApplyTarget(item.mcp!.id, item.mcp!.state === 'invalid_config')}><PlugZap size={14} />{mcpPending ? '处理中' : mcpState(item.mcp).label}</button>
+                  <button type="button" className="btn btn-primary ai-service-tool-btn" disabled={mcpPending} onClick={() => onApplyTarget(item.mcp!.id, item.mcp!.state === 'invalid_config')}><PlugZap size={14} />{mcpPending ? '处理中' : mcpActionLabel(item.mcp!)}</button>
                 )}
               </span>
             </div>

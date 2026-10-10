@@ -3418,7 +3418,7 @@ tr:last-child td { border-bottom: 0; }
 .ai-client-section:first-of-type { margin-top: 0; }
 .ai-section-heading { min-height: 38px; align-items: center; }
 .ai-section-heading h3 { font-size: 13px; }
-.ai-section-heading span { font-size: 11px; }
+.ai-section-heading span { font-size: 12px; }
 /* 段落动作与计数同一簇收在右端：和「断开全部」这类列表级动作对上，不与标题争宽度。 */
 .ai-section-heading > .ai-section-tail { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 .ai-section-heading > .ai-section-tail .btn { min-height: 28px; padding: 0 9px; gap: 5px; font-size: 12px; white-space: nowrap; }
@@ -3809,10 +3809,13 @@ tr:last-child td { border-bottom: 0; }
 /* 「本机工具」：一行一个工具，展开后是它的接入 / 模型 / 执行三条接线。 */
 .ai-tool-row.builtin { background: var(--surface-muted); }
 .ai-tool-row.has-attention { box-shadow: inset 3px 0 0 var(--warning); }
-.ai-client-copy .ai-tool-caps { overflow: visible; white-space: normal; text-overflow: clip; }
-.ai-tool-caps { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 2px; }
-.ai-tool-cap { padding: 1px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--text-muted); background: var(--surface-muted); font-size: 10.5px; line-height: 1.5; }
-.ai-tool-cap.off { color: var(--text-subtle); opacity: .55; text-decoration: line-through; }
+/* 状态胶囊并进工具名一行：跟名字走，任何宽度都不会被挤到第二行去。 */
+.ai-tool-head { min-width: 0; display: flex; align-items: center; gap: 7px; overflow: visible; white-space: normal; }
+.ai-tool-head > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-tool-head > .pill { flex: 0 0 auto; }
+/* 工具行固定三列（图标 / 内容 / 动作），去掉独立胶囊列：窗口一窄也不再换行、不再把动作挤成全宽按钮。 */
+.ai-client-row.ai-tool-row { grid-template-columns: 36px minmax(0, 1fr) auto; }
+.ai-client-row.ai-tool-row .ai-client-registration-actions { grid-column: 3; grid-row: 1; }
 .ai-tool-detail { gap: 8px; padding-top: 10px; }
 .ai-tool-wire { min-width: 0; display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-muted); }
 .ai-tool-wire-kind { display: inline-flex; align-items: center; color: var(--text-muted); font-size: 12px; font-weight: 600; }

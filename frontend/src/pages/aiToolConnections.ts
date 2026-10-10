@@ -19,6 +19,16 @@ import { clientLabel } from '../utils/clientLabels';
 
 export type ToolCapabilities = { mcp: boolean; model: boolean; exec: boolean };
 
+/**
+ * 一个工具在一行里只能有一种状态，三选一：
+ *   attention = 有东西坏了要修（配置异常 / 需更新）；
+ *   ready     = 该接的都接好了，或本来就无需再动（内置）；
+ *   idle      = 可选接线还没接（多是用户未必想接的工具）。
+ * 把「能接但没接」和「接坏了」分开，是为了让「待处理」只留真需要处理的，
+ * 否则一屏十几个琥珀色标签，真正的异常反而被淹没。
+ */
+export type ToolState = 'attention' | 'idle' | 'ready';
+
 export type ToolConnection = {
   /** 稳定工具身份：MCP 目标 id / 模型客户端 target / ACP 的 `acp.<id>` 去掉前缀后同一个。 */
   key: string;
@@ -29,8 +39,7 @@ export type ToolConnection = {
   capabilities: ToolCapabilities;
   detected: boolean;
   builtin: boolean;
-  /** 需要用户处理：能接但没接、或接得不对。 */
-  attention: boolean;
+  state: ToolState;
 };
 
 export const BUILTIN_TOOL_KEY = 'himind-ai';
@@ -47,27 +56,22 @@ function displayName(key: string, mcp: McpTargetDescriptor | null, exec: AcpRunt
   return key;
 }
 
-function mcpWantsAttention(mcp: McpTargetDescriptor | null): boolean {
-  if (!mcp) return false;
-  if (mcp.state === 'needs_repair' || mcp.state === 'invalid_config') return true;
-  return mcp.detected && mcp.state !== 'configured';
+export function toolState(item: ToolConnection): ToolState {
+  if (item.builtin) return 'ready';
+  const mcp = item.mcp;
+  if (mcp && (mcp.state === 'needs_repair' || mcp.state === 'invalid_config')) return 'attention';
+  const mcpSettled = !mcp || mcp.state === 'configured';
+  const modelSettled = !item.model || item.model.state === 'imported';
+  const execSettled = !item.exec || item.exec.enabled;
+  return mcpSettled && modelSettled && execSettled ? 'ready' : 'idle';
 }
 
-function modelWantsAttention(model: AIProviderImportStatus | null): boolean {
-  if (!model) return false;
-  return model.client_detected && model.state !== 'imported';
-}
-
-function computeAttention(item: ToolConnection): boolean {
-  if (item.builtin) return false;
-  return mcpWantsAttention(item.mcp) || modelWantsAttention(item.model);
-}
+// 排序：内置置顶 → 待处理 → 已就绪 → 未接入。把已接好的排在未接入前面，
+// 接一个工具它就往上走一格，列表底部留给那串可选的未接入工具。
+const STATE_RANK: Record<ToolState, number> = { attention: 1, ready: 2, idle: 3 };
 
 function rank(item: ToolConnection): number {
-  if (item.builtin) return 0;
-  if (item.attention) return 1;
-  if (item.detected) return 2;
-  return 3;
+  return item.builtin ? 0 : STATE_RANK[item.state];
 }
 
 export function buildToolConnections(input: {
@@ -88,7 +92,7 @@ export function buildToolConnections(input: {
         capabilities: { mcp: false, model: false, exec: false },
         detected: false,
         builtin: key === BUILTIN_TOOL_KEY,
-        attention: false,
+        state: 'idle',
       };
       map.set(key, item);
     }
@@ -107,7 +111,7 @@ export function buildToolConnections(input: {
       exec: Boolean(item.exec) || execPresetKeys.has(item.key),
     };
     item.detected = Boolean(item.mcp?.detected || item.model?.client_detected || item.exec);
-    item.attention = computeAttention(item);
+    item.state = toolState(item);
     return item;
   });
 
