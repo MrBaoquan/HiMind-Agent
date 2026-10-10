@@ -146,7 +146,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     // 因此客户端切换注入模式后无需重启网关。
     let gateway_options = options.clone();
     match crate::app::inference_gateway::ensure_started(
-        Some(crate::app::inference_gateway::DEFAULT_GATEWAY_PORT),
+        Some(crate::app::inference_gateway::configured_port(
+            &options.state_path,
+        )),
         Box::new(move || crate::app::ai_provider_import::gateway_bindings(&gateway_options)),
     ) {
         Ok(()) => println!(
@@ -243,6 +245,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_inference_gateway_status,
             super::commands::restart_inference_gateway,
             super::commands::stop_inference_gateway_and_unbind,
+            super::commands::set_inference_gateway_port,
             super::commands::set_provider_binding_mode,
             super::commands::start_dashboard_authorization,
             super::commands::get_dashboard_authorization_progress,

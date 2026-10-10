@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -24,8 +25,68 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const SSE_LINE_LIMIT: usize = 1024 * 1024;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// 固定端口：客户端配置里写死的地址必须跨重启稳定，否则每次启动都要重写配置。
+/// 默认端口：客户端配置里写死的地址必须跨重启稳定，否则每次启动都要重写配置。
+/// 它只是默认值——实际端口由 [`configured_port`] 解析，可被持久化设置或环境变量覆盖。
 pub(crate) const DEFAULT_GATEWAY_PORT: u16 = 18_150;
+
+/// 覆盖端口的操作员环境变量：同一台机器并行跑多个 Agent（例如 development profile）
+/// 时，用它给后启动的实例换一个环回端口，不必停掉先启动的实例。
+pub(crate) const GATEWAY_PORT_ENV: &str = "HIMIND_AGENT_GATEWAY_PORT";
+
+/// 网关端口的持久化设置文件（与注入簿记同目录，随 profile 隔离）。
+const GATEWAY_CONFIG_FILE: &str = "gateway.json";
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct GatewayConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+}
+
+fn gateway_config_path(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(GATEWAY_CONFIG_FILE)
+}
+
+/// 端口解析优先级：环境变量 > 持久化设置 > 默认 18150。`0` 与解析失败都视为未设置。
+///
+/// 抽成纯函数，便于单测不触碰环境变量与磁盘的分支。
+fn resolve_gateway_port(env_override: Option<u16>, stored: Option<u16>) -> u16 {
+    // 注意：不能写成 `env_override.or(stored).filter(>0)`——`Some(0).or(...)`
+    // 会在 `Some` 上短路，把 `stored` 整个丢掉。两路都要各自先过滤。
+    env_override
+        .filter(|port| *port > 0)
+        .or(stored.filter(|port| *port > 0))
+        .unwrap_or(DEFAULT_GATEWAY_PORT)
+}
+
+/// 当前生效的网关端口。
+pub(crate) fn configured_port(state_path: &Path) -> u16 {
+    let env_override = std::env::var(GATEWAY_PORT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok());
+    let stored = std::fs::read(gateway_config_path(state_path))
+        .ok()
+        .and_then(|content| serde_json::from_slice::<GatewayConfig>(&content).ok())
+        .and_then(|config| config.port);
+    resolve_gateway_port(env_override, stored)
+}
+
+/// 持久化网关端口。`0` 不合法。
+///
+/// 调用方必须保证改端口不会留下指向死端口的客户端配置——见
+/// `commands::set_inference_gateway_port` 的前置检查。
+pub(crate) fn set_configured_port(state_path: &Path, port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Err("端口必须在 1-65535 之间。".to_string());
+    }
+    let path = gateway_config_path(state_path);
+    let _lock = crate::store::atomic_file::lock(&path).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec_pretty(&GatewayConfig { port: Some(port) })
+        .map_err(|error| error.to_string())?;
+    crate::store::atomic_file::atomic_write(&path, &bytes).map_err(|error| error.to_string())
+}
 
 /// 已启动网关的地址。客户端注入与状态查询都从这里取，避免各处各自猜端口。
 /// 进程级单例：网关与 Agent 同生命周期。持有状态而不是裸实例，是因为
@@ -1538,5 +1599,33 @@ mod tests {
         let gateway = InferenceGateway::start(Some(port), Box::new(Vec::new), false).unwrap();
         assert_ne!(gateway.port(), port);
         assert!(!gateway.notice.is_empty(), "换端口必须留下提示");
+    }
+
+    /// 端口解析优先级：环境变量 > 持久化设置 > 默认值；`0` 视为未设置。
+    #[test]
+    fn gateway_port_resolution_prefers_env_then_setting_then_default() {
+        assert_eq!(resolve_gateway_port(Some(19_001), Some(19_002)), 19_001);
+        assert_eq!(resolve_gateway_port(None, Some(19_002)), 19_002);
+        assert_eq!(resolve_gateway_port(None, None), DEFAULT_GATEWAY_PORT);
+        assert_eq!(resolve_gateway_port(Some(0), Some(19_002)), 19_002);
+        assert_eq!(resolve_gateway_port(Some(0), Some(0)), DEFAULT_GATEWAY_PORT);
+    }
+
+    /// 持久化端口写到 `gateway.json`，`configured_port` 能原样读回。
+    #[test]
+    fn gateway_port_round_trips_through_settings_file() {
+        std::env::remove_var(GATEWAY_PORT_ENV);
+        let dir = std::env::temp_dir().join(format!("himind-gateway-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let state_path = dir.join("data").join("state.json");
+
+        assert_eq!(configured_port(&state_path), DEFAULT_GATEWAY_PORT);
+        set_configured_port(&state_path, 19_250).unwrap();
+        assert_eq!(configured_port(&state_path), 19_250);
+        assert!(dir.join("data").join(GATEWAY_CONFIG_FILE).is_file());
+        assert!(set_configured_port(&state_path, 0).is_err(), "0 不是合法端口");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2542,7 +2542,7 @@ fn inference_gateway_status_value(options: &Options) -> serde_json::Value {
         "running": running,
         "url": url,
         "port": port,
-        "preferred_port": crate::app::inference_gateway::DEFAULT_GATEWAY_PORT,
+        "preferred_port": crate::app::inference_gateway::configured_port(&options.state_path),
         "last_error": last_error,
         "notice": notice,
         "gateway_clients": bindings
@@ -2567,7 +2567,7 @@ pub(crate) async fn restart_inference_gateway(
     tauri::async_runtime::spawn_blocking(move || {
         let resolver_options = options.clone();
         crate::app::inference_gateway::restart(
-            Some(crate::app::inference_gateway::DEFAULT_GATEWAY_PORT),
+            Some(crate::app::inference_gateway::configured_port(&options.state_path)),
             Box::new(move || crate::app::ai_provider_import::gateway_bindings(&resolver_options)),
         )
         .map_err(|error| error.to_string())?;
@@ -2614,6 +2614,41 @@ pub(crate) async fn stop_inference_gateway_and_unbind(
             "switched": switched,
             "failures": failures,
         }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 改本机网关端口。
+///
+/// 端口是写进各客户端配置的地址，改它会连带让所有引用它的客户端失效，
+/// 所以只在**没有网关绑定**时允许；有绑定时先要求切回直连，避免留下
+/// 指向死端口的配置（这正是界面上不让随手改端口的原因）。
+#[tauri::command]
+pub(crate) async fn set_inference_gateway_port(
+    state: State<'_, AgentState>,
+    port: u16,
+) -> Result<serde_json::Value, String> {
+    let options = state.options.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bound = crate::app::ai_provider_import::gateway_bindings(&options);
+        if !bound.is_empty() {
+            let clients = bound
+                .iter()
+                .map(|binding| binding.client.clone())
+                .collect::<Vec<_>>()
+                .join("、");
+            return Err(format!(
+                "还有工具走网关（{clients}）。改端口会让它们的配置指向死端口，请先切回直连再改。"
+            ));
+        }
+        crate::app::inference_gateway::set_configured_port(&options.state_path, port)?;
+        let resolver_options = options.clone();
+        crate::app::inference_gateway::restart(
+            Some(crate::app::inference_gateway::configured_port(&options.state_path)),
+            Box::new(move || crate::app::ai_provider_import::gateway_bindings(&resolver_options)),
+        )?;
+        Ok(inference_gateway_status_value(&options))
     })
     .await
     .map_err(|error| error.to_string())?

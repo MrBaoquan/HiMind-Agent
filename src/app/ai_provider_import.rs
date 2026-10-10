@@ -291,12 +291,15 @@ impl AIClientAdapter for KimiCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_kimi_code(options, user_id, service)
     }
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        kimi_code_owned_snapshot()
+    }
     fn cancel(
         &self,
         _options: &Options,
-        _restore: Option<&Value>,
+        restore: Option<&Value>,
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-        cancel_kimi_code()
+        cancel_kimi_code(restore)
     }
 }
 
@@ -321,12 +324,15 @@ impl AIClientAdapter for QwenCodeAdapter {
     ) -> Result<AIProviderImportResult, Box<dyn Error>> {
         import_qwen_code(options, user_id, service)
     }
+    fn owned_snapshot(&self, _options: &Options) -> Option<Value> {
+        qwen_code_owned_snapshot()
+    }
     fn cancel(
         &self,
         _options: &Options,
-        _restore: Option<&Value>,
+        restore: Option<&Value>,
     ) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
-        cancel_qwen_code()
+        cancel_qwen_code(restore)
     }
 }
 
@@ -472,7 +478,7 @@ pub(crate) fn known_adapter_ids() -> Vec<&'static str> {
         .collect()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub(crate) struct AIProviderImportResult {
     pub ok: bool,
     pub target: String,
@@ -485,6 +491,16 @@ pub(crate) struct AIProviderImportResult {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub backup_path: String,
     pub client_detected: bool,
+    /// ADR 0114 生命周期：写入落盘后的同步状态。
+    /// `file_written` = 已写入并复核；`conflict` = 写入后复核未通过。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sync_status: String,
+    /// ADR 0114 生命周期：验证等级。
+    /// `file_verified` = 回读目标文件确认 HiMind 标记在位；
+    /// `client_load_unverified` = 写入本身正确，但客户端是否加载无法证明；
+    /// `client_load_verified` = 有真实探针（本机网关可达）证明客户端能加载。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub verification_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -504,6 +520,9 @@ struct AIProviderImportBinding {
     /// 原有配置；旧簿记没有这个字段，退化为「只移除自己写入的键」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     restore: Option<Value>,
+    /// ADR 0114：最近一次写入后复核得到的验证等级，供状态检测回显。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    verification_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -512,7 +531,7 @@ struct AIProviderImportBindings {
     clients: HashMap<String, AIProviderImportBinding>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub(crate) struct AIProviderImportStatus {
     pub target: String,
     pub state: String,
@@ -526,6 +545,10 @@ pub(crate) struct AIProviderImportStatus {
     pub synced_at: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub service: String,
+    /// ADR 0114：该客户端最近一次写入后的验证等级（来自簿记）。客户端自身状态探测
+    /// 无法证明「已加载」时，UI 用它区分「文件已写入」与「客户端已加载」。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub verification_status: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -761,6 +784,10 @@ pub(crate) fn import(
         .targets
         .into_iter()
         .find(|item| item.target == target);
+    // `Some(prior_restore)` 表示本次是「同一来源的重复导入」：沿用首次导入时保存的
+    // 原始快照，不要重新采集——此时目标文件已经含 HiMind 内容，重新采集会把原始
+    // 快照覆盖成 HiMind 状态，导致取消时无法还原用户在导入前的配置。
+    let mut prior_binding_restore: Option<Option<Value>> = None;
     if current
         .as_ref()
         .is_some_and(|item| item.state == "imported")
@@ -786,11 +813,34 @@ pub(crate) fn import(
             let mut bindings = load_import_bindings(options);
             bindings.clients.remove(target);
             save_import_bindings(options, &bindings)?;
+        } else {
+            prior_binding_restore =
+                Some(existing_binding.and_then(|binding| binding.restore.clone()));
         }
     }
     // 快照在写入前采集，且排在「切换来源」的还原之后：此时客户端已是用户原始配置。
-    let snapshot = adapter.owned_snapshot(options);
-    let result = adapter.import(options, expected_user_id, service_source)?;
+    // 同一来源重复导入时沿用首次快照（见上），否则重新采集。
+    let snapshot = match prior_binding_restore {
+        Some(restore) => restore,
+        None => adapter.owned_snapshot(options),
+    };
+    let mut result = adapter.import(options, expected_user_id, service_source)?;
+    // ADR 0114 §2：写入后按内容判定 `file_written` / `file_unchanged`（重复导入同一
+    // 来源时客户端配置逐字节不变，应报「已是最新」而不是又写了一次）。
+    result.sync_status = if import_was_noop(&result) {
+        "file_unchanged".to_string()
+    } else {
+        "file_written".to_string()
+    };
+    // ADR 0114：写入不是完成，回读目标确认 HiMind 标记实际落盘才算 `file_verified`。
+    // 客户端是否「已加载」外部无法可靠证明（有些客户端是异步完成注册的），
+    // 缺省只能到 `client_load_unverified`。
+    let verification_status = if client_config_verified(options, target) {
+        FILE_VERIFIED.to_string()
+    } else {
+        CLIENT_LOAD_UNVERIFIED.to_string()
+    };
+    result.verification_status = verification_status.clone();
     let mut bindings = load_import_bindings(options);
     bindings.clients.insert(
         target.to_string(),
@@ -801,10 +851,39 @@ pub(crate) fn import(
             gateway: None,
             updated_at: now_rfc3339(),
             restore: snapshot,
+            verification_status,
         },
     );
     save_import_bindings(options, &bindings)?;
     Ok(result)
+}
+
+/// ADR 0114 验证等级取值。
+const FILE_VERIFIED: &str = "file_verified";
+const CLIENT_LOAD_UNVERIFIED: &str = "client_load_unverified";
+const CLIENT_LOAD_VERIFIED: &str = "client_load_verified";
+
+/// 回读客户端状态，确认 HiMind 标记真实落盘（ADR 0114 `file_verified`）。
+fn client_config_verified(options: &Options, target: &str) -> bool {
+    status(options)
+        .targets
+        .into_iter()
+        .any(|item| item.target == target && item.state == "imported")
+}
+
+/// 判断本次导入是否实际改动了目标配置（ADR 0114 `file_unchanged`）。
+///
+/// `backup_and_write` 在写入前把原文件复制成 `.himind-backup-*.bak`，所以备份内容就是
+/// 写前内容；若它与写后内容逐字节相同，说明这次导入是空操作。目标文件原本不存在
+/// （无备份）或适配器没有主配置文件时无法判断，保守地按 `file_written`。
+fn import_was_noop(result: &AIProviderImportResult) -> bool {
+    if result.backup_path.trim().is_empty() || result.config_path.trim().is_empty() {
+        return false;
+    }
+    match (fs::read(&result.backup_path), fs::read(&result.config_path)) {
+        (Ok(backup), Ok(current)) => backup == current,
+        _ => false,
+    }
 }
 
 /// 簿记时间戳。用 UTC 秒级 RFC 3339，跨时区显示交给 UI。
@@ -896,7 +975,7 @@ pub(crate) fn enable_gateway_binding(
     };
     // 走客户端自己的写入面：把「客户端看到的凭据」临时替换成网关凭据，
     // 各适配器的协议校验、备份、合并与还原逻辑全部原样复用。
-    let result = {
+    let mut result = {
         let _guard = set_gateway_override(&service_source, client_credential);
         import(
             options,
@@ -911,6 +990,15 @@ pub(crate) fn enable_gateway_binding(
                 replace: true,
             },
         )?
+    };
+    // 网关模式的意义就是请求真的经过本机网关：探一次绑定令牌能否命中，
+    // 能命中才能升级为 `client_load_verified`（ADR 0114）。
+    let verification_status = if gateway_binding_reachable(&gateway_url, &token) {
+        result.sync_status = "file_written".to_string();
+        result.verification_status = CLIENT_LOAD_VERIFIED.to_string();
+        CLIENT_LOAD_VERIFIED.to_string()
+    } else {
+        result.verification_status.clone()
     };
 
     // 客户端配置已写好，再把绑定事实改成网关模式：真实凭据只留在 Agent。
@@ -938,10 +1026,31 @@ pub(crate) fn enable_gateway_binding(
                 .clients
                 .get(target)
                 .and_then(|binding| binding.restore.clone()),
+            verification_status,
         },
     );
     save_import_bindings(options, &bindings)?;
     Ok(result)
+}
+
+/// 探本机网关是否认可这枚绑定令牌（`GET /v1/models`）。
+/// 命中即可证明「客户端走网关」这条链路真实可用（ADR 0114 `client_load_verified`）。
+/// 探测失败只降级验证等级，不影响已经写好的客户端配置。
+fn gateway_binding_reachable(gateway_url: &str, token: &str) -> bool {
+    let url = format!("{}/v1/models", gateway_url.trim_end_matches('/'));
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(url)
+        .bearer_auth(token)
+        .header("x-api-key", token)
+        .send()
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
 }
 
 /// 客户端要求的入口协议与上游真实协议的组合是否有互译实现。
@@ -1161,6 +1270,7 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                 if status.state == "imported" {
                     if let Some(binding) = bindings.clients.get(status.target.as_str()) {
                         status.service = binding.service.clone();
+                        status.verification_status = binding.verification_status.clone();
                         // 客户端自己不记时间时，用簿记时间兜底，UI 才能显示「最近同步」。
                         if status.synced_at.is_empty() {
                             status.synced_at = binding.updated_at.clone();
@@ -1262,6 +1372,7 @@ fn import_vscode(
         config_path: String::new(),
         backup_path: String::new(),
         client_detected: true,
+        ..Default::default()
     })
 }
 
@@ -1386,6 +1497,7 @@ fn import_cc_switch(
         config_path: path.to_string_lossy().to_string(),
         backup_path: backup.to_string_lossy().to_string(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -1453,6 +1565,7 @@ fn import_codex(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -1566,7 +1679,7 @@ fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
         state: if imported { "imported" } else { "not_imported" }.to_string(),
         client_detected,
         detail: if imported && models.is_empty() {
-            "检测到 Codex 已配置 HiMind 供应商，但缺少模型目录，请重新导入".to_string()
+            "检测到 Codex 已配置 HiMind 供应商，但缺少模型目录（himind-models.json）；重新导入可自动重建".to_string()
         } else if imported {
             format!(
                 "已写入 {} 个 HiMind 模型；重启 Codex 后可在 /model 选择",
@@ -1581,6 +1694,7 @@ fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1822,6 +1936,7 @@ fn import_workbuddy(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected: workbuddy_executable_exists(),
+        ..Default::default()
     })
 }
 
@@ -1862,6 +1977,7 @@ fn vscode_import_status(options: &Options) -> AIProviderImportStatus {
         models: status.models,
         synced_at: status.synced_at,
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1898,6 +2014,7 @@ fn cc_switch_import_status() -> AIProviderImportStatus {
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1925,6 +2042,7 @@ fn workbuddy_import_status() -> AIProviderImportStatus {
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1936,6 +2054,8 @@ fn managed_workbuddy_model_ids(root: &Value) -> Vec<String> {
     let mut seen = HashSet::new();
     root.get("models")
         .and_then(Value::as_array)
+        // WorkBuddy 自己写的顶层数组形态：数组本身就是模型列表。
+        .or_else(|| root.as_array())
         .into_iter()
         .flatten()
         .filter(|item| is_managed_workbuddy_model(item))
@@ -2013,8 +2133,7 @@ fn remove_workbuddy_models(content: &str) -> Result<(String, usize), Box<dyn Err
     if content.trim().is_empty() {
         return Ok((String::new(), 0));
     }
-    let mut root = serde_json::from_str::<Value>(content)
-        .map_err(|_| "WorkBuddy models.json 格式无效，已停止取消导入且未覆盖原文件")?;
+    let (mut root, array_root) = workbuddy_root_value(content, "取消导入")?;
     let object = root
         .as_object_mut()
         .ok_or("WorkBuddy models.json 根节点必须是 JSON 对象")?;
@@ -2051,10 +2170,7 @@ fn remove_workbuddy_models(content: &str) -> Result<(String, usize), Box<dyn Err
     if removed == 0 {
         return Ok((content.to_string(), 0));
     }
-    Ok((
-        format!("{}\n", serde_json::to_string_pretty(&root)?),
-        removed,
-    ))
+    Ok((workbuddy_serialize(&root, array_root)?, removed))
 }
 
 fn preferred_model(credential: &AIClientCredential) -> Result<String, Box<dyn Error>> {
@@ -2119,6 +2235,7 @@ fn import_kimi_code(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -2205,6 +2322,7 @@ fn kimi_code_import_status() -> AIProviderImportStatus {
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -2242,7 +2360,7 @@ fn read_kimi_code_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Erro
     Ok(result)
 }
 
-fn cancel_kimi_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+fn cancel_kimi_code(restore: Option<&Value>) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let path = kimi_code_config_path();
     let client_detected = path.is_file();
     let original = if path.is_file() {
@@ -2250,7 +2368,8 @@ fn cancel_kimi_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     } else {
         String::new()
     };
-    let (updated, removed) = strip_kimi_code_himind(&original)?;
+    let previous = restore.and_then(|value| value.get("settings")).and_then(Value::as_str);
+    let (updated, removed) = strip_kimi_code_himind(&original, previous)?;
     let backup = if removed {
         backup_and_write(&path, updated.as_bytes())?
     } else {
@@ -2273,10 +2392,22 @@ fn cancel_kimi_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     })
 }
 
-// 只移除 HiMind 明确写入的字段（providers.himind、himind/* 别名、default_model），
-// 用户其他配置原样保留；无法判定归属的字段不动。
-fn strip_kimi_code_himind(original: &str) -> Result<(String, bool), Box<dyn Error>> {
+// 移除 HiMind 明确写入的字段（providers.himind、himind/* 别名、default_model），
+// 用户其他配置原样保留。`default_model` 若被导入覆盖，按快照还原用户原值，
+// 而不是一律删除（否则用户在导入前设的默认模型会永久丢失）。
+fn strip_kimi_code_himind(
+    original: &str,
+    previous: Option<&str>,
+) -> Result<(String, bool), Box<dyn Error>> {
     let mut document = original.parse::<DocumentMut>()?;
+    let previous_default = previous
+        .filter(|text| !text.trim().is_empty())
+        .and_then(|text| text.parse::<DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("default_model")
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+        });
     let mut changed = false;
     if let Some(providers) = document
         .get_mut("providers")
@@ -2309,13 +2440,23 @@ fn strip_kimi_code_himind(original: &str) -> Result<(String, bool), Box<dyn Erro
             document.remove("models");
         }
     }
-    if document
+    let points_at_himind = document
         .get("default_model")
         .and_then(|item| item.as_str())
-        .is_some_and(|value| value.starts_with(KIMI_CODE_HIMIND_PREFIX))
-    {
-        document.remove("default_model");
-        changed = true;
+        .is_some_and(|value| value.starts_with(KIMI_CODE_HIMIND_PREFIX));
+    if points_at_himind {
+        // 快照里的原值若也是 himind/*（用户此前就导入过），取消时仍应清空，避免
+        // 留下指向已删除别名的悬空默认值。
+        match previous_default.filter(|value| !value.starts_with(KIMI_CODE_HIMIND_PREFIX)) {
+            Some(previous) => {
+                document["default_model"] = value(previous.as_str());
+                changed = true;
+            }
+            None => {
+                document.remove("default_model");
+                changed = true;
+            }
+        }
     }
     Ok((document.to_string(), changed))
 }
@@ -2364,6 +2505,7 @@ fn import_qwen_code(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -2456,6 +2598,7 @@ fn qwen_code_import_status() -> AIProviderImportStatus {
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -2487,7 +2630,24 @@ fn read_qwen_code_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Erro
         .collect())
 }
 
-fn cancel_qwen_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+/// 读取配置文件全文（`{"settings": "<原文>"}`）作为导入前快照，用于取消时还原被
+/// 导入覆盖的、属于用户的键（如默认模型）。Qwen Code / Kimi Code 共用同一形状。
+fn settings_file_snapshot(path: &Path) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    Some(json!({ "settings": text }))
+}
+
+/// Qwen Code 的导入会覆盖用户既有的默认模型 `model`，取消时必须还原。
+fn qwen_code_owned_snapshot() -> Option<Value> {
+    settings_file_snapshot(&qwen_code_settings_path())
+}
+
+/// Kimi Code 的导入会覆盖用户既有的 `default_model`，取消时必须还原。
+fn kimi_code_owned_snapshot() -> Option<Value> {
+    settings_file_snapshot(&kimi_code_config_path())
+}
+
+fn cancel_qwen_code(restore: Option<&Value>) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let path = qwen_code_settings_path();
     let client_detected = path.is_file();
     let original = if path.is_file() {
@@ -2495,7 +2655,8 @@ fn cancel_qwen_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     } else {
         String::new()
     };
-    let (updated, removed) = strip_qwen_code_himind(&original)?;
+    let previous = restore.and_then(|value| value.get("settings")).and_then(Value::as_str);
+    let (updated, removed) = strip_qwen_code_himind(&original, previous)?;
     let backup = if removed {
         backup_and_write(&path, updated.as_bytes())?
     } else {
@@ -2520,7 +2681,10 @@ fn cancel_qwen_code() -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
 
 // 只移除 HiMind 明确写入的字段（env.HIMIND_API_KEY、modelProviders.himind、
 // providerProtocol.himind、model.name 若指向 HiMind 模型），用户其他配置原样保留。
-fn strip_qwen_code_himind(original: &str) -> Result<(String, bool), Box<dyn Error>> {
+fn strip_qwen_code_himind(
+    original: &str,
+    previous: Option<&str>,
+) -> Result<(String, bool), Box<dyn Error>> {
     if original.trim().is_empty() {
         return Ok((String::new(), false));
     }
@@ -2535,13 +2699,15 @@ fn strip_qwen_code_himind(original: &str) -> Result<(String, bool), Box<dyn Erro
             changed = true;
         }
     }
-    if let Some(providers) = object
+    // 导入时我们写入了 modelProviders.himind；它的存在即代表默认模型 `model`
+    // 也是被我们覆盖的，取消时按快照还原，而不是按模型名去猜（写入的是裸模型名，
+    // 不带 himind 前缀，按前缀判定永远命中不了，会留下悬空默认模型）。
+    let had_himind_provider = object
         .get_mut("modelProviders")
         .and_then(Value::as_object_mut)
-    {
-        if providers.remove(QWEN_CODE_PROVIDER_ID).is_some() {
-            changed = true;
-        }
+        .is_some_and(|providers| providers.remove(QWEN_CODE_PROVIDER_ID).is_some());
+    if had_himind_provider {
+        changed = true;
     }
     if let Some(protocols) = object
         .get_mut("providerProtocol")
@@ -2551,21 +2717,23 @@ fn strip_qwen_code_himind(original: &str) -> Result<(String, bool), Box<dyn Erro
             changed = true;
         }
     }
-    let model_points_at_himind = object
-        .get("model")
-        .and_then(|value| value.get("name"))
-        .and_then(Value::as_str)
-        .is_some_and(|name| {
-            object
-                .get("modelProviders")
-                .and_then(|value| value.get(QWEN_CODE_PROVIDER_ID))
-                .and_then(Value::as_array)
-                .is_none()
-                && name.starts_with(QWEN_CODE_PROVIDER_ID)
-        });
-    if model_points_at_himind {
-        object.remove("model");
-        changed = true;
+    if had_himind_provider {
+        let previous_model = previous
+            .filter(|text| !text.trim().is_empty())
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|restore| restore.get("model").cloned());
+        match previous_model {
+            Some(model) if object.get("model") != Some(&model) => {
+                object.insert("model".to_string(), model);
+                changed = true;
+            }
+            Some(_) => {}
+            None => {
+                if object.remove("model").is_some() {
+                    changed = true;
+                }
+            }
+        }
     }
     Ok((
         format!("{}\n", serde_json::to_string_pretty(&root)?),
@@ -2865,6 +3033,7 @@ fn import_claude_code(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -2916,6 +3085,7 @@ fn import_claude_desktop(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -3134,6 +3304,7 @@ fn claude_import_status(path: &Path, target: &str, client_name: &str) -> AIProvi
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -3197,6 +3368,7 @@ fn claude_desktop_status_in(
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -3597,6 +3769,7 @@ fn import_opencode(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default(),
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -3703,6 +3876,7 @@ fn opencode_import_status() -> AIProviderImportStatus {
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -4389,12 +4563,22 @@ fn build_crush_config(
             "models": entries,
         }),
     );
+    // 只在槽位对象上覆写 provider / model，保留用户自己设的推理档位等字段。
+    // 取消导入时按快照把槽位整体还原（见 strip_crush_himind），所以这里即使
+    // 覆写也必须在导入前留快照，不能把用户的 reasoning_effort 冲掉。
     let slots = json_object_at(&mut root, "models", label)?;
     for slot in ["large", "small"] {
-        slots.insert(
-            slot.to_string(),
-            json!({ "provider": DECLARATIVE_PROVIDER_ID, "model": preferred }),
+        let mut entry = slots
+            .get(slot)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        entry.insert(
+            "provider".to_string(),
+            json!(DECLARATIVE_PROVIDER_ID),
         );
+        entry.insert("model".to_string(), json!(preferred));
+        slots.insert(slot.to_string(), Value::Object(entry));
     }
     render_provider_config(&Value::Object(root), format, label)
 }
@@ -4892,18 +5076,19 @@ fn strip_provider_config_file(
     match layout {
         ProviderConfigLayout::ContinueModels => strip_continue_himind(original, format),
         ProviderConfigLayout::AiderConf => strip_aider_himind(original, format, previous),
-        ProviderConfigLayout::CrushConfig => strip_crush_himind(original, format),
-        ProviderConfigLayout::QoderSettings => strip_qoder_himind(original, format),
+        ProviderConfigLayout::CrushConfig => strip_crush_himind(original, format, previous),
+        ProviderConfigLayout::QoderSettings => strip_qoder_himind(original, format, previous),
         ProviderConfigLayout::ZCodeConfig => strip_zcode_himind(original, format),
         ProviderConfigLayout::ZCodeProviderRules => strip_zcode_rules_himind(original, format),
     }
 }
 
-/// Crush：移除 providers.himind；large/small 槽位只在仍指向 HiMind 时清掉，
-/// 用户后来自己选的模型保持不动。
+/// Crush：移除 providers.himind，并把 large/small 槽位还原到导入前的原值；
+/// 没有快照（旧簿记）时才退化为「只在仍指向 HiMind 时清掉槽位」。
 fn strip_crush_himind(
     original: &str,
     format: ProviderConfigFormat,
+    previous: Option<&str>,
 ) -> Result<(String, bool), Box<dyn Error>> {
     let label = "Crush crush.json";
     let mut root = provider_config_object(original, format, label)?;
@@ -4911,15 +5096,35 @@ fn strip_crush_himind(
         .get_mut("providers")
         .and_then(Value::as_object_mut)
         .is_some_and(|providers| providers.remove(DECLARATIVE_PROVIDER_ID).is_some());
+    let restore_root = previous
+        .filter(|text| !text.trim().is_empty())
+        .and_then(|text| parse_provider_config(text, format, label).ok().flatten());
     let mut drop_slots = false;
     if let Some(slots) = root.get_mut("models").and_then(Value::as_object_mut) {
         for slot in ["large", "small"] {
             let points_at_himind = slots
                 .get(slot)
-                .is_some_and(|entry| is_crush_himind_slot(entry));
-            if points_at_himind {
-                slots.remove(slot);
-                changed = true;
+                .is_some_and(is_crush_himind_slot);
+            if !points_at_himind {
+                continue;
+            }
+            match restore_root
+                .as_ref()
+                .and_then(|restore| restore.get("models"))
+                .and_then(Value::as_object)
+                .and_then(|models| models.get(slot))
+                .cloned()
+            {
+                Some(original_slot) => {
+                    if slots.get(slot) != Some(&original_slot) {
+                        slots.insert(slot.to_string(), original_slot);
+                        changed = true;
+                    }
+                }
+                None => {
+                    slots.remove(slot);
+                    changed = true;
+                }
             }
         }
         drop_slots = slots.is_empty();
@@ -4940,10 +5145,12 @@ fn is_crush_himind_slot(entry: &Value) -> bool {
     entry.get("provider").and_then(Value::as_str) == Some(DECLARATIVE_PROVIDER_ID)
 }
 
-/// Qoder：移除 providers.himind；model.name 只在仍指向 HiMind 时清掉。
+/// Qoder：移除 providers.himind，并把 model.name 还原到导入前的原值；
+/// 没有快照时才退化为「只在仍指向 HiMind 时清掉 model.name」。
 fn strip_qoder_himind(
     original: &str,
     format: ProviderConfigFormat,
+    previous: Option<&str>,
 ) -> Result<(String, bool), Box<dyn Error>> {
     let label = "Qoder settings.json";
     let mut root = provider_config_object(original, format, label)?;
@@ -4951,15 +5158,35 @@ fn strip_qoder_himind(
         .get_mut("providers")
         .and_then(Value::as_object_mut)
         .is_some_and(|providers| providers.remove(DECLARATIVE_PROVIDER_ID).is_some());
+    let previous_name = previous
+        .filter(|text| !text.trim().is_empty())
+        .and_then(|text| parse_provider_config(text, format, label).ok().flatten())
+        .and_then(|restore| {
+            restore
+                .get("model")
+                .and_then(|model| model.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
     let mut drop_model = false;
     if let Some(model) = root.get_mut("model").and_then(Value::as_object_mut) {
-        if model
+        let points_at_himind = model
             .get("name")
             .and_then(Value::as_str)
-            .is_some_and(|name| name.starts_with(DECLARATIVE_MODEL_PREFIX))
-        {
-            model.remove("name");
-            changed = true;
+            .is_some_and(|name| name.starts_with(DECLARATIVE_MODEL_PREFIX));
+        if points_at_himind {
+            match previous_name {
+                Some(name) if model.get("name").and_then(Value::as_str) != Some(name.as_str()) => {
+                    model.insert("name".to_string(), json!(name));
+                    changed = true;
+                }
+                None => {
+                    model.remove("name");
+                    changed = true;
+                }
+                // 快照原值就是当前值：无需改动。
+                Some(_) => {}
+            }
         }
         drop_model = model.is_empty();
     }
@@ -5115,6 +5342,7 @@ fn provider_config_status(definition: &AiProviderTargetDefinition) -> AIProvider
         models,
         synced_at: String::new(),
         service: String::new(),
+        ..Default::default()
     }
 }
 
@@ -5168,6 +5396,7 @@ fn import_provider_config(
         config_path: primary.path.to_string_lossy().to_string(),
         backup_path,
         client_detected,
+        ..Default::default()
     })
 }
 
@@ -5254,17 +5483,10 @@ impl AIClientAdapter for ProviderConfigAdapter {
     }
 }
 
-/// 只有 Aider 的 `.aider.conf.yml` 会把用户原有的 `openai-api-base` /
-/// `openai-api-key` / `model` 改写成 HiMind 的值，因此导入前留存原文件用于还原。
-/// 其他布局只新增自己的 provider 条目或 `himind/*` 前缀项，取消时按标记删除即可。
+/// 布局在导入时会覆盖用户既有键时（Aider、Crush 的槽位、Qoder 的默认模型），
+/// 导入前留存原文件用于还原；只做新增式合并的布局也会留存，取消逻辑忽略即可。
 fn provider_config_owned_snapshot(definition: &AiProviderTargetDefinition) -> Option<Value> {
     let files = (definition.config_files)();
-    if !files
-        .iter()
-        .any(|file| matches!(file.layout, ProviderConfigLayout::AiderConf))
-    {
-        return None;
-    }
     let mut snapshot = serde_json::Map::new();
     for file in files {
         if let Ok(text) = fs::read_to_string(&file.path) {
@@ -5458,16 +5680,42 @@ fn read_cc_switch_managed_models(path: &Path) -> Result<Option<Vec<String>>, Box
     ))
 }
 
+/// 解析 WorkBuddy models.json，并把两种根形态归一到对象。
+///
+/// WorkBuddy 自己会把空配置写成顶层数组 `[]`（更早还写过 0 字节文件），而 HiMind
+/// 写入的是对象 `{ models, availableModels }`。两者都必须能读：顶层数组按「模型列表」
+/// 包成对象，并返回 `true`，让调用方按原形态写回——不擅自替 WorkBuddy 改变表示法。
+/// 其它根类型继续报错。
+fn workbuddy_root_value(content: &str, action: &str) -> Result<(Value, bool), Box<dyn Error>> {
+    if content.trim().is_empty() {
+        return Ok((json!({}), false));
+    }
+    let root = serde_json::from_str::<Value>(content)
+        .map_err(|_| format!("WorkBuddy models.json 格式无效，已停止{action}且未覆盖原文件"))?;
+    if root.is_array() {
+        return Ok((json!({ "models": root }), true));
+    }
+    if !root.is_object() {
+        return Err("WorkBuddy models.json 根节点必须是 JSON 对象或数组".into());
+    }
+    Ok((root, false))
+}
+
+/// 按 root 的原形态写回：顶层数组根重新序列化成数组，对象根保持对象。
+fn workbuddy_serialize(root: &Value, array_root: bool) -> Result<String, Box<dyn Error>> {
+    let value = if array_root {
+        root.get("models").cloned().unwrap_or_else(|| json!([]))
+    } else {
+        root.clone()
+    };
+    Ok(format!("{}\n", serde_json::to_string_pretty(&value)?))
+}
+
 fn merge_workbuddy_models(
     content: &str,
     credential: &AIClientCredential,
 ) -> Result<(String, usize), Box<dyn Error>> {
-    let mut root = if content.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str::<Value>(content)
-            .map_err(|_| "WorkBuddy models.json 格式无效，已停止导入且未覆盖原文件")?
-    };
+    let (mut root, array_root) = workbuddy_root_value(content, "导入")?;
     let object = root
         .as_object_mut()
         .ok_or("WorkBuddy models.json 根节点必须是 JSON 对象")?;
@@ -5530,10 +5778,7 @@ fn merge_workbuddy_models(
             available.push(Value::String(id));
         }
     }
-    Ok((
-        format!("{}\n", serde_json::to_string_pretty(&root)?),
-        aliases.len(),
-    ))
+    Ok((workbuddy_serialize(&root, array_root)?, aliases.len()))
 }
 
 fn available_models(credential: &AIClientCredential) -> Result<Vec<String>, Box<dyn Error>> {
@@ -5728,40 +5973,203 @@ fn openai_provider_type(credential: &AIClientCredential) -> &'static str {
     }
 }
 
+/// 入口协议兼容性判定：先看服务的 `protocol` 标签，标签不匹配时**再探测端点**
+/// 是否真的支持目标协议（能力判定），而不是只凭标签拒绝。
+///
+/// 起因：HiMind 云端网关同时讲 Anthropic 与 OpenAI，但服务记录只标了
+/// `openai-responses`；标签判定会误拦这类「标签单一、端点多协议」的服务，
+/// 例如把可用的网关服务导入 Claude Desktop。探测确认可达即放行，探测不了
+/// 或明确不支持，才回落到原有的清晰报错。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RequiredProtocol {
+    Anthropic,
+    OpenAi,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbeVerdict {
+    Supported,
+    Unsupported,
+    Unavailable,
+}
+
+#[cfg(not(test))]
+fn protocol_probe(credential: &AIClientCredential, required: RequiredProtocol) -> ProbeVerdict {
+    probe_endpoint_protocol(credential, required)
+}
+
+#[cfg(test)]
+fn protocol_probe(_credential: &AIClientCredential, _required: RequiredProtocol) -> ProbeVerdict {
+    // 单测不打网络：回落到标签判定，行为与历史一致。
+    ProbeVerdict::Unavailable
+}
+
+/// 标签是否已经满足目标协议。`openai-chat` / `openai-responses` 都算 OpenAI 兼容。
+fn label_satisfies_protocol(credential: &AIClientCredential, required: RequiredProtocol) -> bool {
+    match required {
+        RequiredProtocol::Anthropic => credential.access.protocol.trim() == "anthropic",
+        RequiredProtocol::OpenAi => credential.access.protocol.trim() != "anthropic",
+    }
+}
+
+/// 纯判定：标签满足即放行；否则看探测结论。
+fn protocol_gate(label_ok: bool, verdict: ProbeVerdict) -> bool {
+    label_ok || verdict == ProbeVerdict::Supported
+}
+
+#[cfg(not(test))]
+fn probe_endpoint_protocol(
+    credential: &AIClientCredential,
+    required: RequiredProtocol,
+) -> ProbeVerdict {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    else {
+        return ProbeVerdict::Unavailable;
+    };
+    match required {
+        RequiredProtocol::Anthropic => {
+            let Ok(root) = anthropic_api_root_checked(&credential.access.base_url) else {
+                return ProbeVerdict::Unavailable;
+            };
+            let model = preferred_model(credential).unwrap_or_default();
+            let body = json!({
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{ "role": "user", "content": "ping" }],
+            });
+            let Ok(response) = client
+                .post(format!("{root}/v1/messages"))
+                .header("x-api-key", &credential.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+            else {
+                return ProbeVerdict::Unavailable;
+            };
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .keys()
+                .map(|name| name.as_str().to_string())
+                .collect::<Vec<_>>();
+            let body = response.text().unwrap_or_default();
+            classify_anthropic_probe(status, &headers, &body)
+        }
+        RequiredProtocol::OpenAi => {
+            let Ok(base) = normalized_base_url(&credential.access.base_url) else {
+                return ProbeVerdict::Unavailable;
+            };
+            let Ok(response) = client
+                .get(format!("{base}/models"))
+                .bearer_auth(&credential.api_key)
+                .send()
+            else {
+                return ProbeVerdict::Unavailable;
+            };
+            let status = response.status().as_u16();
+            let body = response.text().unwrap_or_default();
+            classify_openai_probe(status, &body)
+        }
+    }
+}
+
+/// Anthropic 探针判读：2xx 直接成立；4xx 里 Anthropic 的错误信封
+/// （`{"type":"error","error":{...}}`）或 `anthropic-*` 响应头也足以证明端点讲该协议；
+/// 404 说明没有该路由，判为不支持。
+fn classify_anthropic_probe(status: u16, header_names: &[String], body: &str) -> ProbeVerdict {
+    if (200..300).contains(&status) {
+        return ProbeVerdict::Supported;
+    }
+    if status == 404 {
+        return ProbeVerdict::Unsupported;
+    }
+    if header_names
+        .iter()
+        .any(|name| name.to_ascii_lowercase().starts_with("anthropic-"))
+    {
+        return ProbeVerdict::Supported;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if value.get("type").and_then(Value::as_str) == Some("error")
+            && value.get("error").is_some_and(Value::is_object)
+        {
+            return ProbeVerdict::Supported;
+        }
+    }
+    ProbeVerdict::Unsupported
+}
+
+/// OpenAI 探针判读：`/models` 2xx 且带 `data`/`object:list` 才成立；
+/// 其余（含 401/404）一律判为不支持，避免把不可用端点误放行。
+fn classify_openai_probe(status: u16, body: &str) -> ProbeVerdict {
+    if !(200..300).contains(&status) {
+        return ProbeVerdict::Unsupported;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if value.get("data").is_some_and(Value::is_array)
+            || value.get("object").and_then(Value::as_str) == Some("list")
+        {
+            return ProbeVerdict::Supported;
+        }
+    }
+    ProbeVerdict::Unsupported
+}
+
 /// 只支持 OpenAI 兼容协议的客户端必须显式拒绝 Anthropic 服务。
 ///
 /// 这些客户端的配置里只有 `chat`/`responses` 两种线格式，把 Anthropic 端点按
 /// Responses 写进去会得到一个能保存、但一发请求就失败的配置。这里提前报错并给出
 /// 可用去处，比让用户在客户端里排查一个 404 更清楚。
+///
+/// 标签为 Anthropic 时，先探测端点是否其实也讲 OpenAI（标签单一、端点多协议），
+/// 探测确认为不支持才拒绝。
 fn ensure_openai_compatible(
     credential: &AIClientCredential,
     client_label: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if credential.access.protocol.trim() == "anthropic" {
-        return Err(format!(
-            "{client_label} 只支持 OpenAI 兼容的 AI 服务，当前服务使用 Anthropic 协议。\
-             请改用 HiMind AI 或选择 OpenAI Chat / OpenAI Responses 的服务；\
-             Anthropic 服务可以导入到 Claude Code、OpenCode 等支持该协议的客户端。"
-        )
-        .into());
+    if !label_satisfies_protocol(credential, RequiredProtocol::OpenAi) {
+        let verdict = protocol_probe(credential, RequiredProtocol::OpenAi);
+        if !protocol_gate(false, verdict) {
+            return Err(format!(
+                "{client_label} 只支持 OpenAI 兼容的 AI 服务，当前服务使用 Anthropic 协议。\
+                 请改用 HiMind AI 或选择 OpenAI Chat / OpenAI Responses 的服务；\
+                 Anthropic 服务可以导入到 Claude Code、OpenCode 等支持该协议的客户端。"
+            )
+            .into());
+        }
     }
     Ok(())
 }
 
 /// 只吃 Anthropic Messages 的客户端（ZCode 的自定义 provider 固定 kind=anthropic）
 /// 遇到 OpenAI 兼容服务时同样提前拦下：写进去只能保存、一发请求就失败。
+///
+/// 标签不是 Anthropic 时，先探测端点是否其实也讲 Anthropic（同一端点两种协议的服务
+/// 很常见，例如 HiMind 网关），探测确认支持即放行。
 fn ensure_anthropic_compatible(
     credential: &AIClientCredential,
     client_label: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if credential.access.protocol.trim() != "anthropic" {
-        return Err(format!(
-            "{client_label} 的自定义 AI 服务只支持 Anthropic 协议，当前服务使用 OpenAI 兼容协议。\
-             请改用 Anthropic 协议的服务；OpenAI 兼容服务可以导入到 Continue、Crush、Qoder 等客户端。"
-        )
-        .into());
+    if !label_satisfies_protocol(credential, RequiredProtocol::Anthropic) {
+        let verdict = protocol_probe(credential, RequiredProtocol::Anthropic);
+        if !protocol_gate(false, verdict) {
+            return Err(format!(
+                "{client_label} 的自定义 AI 服务只支持 Anthropic 协议，当前服务使用 OpenAI 兼容协议。\
+                 请改用 Anthropic 协议的服务；OpenAI 兼容服务可以导入到 Continue、Crush、Qoder 等客户端。"
+            )
+            .into());
+        }
     }
     Ok(())
+}
+
+/// 探针用的 Anthropic 根地址（剥掉末尾 `/v1`），失败时不 panic。
+#[cfg(not(test))]
+fn anthropic_api_root_checked(value: &str) -> Result<String, Box<dyn Error>> {
+    anthropic_base_url(value)
 }
 
 fn workbuddy_models_path() -> PathBuf {
@@ -6677,12 +7085,14 @@ mod tests {
         build_codex_models_json, build_continue_config, build_crush_config, build_kimi_code_config,
         build_opencode_config, build_qoder_config, build_qwen_code_settings,
         build_vscode_enrollment_url, build_zcode_config, build_zcode_provider_rules,
-        bundled_vscode_vsix_candidates, chat_completions_url, compare_extension_versions,
+        bundled_vscode_vsix_candidates, chat_completions_url, classify_anthropic_probe,
+        classify_openai_probe, compare_extension_versions,
         consume_vscode_enrollment, continue_himind_models, create_vscode_enrollment,
         crush_himind_models, ensure_anthropic_compatible, ensure_openai_compatible,
         ensure_vscode_chat_provider_allowlist, find_vscode_extension_version, known_adapters,
         legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
         migrate_workbuddy_sessions, opencode_anthropic_base_url, opencode_npm_for_protocol,
+        label_satisfies_protocol, protocol_gate,
         parse_vscode_cli_version, parse_vscode_extension_version, parse_vscode_import_status,
         push_vscode_registry_value, qoder_himind_models, read_cc_switch_managed_models,
         read_cc_switch_managed_settings, read_codex_model_catalog, remove_workbuddy_models,
@@ -6691,8 +7101,8 @@ mod tests {
         strip_qwen_code_himind, strip_zcode_himind, strip_zcode_rules_himind,
         vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
         write_cc_switch_provider, zcode_himind_models, AIClientCredential, AIProviderImportRequest,
-        ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION, PROVIDER_TARGETS,
-        VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
+        ProbeVerdict, ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION,
+        PROVIDER_TARGETS, VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::AIUserCredential;
     use semver::Version;
@@ -6781,6 +7191,7 @@ mod tests {
                 gateway: None,
                 updated_at: String::new(),
                 restore: None,
+                verification_status: String::new(),
             },
         );
         super::save_import_bindings(&options, &bindings).unwrap();
@@ -7781,6 +8192,46 @@ command = "uvx.exe"
         assert!(error.contains("未覆盖原文件"));
     }
 
+    /// WorkBuddy 自己会把空配置写成顶层数组 `[]`；导入不能因为根是数组就失败。
+    #[test]
+    fn merge_accepts_top_level_array_and_writes_it_back() {
+        let (updated, count) = merge_workbuddy_models("[]", &credential(&["gpt-4.1"])).unwrap();
+        assert_eq!(count, 1);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root.is_array(), "数组根要按数组写回，不擅自改成对象");
+        assert_eq!(root.as_array().unwrap().len(), 1);
+        assert_eq!(root[0]["id"], "gpt-4.1");
+    }
+
+    #[test]
+    fn merge_keeps_existing_entries_in_array_root() {
+        let source = r#"[{"id":"personal","vendor":"Other","apiKey":"keep"}]"#;
+        let (updated, _) = merge_workbuddy_models(source, &credential(&["gpt-4.1"])).unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root.is_array());
+        assert!(root.as_array().unwrap().iter().any(|item| item["id"] == "personal"));
+        assert!(root.as_array().unwrap().iter().any(|item| item["id"] == "gpt-4.1"));
+    }
+
+    #[test]
+    fn remove_accepts_top_level_array_and_prunes_managed_entries() {
+        let source = r#"[{"id":"personal","vendor":"Other"},{"id":"gpt-4.1","vendor":"HiMind"}]"#;
+        let (updated, removed) = remove_workbuddy_models(source).unwrap();
+        assert_eq!(removed, 1);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root.is_array());
+        assert_eq!(root.as_array().unwrap().len(), 1);
+        assert_eq!(root[0]["id"], "personal");
+    }
+
+    #[test]
+    fn managed_ids_read_top_level_array_root() {
+        let empty: Value = serde_json::from_str("[]").unwrap();
+        assert!(managed_workbuddy_model_ids(&empty).is_empty());
+        let wired: Value = serde_json::from_str(r#"[{"id":"gpt-4.1","vendor":"HiMind"}]"#).unwrap();
+        assert_eq!(managed_workbuddy_model_ids(&wired), vec!["gpt-4.1".to_string()]);
+    }
+
     #[test]
     fn resolves_service_source_from_import_request() {
         let managed = AIProviderImportRequest {
@@ -7836,12 +8287,27 @@ command = "uvx.exe"
     #[test]
     fn strip_kimi_code_only_removes_himind_fields() {
         let original = "default_model = \"himind/kimi-k3\"\n[providers.himind]\ntype = \"openai_responses\"\n[providers.other]\ntype = \"openai\"\n[models.\"himind/kimi-k3\"]\nprovider = \"himind\"\n[models.\"local/m1\"]\nprovider = \"other\"\n";
-        let (updated, changed) = strip_kimi_code_himind(original).unwrap();
+        let (updated, changed) = strip_kimi_code_himind(original, None).unwrap();
         assert!(changed);
         assert!(!updated.contains("himind"));
         assert!(updated.contains("[providers.other]"));
         assert!(updated.contains("[models.\"local/m1\"]"));
         assert!(!updated.contains("default_model"));
+    }
+
+    // Kimi Code 的取消：有导入前快照时，用户的 default_model 应还原，而不是被清空。
+    #[test]
+    fn strip_kimi_code_restores_previous_default_model() {
+        let original = "default_model = \"existing/model\"\n[hooks]\nenabled = true\n";
+        let updated =
+            build_kimi_code_config(original, &credential(&["kimi-k3"]), &["kimi-k3".to_string()], "kimi-k3")
+                .unwrap();
+        assert!(updated.contains("default_model = \"himind/kimi-k3\""));
+        let (restored, changed) = strip_kimi_code_himind(&updated, Some(original)).unwrap();
+        assert!(changed);
+        assert!(restored.contains("default_model = \"existing/model\""));
+        assert!(!restored.contains("himind"));
+        assert!(restored.contains("[hooks]"));
     }
 
     #[test]
@@ -7885,7 +8351,7 @@ command = "uvx.exe"
     #[test]
     fn strip_qwen_code_only_removes_himind_fields() {
         let original = r#"{"env":{"HIMIND_API_KEY":"sk-1","OTHER":"v"},"modelProviders":{"himind":[{"id":"qwen3-coder-plus"}],"local":[{"id":"m1"}]},"providerProtocol":{"himind":"openai","local":"openai"},"mcpServers":{"s":{"command":"x"}}}"#;
-        let (updated, changed) = strip_qwen_code_himind(original).unwrap();
+        let (updated, changed) = strip_qwen_code_himind(original, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert!(root["env"].get("HIMIND_API_KEY").is_none());
@@ -7895,6 +8361,46 @@ command = "uvx.exe"
         assert!(root["providerProtocol"].get("himind").is_none());
         assert_eq!(root["providerProtocol"]["local"], "openai");
         assert!(root["mcpServers"]["s"].is_object());
+    }
+
+    // Qwen Code：导入写了裸模型名，取消时按快照还原默认模型，而不是留下悬空 model。
+    #[test]
+    fn strip_qwen_code_restores_previous_default_model() {
+        let original = r#"{"model":{"name":"qwen3-max"},"mcpServers":{"s":{"command":"x"}}}"#;
+        let updated = build_qwen_code_settings(
+            original,
+            &credential(&["qwen3-coder-plus"]),
+            &["qwen3-coder-plus".to_string()],
+            "qwen3-coder-plus",
+        )
+        .unwrap();
+        let imported: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(imported["model"]["name"], "qwen3-coder-plus");
+        let (restored, changed) = strip_qwen_code_himind(&updated, Some(original)).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&restored).unwrap();
+        assert!(root["modelProviders"].get("himind").is_none());
+        assert!(root["env"].get("HIMIND_API_KEY").is_none());
+        assert!(root["providerProtocol"].get("himind").is_none());
+        assert_eq!(root["model"]["name"], "qwen3-max");
+        assert_eq!(root["mcpServers"]["s"]["command"], "x");
+    }
+
+    // 没有快照（旧簿记）时，取消仍要清掉我们写入的默认模型，避免悬空引用。
+    #[test]
+    fn strip_qwen_code_removes_default_model_without_snapshot() {
+        let updated = build_qwen_code_settings(
+            "",
+            &credential(&["qwen3-coder-plus"]),
+            &["qwen3-coder-plus".to_string()],
+            "qwen3-coder-plus",
+        )
+        .unwrap();
+        let (restored, changed) = strip_qwen_code_himind(&updated, None).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&restored).unwrap();
+        assert!(root.get("model").is_none());
+        assert!(root["modelProviders"].get("himind").is_none());
     }
 
     #[test]
@@ -8355,7 +8861,8 @@ command = "uvx.exe"
         .unwrap();
         let root: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(root["providers"]["anthropic"]["name"], "anthropic");
-        let (updated, changed) = strip_crush_himind(&content, ProviderConfigFormat::Json).unwrap();
+        let (updated, changed) =
+            strip_crush_himind(&content, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert!(root["providers"].get("himind").is_none());
@@ -8366,13 +8873,40 @@ command = "uvx.exe"
     #[test]
     fn strips_crush_himind_keeps_slots_pointing_elsewhere() {
         let original = r#"{"providers":{"himind":{"type":"openai"}},"models":{"large":{"provider":"anthropic","model":"claude"},"small":{"provider":"himind","model":"model-a"}}}"#;
-        let (updated, changed) = strip_crush_himind(original, ProviderConfigFormat::Json).unwrap();
+        let (updated, changed) = strip_crush_himind(original, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(root["models"]["large"]["provider"], "anthropic");
         assert!(root["models"].get("small").is_none());
-        let (_, again) = strip_crush_himind(&updated, ProviderConfigFormat::Json).unwrap();
+        let (_, again) = strip_crush_himind(&updated, ProviderConfigFormat::Json, None).unwrap();
         assert!(!again);
+    }
+
+    // Crush 的取消：有导入前快照时，large/small 槽位连同用户自己的推理档位一起还原，
+    // 不再把用户原有槽位永久丢失。
+    #[test]
+    fn strips_crush_himind_restores_previous_slot_snapshot() {
+        let original = r#"{"providers":{"anthropic":{"type":"anthropic"}},"models":{"large":{"provider":"anthropic","model":"claude-sonnet","reasoning_effort":"high"},"small":{"provider":"anthropic","model":"claude-haiku"}}}"#;
+        let content = build_crush_config(
+            original,
+            ProviderConfigFormat::Json,
+            &credential(&["model-a"]),
+            &["model-a".to_string()],
+            "model-a",
+        )
+        .unwrap();
+        let imported: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(imported["models"]["large"]["provider"], "himind");
+        assert_eq!(imported["models"]["large"]["reasoning_effort"], "high");
+        let (updated, changed) =
+            strip_crush_himind(&content, ProviderConfigFormat::Json, Some(original)).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["providers"].get("himind").is_none());
+        assert_eq!(root["models"]["large"]["provider"], "anthropic");
+        assert_eq!(root["models"]["large"]["model"], "claude-sonnet");
+        assert_eq!(root["models"]["large"]["reasoning_effort"], "high");
+        assert_eq!(root["models"]["small"]["model"], "claude-haiku");
     }
 
     // Qoder：providers.himind 走 openai 协议，默认模型写成 `<id>/<model>`。
@@ -8401,7 +8935,7 @@ command = "uvx.exe"
     #[test]
     fn strips_qoder_himind_and_keeps_reasoning_effort() {
         let original = r#"{"model":{"name":"himind/model-a","reasoningEffort":"high"},"providers":{"himind":{"protocol":"openai"},"other":{"protocol":"openai"}}}"#;
-        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json).unwrap();
+        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert!(root["providers"].get("himind").is_none());
@@ -8413,11 +8947,33 @@ command = "uvx.exe"
     #[test]
     fn strips_qoder_himind_keeps_foreign_default_model() {
         let original = r#"{"model":{"name":"other/model"},"providers":{"himind":{}}}"#;
-        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json).unwrap();
+        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(root["model"]["name"], "other/model");
         assert!(root["providers"].get("himind").is_none());
+    }
+
+    // Qoder 的取消：有导入前快照时，默认模型还原到用户原值，而不是清成空。
+    #[test]
+    fn strips_qoder_himind_restores_previous_default_model() {
+        let original =
+            r#"{"model":{"name":"other/model","reasoningEffort":"high"},"providers":{"other":{"protocol":"openai"}}}"#;
+        let content = build_qoder_config(
+            original,
+            ProviderConfigFormat::Json,
+            &credential(&["model-a"]),
+            &["model-a".to_string()],
+            "model-a",
+        )
+        .unwrap();
+        let (updated, changed) =
+            strip_qoder_himind(&content, ProviderConfigFormat::Json, Some(original)).unwrap();
+        assert!(changed);
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        assert!(root["providers"].get("himind").is_none());
+        assert_eq!(root["model"]["name"], "other/model");
+        assert_eq!(root["model"]["reasoningEffort"], "high");
     }
 
     // ZCode：config.json 的 provider kind 固定 anthropic，baseURL 不带 /v1；
@@ -8536,6 +9092,32 @@ command = "uvx.exe"
         assert!(!again);
     }
 
+    // 重复导入同一来源时配置逐字节不变，应判定为 file_unchanged（备份=写前内容）。
+    #[test]
+    fn import_noop_detected_when_backup_matches_written_file() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-noop-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+        let backup = root.join("config.json.himind-backup-1.bak");
+        std::fs::write(&config, b"{\"a\":1}\n").unwrap();
+        std::fs::write(&backup, b"{\"a\":1}\n").unwrap();
+        let result = super::AIProviderImportResult {
+            config_path: config.to_string_lossy().to_string(),
+            backup_path: backup.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        assert!(super::import_was_noop(&result));
+        std::fs::write(&config, b"{\"a\":2}\n").unwrap();
+        assert!(!super::import_was_noop(&result));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // 线格式守卫：ZCode 只吃 Anthropic，Continue/Aider/Crush/Qoder 只吃 OpenAI 兼容。
     #[test]
     fn protocol_guards_match_each_client_wire_format() {
@@ -8546,6 +9128,77 @@ command = "uvx.exe"
         assert!(ensure_anthropic_compatible(&anthropic, "ZCode").is_ok());
         assert!(ensure_openai_compatible(&anthropic, "Crush").is_err());
         assert!(ensure_openai_compatible(&openai, "Crush").is_ok());
+    }
+
+    // 能力判定：标签不匹配时，探针确认端点支持目标协议即放行。
+    #[test]
+    fn protocol_gate_allows_when_probe_confirms_capability() {
+        assert!(protocol_gate(true, ProbeVerdict::Unavailable));
+        assert!(protocol_gate(true, ProbeVerdict::Unsupported));
+        assert!(protocol_gate(false, ProbeVerdict::Supported));
+        assert!(!protocol_gate(false, ProbeVerdict::Unsupported));
+        assert!(!protocol_gate(false, ProbeVerdict::Unavailable));
+    }
+
+    #[test]
+    fn label_satisfies_protocol_treats_both_openai_wire_formats_as_openai() {
+        let mut credential = credential(&["model-a"]);
+        credential.access.protocol = "openai-chat".to_string();
+        assert!(label_satisfies_protocol(&credential, super::RequiredProtocol::OpenAi));
+        assert!(!label_satisfies_protocol(&credential, super::RequiredProtocol::Anthropic));
+        credential.access.protocol = "openai-responses".to_string();
+        assert!(label_satisfies_protocol(&credential, super::RequiredProtocol::OpenAi));
+        credential.access.protocol = "anthropic".to_string();
+        assert!(label_satisfies_protocol(&credential, super::RequiredProtocol::Anthropic));
+        assert!(!label_satisfies_protocol(&credential, super::RequiredProtocol::OpenAi));
+    }
+
+    // Anthropic 探针判读：2xx 成立；404 不成立；错误信封与 anthropic-* 头也算讲该协议。
+    #[test]
+    fn classify_anthropic_probe_recognizes_protocol_signals() {
+        assert_eq!(
+            classify_anthropic_probe(200, &[], "{}"),
+            ProbeVerdict::Supported
+        );
+        assert_eq!(
+            classify_anthropic_probe(404, &[], "not found"),
+            ProbeVerdict::Unsupported
+        );
+        assert_eq!(
+            classify_anthropic_probe(
+                400,
+                &[],
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#
+            ),
+            ProbeVerdict::Supported
+        );
+        assert_eq!(
+            classify_anthropic_probe(400, &["anthropic-ratelimit-requests-limit".to_string()], "{}"),
+            ProbeVerdict::Supported
+        );
+        assert_eq!(
+            classify_anthropic_probe(500, &[], "oops"),
+            ProbeVerdict::Unsupported
+        );
+    }
+
+    // OpenAI 探针判读：只有 /models 2xx 且带 data/list 才成立。
+    #[test]
+    fn classify_openai_probe_requires_model_list_shape() {
+        assert_eq!(
+            classify_openai_probe(200, r#"{"object":"list","data":[{"id":"m1"}]}"#),
+            ProbeVerdict::Supported
+        );
+        assert_eq!(
+            classify_openai_probe(200, r#"{"data":[]}"#),
+            ProbeVerdict::Supported
+        );
+        assert_eq!(
+            classify_openai_probe(200, "<html>ok</html>"),
+            ProbeVerdict::Unsupported
+        );
+        assert_eq!(classify_openai_probe(401, "{}"), ProbeVerdict::Unsupported);
+        assert_eq!(classify_openai_probe(404, "not found"), ProbeVerdict::Unsupported);
     }
 
     #[test]
