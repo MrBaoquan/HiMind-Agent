@@ -2642,7 +2642,7 @@ export type AIServiceModelListResult = {
 /** 用量窗口档位；今日只有日粒度单点，界面据此不出趋势图（ADR 0111）。 */
 export type AiUsageRange = 'today' | '7d' | '30d';
 
-/** 用量统计只做本机网关这一条口径（ADR 0113）：只有 Token 与调用次数，没有金额。 */
+/** 用量统计只做本机推理网关这一条口径（ADR 0113）：只有 Token 与调用次数，没有金额。 */
 export type LocalUsageGroup = {
     key: string;
     label: string;
@@ -2680,7 +2680,7 @@ export type InferenceGatewayStatus = {
     running: boolean;
     url: string;
     port: number;
-    /** 固定端口；端口被占用且已有绑定时不会退让，只在 last_error 里说明。 */
+    /** 当前生效的配置端口（环境变量 > 设置 > 默认 18150）；被占用且已有绑定时不会退让，只在 last_error 里说明。 */
     preferred_port: number;
     /** 启动失败的硬原因（端口不可用等）。 */
     last_error: string;
@@ -2720,6 +2720,7 @@ export const agentApi = {
     localUsageOverview: (range: AiUsageRange) => invoke<LocalUsageOverview>('get_local_usage_overview', { range }),
     inferenceGatewayStatus: () => invoke<InferenceGatewayStatus>('get_inference_gateway_status'),
     restartInferenceGateway: () => invoke<InferenceGatewayStatus>('restart_inference_gateway'),
+    setInferenceGatewayPort: (port: number) => invoke<InferenceGatewayStatus>('set_inference_gateway_port', { port }),
     stopInferenceGatewayAndUnbind: () => invoke<InferenceGatewayStopReport>('stop_inference_gateway_and_unbind'),
     setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) =>
         invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null }),

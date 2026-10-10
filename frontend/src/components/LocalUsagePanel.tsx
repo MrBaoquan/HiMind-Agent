@@ -22,7 +22,7 @@ const RANGE_OPTIONS: Array<{ key: AiUsageRange; label: string }> = [
 ];
 
 /**
- * 用量（ADR 0113）。只做本机网关这一条口径：读数、按日趋势、按工具构成。
+ * 用量（ADR 0113）。只做本机推理网关这一条口径：读数、按日趋势、按工具构成。
  * 平台口径留在工作台，不在 Agent 重复展示。
  */
 export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange, onRefresh, onBindGateway, bindBusy }: LocalUsagePanelProps) {
@@ -36,7 +36,7 @@ export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange,
         <div className="ai-usage-title">
           <Network size={16} aria-hidden="true" />
           <strong>用量</strong>
-          <span className="ai-usage-scope">本机网关</span>
+          <span className="ai-usage-scope">本机推理网关</span>
         </div>
         <div className="ai-usage-tools">
           <div className="ai-usage-segmented" role="group" aria-label="本机用量统计范围">
@@ -73,7 +73,7 @@ export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange,
     if (gatewayClients.length === 0) {
       return (
         <div className="ai-usage-notice neutral">
-          <span>还没有工具走本机网关</span>
+          <span>还没有工具走本机推理网关</span>
           <button type="button" className="btn" style={{ marginLeft: 'auto' }} disabled={bindBusy} onClick={onBindGateway}>
             {bindBusy ? <BusyIndicator size={14} /> : null}去配置
           </button>
@@ -131,12 +131,12 @@ export function LocalUsagePanel({ overview, gateway, range, busy, onRangeChange,
         <p
           className="ai-usage-footnote"
           title={[
-            '只统计经过本机网关的调用，不含金额（费用以服务商控制台为准）',
+            '只统计经过本机推理网关的调用；费用以服务商控制台为准',
             direct.length ? `直连未计入：${direct.join('、')}` : '',
             overview.usage_unreported ? `${overview.usage_unreported} 次调用上游未返回用量，只计入了次数` : '',
           ].filter(Boolean).join('；')}
         >
-          仅统计本机网关调用 · 不含费用{direct.length ? ` · ${direct.length} 个直连工具未计入` : ''}
+          仅统计本机推理网关调用 · 不含费用{direct.length ? ` · ${direct.length} 个直连工具未计入` : ''}
         </p>
       </>
     );

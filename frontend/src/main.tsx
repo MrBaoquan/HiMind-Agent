@@ -431,7 +431,7 @@ function AgentApp() {
     void refreshLocalUsage({ range, force: true });
   }
   /**
-   * P1 的最小入口：把 Codex 切到本机网关。真正的「服务 × 客户端」矩阵
+   * P1 的最小入口：把 Codex 切到本机推理网关。真正的「服务 × 客户端」矩阵
    * 属 P2（ADR 0113 分期），这里先让这条链路可用、可验证。
    */
   async function bindCodexToGateway() {
@@ -446,17 +446,17 @@ function AgentApp() {
   async function setClientBindingMode(target: string, mode: 'gateway' | 'direct', service?: string) {
     try {
       await agentApi.setProviderBindingMode(target, mode, service);
-      notify('success', mode === 'gateway' ? `${target} 已切换到本机网关` : `${target} 已切回直连`);
+      notify('success', mode === 'gateway' ? `${target} 已切换到本机推理网关` : `${target} 已切回直连`);
       await Promise.all([refreshInferenceGateway(), refreshAIServices(), refreshLocalUsage({ force: true })]);
     } catch (error) {
-      notify('error', formatError(error, mode === 'gateway' ? '切换到本机网关失败' : '切回直连失败'));
+      notify('error', formatError(error, mode === 'gateway' ? '切换到本机推理网关失败' : '切回直连失败'));
     }
   }
   async function refreshInferenceGateway() {
     try {
       setInferenceGateway(await agentApi.inferenceGatewayStatus());
     } catch (error) {
-      console.error('本机网关状态读取失败', error);
+      console.error('本机推理网关状态读取失败', error);
     }
   }
   /**
@@ -466,9 +466,25 @@ function AgentApp() {
     setGatewayBusy(true);
     try {
       setInferenceGateway(await agentApi.restartInferenceGateway());
-      notify('success', '本机网关已重启');
+      notify('success', '本机推理网关已重启');
     } catch (error) {
-      notify('error', formatError(error, '重启本机网关失败'));
+      notify('error', formatError(error, '重启本机推理网关失败'));
+      await refreshInferenceGateway();
+    } finally {
+      setGatewayBusy(false);
+    }
+  }
+  /**
+   * 改本机推理网关端口。有工具走网关时后端会拒绝：改端口必须同步改那些工具的
+   * 配置，目前只允许在没有网关绑定时改，以免留下指向死端口的客户端配置。
+   */
+  async function setGatewayPort(port: number) {
+    setGatewayBusy(true);
+    try {
+      setInferenceGateway(await agentApi.setInferenceGatewayPort(port));
+      notify('success', `本机推理网关已改用端口 ${port}`);
+    } catch (error) {
+      notify('error', formatError(error, '修改本机推理网关端口失败'));
       await refreshInferenceGateway();
     } finally {
       setGatewayBusy(false);
@@ -481,7 +497,7 @@ function AgentApp() {
   async function stopGatewayAndUnbind() {
     const affected = inferenceGateway?.gateway_clients.length ?? 0;
     const accepted = await confirm({
-      title: '停用本机网关？',
+      title: '停用本机推理网关？',
       description: affected
         ? `会把 ${affected} 个走网关的工具切回直连，然后停止监听。`
         : '当前没有工具走网关，将只停止监听。',
@@ -494,11 +510,11 @@ function AgentApp() {
       if (report.failures.length) {
         notify('error', `${report.failures.length} 个工具没能切回直连，网关保持运行`);
       } else {
-        notify('success', report.stopped ? '本机网关已停用' : '本机网关本来就没有运行');
+        notify('success', report.stopped ? '本机推理网关已停用' : '本机推理网关本来就没有运行');
       }
       await Promise.all([refreshInferenceGateway(), refreshAIServices(), refreshLocalUsage({ force: true })]);
     } catch (error) {
-      notify('error', formatError(error, '停用本机网关失败'));
+      notify('error', formatError(error, '停用本机推理网关失败'));
     } finally {
       setGatewayBusy(false);
     }
@@ -1958,6 +1974,7 @@ function AgentApp() {
       gatewayBusy={gatewayBusy}
       onRestartGateway={() => void restartGateway()}
       onStopGateway={() => void stopGatewayAndUnbind()}
+      onSetGatewayPort={setGatewayPort}
       acpProfiles={acpRuntimeProfiles}
       onOpenAccount={() => setPage('dashboard')}
       targets={mcpTargets}
