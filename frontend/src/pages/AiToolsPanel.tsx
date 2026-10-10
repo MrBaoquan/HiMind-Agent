@@ -179,6 +179,26 @@ export function AiToolsPanel({
 
       {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>工作台账号未连接</strong><span>不影响本机工具接入；需要工作台数据时再连接账号。</span></div><button className="btn" onClick={onOpenAccount}>连接账号</button></div> : null}
 
+      <details className={`ai-advanced ai-gateway-advanced${gatewayStatus?.running ? ' is-running' : ''}`}>
+        <summary>
+          <div className="ai-gateway-advanced-dot"><span className={`status-dot ${gatewayStatus?.running ? 'success' : ''}`} aria-hidden="true" /></div>
+          <span>
+            <strong>本机推理网关</strong>
+            <small>{gatewayStatus?.running ? `运行中 · ${gatewayStatus.url} · ${gatewayClients.length} 个工具经此转发` : gatewayStatus?.last_error || '未启动'}</small>
+          </span>
+        </summary>
+        <div className="ai-gateway-advanced-body">
+          <label className="ai-gateway-port" title={gatewayPortEditable ? '端口是写进各 AI 工具配置的地址，改动会重启本机推理网关' : '有工具走网关时不能改端口：请先把这些工具切回直连'}>
+            <span>端口</span>
+            <input type="number" min={1} max={65535} inputMode="numeric" value={portDraft} disabled={gatewayBusy || !gatewayPortEditable} onChange={(event) => setPortDraft(event.target.value)} />
+          </label>
+          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy || !gatewayPortEditable || !portChanged} onClick={() => void onSetGatewayPort(parsedPort)}>应用端口</button>
+          {gatewayPortEditable ? null : <span className="ai-gateway-port-note">有工具走网关，端口已锁定</span>}
+          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy} aria-busy={gatewayBusy} onClick={onRestartGateway}>{gatewayBusy ? <BusyIndicator size={11} /> : null}重启</button>
+          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy || !gatewayStatus?.running} onClick={onStopGateway}>停用</button>
+        </div>
+      </details>
+
       <section className="ai-client-section">
         <div className="ai-section-heading">
           <div><h3>工具</h3><span>展开任一工具，管理它的接入、模型与执行接线。</span></div>
@@ -230,26 +250,6 @@ export function AiToolsPanel({
           ) : null}
         </div>
       </section>
-
-      <details className="ai-advanced ai-gateway-advanced">
-        <summary>
-          <div className="ai-gateway-advanced-dot"><span className={`status-dot ${gatewayStatus?.running ? 'success' : ''}`} aria-hidden="true" /></div>
-          <span>
-            <strong>本机推理网关</strong>
-            <small>{gatewayStatus?.running ? `${gatewayStatus.url} · 走网关 ${gatewayClients.length}` : gatewayStatus?.last_error || '未启动'}</small>
-          </span>
-        </summary>
-        <div className="ai-gateway-advanced-body">
-          <label className="ai-gateway-port" title={gatewayPortEditable ? '端口是写进各 AI 工具配置的地址，改动会重启本机推理网关' : '有工具走网关时不能改端口：请先把这些工具切回直连'}>
-            <span>端口</span>
-            <input type="number" min={1} max={65535} inputMode="numeric" value={portDraft} disabled={gatewayBusy || !gatewayPortEditable} onChange={(event) => setPortDraft(event.target.value)} />
-          </label>
-          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy || !gatewayPortEditable || !portChanged} onClick={() => void onSetGatewayPort(parsedPort)}>应用端口</button>
-          {gatewayPortEditable ? null : <span className="ai-gateway-port-note">有工具走网关，端口已锁定</span>}
-          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy} aria-busy={gatewayBusy} onClick={onRestartGateway}>{gatewayBusy ? <BusyIndicator size={11} /> : null}重启</button>
-          <button type="button" className="btn ai-service-tool-btn" disabled={gatewayBusy || !gatewayStatus?.running} onClick={onStopGateway}>停用</button>
-        </div>
-      </details>
 
       {undetected.length ? (
         <details className="ai-unavailable">

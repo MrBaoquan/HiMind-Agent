@@ -3825,6 +3825,9 @@ tr:last-child td { border-bottom: 0; }
 .ai-tool-source-select { min-height: 28px; max-width: 220px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); background: var(--surface); font-size: 12px; }
 .ai-gateway-advanced-dot { display: grid; place-items: center; }
 .ai-gateway-advanced-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); }
+/* 本机推理网关是「工具 → 模型」的共享上游，不是列表的脚注：运行中给它一块独立的淡色底，
+   与「未检测到 / 连接诊断」的普通折叠区分开。 */
+.ai-gateway-advanced.is-running { border-color: var(--primary-border); background: var(--primary-soft); }
 /* 破坏性操作收进独立折叠：不再和「接入全部 / 检查连接」并排，避免误点。 */
 .ai-danger-advanced > summary svg { color: var(--danger-strong, #b91c1c); }
 .ai-danger-advanced > summary strong { color: var(--danger-strong, #b91c1c); }
