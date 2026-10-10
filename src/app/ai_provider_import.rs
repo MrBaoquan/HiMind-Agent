@@ -28,6 +28,12 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const MANAGED_VENDOR: &str = "HiMind";
 const CC_SWITCH_PROVIDER_ID: &str = "himind-codex";
 const CODEX_HIMIND_MODELS_FILE: &str = "himind-models.json";
+// Codex 原生 /responses 第三方网关的目录条目以 cc-switch 的
+// `codex_native_responses_template.json` 为对齐基准：中性身份指令 + shell_type
+// 走 shell_command（不声明 freeform apply_patch，原生网关可能拒收该自定义工具）。
+// 取 cc-switch 的原文，避免自带一段会随 Codex 版本过时的系统提示词。
+const CODEX_NATIVE_BASE_INSTRUCTIONS: &str =
+    "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.";
 const CODEX_PROVIDER_ID: &str = "himind";
 const KIMI_CODE_PROVIDER_ID: &str = "himind";
 const KIMI_CODE_HIMIND_PREFIX: &str = "himind/";
@@ -1640,6 +1646,18 @@ fn import_codex(
     })
 }
 
+// 生成 Codex 直连（wire_api="responses"）的模型目录。条目形状对齐 cc-switch 的
+// `codex_native_responses_template.json`（其把 /responses 第三方网关归为
+// NativeResponses 档，用的就是这份中性模板）：
+//  * 每行必带 `base_instructions`（中性身份指令）。Codex 0.150 起目录解析器把
+//    「base_instructions 或 model_messages.instructions_template 至少其一」视为必需，
+//    整份目录缺指令会让解析直接失败、客户端拒绝启动；空串虽能解析，但模型会丢失
+//    Codex 默认行为，故用 cc-switch 的中性原文。
+//  * 必带 `experimental_supported_tools`（Codex 0.150 起为解析必需字段，空数组即可）
+//    与 `supports_reasoning_summaries` / `supports_parallel_tool_calls`。
+//  * 原生网关可能拒收 Codex 的 freeform `apply_patch`（type=="custom"）工具，故不声明
+//    `apply_patch_tool_type` / `web_search_tool_type` / `model_messages`，编辑改由
+//    `shell_type="shell_command"` 承担。这些结论与 cc-switch 完全一致。
 fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> {
     let mut catalog = Vec::new();
     for (index, model) in models.iter().enumerate() {
@@ -1652,36 +1670,30 @@ fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> 
             "slug": model,
             "display_name": display,
             "description": "HiMind 网关模型",
-            "context_window": 1048576,
-            "max_context_window": 1048576,
-            "effective_context_window_percent": 95,
-            "input_modalities": ["text"],
-            "supports_parallel_tool_calls": true,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text",
-            "supports_search_tool": true,
+            "base_instructions": CODEX_NATIVE_BASE_INSTRUCTIONS,
             "default_reasoning_level": "high",
             "supported_reasoning_levels": [
                 {"effort": "low", "description": "Fast responses with lighter reasoning"},
-                {"effort": "high", "description": "Extra high reasoning depth for complex problems"},
+                {"effort": "high", "description": "Greater reasoning depth for complex problems"},
                 {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"}
             ],
-            "default_verbosity": "low",
-            "support_verbosity": true,
-            "priority": (index + 1) as i64,
+            "shell_type": "shell_command",
             "visibility": "list",
-            "minimal_client_version": "0.144.0",
             "supported_in_api": true,
-            "truncation_policy": {"mode": "tokens", "limit": 10000},
-            // Codex 0.150 的模型目录把 comp_hash 当字符串读；写成整数会让整个
-            // 目录解析失败，客户端直接拒绝启动。
-            "comp_hash": "3000",
-            "multi_agent_version": "v2",
-            "use_responses_lite": false,
+            "priority": (index + 1) as i64,
             "supports_reasoning_summaries": true,
-            "reasoning_summary_format": "experimental",
             "default_reasoning_summary": "none",
-            "shell_type": "shell_command"
+            "support_verbosity": false,
+            "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "supports_parallel_tool_calls": false,
+            "supports_image_detail_original": false,
+            "context_window": 1048576,
+            "max_context_window": 1048576,
+            "effective_context_window_percent": 95,
+            // Codex 0.150 的目录解析器要求该字段存在（空数组即可）。
+            "experimental_supported_tools": [],
+            "input_modalities": ["text"],
+            "supports_search_tool": false
         }));
     }
     Ok(serde_json::to_string_pretty(&json!({ "models": catalog }))?)
@@ -7634,6 +7646,44 @@ mod tests {
             models[0].get("visibility").and_then(Value::as_str),
             Some("list")
         );
+        // cc-switch 原生 /responses 模板的必需品：缺 `base_instructions` 或
+        // `experimental_supported_tools` 会让 Codex 0.150 拒绝整份目录、客户端起不来。
+        for model in models {
+            assert!(
+                model
+                    .get("base_instructions")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "each entry needs a non-empty base_instructions"
+            );
+            assert!(
+                model
+                    .get("experimental_supported_tools")
+                    .and_then(Value::as_array)
+                    .is_some(),
+                "each entry needs experimental_supported_tools"
+            );
+            assert_eq!(
+                model
+                    .get("supports_reasoning_summaries")
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            assert_eq!(
+                model
+                    .get("supports_parallel_tool_calls")
+                    .and_then(Value::as_bool),
+                Some(false)
+            );
+            assert_eq!(
+                model.get("shell_type").and_then(Value::as_str),
+                Some("shell_command")
+            );
+            // 原生网关可能拒收 freeform apply_patch，故不声明自由格式工具键。
+            assert!(model.get("apply_patch_tool_type").is_none());
+            assert!(model.get("web_search_tool_type").is_none());
+            assert!(model.get("model_messages").is_none());
+        }
     }
 
     #[test]
