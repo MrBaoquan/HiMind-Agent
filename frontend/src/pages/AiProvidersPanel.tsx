@@ -266,7 +266,7 @@ export function AiProvidersPanel({
             {customServices.map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
           </select>
           {settingActive ? <BusyIndicator size={13} /> : null}
-          <span className="ai-service-route-hint">只影响 HiMind 自己的对话，分发到工具在「本机工具」里做。</span>
+          <span className="ai-service-route-hint">只影响 HiMind 自己的对话，分发到工具在「工具接入」里做。</span>
         </div>
       ) : null}
 

@@ -1,4 +1,4 @@
-// 「本机工具」的信息架构：把三份注册表（MCP 目标 / 模型分发客户端 / ACP 执行器）
+// 「工具接入」的信息架构：把三份注册表（MCP 目标 / 模型分发客户端 / ACP 执行器）
 // 按工具身份合并成一行，每个工具在同屏里管好自己的全部接线。
 //
 // 为什么不把这个合并做进后端：三份清单分别由 MCP 探测、供应商簿记、ACP 登记产生，
@@ -124,7 +124,7 @@ export function buildToolConnections(input: {
 
 /** 模型来源的展示名：把簿记里的 `managed` / `custom:<id>` / 空值翻成人话。 */
 export function modelSourceLabel(service: string | undefined | null, services: CustomAIService[], managed: ManagedAIServiceSummary): string {
-  if (!service) return '来源不明';
+  if (!service) return '未知来源';
   if (service === 'managed') return managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
   if (service.startsWith('custom:')) {
     const id = service.slice('custom:'.length);

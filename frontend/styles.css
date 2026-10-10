@@ -3825,6 +3825,10 @@ tr:last-child td { border-bottom: 0; }
 .ai-tool-source-select { min-height: 28px; max-width: 220px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); background: var(--surface); font-size: 12px; }
 .ai-gateway-advanced-dot { display: grid; place-items: center; }
 .ai-gateway-advanced-body { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); }
+/* 破坏性操作收进独立折叠：不再和「接入全部 / 检查连接」并排，避免误点。 */
+.ai-danger-advanced > summary svg { color: var(--danger-strong, #b91c1c); }
+.ai-danger-advanced > summary strong { color: var(--danger-strong, #b91c1c); }
+.ai-danger-note { color: var(--text-muted); font-size: 12px; }
 @media (max-width: 820px) {
   .ai-tool-wire { grid-template-columns: minmax(0, 1fr) auto; }
   .ai-tool-wire-kind { grid-column: 1 / -1; }

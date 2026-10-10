@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type KeyboardEvent } from 'react';
 import { PageHeader } from '../components/Common';
 import { AcpProfilesPanel } from './AcpProfilesPanel';
 import { AiToolsPanel } from './AiToolsPanel';
@@ -61,10 +61,15 @@ type AiConnectionsPageProps = {
 
 /**
  * AI 连接按「用户要做什么」分三个 tab，而不是按 HiMind 的内部子系统分。
- * 同一个工具只在「本机工具」里出现一次：展开即见它的接入（MCP）、模型、执行三条接线。
+ * 同一个工具只在「工具接入」里出现一次：展开即见它的接入（MCP）、模型、执行三条接线。
  * 模型「来源」单独成页只管定义与对话默认；执行环境保留原样。
- * tab id 保持稳定，外部脚本与深链依赖它（initialTab 的 mcp / services / acp 键不变）。
+ * tab id 保持稳定，外部脚本与深链依赖它（initialTab 的 mcp / services / acp 键不变）；
+ * 第一个 tab 对外叫「工具接入」，避开左栏「本机工具与技能」的同词撞车。
  */
+const TAB_ORDER = ['mcp', 'services', 'acp'] as const;
+type AiTab = (typeof TAB_ORDER)[number];
+const TAB_LABELS: Record<AiTab, string> = { mcp: '工具接入', services: '模型来源', acp: '执行环境' };
+
 export function AiConnectionsPage({
   initialTab = 'mcp',
   identity,
@@ -106,24 +111,50 @@ export function AiConnectionsPage({
     setActiveTab(initialTab);
   }, [initialTab]);
 
+  // WAI-ARIA tabs 键盘约定：左右/上下键循环、Home/End 跳首尾，焦点跟着切换走。
+  const selectTab = (index: number) => {
+    const next = TAB_ORDER[(index + TAB_ORDER.length) % TAB_ORDER.length];
+    setActiveTab(next);
+    requestAnimationFrame(() => document.getElementById(`ai-tab-${next}`)?.focus());
+  };
+  const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { event.preventDefault(); selectTab(index + 1); }
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') { event.preventDefault(); selectTab(index - 1); }
+    else if (event.key === 'Home') { event.preventDefault(); selectTab(0); }
+    else if (event.key === 'End') { event.preventDefault(); selectTab(TAB_ORDER.length - 1); }
+  };
+
   return (
     <div className="ai-page">
       <PageHeader title="AI 连接" />
 
       <div className="ai-tabs" role="tablist" aria-label="AI 连接分类">
-        <button type="button" id="ai-tab-mcp" role="tab" aria-selected={activeTab === 'mcp'} aria-controls="ai-panel-mcp" className={`ai-tab${activeTab === 'mcp' ? ' active' : ''}`} onClick={() => setActiveTab('mcp')}>本机工具</button>
-        <button type="button" id="ai-tab-services" role="tab" aria-selected={activeTab === 'services'} aria-controls="ai-panel-services" className={`ai-tab${activeTab === 'services' ? ' active' : ''}`} onClick={() => setActiveTab('services')}>模型来源</button>
-        <button type="button" id="ai-tab-acp" role="tab" aria-selected={activeTab === 'acp'} aria-controls="ai-panel-acp" className={`ai-tab${activeTab === 'acp' ? ' active' : ''}`} onClick={() => setActiveTab('acp')}>执行环境</button>
+        {TAB_ORDER.map((tab, index) => (
+          <button
+            key={tab}
+            type="button"
+            id={`ai-tab-${tab}`}
+            role="tab"
+            aria-selected={activeTab === tab}
+            aria-controls={`ai-panel-${tab}`}
+            tabIndex={activeTab === tab ? 0 : -1}
+            className={`ai-tab${activeTab === tab ? ' active' : ''}`}
+            onClick={() => setActiveTab(tab)}
+            onKeyDown={(event) => onTabKeyDown(event, index)}
+          >{TAB_LABELS[tab]}</button>
+        ))}
       </div>
 
       {activeTab === 'acp' ? (
-        <AcpProfilesPanel
-          snapshot={acpProfiles}
-          busyAction={busyAction}
-          onSave={onSaveAcpProfile}
-          onSetEnabled={onSetAcpProfileEnabled}
-          onRemove={onRemoveAcpProfile}
-        />
+        <div id="ai-panel-acp" role="tabpanel" aria-labelledby="ai-tab-acp">
+          <AcpProfilesPanel
+            snapshot={acpProfiles}
+            busyAction={busyAction}
+            onSave={onSaveAcpProfile}
+            onSetEnabled={onSetAcpProfileEnabled}
+            onRemove={onRemoveAcpProfile}
+          />
+        </div>
       ) : activeTab === 'services' ? (
         <div id="ai-panel-services" role="tabpanel" aria-labelledby="ai-tab-services">
           <AiProvidersPanel

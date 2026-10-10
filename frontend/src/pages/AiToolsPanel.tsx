@@ -105,10 +105,10 @@ export function AiToolsPanel({
 
   const visible = filter === 'attention' ? attention : filter === 'ready' ? ready : filter === 'idle' ? idle : detected;
 
-  const headline = attention.length ? `${attention.length} 个工具待处理` : '本机工具已就绪';
+  const headline = attention.length ? `${attention.length} 个工具待处理` : '工具已就绪';
   const headlineDescription = attention.length
     ? '接入、模型、执行在这里一次管好。'
-    : '所有本机工具都已完成接线。';
+    : '接入、模型、执行都已接好。';
 
   const gatewayPortEditable = gatewayClients.length === 0;
   const [portDraft, setPortDraft] = useState('');
@@ -148,12 +148,12 @@ export function AiToolsPanel({
         <div className="ai-overview-main">
           <div className="ai-overview-icon">{attention.length ? <CircleAlert size={20} /> : <ShieldCheck size={20} />}</div>
           <div className="ai-overview-copy">
-            <span className="ai-overview-eyebrow">本机工具</span>
+            <span className="ai-overview-eyebrow">工具接入</span>
             <strong>{headline}</strong>
             <span>{headlineDescription}</span>
           </div>
         </div>
-        <div className="ai-overview-stats" aria-label="本机工具统计">
+        <div className="ai-overview-stats" aria-label="工具接入统计">
           <div><span>已就绪</span><strong>{ready.length}</strong></div>
           <div><span>待处理</span><strong className={attention.length ? 'warning-text' : ''}>{attention.length}</strong></div>
           <div><span>未接入</span><strong>{idle.length}</strong></div>
@@ -163,8 +163,7 @@ export function AiToolsPanel({
           <button className="btn btn-primary" disabled={Boolean(busyAction) || !actionable.length} onClick={onApplyAll}>
             <PlugZap size={15} />{busyAction === 'apply-all' ? '接入中' : actionable.length ? '接入全部' : '已接入'}
           </button>
-          <button className="btn btn-quiet" disabled={Boolean(busyAction)} onClick={onTest}><Activity size={15} />检查连接</button>
-          <button className="btn btn-quiet" disabled={Boolean(busyAction)} onClick={() => { void confirm({ title: '断开全部 MCP 接入？', description: '会移除所有 AI 工具里的 HiMind MCP 注册。', confirmText: '全部断开' }).then((accepted) => { if (accepted) onRemoveAll(); }); }}><Unplug size={15} />全部断开</button>
+          <button className="btn btn-quiet" disabled={Boolean(busyAction)} onClick={onTest}>{busyAction === 'test' ? <BusyIndicator size={13} /> : <Activity size={15} />}{busyAction === 'test' ? '检查中' : '检查连接'}</button>
         </div>
       </section>
 
@@ -287,6 +286,16 @@ export function AiToolsPanel({
                 {target.config_directory ? <div className="ai-diagnostic-actions"><button className="btn btn-icon" title="打开配置目录" aria-label={`打开 ${target.name} 配置目录`} onClick={() => onOpenDirectory(target.config_directory)}><FolderOpen size={15} /></button></div> : null}
               </div>;
             })}
+          </div>
+        </details>
+      ) : null}
+
+      {targets.some((target) => target.state === 'configured') ? (
+        <details className="ai-advanced ai-danger-advanced">
+          <summary><Unplug size={16} /><span><strong>断开全部接入</strong><small>移除所有 AI 工具里的 HiMind MCP 注册</small></span></summary>
+          <div className="ai-gateway-advanced-body">
+            <button type="button" className="btn btn-danger-quiet ai-service-tool-btn" disabled={Boolean(busyAction)} onClick={() => { void confirm({ title: '断开全部 MCP 接入？', description: '会移除所有 AI 工具里的 HiMind MCP 注册。', confirmText: '全部断开' }).then((accepted) => { if (accepted) onRemoveAll(); }); }}><Unplug size={15} />全部断开</button>
+            <span className="ai-danger-note">只移除 HiMind 写入的注册，各工具自己的配置保留。</span>
           </div>
         </details>
       ) : null}
@@ -448,9 +457,9 @@ function ToolRow(props: {
               <span className="ai-tool-wire-state">
                 {modelImported ? <>
                   <span className={`status-dot ${gatewayMode ? 'warn' : 'success'}`} />
-                  <select className="ai-service-route-select ai-tool-source-select" aria-label={`${item.name} 的模型来源`} value={item.model?.service ?? ''} disabled={rowBusy} onChange={(event) => void changeSource(event.target.value)}>
+                  <select className="ai-service-route-select ai-tool-source-select" aria-label={`${item.name} 的模型来源`} title={sourceOptions.some((option) => option.value === (item.model?.service ?? '')) ? undefined : '当前绑定的来源没有记录，可在这里重新选择'} value={item.model?.service ?? ''} disabled={rowBusy} onChange={(event) => void changeSource(event.target.value)}>
                     {sourceOptions.map((option) => <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>)}
-                    {sourceOptions.some((option) => option.value === (item.model?.service ?? '')) ? null : <option value={item.model?.service ?? ''}>来源不明</option>}
+                    {sourceOptions.some((option) => option.value === (item.model?.service ?? '')) ? null : <option value={item.model?.service ?? ''}>未知来源</option>}
                   </select>
                   <span className="muted">· {gatewayMode ? '经本机网关' : '直连'}</span>
                 </> : <>
