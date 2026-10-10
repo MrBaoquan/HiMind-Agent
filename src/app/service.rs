@@ -1122,7 +1122,7 @@ fn handle_local_http(
             match gateway.invoke(
                 &context,
                 "ai.client.import",
-                json!({ "target": payload.target.clone(), "service": payload.service_source() }),
+                json!({ "target": payload.target.clone(), "service": payload.service_source(), "replace": payload.replace }),
             ) {
                 Ok(value) => write_local_response(
                     &mut stream,
