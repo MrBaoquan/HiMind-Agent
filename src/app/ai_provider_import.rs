@@ -19,7 +19,7 @@ use url::Url;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::api::ai::{fetch_client_credential, AIClientCredential};
+use crate::api::ai::{fetch_client_credential, fetch_managed_service_revision, AIClientCredential};
 use crate::app::ai_clients::{backup_and_write, workbuddy_executable_exists};
 use crate::Options;
 
@@ -523,6 +523,11 @@ struct AIProviderImportBinding {
     /// ADR 0114：最近一次写入后复核得到的验证等级，供状态检测回显。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     verification_status: String,
+    /// ADR 0118：写入时源凭据的修订号（`managed` 为 `updated_at|rotated_at`，
+    /// `custom:<id>` 为服务 `updated_at`）。客户端持有的凭据与当前接入来源修订号
+    /// 不一致，即说明 Key 已轮换或来源已切换，注册已过期。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    service_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -549,6 +554,10 @@ pub(crate) struct AIProviderImportStatus {
     /// 无法证明「已加载」时，UI 用它区分「文件已写入」与「客户端已加载」。
     #[serde(skip_serializing_if = "String::is_empty")]
     pub verification_status: String,
+    /// ADR 0118：该客户端注册时源凭据的修订号（来自簿记）。工作台用它判断客户端
+    /// 持有的凭据是否仍是当前接入来源（Key 轮换 / 来源切换后应显示为待同步）。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service_revision: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -852,6 +861,7 @@ pub(crate) fn import(
             updated_at: now_rfc3339(),
             restore: snapshot,
             verification_status,
+            service_revision: resolve_service_revision(options, expected_user_id, service_source),
         },
     );
     save_import_bindings(options, &bindings)?;
@@ -1027,6 +1037,7 @@ pub(crate) fn enable_gateway_binding(
                 .get(target)
                 .and_then(|binding| binding.restore.clone()),
             verification_status,
+            service_revision: resolve_service_revision(options, expected_user_id, &service_source),
         },
     );
     save_import_bindings(options, &bindings)?;
@@ -1271,6 +1282,7 @@ pub(crate) fn status(options: &Options) -> AIProviderImportStatusOverview {
                     if let Some(binding) = bindings.clients.get(status.target.as_str()) {
                         status.service = binding.service.clone();
                         status.verification_status = binding.verification_status.clone();
+                        status.service_revision = binding.service_revision.clone();
                         // 客户端自己不记时间时，用簿记时间兜底，UI 才能显示「最近同步」。
                         if status.synced_at.is_empty() {
                             status.synced_at = binding.updated_at.clone();
@@ -1340,6 +1352,25 @@ fn resolve_credential(
         protocol: custom.protocol.as_str().to_string(),
     };
     Ok(AIClientCredential { access, api_key })
+}
+
+/// ADR 0118：解析服务源当前的修订号，供工作台判断客户端持有的凭据是否已过期。
+///
+/// `managed` 取 Dashboard `/api/integrations/ai/access` 的 `updated_at|rotated_at`
+/// （与工作台 `activeServiceRevision` 同源）；`custom:<id>` 取本机服务的 `updated_at`。
+/// 任一步失败都返回空串——空修订号等于退回「不参与对账」的旧行为，绝不把读取失败
+/// 误判成不同步。
+fn resolve_service_revision(options: &Options, expected_user_id: &str, service: &str) -> String {
+    let service = service.trim();
+    if service.is_empty() || service == "managed" {
+        return fetch_managed_service_revision(options, expected_user_id).unwrap_or_default();
+    }
+    let Some(custom_id) = service.strip_prefix("custom:") else {
+        return String::new();
+    };
+    crate::store::ai_services::load_secret(custom_id)
+        .map(|(custom, _)| custom.updated_at)
+        .unwrap_or_default()
 }
 
 fn import_vscode(
@@ -7192,6 +7223,7 @@ mod tests {
                 updated_at: String::new(),
                 restore: None,
                 verification_status: String::new(),
+                service_revision: String::new(),
             },
         );
         super::save_import_bindings(&options, &bindings).unwrap();

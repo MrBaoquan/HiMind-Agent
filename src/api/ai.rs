@@ -323,6 +323,36 @@ pub(crate) fn fetch_client_credential(
     })
 }
 
+/// ADR 0118：读取当前 managed 接入的来源修订号（`updated_at|rotated_at`），
+/// 与工作台「我的接入」用于判断同步态的 `activeServiceRevision` 同源。
+///
+/// 只读、不领取密钥；未授权、用户不一致、未生成凭据或请求失败都返回空串，
+/// 由调用方退回到「不参与对账」的旧行为，绝不把读取失败当作不同步。
+pub(crate) fn fetch_managed_service_revision(
+    options: &Options,
+    expected_user_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    let delegated = platform_access_token(options, AI_CONVERSATION_SCOPE)?;
+    if delegated.user_id.trim() != expected_user_id.trim() {
+        return Ok(String::new());
+    }
+    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let response = client
+        .get(format!("{}/api/integrations/ai/access", options.api_base()))
+        .bearer_auth(&delegated.token)
+        .header("X-HiMind-Agent-ID", &delegated.agent_id)
+        .header("X-HiMind-AI-Client", "ai-service-revision")
+        .send()?;
+    if !response.status().is_success() {
+        return Ok(String::new());
+    }
+    let access = response.json::<AIUserAccess>()?;
+    Ok(match access.credential {
+        Some(credential) => format!("{}|{}", credential.updated_at, credential.rotated_at),
+        None => String::new(),
+    })
+}
+
 /// Dashboard 分发的个人 AI 服务摘要（只读，不领取 API Key）。
 ///
 /// 用于 `ai.service.list` 的 managed 摘要与 Agent「AI 服务」页展示；
