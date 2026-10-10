@@ -536,6 +536,23 @@ struct AIProviderImportBindings {
     clients: HashMap<String, AIProviderImportBinding>,
 }
 
+/// ADR 0118 P1b：心跳上报的客户端注册事实投影。只带「登记了什么」，不带任何凭据；
+/// 工作台在没有 loopback 通道时据此只读展示本机客户端，事实态不再依赖同机可达。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AIClientBindingReport {
+    pub target: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub verification_status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service_revision: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub synced_at: String,
+}
+
 #[derive(Debug, Serialize, Default)]
 pub(crate) struct AIProviderImportStatus {
     pub target: String,
@@ -914,6 +931,29 @@ fn load_import_bindings(options: &Options) -> AIProviderImportBindings {
         .ok()
         .and_then(|content| serde_json::from_slice(&content).ok())
         .unwrap_or_default()
+}
+
+/// ADR 0118 P1b：把簿记投影成心跳上报的客户端注册事实（不含凭据）。
+/// 工作台在没有 loopback 通道时据此只读展示「本机登记了哪些客户端」，
+/// 让事实态不再依赖工作台与本机 Agent 同机可达。失败退化为空数组，
+/// 不会因为读不到簿记就让心跳失败。
+pub(crate) fn heartbeat_ai_client_bindings(options: &Options) -> Value {
+    let bindings = load_import_bindings(options);
+    let mut reports: Vec<AIClientBindingReport> = bindings
+        .clients
+        .into_iter()
+        .filter(|(target, _)| !target.trim().is_empty())
+        .map(|(target, binding)| AIClientBindingReport {
+            target,
+            service: binding.service,
+            mode: binding.mode,
+            verification_status: binding.verification_status,
+            service_revision: binding.service_revision,
+            synced_at: binding.updated_at,
+        })
+        .collect();
+    reports.sort_by(|a, b| a.target.cmp(&b.target));
+    serde_json::to_value(reports).unwrap_or_else(|_| Value::Array(Vec::new()))
 }
 
 fn save_import_bindings(
@@ -7236,6 +7276,90 @@ mod tests {
         );
         // 注册来源不明的客户端没有指向这个服务，不阻止删除。
         assert!(super::ensure_service_not_in_use(&options, "free").is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+    }
+
+    /// ADR 0118 P1b：心跳上报的客户端注册事实必须是「只读投影」——按 target 排序、
+    /// 剔除空 target、携带 service/mode/verification_status/service_revision/synced_at，
+    /// 且绝不包含任何凭据字段。
+    #[test]
+    fn heartbeat_ai_client_bindings_projects_registry_without_secrets() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-ai-heartbeat-bindings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+
+        let options = crate::Options::from_env();
+        let mut bindings = super::AIProviderImportBindings::default();
+        bindings.clients.insert(
+            "codex".to_string(),
+            super::AIProviderImportBinding {
+                service: "managed".to_string(),
+                mode: "gateway".to_string(),
+                gateway: Some(super::AIProviderGatewayBinding {
+                    token_protected: "opaque-token".to_string(),
+                    base_url: "http://127.0.0.1:18150".to_string(),
+                    api_key_protected: "opaque-key".to_string(),
+                    protocol: "openai-chat".to_string(),
+                    models: vec!["himind-gateway".to_string()],
+                    default_model: "himind-gateway".to_string(),
+                }),
+                updated_at: "2026-10-10T00:00:00Z".to_string(),
+                restore: None,
+                verification_status: "client_load_verified".to_string(),
+                service_revision: "2026-10-09T00:00:00Z|".to_string(),
+            },
+        );
+        bindings.clients.insert(
+            "aider".to_string(),
+            super::AIProviderImportBinding {
+                service: "custom:local".to_string(),
+                mode: String::new(),
+                gateway: None,
+                updated_at: "2026-10-08T00:00:00Z".to_string(),
+                restore: None,
+                verification_status: "file_verified".to_string(),
+                service_revision: "2026-10-08T00:00:00Z".to_string(),
+            },
+        );
+        // 空 target 不应出现在上报里。
+        bindings.clients.insert(
+            "  ".to_string(),
+            super::AIProviderImportBinding::default(),
+        );
+        super::save_import_bindings(&options, &bindings).unwrap();
+
+        let report = super::heartbeat_ai_client_bindings(&options);
+        let array = report.as_array().expect("report must be a JSON array");
+        assert_eq!(array.len(), 2, "empty target must be dropped: {report}");
+        assert_eq!(array[0]["target"], "aider");
+        assert_eq!(array[0]["service"], "custom:local");
+        assert_eq!(array[0]["verification_status"], "file_verified");
+        assert_eq!(array[0]["service_revision"], "2026-10-08T00:00:00Z");
+        assert_eq!(array[1]["target"], "codex");
+        assert_eq!(array[1]["mode"], "gateway");
+        assert_eq!(array[1]["service_revision"], "2026-10-09T00:00:00Z|");
+        assert_eq!(array[1]["synced_at"], "2026-10-10T00:00:00Z");
+        let rendered = report.to_string();
+        assert!(
+            !rendered.contains("opaque-token")
+                && !rendered.contains("opaque-key")
+                && !rendered.contains("base_url"),
+            "heartbeat projection must never leak gateway credentials: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         match previous_home {

@@ -393,7 +393,7 @@ pub fn heartbeat(
     agent_id: &str,
     credential: &str,
 ) -> Result<bool, Box<dyn Error>> {
-    heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None, None)
+    heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None, None, None)
 }
 
 pub fn heartbeat_with_runtime_installations(
@@ -404,6 +404,7 @@ pub fn heartbeat_with_runtime_installations(
     runtime_installations: Option<&[RuntimeInstallationReport]>,
     remote_execution: Option<&RemoteExecutionReport>,
     svn_username: Option<&str>,
+    ai_client_bindings: Option<&serde_json::Value>,
 ) -> Result<bool, Box<dyn Error>> {
     let mut payload = json!({
         "agent_id": agent_id,
@@ -419,6 +420,10 @@ pub fn heartbeat_with_runtime_installations(
     }
     if let Some(settings) = remote_execution {
         payload["remote_execution"] = serde_json::to_value(settings)?;
+    }
+    // ADR 0118：本机客户端注册事实。Dashboard 只读存储并回显，Agent 仍是唯一写入者。
+    if let Some(bindings) = ai_client_bindings {
+        payload["ai_client_bindings"] = bindings.clone();
     }
     let response = client
         .post(format!("{}/api/agent/heartbeat", api_base))

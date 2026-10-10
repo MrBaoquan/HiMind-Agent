@@ -229,6 +229,9 @@ pub(crate) fn run_loop(
                 runtime_installations = crate::runtime::probe_installations();
                 last_runtime_probe = Instant::now();
             }
+            // ADR 0118：每次心跳带上本机客户端注册事实（读簿记，不含凭据）。
+            let ai_client_bindings =
+                crate::app::ai_provider_import::heartbeat_ai_client_bindings(&heartbeat_options);
             match heartbeat_with_runtime_installations(
                 &heartbeat_client,
                 &heartbeat_options.api_base(),
@@ -237,6 +240,7 @@ pub(crate) fn run_loop(
                 Some(&runtime_installations),
                 Some(&remote_execution),
                 crate::svn::service::local_svn_username().as_deref(),
+                Some(&ai_client_bindings),
             ) {
                 Ok(true) => {
                     heartbeat_failures = 0;
