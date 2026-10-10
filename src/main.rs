@@ -100,24 +100,53 @@ pub(crate) struct PluginViewLaunch {
 
 const AGENT_PROTOCOL_SCHEME: &str = "himind-agent";
 
-fn protocol_open_requested(args: &[String]) -> bool {
-    let Some(index) = args.iter().position(|value| value == "--protocol-url") else {
-        return false;
-    };
-    let Some(value) = args.get(index + 1) else {
-        return false;
-    };
-    let Ok(url) = url::Url::parse(value) else {
-        return false;
-    };
-    url.scheme() == AGENT_PROTOCOL_SCHEME
-        && url.host_str() == Some("open")
-        && (url.path().is_empty() || url.path() == "/")
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.port().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
+/// 深链 `himind-agent://open?...` 携带的落点。写通道②（工作台在 Agent 不可达
+/// 时经 `himind-agent://` 唤起工具中心）只使用下方「精确枚举」的值，见 ADR 0118。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentOpenTarget {
+    /// 纯唤起：只把主窗口带到前台（历史行为）。
+    Main,
+    /// 唤起并把设置窗口开到「AI 连接」面板，供用户在本机完成注册。
+    SettingsAi,
+}
+
+impl AgentOpenTarget {
+    /// `open` 查询参数的枚举值到落点的映射；未知名返回 `None` 由调用方拒绝。
+    fn from_query(value: &str) -> Option<Self> {
+        match value {
+            "ai" => Some(AgentOpenTarget::SettingsAi),
+            _ => None,
+        }
+    }
+}
+
+/// 解析 `--protocol-url himind-agent://open[?open=<枚举>]`。
+///
+/// 只认「精确枚举」：主机必须是 `open`、路径为空、无用户名/端口/片段，查询串
+/// 里也只允许一个受白名单约束的 `open` 键。其余一律拒绝，避免深链退化成能从
+/// 浏览器触发任意动作的命令通道（ADR 0118）。
+fn parse_protocol_open(args: &[String]) -> Option<AgentOpenTarget> {
+    let index = args.iter().position(|value| value == "--protocol-url")?;
+    let value = args.get(index + 1)?;
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != AGENT_PROTOCOL_SCHEME
+        || url.host_str() != Some("open")
+        || !(url.path().is_empty() || url.path() == "/")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut target = AgentOpenTarget::Main;
+    for (key, raw) in url.query_pairs() {
+        if key != "open" {
+            return None;
+        }
+        target = AgentOpenTarget::from_query(raw.as_ref())?;
+    }
+    Some(target)
 }
 
 fn main() {
@@ -3010,8 +3039,8 @@ impl Options {
         parse_plugin_view_launch(&env::args().collect::<Vec<_>>())
     }
 
-    pub(crate) fn protocol_open_requested(&self) -> bool {
-        protocol_open_requested(&env::args().collect::<Vec<_>>())
+    pub(crate) fn protocol_open_target(&self) -> Option<AgentOpenTarget> {
+        parse_protocol_open(&env::args().collect::<Vec<_>>())
     }
 
     fn from_env() -> Self {
@@ -3245,8 +3274,8 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cli_subcommand, default_local_port, parse_plugin_view_launch, protocol_open_requested,
-        should_run_acp, should_run_mcp, workflow_dispatch_limit, PluginViewLaunch,
+        cli_subcommand, default_local_port, parse_plugin_view_launch, parse_protocol_open,
+        should_run_acp, should_run_mcp, workflow_dispatch_limit, AgentOpenTarget, PluginViewLaunch,
         SHIPPED_DASHBOARD_API_BASE,
     };
     use crate::api::types::Task;
@@ -3479,10 +3508,23 @@ mod tests {
             "--protocol-url".to_string(),
             "himind-agent://open".to_string(),
         ];
-        assert!(protocol_open_requested(&accepted));
+        assert_eq!(parse_protocol_open(&accepted), Some(AgentOpenTarget::Main));
+
+        let open_ai = vec![
+            "agent.exe".to_string(),
+            "--protocol-url".to_string(),
+            "himind-agent://open?open=ai".to_string(),
+        ];
+        assert_eq!(
+            parse_protocol_open(&open_ai),
+            Some(AgentOpenTarget::SettingsAi)
+        );
 
         for value in [
             "himind-agent://open?command=exec",
+            "himind-agent://open?open=unknown",
+            "himind-agent://open?open=",
+            "himind-agent://open?open=ai&command=exec",
             "himind-agent://open/project",
             "himind-agent://user@open",
             "himind-agent://plugin/open",
@@ -3494,7 +3536,7 @@ mod tests {
                 "--protocol-url".to_string(),
                 value.to_string(),
             ];
-            assert!(!protocol_open_requested(&rejected), "accepted {value}");
+            assert_eq!(parse_protocol_open(&rejected), None, "accepted {value}");
         }
     }
 }

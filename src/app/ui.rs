@@ -87,7 +87,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     let webview_data_dir = crate::store::paths::apply_webview_user_data_dir(port);
     println!("webview user data dir: {}", webview_data_dir.display());
     let initial_plugin_view = options.plugin_view_launch();
-    let initial_protocol_open = options.protocol_open_requested();
+    let initial_open_target = options.protocol_open_target();
 
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
@@ -191,9 +191,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                             }
                         }
                     });
-            } else if crate::protocol_open_requested(&args)
-                || !args.iter().any(|argument| argument == "--protocol-url")
-            {
+            } else if let Some(target) = crate::parse_protocol_open(&args) {
+                open_agent_open_target(app, target);
+            } else if !args.iter().any(|argument| argument == "--protocol-url") {
                 show_main_window(app);
             }
         }))
@@ -580,8 +580,8 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             fit_main_window_to_monitor(app);
             if let Some(launch) = initial_plugin_view.as_ref() {
                 open_plugin_view(app.handle(), &launch.plugin_id, &launch.view_id)?;
-            } else if initial_protocol_open {
-                show_main_window(app.handle());
+            } else if let Some(target) = initial_open_target {
+                open_agent_open_target(app.handle(), target);
             }
             Ok(())
         });
@@ -916,6 +916,20 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+/// 深链唤起落点（ADR 0118 写通道②）：`Main` 只把主窗口带到前台；`SettingsAi`
+/// 额外把设置窗口开到「AI 连接」面板，让用户在本机完成客户端注册。设置窗口
+/// 不存在时 `open_settings_window` 会按同一路由新建。
+fn open_agent_open_target(app: &tauri::AppHandle, target: crate::AgentOpenTarget) {
+    match target {
+        crate::AgentOpenTarget::Main => show_main_window(app),
+        crate::AgentOpenTarget::SettingsAi => {
+            if let Err(error) = open_settings_window(app, Some("ai"), None, None, None) {
+                eprintln!("deep link open ai failed: {error}");
+            }
+        }
     }
 }
 

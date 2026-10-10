@@ -8451,6 +8451,115 @@ mod tests {
         }
     }
 
+    /// ADR 0118 P3：`ai.client.*` 是工作台 loopback 一键通道与 `himind-agent://`
+    /// 深链 handoff 共同依赖的**正式契约**。这里用 golden 断言把每个能力的
+    /// `version`、`risk_level` 与完整 `input_schema` 钉死：任何改动都必须显式更新
+    /// 本测试（并同步 `docs/agent-capabilities.md` 与 ADR 0118），把「悄悄漂移」
+    /// 变成「测试失败」。target enum 仍由适配器注册表派生，见上一个测试。
+    #[test]
+    fn ai_client_capability_contract_is_frozen() {
+        let mut options = crate::Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let registry = gateway.registry().unwrap();
+        let targets = crate::app::ai_provider_import::known_adapter_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let target_enum = || json!(targets.clone());
+
+        let expected: Vec<(&str, &str, Value)> = vec![
+            (
+                "ai.client.list",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+            ),
+            (
+                "ai.client.status",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": false }),
+            ),
+            (
+                "ai.client.import",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": target_enum() },
+                        "service": {
+                            "type": "string",
+                            "default": "managed",
+                            "pattern": "^(managed|custom:[A-Za-z0-9_-]{1,64})$"
+                        },
+                        "replace": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "目标客户端已注册其它 AI 服务时，先撤销旧注册再写入当前服务"
+                        }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "ai.client.remove",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": target_enum() }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "ai.client.import.plan",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": target_enum() },
+                        "service": { "type": "string", "description": "managed 或 custom:<id>；仅用于预览切换冲突" }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "ai.client.remove.plan",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "enum": target_enum() },
+                        "service": { "type": "string", "description": "可选服务源，便于客户端统一调用契约" }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            ),
+        ];
+
+        for (capability_id, risk_level, schema) in expected {
+            let descriptor = &registry[capability_id].descriptor;
+            assert_eq!(
+                descriptor.version, "1.0.0",
+                "contract version drifted for {capability_id}; a breaking change requires an \
+                 explicit version bump plus documentation update (ADR 0118 P3)"
+            );
+            assert_eq!(
+                descriptor.risk_level, risk_level,
+                "risk level drifted for {capability_id}"
+            );
+            assert_eq!(
+                descriptor.input_schema, schema,
+                "input schema drifted for {capability_id}; update the frozen contract on purpose"
+            );
+        }
+    }
+
     #[test]
     fn capability_catalog_cursor_is_bound_to_snapshot_and_filters() {
         let generation = "sha256:generation";
