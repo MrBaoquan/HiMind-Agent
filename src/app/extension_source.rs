@@ -374,6 +374,26 @@ pub(crate) fn settings() -> Result<ExtensionSourceSettings, Box<dyn Error>> {
     settings_at(&settings_path())
 }
 
+/// 找到包含指定工作区路径的本地来源。开发插件登记在插件草稿目录里，
+/// 需要通过 draft.workspace_path 反查它属于哪个本地工作区。
+pub(crate) fn source_id_for_workspace(
+    workspace: &Path,
+    sources: &[ExtensionSourceConfig],
+) -> Option<String> {
+    let workspace = normalized_path(&workspace.to_string_lossy());
+    sources
+        .iter()
+        .filter(|source| source.kind == ExtensionSourceKind::Local)
+        .filter_map(|source| {
+            let root = normalized_path(&source.repository);
+            let prefix = format!("{root}/");
+            let inside = workspace == root || workspace.starts_with(&prefix);
+            inside.then_some((root.len(), source.id.clone()))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, id)| id)
+}
+
 pub(crate) fn add_github_source(
     name: &str,
     repository: &str,
@@ -454,6 +474,8 @@ pub(crate) fn upsert_source(
         .sort_by(|left, right| left.id.cmp(&right.id));
     save_settings(&current)?;
     invalidate_snapshot_cache();
+    // 工作区开关同时是能力门禁，不能等能力发现缓存自然过期。
+    crate::capability::service::invalidate_capability_discovery();
     Ok(current)
 }
 
@@ -565,6 +587,8 @@ pub(crate) fn update_source(
     }
     save_settings(&current)?;
     invalidate_snapshot_cache();
+    // 工作区开关同时是能力门禁，不能等能力发现缓存自然过期。
+    crate::capability::service::invalidate_capability_discovery();
     Ok(current)
 }
 
@@ -637,14 +661,19 @@ fn workspace_after_removal(
     }
 }
 
+fn normalized_path(value: &str) -> String {
+    let value = value
+        .strip_prefix("\\\\?\\")
+        .or_else(|| value.strip_prefix("//?/"))
+        .unwrap_or(value);
+    value
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
 fn paths_equal(left: &str, right: &str) -> bool {
-    let normalize = |value: &str| {
-        value
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-    };
-    normalize(left) == normalize(right)
+    normalized_path(left) == normalized_path(right)
 }
 
 pub(crate) fn snapshot() -> Result<ExtensionSourceSnapshot, Box<dyn Error>> {
@@ -4563,10 +4592,9 @@ pub(crate) fn authoritative_local_sources() -> Vec<LocalSourceSnapshot> {
         return Vec::new();
     };
     let mut snapshots = Vec::new();
-    // Source enablement controls market discovery and installation only. A
-    // developer must still be able to open and build a registered workspace
-    // while its distribution side is paused, so authoring discovery includes
-    // every configured local source and validates it independently below.
+    // Source enablement gates distribution discovery and runtime plugin
+    // capabilities. Authoring discovery still includes every configured local
+    // source so a paused workspace remains editable and buildable.
     for source in current
         .sources
         .iter()

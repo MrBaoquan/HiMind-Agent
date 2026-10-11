@@ -455,6 +455,8 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
         .collect();
     merge_development_items(&mut items, development_items);
     items.sort_by(|a, b| a.id.cmp(&b.id));
+    // 来源/工作区门禁必须先于依赖解析生效，否则依赖被停用插件的插件仍会被注册。
+    apply_disabled_source_gate(&mut items);
     for (plugin_id, issue) in plugin_dependency_cycle_issues(&items) {
         if let Some(item) = items
             .iter_mut()
@@ -485,6 +487,68 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
         }
     }
     Ok(items)
+}
+
+fn plugin_source_id(source: &str) -> Option<&str> {
+    let (kind, id) = source.trim().split_once(':')?;
+    if !matches!(kind, "local" | "github") {
+        return None;
+    }
+    let id = id.trim();
+    (!id.is_empty()).then_some(id)
+}
+
+/// 来源/工作区停用是能力门禁：先让插件注册表返回 enabled=false，
+/// 后续能力发现、MCP 暴露和直接调用才会统一阻断。
+fn apply_disabled_source_gate(items: &mut [PluginRegistryItem]) {
+    let Ok(source_settings) = crate::app::extension_source::settings() else {
+        return;
+    };
+    let disabled_sources = source_settings
+        .sources
+        .iter()
+        .filter(|source| !source.enabled)
+        .map(|source| source.id.clone())
+        .collect::<HashSet<_>>();
+    if disabled_sources.is_empty() {
+        return;
+    }
+
+    // 开发插件本身没有 policy.json，需用草稿登记的 workspace_path 反查来源。
+    let development_sources = crate::plugin_authoring::list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|draft| {
+            let source_id = draft.workspace_path.as_deref().and_then(|workspace| {
+                crate::app::extension_source::source_id_for_workspace(
+                    workspace,
+                    &source_settings.sources,
+                )
+            })?;
+            Some((draft.manifest.id, source_id))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for item in items {
+        let source_id = plugin_source_id(&item.source)
+            .map(str::to_string)
+            .or_else(|| {
+                if item.development {
+                    development_sources.get(&item.id).cloned()
+                } else {
+                    None
+                }
+            });
+        if source_id
+            .as_deref()
+            .is_some_and(|source_id| disabled_sources.contains(source_id))
+        {
+            item.enabled = false;
+            if item.status == "installed" {
+                item.status = "disabled".to_string();
+            }
+        }
+    }
 }
 
 fn plugin_dependency_cycle_issues(installed: &[PluginRegistryItem]) -> HashMap<String, String> {

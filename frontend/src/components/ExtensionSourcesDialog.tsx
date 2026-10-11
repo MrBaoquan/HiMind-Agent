@@ -329,7 +329,7 @@ function MemberRow({ source, kind, handlers, active, upstreamAdded }: { source: 
       {kind === 'remote' && source.verification === 'optional' ? <span className="extension-source-chip is-warn" title="允许安装未签名版本">允许未签名</span> : null}
       {kind === 'local' && status?.source_dirty ? <span className="extension-source-chip is-warn" title={revision ? `源码 HEAD ${revision}，有未提交修改` : '本地有未提交修改'}>有未提交修改</span> : null}
       <span className="extension-source-member-actions">
-        <SourceSwitch title="启用该来源" label={`启用 ${label}`} checked={source.enabled} disabled={handlers.loading} onChange={value => void handlers.onUpdate(source, value, source.auto_update, source.verification)} />
+        <SourceSwitch title={kind === 'local' ? '启用该工作区及插件能力' : '启用该来源'} label={kind === 'local' ? `启用 ${label} 的工作区能力` : `启用 ${label}`} checked={source.enabled} disabled={handlers.loading} onChange={value => void handlers.onUpdate(source, value, source.auto_update, source.verification)} />
         <ActionMenu variant="icon" title={`${label} 的更多操作`} icon={<MoreHorizontal size={15} />} disabled={handlers.loading}>
           {close => kind === 'local' ? <>
             <ActionMenuItem icon={<MessageCircle size={15} />} label="在扩展开发中打开" title="用 AI 在这个目录里开发" disabled={handlers.loading} onClick={() => { close(); void handlers.onDevelopWorkspace(source); }} />
