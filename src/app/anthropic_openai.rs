@@ -38,6 +38,10 @@ pub(crate) fn request_to_openai(body: &Value, default_model: &str) -> Result<Val
     for message in source_messages {
         translate_message(message, &mut messages)?;
     }
+    // Claude Code / Claude Desktop 在工具调用被中断、重试或从更早消息重启时，会把
+    // history 发成 assistant 的 tool_use 没有对应 tool_result（反之亦然）。断裂的配对
+    // 会被上游整条拒绝，这里在翻译后先修复再转发。
+    repair_openai_tool_pairing(&mut messages);
 
     let mut translated = Map::new();
     translated.insert("model".to_string(), json!(model));
@@ -71,6 +75,76 @@ pub(crate) fn request_to_openai(body: &Value, default_model: &str) -> Result<Val
         );
     }
     Ok(Value::Object(translated))
+}
+
+/// 修复从 Anthropic history 翻过来后可能断裂的工具配对。
+///
+/// 上游 OpenAI 兼容服务要求「带 `tool_calls` 的 assistant 消息之后必须有回应每个
+/// `tool_call_id` 的 `tool` 消息」，否则整条请求 400（insufficient tool messages）。
+/// 客户端中断/重试工具调用时会产生不配对的历史，这里为悬空调用补一条「已中断」结果、
+/// 丢弃无主的 `tool` 消息；历史本来自洽时不做任何改动。
+fn repair_openai_tool_pairing(messages: &mut Vec<Value>) {
+    if !messages
+        .iter()
+        .any(|message| message.get("tool_calls").is_some() || message.get("tool_call_id").is_some())
+    {
+        return;
+    }
+    let mut call_ids = std::collections::HashSet::<String>::new();
+    let mut answered = std::collections::HashSet::<String>::new();
+    for message in messages.iter() {
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        call_ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        if message.get("role").and_then(Value::as_str) == Some("tool") {
+            if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+                if !id.is_empty() {
+                    answered.insert(id.to_string());
+                }
+            }
+        }
+    }
+    let dangling = call_ids.iter().any(|id| !answered.contains(id));
+    let orphaned = answered.iter().any(|id| !call_ids.contains(id));
+    if !dangling && !orphaned {
+        return;
+    }
+    let mut repaired = Vec::with_capacity(messages.len() + call_ids.len());
+    for message in messages.drain(..) {
+        if message.get("role").and_then(Value::as_str) == Some("tool") {
+            let id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if id.is_empty() || !call_ids.contains(id) {
+                // 无主结果：上游会以「insufficient tool messages」拒绝整条请求。
+                continue;
+            }
+        }
+        let mut synthetic = Vec::new();
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                if id.is_empty() || answered.contains(id) {
+                    continue;
+                }
+                synthetic.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": "Tool result unavailable: the previous turn was interrupted before this tool returned.",
+                }));
+            }
+        }
+        repaired.push(message);
+        repaired.extend(synthetic);
+    }
+    *messages = repaired;
 }
 
 fn translate_message(message: &Value, out: &mut Vec<Value>) -> Result<(), String> {
@@ -552,6 +626,44 @@ mod tests {
             "object"
         );
         assert_eq!(translated["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn request_repairs_dangling_tool_call() {
+        let request = json!({
+            "messages": [
+                { "role": "user", "content": "调用 get_time" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "call_1", "name": "get_time", "input": {} }
+                ]}
+            ]
+        });
+        let translated = request_to_openai(&request, "m").unwrap();
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "悬空调用必须补一条 tool 结果");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn request_drops_orphan_tool_result() {
+        let request = json!({
+            "messages": [
+                { "role": "user", "content": "你好" },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "call_missing", "content": "过期结果" }
+                ]}
+            ]
+        });
+        let translated = request_to_openai(&request, "m").unwrap();
+        let messages = translated["messages"].as_array().unwrap();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
+            "无主 tool 结果必须被丢弃"
+        );
     }
 
     #[test]
