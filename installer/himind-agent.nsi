@@ -43,7 +43,7 @@ InstallDir "$LOCALAPPDATA\HiMindAgent"
 InstallDirRegKey HKCU "${PRODUCT_REGISTRY_KEY}" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
-SetCompressorDictSize 32
+SetCompressorDictSize 64
 ManifestDPIAware true
 ManifestSupportedOS all
 XPStyle on
@@ -202,6 +202,14 @@ Section "HiMind Agent 核心组件" SEC_AGENT
     MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装或能力预检失败。安装已中止，Agent 未启动。"
     Abort
   ${EndIf}
+  ; The Runtime has been imported into $INSTDIR\runtimes\ above, so the staged
+  ; copy only served this install. Drop it - including packages left behind by
+  ; older installers - so the Runtime is not stored twice on disk (and inside
+  ; Agent backups). A reinstall re-extracts it from the installer.
+  Delete "$INSTDIR\resources\runtime\*.zip"
+  Delete "$INSTDIR\resources\runtime\*.json"
+  RMDir "$INSTDIR\resources\runtime"
+
   SetOutPath "$INSTDIR\previous"
   SetOutPath "$INSTDIR\logs"
   WriteUninstaller "$INSTDIR\uninstall.exe"
