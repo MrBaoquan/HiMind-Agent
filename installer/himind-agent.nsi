@@ -3,6 +3,7 @@ Unicode true
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 !ifndef API_BASE
   !define API_BASE "https://himind.andcrane.com"
@@ -28,6 +29,11 @@ Unicode true
 !ifndef RUNTIME_PACKAGE
   !error "RUNTIME_PACKAGE is required: installer must carry the signed HiMind AI Runtime"
 !endif
+
+; Staging the bundled Runtime and extracting it both live under $INSTDIR, so the
+; installer requires real headroom instead of failing half way through. Roughly:
+; staged package + agent binaries (~560 MB) plus the extracted Runtime (~456 MB).
+!define MIN_FREE_SPACE_MB 1536
 
 !define PRODUCT_NAME "HiMind Agent"
 !define PRODUCT_PUBLISHER "HiMind"
@@ -192,14 +198,54 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   FileClose $0
   mode_preferences_done:
 
+  ; Reserve disk space before staging the Runtime.
+  ${GetRoot} "$INSTDIR" $R8
+  ${DriveSpace} "$R8" "/D=F /S=M" $R9
+  StrCmp $R9 "" runtime_space_checked
+  ${If} $R9 < ${MIN_FREE_SPACE_MB}
+    MessageBox MB_ICONSTOP|MB_OK "磁盘可用空间不足，无法安装 HiMind Agent。$\r$\n$\r$\n$INSTDIR 所在磁盘剩余约 $R9 MB，需要至少 ${MIN_FREE_SPACE_MB} MB。$\r$\n请清理磁盘空间后重新运行安装程序。"
+    Abort
+  ${EndIf}
+  runtime_space_checked:
+
   ; Import the bundled signed Runtime before installation reports success.
-  ; Agent performs SHA-256, RSA-PSS, compatibility, CLI, Office and screen
-  ; control preflight checks and fails closed if any capability is incomplete.
+  ; Agent verifies size, SHA-256, RSA-PSS and the package contents, then runs the
+  ; CLI / Office / screen-control preflight. Capabilities that depend on this
+  ; machine (screen control) degrade instead of aborting and are reported with
+  ; exit code 2; an unusable Runtime still fails closed.
   SetOutPath "$INSTDIR"
   nsExec::ExecToLog /TIMEOUT=900000 '"$INSTDIR\versions\${PRODUCT_VERSION}\himind-agent.exe" runtime install --manifest "$INSTDIR\resources\runtime\himind-runtime-release.json"'
   Pop $0
-  ${If} $0 != 0
-    MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装或能力预检失败。安装已中止，Agent 未启动。"
+
+  ; The Agent mirrors its output into runtime-install.log. Read the last
+  ; non-empty line so the dialog can name the real reason: the NSIS details pane
+  ; is not persisted, which previously left field failures undiagnosable.
+  StrCpy $R7 ""
+  ${If} ${FileExists} "$INSTDIR\logs\runtime-install.log"
+    FileOpen $R6 "$INSTDIR\logs\runtime-install.log" r
+    ${Do}
+      ClearErrors
+      FileRead $R6 $R5
+      ${If} ${Errors}
+        ${Break}
+      ${EndIf}
+      ${If} $R5 != ""
+        StrCpy $R7 $R5
+      ${EndIf}
+    ${Loop}
+    FileClose $R6
+  ${EndIf}
+  StrCmp $R7 "" 0 runtime_reason_ready
+  StrCpy $R7 "未生成安装日志，请展开本页的「详细信息」查看 Agent 输出。"
+  runtime_reason_ready:
+
+  ${If} $0 == "error"
+    MessageBox MB_ICONSTOP|MB_OK "无法启动 HiMind AI 运行时安装程序，安装已中止，Agent 未启动。$\r$\n$\r$\n请检查安全软件是否拦截了 $INSTDIR 下的程序，然后重新运行安装程序。"
+    Abort
+  ${ElseIf} $0 == 2
+    MessageBox MB_ICONEXCLAMATION|MB_OK "HiMind Agent 已安装，但部分本机能力暂不可用（例如屏幕控制）。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log"
+  ${ElseIf} $0 != 0
+    MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装失败，安装已中止，Agent 未启动。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log"
     Abort
   ${EndIf}
   ; The Runtime has been imported into $INSTDIR\runtimes\ above, so the staged

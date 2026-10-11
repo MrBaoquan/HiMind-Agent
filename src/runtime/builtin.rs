@@ -221,6 +221,26 @@ pub(crate) fn install_with_progress(
     active_adapter().install(options, client_instance_id, report_progress)
 }
 
+/// Install the built-in Runtime and report capabilities that could not be
+/// verified on this machine. Degraded capabilities are dropped from the
+/// installed contract rather than failing the installation: a workstation
+/// without screen-control permission must still be able to run the Agent.
+pub(crate) fn install_with_report(
+    options: &Options,
+    client_instance_id: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<
+    (
+        BuiltinAIRuntimeStatus,
+        Vec<deepseek_harness::RuntimeCapabilityDegradation>,
+    ),
+    String,
+> {
+    deepseek_harness::install_with_report(options, client_instance_id, report_progress)
+        .map(|(status, degraded)| (from_engine_status(status), degraded))
+        .map_err(productize_runtime_error)
+}
+
 pub(crate) fn update_with_progress(
     options: &Options,
     client_instance_id: &str,

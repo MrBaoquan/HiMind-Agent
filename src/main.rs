@@ -2676,6 +2676,59 @@ fn run_mcp_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// Exit code for "Runtime installed, but one or more capabilities could not be
+/// verified on this machine". The Windows installer treats it as success and
+/// surfaces a warning instead of rolling the installation back.
+const RUNTIME_INSTALL_EXIT_DEGRADED: i32 = 2;
+
+/// Append-only log for `himind-agent runtime install`.
+///
+/// The installer runs this CLI as a child process whose output is only visible
+/// in the NSIS details pane, which is never persisted. Mirroring every line
+/// into `<agent_home>/logs/runtime-install.log` gives the installer a file to
+/// read after a failure, so the failure dialog can name the real reason, and
+/// leaves support something to inspect afterwards.
+/// Collapse embedded newlines so one logical log entry stays one physical line.
+/// The installer reads the last line of the log to name the failure reason, so a
+/// multi-line message (spawn errors, summarized process output) must not split
+/// the reason across lines.
+fn flatten_log_line(text: &str) -> String {
+    text.replace("\r\n", " | ")
+        .replace('\n', " | ")
+        .replace('\r', " | ")
+}
+
+struct RuntimeInstallLog {
+    path: PathBuf,
+    handle: Option<std::fs::File>,
+}
+
+impl RuntimeInstallLog {
+    fn begin() -> Self {
+        let path = store::paths::agent_home()
+            .join("logs")
+            .join("runtime-install.log");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let handle = std::fs::File::create(&path).ok();
+        Self { path, handle }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn line(&mut self, text: &str) {
+        use std::io::Write;
+        if let Some(handle) = self.handle.as_mut() {
+            let _ = handle.write_all(text.as_bytes());
+            let _ = handle.write_all(b"\n");
+            let _ = handle.flush();
+        }
+    }
+}
+
 fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments.first().map(String::as_str) {
         Some("acp-profile") => {
@@ -2703,9 +2756,65 @@ fn run_runtime_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dy
             apply_runtime_manifest_argument(&arguments[1..])?;
             let client_instance_id =
                 format!("himind-agent-runtime-{}", store::paths::profile_name());
-            let status = runtime::builtin::install(options, &client_instance_id)
-                .map_err(std::io::Error::other)?;
-            println!("{}", serde_json::to_string_pretty(&status)?);
+            let mut log = RuntimeInstallLog::begin();
+            log.line(&format!(
+                "himind-agent {} runtime install ({})",
+                crate::VERSION,
+                store::paths::profile_name()
+            ));
+            log.line(&format!("args: {}", arguments.join(" ")));
+            let mut progress = |stage: &str, percent: u8, message: &str| {
+                let line = format!("[{percent:>3}%] {stage}: {message}");
+                eprintln!("{line}");
+                log.line(&line);
+            };
+            match runtime::builtin::install_with_report(options, &client_instance_id, &mut progress)
+            {
+                Ok((status, degraded)) => {
+                    for item in &degraded {
+                        let line = format!(
+                            "capability-degraded: {} - {}",
+                            item.capability,
+                            flatten_log_line(&item.reason)
+                        );
+                        eprintln!("{line}");
+                    }
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    log.line(&format!(
+                        "result: {}",
+                        serde_json::to_string(&status).unwrap_or_default()
+                    ));
+                    if degraded.is_empty() {
+                        log.line("outcome: ready");
+                        return Ok(());
+                    }
+                    // Keep the human-readable reason as the last physical line:
+                    // the installer surfaces the log tail in its failure dialog.
+                    log.line(&format!(
+                        "outcome: degraded ({})",
+                        degraded
+                            .iter()
+                            .map(|item| item.capability.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                    log.line(&format!("log: {}", log.path().display()));
+                    for item in &degraded {
+                        log.line(&format!(
+                            "capability-degraded: {} - {}",
+                            item.capability,
+                            flatten_log_line(&item.reason)
+                        ));
+                    }
+                    std::process::exit(RUNTIME_INSTALL_EXIT_DEGRADED);
+                }
+                Err(error) => {
+                    log.line("outcome: failed");
+                    log.line(&format!("log: {}", log.path().display()));
+                    log.line(&format!("error: {}", flatten_log_line(&error)));
+                    return Err(std::io::Error::other(error).into());
+                }
+            }
         }
         Some("check-update") => {
             apply_runtime_manifest_argument(&arguments[1..])?;

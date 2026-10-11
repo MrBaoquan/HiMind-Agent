@@ -81,6 +81,15 @@ struct InstalledRuntimeState {
     capabilities: Vec<String>,
 }
 
+/// A Runtime capability that the package declares but that could not be
+/// verified on this machine. Install still succeeds: the capability is dropped
+/// from the installed contract instead of failing the whole installation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct RuntimeCapabilityDegradation {
+    pub capability: String,
+    pub reason: String,
+}
+
 #[derive(Default)]
 struct HomeMigrationBudget {
     files: u64,
@@ -687,12 +696,20 @@ pub(crate) fn install(
     install_with_progress(options, client_instance_id, &mut ignore_progress)
 }
 
+pub(crate) fn install_with_report(
+    options: &Options,
+    client_instance_id: &str,
+    report_progress: &mut dyn FnMut(&str, u8, &str),
+) -> Result<(DeepSeekHarnessRuntimeStatus, Vec<RuntimeCapabilityDegradation>), String> {
+    install_resolved_with_report(options, client_instance_id, "0.0.0", report_progress)
+}
+
 pub(crate) fn install_with_progress(
     options: &Options,
     client_instance_id: &str,
     report_progress: &mut dyn FnMut(&str, u8, &str),
 ) -> Result<DeepSeekHarnessRuntimeStatus, String> {
-    install_resolved_with_progress(options, client_instance_id, "0.0.0", report_progress)
+    install_with_report(options, client_instance_id, report_progress).map(|(status, _)| status)
 }
 
 pub(crate) fn update_with_progress(
@@ -704,20 +721,16 @@ pub(crate) fn update_with_progress(
     if !runtime.cli_compatible || runtime.version.trim().is_empty() {
         return Err("HiMind AI 运行时尚未安装".to_string());
     }
-    install_resolved_with_progress(
-        options,
-        client_instance_id,
-        &runtime.version,
-        report_progress,
-    )
+    install_resolved_with_report(options, client_instance_id, &runtime.version, report_progress)
+        .map(|(status, _)| status)
 }
 
-fn install_resolved_with_progress(
+fn install_resolved_with_report(
     options: &Options,
     client_instance_id: &str,
     current_version: &str,
     report_progress: &mut dyn FnMut(&str, u8, &str),
-) -> Result<DeepSeekHarnessRuntimeStatus, String> {
+) -> Result<(DeepSeekHarnessRuntimeStatus, Vec<RuntimeCapabilityDegradation>), String> {
     report_progress("resolving", 5, "正在检查可用的 HiMind AI 运行时");
     let update = resolve_configured_runtime_component(
         options,
@@ -731,7 +744,7 @@ fn install_resolved_with_progress(
             return Err("当前没有可用的 HiMind AI 运行时安装包".to_string());
         }
         report_progress("ready", 100, "HiMind AI 运行时已是最新版本");
-        return Ok(status());
+        return Ok((status(), Vec::new()));
     };
     validate_update(&options.api_base(), &resolved)?;
     let client = Client::builder()
@@ -745,9 +758,9 @@ fn install_resolved_with_progress(
     if result.is_ok() {
         let _ = fs::remove_file(&archive);
     }
-    result.map(|_| {
+    result.map(|degraded| {
         report_progress("ready", 100, "HiMind AI 运行时已准备就绪");
-        status()
+        (status(), degraded)
     })
 }
 
@@ -1432,7 +1445,7 @@ fn install_runtime_archive(
     archive_path: &Path,
     update: &RuntimeComponentUpdate,
     report_progress: &mut dyn FnMut(&str, u8, &str),
-) -> Result<(), String> {
+) -> Result<Vec<RuntimeCapabilityDegradation>, String> {
     report_progress("installing", 84, "正在安装 HiMind AI 运行时");
     let versions = runtime_root().join("versions");
     fs::create_dir_all(&versions).map_err(|error| format!("创建 Runtime 安装目录失败: {error}"))?;
@@ -1476,12 +1489,14 @@ fn install_runtime_archive(
     } else {
         manifest.engine_version.as_str()
     };
-    if let Err(error) =
-        verify_staged_runtime(&temporary.join(&executable), &temporary, engine_version)
-    {
-        let _ = fs::remove_dir_all(&temporary);
-        return Err(error);
-    }
+    let degraded =
+        match verify_staged_runtime(&temporary.join(&executable), &temporary, engine_version) {
+            Ok(degraded) => degraded,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&temporary);
+                return Err(error);
+            }
+        };
     // Runtime versions are content-addressed (`version-sha256prefix`) and
     // immutable. Never rename the currently active version out of the way:
     // Windows keeps running executables/directories open, so doing so makes
@@ -1501,6 +1516,16 @@ fn install_runtime_archive(
         rename_directory_with_retry(&temporary, &target)
             .map_err(|error| format!("提交 HiMind AI 运行时安装失败: {error}"))?;
     }
+    // The installed state is the capability contract the Agent reports, so a
+    // capability that failed its preflight must not stay advertised.
+    let mut capabilities = manifest.capabilities.clone();
+    if !degraded.is_empty() {
+        capabilities.retain(|capability| {
+            !degraded
+                .iter()
+                .any(|item| item.capability == *capability)
+        });
+    }
     let state = InstalledRuntimeState {
         schema_version: 2,
         product_id: RUNTIME_PRODUCT_ID.to_string(),
@@ -1509,7 +1534,7 @@ fn install_runtime_archive(
         executable_path: target.join(executable).to_string_lossy().to_string(),
         min_agent_version: manifest.min_agent_version,
         max_agent_version: manifest.max_agent_version,
-        capabilities: manifest.capabilities,
+        capabilities,
     };
     if let Err(error) = write_runtime_state(&state) {
         if !target_is_complete {
@@ -1517,7 +1542,7 @@ fn install_runtime_archive(
         }
         return Err(error);
     }
-    Ok(())
+    Ok(degraded)
 }
 
 fn rename_directory_with_retry(source: &Path, target: &Path) -> Result<(), std::io::Error> {
@@ -1575,11 +1600,11 @@ fn verify_staged_runtime(
     executable: &Path,
     workspace: &Path,
     expected_version: &str,
-) -> Result<(), String> {
+) -> Result<Vec<RuntimeCapabilityDegradation>, String> {
     let preflight_home = workspace.join(".himind-preflight");
     fs::create_dir_all(&preflight_home)
         .map_err(|error| format!("创建 Runtime 预检目录失败: {error}"))?;
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<Vec<RuntimeCapabilityDegradation>, String> {
         let run = |arguments: &[&str]| -> Result<String, String> {
             let mut command = Command::new(executable);
             process::remove_himind_secret_environment(&mut command);
@@ -1641,21 +1666,37 @@ fn verify_staged_runtime(
                 .map_err(|error| format!("读取 Runtime manifest 失败: {error}"))?,
         )
         .map_err(|error| format!("Runtime manifest 无效: {error}"))?;
+        // Office is a packaging-completeness contract: the check above only
+        // looks at whether the bundled LibreOfficeKit files are present, so a
+        // failure means the ZIP itself is incomplete and must not be installed.
         if manifest.capabilities.iter().any(|value| value == "office") {
             verify_staged_office_bundle(workspace)?;
         }
+        // Screen control is the one capability whose preflight depends on the
+        // machine rather than the package: PowerShell, UI Automation, screen
+        // capture permission and locked/disconnected sessions all decide the
+        // outcome. A machine that cannot do screen control must still be able
+        // to install the Agent, so the package is still required to be
+        // complete but the runtime self-test only degrades the capability.
+        let mut degraded = Vec::new();
         if manifest
             .capabilities
             .iter()
             .any(|value| value == "computer-use")
         {
-            verify_staged_computer_use_bundle(workspace)?;
+            verify_staged_computer_use_package(workspace)?;
+            if let Err(reason) = verify_staged_computer_use_runtime(workspace) {
+                degraded.push(RuntimeCapabilityDegradation {
+                    capability: "computer-use".to_string(),
+                    reason,
+                });
+            }
         }
-        Ok(())
+        Ok(degraded)
     })();
     let cleanup = fs::remove_dir_all(&preflight_home)
         .map_err(|error| format!("清理 Runtime 预检目录失败: {error}"));
-    result.and(cleanup)
+    result.and_then(|degraded| cleanup.map(|_| degraded))
 }
 
 fn verify_staged_office_bundle(workspace: &Path) -> Result<(), String> {
@@ -1696,7 +1737,9 @@ fn verify_staged_office_bundle(workspace: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_staged_computer_use_bundle(workspace: &Path) -> Result<(), String> {
+/// Package completeness for screen control. Missing files mean the ZIP was
+/// published incomplete, which is a hard installation failure.
+fn verify_staged_computer_use_package(workspace: &Path) -> Result<(), String> {
     let package = workspace.join("node_modules/dsh-computer-use-win");
     if !package.join("mcp/server.mjs").is_file()
         || !package.join("scripts/windows-uia.ps1").is_file()
@@ -1705,6 +1748,14 @@ fn verify_staged_computer_use_bundle(workspace: &Path) -> Result<(), String> {
             "Runtime 声明支持屏幕控制，但缺少 dsh-computer-use-win Windows 控制包。".to_string(),
         );
     }
+    Ok(())
+}
+
+/// Runs the packaged screen-control self-test. Failure is environmental (no
+/// interactive desktop, blocked UI Automation/screen capture, endpoint
+/// protection, locked session) and only degrades the capability.
+fn verify_staged_computer_use_runtime(workspace: &Path) -> Result<(), String> {
+    let package = workspace.join("node_modules/dsh-computer-use-win");
     let node = workspace.join("node.exe");
     let mut command = Command::new(node);
     command
