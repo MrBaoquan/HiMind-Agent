@@ -6807,6 +6807,20 @@ fn matches_capability_pattern(pattern: &str, value: &str) -> bool {
 const EXHIBIT_ROUTE_ID_DESCRIPTION: &str =
     "使用 workbench.business.exhibit.list 或 workbench.context.resolve 返回的 pid（展项路由 ID）；exhibit_id（如 EX-0021）只是展示编号，不能直接使用。";
 
+/// `exhibit_id` 要的是**展项编号**（SVN 路径末段）而不是路由 pid 的那批能力。
+///
+/// 这些能力的 `exhibit_id` 会直接拼进 `<项目仓库>/trunk/exhibits/<展项编号>`（见
+/// `svn::service::exhibit_repository_url`）。路由 pid 没有到 SVN 路径的离线映射，
+/// 传 pid 只会推导出不存在的地址 —— 实测传 pid 一定 `non-existent`，传展项编号才成功，
+/// 所以它们不能用上面那条共享的"传 pid"文案。
+const EXHIBIT_REPOSITORY_CODE_DESCRIPTION: &str =
+    "展项编号（如 EX-0021），即展项仓库路径的末段，取自 workbench.business.exhibit.get 返回的 exhibit_id 字段。不要传 pid：workbench.business.exhibit.list / context.resolve 返回的 pid 是路由 ID，没有到 SVN 路径的离线映射，传它只会推导出不存在的地址。省略 repository_url 时按 <项目仓库>/trunk/exhibits/<展项编号> 推导。";
+
+/// 该能力的 `exhibit_id` 是否是 SVN 路径末段（展项编号）。
+fn exhibit_id_is_repository_code(capability_id: &str) -> bool {
+    capability_id.starts_with("svn.") || capability_id == "workspace.exhibit.repository.import"
+}
+
 /// Add the stable exhibit identifier rule to every projected business
 /// capability. Dashboard catalogs are allowed to update schemas at runtime,
 /// so this normalization belongs at the final Gateway projection boundary
@@ -6832,9 +6846,14 @@ fn annotate_business_exhibit_id_contract(descriptor: &mut CapabilityDescriptor) 
     let Some(schema) = exhibit_id.as_object_mut() else {
         return;
     };
+    let description = if exhibit_id_is_repository_code(&descriptor.id) {
+        EXHIBIT_REPOSITORY_CODE_DESCRIPTION
+    } else {
+        EXHIBIT_ROUTE_ID_DESCRIPTION
+    };
     schema.insert(
         "description".to_string(),
-        Value::String(EXHIBIT_ROUTE_ID_DESCRIPTION.to_string()),
+        Value::String(description.to_string()),
     );
 }
 

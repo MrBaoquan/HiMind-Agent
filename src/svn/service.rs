@@ -4681,16 +4681,14 @@ fn workspace_status_path(target: &Path) -> Result<Value, Box<dyn Error>> {
         .current_dir(target)
         .creation_flags(CREATE_NO_WINDOW)
         .output()?;
-    let changes = Command::new(&executable)
-        .args(["status", "--xml"])
-        .current_dir(target)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()?;
-    if !revision.status.success() || !changes.status.success() {
+    if !revision.status.success() {
         return Err("failed to read SVN working copy status".into());
     }
-    let status_xml = decode_svn_cli_output(&changes.stdout);
-    let change_count = status_xml.matches("<entry").count();
+    // 复用统一的变更计数：它带 `--ignore-externals`，并按 XML 过滤掉
+    // normal / ignored / external / none。此前这里直接数 `"<entry"` 子串，
+    // 于是 svn:externals 被当成 3 项本地变更 —— 刚检出、零改动的展项也会报
+    // `clean: false`，让"有没有本地改动"这个判断失真。
+    let change_count = svn_status_change_count(target)?;
     Ok(json!({
         "target_path": target,
         "repository_url": decode_svn_cli_output(&info.stdout).trim(),
@@ -6606,4 +6604,19 @@ Develop.meta
             "Clone exhibit EX-1 from http://svn.example/source"
         );
     }
+
+    /// `svn:externals` 是工作副本结构的一部分，不是"本地改动"：刚检出、零改动的展项
+    /// 不应因为带外部依赖就被判成脏。普通未版本化文件仍要计数。
+    #[test]
+    fn status_change_count_ignores_externals_and_ignored_entries() {
+        let xml = r#"<?xml version="1.0"?><status><target path=".">
+<entry path="Packages/ext"><wc-status item="external" revision="152" props="none"></wc-status></entry>
+<entry path="Assets/a.unity"><wc-status item="modified" revision="244" props="none"></wc-status></entry>
+<entry path="Temp/x"><wc-status item="ignored" props="none"></wc-status></entry>
+<entry path="New.txt"><wc-status item="unversioned" props="none"></wc-status></entry>
+<entry path="Assets/b.unity"><wc-status item="normal" revision="244" props="none"></wc-status></entry>
+</target></status>"#;
+        assert_eq!(svn_status_change_count_from_xml(xml).unwrap(), 2);
+    }
+
 }
