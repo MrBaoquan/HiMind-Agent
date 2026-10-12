@@ -432,12 +432,21 @@ fn merge_development_items(
     }
 }
 
-/// 插件能力命名空间：优先用清单声明，否则取插件 ID 的最后一段 slug。
+/// 插件能力命名空间（提示/文案用）：优先清单声明，否则取插件 ID 的最后一段 slug。
 pub(crate) fn plugin_capability_namespace(manifest: &PluginManifest) -> String {
+    declared_plugin_namespace(manifest)
+        .map(str::to_string)
+        .unwrap_or_else(|| plugin_slug(manifest))
+}
+
+/// 清单显式声明的命名空间（`plugin.json#/capability_namespace`）；未声明时为 `None`。
+fn declared_plugin_namespace(manifest: &PluginManifest) -> Option<&str> {
     let declared = manifest.capability_namespace.trim().trim_end_matches('.');
-    if !declared.is_empty() {
-        return declared.to_string();
-    }
+    (!declared.is_empty()).then_some(declared)
+}
+
+/// 插件 ID 最后一段 slug（`com.himind.work-log` → `work-log`）。
+fn plugin_slug(manifest: &PluginManifest) -> String {
     manifest
         .id
         .rsplit('.')
@@ -447,29 +456,71 @@ pub(crate) fn plugin_capability_namespace(manifest: &PluginManifest) -> String {
         .to_string()
 }
 
-/// ADR 0119 插件规则：能力 ID 必须结构合规，且以插件命名空间开头。
+/// ADR 0119 插件门禁：能力 ID 必须结构合规，并落在插件可用的命名边界内。
+///
+/// 边界判定：
+/// - 清单显式声明 `capability_namespace` 时，能力 ID 必须以该命名空间开头
+///   （多段前缀如 `wechat.miniprogram` 同样按整段前缀匹配）；
+/// - 未声明时，首段允许是 ADR 0119 领域注册表内的域（例如 `extension.*`
+///   这类内核共享域），或插件 ID 的最后一段 slug（例如 `com.himind.work-log`
+///   → `work-log`）。共享同一命名空间的插件（如 work-log 与 work-log-collector）
+///   应显式声明 `capability_namespace`，不依赖 slug 推导。
 ///
 /// 返回可读问题列表；为空表示通过。规则事实源与内核共用
 /// `contracts/capability-naming-rules.json`。
 pub(crate) fn plugin_capability_naming_issues(manifest: &PluginManifest) -> Vec<String> {
-    let namespace = plugin_capability_namespace(manifest);
-    let allowed = [namespace.as_str()];
+    let declared = declared_plugin_namespace(manifest);
+    let slug = plugin_slug(manifest);
+    let domains = crate::capability::service::capability_naming_domains();
     let mut issues = Vec::new();
+    if let Some(namespace) = declared {
+        if !is_valid_namespace(namespace) {
+            issues.push(format!(
+                "capability_namespace `{namespace}` 必须小写、以 `.` 分层、词内用 `-`"
+            ));
+        }
+    }
     for capability in &manifest.capabilities {
         let id = capability.id.trim();
-        for rule in crate::capability::service::capability_id_naming_violations_allow(id, &allowed) {
+        for rule in crate::capability::service::capability_id_structure_violations(id) {
             issues.push(format!("{id}: {rule}"));
         }
-        if !namespace.is_empty() && id != namespace && !id.starts_with(&format!("{namespace}.")) {
-            issues.push(format!(
-                "{id}: 能力 ID 必须以插件命名空间 `{namespace}.` 开头"
-            ));
+        let first = id.split('.').next().unwrap_or(id);
+        match declared {
+            Some(namespace) => {
+                if id != namespace && !id.starts_with(&format!("{namespace}.")) {
+                    issues.push(format!(
+                        "{id}: 能力 ID 必须以清单声明的 capability_namespace `{namespace}` 开头"
+                    ));
+                }
+            }
+            None => {
+                let in_registry = domains.iter().any(|domain| *domain == first);
+                if !in_registry && first != slug {
+                    issues.push(format!(
+                        "{id}: 首段必须是 ADR 0119 领域注册表内的域，或插件命名空间 `{slug}`"
+                    ));
+                }
+            }
         }
     }
     issues.sort();
     issues.dedup();
     issues
 }
+
+fn is_valid_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
+                && !segment.ends_with('-')
+                && segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        })
+}
+
 
 pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
     let mut items = builtin_plugin_items();
@@ -1988,6 +2039,55 @@ mod tests {
         .unwrap();
         assert_eq!(plugin_capability_namespace(&declared), "image-optimizer");
         assert!(plugin_capability_naming_issues(&declared).is_empty());
+        // 未声明命名空间时，内核领域注册表内的共享域同样放行（例如 extension.*）。
+        let shared: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.extension-development-tools",
+            "name": "扩展开发工具",
+            "version": "1.0.0",
+            "capabilities": [{ "id": "extension.plugin.validate" }]
+        }))
+        .unwrap();
+        assert!(
+            plugin_capability_naming_issues(&shared).is_empty(),
+            "{:?}",
+            plugin_capability_naming_issues(&shared)
+        );
+
+        // 多段命名空间按整段前缀匹配：同名首段但不完整的前缀要拦下。
+        let multi: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.wechat-miniprogram-tools",
+            "name": "微信小程序工具",
+            "version": "1.0.0",
+            "capability_namespace": "wechat.miniprogram",
+            "capabilities": [
+                { "id": "wechat.miniprogram.code.upload" },
+                { "id": "wechat.code.upload" }
+            ]
+        }))
+        .unwrap();
+        let multi_issues = plugin_capability_naming_issues(&multi);
+        assert!(
+            !multi_issues.iter().any(|item| item.starts_with("wechat.miniprogram.code.upload:")),
+            "{multi_issues:?}"
+        );
+        assert!(
+            multi_issues.iter().any(|item| item.starts_with("wechat.code.upload:")),
+            "{multi_issues:?}"
+        );
+
+        // 一旦显式声明了命名空间，其它内核域也不能越界使用。
+        let mismatched: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.work-log",
+            "name": "工时日志工具",
+            "version": "1.0.0",
+            "capability_namespace": "work-log",
+            "capabilities": [{ "id": "media.image.generate" }]
+        }))
+        .unwrap();
+        assert!(plugin_capability_naming_issues(&mismatched)
+            .iter()
+            .any(|item| item.contains("capability_namespace")));
+
     }
 
     #[test]

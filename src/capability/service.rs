@@ -7530,14 +7530,35 @@ pub(crate) fn capability_id_naming_violations_allow(
     id: &str,
     extra_domains: &[&str],
 ) -> Vec<&'static str> {
+    let mut violations = capability_id_structure_violations(id);
+    if let Some(first) = id.split('.').next() {
+        let domains = capability_naming_domains();
+        if !domains.is_empty()
+            && !domains.iter().any(|domain| *domain == first)
+            && !extra_domains.iter().any(|domain| *domain == first)
+        {
+            violations.push("首段必须是 ADR 0119 领域注册表（或插件命名空间）中的边界");
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+/// 规则文件里的领域注册表（插件校验复用同一份）。
+pub(crate) fn capability_naming_domains() -> Vec<&'static str> {
+    capability_naming_rules()["domains"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// 只做结构校验（字符集/段数/长度/版本/重复段），不含领域白名单。
+pub(crate) fn capability_id_structure_violations(id: &str) -> Vec<&'static str> {
     let rules = capability_naming_rules();
     let max_len = rules["id"]["maxLength"].as_u64().unwrap_or(48) as usize;
     let min_segments = rules["id"]["minSegments"].as_u64().unwrap_or(2) as usize;
     let max_segments = rules["id"]["maxSegments"].as_u64().unwrap_or(5) as usize;
-    let domains: Vec<&str> = rules["domains"]
-        .as_array()
-        .map(|items| items.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
     let mut violations = Vec::new();
     if id.is_empty() || id.len() > max_len {
         violations.push("长度超出规则文件上限（contracts/capability-naming-rules.json）");
@@ -7559,14 +7580,6 @@ pub(crate) fn capability_id_naming_violations_allow(
         if !valid {
             violations.push("每段必须小写，以字母开头，只含字母/数字/连字符");
             break;
-        }
-    }
-    if let Some(first) = segments.first() {
-        if !domains.is_empty()
-            && !domains.contains(first)
-            && !extra_domains.iter().any(|domain| domain == first)
-        {
-            violations.push("首段必须是 ADR 0119 领域注册表（或插件命名空间）中的边界");
         }
     }
     if let Some(last) = segments.last() {
