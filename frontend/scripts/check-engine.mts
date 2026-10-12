@@ -31,10 +31,10 @@ assert.ok(!existsSync(agentPath(join('frontend', 'src', 'pages', 'EngineBuildPag
 const workflow = JSON.parse(readAgent(join('workflows', 'engine-build', 'workflow.json')));
 assert.equal(workflow.schema_version, 'workflow_package.v1');
 assert.equal(workflow.id, 'com.himind.workflow.engine-build');
-assert.ok(workflow.capabilities.includes('exhibit.workspace.build'), '工作流必须声明构建能力');
+assert.ok(workflow.capabilities.includes('workspace.exhibit.build'), '工作流必须声明构建能力');
 const buildStep = workflow.steps.find((step: { id: string }) => step.id === 'ENGINE-BUILD');
 assert.ok(buildStep, '工作流缺少构建步骤');
-assert.equal(buildStep.capability_id, 'exhibit.workspace.build');
+assert.equal(buildStep.capability_id, 'workspace.exhibit.build');
 assert.equal(buildStep.execution_mode, 'long_running', '构建要按长任务声明');
 assert.equal(buildStep.input.wait, true, '构建步骤必须要求等待终态，否则运行会秒完成');
 assert.equal(workflow.ui.mode, 'declarative');
@@ -47,8 +47,8 @@ for (const field of ['target_path', 'engine_type', 'engine_version', 'provider',
   assert.ok(fieldIds.includes(field), `表单缺少能力入参：${field}`);
 }
 const buildSchema = serviceRs.slice(
-  serviceRs.indexOf('"exhibit.workspace.build"'),
-  serviceRs.indexOf('"exhibit.workspace.build.status"'),
+  serviceRs.indexOf('"workspace.exhibit.build"'),
+  serviceRs.indexOf('"workspace.exhibit.build.status"'),
 );
 for (const field of fieldIds) {
   assert.ok(new RegExp(`"${field}"`).test(buildSchema), `能力 schema 不接受表单字段：${field}`);

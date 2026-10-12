@@ -105,8 +105,8 @@ fn validate_capability_scope(
     claim: &AgentRunClaim,
 ) -> Result<(), Box<dyn Error>> {
     let path_key = match capability_id {
-        "system.open_folder" => Some("path"),
-        "exhibit.workspace.build" | "exhibit.workspace.open" => Some("target_path"),
+        "system.folder.open" => Some("path"),
+        "workspace.exhibit.build" | "workspace.exhibit.open" => Some("target_path"),
         _ => None,
     };
     let Some(path_key) = path_key else {
@@ -119,7 +119,7 @@ fn validate_capability_scope(
         if !claim.workspace_path.trim().is_empty()
             && matches!(
                 capability_id,
-                "exhibit.workspace.build" | "exhibit.workspace.open"
+                "workspace.exhibit.build" | "workspace.exhibit.open"
             )
         {
             object.insert(

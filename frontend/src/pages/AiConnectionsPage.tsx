@@ -46,9 +46,12 @@ type AiConnectionsPageProps = {
     protocol: AIServiceProtocol;
     model: string;
     models: string[];
+    image_model: string;
+    image_adapter: string;
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
+  onSetImageAIService: (id: string) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
@@ -96,6 +99,7 @@ export function AiConnectionsPage({
   onTest,
   onSaveAIService,
   onSetActiveAIService,
+  onSetImageAIService,
   onRemoveAIService,
   onImportAIClient,
   onRemoveAIClient,
@@ -163,6 +167,7 @@ export function AiConnectionsPage({
             onRefresh={onRefresh}
             onSaveAIService={onSaveAIService}
             onSetActiveAIService={onSetActiveAIService}
+            onSetImageAIService={onSetImageAIService}
             onRemoveAIService={onRemoveAIService}
             onOpenAccount={onOpenAccount}
             onFetchModels={onFetchModels}

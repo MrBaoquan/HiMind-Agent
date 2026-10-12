@@ -236,6 +236,11 @@ fn main() {
             eprintln!("approval command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = ai_cli_arguments() {
+        if let Err(error) = run_ai_cli(&options, &arguments) {
+            eprintln!("ai command failed: {error}");
+            std::process::exit(1);
+        }
     } else if let Some(arguments) = workflow_cli_arguments() {
         if let Err(error) = run_workflow_cli(&options, &arguments) {
             eprintln!("workflow command failed: {error}");
@@ -899,6 +904,37 @@ fn paired_agent_id_or_empty(options: &Options) -> String {
 
 fn extension_cli_arguments() -> Option<Vec<String>> {
     cli_command_arguments("extension")
+}
+
+fn ai_cli_arguments() -> Option<Vec<String>> {
+    cli_command_arguments("ai")
+}
+
+/// `himind-agent ai ask <workspace> <prompt>`：用真实的 HiMind AI 会话能力跑一次
+/// 无头对话（含 MCP 工具），并把最终回答以 JSON 打印出来。
+///
+/// 这是「AI 对话具备工具能力」的验收通道：与内置对话使用同一条启动路径、同一份
+/// overlay（含 `HIMIND_MCP_DEFAULT_ACTIVATE`）和同一套凭据解析。
+fn run_ai_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    match arguments {
+        [action, workspace, prompt] if action == "ask" => {
+            let canceled = || Ok(false);
+            let outcome = runtime::deepseek_harness::execute_workflow_allow_degraded(
+                options, workspace, prompt, 900, &canceled,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "text": outcome.text,
+                    "model": outcome.model,
+                    "service_source": outcome.service_source,
+                    "endpoint": outcome.endpoint,
+                }))?
+            );
+            Ok(())
+        }
+        _ => Err("usage: himind-agent ai ask <workspace> <prompt>".into()),
+    }
 }
 
 fn workflow_cli_arguments() -> Option<Vec<String>> {
@@ -3472,29 +3508,29 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(super::explicit_task_capability(&task), None);
-        task.capability = "capability:exhibit.workspace.checkout".to_string();
+        task.capability = "capability:svn.exhibit.workspace.checkout".to_string();
         assert_eq!(
             super::explicit_task_capability(&task),
-            Some("exhibit.workspace.checkout")
+            Some("svn.exhibit.workspace.checkout")
         );
-        task.capability = "remote.connect".to_string();
+        task.capability = "device.remote.connect".to_string();
         assert_eq!(
             super::explicit_task_capability(&task),
-            Some("remote.connect")
+            Some("device.remote.connect")
         );
     }
 
     #[test]
     fn legacy_task_capability_mapping_covers_migrated_queue_tasks() {
         let expected = [
-            ("scan_projects", "scan.projects"),
-            ("sync_exhibits", "inner_admin.sync_exhibits"),
-            ("upload_code", "upload.code"),
-            ("upload_placeholder", "upload.placeholder"),
+            ("scan_projects", "workspace.project.scan"),
+            ("sync_exhibits", "network.inner-admin.exhibit.sync"),
+            ("upload_code", "workspace.code.upload"),
+            ("upload_placeholder", "workspace.placeholder.upload"),
             ("smb_upload", "storage.smb.upload"),
             (
                 "exhibit_repository_import_local",
-                "exhibit.repository.import_local",
+                "workspace.exhibit.repository.import",
             ),
             ("project_repository_create", "project.repository.create"),
             (
@@ -3505,7 +3541,7 @@ mod tests {
                 "exhibit_repository_path_create",
                 "exhibit.repository_path.create",
             ),
-            ("exhibit_workspace_checkout", "exhibit.workspace.checkout"),
+            ("exhibit_workspace_checkout", "svn.exhibit.workspace.checkout"),
             ("exhibit_repository_clone", "exhibit.repository.clone"),
             ("project_acl_preview", "project.repository.acl.preview"),
             ("project_acl_apply", "project.repository.acl.apply"),
@@ -3519,7 +3555,7 @@ mod tests {
         }
         assert_eq!(
             super::legacy_task_capability("upload_code"),
-            Some("upload.code")
+            Some("workspace.code.upload")
         );
     }
 
@@ -3822,18 +3858,18 @@ fn explicit_task_capability(task: &Task) -> Option<&str> {
 /// Capability ID as the policy and execution owner.
 fn legacy_task_capability(task_type: &str) -> Option<&'static str> {
     match task_type {
-        "scan_projects" => Some("scan.projects"),
-        "sync_exhibits" => Some("inner_admin.sync_exhibits"),
-        "upload_code" => Some("upload.code"),
-        "upload_placeholder" => Some("upload.placeholder"),
+        "scan_projects" => Some("workspace.project.scan"),
+        "sync_exhibits" => Some("network.inner-admin.exhibit.sync"),
+        "upload_code" => Some("workspace.code.upload"),
+        "upload_placeholder" => Some("workspace.placeholder.upload"),
         "smb_upload" => Some("storage.smb.upload"),
-        "exhibit_repository_import_local" => Some("exhibit.repository.import_local"),
+        "exhibit_repository_import_local" => Some("workspace.exhibit.repository.import"),
         "project_repository_create" => Some("project.repository.create"),
         "project_repository_exhibits_access_ensure" => {
             Some("project.repository.exhibits_access.ensure")
         }
         "exhibit_repository_path_create" => Some("exhibit.repository_path.create"),
-        "exhibit_workspace_checkout" => Some("exhibit.workspace.checkout"),
+        "exhibit_workspace_checkout" => Some("svn.exhibit.workspace.checkout"),
         "exhibit_repository_clone" => Some("exhibit.repository.clone"),
         "project_acl_preview" => Some("project.repository.acl.preview"),
         "project_acl_apply" => Some("project.repository.acl.apply"),
@@ -4085,14 +4121,14 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "inner_admin.sync_exhibits",
+                    "network.inner-admin.exhibit.sync",
                     &input,
                 );
                 invoke_dashboard_capability_with_execution(
                     options,
                     agent_id,
                     &task,
-                    "inner_admin.sync_exhibits",
+                    "network.inner-admin.exhibit.sync",
                     input,
                     &mut execution,
                 )
@@ -4121,12 +4157,12 @@ fn execute_task(
             "upload_code" => {
                 let input = task.payload.clone().unwrap_or_else(|| json!({}));
                 let mut execution =
-                    task_execution_context(client, options, agent_id, &task, "upload.code", &input);
+                    task_execution_context(client, options, agent_id, &task, "workspace.code.upload", &input);
                 invoke_dashboard_capability_with_execution(
                     options,
                     agent_id,
                     &task,
-                    "upload.code",
+                    "workspace.code.upload",
                     input,
                     &mut execution,
                 )
@@ -4141,14 +4177,14 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "upload.placeholder",
+                    "workspace.placeholder.upload",
                     &input,
                 );
                 invoke_dashboard_capability_with_execution(
                     options,
                     agent_id,
                     &task,
-                    "upload.placeholder",
+                    "workspace.placeholder.upload",
                     input,
                     &mut execution,
                 )
@@ -4412,14 +4448,14 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "exhibit.repository.import_local",
+                    "workspace.exhibit.repository.import",
                     &input,
                 );
                 invoke_dashboard_capability_with_execution(
                     options,
                     agent_id,
                     &task,
-                    "exhibit.repository.import_local",
+                    "workspace.exhibit.repository.import",
                     input,
                     &mut execution,
                 )

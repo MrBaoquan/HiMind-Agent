@@ -48,6 +48,9 @@ const HIMIND_MCP_SERVER_NAME: &str = "himind-agent";
 const HIMIND_MCP_ROW_ID: &str = "himind-agent-mcp";
 const HIMIND_SKILL_ROW_ID: &str = "himind-agent-skill-filesystem";
 const HIMIND_MCP_CLIENT_ID: &str = "himind-ai";
+/// HiMind AI 对话启动时预激活的本机能力。只放"对话里随时可能用到、且不依赖
+/// AI 工作台"的本地能力；控制面能力仍按需激活，避免撑大默认工具面。
+const HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES: &str = "media.image.generate";
 const HIMIND_SKILL_ADAPTER_DIR: &str = "himind-skills";
 const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
 const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
@@ -925,13 +928,55 @@ pub(crate) fn execute_workflow(
     disable_tools: bool,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
+    execute_workflow_with(
+        options,
+        workspace,
+        prompt,
+        timeout_seconds,
+        disable_tools,
+        is_canceled,
+        ControlPlaneFallback::Fail,
+    )
+}
+
+/// 与 [`execute_workflow`] 相同，但控制面凭据不可用时按本机服务降级拉起会话。
+///
+/// 交互式 AI 对话走的就是这条降级语义；命令行验收需要与它一致，否则未登录
+/// AI 工作台的机器无法用本地模型完成一次真实会话验证。
+pub(crate) fn execute_workflow_allow_degraded(
+    options: &Options,
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
+    execute_workflow_with(
+        options,
+        workspace,
+        prompt,
+        timeout_seconds,
+        false,
+        is_canceled,
+        ControlPlaneFallback::Degrade,
+    )
+}
+
+fn execute_workflow_with(
+    options: &Options,
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    disable_tools: bool,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+    fallback: ControlPlaneFallback,
+) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     let workspace = process::canonical_workspace(workspace)?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err("DSH workflow prompt is empty".into());
     }
-    let launch =
-        prepare_interactive_launch(options, Some(&workspace)).map_err(std::io::Error::other)?;
+    let launch = prepare_interactive_launch_with(options, Some(&workspace), fallback)
+        .map_err(std::io::Error::other)?;
     // `tool_policy=none` 的步骤用一份把工具行全部禁用的 overlay：模型看不到任何
     // 工具 schema，也就不可能“去工作区找文件”。这和 prompt 里的约定不同，是
     // 平台强制的事实。
@@ -2696,9 +2741,12 @@ fn render_himind_profile_patch_from_base(
         patch.push_str(&format!("          - {}\n", yaml_scalar(&argument)));
     }
     patch.push_str(&format!(
-        "        env:\n          HIMIND_AI_CLIENT_ID: {}\n          HIMIND_AGENT_PROFILE: {}\n",
+        // `HIMIND_MCP_DEFAULT_ACTIVATE` 让本机生图等本地能力在对话首轮 tools/list
+        // 就直接可见，不必让模型先 search/describe/activate 绕一圈。
+        "        env:\n          HIMIND_AI_CLIENT_ID: {}\n          HIMIND_AGENT_PROFILE: {}\n          HIMIND_MCP_DEFAULT_ACTIVATE: {}\n",
         yaml_scalar(HIMIND_MCP_CLIENT_ID),
         yaml_scalar(&crate::store::paths::profile_name()),
+        yaml_scalar(HIMIND_MCP_DEFAULT_ACTIVATED_CAPABILITIES),
     ));
     if let Some(workspace) = workspace {
         patch.push_str(&format!(
@@ -4178,6 +4226,9 @@ mod tests {
         assert!(patch.contains("id: himind-agent-mcp"));
         assert!(patch.contains("name: '@deepseek-ai/dsh-mcp-client'"));
         assert!(patch.contains("HIMIND_AI_CLIENT_ID: \"himind-ai\""));
+        // 本机生图能力在对话首轮就要可见，否则模型要先 search/describe/activate。
+        assert!(patch.contains("HIMIND_MCP_DEFAULT_ACTIVATE:"));
+        assert!(patch.contains("media.image.generate"));
         assert!(!patch.contains("HIMIND_AI_WORKSPACE:"));
         assert!(patch.contains("id: himind-agent-skill-filesystem"));
         assert!(patch.contains("providerName: himind-managed"));
@@ -4326,6 +4377,8 @@ mod tests {
                 protocol: crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
                 model: "local-model".to_string(),
                 models: vec!["local-model".to_string(), "local-fast".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
                 api_key: "sk-local-secret".to_string(),
             })
             .unwrap();
@@ -4406,6 +4459,8 @@ mod tests {
                 protocol: crate::store::ai_services::AIServiceProtocol::OpenaiChat,
                 model: "deepseek-chat".to_string(),
                 models: vec!["deepseek-chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
                 api_key: "sk-deepseek-secret".to_string(),
             })
             .unwrap();
@@ -4527,6 +4582,8 @@ mod tests {
                 protocol: crate::store::ai_services::AIServiceProtocol::Anthropic,
                 model: "kimi-k3".to_string(),
                 models: vec!["kimi-k3".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
                 api_key: "sk-anthropic-secret".to_string(),
             })
             .unwrap();

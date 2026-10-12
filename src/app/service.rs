@@ -991,7 +991,7 @@ fn handle_local_http(
             let folder_path = query_param(&query, "path").unwrap_or_default();
             match gateway.invoke(
                 &InvocationContext::local_http(),
-                "system.open_folder",
+                "system.folder.open",
                 json!({ "path": folder_path }),
             ) {
                 Ok(value) => {
@@ -1012,7 +1012,7 @@ fn handle_local_http(
             };
             match gateway.invoke(
                 &local_http_invocation_context(local_principal.as_ref()),
-                "exhibit.workspace.status.local",
+                "workspace.exhibit.status",
                 serde_json::to_value(payload)?,
             ) {
                 Ok(value) => write_local_response(&mut stream, 200, &value.to_string(), "application/json"),
@@ -1048,7 +1048,7 @@ fn handle_local_http(
             };
             match gateway.invoke(
                 &local_http_invocation_context(local_principal.as_ref()),
-                "remote.connect",
+                "device.remote.connect",
                 serde_json::to_value(payload)?,
             ) {
                 Ok(value) => {
@@ -1844,9 +1844,9 @@ fn local_operation(method: &str, path: &str) -> Option<&'static str> {
             | "/plugins/disable",
         ) => Some("local.plugin.manage"),
         ("GET" | "POST", "/open-folder") => Some("local.file.open_folder"),
-        ("POST", "/workspace-status") => Some("exhibit.workspace.status.local"),
+        ("POST", "/workspace-status") => Some("workspace.exhibit.status"),
         ("POST", "/open-project") => Some("workspace.open.local"),
-        ("POST", "/remote-connect") => Some("remote.connect"),
+        ("POST", "/remote-connect") => Some("device.remote.connect"),
         ("GET", "/remote-clients") => Some("local.remote.clients.read"),
         ("POST", "/remote-clients/detect") => Some("local.remote.clients.detect"),
         ("POST", "/remote-clients/configure") => Some("local.remote.clients.configure"),
@@ -1912,7 +1912,7 @@ mod local_operation_tests {
     fn maps_sensitive_local_routes_to_stable_operations() {
         assert_eq!(
             local_operation("POST", "/remote-connect"),
-            Some("remote.connect")
+            Some("device.remote.connect")
         );
         assert_eq!(
             local_operation("GET", "/remote-clients"),

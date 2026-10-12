@@ -1987,6 +1987,7 @@ function AgentApp() {
       onTest={testMcpConnection}
       onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', '模型服务已保存'); } catch (error) { notify('error', formatError(error, '保存模型服务失败')); throw error; } }}
       onSetActiveAIService={(id) => run(async () => { await agentApi.setActiveAIService(id); await refreshAIServices(); }, id ? 'HiMind AI 对话已改用所选服务' : 'HiMind AI 对话已恢复默认服务', '切换 HiMind AI 对话服务失败')}
+      onSetImageAIService={(id) => run(async () => { await agentApi.setImageAIService(id); await refreshAIServices(); }, id ? '生图已改用所选服务' : '生图已恢复自动选择', '设置生图服务失败')}
       onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型服务已删除', '删除模型服务失败')}
       onFetchModels={(input) => agentApi.fetchAIServiceModels(input).then((result) => result.models)}
       onFetchSavedModels={(id, baseUrl) => agentApi.fetchSavedAIServiceModels(id, baseUrl).then((result) => result.models)}

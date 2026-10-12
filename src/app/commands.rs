@@ -2864,6 +2864,9 @@ pub(crate) fn save_ai_service(
     protocol: String,
     model: String,
     models: Vec<String>,
+    #[allow(clippy::too_many_arguments)]
+    image_model: Option<String>,
+    image_adapter: Option<String>,
     api_key: String,
 ) -> Result<serde_json::Value, String> {
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
@@ -2875,6 +2878,8 @@ pub(crate) fn save_ai_service(
             protocol,
             model,
             models,
+            image_model: image_model.unwrap_or_default(),
+            image_adapter: image_adapter.unwrap_or_default(),
             api_key,
         })
         .map_err(|e| e.to_string())?;
@@ -2928,6 +2933,28 @@ pub(crate) fn set_active_ai_service(
     }
     Ok(json!({
         "active_service_id": selected.map(|service| service.id).unwrap_or_default(),
+    }))
+}
+
+/// 指定生图（`media.image.generate`）默认使用的本机服务；不影响对话使用的服务。
+#[tauri::command]
+pub(crate) fn set_image_ai_service(
+    state: State<'_, AgentState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let selected = crate::store::ai_services::set_image_service(&id).map_err(|e| e.to_string())?;
+    if let Some(service) = selected.as_ref() {
+        state.approval_manager.add_log(
+            "info",
+            &format!("已将本机模型服务设为生图默认服务: {}", service.display_name),
+        );
+    } else {
+        state
+            .approval_manager
+            .add_log("info", "已清除生图默认服务，恢复自动选择");
+    }
+    Ok(json!({
+        "image_service_id": selected.map(|service| service.id).unwrap_or_default(),
     }))
 }
 
@@ -5433,7 +5460,7 @@ pub(crate) fn open_folder(state: State<'_, AgentState>, path: String) -> Result<
         .capability_gateway
         .invoke(
             &InvocationContext::tauri(),
-            "system.open_folder",
+            "system.folder.open",
             json!({ "path": path }),
         )
         .map(|_| ())

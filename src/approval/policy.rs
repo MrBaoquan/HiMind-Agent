@@ -29,7 +29,7 @@ pub(crate) fn args_digest(input: &serde_json::Value) -> Result<String, serde_jso
 pub(crate) fn destructive_request_type(capability_id: &str) -> Option<RequestType> {
     let id = capability_id.trim().to_ascii_lowercase();
     match id.as_str() {
-        "filesystem.delete" | "workspace.delete" => Some(RequestType::FilesystemDelete),
+        "system.filesystem.delete" | "workspace.delete" => Some(RequestType::FilesystemDelete),
         "business.project.delete" | "project.delete" => Some(RequestType::BusinessProjectDelete),
         "business.exhibit.delete" | "exhibit.delete" => Some(RequestType::BusinessExhibitDelete),
         // Full replacement and detach operations can remove existing business
@@ -39,10 +39,10 @@ pub(crate) fn destructive_request_type(capability_id: &str) -> Option<RequestTyp
         | "business.exhibit.crew.replace"
         | "business.exhibit.crew.remove"
         | "business.project.exhibit.detach" => Some(RequestType::DestructiveAction),
-        "mcp.server.remove" | "mcp.registration.remove" | "mcp.registration.remove_all" => {
+        "mcp.server.remove" | "mcp.registration.remove" | "mcp.registration.remove-all" => {
             Some(RequestType::DestructiveAction)
         }
-        _ if id.ends_with(".delete") || id.ends_with(".delete_all") => {
+        _ if id.ends_with(".delete") || id.ends_with(".delete-all") => {
             Some(RequestType::DestructiveAction)
         }
         _ => None,
@@ -69,7 +69,7 @@ pub(crate) fn effective_risk_level(capability_id: &str, declared: &str) -> &'sta
     if is_destructive_capability(&capability_id)
         || matches!(
             capability_id.as_str(),
-            "software.distribution.release.publish" | "extension.review.decide"
+            "distribution.release.publish" | "extension.review.decide"
         )
     {
         "R3"
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn business_and_filesystem_deletes_are_r3() {
         assert_eq!(effective_risk_level("business.project.delete", "R1"), "R3");
-        assert_eq!(effective_risk_level("filesystem.delete", "read_only"), "R3");
+        assert_eq!(effective_risk_level("system.filesystem.delete", "read_only"), "R3");
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn publish_and_admin_decisions_are_r3() {
         assert_eq!(
-            effective_risk_level("software.distribution.release.publish", "network_write"),
+            effective_risk_level("distribution.release.publish", "network_write"),
             "R3"
         );
         assert_eq!(
@@ -263,7 +263,7 @@ mod tests {
             "ai.service.list",
             "ai.service.custom.upsert",
             "ai.service.custom.remove",
-            "ai.service.custom.list_models",
+            "ai.service.custom.model.list",
         ] {
             assert!(
                 is_local_ai_configuration_capability(capability_id),
@@ -281,7 +281,7 @@ mod tests {
         }
         for unrelated in [
             "business.project.delete",
-            "filesystem.delete",
+            "system.filesystem.delete",
             "context.resolve",
         ] {
             assert!(!is_local_ai_configuration_capability(unrelated));

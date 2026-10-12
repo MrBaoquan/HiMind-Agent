@@ -121,6 +121,7 @@ enum CapabilityHandler {
     AIServiceCustomUpsert,
     AIServiceCustomRemove,
     AIServiceCustomListModels,
+    AIServiceImageSet,
     AuthoringIdentity,
     AuthoringPreflight,
     ExtensionWorkspaceCurrent,
@@ -236,6 +237,7 @@ enum CapabilityHandler {
     MediaSubmit(String, String),
     MediaJobGet,
     MediaJobCancel,
+    MediaImageGenerateLocal,
     PluginCapability(String),
     DownstreamMcp(String),
     McpServerList,
@@ -484,7 +486,7 @@ impl CapabilityGateway {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or("capability.catalog.describe requires a non-empty id")?;
+            .ok_or("system.capability.describe requires a non-empty id")?;
         let capability = self
             .list_capabilities(context)?
             .into_iter()
@@ -575,7 +577,7 @@ impl CapabilityGateway {
         let ai_client_targets = crate::app::ai_provider_import::known_adapter_ids();
         let builtins = [
             registration(
-                "capability.catalog.search",
+                "system.capability.search",
                 "能力目录搜索",
                 "按关键字、分组、surface、可用性和来源搜索当前可见能力，仅返回轻量摘要。",
                 "read_only",
@@ -595,7 +597,7 @@ impl CapabilityGateway {
                 CapabilityHandler::CapabilityCatalogSearch,
             ),
             registration(
-                "capability.catalog.describe",
+                "system.capability.describe",
                 "能力详情",
                 "按稳定能力 ID 返回能力契约和完整输入 Schema。",
                 "read_only",
@@ -725,6 +727,8 @@ impl CapabilityGateway {
                         "protocol": { "type": "string", "enum": ["openai-chat", "openai-responses", "anthropic"] },
                         "model": { "type": "string" },
                         "models": { "type": "array", "items": { "type": "string" } },
+                        "image_model": { "type": "string" },
+                        "image_adapter": { "type": "string", "enum": ["", "openai-images", "ark-images"] },
                         "api_key": { "type": "string" }
                     },
                     "required": ["id", "display_name", "base_url", "protocol", "model"],
@@ -746,7 +750,7 @@ impl CapabilityGateway {
                 CapabilityHandler::AIServiceCustomRemove,
             ),
             registration(
-                "ai.service.custom.list_models",
+                "ai.service.custom.model.list",
                 "拉取自定义 AI 服务模型",
                 "读取指定自定义 AI 服务的 /models 接口，返回可用模型 ID 列表；不修改任何配置。",
                 "read_only",
@@ -757,6 +761,19 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::AIServiceCustomListModels,
+            ),
+            registration(
+                "ai.service.image.set",
+                "设置生图服务",
+                "指定本机哪个 AI 服务用于生图（media.image.generate）；传空字符串清除，恢复自动选择。不影响对话使用的服务。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string", "maxLength": 64 } },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::AIServiceImageSet,
             ),
             registration(
                 "mcp.server.inspect",
@@ -852,7 +869,7 @@ impl CapabilityGateway {
                 CapabilityHandler::McpRegistrationApply,
             ),
             registration(
-                "mcp.registration.apply_all",
+                "mcp.registration.apply-all",
                 "批量应用 MCP 注册",
                 "将 Agent MCP 注册到已检测到的本机 AI 客户端；各目标独立执行并返回成功与失败明细。",
                 "local_action",
@@ -880,7 +897,7 @@ impl CapabilityGateway {
                 CapabilityHandler::McpRegistrationRemove,
             ),
             registration(
-                "mcp.registration.remove_all",
+                "mcp.registration.remove-all",
                 "移除全部 MCP 注册",
                 "移除已检测 AI 工具中的 HiMind MCP 配置，保留原配置备份。",
                 "local_action",
@@ -1077,7 +1094,7 @@ impl CapabilityGateway {
                 CapabilityHandler::ExtensionDistributionStateGet,
             ),
             registration(
-                "github.account.get",
+                "vcs.github.account.get",
                 "读取 GitHub 账号",
                 "读取本机保存的 GitHub 分发账号状态（登录名与已授权仓库）。不返回令牌内容。",
                 "read_only",
@@ -1085,7 +1102,7 @@ impl CapabilityGateway {
                 CapabilityHandler::GithubAccountGet,
             ),
             registration(
-                "github.account.set",
+                "vcs.github.account.set",
                 "授权 GitHub 账号",
                 "校验并保存 GitHub 分发凭据：先用令牌调用 GitHub 校验登录名，再以 DPAPI 加密存储。令牌不会写入日志或项目记录。",
                 "local_write",
@@ -1105,7 +1122,7 @@ impl CapabilityGateway {
                 CapabilityHandler::GithubAccountSet,
             ),
             registration(
-                "github.account.remove",
+                "vcs.github.account.remove",
                 "解除 GitHub 授权",
                 "删除本机保存的 GitHub 分发凭据。",
                 "local_write",
@@ -1113,15 +1130,15 @@ impl CapabilityGateway {
                 CapabilityHandler::GithubAccountRemove,
             ),
             registration(
-                "github.app.authorize.start",
+                "vcs.github.app.authorize.start",
                 "开始 GitHub App 授权",
-                "申请 GitHub App 设备码，返回 user_code 与验证地址，用户在浏览器完成授权后用 github.app.authorize.poll 继续。需要组织先注册 App 并配置 HIMIND_GITHUB_APP_CLIENT_ID。",
+                "申请 GitHub App 设备码，返回 user_code 与验证地址，用户在浏览器完成授权后用 vcs.github.app.authorize.poll 继续。需要组织先注册 App 并配置 HIMIND_GITHUB_APP_CLIENT_ID。",
                 "local_write",
                 json!({ "type": "object", "additionalProperties": false }),
                 CapabilityHandler::GithubAppAuthorizeStart,
             ),
             registration(
-                "github.app.authorize.poll",
+                "vcs.github.app.authorize.poll",
                 "轮询 GitHub App 授权",
                 "用设备码换取 user token；返回 pending / slow_down 时按 interval 再次调用。授权成功会保存授权事实并返回可用安装列表。",
                 "local_write",
@@ -1134,7 +1151,7 @@ impl CapabilityGateway {
                 CapabilityHandler::GithubAppAuthorizePoll,
             ),
             registration(
-                "github.app.installations",
+                "vcs.github.app.installation.list",
                 "列出 GitHub App 安装",
                 "列出当前用户可用的 GitHub App 安装（组织或个人），供绑定发布目标。",
                 "read_only",
@@ -1142,7 +1159,7 @@ impl CapabilityGateway {
                 CapabilityHandler::GithubAppInstallations,
             ),
             registration(
-                "github.app.installation.select",
+                "vcs.github.app.installation.select",
                 "绑定 GitHub App 安装",
                 "绑定选定的安装；之后的发布、安装与私仓读取都使用该安装签发的短期令牌。",
                 "local_write",
@@ -1688,7 +1705,7 @@ impl CapabilityGateway {
                 CapabilityHandler::WorkflowCandidateFreeze,
             ),
             registration(
-                "inner_admin.login_status",
+                "network.inner-admin.login.status",
                 "内网登录状态",
                 "读取本机保存的内网管理系统登录状态摘要，不返回明文凭据。",
                 "read_only",
@@ -1696,7 +1713,7 @@ impl CapabilityGateway {
                 CapabilityHandler::InnerAdminLoginStatus,
             ),
             registration(
-                "scan.projects",
+                "workspace.project.scan",
                 "扫描本机项目",
                 "按本机扫描根目录和可选项目目标识别 Unity、Unreal 或通用工程候选。",
                 "read_only",
@@ -1722,7 +1739,7 @@ impl CapabilityGateway {
                 CapabilityHandler::ScanProjects,
             ),
             registration(
-                "inner_admin.sync_exhibits",
+                "network.inner-admin.exhibit.sync",
                 "同步内网展项",
                 "登录内网管理系统并同步当前用户待上传展项及工程信息。",
                 "network_write",
@@ -1730,7 +1747,7 @@ impl CapabilityGateway {
                 CapabilityHandler::InnerAdminSyncExhibits,
             ),
             registration(
-                "upload.code",
+                "workspace.code.upload",
                 "上传代码包",
                 "按工程目录生成代码归档并分片上传到内网管理系统。",
                 "network_write",
@@ -1749,7 +1766,7 @@ impl CapabilityGateway {
                 CapabilityHandler::UploadCode,
             ),
             registration(
-                "upload.placeholder",
+                "workspace.placeholder.upload",
                 "上传占位文件",
                 "生成占位说明文件并上传到内网管理系统。",
                 "network_write",
@@ -1786,7 +1803,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SmbUpload,
             ),
             registration(
-                "system.open_folder",
+                "system.folder.open",
                 "打开本机文件夹",
                 "用系统文件管理器打开指定本机目录。",
                 "local_action",
@@ -1799,7 +1816,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SystemOpenFolder,
             ),
             registration(
-                "filesystem.delete",
+                "system.filesystem.delete",
                 "删除本机文件或目录",
                 "高风险删除能力。默认只生成删除预览；必须显式 permanent=true，并通过桌面审批后才会执行。系统目录、Agent 数据目录和根目录永远拒绝。",
                 "R3",
@@ -1816,7 +1833,7 @@ impl CapabilityGateway {
                 CapabilityHandler::FilesystemDelete,
             ),
             registration(
-                "exhibit.workspace.build",
+                "workspace.exhibit.build",
                 "构建展项工作区",
                 "使用检测到的 Unity/Unreal 原生工具链构建工程；项目脚本仅在显式选择 script 时执行。",
                 "local_action",
@@ -1841,7 +1858,7 @@ impl CapabilityGateway {
                 CapabilityHandler::WorkspaceBuild,
             ),
             registration(
-                "exhibit.workspace.build.status",
+                "workspace.exhibit.build.status",
                 "读取工程构建状态",
                 "读取本机工程构建任务的状态和最近日志。",
                 "read_only",
@@ -1854,7 +1871,7 @@ impl CapabilityGateway {
                 CapabilityHandler::WorkspaceBuildStatus,
             ),
             registration(
-                "exhibit.workspace.build.cancel",
+                "workspace.exhibit.build.cancel",
                 "取消工程构建",
                 "停止本机工程构建任务及其子进程。",
                 "local_action",
@@ -1867,7 +1884,7 @@ impl CapabilityGateway {
                 CapabilityHandler::WorkspaceBuildCancel,
             ),
             registration(
-                "exhibit.workspace.status.local",
+                "workspace.exhibit.status",
                 "读取本机工程状态",
                 "检查本机工程目录、引擎编辑器和构建入口是否可用。",
                 "read_only",
@@ -1901,7 +1918,7 @@ impl CapabilityGateway {
                 CapabilityHandler::WorkspaceOpen,
             ),
             registration(
-                "remote.connect",
+                "device.remote.connect",
                 "连接远程设备",
                 "使用本机配置的远程客户端连接指定设备。",
                 "local_action",
@@ -1938,7 +1955,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnConnectionTest,
             ),
             registration(
-                "exhibit.workspace.checkout",
+                "svn.exhibit.workspace.checkout",
                 "检出展项工作区",
                 "使用本机 SVN 连接将仓库路径检出到经过校验的绝对目录。",
                 "network_write",
@@ -1956,7 +1973,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnWorkspaceCheckout,
             ),
             registration(
-                "exhibit.workspace.status",
+                "svn.exhibit.workspace.status",
                 "读取展项工作区状态",
                 "读取本机 SVN 工作副本的仓库地址、revision 和本地变更数量。",
                 "read_only",
@@ -1982,7 +1999,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnWorkspaceStatus,
             ),
             registration(
-                "exhibit.migration_source.scan",
+                "workspace.exhibit.migration.scan",
                 "扫描历史展项工程",
                 "只读扫描本机历史工程，返回规模、引擎、来源仓库和指纹，不返回绝对路径。",
                 "read_only",
@@ -1995,7 +2012,7 @@ impl CapabilityGateway {
                 CapabilityHandler::MigrationSourceScan,
             ),
             registration(
-                "exhibit.workspace.update",
+                "svn.exhibit.workspace.update",
                 "更新展项工作区",
                 "使用本机 SVN 连接更新指定工作副本。",
                 "network_write",
@@ -2008,7 +2025,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnWorkspaceUpdate,
             ),
             registration(
-                "exhibit.workspace.open",
+                "workspace.exhibit.open",
                 "打开展项 SVN 日志",
                 "使用 TortoiseSVN 打开指定工作副本的日志窗口。",
                 "local_action",
@@ -2075,7 +2092,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnExhibitRepositoryClone,
             ),
             registration(
-                "exhibit.repository.import_local",
+                "workspace.exhibit.repository.import",
                 "导入本地展项工程",
                 "使用当前用户的个人 SVN 凭据将本地工程迁移到目标展项 SVN 仓库，并保留可验证的忽略规则、属性和外部依赖。",
                 "network_write",
@@ -2449,7 +2466,7 @@ impl CapabilityGateway {
                 CapabilityHandler::ExtensionReviewDecide,
             ),
             registration_versioned(
-                "software.distribution.release.publish",
+                "distribution.release.publish",
                 "1.1.0",
                 "发布软件版本",
                 "使用 Agent 内部短时委托身份创建软件产品、上传制品并发布版本；AI 和插件均无法读取凭据。",
@@ -2672,13 +2689,16 @@ impl CapabilityGateway {
                 }),
                 CapabilityHandler::DashboardKnowledgeSearch,
             ),
-            media_registration("media.image.generate", "生成图片", "根据提示词生成图片，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("image".into(), "generate".into())),
-            media_registration("media.image.edit", "编辑图片", "根据提示词和参考图片编辑图像，返回可查询的媒体任务。", "network_write", media_generate_schema(true), CapabilityHandler::MediaSubmit("image".into(), "edit".into())),
-            media_registration("media.video.generate", "生成视频", "根据提示词和可选参考素材生成视频，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("video".into(), "generate".into())),
-            media_registration("media.audio.speech", "生成语音", "将文案合成为语音，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("speech".into(), "generate".into())),
-            media_registration("media.audio.transcribe", "语音转写", "转写已上传的音频文件，返回可查询的媒体任务。", "network_write", media_transcribe_schema(), CapabilityHandler::MediaSubmit("transcription".into(), "transcribe".into())),
-            media_registration("media.job.get", "查看媒体任务", "查看图片、视频或语音任务的状态和输出文件。", "read_only", media_job_schema(), CapabilityHandler::MediaJobGet),
-            media_registration("media.job.cancel", "取消媒体任务", "取消仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
+            // 命名规则：`media.*` 属于 Agent 本机能力（用户自己的服务与 Key），
+            // 工作台提供的媒体通道统一放在 `workbench.media.*` 下。
+            local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，独立模式同样可用。", "local_write", media_image_generate_local_schema(), CapabilityHandler::MediaImageGenerateLocal),
+            media_registration("workbench.media.image.generate", "生成图片（工作台）", "由 AI 工作台媒体通道根据提示词生成图片，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("image".into(), "generate".into())),
+            media_registration("workbench.media.image.edit", "编辑图片（工作台）", "由 AI 工作台媒体通道根据提示词和参考图片编辑图像，返回可查询的媒体任务。", "network_write", media_generate_schema(true), CapabilityHandler::MediaSubmit("image".into(), "edit".into())),
+            media_registration("workbench.media.video.generate", "生成视频（工作台）", "由 AI 工作台媒体通道根据提示词和可选参考素材生成视频，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("video".into(), "generate".into())),
+            media_registration("workbench.media.audio.speech", "生成语音（工作台）", "由 AI 工作台媒体通道将文案合成为语音，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("speech".into(), "generate".into())),
+            media_registration("workbench.media.audio.transcribe", "语音转写（工作台）", "由 AI 工作台媒体通道转写已上传的音频文件，返回可查询的媒体任务。", "network_write", media_transcribe_schema(), CapabilityHandler::MediaSubmit("transcription".into(), "transcribe".into())),
+            media_registration("workbench.media.job.get", "查看工作台媒体任务", "查看工作台图片、视频或语音任务的状态和输出文件。", "read_only", media_job_schema(), CapabilityHandler::MediaJobGet),
+            media_registration("workbench.media.job.cancel", "取消工作台媒体任务", "取消工作台上仍在排队或执行中的媒体任务。", "network_write", media_job_schema(), CapabilityHandler::MediaJobCancel),
         ];
 
         for mut item in builtins {
@@ -2905,6 +2925,12 @@ impl CapabilityGateway {
         input: Value,
         mut execution: Option<&mut CapabilityExecutionContext<'_>>,
     ) -> Result<Value, Box<dyn Error>> {
+        // 工作台媒体能力已从 `media.*` 迁移到 `workbench.media.*`；旧 ID 只在调用
+        // 侧解析，不再进入能力目录，避免把废弃命名继续当成公开契约。
+        let capability_id: &str = match capability_id_aliases(capability_id) {
+            Some(target) => target,
+            None => capability_id,
+        };
         if is_svn_admin_capability(capability_id) {
             return Err("集中 SVN 管理能力仅由 Edge Worker 执行".into());
         }
@@ -3429,6 +3455,16 @@ impl CapabilityGateway {
                 let models = crate::store::ai_services::list_models(id)?;
                 Ok(serde_json::json!({ "service_id": id, "models": models }))
             }
+            CapabilityHandler::AIServiceImageSet => {
+                let id = input
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let selected = crate::store::ai_services::set_image_service(id)?;
+                Ok(serde_json::json!({
+                    "image_service_id": selected.map(|service| service.id).unwrap_or_default(),
+                }))
+            }
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
             CapabilityHandler::AuthoringPreflight => self.authoring_preflight(input),
             CapabilityHandler::ExtensionWorkspaceCurrent => {
@@ -3502,7 +3538,7 @@ impl CapabilityGateway {
                     "authorization": authorization,
                     "next_steps": [
                         "在浏览器打开 verification_uri 并输入 user_code",
-                        "按 interval 周期调用 github.app.authorize.poll，直到返回 authorized"
+                        "按 interval 周期调用 vcs.github.app.authorize.poll，直到返回 authorized"
                     ]
                 }))
             }
@@ -3534,7 +3570,7 @@ impl CapabilityGateway {
                             "state": "authorized",
                             "installations": installations,
                             "next_steps": [
-                                "调用 github.app.installation.select 绑定发布用的安装"
+                                "调用 vcs.github.app.installation.select 绑定发布用的安装"
                             ]
                         }))
                     }
@@ -3554,7 +3590,7 @@ impl CapabilityGateway {
             }
             CapabilityHandler::GithubAppInstallations => {
                 let state = crate::store::github_credentials::app_state()?
-                    .ok_or("GitHub App 尚未授权，请先调用 github.app.authorize.start")?;
+                    .ok_or("GitHub App 尚未授权，请先调用 vcs.github.app.authorize.start")?;
                 Ok(json!({
                     "installations": crate::app::github_app::list_installations(&state.user_token)?,
                 }))
@@ -3567,11 +3603,11 @@ impl CapabilityGateway {
                     .filter(|value| !value.is_empty())
                     .ok_or("installation_id is required")?;
                 let state = crate::store::github_credentials::app_state()?
-                    .ok_or("GitHub App 尚未授权，请先调用 github.app.authorize.start")?;
+                    .ok_or("GitHub App 尚未授权，请先调用 vcs.github.app.authorize.start")?;
                 let selected = crate::app::github_app::list_installations(&state.user_token)?
                     .into_iter()
                     .find(|item| item.id == installation_id)
-                    .ok_or("未找到该安装，请先调用 github.app.installations")?;
+                    .ok_or("未找到该安装，请先调用 vcs.github.app.installation.list")?;
                 crate::app::github_app::select_installation(&selected)?;
                 Ok(json!({
                     "state": "ready",
@@ -4046,6 +4082,9 @@ impl CapabilityGateway {
             }
             CapabilityHandler::MediaJobGet => crate::api::media::get(&self.options, input),
             CapabilityHandler::MediaJobCancel => crate::api::media::cancel(&self.options, input),
+            CapabilityHandler::MediaImageGenerateLocal => {
+                crate::app::local_image::generate(&input)
+            }
             CapabilityHandler::PluginCapability(id) => {
                 validate_mcp_capability_workspace(context, &id, &input)?;
                 let output = invoke_plugin_capability(
@@ -5015,7 +5054,7 @@ impl CapabilityGateway {
             return Ok(None);
         }
         // A non-permanent filesystem call is a read-only deletion preview.
-        if descriptor.id == "filesystem.delete"
+        if descriptor.id == "system.filesystem.delete"
             && !input
                 .get("permanent")
                 .and_then(Value::as_bool)
@@ -5345,7 +5384,7 @@ impl CapabilityGateway {
         validate_distribution_publish_request(&request)?;
         validate_mcp_capability_workspace(
             context,
-            "software.distribution.release.publish",
+            "distribution.release.publish",
             &serde_json::json!({ "workspace_root": request.workspace_root.clone() }),
         )?;
         let verified = verify_inspection_receipt(context, &request)?;
@@ -6072,10 +6111,10 @@ fn should_record_agent_core_run(capability_id: &str) -> bool {
     !matches!(
         capability_id,
         "system.health"
-            | "capability.catalog.search"
-            | "capability.catalog.describe"
-            | "capability.catalog.activate"
-            | "capability.catalog.invoke"
+            | "system.capability.search"
+            | "system.capability.describe"
+            | "system.capability.activate"
+            | "system.capability.invoke"
     )
 }
 
@@ -6090,7 +6129,7 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         "extension.review.queue" | "extension.review.get" | "extension.review.decide" => {
             Some(crate::api::oauth::RELEASE_MANAGE_SCOPE)
         }
-        "software.distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
+        "distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
         "context.resolve" | "work.my_summary" => {
             Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
         }
@@ -6136,13 +6175,13 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         "operation.get" => Some(crate::api::oauth::OPERATION_READ_SCOPE),
         "operation.cancel" => Some(crate::api::oauth::OPERATION_CANCEL_SCOPE),
         "knowledge.search.v1" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
-        "media.image.generate"
-        | "media.image.edit"
-        | "media.video.generate"
-        | "media.audio.speech"
-        | "media.audio.transcribe" => Some(crate::api::oauth::MEDIA_SUBMIT_SCOPE),
-        "media.job.get" => Some(crate::api::oauth::MEDIA_READ_SCOPE),
-        "media.job.cancel" => Some(crate::api::oauth::MEDIA_CANCEL_SCOPE),
+        "workbench.media.image.generate"
+        | "workbench.media.image.edit"
+        | "workbench.media.video.generate"
+        | "workbench.media.audio.speech"
+        | "workbench.media.audio.transcribe" => Some(crate::api::oauth::MEDIA_SUBMIT_SCOPE),
+        "workbench.media.job.get" => Some(crate::api::oauth::MEDIA_READ_SCOPE),
+        "workbench.media.job.cancel" => Some(crate::api::oauth::MEDIA_CANCEL_SCOPE),
         _ => None,
     }
 }
@@ -6995,7 +7034,7 @@ fn validate_mcp_capability_workspace(
         capability_id,
         "software.distribution.project.inspect"
             | "software.distribution.artifact.inspect"
-            | "software.distribution.release.publish"
+            | "distribution.release.publish"
     );
     if !extension_scoped && !software_scoped {
         return Ok(());
@@ -7428,6 +7467,173 @@ fn media_registration(
     item
 }
 
+/// 已退役的能力 ID → 新 ID（ADR 0119 生命周期）。
+///
+/// 别名只做**调用侧解析**：不参与发现、不进入 `tools/list`、不写进能力目录，
+/// 因此旧 Skill / 旧客户端在过渡期仍能调用，而命名契约只暴露新 ID。
+/// 保留窗口：至少 2 个发布周期；退役 ID 永久禁止复用。
+fn capability_id_aliases(capability_id: &str) -> Option<&'static str> {
+    match capability_id.trim() {
+        // 媒体：`media.*` 由工作台交还 Agent 本机，工作台通道迁到 `workbench.media.*`。
+        "media.image.edit" => Some("workbench.media.image.edit"),
+        "media.video.generate" => Some("workbench.media.video.generate"),
+        "media.audio.speech" => Some("workbench.media.audio.speech"),
+        "media.audio.transcribe" => Some("workbench.media.audio.transcribe"),
+        "media.job.get" => Some("workbench.media.job.get"),
+        "media.job.cancel" => Some("workbench.media.job.cancel"),
+        // 命名收敛 P1（硬违规批次，2026-10-12）。
+        "ai.service.custom.list_models" => Some("ai.service.custom.model.list"),
+        "exhibit.migration_source.scan" => Some("workspace.exhibit.migration.scan"),
+        "exhibit.repository.import_local" => Some("workspace.exhibit.repository.import"),
+        "inner_admin.login_status" => Some("network.inner-admin.login.status"),
+        "inner_admin.sync_exhibits" => Some("network.inner-admin.exhibit.sync"),
+        "mcp.registration.apply_all" => Some("mcp.registration.apply-all"),
+        "mcp.registration.remove_all" => Some("mcp.registration.remove-all"),
+        "system.open_folder" => Some("system.folder.open"),
+        // 命名收敛 P2（域收敛批次，2026-10-12）。
+        "exhibit.workspace.build" => Some("workspace.exhibit.build"),
+        "exhibit.workspace.build.cancel" => Some("workspace.exhibit.build.cancel"),
+        "exhibit.workspace.build.status" => Some("workspace.exhibit.build.status"),
+        "exhibit.workspace.open" => Some("workspace.exhibit.open"),
+        "exhibit.workspace.status.local" => Some("workspace.exhibit.status"),
+        "exhibit.workspace.checkout" => Some("svn.exhibit.workspace.checkout"),
+        "exhibit.workspace.status" => Some("svn.exhibit.workspace.status"),
+        "exhibit.workspace.update" => Some("svn.exhibit.workspace.update"),
+        "filesystem.delete" => Some("system.filesystem.delete"),
+        "remote.connect" => Some("device.remote.connect"),
+        "github.account.get" => Some("vcs.github.account.get"),
+        "github.account.remove" => Some("vcs.github.account.remove"),
+        "github.account.set" => Some("vcs.github.account.set"),
+        "github.app.authorize.poll" => Some("vcs.github.app.authorize.poll"),
+        "github.app.authorize.start" => Some("vcs.github.app.authorize.start"),
+        "github.app.installation.select" => Some("vcs.github.app.installation.select"),
+        "github.app.installations" => Some("vcs.github.app.installation.list"),
+        "scan.projects" => Some("workspace.project.scan"),
+        "upload.code" => Some("workspace.code.upload"),
+        "upload.placeholder" => Some("workspace.placeholder.upload"),
+        "software.distribution.release.publish" => Some("distribution.release.publish"),
+        _ => None,
+    }
+}
+
+/// 能力 ID 命名规范（ADR 0119）的硬规则实现。
+///
+/// 只做机械可判定的部分：分隔符/字符集、段数与长度、版本后缀、重复段。
+/// 领域与动作词表属于评审规则，不在这里硬编码，避免把历史命名空间一次判死。
+fn capability_id_naming_violations(id: &str) -> Vec<&'static str> {
+    let rules = capability_naming_rules();
+    let max_len = rules["id"]["maxLength"].as_u64().unwrap_or(48) as usize;
+    let min_segments = rules["id"]["minSegments"].as_u64().unwrap_or(2) as usize;
+    let max_segments = rules["id"]["maxSegments"].as_u64().unwrap_or(5) as usize;
+    let domains: Vec<&str> = rules["domains"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut violations = Vec::new();
+    if id.is_empty() || id.len() > max_len {
+        violations.push("长度超出规则文件上限（contracts/capability-naming-rules.json）");
+    }
+    if id.contains('_') {
+        violations.push("不得使用下划线：层级用 `.`，词内复合用 `-`");
+    }
+    let segments: Vec<&str> = id.split('.').collect();
+    if !(min_segments..=max_segments).contains(&segments.len()) {
+        violations.push("段数超出规则文件区间");
+    }
+    for segment in &segments {
+        let valid = !segment.is_empty()
+            && segment.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
+            && !segment.ends_with('-')
+            && segment
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+        if !valid {
+            violations.push("每段必须小写，以字母开头，只含字母/数字/连字符");
+            break;
+        }
+    }
+    if let (Some(first), false) = (segments.first(), domains.is_empty()) {
+        if !domains.contains(first) {
+            violations.push("首段必须是 ADR 0119 领域注册表中的边界");
+        }
+    }
+    if let Some(last) = segments.last() {
+        let version = last
+            .strip_prefix('v')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()));
+        if version {
+            violations.push("版本不得进入能力 ID，请使用 version 字段");
+        }
+    }
+    for window in segments.windows(2) {
+        if window[0] == window[1] {
+            violations.push("不得出现重复段");
+            continue;
+        }
+        // 按 `-` 分词比较，避免用子串判等（`tar-get` 会误伤 `get`）。
+        let parent: Vec<&str> = window[0].split('-').collect();
+        let child: Vec<&str> = window[1].split('-').collect();
+        if child.iter().any(|token| parent.contains(token)) {
+            violations.push("子段与父段语义重复");
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+/// 能力 ID 命名规则的机器可读事实源（ADR 0119）。
+///
+/// 内核、插件校验器与 Dashboard 目录校验共读同一份文件，避免三处各写一套。
+const CAPABILITY_NAMING_RULES_JSON: &str =
+    include_str!("../../contracts/capability-naming-rules.json");
+
+fn capability_naming_rules() -> &'static Value {
+    static RULES: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        serde_json::from_str(CAPABILITY_NAMING_RULES_JSON)
+            .expect("contracts/capability-naming-rules.json 必须是合法 JSON")
+    })
+}
+
+/// 命名边界与可见性必须一致：`media.*` ⇒ local、`workbench.*` ⇒ control_plane。
+fn capability_boundary_availability_violation(id: &str, availability: &str) -> Option<String> {
+    let rules = capability_naming_rules();
+    for rule in rules["boundaryRules"].as_array()? {
+        let prefix = rule["prefix"].as_str()?;
+        if id.starts_with(prefix) {
+            let expected = rule["availability"].as_str()?;
+            if availability != expected {
+                return Some(format!(
+                    "边界 `{prefix}` 的可见性必须是 `{expected}`，实际 `{availability}`"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 待整改的历史内置能力 ID → 目标 ID（**只允许减少**）。
+///
+/// 改好一个就从这里删一个；新增能力不得加入此清单，否则门禁失败。
+const LEGACY_CAPABILITY_ID_MIGRATIONS: &[(&str, &str)] = &[
+];
+/// 本机生图能力：与 `media_registration` 共用媒体命名空间，但服务源是本机自定义
+/// AI 服务，不经过 AI 工作台，因此在独立模式下也必须保持可见可用。
+fn local_media_registration(
+    id: &str,
+    name: &str,
+    description: &str,
+    risk_level: &str,
+    input_schema: Value,
+    handler: CapabilityHandler,
+) -> CapabilityRegistration {
+    let mut item = registration(id, name, description, risk_level, input_schema, handler);
+    item.descriptor.source = "builtin:himind-media".to_string();
+    item.descriptor.availability = CapabilityAvailability::Local;
+    item
+}
+
 fn media_generate_schema(reference_required: bool) -> Value {
     let mut required = vec!["prompt"];
     if reference_required {
@@ -7456,6 +7662,67 @@ fn media_generate_schema(reference_required: bool) -> Value {
             "agent_run_id":{"type":"string"}
         },
         "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn media_image_generate_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8000,
+                "description": "图片描述（提示词）"
+            },
+            "service": {
+                "type": "string",
+                "maxLength": 80,
+                "description": "服务源：custom:<id>；留空表示使用当前激活的本机 AI 服务"
+            },
+            "model": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "生图模型；留空表示使用服务配置的 image_model"
+            },
+            "size": {
+                "type": "string",
+                "maxLength": 32,
+                "description": "图片尺寸，如 1024x1024"
+            },
+            "quality": {
+                "type": "string",
+                "maxLength": 32,
+                "description": "质量档位，如 high / medium / low"
+            },
+            "n": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4,
+                "description": "生成张数，默认 1"
+            },
+            "output_dir": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "保存目录（绝对路径）；留空保存到工作区 .himind/media"
+            },
+            "filename": {
+                "type": "string",
+                "maxLength": 120,
+                "description": "文件名前缀（可选）"
+            },
+            "inline": {
+                "type": "boolean",
+                "description": "是否把图片内联返回给 AI 对话，默认 true"
+            },
+            "parameters": {
+                "type": "object",
+                "description": "provider 专属参数（如火山方舟的 watermark、sequential_image_generation）",
+                "additionalProperties": true
+            }
+        },
+        "required": ["prompt"],
         "additionalProperties": false
     })
 }
@@ -7587,8 +7854,8 @@ mod tests {
         assert!(is_svn_admin_capability("project.repository.create"));
         assert!(is_svn_admin_capability("svn.user.provision"));
         assert!(is_svn_admin_capability("project.repository.archive"));
-        assert!(!is_svn_admin_capability("exhibit.workspace.checkout"));
-        assert!(!is_svn_admin_capability("exhibit.repository.import_local"));
+        assert!(!is_svn_admin_capability("svn.exhibit.workspace.checkout"));
+        assert!(!is_svn_admin_capability("workspace.exhibit.repository.import"));
         assert!(!is_svn_admin_capability(
             "exhibit.repository.initialize_template"
         ));
@@ -8196,7 +8463,7 @@ mod tests {
     #[test]
     fn svn_checkout_reports_long_running_contract() {
         let item = registration(
-            "exhibit.workspace.checkout",
+            "svn.exhibit.workspace.checkout",
             "检出展项工作区",
             "检出 SVN 工作区",
             "network_write",
@@ -8212,14 +8479,14 @@ mod tests {
     fn migrated_dashboard_long_tasks_report_progress_and_cancel_contracts() {
         let handlers = [
             (
-                "inner_admin.sync_exhibits",
+                "network.inner-admin.exhibit.sync",
                 CapabilityHandler::InnerAdminSyncExhibits,
             ),
-            ("upload.code", CapabilityHandler::UploadCode),
-            ("upload.placeholder", CapabilityHandler::UploadPlaceholder),
+            ("workspace.code.upload", CapabilityHandler::UploadCode),
+            ("workspace.placeholder.upload", CapabilityHandler::UploadPlaceholder),
             ("storage.smb.upload", CapabilityHandler::SmbUpload),
             (
-                "exhibit.repository.import_local",
+                "workspace.exhibit.repository.import",
                 CapabilityHandler::SvnExhibitRepositoryImportLocal,
             ),
         ];
@@ -8308,10 +8575,18 @@ mod tests {
         assert!(visible.iter().any(|item| item.id == "system.health"));
         assert!(visible
             .iter()
-            .any(|item| item.id == "exhibit.workspace.status.local"));
+            .any(|item| item.id == "workspace.exhibit.status"));
         assert!(visible.iter().any(|item| item.id == "svn.connection.test"));
         assert!(!visible.iter().any(|item| item.id == "context.resolve"));
-        assert!(!visible.iter().any(|item| item.id == "media.image.generate"));
+        // 本机生图只依赖用户自己的 OpenAI 兼容服务，不经过 AI 工作台，
+        // 因此独立模式必须保持可见、可用。
+        assert!(visible
+            .iter()
+            .any(|item| item.id == "media.image.generate"));
+        // 工作台媒体通道在独立模式下整体不可见。
+        assert!(!visible
+            .iter()
+            .any(|item| item.id.starts_with("workbench.media.")));
         for capability_id in [
             "svn.user.provision",
             "project.repository.create",
@@ -8372,7 +8647,13 @@ mod tests {
             .any(|item| { is_svn_admin_capability(&item.id) }));
         assert!(visible.iter().any(|item| item.id == "system.health"));
         assert!(visible.iter().any(|item| item.id == "context.resolve"));
+        // 本机生图在已对接模式下同样可见（服务源是用户自己的服务）。
         assert!(visible.iter().any(|item| item.id == "media.image.generate"));
+        // 工作台媒体通道只在已对接模式投影，且不与 media.* 抢命名。
+        assert!(visible
+            .iter()
+            .any(|item| item.id == "workbench.media.video.generate"));
+        assert!(!visible.iter().any(|item| item.id == "media.video.generate"));
         for capability_id in [
             "ai.client.list",
             "ai.client.status",
@@ -8406,7 +8687,7 @@ mod tests {
             "ai.service.list",
             "ai.service.custom.upsert",
             "ai.service.custom.remove",
-            "ai.service.custom.list_models",
+            "ai.service.custom.model.list",
         ] {
             assert!(
                 visible.iter().any(|item| item.id == capability_id),
@@ -8710,5 +8991,275 @@ mod tests {
         validate_mcp_capability_workspace(&mcp, "software.distribution.artifact.inspect", &input)
             .unwrap();
         let _ = std::fs::remove_dir_all(input["workspace_root"].as_str().unwrap());
+    }
+
+    #[test]
+    fn local_image_generation_invokes_the_local_openai_compatible_service() {
+        use std::io::{Read as _, Write as _};
+
+        const TINY_PNG_B64: &str =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&received);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                let mut buffer = [0u8; 8192];
+                let mut captured_text = String::new();
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            captured_text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                *captured.lock().unwrap() = captured_text;
+                let body = format!("{{\"data\":[{{\"b64_json\":\"{TINY_PNG_B64}\"}}]}}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "himind-local-image-invoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+
+        let result = (|| -> Result<serde_json::Value, Box<dyn Error>> {
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "local-image".to_string(),
+                display_name: "本机生图".to_string(),
+                base_url: format!("http://{address}/v1"),
+                protocol: crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+                model: "chat-model".to_string(),
+                models: vec!["chat-model".to_string()],
+                image_model: "image-model".to_string(),
+                image_adapter: String::new(),
+                api_key: "sk-test-image".to_string(),
+            })
+            .unwrap();
+            crate::store::ai_services::set_active("local-image").unwrap();
+
+            let mut options = crate::Options::from_env();
+            options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+            let gateway =
+                CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+            gateway.invoke(
+                &InvocationContext::new(
+                    crate::capability::types::InvocationSource::LocalHttp,
+                    "local-user",
+                ),
+                "media.image.generate",
+                json!({
+                    "prompt": "一只猫",
+                    "output_dir": root.join("images").to_string_lossy(),
+                    "inline": false,
+                }),
+            )
+        })();
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+
+        let value = result.expect("本机生图能力应能完成一次生成");
+        assert_eq!(value["mode"], "local");
+        assert_eq!(value["model"], "image-model");
+        let path = std::path::PathBuf::from(value["files"][0]["path"].as_str().unwrap());
+        assert!(path.is_file(), "生成的图片必须落盘：{}", path.display());
+        assert!(received
+            .lock()
+            .unwrap()
+            .contains("/v1/images/generations"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn naming_spec_helper_accepts_elegant_ids_and_flags_the_rest() {
+        for id in [
+            "media.image.generate",
+            "workbench.media.video.generate",
+            "business.project.create",
+            "extension.distribution.target.get",
+            "system.capability.search",
+            "workspace.exhibit.checkout",
+        ] {
+            assert!(
+                capability_id_naming_violations(id).is_empty(),
+                "`{id}` 应当合规：{:?}",
+                capability_id_naming_violations(id)
+            );
+        }
+        for (id, expected) in [
+            ("work-log.project.mapPath", "每段必须小写"),
+            ("work-log.project.map_path", "不得使用下划线"),
+            ("knowledge.search.v1", "版本不得进入能力 ID"),
+            ("extension.workspace.workspace", "不得出现重复段"),
+            ("media-library.library.search", "子段与父段语义重复"),
+            ("one.two.three.four.five.six", "段数超出规则文件区间"),
+            // 插件命名空间不在内核领域注册表里：由插件校验器按 capability_namespace 单独校验。
+            ("work-log.project.path.set", "首段必须是 ADR 0119 领域注册表中的边界"),
+        ] {
+            let rules = capability_id_naming_violations(id);
+            assert!(
+                rules.iter().any(|rule| rule.contains(expected)),
+                "`{id}` 应当命中「{expected}」，实际：{rules:?}"
+            );
+        }
+    }
+    #[test]
+    fn capability_ids_obey_the_naming_spec() {
+        // 固定 Connected 模式：ControlPlane 能力只在已对接模式下可见，若跟随进程
+        // 全局模式，用例会随其他测试的切换而漏检一半能力。
+        let mut options = crate::Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let descriptors = gateway
+            .list_capabilities(&InvocationContext::new(
+                crate::capability::types::InvocationSource::LocalHttp,
+                "naming-spec",
+            ))
+            .expect("capability registry");
+
+        // 只校验内核与内建 Provider 的能力；插件能力由插件仓库按同一规范自证。
+        let mut offending: Vec<String> = Vec::new();
+        for descriptor in descriptors
+            .iter()
+            .filter(|item| item.source.starts_with("builtin"))
+        {
+            let rules = capability_id_naming_violations(&descriptor.id);
+            if !rules.is_empty() {
+                offending.push(format!("{} -> {rules:?}", descriptor.id));
+            }
+            // 边界一致性：`media.*` 必须 local，`workbench.*` 必须 control_plane。
+            if let Some(problem) =
+                capability_boundary_availability_violation(&descriptor.id, &descriptor.availability.as_str())
+            {
+                offending.push(format!("{} -> {problem}", descriptor.id));
+            }
+        }
+
+        let planned: BTreeMap<&str, &str> = LEGACY_CAPABILITY_ID_MIGRATIONS
+            .iter()
+            .map(|(legacy, target)| (*legacy, *target))
+            .collect();
+
+        for entry in &offending {
+            let id = entry.split(" -> ").next().unwrap_or_default();
+            assert!(
+                planned.contains_key(id),
+                "能力 ID `{id}` 不符合命名规范（ADR 0119）：{entry}"
+            );
+        }
+        // 待整改清单只能减少：改好一个就必须从清单里删掉，避免清单腐烂。
+        for (legacy, target) in LEGACY_CAPABILITY_ID_MIGRATIONS {
+            assert!(
+                offending.iter().any(|entry| entry.starts_with(&format!("{legacy} ->"))),
+                "`{legacy}` 现在已经合规，请从待整改清单移除（目标 `{target}`）"
+            );
+            assert!(
+                !offending
+                    .iter()
+                    .any(|entry| entry.starts_with(&format!("{target} ->"))),
+                "目标 ID `{target}` 自己也不合规，先修正清单里的目标"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_ids_resolve_to_the_current_namespace() {
+        for (legacy, current) in [
+            ("media.image.edit", "workbench.media.image.edit"),
+            ("media.video.generate", "workbench.media.video.generate"),
+            ("media.audio.speech", "workbench.media.audio.speech"),
+            ("media.audio.transcribe", "workbench.media.audio.transcribe"),
+            ("media.job.get", "workbench.media.job.get"),
+            ("media.job.cancel", "workbench.media.job.cancel"),
+            ("ai.service.custom.list_models", "ai.service.custom.model.list"),
+            ("exhibit.migration_source.scan", "workspace.exhibit.migration.scan"),
+            ("exhibit.repository.import_local", "workspace.exhibit.repository.import"),
+            ("inner_admin.login_status", "network.inner-admin.login.status"),
+            ("inner_admin.sync_exhibits", "network.inner-admin.exhibit.sync"),
+            ("mcp.registration.apply_all", "mcp.registration.apply-all"),
+            ("mcp.registration.remove_all", "mcp.registration.remove-all"),
+            ("system.open_folder", "system.folder.open"),
+            ("exhibit.workspace.build", "workspace.exhibit.build"),
+            ("exhibit.workspace.build.cancel", "workspace.exhibit.build.cancel"),
+            ("exhibit.workspace.build.status", "workspace.exhibit.build.status"),
+            ("exhibit.workspace.open", "workspace.exhibit.open"),
+            ("exhibit.workspace.status.local", "workspace.exhibit.status"),
+            ("exhibit.workspace.checkout", "svn.exhibit.workspace.checkout"),
+            ("exhibit.workspace.status", "svn.exhibit.workspace.status"),
+            ("exhibit.workspace.update", "svn.exhibit.workspace.update"),
+            ("filesystem.delete", "system.filesystem.delete"),
+            ("remote.connect", "device.remote.connect"),
+            ("github.account.get", "vcs.github.account.get"),
+            ("github.account.remove", "vcs.github.account.remove"),
+            ("github.account.set", "vcs.github.account.set"),
+            ("github.app.authorize.poll", "vcs.github.app.authorize.poll"),
+            ("github.app.authorize.start", "vcs.github.app.authorize.start"),
+            ("github.app.installation.select", "vcs.github.app.installation.select"),
+            ("github.app.installations", "vcs.github.app.installation.list"),
+            ("scan.projects", "workspace.project.scan"),
+            ("upload.code", "workspace.code.upload"),
+            ("upload.placeholder", "workspace.placeholder.upload"),
+            ("software.distribution.release.publish", "distribution.release.publish"),
+        ] {
+            assert_eq!(capability_id_aliases(legacy), Some(current), "{legacy}");
+            // 别名目标本身必须是新规范下的合规 ID。
+            assert!(
+                capability_id_naming_violations(current).is_empty(),
+                "别名目标 `{current}` 不合规：{:?}",
+                capability_id_naming_violations(current)
+            );
+        }
+        // `media.image.generate` 已被本机能力占用，不能被别名劫持。
+        assert_eq!(capability_id_aliases("media.image.generate"), None);
+    }
+    #[test]
+    fn local_image_generation_stays_available_without_the_control_plane() {
+        let mut options = crate::Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let descriptor = gateway
+            .list_capabilities(&InvocationContext::new(
+                crate::capability::types::InvocationSource::Mcp,
+                "ai-client:himind-ai",
+            ))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == "media.image.generate")
+            .expect("本机生图能力必须在独立模式下保持可见");
+
+        assert_eq!(descriptor.risk_level, "local_write");
+        assert_eq!(descriptor.availability, CapabilityAvailability::Local);
+        assert!(
+            descriptor.required_scope.is_none(),
+            "本机生图不走 Dashboard OAuth，不应声明控制面 scope"
+        );
+        assert!(!descriptor.approval_required);
+        assert_eq!(descriptor.execution_mode, "sync");
+        assert_eq!(descriptor.input_schema["required"][0], "prompt");
     }
 }

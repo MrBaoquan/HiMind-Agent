@@ -2598,6 +2598,10 @@ export type CustomAIService = {
     protocol: AIServiceProtocol;
     model: string;
     models: string[];
+    /** 生图模型。留空表示该来源不用于生图。 */
+    image_model: string;
+    /** 生图适配器：空/openai-images = OpenAI Images；ark-images = 火山方舟（豆包）。 */
+    image_adapter: string;
     created_at: string;
     updated_at: string;
 };
@@ -2630,7 +2634,7 @@ export type ManagedAIServiceSummary = {
 };
 
 export type AIServiceListResult = {
-    custom: { services: CustomAIService[]; active_service_id?: string };
+    custom: { services: CustomAIService[]; active_service_id?: string; image_service_id?: string };
     managed: ManagedAIServiceSummary;
     clients: AIProviderImportOverview;
 };
@@ -3034,7 +3038,7 @@ export const agentApi = {
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -3042,9 +3046,12 @@ export const agentApi = {
             protocol: input.protocol,
             model: input.model,
             models: input.models,
+            imageModel: input.image_model,
+            imageAdapter: input.image_adapter,
             apiKey: input.api_key,
         }),
     setActiveAIService: (id: string) => invoke<{ active_service_id: string }>('set_active_ai_service', { id }),
+    setImageAIService: (id: string) => invoke<{ image_service_id: string }>('set_image_ai_service', { id }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
     importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),

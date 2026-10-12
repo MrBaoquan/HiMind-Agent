@@ -64,6 +64,10 @@ pub(crate) struct CustomAIService {
     pub protocol: AIServiceProtocol,
     pub model: String,
     pub models: Vec<String>,
+    /// 生图模型。留空表示该服务不用于生图。
+    pub image_model: String,
+    /// 生图适配器：`openai-images`（默认）或 `ark-images`（火山方舟/豆包）。
+    pub image_adapter: String,
     /// DPAPI 加密后的 API Key，不落明文。
     encrypted_api_key: String,
     pub created_at: String,
@@ -78,6 +82,10 @@ struct PersistedCustomAIService {
     protocol: AIServiceProtocol,
     model: String,
     models: Vec<String>,
+    #[serde(default)]
+    image_model: String,
+    #[serde(default)]
+    image_adapter: String,
     encrypted_api_key: String,
     created_at: String,
     updated_at: String,
@@ -87,6 +95,9 @@ struct PersistedCustomAIService {
 struct PersistedAIServiceSelection {
     #[serde(default)]
     active_service_id: String,
+    /// 生图默认使用的本机服务（`media.image.generate`）。留空表示自动解析。
+    #[serde(default)]
+    image_service_id: String,
 }
 
 impl From<PersistedCustomAIService> for CustomAIService {
@@ -98,6 +109,8 @@ impl From<PersistedCustomAIService> for CustomAIService {
             protocol: value.protocol,
             model: value.model,
             models: value.models,
+            image_model: value.image_model,
+            image_adapter: value.image_adapter,
             encrypted_api_key: value.encrypted_api_key,
             created_at: value.created_at,
             updated_at: value.updated_at,
@@ -114,6 +127,8 @@ impl From<&CustomAIService> for PersistedCustomAIService {
             protocol: value.protocol.clone(),
             model: value.model.clone(),
             models: value.models.clone(),
+            image_model: value.image_model.clone(),
+            image_adapter: value.image_adapter.clone(),
             encrypted_api_key: value.encrypted_api_key.clone(),
             created_at: value.created_at.clone(),
             updated_at: value.updated_at.clone(),
@@ -129,6 +144,12 @@ pub(crate) struct CustomAIServiceInput {
     pub protocol: AIServiceProtocol,
     pub model: String,
     pub models: Vec<String>,
+    /// 生图模型。可留空。
+    #[serde(default)]
+    pub image_model: String,
+    /// 生图适配器（`openai-images` / `ark-images`）。可留空，缺省 `openai-images`。
+    #[serde(default)]
+    pub image_adapter: String,
     /// 写入明文 Key；读取时返回的公开视图不含此字段。
     #[serde(default)]
     pub api_key: String,
@@ -143,6 +164,8 @@ impl CustomAIService {
             "protocol": self.protocol.as_str(),
             "model": self.model,
             "models": self.models,
+            "image_model": self.image_model,
+            "image_adapter": self.image_adapter,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         })
@@ -214,6 +237,7 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
     Ok(serde_json::json!({
         "services": services.iter().map(|item| item.public_json()).collect::<Vec<_>>(),
         "active_service_id": active_id()?.unwrap_or_default(),
+        "image_service_id": image_service_id()?.unwrap_or_default(),
     }))
 }
 
@@ -248,6 +272,8 @@ pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
             .collect(),
+        image_model: input.image_model.trim().to_string(),
+        image_adapter: input.image_adapter.trim().to_string(),
         encrypted_api_key,
         created_at: existing
             .map(|item| item.created_at.clone())
@@ -281,14 +307,98 @@ pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn
     Ok((service.clone(), api_key))
 }
 
-pub(crate) fn active_id() -> Result<Option<String>, Box<dyn Error>> {
+/// 解析本机生图要用的服务与明文 Key。
+///
+/// `service` 为空时按「显式指定的生图服务 → 激活服务（且已配生图模型）→
+/// 唯一一个配了生图模型的服务」解析；否则必须是 `custom:<id>`。
+/// 该解析只读本机状态库（DPAPI 解密），不触碰 AI 工作台。
+pub(crate) fn resolve_image_service(
+    service: &str,
+) -> Result<(CustomAIService, String), Box<dyn Error>> {
+    let service = service.trim();
+    if !service.is_empty() {
+        let id = service.strip_prefix("custom:").ok_or_else(|| {
+            format!("不支持的服务源：{service}；本机生图只接受 custom:<id>，留空表示自动选择")
+        })?;
+        return load_secret(id);
+    }
+    if let Some(id) = image_service_id()? {
+        if let Ok(found) = load_secret(&id) {
+            return Ok(found);
+        }
+    }
+    if let Some((active, api_key)) = active_service_with_secret()? {
+        if !active.image_model.trim().is_empty() {
+            return Ok((active, api_key));
+        }
+    }
+    let candidates = list()?
+        .into_iter()
+        .filter(|item| !item.image_model.trim().is_empty())
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [only] => load_secret(&only.id),
+        [] => Err(
+            "没有配置「生图模型」的本机 AI 服务；请先在「AI 服务」里为某个服务填写生图模型".into(),
+        ),
+        many => Err(format!(
+            "有多个可生图的本机服务，请显式指定 service 或设置默认生图服务：{}",
+            many.iter()
+                .map(|item| format!("custom:{}", item.id))
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+        .into()),
+    }
+}
+
+fn load_selection() -> Result<PersistedAIServiceSelection, Box<dyn Error>> {
     let path = selection_path()?;
     if !path.is_file() {
-        return Ok(None);
+        return Ok(PersistedAIServiceSelection::default());
     }
-    let selection: PersistedAIServiceSelection = serde_json::from_slice(&fs::read(path)?)?;
-    let id = selection.active_service_id.trim();
-    Ok((!id.is_empty()).then(|| id.to_string()))
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_selection(selection: &PersistedAIServiceSelection) -> Result<(), Box<dyn Error>> {
+    crate::store::atomic_file::atomic_write(
+        &selection_path()?,
+        &serde_json::to_vec_pretty(selection)?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn active_id() -> Result<Option<String>, Box<dyn Error>> {
+    let id = load_selection()?.active_service_id.trim().to_string();
+    Ok((!id.is_empty()).then_some(id))
+}
+
+/// 生图默认使用的本机服务；留空表示按「激活服务 → 唯一生图服务」自动解析。
+pub(crate) fn image_service_id() -> Result<Option<String>, Box<dyn Error>> {
+    let id = load_selection()?.image_service_id.trim().to_string();
+    Ok((!id.is_empty()).then_some(id))
+}
+
+/// 指定（或清除）生图默认使用的本机服务；不影响对话使用的激活服务。
+pub(crate) fn set_image_service(id: &str) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    let id = id.trim();
+    let selected = if id.is_empty() {
+        None
+    } else {
+        let id = normalize_id(id)?;
+        Some(
+            load_all()?
+                .remove(&id)
+                .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
+        )
+    };
+    let mut selection = load_selection()?;
+    selection.image_service_id = selected
+        .as_ref()
+        .map(|service| service.id.clone())
+        .unwrap_or_default();
+    write_selection(&selection)?;
+    Ok(selected)
 }
 
 pub(crate) fn active_service() -> Result<Option<CustomAIService>, Box<dyn Error>> {
@@ -318,16 +428,12 @@ pub(crate) fn set_active(id: &str) -> Result<Option<CustomAIService>, Box<dyn Er
                 .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?,
         )
     };
-    let selection = PersistedAIServiceSelection {
-        active_service_id: selected
-            .as_ref()
-            .map(|service| service.id.clone())
-            .unwrap_or_default(),
-    };
-    crate::store::atomic_file::atomic_write(
-        &selection_path()?,
-        &serde_json::to_vec_pretty(&selection)?,
-    )?;
+    let mut selection = load_selection()?;
+    selection.active_service_id = selected
+        .as_ref()
+        .map(|service| service.id.clone())
+        .unwrap_or_default();
+    write_selection(&selection)?;
     Ok(selected)
 }
 
@@ -452,6 +558,8 @@ mod tests {
                 protocol: AIServiceProtocol::OpenaiResponses,
                 model: "gpt-test".to_string(),
                 models: vec!["gpt-test".to_string(), "gpt-test-2".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
                 api_key: "sk-test-secret-123".to_string(),
             };
             let saved = super::upsert(input).expect("upsert custom service");
@@ -486,6 +594,8 @@ mod tests {
                 protocol: AIServiceProtocol::OpenaiChat,
                 model: "model-a".to_string(),
                 models: vec!["model-a".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
                 api_key: "sk-original".to_string(),
             })
             .expect("create service");
@@ -496,6 +606,8 @@ mod tests {
                 protocol: AIServiceProtocol::OpenaiResponses,
                 model: "model-b".to_string(),
                 models: vec!["model-b".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
                 api_key: String::new(),
             })
             .expect("update service without rotating key");
@@ -517,6 +629,8 @@ mod tests {
                     protocol: AIServiceProtocol::OpenaiChat,
                     model: "model-a".to_string(),
                     models: vec!["model-a".to_string()],
+                    image_model: String::new(),
+                    image_adapter: String::new(),
                     api_key: format!("sk-{id}"),
                 })
                 .expect("create service");
@@ -543,6 +657,57 @@ mod tests {
     }
 
     #[test]
+    fn image_service_selection_is_independent_from_the_chat_service() {
+        with_isolated_home(|| {
+            super::upsert(CustomAIServiceInput {
+                id: "chat-only".to_string(),
+                display_name: "纯对话".to_string(),
+                base_url: "https://chat.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiChat,
+                model: "chat-model".to_string(),
+                models: vec!["chat-model".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                api_key: "sk-chat".to_string(),
+            })
+            .expect("chat service");
+            super::upsert(CustomAIServiceInput {
+                id: "image-only".to_string(),
+                display_name: "豆包生图".to_string(),
+                base_url: "https://ark.example/api/v3".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "doubao-seed".to_string(),
+                models: vec!["doubao-seed".to_string()],
+                image_model: "doubao-seedream-5-0-pro".to_string(),
+                image_adapter: "ark-images".to_string(),
+                api_key: "sk-image".to_string(),
+            })
+            .expect("image service");
+
+            super::set_active("chat-only").unwrap();
+            // 激活服务没有生图模型时，唯一配了生图模型的服务会自动兜底。
+            let (service, _) = super::resolve_image_service("").expect("auto fallback");
+            assert_eq!(service.id, "image-only");
+            assert_eq!(service.image_adapter, "ark-images");
+
+            super::set_image_service("image-only").unwrap();
+            assert_eq!(
+                super::image_service_id().unwrap().as_deref(),
+                Some("image-only")
+            );
+            // 切换对话服务不得清掉生图服务。
+            super::set_active("chat-only").unwrap();
+            assert_eq!(
+                super::image_service_id().unwrap().as_deref(),
+                Some("image-only")
+            );
+            let (explicit, _) =
+                super::resolve_image_service("custom:image-only").expect("explicit service");
+            assert_eq!(explicit.id, "image-only");
+        });
+    }
+
+    #[test]
     fn rejects_invalid_service_input() {
         assert!(validate_base_url("file:///etc/passwd").is_err());
         assert!(validate_base_url("https://user:pass@host/v1").is_err());
@@ -554,6 +719,8 @@ mod tests {
             protocol: AIServiceProtocol::OpenaiChat,
             model: "m".to_string(),
             models: Vec::new(),
+            image_model: String::new(),
+            image_adapter: String::new(),
             api_key: "k".to_string(),
         };
         let err = super::upsert(invalid).err().expect("must reject");

@@ -21,11 +21,11 @@
 
 ## 执行语义
 
-这是一个单步骤工作流，步骤以 `wait=true` 调用 `exhibit.workspace.build`：
+这是一个单步骤工作流，步骤以 `wait=true` 调用 `workspace.exhibit.build`：
 能力启动构建进程后阻塞等待终态，因此工作流运行态与真实构建一致，失败时日志尾部会带在结果里。
 
-需要取消正在跑的构建时，用 `exhibit.workspace.build.cancel` 传 `job_id`。
+需要取消正在跑的构建时，用 `workspace.exhibit.build.cancel` 传 `job_id`。
 
 ## 依赖
 
-仅使用 Agent 内置能力 `exhibit.workspace.build`，无插件、连接器与运行时依赖。
+仅使用 Agent 内置能力 `workspace.exhibit.build`，无插件、连接器与运行时依赖。

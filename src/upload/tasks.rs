@@ -25,7 +25,7 @@ pub(crate) fn execute_upload_code(
     let mut cancel_guard = TaskCancelGuard::new();
     let mut execution_context = CapabilityExecutionContext::new(
         task.id.clone(),
-        "upload.code",
+        "workspace.code.upload",
         payload
             .and_then(|value| value.get("source_path"))
             .and_then(Value::as_str)
@@ -519,7 +519,7 @@ pub(crate) fn execute_upload_placeholder(
     let mut cancel_guard = TaskCancelGuard::new();
     let mut execution_context = CapabilityExecutionContext::new(
         task.id.clone(),
-        "upload.placeholder",
+        "workspace.placeholder.upload",
         payload
             .and_then(|value| value.get("pid"))
             .and_then(Value::as_str)

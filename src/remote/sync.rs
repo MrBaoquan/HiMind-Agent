@@ -40,7 +40,7 @@ pub(crate) fn execute_sync_exhibits(
     let mut cancel_guard = crate::api::client::TaskCancelGuard::new();
     let mut execution_context = CapabilityExecutionContext::new(
         task.id.clone(),
-        "inner_admin.sync_exhibits",
+        "network.inner-admin.exhibit.sync",
         "inner_admin",
         || cancel_guard.check(dashboard_client, options, agent_id, &task.id),
         |progress, detail| {

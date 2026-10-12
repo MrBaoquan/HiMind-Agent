@@ -57,7 +57,7 @@ impl CapabilityDescriptor {
             "platform"
         } else if id.starts_with("knowledge.") {
             "knowledge"
-        } else if id.starts_with("media.") {
+        } else if id.starts_with("media.") || id.starts_with("workbench.media.") {
             "media"
         } else if id.starts_with("extension.") {
             "authoring"

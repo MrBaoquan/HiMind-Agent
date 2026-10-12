@@ -23,7 +23,7 @@ const MAX_MCP_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MCP_INPUT_QUEUE_CAPACITY: usize = 128;
 const MAX_ACTIVATED_CAPABILITIES: usize = 128;
 const MAX_ACTIVATED_SCHEMA_BYTES: usize = 512 * 1024;
-const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。工程开发入口应优先调用 engineering.project.resolve 解析 workspace_root、target 和 environment，再启动或继续 Workflow；不要猜测展馆、AppID、构建目录或交付 Workflow。需要编辑工作区时必须先调用 engineering.workspace.lease.acquire 获取 write Lease，编辑完成后 release；开发阶段结束时调用 engineering.checkpoint.create 生成 DevelopmentCheckpoint，再把它作为交付 Workflow 的 Seed。Workflow 生命周期统一使用 workflow.catalog.list、workflow.catalog.describe、workflow.run.start、workflow.run.get、workflow.run.feedback 和 workflow.run.cancel；审批仍由全局审批中心完成，模型不得代替用户批准。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 capability.catalog.search 搜索目录，再用 capability.catalog.describe 获取具体 Schema，最后调用 capability.catalog.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 capability.catalog.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
+const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。工程开发入口应优先调用 engineering.project.resolve 解析 workspace_root、target 和 environment，再启动或继续 Workflow；不要猜测展馆、AppID、构建目录或交付 Workflow。需要编辑工作区时必须先调用 engineering.workspace.lease.acquire 获取 write Lease，编辑完成后 release；开发阶段结束时调用 engineering.checkpoint.create 生成 DevelopmentCheckpoint，再把它作为交付 Workflow 的 Seed。Workflow 生命周期统一使用 workflow.catalog.list、workflow.catalog.describe、workflow.run.start、workflow.run.get、workflow.run.feedback 和 workflow.run.cancel；审批仍由全局审批中心完成，模型不得代替用户批准。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 system.capability.search 搜索目录，再用 system.capability.describe 获取具体 Schema，最后调用 system.capability.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 system.capability.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
 
 /// 市场使用引导单独成段：它回答的是"缺能力时怎么办"，与上面的 stdio/授权说明
 /// 不是同一件事，拆开也方便单独演进。
@@ -35,10 +35,10 @@ fn mcp_instructions() -> String {
 }
 
 const BOOTSTRAP_TOOL_IDS: &[&str] = &[
-    "capability.catalog.search",
-    "capability.catalog.describe",
-    "capability.catalog.activate",
-    "capability.catalog.invoke",
+    "system.capability.search",
+    "system.capability.describe",
+    "system.capability.activate",
+    "system.capability.invoke",
     "market.search",
     "market.installed",
     "market.install.plan",
@@ -52,7 +52,7 @@ struct McpSessionState {
     /// Capability IDs pre-activated at MCP startup (from
     /// HIMIND_MCP_DEFAULT_ACTIVATE). Unlike dynamic activations they survive
     /// registry generation changes, so clients that cannot reliably call
-    /// capability.catalog.activate (e.g. some VS Code Copilot sessions) still
+    /// system.capability.activate (e.g. some VS Code Copilot sessions) still
     /// see the configured business tools on the first tools/list projection.
     default_activated: BTreeSet<String>,
     activation_generation: Option<String>,
@@ -491,13 +491,13 @@ fn handle_request_with_session(
             // them to understand listChanged notifications.
             if !all_tools
                 .iter()
-                .any(|tool| tool["name"] == "capability.catalog.invoke")
+                .any(|tool| tool["name"] == "system.capability.invoke")
             {
                 all_tools.insert(2.min(all_tools.len()), catalog_invoke_tool());
             }
             if !all_tools
                 .iter()
-                .any(|tool| tool["name"] == "capability.catalog.activate")
+                .any(|tool| tool["name"] == "system.capability.activate")
             {
                 all_tools.insert(1.min(all_tools.len()), catalog_activation_tool());
             }
@@ -537,13 +537,13 @@ fn handle_request_with_session(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            if name == "capability.catalog.activate" {
+            if name == "system.capability.activate" {
                 return match activate_capabilities(gateway, arguments, session) {
                     Ok(result) => mcp_tool_call_result(result),
                     Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
                 };
             }
-            if name == "capability.catalog.invoke" {
+            if name == "system.capability.invoke" {
                 return match invoke_activated_capability(gateway, arguments, session) {
                     Ok(result) => mcp_tool_call_result(result),
                     Err(error) => Ok(mcp_tool_call_error(error.as_ref())),
@@ -703,7 +703,7 @@ fn activate_capabilities(
 
 fn catalog_activation_tool() -> Value {
     json!({
-        "name": "capability.catalog.activate",
+        "name": "system.capability.activate",
         "title": "激活能力",
         "description": "按能力 ID、分组、surface 或关键字将能力加入当前 MCP 会话的工具列表。",
         "inputSchema": {
@@ -741,7 +741,7 @@ fn catalog_activation_tool() -> Value {
 
 fn catalog_invoke_tool() -> Value {
     json!({
-        "name": "capability.catalog.invoke",
+        "name": "system.capability.invoke",
         "title": "调用已激活能力",
         "description": "调用当前 MCP 会话已经激活的能力；适用于不支持动态工具列表刷新的客户端。",
         "inputSchema": {
@@ -781,7 +781,7 @@ fn invoke_activated_capability(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("capability.catalog.invoke requires a non-empty id")?;
+        .ok_or("system.capability.invoke requires a non-empty id")?;
     if !session.is_exposed(capability_id) {
         return Err(
             format!("capability is not active in this MCP session: {capability_id}").into(),
@@ -1293,7 +1293,7 @@ mod tests {
         );
         assert!(tools
             .iter()
-            .any(|tool| tool["name"] == "capability.catalog.search"));
+            .any(|tool| tool["name"] == "system.capability.search"));
         // 市场能力属于 Bootstrap：客户端装能力之前先要能看见市场，
         // 否则"缺能力"这件事只能靠人来解决。
         assert!(tools.iter().any(|tool| tool["name"] == "market.search"));
@@ -1304,13 +1304,13 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "market.install"));
         assert!(tools
             .iter()
-            .any(|tool| tool["name"] == "capability.catalog.describe"));
+            .any(|tool| tool["name"] == "system.capability.describe"));
         assert!(tools
             .iter()
-            .any(|tool| tool["name"] == "capability.catalog.activate"));
+            .any(|tool| tool["name"] == "system.capability.activate"));
         assert!(tools
             .iter()
-            .any(|tool| tool["name"] == "capability.catalog.invoke"));
+            .any(|tool| tool["name"] == "system.capability.invoke"));
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "business.project.list"));
@@ -1333,7 +1333,7 @@ mod tests {
             &gateway,
             "tools/call",
             json!({
-                "name": "capability.catalog.activate",
+                "name": "system.capability.activate",
                 "arguments": { "ids": ["ai.client.list"] }
             }),
             &mut session,
@@ -1357,7 +1357,7 @@ mod tests {
             &gateway,
             "tools/call",
             json!({
-                "name": "capability.catalog.invoke",
+                "name": "system.capability.invoke",
                 "arguments": { "id": "ai.client.list", "arguments": {} }
             }),
             &mut session,
@@ -1447,7 +1447,7 @@ mod tests {
             &gateway,
             "tools/call",
             json!({
-                "name": "capability.catalog.search",
+                "name": "system.capability.search",
                 "arguments": { "query": "ai.client", "limit": 5 }
             }),
             &mut session,
@@ -1462,7 +1462,7 @@ mod tests {
             &gateway,
             "tools/call",
             json!({
-                "name": "capability.catalog.describe",
+                "name": "system.capability.describe",
                 "arguments": { "id": "ai.client.import" }
             }),
             &mut session,
@@ -1486,7 +1486,7 @@ mod tests {
             &gateway,
             "tools/call",
             json!({
-                "name": "capability.catalog.activate",
+                "name": "system.capability.activate",
                 "arguments": { "ids": ["ai.client.list"] }
             }),
             &mut session,
@@ -1503,7 +1503,7 @@ mod tests {
             &gateway,
             "tools/call",
             json!({
-                "name": "capability.catalog.invoke",
+                "name": "system.capability.invoke",
                 "arguments": { "id": "ai.client.list", "arguments": {} }
             }),
             &mut session,
@@ -1897,7 +1897,7 @@ mod tests {
             "ai.service.list",
             "ai.service.custom.upsert",
             "ai.service.custom.remove",
-            "ai.service.custom.list_models",
+            "ai.service.custom.model.list",
         ] {
             let tool = tools
                 .iter()
@@ -1917,7 +1917,7 @@ mod tests {
             "ai.client.import.plan",
             "ai.client.remove.plan",
             "ai.service.list",
-            "ai.service.custom.list_models",
+            "ai.service.custom.model.list",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["riskLevel"], "read_only");
@@ -2064,7 +2064,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "mcp.server.remove"));
         assert!(tools
             .iter()
-            .any(|tool| tool["name"] == "mcp.registration.apply_all"));
+            .any(|tool| tool["name"] == "mcp.registration.apply-all"));
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "knowledge.search.v1"));

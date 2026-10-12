@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "spec": "ADR-0119",
+  "updated_at": "2026-10-12",
+  "id": {
+    "maxLength": 48,
+    "minSegments": 2,
+    "maxSegments": 5,
+    "segmentPattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+    "separators": {
+      "hierarchy": ".",
+      "compound": "-"
+    }
+  },
+  "domains": [
+    "system",
+    "ai",
+    "media",
+    "workbench",
+    "business",
+    "engineering",
+    "extension",
+    "skill",
+    "plugin",
+    "workflow",
+    "mcp",
+    "market",
+    "schedule",
+    "distribution",
+    "svn",
+    "storage",
+    "device",
+    "network",
+    "vcs",
+    "workspace"
+  ],
+  "actions": [
+    "get",
+    "list",
+    "search",
+    "describe",
+    "status",
+    "health",
+    "create",
+    "update",
+    "replace",
+    "upsert",
+    "delete",
+    "set",
+    "run",
+    "start",
+    "cancel",
+    "retry",
+    "apply",
+    "plan",
+    "preview",
+    "validate",
+    "inspect",
+    "publish",
+    "install",
+    "enable",
+    "disable",
+    "import",
+    "export",
+    "upload",
+    "download",
+    "sync"
+  ],
+  "qualifiers": [
+    "plan",
+    "status",
+    "preview"
+  ],
+  "boundaryRules": [
+    {
+      "prefix": "media.",
+      "availability": "local"
+    },
+    {
+      "prefix": "workbench.",
+      "availability": "control_plane"
+    }
+  ],
+  "pluginNamespace": {
+    "declaredIn": "plugin.json#/capability_namespace",
+    "rule": "插件能力的首段前缀必须等于 capability_namespace 的第一段；多段前缀（如 short.video）需在清单中登记"
+  },
+  "errorCode": {
+    "pattern": "^[A-Z][A-Z0-9_]*$",
+    "namespace": "uppercase-snake"
+  },
+  "deprecatedStrategy": {
+    "aliasWindowReleases": 2,
+    "aliasVisibleInCatalog": false,
+    "note": "新 ID 注册 + 旧 ID 仅调用侧解析；退役 ID 永久禁止复用"
+  }
+}

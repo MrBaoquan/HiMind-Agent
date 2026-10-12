@@ -29,7 +29,7 @@
   ],
   "default_exitpoint": "built",
   "capabilities": [
-    "exhibit.workspace.build"
+    "workspace.exhibit.build"
   ],
   "dependencies": {
     "skills": [],
@@ -42,7 +42,7 @@
       "id": "ENGINE-BUILD",
       "title": "按所选引擎与目标构建",
       "kind": "capability",
-      "capability_id": "exhibit.workspace.build",
+      "capability_id": "workspace.exhibit.build",
       "execution_mode": "long_running",
       "risk_level": "process",
       "input": {

@@ -743,7 +743,7 @@ impl ApprovalManager {
             || super::policy::is_destructive_capability(request_type)
             || matches!(
                 request_type,
-                "software.distribution.release.publish" | "extension.review.decide"
+                "distribution.release.publish" | "extension.review.decide"
             );
         if mode == "auto_approve"
             && ((is_r4 && settings.profile != "full_access")
@@ -1524,7 +1524,7 @@ mod destructive_tests {
         let home = test_home("destructive");
         let manager = Arc::new(ApprovalManager::new_in(home.clone()));
         assert!(manager
-            .update_rule("filesystem.delete", "auto_approve")
+            .update_rule("system.filesystem.delete", "auto_approve")
             .is_err());
         assert!(matches!(
             RequestType::FilesystemDelete.default_mode(),
@@ -1566,7 +1566,7 @@ mod destructive_tests {
             .unwrap();
         assert!(approved);
         assert!(manager
-            .update_rule("filesystem.delete", "auto_approve")
+            .update_rule("system.filesystem.delete", "auto_approve")
             .is_err());
         drop(manager);
         let _ = fs::remove_dir_all(home);
@@ -1578,7 +1578,7 @@ mod destructive_tests {
         let manager = ApprovalManager::new_in(home.clone());
         manager.update_profile("trusted", true).unwrap();
         assert!(matches!(
-            manager.get_mode_for_key("filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
+            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
             ApprovalMode::AutoApprove
         ));
         assert!(matches!(
@@ -1592,7 +1592,7 @@ mod destructive_tests {
         ));
         assert!(manager
             .request_capability_approval(
-                "filesystem.delete",
+                "system.filesystem.delete",
                 "R3",
                 "删除测试文件".to_string(),
                 "target=test.txt".to_string(),
@@ -1828,7 +1828,7 @@ mod destructive_tests {
             .update_rule("ai.client.import", "auto_approve")
             .unwrap();
         assert!(matches!(
-            manager.get_mode_for_key("filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
+            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
             ApprovalMode::AutoApprove
         ));
 
@@ -1847,7 +1847,7 @@ mod destructive_tests {
         )
         .unwrap();
         assert!(matches!(
-            manager.get_mode_for_key("filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
+            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
             ApprovalMode::Manual
         ));
         manager.bind_identity("user-b", "agent-a").unwrap();
@@ -1961,7 +1961,7 @@ mod destructive_tests {
         manager.update_profile("full_access", true).unwrap();
 
         assert!(matches!(
-            manager.get_mode_for_key("filesystem.delete", ApprovalMode::Manual, true, Some("R4")),
+            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R4")),
             ApprovalMode::AutoApprove
         ));
         drop(manager);

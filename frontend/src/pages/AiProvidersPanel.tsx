@@ -30,9 +30,12 @@ type AiProvidersPanelProps = {
     protocol: AIServiceProtocol;
     model: string;
     models: string[];
+    image_model: string;
+    image_adapter: string;
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
+  onSetImageAIService: (id: string) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
   onOpenAccount: () => void;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
@@ -46,6 +49,8 @@ const emptyDraft = {
   protocol: 'openai-responses' as AIServiceProtocol,
   model: '',
   models: '',
+  image_model: '',
+  image_adapter: '',
   api_key: '',
 };
 
@@ -55,6 +60,7 @@ export function AiProvidersPanel({
   onRefresh,
   onSaveAIService,
   onSetActiveAIService,
+  onSetImageAIService,
   onRemoveAIService,
   onOpenAccount,
   onFetchModels,
@@ -74,6 +80,7 @@ export function AiProvidersPanel({
 
   const customServices = aiServices?.custom?.services ?? [];
   const activeServiceId = aiServices?.custom?.active_service_id ?? '';
+  const imageServiceId = aiServices?.custom?.image_service_id ?? '';
   const managed = aiServices?.managed ?? { available: false };
   const independentMode = managed.reason === 'independent';
   const clientStatuses = aiServices?.clients?.targets ?? [];
@@ -120,6 +127,18 @@ export function AiProvidersPanel({
     ? '本机默认配置'
     : managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
 
+  const imageCapableServices = customServices.filter((service) => service.image_model.trim() !== '');
+
+  async function changeImageRoute(id: string) {
+    if (id === imageServiceId || settingActive) return;
+    setSettingActive(true);
+    try {
+      await onSetImageAIService(id);
+    } finally {
+      setSettingActive(false);
+    }
+  }
+
   async function changeChatRoute(id: string) {
     if (id === chatRouteValue || settingActive) return;
     setSettingActive(true);
@@ -147,6 +166,8 @@ export function AiProvidersPanel({
       protocol: preset.protocol,
       model: preset.default_model,
       models: preset.models.join(', '),
+      image_model: '',
+      image_adapter: '',
       api_key: '',
     });
   }
@@ -175,6 +196,8 @@ export function AiProvidersPanel({
         protocol: draft.protocol,
         model: draft.model.trim(),
         models: draft.models.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+        image_model: draft.image_model.trim(),
+        image_adapter: draft.image_adapter,
         api_key: draft.api_key.trim(),
       });
       setDraft(emptyDraft);
@@ -225,6 +248,8 @@ export function AiProvidersPanel({
       protocol: service.protocol,
       model: service.model,
       models: service.models.join(', '),
+      image_model: service.image_model ?? '',
+      image_adapter: service.image_adapter ?? '',
       api_key: '',
     });
     setFormError('');
@@ -267,6 +292,17 @@ export function AiProvidersPanel({
           </select>
           {settingActive ? <BusyIndicator size={13} /> : null}
           <span className="ai-service-route-hint">只影响 HiMind 自己的对话，分发到工具在「工具接入」里做。</span>
+        </div>
+      ) : null}
+
+      {serviceCount ? (
+        <div className="ai-service-route" role="group" aria-label="AI 生图使用的模型来源">
+          <span className="ai-service-route-label">AI 生图使用</span>
+          <select className="ai-service-route-select" aria-label="AI 生图使用的模型来源" value={imageServiceId} disabled={settingActive} onChange={(event) => void changeImageRoute(event.target.value)}>
+            <option value="">自动选择（跟随已配生图模型的服务）</option>
+            {imageCapableServices.map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
+          </select>
+          <span className="ai-service-route-hint">{imageCapableServices.length ? '只影响 media.image.generate 使用的服务，与对话模型分开。' : '还没有来源填写生图模型；编辑来源并在「生图模型」里填写后即可选择。'}</span>
         </div>
       ) : null}
 
@@ -344,7 +380,9 @@ export function AiProvidersPanel({
               <div className="ai-service-form-group">
                 <div className="ai-service-group-label">模型</div>
                 <div className="ai-service-form-grid">
-                  <label className="field-label ai-service-field ai-service-field-wide"><span>默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-test" /></label>
+                  <label className="field-label ai-service-field"><span>默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-test" /></label>
+                  <label className="field-label ai-service-field"><span>生图模型（可选）</span><input value={draft.image_model} onChange={(event) => setDraft((current) => ({ ...current, image_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seedream-4-0" /></label>
+                  <label className="field-label ai-service-field"><span>生图协议</span><select value={draft.image_adapter} onChange={(event) => setDraft((current) => ({ ...current, image_adapter: event.target.value }))}><option value="">OpenAI 兼容（默认）</option><option value="ark-images">火山方舟（豆包）</option></select></label>
                 </div>
               </div>
 

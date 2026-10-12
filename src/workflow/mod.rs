@@ -1560,7 +1560,7 @@ mod tests {
             .iter()
             .find(|step| step.id == "ENGINE-BUILD")
             .expect("engine build step");
-        assert_eq!(step.capability_id, "exhibit.workspace.build");
+        assert_eq!(step.capability_id, "workspace.exhibit.build");
         assert_eq!(step.execution_mode, "long_running");
         assert_eq!(step.input["wait"], serde_json::json!(true));
         assert_eq!(package.ui.mode, "declarative");

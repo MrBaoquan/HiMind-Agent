@@ -431,6 +431,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_acp_runtime_profile,
             super::commands::save_ai_service,
             super::commands::set_active_ai_service,
+            super::commands::set_image_ai_service,
             super::commands::remove_ai_service,
             super::commands::import_ai_client,
             super::commands::remove_ai_client,

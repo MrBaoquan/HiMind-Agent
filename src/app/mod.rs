@@ -25,6 +25,7 @@ pub(crate) mod github_source;
 pub mod http;
 pub(crate) mod identity;
 pub(crate) mod inference_gateway;
+pub(crate) mod local_image;
 pub(crate) mod local_package;
 pub(crate) mod market;
 pub(crate) mod mcp_catalog;
