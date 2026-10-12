@@ -7076,7 +7076,14 @@ fn finalize_plugin_capability(
     input: &Value,
     output: Value,
 ) -> Result<Value, Box<dyn Error>> {
-    if capability_id == "software.distribution.artifact.inspect" {
+    // 预检收据由内核签发，不是插件给的：ADR 0119 把能力从
+    // `software.distribution.artifact.inspect` 收敛到 `distribution.artifact.inspect`，
+    // 这里必须两个名字都认，否则新名调用拿不到 inspection_receipt，发布会被判成
+    // 「不可发布」。旧名保留到过渡期结束。
+    if matches!(
+        capability_id,
+        "distribution.artifact.inspect" | "software.distribution.artifact.inspect"
+    ) {
         attach_inspection_receipt(context, input, output)
     } else {
         Ok(output)
@@ -7101,7 +7108,9 @@ fn validate_mcp_capability_workspace(
     let extension_scoped = capability_id.starts_with("extension.");
     let software_scoped = matches!(
         capability_id,
-        "software.distribution.project.inspect"
+        "distribution.project.inspect"
+            | "software.distribution.project.inspect"
+            | "distribution.artifact.inspect"
             | "software.distribution.artifact.inspect"
             | "distribution.release.publish"
     );
@@ -9279,8 +9288,12 @@ mod tests {
             "ai-client:test",
         );
         let input = serde_json::json!({ "workspace_root": root });
-        validate_mcp_capability_workspace(&mcp, "software.distribution.artifact.inspect", &input)
-            .unwrap();
+        for capability in [
+            "distribution.artifact.inspect",
+            "software.distribution.artifact.inspect",
+        ] {
+            validate_mcp_capability_workspace(&mcp, capability, &input).unwrap();
+        }
         let _ = std::fs::remove_dir_all(input["workspace_root"].as_str().unwrap());
     }
 
