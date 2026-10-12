@@ -530,13 +530,11 @@ fn runtime_version_is_newer(
         .map_err(|error| format!("当前 Runtime 版本号无效: {error}"))?;
     let candidate = semver::Version::parse(candidate_version.trim())
         .map_err(|error| format!("候选 Runtime 版本号无效: {error}"))?;
-    match candidate.cmp(&current) {
-        std::cmp::Ordering::Greater => Ok(true),
-        std::cmp::Ordering::Equal => Ok(false),
-        std::cmp::Ordering::Less => {
-            Err(format!("拒绝将 Runtime 从 {current_version} 降级到 {candidate_version}").into())
-        }
-    }
+    // An older candidate in the catalog is simply not an update. Reporting it as a
+    // failure aborted whole installs and updates whenever the reachable catalog only
+    // offered an older Runtime than the one already on disk, which is exactly what a
+    // pinned or lagging release channel looks like.
+    Ok(candidate > current)
 }
 
 fn configured_github_repository() -> Result<String, Box<dyn Error>> {
@@ -713,15 +711,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_runtime_downgrades_and_size_mismatches() {
+    fn treats_older_candidates_as_no_update_and_rejects_size_mismatches() {
         let downgrade = runtime_update_from_manifest(
             manifest("1.2.2", 10),
             "runtime.zip".to_string(),
             Some(10),
             "1.2.3",
         )
-        .unwrap_err();
-        assert!(downgrade.to_string().contains("降级"));
+        .unwrap();
+        assert!(downgrade.is_none(), "an older Runtime is not an update");
+
+        let same = runtime_update_from_manifest(
+            manifest("1.2.3", 10),
+            "runtime.zip".to_string(),
+            Some(10),
+            "1.2.3",
+        )
+        .unwrap();
+        assert!(same.is_none(), "the installed Runtime is already current");
 
         let mismatch = runtime_update_from_manifest(
             manifest("1.2.3", 10),

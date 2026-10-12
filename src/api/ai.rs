@@ -77,7 +77,7 @@ mod tests {
             let mut buffer = [0u8; 4096];
             let read = stream.read(&mut buffer).unwrap_or(0);
             *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
-            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"国际厂商","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true}]}]}"#;
+            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"按量付费","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true}]}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),

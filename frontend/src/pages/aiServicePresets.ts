@@ -1,7 +1,7 @@
 // 本文件由 scripts/generate-ai-service-presets.mts 生成，请勿手工编辑。
 //
 // 内容来自工作台 AI 服务目录（GET /api/integrations/ai/personal-connections/catalog，
-// GCMP 供应商目录投影），生成时目录版本 0.28.4，共 23 条。
+// GCMP 供应商目录投影），生成时目录版本 e585f019b184，共 23 条。
 // 它只在独立模式或目录暂不可用时兜底；能连上工作台时以工作台目录为准。
 // 重新生成：保存目录响应后执行 npm run generate:ai-service-presets -- catalog.json。
 import type { AIServiceProtocol } from '../services/agentApi';
@@ -21,7 +21,7 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'openai',
     name: 'OpenAI API',
-    category: '国际厂商',
+    category: '按量付费',
     description: 'OpenAI 官方按量 API',
     base_url: 'https://api.openai.com/v1',
     protocol: 'openai-responses',
@@ -31,7 +31,7 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'anthropic',
     name: 'Anthropic Claude',
-    category: '国际厂商',
+    category: '按量付费',
     description: 'Anthropic 官方 API',
     base_url: 'https://api.anthropic.com',
     protocol: 'anthropic',
@@ -41,17 +41,17 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'xai',
     name: 'xAI Grok',
-    category: '国际厂商',
+    category: '按量付费',
     description: 'xAI OpenAI 兼容 API',
     base_url: 'https://api.x.ai/v1',
     protocol: 'openai-responses',
-    default_model: 'grok-4.6',
-    models: ['grok-4.6', 'grok-4.5'],
+    default_model: 'grok-4.7',
+    models: ['grok-4.7', 'grok-4.6', 'grok-4.5'],
   },
   {
     id: 'mistral',
     name: 'Mistral AI',
-    category: '国际厂商',
+    category: '按量付费',
     description: 'Mistral 官方 API',
     base_url: 'https://api.mistral.ai/v1',
     protocol: 'openai-responses',
@@ -61,7 +61,7 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'deepseek',
     name: 'DeepSeek API',
-    category: '国内厂商',
+    category: '按量付费',
     description: 'DeepSeek 官方按量 API',
     base_url: 'https://api.deepseek.com/v1',
     protocol: 'openai-responses',
@@ -71,7 +71,7 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'dashscope',
     name: '阿里云百炼',
-    category: '国内厂商',
+    category: '按量付费',
     description: '百炼 OpenAI 兼容按量 API',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     protocol: 'openai-responses',
@@ -79,19 +79,9 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
     models: ['qwen3.8-max', 'qwen3.8-flash', 'deepseek-v4.1-flash', 'kimi/kimi-k3', 'MiniMax/MiniMax-M3'],
   },
   {
-    id: 'zhipu',
-    name: '智谱 GLM Coding Plan',
-    category: '国内厂商',
-    description: '智谱 Coding Plan OpenAI 兼容入口',
-    base_url: 'https://open.bigmodel.cn/api/v1',
-    protocol: 'openai-responses',
-    default_model: 'glm-5.3',
-    models: ['glm-5.3', 'glm-5.3-flash'],
-  },
-  {
     id: 'minimax',
     name: 'MiniMax API',
-    category: '国内厂商',
+    category: '按量付费',
     description: 'MiniMax Anthropic 兼容入口',
     base_url: 'https://api.minimaxi.com/anthropic',
     protocol: 'anthropic',
@@ -101,7 +91,7 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'kimi',
     name: 'Kimi API',
-    category: '国内厂商',
+    category: '按量付费',
     description: 'Moonshot Anthropic 兼容按量入口',
     base_url: 'https://api.moonshot.cn/anthropic',
     protocol: 'anthropic',
@@ -111,27 +101,27 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'xiaomi',
     name: '小米 MiMo',
-    category: '国内厂商',
+    category: '按量付费',
     description: '小米 MiMo OpenAI 兼容 API',
     base_url: 'https://api.xiaomimimo.com/v1',
     protocol: 'openai-responses',
-    default_model: 'mimo-v2.5-pro-ultraspeed',
-    models: ['mimo-v2.5-pro-ultraspeed', 'mimo-v2.5-pro', 'mimo-v2.5'],
+    default_model: 'mimo-v2.6-pro',
+    models: ['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.6-pro-ultraspeed'],
   },
   {
     id: 'stepfun',
     name: '阶跃星辰 StepFun',
-    category: '国内厂商',
+    category: '按量付费',
     description: 'StepFun Anthropic 兼容按量 API',
     base_url: 'https://api.stepfun.com',
     protocol: 'anthropic',
-    default_model: 'step-3.7-flash',
-    models: ['step-3.7-flash', 'step-3.5-flash', 'step-3.5-flash-2603'],
+    default_model: 'step-5-preview',
+    models: ['step-5-preview', 'step-3.7-flash', 'step-3.5-flash', 'step-3.5-flash-2603'],
   },
   {
     id: 'antling',
     name: '蚂蚁百灵',
-    category: '国内厂商',
+    category: '按量付费',
     description: '蚂蚁百灵 Anthropic 兼容 API',
     base_url: 'https://api.ant-ling.com/anthropic',
     protocol: 'anthropic',
@@ -141,12 +131,22 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
   {
     id: 'longcat',
     name: '美团 LongCat',
-    category: '国内厂商',
+    category: '按量付费',
     description: 'LongCat Anthropic 兼容 API',
     base_url: 'https://api.longcat.chat/anthropic',
     protocol: 'anthropic',
     default_model: 'LongCat-2.0',
     models: ['LongCat-2.0'],
+  },
+  {
+    id: 'zhipu',
+    name: '智谱 GLM Coding Plan',
+    category: '编码套餐',
+    description: '智谱 Coding Plan OpenAI 兼容入口',
+    base_url: 'https://open.bigmodel.cn/api/v1',
+    protocol: 'openai-responses',
+    default_model: 'glm-5.3',
+    models: ['glm-5.3', 'glm-5.3-flash', 'glm-5.3-flashx'],
   },
   {
     id: 'xfyun',

@@ -580,7 +580,12 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
                 .unwrap_or_default(),
             "runtime_capabilities": runtime_state
                 .as_ref()
-                .map(|state| state.capabilities.clone())
+                .map(|state| {
+                    effective_runtime_capabilities(
+                        &state.capabilities,
+                        Path::new(&state.executable_path),
+                    )
+                })
                 .unwrap_or_default(),
             "network_isolated": false,
             "tool_access": "windows-restricted-token",
@@ -651,7 +656,12 @@ pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
             .map(|state| state.max_agent_version.clone())
             .unwrap_or_default(),
         capabilities: runtime_state
-            .map(|state| state.capabilities)
+            .map(|state| {
+                effective_runtime_capabilities(
+                    &state.capabilities,
+                    Path::new(&state.executable_path),
+                )
+            })
             .unwrap_or_default(),
     }
 }
@@ -1563,20 +1573,22 @@ fn install_runtime_archive(
     }
     // The installed state is the capability contract the Agent reports, so a
     // capability that failed its preflight must not stay advertised.
-    let mut capabilities = manifest.capabilities.clone();
+    let mut accepted = manifest.capabilities.clone();
     if !degraded.is_empty() {
-        capabilities.retain(|capability| {
+        accepted.retain(|capability| {
             !degraded
                 .iter()
                 .any(|item| item.capability == *capability)
         });
     }
+    let executable_path = target.join(executable);
+    let capabilities = effective_runtime_capabilities(&accepted, &executable_path);
     let state = InstalledRuntimeState {
         schema_version: 2,
         product_id: RUNTIME_PRODUCT_ID.to_string(),
         provider: RUNTIME_CONTRACT.to_string(),
         version: manifest.version,
-        executable_path: target.join(executable).to_string_lossy().to_string(),
+        executable_path: executable_path.to_string_lossy().to_string(),
         min_agent_version: manifest.min_agent_version,
         max_agent_version: manifest.max_agent_version,
         capabilities,
@@ -2301,7 +2313,7 @@ fn ensure_himind_headless_profile(
 fn ensure_profile_files(
     home: &Path,
     _options: &Options,
-    _invocation: &Invocation,
+    invocation: &Invocation,
     profile_name: &str,
     package_json: &str,
     pnpm_workspace: &str,
@@ -2320,43 +2332,130 @@ fn ensure_profile_files(
             fs::write(path, content)?;
         }
     }
-    ensure_profile_patch(&profile.join("cordis.patch.yml"), base_patch)?;
+    ensure_profile_patch(
+        &profile.join("cordis.patch.yml"),
+        base_patch,
+        office_engine_is_installed(&invocation.executable),
+    )?;
     Ok(())
 }
 
-fn ensure_profile_patch(path: &Path, base_patch: &str) -> Result<(), Box<dyn Error>> {
+fn ensure_profile_patch(
+    path: &Path,
+    base_patch: &str,
+    office_installed: bool,
+) -> Result<(), Box<dyn Error>> {
     if !path.is_file() {
         fs::write(path, base_patch)?;
         return Ok(());
     }
     migrate_managed_profile_patch(path)?;
-    ensure_managed_capability_rows(path)
+    ensure_managed_capability_rows(path, office_installed)
+}
+
+/// The Office skill provider row HiMind owns. DSH keeps it in its native skill
+/// registry and settings surfaces, so HiMind edits the row rather than hiding
+/// Office behind its own surface.
+const MANAGED_OFFICE_SKILL_ROW: &str = "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')\"\n        node: !!js \"process.env.HIMIND_DSH_NODE\"\n        cli: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')\"\n";
+
+/// Headless has no Web bundle to mount Office conversion, so it needs the
+/// conversion provider row as well.
+const MANAGED_OFFICE_CONVERT_ROW: &str = "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n";
+
+/// Whether this machine can actually do Office work.
+///
+/// The base Runtime keeps the JavaScript Office packages (DSH declares
+/// `dsh-skill-office` as a direct dependency itself) but not the LibreOfficeKit
+/// native engine, which is the optional dependency holding the ~186 MB payload.
+/// Reading that engine instead of a declared capability list keeps the rows
+/// honest: a Runtime without the engine never advertises Office it cannot serve,
+/// and the engine appearing on disk is what turns the rows on.
+fn office_engine_is_installed(executable: &std::ffi::OsStr) -> bool {
+    Path::new(executable)
+        .parent()
+        .and_then(Path::parent)
+        .map(|runtime_root| {
+            runtime_root
+                .join("node_modules/@deepseek-ai/libreoffice-kit-win32-x64/bin/libreoffice-kit.exe")
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
+const OFFICE_CAPABILITY: &str = "office";
+
+/// The capability set the Agent may report for an installed Runtime.
+///
+/// `InstalledRuntimeState.capabilities` records what the package declared and what
+/// its install-time preflight accepted, which is a snapshot taken once. Office is
+/// no longer in that package: the Agent extension installs the LibreOfficeKit
+/// engine per machine afterwards, and a user can take it away again. Reporting the
+/// snapshot would therefore be wrong in both directions - a Runtime that gained the
+/// engine would still claim it cannot do Office, and one whose engine was removed
+/// would keep advertising Office it cannot serve. So the declared list is treated
+/// as the set of capabilities that need no per-machine payload, and Office is
+/// decided by the same on-disk evidence that drives the profile rows.
+fn effective_runtime_capabilities(declared: &[String], executable: &Path) -> Vec<String> {
+    let mut capabilities = declared
+        .iter()
+        .filter(|capability| capability.as_str() != OFFICE_CAPABILITY)
+        .cloned()
+        .collect::<Vec<_>>();
+    if office_engine_is_installed(executable.as_os_str()) {
+        capabilities.push(OFFICE_CAPABILITY.to_string());
+    }
+    capabilities
 }
 
 /// Upgrade profiles created by older Agent versions without replacing the
 /// user's DSH patch rows.  The rows are deliberately ordinary DSH rows so the
 /// native plugin inventory and settings UI remain the source of truth.
-fn ensure_managed_capability_rows(path: &Path) -> Result<(), Box<dyn Error>> {
+///
+/// Office is the one capability HiMind installs per machine rather than
+/// carrying in the base Runtime, so these rows are reconciled against the
+/// engine on disk: added when Office is installable, taken back out when it is
+/// not. Removal only ever drops the exact managed text below, so a user's own
+/// variant of the row is left alone.
+fn ensure_managed_capability_rows(
+    path: &Path,
+    office_installed: bool,
+) -> Result<(), Box<dyn Error>> {
     let source = fs::read_to_string(path)?;
-    let mut additions = String::new();
-    if !source.contains("id: skill-office") {
-        additions.push_str(
-            "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')\"\n        node: !!js \"process.env.HIMIND_DSH_NODE\"\n        cli: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')\"\n",
-        );
+    let headless = path.to_string_lossy().contains(HIMIND_HEADLESS_PROFILE);
+    let rows: &[(&str, &str)] = if headless {
+        &[
+            ("id: skill-office", MANAGED_OFFICE_SKILL_ROW),
+            ("id: office-to-pdf", MANAGED_OFFICE_CONVERT_ROW),
+        ]
+    } else {
+        &[("id: skill-office", MANAGED_OFFICE_SKILL_ROW)]
+    };
+    let mut updated = source.clone();
+    // Add or drop each managed row as a whole. Appending them in one write keeps
+    // every row's own leading and trailing newlines intact, which is what makes
+    // the removal below able to find the exact text it wrote earlier.
+    let additions: String = rows
+        .iter()
+        .filter(|(row_id, _)| !updated.contains(*row_id))
+        .map(|(_, row)| *row)
+        .collect();
+    if office_installed {
+        if !additions.is_empty() {
+            updated = format!("{}{additions}", updated.trim_end());
+        }
+    } else {
+        for (_, row) in rows {
+            if updated.contains(row) {
+                updated = updated.replace(row, "");
+            }
+        }
     }
-    if path.to_string_lossy().contains(HIMIND_HEADLESS_PROFILE)
-        && !source.contains("id: office-to-pdf")
-    {
-        additions.push_str(
-            "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n",
-        );
+    if updated == source {
+        return Ok(());
     }
-    if !additions.is_empty() {
-        let mut updated = source.trim_end().to_string();
-        updated.push_str(&additions);
-        updated.push('\n');
-        fs::write(path, updated)?;
-    }
+    let mut normalized = updated.trim_end().to_string();
+    normalized.push('\n');
+    fs::write(path, normalized)?;
     Ok(())
 }
 
@@ -3897,15 +3996,17 @@ mod tests {
     use super::{
         active_independent_provider_config, agent_owned_route_is_viable,
         agent_owned_route_is_viable_with, append_independent_service_profile, degraded_notice,
-        dsh_run_home, dsh_skill_name, ensure_interactive_home, ensure_profile_patch, first_line,
-        himind_mcp_arguments, managed_model_catalog, merge_profile_package,
-        migrate_legacy_managed_settings, native_dsh_provider_config, no_tools_overlay_text,
-        parse_native_dsh_provider_config, parse_runtime_version, recent_workspace_in,
-        release_agent_owned_model_route, remove_managed_runtime, render_himind_agent_overlay,
-        render_himind_profile_patch, render_himind_profile_patch_from_base, safe_relative_path,
+        dsh_run_home, dsh_skill_name, effective_runtime_capabilities,
+        ensure_interactive_home, ensure_managed_capability_rows,
+        ensure_profile_patch, first_line, himind_mcp_arguments, managed_model_catalog,
+        merge_profile_package, migrate_legacy_managed_settings, native_dsh_provider_config,
+        no_tools_overlay_text, parse_native_dsh_provider_config, parse_runtime_version,
+        recent_workspace_in, release_agent_owned_model_route, remove_managed_runtime,
+        render_himind_agent_overlay, render_himind_profile_patch,
+        render_himind_profile_patch_from_base, safe_relative_path,
         safe_segment, skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
         validate_runtime_agent_compatibility, versioned_home, InteractiveEventProjector,
-        InteractiveLaunch, ModelRouteSource,
+        InteractiveLaunch, ModelRouteSource, HIMIND_HEADLESS_PROFILE,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
@@ -4319,6 +4420,7 @@ mod tests {
         ensure_profile_patch(
             &path,
             include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
+            false,
         )
         .unwrap();
 
@@ -4327,6 +4429,182 @@ mod tests {
         assert!(!migrated.contains("id: agent-default-model"));
         assert!(!migrated.contains("serverName: \"himind\""));
         assert!(!migrated.contains("serverName: \"himind-agent\""));
+        assert!(!migrated.contains("id: skill-office"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn office_rows_track_the_engine_on_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-office-rows-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profiles").join(HIMIND_HEADLESS_PROFILE);
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join("cordis.patch.yml");
+        std::fs::write(
+            &path,
+            include_str!("../../runtime-profiles/himind-headless/cordis.patch.yml"),
+        )
+        .unwrap();
+
+        // A base Runtime has no LibreOfficeKit engine, so neither row appears.
+        ensure_managed_capability_rows(&path, false).unwrap();
+        let without = std::fs::read_to_string(&path).unwrap();
+        assert!(!without.contains("id: skill-office"));
+        assert!(!without.contains("id: office-to-pdf"));
+
+        // Installing the engine is what turns both rows on.
+        ensure_managed_capability_rows(&path, true).unwrap();
+        let with = std::fs::read_to_string(&path).unwrap();
+        assert!(with.contains("id: skill-office"));
+        assert!(with.contains("id: office-to-pdf"));
+        assert_eq!(with.matches("id: skill-office").count(), 1);
+        assert_eq!(with.matches("id: office-to-pdf").count(), 1);
+
+        // It is idempotent, so a session start neither duplicates nor reorders.
+        ensure_managed_capability_rows(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), with);
+
+        // Removing the engine takes the managed rows back out and keeps the
+        // profile's own rows intact.
+        ensure_managed_capability_rows(&path, false).unwrap();
+        let removed = std::fs::read_to_string(&path).unwrap();
+        assert!(!removed.contains("id: skill-office"));
+        assert!(!removed.contains("id: office-to-pdf"));
+        assert!(removed.contains("id: system-prompt"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn effective_capabilities_follow_the_office_engine_on_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-effective-capabilities-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let executable = root.join("bin").join("dsh.cmd");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "@echo off\r\n").unwrap();
+        let engine = root
+            .join("node_modules/@deepseek-ai/libreoffice-kit-win32-x64/bin/libreoffice-kit.exe");
+
+        let base = ["interactive", "headless", "workflow", "computer-use"]
+            .map(str::to_string)
+            .to_vec();
+
+        // The base Runtime carries no engine, so it never advertises Office.
+        let without_engine_declared = effective_runtime_capabilities(&base, &executable);
+        assert!(!without_engine_declared.contains(&"office".to_string()));
+
+        // A stale declared Office entry is dropped rather than reported, because
+        // the engine that would serve it is not there.
+        let mut stale = base.clone();
+        stale.push("office".to_string());
+        let without_engine = effective_runtime_capabilities(&stale, &executable);
+        assert!(!without_engine.contains(&"office".to_string()));
+        assert_eq!(without_engine, base);
+
+        // Installing the engine afterwards is what makes Office reportable, even
+        // though the install-time snapshot never declared it.
+        std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
+        std::fs::write(&engine, "engine").unwrap();
+        let with_engine = effective_runtime_capabilities(&base, &executable);
+        assert_eq!(with_engine, {
+            let mut expected = base.clone();
+            expected.push("office".to_string());
+            expected
+        });
+
+        // The declared order of everything else survives, and Office is reported
+        // exactly once even when the snapshot had also declared it.
+        assert_eq!(
+            effective_runtime_capabilities(&stale, &executable),
+            with_engine
+        );
+
+        // Removing the engine takes the capability back out again.
+        std::fs::remove_file(&engine).unwrap();
+        assert_eq!(
+            effective_runtime_capabilities(&with_engine, &executable),
+            base
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The Office rows an Agent from before the base Runtime dropped Office wrote
+    /// into the profile, exactly as that version wrote them.
+    ///
+    /// Removal finds the managed rows by this exact text, so a profile written by
+    /// the older Agent is only cleaned up while the constants still match what it
+    /// wrote. If a future edit reformats them, that machine keeps advertising
+    /// Office on a Runtime that has no engine to serve it - a silent failure, not
+    /// a loud one. Hence `managed_rows_still_match_what_older_agents_wrote`.
+    const HISTORICAL_OFFICE_SKILL_ROW: &str = "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')\"\n        node: !!js \"process.env.HIMIND_DSH_NODE\"\n        cli: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')\"\n";
+    const HISTORICAL_OFFICE_CONVERT_ROW: &str =
+        "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n";
+
+    #[test]
+    fn managed_rows_still_match_what_older_agents_wrote() {
+        assert_eq!(
+            super::MANAGED_OFFICE_SKILL_ROW, HISTORICAL_OFFICE_SKILL_ROW,
+            "reformatting the managed Office row would strand it on upgraded machines"
+        );
+        assert_eq!(
+            super::MANAGED_OFFICE_CONVERT_ROW, HISTORICAL_OFFICE_CONVERT_ROW,
+            "reformatting the managed conversion row would strand it on upgraded machines"
+        );
+    }
+
+    #[test]
+    fn upgraded_profiles_drop_the_rows_an_older_agent_wrote() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-office-upgrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profiles").join(HIMIND_HEADLESS_PROFILE);
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join("cordis.patch.yml");
+
+        // What an older Agent left behind: its two managed rows plus a row the
+        // user wrote themselves.
+        let mut upgraded = include_str!("../../runtime-profiles/himind-headless/cordis.patch.yml")
+            .trim_end()
+            .to_string();
+        upgraded.push_str(HISTORICAL_OFFICE_SKILL_ROW);
+        upgraded.push_str(HISTORICAL_OFFICE_CONVERT_ROW);
+        upgraded.push_str("\n- id: user-owned-row\n  config:\n    enabled: true\n");
+        std::fs::write(&path, &upgraded).unwrap();
+
+        // The base Runtime has no engine, so the upgrade takes them back out.
+        ensure_managed_capability_rows(&path, false).unwrap();
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("id: skill-office"));
+        assert!(!migrated.contains("id: office-to-pdf"));
+        assert!(migrated.contains("id: user-owned-row"));
+        assert!(migrated.contains("id: system-prompt"));
+
+        // Installing the engine restores exactly one of each, with no leftover of
+        // the older Agent's text.
+        ensure_managed_capability_rows(&path, true).unwrap();
+        let reinstalled = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(reinstalled.matches("id: skill-office").count(), 1);
+        assert_eq!(reinstalled.matches("id: office-to-pdf").count(), 1);
+        assert!(reinstalled.contains("id: user-owned-row"));
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4782,8 +5060,9 @@ api_key: "sk-anthropic-secret".to_string(),
         assert!(!patch.contains("id: himind-agent-personal-mcp-project-tools"));
         assert!(!patch.contains("serverName: \"project-tools\""));
         assert!(!patch.contains("\"API_KEY\": \"local-secret\""));
-        // 这个连接是停用状态，桥不应被它拖长等待时间。
-        assert!(patch.contains("toolCallTimeoutMs: 60000"));
+        // 这个连接是停用状态，桥不应被它拖长等待时间；剩下的下限是本机媒体能力
+        // 的 240s（生图 provider 超时 180s + 收尾余量），不是 DSH 的 60s 默认值。
+        assert!(patch.contains("toolCallTimeoutMs: 240000"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4830,28 +5109,29 @@ api_key: "sk-anthropic-secret".to_string(),
             enabled,
         };
 
-        // 桥自身也是 stdio 服务，连不上就当会话缺工具；等待时间只跟下游对齐。
-        assert!(render(&options, &home).contains("toolCallTimeoutMs: 60000"));
+        // 桥自身也是 stdio 服务，连不上就当会话缺工具。等待时间取「下游最长」与
+        // 「本机媒体能力下限 240s」中的较大者：没有下游时就是那个下限。
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 240000"));
 
         crate::app::mcp_settings::upsert(
             &options.state_path,
-            downstream("slow-tools", 240_000, true),
+            downstream("slow-tools", 300_000, true),
+        )
+        .unwrap();
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 300000"));
+
+        // 停用的下游不参与，等待时间回落到本机媒体能力的下限。
+        crate::app::mcp_settings::upsert(
+            &options.state_path,
+            downstream("slow-tools", 300_000, false),
         )
         .unwrap();
         assert!(render(&options, &home).contains("toolCallTimeoutMs: 240000"));
 
-        // 停用的下游不参与，等待时间回落到 60 秒。
+        // 两个下游时取更长的那个，并且不超过注册表允许的上限（10 分钟）。
         crate::app::mcp_settings::upsert(
             &options.state_path,
-            downstream("slow-tools", 240_000, false),
-        )
-        .unwrap();
-        assert!(render(&options, &home).contains("toolCallTimeoutMs: 60000"));
-
-        // 两个下游时取更长的那个，并且不超过注册表允许的上限。
-        crate::app::mcp_settings::upsert(
-            &options.state_path,
-            downstream("slow-tools", 240_000, true),
+            downstream("slow-tools", 300_000, true),
         )
         .unwrap();
         crate::app::mcp_settings::upsert(
@@ -4859,7 +5139,7 @@ api_key: "sk-anthropic-secret".to_string(),
             downstream("fast-tools", 90_000, true),
         )
         .unwrap();
-        assert!(render(&options, &home).contains("toolCallTimeoutMs: 240000"));
+        assert!(render(&options, &home).contains("toolCallTimeoutMs: 300000"));
         let _ = std::fs::remove_dir_all(root);
     }
 

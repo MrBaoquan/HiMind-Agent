@@ -205,7 +205,7 @@ mod tests {
             id: id.to_string(),
             name: format!("{id} 名称"),
             vendor_name: id.to_string(),
-            category: "国内厂商".to_string(),
+            category: "按量付费".to_string(),
             description: format!("{id} 描述"),
             service_type: "token".to_string(),
             protocol: protocol.to_string(),
