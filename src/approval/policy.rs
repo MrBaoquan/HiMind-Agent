@@ -30,15 +30,15 @@ pub(crate) fn destructive_request_type(capability_id: &str) -> Option<RequestTyp
     let id = capability_id.trim().to_ascii_lowercase();
     match id.as_str() {
         "system.filesystem.delete" | "workspace.delete" => Some(RequestType::FilesystemDelete),
-        "business.project.delete" | "project.delete" => Some(RequestType::BusinessProjectDelete),
-        "business.exhibit.delete" | "exhibit.delete" => Some(RequestType::BusinessExhibitDelete),
+        "workbench.business.project.delete" | "project.delete" => Some(RequestType::BusinessProjectDelete),
+        "workbench.business.exhibit.delete" | "exhibit.delete" => Some(RequestType::BusinessExhibitDelete),
         // Full replacement and detach operations can remove existing business
         // relationships even though they are exposed as network writes.
-        "business.project.managers.replace"
-        | "business.project.owners.replace"
-        | "business.exhibit.crew.replace"
-        | "business.exhibit.crew.remove"
-        | "business.project.exhibit.detach" => Some(RequestType::DestructiveAction),
+        "workbench.business.project.managers.replace"
+        | "workbench.business.project.owners.replace"
+        | "workbench.business.exhibit.crew.replace"
+        | "workbench.business.exhibit.crew.remove"
+        | "workbench.business.project.exhibit.detach" => Some(RequestType::DestructiveAction),
         "mcp.server.remove" | "mcp.registration.remove" | "mcp.registration.remove-all" => {
             Some(RequestType::DestructiveAction)
         }
@@ -150,15 +150,15 @@ mod tests {
 
     #[test]
     fn business_and_filesystem_deletes_are_r3() {
-        assert_eq!(effective_risk_level("business.project.delete", "R1"), "R3");
+        assert_eq!(effective_risk_level("workbench.business.project.delete", "R1"), "R3");
         assert_eq!(effective_risk_level("system.filesystem.delete", "read_only"), "R3");
     }
 
     #[test]
     fn ordinary_writes_are_not_promoted_to_destructive() {
-        assert!(!is_destructive_capability("business.project.update"));
+        assert!(!is_destructive_capability("workbench.business.project.update"));
         assert_eq!(
-            effective_risk_level("business.project.update", "network_write"),
+            effective_risk_level("workbench.business.project.update", "network_write"),
             "R2"
         );
     }
@@ -166,11 +166,11 @@ mod tests {
     #[test]
     fn relationship_replacements_and_detach_are_r3() {
         for capability_id in [
-            "business.project.managers.replace",
-            "business.project.owners.replace",
-            "business.exhibit.crew.replace",
-            "business.exhibit.crew.remove",
-            "business.project.exhibit.detach",
+            "workbench.business.project.managers.replace",
+            "workbench.business.project.owners.replace",
+            "workbench.business.exhibit.crew.replace",
+            "workbench.business.exhibit.crew.remove",
+            "workbench.business.project.exhibit.detach",
         ] {
             assert_eq!(effective_risk_level(capability_id, "network_write"), "R3");
             assert!(is_destructive_capability(capability_id));
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn legacy_catalog_risk_aliases_map_to_unified_tiers() {
-        assert_eq!(effective_risk_level("context.resolve", "read_only"), "R1");
+        assert_eq!(effective_risk_level("workbench.context.resolve", "read_only"), "R1");
         assert_eq!(
             effective_risk_level("project.update", "network_write"),
             "R2"
@@ -280,9 +280,9 @@ mod tests {
             );
         }
         for unrelated in [
-            "business.project.delete",
+            "workbench.business.project.delete",
             "system.filesystem.delete",
-            "context.resolve",
+            "workbench.context.resolve",
         ] {
             assert!(!is_local_ai_configuration_capability(unrelated));
         }

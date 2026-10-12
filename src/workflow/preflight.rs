@@ -1926,7 +1926,7 @@ mod tests {
 
     #[test]
     fn managed_connector_health_uses_authenticated_dashboard_capability() {
-        let mut capability = capability("business.connector.health");
+        let mut capability = capability("workbench.workbench.business.connector.health");
         capability.availability = CapabilityAvailability::ControlPlane;
         capability.dashboard_provider = true;
         capability.input_schema = json!({
@@ -1935,12 +1935,12 @@ mod tests {
             "required": ["connector_id"],
             "additionalProperties": false
         });
-        let mut package = connector_health_package("business.connector.health");
+        let mut package = connector_health_package("workbench.workbench.business.connector.health");
         package.connectors[0].availability = "control_plane".to_string();
         package.connectors[0].credential_ownership = "dashboard".to_string();
         package.connectors[0].health_check = json!({
             "type": "capability",
-            "target": "business.connector.health",
+            "target": "workbench.workbench.business.connector.health",
             "input": {"connector_id": "managed.example"}
         });
         let mut observed = Value::Null;
@@ -1950,7 +1950,7 @@ mod tests {
             &[capability],
             &json!({}),
             |target, input| {
-                assert_eq!(target, "business.connector.health");
+                assert_eq!(target, "workbench.workbench.business.connector.health");
                 observed = input;
                 Ok(json!({"status": "available"}))
             },

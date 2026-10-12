@@ -1508,10 +1508,10 @@ function isHighRiskRuleKey(key: string) {
   return normalized === 'risk:r3'
     || normalized.endsWith('.delete')
     || normalized.endsWith('.delete_all')
-    || normalized === 'business.project.managers.replace'
-    || normalized === 'business.project.owners.replace'
-    || normalized === 'business.exhibit.crew.replace'
-    || normalized === 'business.project.exhibit.detach'
+    || normalized === 'workbench.business.project.managers.replace'
+    || normalized === 'workbench.business.project.owners.replace'
+    || normalized === 'workbench.business.exhibit.crew.replace'
+    || normalized === 'workbench.business.project.exhibit.detach'
     || normalized === 'software.distribution.release.publish'
     || normalized === 'extension.review.decide';
 }

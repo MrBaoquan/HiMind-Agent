@@ -2493,7 +2493,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SoftwareDistributionPublish,
             ),
             dashboard_business_registration(
-                "context.resolve",
+                "workbench.context.resolve",
                 "解析项目业务上下文",
                 "按项目名、展项名或 IP 解析当前用户可见的稳定业务实体。",
                 "read_only",
@@ -2510,7 +2510,7 @@ impl CapabilityGateway {
                 CapabilityHandler::DashboardContextResolve,
             ),
             dashboard_business_registration(
-                "project.context.get",
+                "workbench.project.context.get",
                 "项目全景",
                 "读取当前用户可见的项目、展项、需求和健康度聚合事实。",
                 "read_only",
@@ -2523,11 +2523,11 @@ impl CapabilityGateway {
                 CapabilityHandler::DashboardProjectContext,
             ),
             dashboard_business_registration(
-                "business.project.get", "读取项目", "读取项目、展项、需求和健康度聚合事实。", "read_only",
+                "workbench.business.project.get", "读取项目", "读取项目、展项、需求和健康度聚合事实。", "read_only",
                 json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectContext,
             ),
             dashboard_business_registration(
-                "exhibit.context.get",
+                "workbench.exhibit.context.get",
                 "展项全景",
                 "读取展项 IP、设备、成员、需求和最近推进事件。",
                 "read_only",
@@ -2540,11 +2540,11 @@ impl CapabilityGateway {
                 CapabilityHandler::DashboardExhibitContext,
             ),
             dashboard_business_registration(
-                "business.exhibit.get", "读取展项", "读取展项成员、设备、需求和推进事件。", "read_only",
+                "workbench.business.exhibit.get", "读取展项", "读取展项成员、设备、需求和推进事件。", "read_only",
                 json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitContext,
             ),
             dashboard_business_registration(
-                "work.my_summary",
+                "workbench.work.summary.get",
                 "我的工作摘要",
                 "读取当前用户负责或关注的项目、展项和需求摘要。",
                 "read_only",
@@ -2552,64 +2552,64 @@ impl CapabilityGateway {
                 CapabilityHandler::DashboardMyWorkSummary,
             ),
             dashboard_business_registration(
-                "business.project.list", "项目列表", "读取当前用户可见的项目列表。", "read_only",
+                "workbench.business.project.list", "项目列表", "读取当前用户可见的项目列表。", "read_only",
                 json!({"type":"object","properties":{"q":{"type":"string"},"status":{"type":"string"},"scope":{"type":"string"},"page":{"type":"integer"},"page_size":{"type":"integer"}},"additionalProperties":false}), CapabilityHandler::DashboardProjectList,
             ),
             dashboard_business_registration(
-                "business.project.create", "创建项目", "创建项目并按 Dashboard 权限初始化项目责任人和仓库任务。", "network_write",
+                "workbench.business.project.create", "创建项目", "创建项目并按 Dashboard 权限初始化项目责任人和仓库任务。", "network_write",
                 json!({"type":"object","properties":{"project_name":{"type":"string"},"scope_type":{"type":"string","enum":["organization","personal"]},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"project_manager_user_ids":{"type":"array","items":{"type":"string"}},"project_owner_user_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string","enum":["members","all_read","all_read_write"]},"initial_engineering_name":{"type":"string"},"initial_engine_type":{"type":"string"},"agent_id":{"type":"string"}},"required":["project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectCreate,
             ),
             dashboard_business_registration(
-                "business.project.update", "更新项目", "更新项目资料和协作中心；项目经理/负责人必须通过专用人员能力调整。", "network_write",
+                "workbench.business.project.update", "更新项目", "更新项目资料和协作中心；项目经理/负责人必须通过专用人员能力调整。", "network_write",
                 json!({"type":"object","properties":{"project_id":{"type":"string"},"project_name":{"type":"string"},"business_unit_id":{"type":"string"},"management_center_ids":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"note":{"type":"string"},"exhibit_visibility":{"type":"string"},"repository_access":{"type":"string","enum":["members","all_read","all_read_write"]}},"required":["project_id","project_name"],"additionalProperties":false}), CapabilityHandler::DashboardProjectUpdate,
             ),
             dashboard_business_registration(
-                "business.project.delete", "删除项目", "删除项目及其展项、工作区和项目关系。该操作为 R3 高风险能力，必须经过审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectDelete,
+                "workbench.business.project.delete", "删除项目", "删除项目及其展项、工作区和项目关系。该操作为 R3 高风险能力，必须经过审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"}},"required":["project_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectDelete,
             ),
             dashboard_business_registration(
-                "business.exhibit.list", "展项列表", "读取当前用户可见的展项列表。", "read_only", json!({"type":"object","properties":{"q":{"type":"string"},"project":{"type":"string"},"engine":{"type":"string"},"page":{"type":"integer"},"page_size":{"type":"integer"}},"additionalProperties":false}), CapabilityHandler::DashboardExhibitList,
+                "workbench.business.exhibit.list", "展项列表", "读取当前用户可见的展项列表。", "read_only", json!({"type":"object","properties":{"q":{"type":"string"},"project":{"type":"string"},"engine":{"type":"string"},"page":{"type":"integer"},"page_size":{"type":"integer"}},"additionalProperties":false}), CapabilityHandler::DashboardExhibitList,
             ),
             dashboard_business_registration(
-                "business.exhibit.create", "创建展项", "在项目下创建展项。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"resolution":{"type":"string"},"hall_id":{"type":"string"},"hall":{"type":"string"},"workload":{"type":"number"},"engineering_id":{"type":"string"},"developer_source":{"type":"string"},"edit_url":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"source_path":{"type":"string"},"release_path":{"type":"string"},"config_params":{"type":"array","items":{"type":"string"}},"code_uploads":{"type":"array","items":{"type":"string"}},"engine_type":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"note":{"type":"string"}},"required":["project_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCreate,
+                "workbench.business.exhibit.create", "创建展项", "在项目下创建展项。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"resolution":{"type":"string"},"hall_id":{"type":"string"},"hall":{"type":"string"},"workload":{"type":"number"},"engineering_id":{"type":"string"},"developer_source":{"type":"string"},"edit_url":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"source_path":{"type":"string"},"release_path":{"type":"string"},"config_params":{"type":"array","items":{"type":"string"}},"code_uploads":{"type":"array","items":{"type":"string"}},"engine_type":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"note":{"type":"string"}},"required":["project_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCreate,
             ),
             dashboard_business_registration(
-                "business.exhibit.update", "更新展项", "更新展项资料和项目归属；制作人员必须通过 crew 专用能力调整。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"hall_id":{"type":"string"},"hall":{"type":"string"},"engine_type":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"note":{"type":"string"}},"required":["exhibit_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitUpdate,
+                "workbench.business.exhibit.update", "更新展项", "更新展项资料和项目归属；制作人员必须通过 crew 专用能力调整。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"project_id":{"type":"string"},"exhibit_name":{"type":"string"},"parent_exhibit_pid":{"type":["string","null"]},"hall_id":{"type":"string"},"hall":{"type":"string"},"engine_type":{"type":"string"},"status":{"type":"string"},"repository_url":{"type":"string"},"note":{"type":"string"}},"required":["exhibit_id","exhibit_name"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitUpdate,
             ),
             dashboard_business_registration(
-                "business.exhibit.delete", "删除展项", "删除展项及其工作区、设备和关联关系。该操作为 R3 高风险能力，必须经过审批。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitDelete,
+                "workbench.business.exhibit.delete", "删除展项", "删除展项及其工作区、设备和关联关系。该操作为 R3 高风险能力，必须经过审批。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitDelete,
             ),
             dashboard_business_registration(
-                "business.project.managers.replace", "替换项目经理", "全量替换项目经理；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}},"expected_user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectManagersReplace,
+                "workbench.business.project.managers.replace", "替换项目经理", "全量替换项目经理；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}},"expected_user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectManagersReplace,
             ),
             dashboard_business_registration(
-                "business.project.owners.replace", "替换项目负责人", "全量替换项目负责人；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}},"expected_user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectOwnersReplace,
+                "workbench.business.project.owners.replace", "替换项目负责人", "全量替换项目负责人；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"user_ids":{"type":"array","items":{"type":"string"}},"expected_user_ids":{"type":"array","items":{"type":"string"}}},"required":["project_id","user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardProjectOwnersReplace,
             ),
             dashboard_business_registration(
-                "business.exhibit.crew.replace", "替换展项人员", "全量替换展项制作人员和现场调试人员；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewReplace,
+                "workbench.business.exhibit.crew.replace", "替换展项人员", "全量替换展项制作人员和现场调试人员；未包含的既有人员会被移除。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"developer_user_ids":{"type":"array","items":{"type":"string"}},"onsite_debugger_user_ids":{"type":"array","items":{"type":"string"}},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewReplace,
             ),
             dashboard_business_registration(
-                "business.exhibit.crew.append", "追加展项制作人员", "只向展项追加制作人员，不会删除或替换已有制作人员。重复人员会被忽略。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"add_developer_user_ids":{"type":"array","items":{"type":"string"},"maxItems":100},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id","add_developer_user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewAppend,
+                "workbench.business.exhibit.crew.append", "追加展项制作人员", "只向展项追加制作人员，不会删除或替换已有制作人员。重复人员会被忽略。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"add_developer_user_ids":{"type":"array","items":{"type":"string"},"maxItems":100},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id","add_developer_user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewAppend,
             ),
             dashboard_business_registration(
-                "business.exhibit.crew.remove", "移出展项制作人员", "从展项移出制作人员，不影响现场调试人员、需求历史或用户账户；重复移出幂等。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"remove_developer_user_ids":{"type":"array","items":{"type":"string"},"maxItems":100},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}},"reason":{"type":"string","maxLength":500}},"required":["exhibit_id","remove_developer_user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewRemove,
+                "workbench.business.exhibit.crew.remove", "移出展项制作人员", "从展项移出制作人员，不影响现场调试人员、需求历史或用户账户；重复移出幂等。", "R3", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"remove_developer_user_ids":{"type":"array","items":{"type":"string"},"maxItems":100},"expected_developer_user_ids":{"type":"array","items":{"type":"string"}},"reason":{"type":"string","maxLength":500}},"required":["exhibit_id","remove_developer_user_ids"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitCrewRemove,
             ),
             dashboard_business_registration(
-                "business.project.exhibit.attach", "关联展项", "将展项关联到指定项目。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitAttach,
+                "workbench.business.project.exhibit.attach", "关联展项", "将展项关联到指定项目。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitAttach,
             ),
             dashboard_business_registration(
-                "business.project.exhibit.detach", "解除展项关联", "解除展项与项目的既有关联。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitDetach,
+                "workbench.business.project.exhibit.detach", "解除展项关联", "解除展项与项目的既有关联。该操作为 R3 高风险能力，需要审批。", "R3", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"}},"required":["project_id","exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardProjectExhibitDetach,
             ),
             dashboard_business_registration(
-                "business.exhibit.workspace.get", "查看展项工作区", "读取展项在指定 Agent 上的本地工作区绑定。", "read_only", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"}},"required":["exhibit_id","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceGet,
+                "workbench.business.exhibit.workspace.get", "查看展项工作区", "读取展项在指定 Agent 上的本地工作区绑定。", "read_only", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"}},"required":["exhibit_id","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceGet,
             ),
             dashboard_business_registration(
-                "business.exhibit.workspace.bind", "绑定展项工作区", "保存展项与 Agent 本地目录的绑定。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"},"local_path":{"type":"string"},"engine_version":{"type":"string"}},"required":["exhibit_id","agent_id","local_path"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceBind,
+                "workbench.business.exhibit.workspace.bind", "绑定展项工作区", "保存展项与 Agent 本地目录的绑定。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"agent_id":{"type":"string"},"local_path":{"type":"string"},"engine_version":{"type":"string"}},"required":["exhibit_id","agent_id","local_path"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceBind,
             ),
             dashboard_business_registration(
-                "business.exhibit.workspace.checkout", "检出展项工作区", "检出展项 SVN 工作区并自动保存到 Dashboard 的工作区绑定。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"repository_url":{"type":"string"},"target_path":{"type":"string"},"agent_id":{"type":"string"},"engine_version":{"type":"string"}},"required":["project_id","exhibit_id","target_path","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceCheckout,
+                "workbench.business.exhibit.workspace.checkout", "检出展项工作区", "检出展项 SVN 工作区并自动保存到 Dashboard 的工作区绑定。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"repository_url":{"type":"string"},"target_path":{"type":"string"},"agent_id":{"type":"string"},"engine_version":{"type":"string"}},"required":["project_id","exhibit_id","target_path","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceCheckout,
             ),
             dashboard_business_registration(
-                "operation.get",
+                "workbench.operation.get",
                 "查看异步操作",
                 "读取由 Dashboard AI 能力创建的异步操作状态、进度和结果。",
                 "read_only",
@@ -2622,7 +2622,7 @@ impl CapabilityGateway {
                 CapabilityHandler::OperationGet,
             ),
             dashboard_business_registration(
-                "operation.cancel",
+                "workbench.operation.cancel",
                 "取消异步操作",
                 "请求取消仍在排队或执行中的 Dashboard AI 异步操作。",
                 "network_write",
@@ -2635,43 +2635,43 @@ impl CapabilityGateway {
                 CapabilityHandler::OperationCancel,
             ),
             dashboard_business_registration(
-                "business.people.search", "查询人员", "按姓名、用户 ID 或部门查询可用于项目和展项配置的人员。", "read_only",
+                "workbench.business.people.search", "查询人员", "按姓名、用户 ID 或部门查询可用于项目和展项配置的人员。", "read_only",
                 json!({"type":"object","properties":{"q":{"type":"string","maxLength":100},"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"page":{"type":"integer","minimum":1},"page_size":{"type":"integer","minimum":1,"maximum":100}},"required":["q"],"additionalProperties":false}), CapabilityHandler::DashboardPeopleSearch,
             ),
             dashboard_business_registration(
-                "business.requirement.list", "需求列表", "读取展项需求及分配状态。", "read_only",
+                "workbench.business.requirement.list", "需求列表", "读取展项需求及分配状态。", "read_only",
                 json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"status":{"type":"string","enum":["active","done","all"]},"mine":{"type":"boolean"},"page":{"type":"integer","minimum":1},"page_size":{"type":"integer","minimum":1,"maximum":100}},"required":["exhibit_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementList,
             ),
             dashboard_business_registration(
-                "business.requirement.get", "读取需求", "读取单个需求的完整内容、分配、评论和事件。", "read_only",
+                "workbench.business.requirement.get", "读取需求", "读取单个需求的完整内容、分配、评论和事件。", "read_only",
                 json!({"type":"object","properties":{"requirement_id":{"type":"string"}},"required":["requirement_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementGet,
             ),
             dashboard_business_registration(
-                "business.requirement.create", "创建需求", "在展项下创建需求并指派展项成员。", "network_write",
+                "workbench.business.requirement.create", "创建需求", "在展项下创建需求并指派展项成员。", "network_write",
                 json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"title":{"type":"string","maxLength":200},"description":{"type":"string","maxLength":20000},"acceptance_criteria":{"type":"string","maxLength":10000},"category":{"type":"string","enum":["feature","bug","change","optimization","content","technical","support"]},"priority":{"type":"string","enum":["low","normal","high","urgent"]},"due_at":{"type":"string"},"assignee_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":50},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["exhibit_id","title","assignee_ids"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementCreate,
             ),
             dashboard_business_registration(
-                "business.requirement.update", "更新需求", "更新需求内容和指派成员，使用 version 防止覆盖他人修改。", "network_write",
+                "workbench.business.requirement.update", "更新需求", "更新需求内容和指派成员，使用 version 防止覆盖他人修改。", "network_write",
                 json!({"type":"object","properties":{"requirement_id":{"type":"string"},"title":{"type":"string","maxLength":200},"description":{"type":"string","maxLength":20000},"acceptance_criteria":{"type":"string","maxLength":10000},"category":{"type":"string","enum":["feature","bug","change","optimization","content","technical","support"]},"priority":{"type":"string","enum":["low","normal","high","urgent"]},"due_at":{"type":"string"},"version":{"type":"integer","minimum":1},"assignee_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":50},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","title","version","assignee_ids"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementUpdate,
             ),
             dashboard_business_registration(
-                "business.requirement.assignment.update", "更新我的需求", "更新当前用户的需求进度、阻塞原因或交付说明。", "network_write",
+                "workbench.business.requirement.assignment.update", "更新我的需求", "更新当前用户的需求进度、阻塞原因或交付说明。", "network_write",
                 json!({"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"type":"string","enum":["in_progress","blocked","submitted"]},"completion_note":{"type":"string","maxLength":10000},"blocked_reason":{"type":"string","maxLength":4000},"archive_when_done":{"type":"boolean"},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","status"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementAssignmentUpdate,
             ),
             dashboard_business_registration(
-                "business.requirement.cancel", "取消需求", "取消尚未完成的展项需求。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"}},"required":["requirement_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementCancel,
+                "workbench.business.requirement.cancel", "取消需求", "取消尚未完成的展项需求。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"}},"required":["requirement_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementCancel,
             ),
             dashboard_business_registration(
-                "business.requirement.reopen", "重新打开需求", "重新打开已完成或已取消的成员需求分配。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"user_id":{"type":"string"}},"required":["requirement_id","user_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementReopen,
+                "workbench.business.requirement.reopen", "重新打开需求", "重新打开已完成或已取消的成员需求分配。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"user_id":{"type":"string"}},"required":["requirement_id","user_id"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementReopen,
             ),
             dashboard_business_registration(
-                "business.requirement.review", "验收需求", "验收或退回成员提交的需求交付。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"user_id":{"type":"string"},"action":{"type":"string","enum":["accept","return"]},"note":{"type":"string","maxLength":4000}},"required":["requirement_id","user_id","action","note"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementReview,
+                "workbench.business.requirement.review", "验收需求", "验收或退回成员提交的需求交付。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"user_id":{"type":"string"},"action":{"type":"string","enum":["accept","return"]},"note":{"type":"string","maxLength":4000}},"required":["requirement_id","user_id","action","note"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementReview,
             ),
             dashboard_business_registration(
-                "business.requirement.comment", "评论需求", "向需求添加评论并通知参与者。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"content_markdown":{"type":"string","maxLength":10000},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","content_markdown"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementComment,
+                "workbench.business.requirement.comment", "评论需求", "向需求添加评论并通知参与者。", "network_write", json!({"type":"object","properties":{"requirement_id":{"type":"string"},"content_markdown":{"type":"string","maxLength":10000},"draft_token":{"type":"string"},"attachment_ids":{"type":"array","items":{"type":"string"}}},"required":["requirement_id","content_markdown"],"additionalProperties":false}), CapabilityHandler::DashboardRequirementComment,
             ),
             dashboard_knowledge_registration(
-                "knowledge.search.v1",
+                "workbench.knowledge.search",
                 "知识检索",
                 "检索当前用户允许外部 AI 工具访问的知识空间，返回原文片段、稳定引用和 Trace ID；不调用 HiMind 模型。",
                 "read_only",
@@ -6130,51 +6130,51 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
             Some(crate::api::oauth::RELEASE_MANAGE_SCOPE)
         }
         "distribution.release.publish" => Some(crate::api::oauth::RELEASE_MANAGE_SCOPE),
-        "context.resolve" | "work.my_summary" => {
+        "workbench.context.resolve" | "workbench.work.summary.get" => {
             Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
         }
-        "project.context.get" | "business.project.get" => {
+        "workbench.project.context.get" | "workbench.business.project.get" => {
             Some(crate::api::oauth::BUSINESS_PROJECT_READ_SCOPE)
         }
-        "exhibit.context.get" | "business.exhibit.get" => {
+        "workbench.exhibit.context.get" | "workbench.business.exhibit.get" => {
             Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE)
         }
-        "business.project.list" => Some(crate::api::oauth::BUSINESS_PROJECT_READ_SCOPE),
-        "business.project.create" | "business.project.update" | "business.project.delete" => {
+        "workbench.business.project.list" => Some(crate::api::oauth::BUSINESS_PROJECT_READ_SCOPE),
+        "workbench.business.project.create" | "workbench.business.project.update" | "workbench.business.project.delete" => {
             Some(crate::api::oauth::BUSINESS_PROJECT_WRITE_SCOPE)
         }
-        "business.exhibit.list" => Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE),
-        "business.exhibit.create" | "business.exhibit.update" | "business.exhibit.delete" => {
+        "workbench.business.exhibit.list" => Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE),
+        "workbench.business.exhibit.create" | "workbench.business.exhibit.update" | "workbench.business.exhibit.delete" => {
             Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE)
         }
-        "business.project.managers.replace"
-        | "business.project.owners.replace"
-        | "business.exhibit.crew.replace"
-        | "business.exhibit.crew.append"
-        | "business.exhibit.crew.remove" => Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE),
-        "business.people.search" => Some(crate::api::oauth::BUSINESS_PEOPLE_READ_SCOPE),
-        "business.requirement.list" | "business.requirement.get" => {
+        "workbench.business.project.managers.replace"
+        | "workbench.business.project.owners.replace"
+        | "workbench.business.exhibit.crew.replace"
+        | "workbench.business.exhibit.crew.append"
+        | "workbench.business.exhibit.crew.remove" => Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE),
+        "workbench.business.people.search" => Some(crate::api::oauth::BUSINESS_PEOPLE_READ_SCOPE),
+        "workbench.business.requirement.list" | "workbench.business.requirement.get" => {
             Some(crate::api::oauth::BUSINESS_REQUIREMENT_READ_SCOPE)
         }
-        "business.requirement.create"
-        | "business.requirement.update"
-        | "business.requirement.assignment.update"
-        | "business.requirement.cancel"
-        | "business.requirement.reopen"
-        | "business.requirement.review"
-        | "business.requirement.comment" => {
+        "workbench.business.requirement.create"
+        | "workbench.business.requirement.update"
+        | "workbench.business.requirement.assignment.update"
+        | "workbench.business.requirement.cancel"
+        | "workbench.business.requirement.reopen"
+        | "workbench.business.requirement.review"
+        | "workbench.business.requirement.comment" => {
             Some(crate::api::oauth::BUSINESS_REQUIREMENT_WRITE_SCOPE)
         }
-        "business.project.exhibit.attach" | "business.project.exhibit.detach" => {
+        "workbench.business.project.exhibit.attach" | "workbench.business.project.exhibit.detach" => {
             Some(crate::api::oauth::BUSINESS_PROJECT_WRITE_SCOPE)
         }
-        "business.exhibit.workspace.get" => Some(crate::api::oauth::BUSINESS_WORKSPACE_READ_SCOPE),
-        "business.exhibit.workspace.bind" | "business.exhibit.workspace.checkout" => {
+        "workbench.business.exhibit.workspace.get" => Some(crate::api::oauth::BUSINESS_WORKSPACE_READ_SCOPE),
+        "workbench.business.exhibit.workspace.bind" | "workbench.business.exhibit.workspace.checkout" => {
             Some(crate::api::oauth::BUSINESS_WORKSPACE_WRITE_SCOPE)
         }
-        "operation.get" => Some(crate::api::oauth::OPERATION_READ_SCOPE),
-        "operation.cancel" => Some(crate::api::oauth::OPERATION_CANCEL_SCOPE),
-        "knowledge.search.v1" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
+        "workbench.operation.get" => Some(crate::api::oauth::OPERATION_READ_SCOPE),
+        "workbench.operation.cancel" => Some(crate::api::oauth::OPERATION_CANCEL_SCOPE),
+        "workbench.knowledge.search" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
         "workbench.media.image.generate"
         | "workbench.media.image.edit"
         | "workbench.media.video.generate"
@@ -6440,66 +6440,66 @@ fn business_integration_contract_source(provider_id: &str) -> String {
 
 fn dashboard_route_for(capability_id: &str) -> Option<String> {
     let route = match capability_id {
-        "context.resolve" => "/api/integrations/ai/business/context/resolve",
-        "project.context.get" | "business.project.get" => {
+        "workbench.context.resolve" => "/api/integrations/ai/business/context/resolve",
+        "workbench.project.context.get" | "workbench.business.project.get" => {
             "/api/integrations/ai/business/projects/{project_id}"
         }
-        "exhibit.context.get" | "business.exhibit.get" => {
+        "workbench.exhibit.context.get" | "workbench.business.exhibit.get" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}"
         }
-        "work.my_summary" => "/api/integrations/ai/business/my-work/summary",
-        "business.project.list" => "/api/integrations/ai/business/projects",
-        "business.project.create" => "/api/integrations/ai/business/projects",
-        "business.project.update" | "business.project.delete" => {
+        "workbench.work.summary.get" => "/api/integrations/ai/business/my-work/summary",
+        "workbench.business.project.list" => "/api/integrations/ai/business/projects",
+        "workbench.business.project.create" => "/api/integrations/ai/business/projects",
+        "workbench.business.project.update" | "workbench.business.project.delete" => {
             "/api/integrations/ai/business/projects/{project_id}"
         }
-        "business.project.managers.replace" => {
+        "workbench.business.project.managers.replace" => {
             "/api/integrations/ai/business/projects/{project_id}/managers"
         }
-        "business.project.owners.replace" => {
+        "workbench.business.project.owners.replace" => {
             "/api/integrations/ai/business/projects/{project_id}/owners"
         }
-        "business.exhibit.list" | "business.exhibit.create" => {
+        "workbench.business.exhibit.list" | "workbench.business.exhibit.create" => {
             "/api/integrations/ai/business/exhibits"
         }
-        "business.exhibit.update" | "business.exhibit.delete" => {
+        "workbench.business.exhibit.update" | "workbench.business.exhibit.delete" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}"
         }
-        "business.exhibit.crew.replace" => {
+        "workbench.business.exhibit.crew.replace" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}/crew"
         }
-        "business.exhibit.crew.append" => {
+        "workbench.business.exhibit.crew.append" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}/crew/append"
         }
-        "business.exhibit.crew.remove" => {
+        "workbench.business.exhibit.crew.remove" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}/crew/remove"
         }
-        "business.project.exhibit.attach" => {
+        "workbench.business.project.exhibit.attach" => {
             "/api/integrations/ai/business/projects/{project_id}/exhibits/{exhibit_id}/attach"
         }
-        "business.project.exhibit.detach" => {
+        "workbench.business.project.exhibit.detach" => {
             "/api/integrations/ai/business/projects/{project_id}/exhibits/{exhibit_id}/detach"
         }
-        "business.people.search" => "/api/integrations/ai/business/people/search",
-        "business.requirement.list" => "/api/integrations/ai/business/requirements",
-        "business.requirement.get" => "/api/integrations/ai/business/requirements/{requirement_id}",
-        "business.requirement.create" => "/api/integrations/ai/business/requirements",
-        "business.requirement.update"
-        | "business.requirement.cancel"
-        | "business.requirement.reopen"
-        | "business.requirement.review"
-        | "business.requirement.comment" => {
+        "workbench.business.people.search" => "/api/integrations/ai/business/people/search",
+        "workbench.business.requirement.list" => "/api/integrations/ai/business/requirements",
+        "workbench.business.requirement.get" => "/api/integrations/ai/business/requirements/{requirement_id}",
+        "workbench.business.requirement.create" => "/api/integrations/ai/business/requirements",
+        "workbench.business.requirement.update"
+        | "workbench.business.requirement.cancel"
+        | "workbench.business.requirement.reopen"
+        | "workbench.business.requirement.review"
+        | "workbench.business.requirement.comment" => {
             "/api/integrations/ai/business/requirements/{requirement_id}"
         }
-        "business.requirement.assignment.update" => {
+        "workbench.business.requirement.assignment.update" => {
             "/api/integrations/ai/business/requirements/{requirement_id}/assignment"
         }
-        "knowledge.search.v1" => "/api/integrations/ai/business/knowledge/search",
-        "business.exhibit.workspace.checkout" => {
+        "workbench.knowledge.search" => "/api/integrations/ai/business/knowledge/search",
+        "workbench.business.exhibit.workspace.checkout" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}/workspace/checkout"
         }
-        "operation.get" => "/api/integrations/ai/operations/{operation_id}",
-        "operation.cancel" => "/api/integrations/ai/operations/{operation_id}/cancel",
+        "workbench.operation.get" => "/api/integrations/ai/operations/{operation_id}",
+        "workbench.operation.cancel" => "/api/integrations/ai/operations/{operation_id}/cancel",
         _ => return None,
     };
     Some(route.to_string())
@@ -6558,7 +6558,7 @@ fn validate_exhibit_route_id_input(
             "code": "EXHIBIT_ROUTE_ID_REQUIRED",
             "field": "exhibit_id",
             "display_id": normalized,
-            "message": format!("展项参数使用了展示编号 {normalized}。请先调用 business.exhibit.list 或 context.resolve，并使用返回项的 pid 作为 exhibit_id。"),
+            "message": format!("展项参数使用了展示编号 {normalized}。请先调用 workbench.business.exhibit.list 或 workbench.context.resolve，并使用返回项的 pid 作为 exhibit_id。"),
             "hint": "EX-xxxx 仅用于展示；后续展项读取、人员、需求和工作区操作必须传入 list 返回的 pid。"
         })
         .to_string()
@@ -6736,14 +6736,14 @@ fn matches_capability_pattern(pattern: &str, value: &str) -> bool {
 }
 
 const EXHIBIT_ROUTE_ID_DESCRIPTION: &str =
-    "使用 business.exhibit.list 或 context.resolve 返回的 pid（展项路由 ID）；exhibit_id（如 EX-0021）只是展示编号，不能直接使用。";
+    "使用 workbench.business.exhibit.list 或 workbench.context.resolve 返回的 pid（展项路由 ID）；exhibit_id（如 EX-0021）只是展示编号，不能直接使用。";
 
 /// Add the stable exhibit identifier rule to every projected business
 /// capability. Dashboard catalogs are allowed to update schemas at runtime,
 /// so this normalization belongs at the final Gateway projection boundary
 /// instead of being duplicated in each provider contract.
 fn annotate_business_exhibit_id_contract(descriptor: &mut CapabilityDescriptor) {
-    if descriptor.id == "business.exhibit.list" {
+    if descriptor.id == "workbench.business.exhibit.list" {
         let suffix =
             " 返回项中的 pid 才能作为后续 exhibit_id；exhibit_id（如 EX-0021）只是展示编号。";
         if !descriptor.description.contains("pid") {
@@ -7997,7 +7997,7 @@ mod tests {
         gateway.replace_business_catalog_for_test(BusinessCatalogSnapshot::dashboard(
             "cache-invalidation-generation".into(),
             vec![BusinessCapabilityContract {
-                id: "business.project.list".into(),
+                id: "workbench.business.project.list".into(),
                 version: "2.0.0".into(),
                 name: "项目列表".into(),
                 description: "测试目录能力".into(),
@@ -8023,10 +8023,10 @@ mod tests {
             .list_capabilities(&context)
             .unwrap()
             .into_iter()
-            .find(|item| item.id == "business.project.list")
+            .find(|item| item.id == "workbench.business.project.list")
             .expect("replacement catalog capability remains visible");
         assert_eq!(after.version, "2.0.0");
-        assert!(before.contains("business.project.list"));
+        assert!(before.contains("workbench.business.project.list"));
     }
 
     #[test]
@@ -8187,7 +8187,7 @@ mod tests {
         .is_ok());
 
         let dashboard = dashboard_business_registration(
-            "business.exhibit.get",
+            "workbench.business.exhibit.get",
             "读取展项",
             "读取展项",
             "read_only",
@@ -8416,7 +8416,7 @@ mod tests {
     #[test]
     fn dashboard_business_capabilities_report_the_builtin_plugin_provider() {
         let item = dashboard_business_registration(
-            "exhibit.context.get",
+            "workbench.exhibit.context.get",
             "展项全景",
             "读取展项事实",
             "read_only",
@@ -8501,11 +8501,11 @@ mod tests {
     #[test]
     fn dashboard_business_capabilities_use_business_scope_not_model_scope() {
         assert_eq!(
-            required_platform_scope("context.resolve"),
+            required_platform_scope("workbench.context.resolve"),
             Some(crate::api::oauth::BUSINESS_CONTEXT_READ_SCOPE)
         );
         assert_ne!(
-            required_platform_scope("context.resolve"),
+            required_platform_scope("workbench.context.resolve"),
             Some(crate::api::oauth::AI_CONVERSATION_SCOPE)
         );
     }
@@ -8513,11 +8513,11 @@ mod tests {
     #[test]
     fn knowledge_search_uses_knowledge_scope_not_model_scope() {
         assert_eq!(
-            required_platform_scope("knowledge.search.v1"),
+            required_platform_scope("workbench.knowledge.search"),
             Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE)
         );
         assert_ne!(
-            required_platform_scope("knowledge.search.v1"),
+            required_platform_scope("workbench.knowledge.search"),
             Some(crate::api::oauth::AI_CONVERSATION_SCOPE)
         );
     }
@@ -8577,7 +8577,7 @@ mod tests {
             .iter()
             .any(|item| item.id == "workspace.exhibit.status"));
         assert!(visible.iter().any(|item| item.id == "svn.connection.test"));
-        assert!(!visible.iter().any(|item| item.id == "context.resolve"));
+        assert!(!visible.iter().any(|item| item.id == "workbench.context.resolve"));
         // 本机生图只依赖用户自己的 OpenAI 兼容服务，不经过 AI 工作台，
         // 因此独立模式必须保持可见、可用。
         assert!(visible
@@ -8646,7 +8646,7 @@ mod tests {
             .iter()
             .any(|item| { is_svn_admin_capability(&item.id) }));
         assert!(visible.iter().any(|item| item.id == "system.health"));
-        assert!(visible.iter().any(|item| item.id == "context.resolve"));
+        assert!(visible.iter().any(|item| item.id == "workbench.context.resolve"));
         // 本机生图在已对接模式下同样可见（服务源是用户自己的服务）。
         assert!(visible.iter().any(|item| item.id == "media.image.generate"));
         // 工作台媒体通道只在已对接模式投影，且不与 media.* 抢命名。
@@ -8920,8 +8920,8 @@ mod tests {
             dynamic.dashboard_route.as_deref(),
             Some("/api/integrations/ai/business/examples")
         );
-        assert!(!visible.iter().any(|item| item.id == "context.resolve"));
-        assert!(!visible.iter().any(|item| item.id == "operation.get"));
+        assert!(!visible.iter().any(|item| item.id == "workbench.context.resolve"));
+        assert!(!visible.iter().any(|item| item.id == "workbench.operation.get"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9098,7 +9098,7 @@ mod tests {
         for id in [
             "media.image.generate",
             "workbench.media.video.generate",
-            "business.project.create",
+            "workbench.business.project.create",
             "extension.distribution.target.get",
             "system.capability.search",
             "workspace.exhibit.checkout",
@@ -9112,7 +9112,7 @@ mod tests {
         for (id, expected) in [
             ("work-log.project.mapPath", "每段必须小写"),
             ("work-log.project.map_path", "不得使用下划线"),
-            ("knowledge.search.v1", "版本不得进入能力 ID"),
+            ("workbench.knowledge.search.v1", "版本不得进入能力 ID"),
             ("extension.workspace.workspace", "不得出现重复段"),
             ("media-library.library.search", "子段与父段语义重复"),
             ("one.two.three.four.five.six", "段数超出规则文件区间"),

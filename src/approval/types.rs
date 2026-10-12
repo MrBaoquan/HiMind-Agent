@@ -52,8 +52,8 @@ impl RequestType {
             Self::UploadPlaceholder => "upload_placeholder",
             Self::DestructiveAction => "destructive_action",
             Self::FilesystemDelete => "system.filesystem.delete",
-            Self::BusinessProjectDelete => "business.project.delete",
-            Self::BusinessExhibitDelete => "business.exhibit.delete",
+            Self::BusinessProjectDelete => "workbench.business.project.delete",
+            Self::BusinessExhibitDelete => "workbench.business.exhibit.delete",
         }
     }
 

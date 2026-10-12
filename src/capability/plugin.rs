@@ -778,10 +778,10 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             "项目业务助手",
             "以当前用户身份读取 Dashboard 项目、展项、需求、IP 和我的工作聚合事实。",
             &[
-                "context.resolve",
-                "project.context.get",
-                "exhibit.context.get",
-                "work.my_summary",
+                "workbench.context.resolve",
+                "workbench.project.context.get",
+                "workbench.exhibit.context.get",
+                "workbench.work.summary.get",
             ],
             &["dashboard.business.read", "oauth.delegated_user"],
         ),
@@ -789,7 +789,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             "com.himind.knowledge",
             "知识检索",
             "以当前用户身份检索获准向外部 AI 工具开放的 Dashboard 知识空间。",
-            &["knowledge.search.v1"],
+            &["workbench.knowledge.search"],
             &["dashboard.knowledge.search", "oauth.delegated_user"],
         ),
     ]

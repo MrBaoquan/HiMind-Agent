@@ -804,7 +804,7 @@ fn exhibit_route_id_error(display_id: &str) -> String {
         "code": "EXHIBIT_ROUTE_ID_REQUIRED",
         "field": "exhibit_id",
         "display_id": display_id.trim(),
-        "message": format!("展项参数使用了展示编号 {}。请先调用 business.exhibit.list 或 context.resolve，并使用返回项的 pid 作为 exhibit_id。", display_id.trim()),
+        "message": format!("展项参数使用了展示编号 {}。请先调用 workbench.business.exhibit.list 或 workbench.context.resolve，并使用返回项的 pid 作为 exhibit_id。", display_id.trim()),
         "hint": "EX-xxxx 仅用于展示；后续展项读取、人员、需求和工作区操作必须传入 list 返回的 pid。"
     })
     .to_string()

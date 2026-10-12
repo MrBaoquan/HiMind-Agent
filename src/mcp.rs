@@ -23,7 +23,7 @@ const MAX_MCP_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MCP_INPUT_QUEUE_CAPACITY: usize = 128;
 const MAX_ACTIVATED_CAPABILITIES: usize = 128;
 const MAX_ACTIVATED_SCHEMA_BYTES: usize = 512 * 1024;
-const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。工程开发入口应优先调用 engineering.project.resolve 解析 workspace_root、target 和 environment，再启动或继续 Workflow；不要猜测展馆、AppID、构建目录或交付 Workflow。需要编辑工作区时必须先调用 engineering.workspace.lease.acquire 获取 write Lease，编辑完成后 release；开发阶段结束时调用 engineering.checkpoint.create 生成 DevelopmentCheckpoint，再把它作为交付 Workflow 的 Seed。Workflow 生命周期统一使用 workflow.catalog.list、workflow.catalog.describe、workflow.run.start、workflow.run.get、workflow.run.feedback 和 workflow.run.cancel；审批仍由全局审批中心完成，模型不得代替用户批准。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 system.capability.search 搜索目录，再用 system.capability.describe 获取具体 Schema，最后调用 system.capability.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 system.capability.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 business.project.list、business.exhibit.list 或 context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
+const MCP_INSTRUCTIONS: &str = "HiMind Agent MCP companion 使用 stdio 传输，仅启动本地能力网关，不启动本地 HTTP 服务或 Dashboard Worker。因而 system.health 中 local_service_expected=false、local_service_online=false、dashboard_worker_state=not_applicable、dashboard_worker_expected=false、dashboard_worker_online=false、dashboard_worker_reason_code=stdio_companion_gateway_only 在 stdio 下是正常状态，不代表 MCP 或业务接口故障。只有 Connected 模式的本地 Agent 应用服务才托管 Dashboard Worker；判断 Worker 是否异常时先看 dashboard_worker_expected，再看 dashboard_worker_state 和 dashboard_worker_reason_code，不要只看旧版 dashboard_worker_online。Connected 模式下，只有 Dashboard 控制面能力需要 Dashboard 授权；本地插件、Skill、MCP 管理和扩展开发能力仍由 Agent 直接提供。短视频能力 short.video.* 是本地插件能力，创建项目、预览、反馈、Remotion/HyperFrames 渲染和产物导出在 Independent 模式完整可用，不依赖 Dashboard；其中写入和渲染仍遵循 Agent 本机审批策略。工程开发入口应优先调用 engineering.project.resolve 解析 workspace_root、target 和 environment，再启动或继续 Workflow；不要猜测展馆、AppID、构建目录或交付 Workflow。需要编辑工作区时必须先调用 engineering.workspace.lease.acquire 获取 write Lease，编辑完成后 release；开发阶段结束时调用 engineering.checkpoint.create 生成 DevelopmentCheckpoint，再把它作为交付 Workflow 的 Seed。Workflow 生命周期统一使用 workflow.catalog.list、workflow.catalog.describe、workflow.run.start、workflow.run.get、workflow.run.feedback 和 workflow.run.cancel；审批仍由全局审批中心完成，模型不得代替用户批准。默认 tools/list 只暴露通用 Bootstrap 能力；可通过环境变量 HIMIND_MCP_DEFAULT_ACTIVATE 预激活业务能力（逗号分隔 capability ID，MCP 启动即投影，且不受目录 generation 变化影响）；其余能力先使用 system.capability.search 搜索目录，再用 system.capability.describe 获取具体 Schema，最后调用 system.capability.activate 激活当前工作流需要的工具。客户端不支持动态工具刷新时，可继续使用 system.capability.invoke 调用已激活能力。调用项目/展项业务能力时，先调用 workbench.business.project.list、workbench.business.exhibit.list 或 workbench.context.resolve，再使用返回的稳定 pid；EX-xxxx 是展示编号，不是路由 ID。组织业务能力是可选 Provider，不是 Agent Core 的运行依赖。";
 
 /// 市场使用引导单独成段：它回答的是"缺能力时怎么办"，与上面的 stdio/授权说明
 /// 不是同一件事，拆开也方便单独演进。
@@ -1313,7 +1313,7 @@ mod tests {
             .any(|tool| tool["name"] == "system.capability.invoke"));
         assert!(!tools
             .iter()
-            .any(|tool| tool["name"] == "business.project.list"));
+            .any(|tool| tool["name"] == "workbench.business.project.list"));
         assert!(!tools.iter().any(|tool| tool["name"] == "ai.client.import"));
 
         let blocked = handle_request_with_session(
@@ -1389,7 +1389,7 @@ mod tests {
             "preactivated capability must be projected: {names:?}"
         );
         assert!(
-            !names.contains(&"business.project.list"),
+            !names.contains(&"workbench.business.project.list"),
             "unlisted capabilities must stay hidden: {names:?}"
         );
     }
@@ -1420,17 +1420,17 @@ mod tests {
 
     #[test]
     fn parse_default_activation_filters_unknown_ids() {
-        let known = ["ai.client.list", "business.project.list"]
+        let known = ["ai.client.list", "workbench.business.project.list"]
             .into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
         let parsed = parse_default_activation_ids(
-            "business.project.list, ai.client.list , no.such.capability",
+            "workbench.business.project.list, ai.client.list , no.such.capability",
             &known,
         );
         assert_eq!(
             parsed,
-            ["ai.client.list", "business.project.list"]
+            ["ai.client.list", "workbench.business.project.list"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<BTreeSet<_>>()
@@ -1526,7 +1526,7 @@ mod tests {
     fn session_activation_is_invalidated_when_registry_generation_changes() {
         let mut session = McpSessionState {
             activated_capabilities: ["plugin.example.run".to_string()].into_iter().collect(),
-            default_activated: ["business.exhibit.list".to_string()].into_iter().collect(),
+            default_activated: ["workbench.business.exhibit.list".to_string()].into_iter().collect(),
             activation_generation: Some("sha256:one".to_string()),
             projection_changed: false,
             legacy_compatibility: false,
@@ -1534,7 +1534,7 @@ mod tests {
         };
         session.synchronize_generation("sha256:two");
         assert!(session.activated_capabilities.is_empty());
-        assert!(session.default_activated.contains("business.exhibit.list"));
+        assert!(session.default_activated.contains("workbench.business.exhibit.list"));
         assert!(session.take_projection_changed());
         assert_eq!(session.activation_generation.as_deref(), Some("sha256:two"));
     }
@@ -1549,7 +1549,7 @@ mod tests {
         .unwrap();
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("dashboard_worker_state=not_applicable"));
-        assert!(instructions.contains("business.exhibit.list"));
+        assert!(instructions.contains("workbench.business.exhibit.list"));
         assert!(instructions.contains("pid"));
         assert!(instructions.contains("EX-xxxx"));
         assert_eq!(result["_meta"]["himind"]["runtime"]["schemaVersion"], 1);
@@ -1831,8 +1831,8 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         let knowledge = tools
             .iter()
-            .find(|tool| tool["name"] == "knowledge.search.v1")
-            .expect("knowledge.search.v1 must be discoverable through MCP");
+            .find(|tool| tool["name"] == "workbench.knowledge.search")
+            .expect("workbench.knowledge.search must be discoverable through MCP");
         assert_eq!(knowledge["inputSchema"]["required"], json!(["query"]));
         assert!(knowledge["description"]
             .as_str()
@@ -1846,13 +1846,13 @@ mod tests {
         let tools = result["tools"].as_array().unwrap();
         let list = tools
             .iter()
-            .find(|tool| tool["name"] == "business.exhibit.list")
-            .expect("business.exhibit.list must be discoverable");
+            .find(|tool| tool["name"] == "workbench.business.exhibit.list")
+            .expect("workbench.business.exhibit.list must be discoverable");
         assert!(list["description"].as_str().unwrap().contains("pid"));
         let get = tools
             .iter()
-            .find(|tool| tool["name"] == "business.exhibit.get")
-            .expect("business.exhibit.get must be discoverable");
+            .find(|tool| tool["name"] == "workbench.business.exhibit.get")
+            .expect("workbench.business.exhibit.get must be discoverable");
         assert!(
             get["inputSchema"]["properties"]["exhibit_id"]["description"]
                 .as_str()
@@ -1867,7 +1867,7 @@ mod tests {
             &test_gateway(),
             "tools/call",
             json!({
-                "name": "business.exhibit.get",
+                "name": "workbench.business.exhibit.get",
                 "arguments": { "exhibit_id": "EX-0021" }
             }),
         )
@@ -1905,7 +1905,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(tool["annotations"]["source"], "builtin");
         }
-        for name in ["operation.get", "operation.cancel"] {
+        for name in ["workbench.operation.get", "workbench.operation.cancel"] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == name)
@@ -1966,19 +1966,19 @@ mod tests {
         let result = handle_request(&test_gateway(), "tools/list", json!({})).unwrap();
         let tools = result["tools"].as_array().unwrap();
         for name in [
-            "business.project.list",
-            "business.project.create",
-            "business.exhibit.create",
-            "business.project.managers.replace",
-            "business.exhibit.crew.replace",
-            "business.exhibit.crew.append",
-            "business.exhibit.crew.remove",
-            "business.project.exhibit.attach",
-            "business.exhibit.workspace.checkout",
-            "business.people.search",
-            "business.requirement.list",
-            "business.requirement.create",
-            "business.requirement.assignment.update",
+            "workbench.business.project.list",
+            "workbench.business.project.create",
+            "workbench.business.exhibit.create",
+            "workbench.business.project.managers.replace",
+            "workbench.business.exhibit.crew.replace",
+            "workbench.business.exhibit.crew.append",
+            "workbench.business.exhibit.crew.remove",
+            "workbench.business.project.exhibit.attach",
+            "workbench.business.exhibit.workspace.checkout",
+            "workbench.business.people.search",
+            "workbench.business.requirement.list",
+            "workbench.business.requirement.create",
+            "workbench.business.requirement.assignment.update",
         ] {
             let tool = tools
                 .iter()
@@ -1992,14 +1992,14 @@ mod tests {
         }
         let checkout = tools
             .iter()
-            .find(|tool| tool["name"] == "business.exhibit.workspace.checkout")
+            .find(|tool| tool["name"] == "workbench.business.exhibit.workspace.checkout")
             .unwrap();
         assert_eq!(checkout["annotations"]["executionMode"], "long_running");
         assert_eq!(checkout["annotations"]["supportsProgress"], true);
         assert_eq!(checkout["annotations"]["supportsCancel"], true);
         let crew_remove = tools
             .iter()
-            .find(|tool| tool["name"] == "business.exhibit.crew.remove")
+            .find(|tool| tool["name"] == "workbench.business.exhibit.crew.remove")
             .unwrap();
         assert_eq!(crew_remove["annotations"]["riskLevel"], "R3");
         assert_eq!(crew_remove["annotations"]["approvalRequired"], true);
@@ -2012,7 +2012,7 @@ mod tests {
             &test_gateway(),
             "tools/call",
             json!({
-                "name": "knowledge.search.v1",
+                "name": "workbench.knowledge.search",
                 "arguments": { "query": "知识平台架构" }
             }),
         )
@@ -2067,13 +2067,13 @@ mod tests {
             .any(|tool| tool["name"] == "mcp.registration.apply-all"));
         assert!(!tools
             .iter()
-            .any(|tool| tool["name"] == "knowledge.search.v1"));
+            .any(|tool| tool["name"] == "workbench.knowledge.search"));
         assert!(!tools
             .iter()
             .any(|tool| tool["name"] == "extension.plugin.submission.submit"));
         assert!(!tools
             .iter()
-            .any(|tool| tool["name"] == "business.project.create"));
+            .any(|tool| tool["name"] == "workbench.business.project.create"));
     }
 
     #[test]

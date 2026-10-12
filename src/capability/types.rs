@@ -82,11 +82,11 @@ impl CapabilityDescriptor {
         }
         if matches!(
             self.id.as_str(),
-            "context.resolve"
-                | "business.project.list"
-                | "business.exhibit.list"
-                | "business.people.search"
-                | "knowledge.search.v1"
+            "workbench.context.resolve"
+                | "workbench.business.project.list"
+                | "workbench.business.exhibit.list"
+                | "workbench.business.people.search"
+                | "workbench.knowledge.search"
         ) {
             "primary"
         } else if self.execution_mode != "sync" || self.supports_progress || self.supports_cancel {

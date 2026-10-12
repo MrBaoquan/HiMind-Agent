@@ -6,7 +6,8 @@
 //! `data/categoryCatalog.ts` 的 `FUNCTIONAL_CATEGORIES.id` 一一对应；
 //! 扩展显式声明的分类不会被覆盖。
 
-/// 前缀越长越优先，避免 `business.` 覆盖 `business.exhibit.workspace` 这类更细的命名空间。
+/// 前缀越长越优先，避免 `workbench.business.` 覆盖
+/// `workbench.business.exhibit.workspace` 这类更细的命名空间（ADR 0119）。
 const CAPABILITY_CATEGORY_PREFIXES: &[(&str, &[&str])] = &[
     ("short.video", &["video-post", "content-production"]),
     ("wechat.miniprogram", &["software-engineering"]),
@@ -22,15 +23,18 @@ const CAPABILITY_CATEGORY_PREFIXES: &[(&str, &[&str])] = &[
     ("media.audio", &["audio-sound"]),
     ("document.", &["docs-knowledge"]),
     ("docs.", &["docs-knowledge"]),
-    ("business.exhibit.workspace", &["collaboration-delivery"]),
-    ("exhibit.workspace", &["collaboration-delivery"]),
-    ("business.", &["collaboration-delivery"]),
-    ("exhibit.", &["collaboration-delivery"]),
-    ("project.", &["collaboration-delivery"]),
-    ("inner_admin.", &["collaboration-delivery"]),
-    ("software.distribution", &["collaboration-delivery"]),
+    ("workbench.business.exhibit.workspace", &["collaboration-delivery"]),
+    ("workbench.business.", &["collaboration-delivery"]),
+    ("workbench.exhibit.", &["collaboration-delivery"]),
+    ("workbench.project.", &["collaboration-delivery"]),
+    ("workbench.operation.", &["collaboration-delivery"]),
+    ("workbench.work.", &["collaboration-delivery"]),
+    ("workspace.exhibit", &["collaboration-delivery"]),
+    ("workspace.", &["collaboration-delivery"]),
+    ("svn.exhibit.workspace", &["collaboration-delivery"]),
+    ("network.inner-admin.", &["collaboration-delivery"]),
+    ("distribution.", &["collaboration-delivery"]),
     ("package.", &["collaboration-delivery"]),
-    ("upload.", &["collaboration-delivery"]),
     ("artifact.", &["collaboration-delivery"]),
     ("workflow.", &["data-automation"]),
     ("operation.", &["data-automation"]),
@@ -108,7 +112,7 @@ mod tests {
             vec!["content-production", "video-post"]
         );
         assert_eq!(
-            infer_categories(&ids(&["business.exhibit.list"])),
+            infer_categories(&ids(&["workbench.business.exhibit.list"])),
             vec!["collaboration-delivery"]
         );
         assert_eq!(
@@ -119,9 +123,9 @@ mod tests {
 
     #[test]
     fn keeps_longest_prefix_priority() {
-        // `business.` 也匹配，但更细的展项工作区命名空间必须胜出。
+        // `workbench.business.` 也匹配，但更细的展项工作区命名空间必须胜出。
         assert_eq!(
-            infer_categories(&ids(&["business.exhibit.workspace.status"])),
+            infer_categories(&ids(&["workbench.business.exhibit.workspace.get"])),
             vec!["collaboration-delivery"]
         );
         assert_eq!(infer_categories(&ids(&["media.video"])), vec!["video-post"]);
