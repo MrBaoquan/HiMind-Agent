@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -573,6 +573,21 @@ impl CapabilityGateway {
     }
 
     fn build_registry(&self) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
+        self.build_registry_scoped(true)
+    }
+
+    /// 内核内置能力 ID。
+    ///
+    /// 创作期冲突预检要回答「内核已经占用了哪些 ID」，但不能为此重建整张注册表：
+    /// 重建会连带发现下游 MCP 与业务目录，用户侧 MCP 故障不该让插件创作测试失败。
+    pub(crate) fn builtin_capability_ids(&self) -> Result<BTreeSet<String>, Box<dyn Error>> {
+        Ok(self.build_registry_scoped(false)?.into_keys().collect())
+    }
+
+    fn build_registry_scoped(
+        &self,
+        include_dynamic_providers: bool,
+    ) -> Result<BTreeMap<String, CapabilityRegistration>, Box<dyn Error>> {
         let mut registry = BTreeMap::new();
         let ai_client_targets = crate::app::ai_provider_import::known_adapter_ids();
         let builtins = [
@@ -2707,41 +2722,29 @@ impl CapabilityGateway {
             insert_registration(&mut registry, item)?;
         }
 
+        if !include_dynamic_providers {
+            return Ok(registry);
+        }
+
         if let Ok(plugins) = scan_plugins() {
             for plugin in plugins
                 .into_iter()
                 .filter(|item| item.enabled && item.runtime == "process-jsonrpc-stdio")
             {
+                let mut conflicts = Vec::new();
                 for capability in &plugin.capabilities {
-                    let availability = plugin_capability_availability(&plugin, &capability);
-                    let capability_id = capability.id.clone();
-                    let mut registration = CapabilityRegistration {
-                        descriptor: CapabilityDescriptor {
-                            id: capability_id.clone(),
-                            version: plugin.version.clone(),
-                            name: capability.description.clone(),
-                            description: capability.description.clone(),
-                            risk_level: capability.risk_level.clone(),
-                            source: format!("plugin:{}", plugin.id),
-                            contract_source: format!("plugin:{}:manifest", plugin.id),
-                            contract_generation: None,
-                            availability,
-                            execution_mode: "provider_defined".to_string(),
-                            supports_progress: false,
-                            supports_cancel: false,
-                            idempotency: "provider_defined".to_string(),
-                            retry_policy: "provider_defined".to_string(),
-                            concurrency: "provider_defined".to_string(),
-                            approval_required: false,
-                            dashboard_provider: false,
-                            required_scope: None,
-                            dashboard_route: None,
-                            input_schema: capability.input_schema.clone(),
-                        },
-                        handler: CapabilityHandler::PluginCapability(capability_id),
-                    };
-                    apply_registry_metadata(&mut registration.descriptor, &registration.handler);
-                    insert_registration(&mut registry, registration)?;
+                    let availability = plugin_capability_availability(&plugin, capability);
+                    register_plugin_capability(
+                        &mut registry,
+                        &plugin.id,
+                        &plugin.version,
+                        availability,
+                        capability,
+                        &mut conflicts,
+                    );
+                }
+                for conflict in conflicts {
+                    crate::capability::plugin::record_capability_conflict(&plugin, &conflict);
                 }
             }
         }
@@ -7777,6 +7780,57 @@ fn media_job_schema() -> Value {
     })
 }
 
+/// 把一个插件能力登记进注册表。
+///
+/// 与既有注册（内核内置或先到插件）能力 ID 冲突的条目会被跳过，并把原因写进
+/// `conflicts`，而不是让整张注册表构建失败——一个插件重名不该拖垮整台 Agent 的
+/// 能力面。插件内部重名同样在这里被拦下（先到者保留）。
+fn register_plugin_capability(
+    registry: &mut BTreeMap<String, CapabilityRegistration>,
+    plugin_id: &str,
+    plugin_version: &str,
+    availability: CapabilityAvailability,
+    capability: &crate::capability::plugin::PluginCapabilityManifest,
+    conflicts: &mut Vec<String>,
+) {
+    let capability_id = capability.id.clone();
+    let mut registration = CapabilityRegistration {
+        descriptor: CapabilityDescriptor {
+            id: capability_id.clone(),
+            version: plugin_version.to_string(),
+            name: capability.description.clone(),
+            description: capability.description.clone(),
+            risk_level: capability.risk_level.clone(),
+            source: format!("plugin:{plugin_id}"),
+            contract_source: format!("plugin:{plugin_id}:manifest"),
+            contract_generation: None,
+            availability,
+            execution_mode: "provider_defined".to_string(),
+            supports_progress: false,
+            supports_cancel: false,
+            idempotency: "provider_defined".to_string(),
+            retry_policy: "provider_defined".to_string(),
+            concurrency: "provider_defined".to_string(),
+            approval_required: false,
+            dashboard_provider: false,
+            required_scope: None,
+            dashboard_route: None,
+            input_schema: capability.input_schema.clone(),
+        },
+        handler: CapabilityHandler::PluginCapability(capability_id.clone()),
+    };
+    apply_registry_metadata(&mut registration.descriptor, &registration.handler);
+    if let Err(error) = insert_registration(registry, registration) {
+        let owner = registry
+            .get(&capability_id)
+            .map(|existing| existing.descriptor.source.clone())
+            .unwrap_or_else(|| format!("插件 {plugin_id}"));
+        conflicts.push(format!(
+            "能力 ID `{capability_id}` 已被 {owner} 占用，该能力已跳过（{error}）"
+        ));
+    }
+}
+
 fn insert_registration(
     registry: &mut BTreeMap<String, CapabilityRegistration>,
     mut registration: CapabilityRegistration,
@@ -7948,6 +8002,55 @@ mod tests {
         let error = insert_registration(&mut registry, duplicate).unwrap_err();
 
         assert_eq!(error.to_string(), "duplicate capability id: system.health");
+    }
+
+    #[test]
+    fn plugin_capability_conflicts_are_skipped_instead_of_failing_the_registry() {
+        let mut registry = BTreeMap::new();
+        let mut conflicts = Vec::new();
+        let capability: crate::capability::plugin::PluginCapabilityManifest =
+            serde_json::from_value(json!({ "id": "work-log.entry.list" })).unwrap();
+
+        register_plugin_capability(
+            &mut registry,
+            "com.himind.work-log",
+            "1.0.0",
+            CapabilityAvailability::Local,
+            &capability,
+            &mut conflicts,
+        );
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(registry.contains_key("work-log.entry.list"));
+
+        // 第二个插件声明同一个 ID：跳过该能力并把冲突写下来，注册表本身保持可用。
+        register_plugin_capability(
+            &mut registry,
+            "com.himind.work-log-copy",
+            "1.0.0",
+            CapabilityAvailability::Local,
+            &capability,
+            &mut conflicts,
+        );
+        assert_eq!(registry.len(), 1, "先到者必须保留");
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(
+            conflicts[0].contains("已被 plugin:com.himind.work-log 占用"),
+            "{conflicts:?}"
+        );
+
+        // 不冲突的能力照常登记：一个能力重名不该连累插件的其余能力。
+        let other: crate::capability::plugin::PluginCapabilityManifest =
+            serde_json::from_value(json!({ "id": "work-log.entry.upsert" })).unwrap();
+        register_plugin_capability(
+            &mut registry,
+            "com.himind.work-log-copy",
+            "1.0.0",
+            CapabilityAvailability::Local,
+            &other,
+            &mut conflicts,
+        );
+        assert!(registry.contains_key("work-log.entry.upsert"));
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
     }
 
     #[test]

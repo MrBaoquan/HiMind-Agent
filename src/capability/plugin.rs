@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -521,6 +521,88 @@ fn is_valid_namespace(namespace: &str) -> bool {
         })
 }
 
+
+/// 已安装且启用的插件占用的能力 ID → 归属描述。
+///
+/// 创作期冲突预检用它回答「这个 ID 是不是已经被别的插件占了」。`exclude_plugin_id`
+/// 排除候选插件自身：候选在测试前后可能已经在开发登记里，不能自己和自己冲突。
+pub(crate) fn installed_capability_owners(
+    exclude_plugin_id: &str,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let mut owners = BTreeMap::new();
+    for plugin in scan_plugins()?.into_iter().filter(|item| item.enabled) {
+        if plugin.id == exclude_plugin_id {
+            continue;
+        }
+        for capability in &plugin.capabilities {
+            let id = capability.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            owners
+                .entry(id.to_string())
+                .or_insert_with(|| format!("插件 {}", plugin.id));
+        }
+    }
+    Ok(owners)
+}
+
+/// 候选清单的能力 ID 冲突（ADR 0119）：
+///
+/// 1. 同一份清单里声明了两条同名能力（先到者保留）；
+/// 2. 与 `occupied` 中已有归属的 ID 重名（内核内置能力或其它插件）。
+///
+/// 重名不是命名风格问题：内核按「先到者胜」注册，后到的会变成幽灵能力——
+/// 装了却调不到。所以必须在创作期拦下。
+///
+/// 返回可读问题列表；为空表示通过。
+pub(crate) fn plugin_capability_conflict_issues(
+    manifest: &PluginManifest,
+    occupied: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    let mut seen = BTreeMap::<String, usize>::new();
+    for (index, capability) in manifest.capabilities.iter().enumerate() {
+        let id = capability.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(first_index) = seen.insert(id.to_string(), index) {
+            issues.push(format!(
+                "{id}: 同一插件内重复声明（第 {} 条与第 {} 条）",
+                first_index + 1,
+                index + 1
+            ));
+            continue;
+        }
+        if let Some(owner) = occupied.get(id) {
+            issues.push(format!("{id}: 已被 {owner} 占用，请更换能力 ID"));
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+/// 记录插件的能力 ID 冲突。
+///
+/// 冲突是结构性问题而不是调用失败：只写 `last_error` 让 `plugin.list` 能曝光，
+/// 不累加失败计数、不触发熔断——插件的其余能力仍然可用，用户也能看到原因。
+/// 注册表每几秒重建一次，所以只在内容真正变化时落盘。
+pub(crate) fn record_capability_conflict(plugin: &PluginRegistryItem, detail: &str) {
+    let root = plugin_health_root(
+        std::path::Path::new(&plugin.path),
+        plugin.development,
+        &plugin.id,
+    );
+    let mut health = read_plugin_health(&root);
+    let message: String = detail.chars().take(2048).collect();
+    if health.last_error.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    health.last_error = Some(message);
+    let _ = write_plugin_health(&root, &health);
+}
 
 pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
     let mut items = builtin_plugin_items();
@@ -2088,6 +2170,57 @@ mod tests {
             .iter()
             .any(|item| item.contains("capability_namespace")));
 
+    }
+
+    #[test]
+    fn capability_conflicts_cover_manifest_duplicates_and_occupied_ids() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.work-log",
+            "name": "工时日志工具",
+            "version": "1.0.0",
+            "capabilities": [
+                { "id": "work-log.entry.list" },
+                { "id": "work-log.entry.list" },
+                { "id": "system.health" },
+                { "id": "work-log.entry.upsert" }
+            ]
+        }))
+        .unwrap();
+
+        let mut occupied = BTreeMap::new();
+        occupied.insert("system.health".to_string(), "内核内置能力".to_string());
+        occupied.insert(
+            "work-log.entry.read".to_string(),
+            "插件 com.himind.work-log-collector".to_string(),
+        );
+
+        let issues = plugin_capability_conflict_issues(&manifest, &occupied);
+        assert!(
+            issues.iter().any(|item| item.contains("同一插件内重复声明")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|item| item.contains("system.health") && item.contains("内核内置能力")),
+            "{issues:?}"
+        );
+        // 未被占用的 ID 不报；占用集里没被清单引用的 ID 也不报。
+        assert!(
+            !issues.iter().any(|item| item.contains("work-log.entry.upsert")),
+            "{issues:?}"
+        );
+        assert_eq!(issues.len(), 2, "{issues:?}");
+
+        // 完全干净的清单必须零问题。
+        let clean: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.work-log",
+            "name": "工时日志工具",
+            "version": "1.0.0",
+            "capabilities": [{ "id": "work-log.entry.upsert" }]
+        }))
+        .unwrap();
+        assert!(plugin_capability_conflict_issues(&clean, &occupied).is_empty());
     }
 
     #[test]

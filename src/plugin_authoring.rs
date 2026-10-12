@@ -294,6 +294,31 @@ pub(crate) fn test(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dy
         )
         .into());
     }
+    // 重名不用等到运行期才暴露：内核按「先到者胜」注册，后到的会变成装了却
+    // 调不到的幽灵能力。占用集 = 内核内置 + 其它已装插件；候选自身可能已经躺在
+    // 开发登记里，所以要排除掉自己，否则会自判冲突。
+    let mut occupied =
+        crate::capability::plugin::installed_capability_owners(&draft.manifest.id)?;
+    let gateway = crate::capability::service::CapabilityGateway::new(
+        Options::from_env(),
+        std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::types::LocalWorkerStatus::default(),
+        )),
+    );
+    for id in gateway.builtin_capability_ids()? {
+        occupied
+            .entry(id)
+            .or_insert_with(|| "内核内置能力".to_string());
+    }
+    let conflict_issues =
+        crate::capability::plugin::plugin_capability_conflict_issues(&draft.manifest, &occupied);
+    if !conflict_issues.is_empty() {
+        return Err(format!(
+            "插件候选包能力 ID 冲突（ADR 0119）: {}",
+            conflict_issues.join("; ")
+        )
+        .into());
+    }
     let root = draft_version_root(plugin_id, version).join("test-package");
     if root.exists() {
         fs::remove_dir_all(&root)?;
@@ -345,6 +370,7 @@ pub(crate) fn test(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dy
         "dependencies": "passed",
         "package": "passed",
         "capability_naming": "passed",
+        "capability_conflicts": "passed",
         "runtime": runtime,
         "lifecycle": {
             "registered": registered_before_cleanup,
