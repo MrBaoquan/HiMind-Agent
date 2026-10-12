@@ -2859,9 +2859,26 @@ fn himind_mcp_bridge_tool_timeout_ms(state_path: &Path) -> u64 {
         })
         // 读不到配置时退回 DSH 默认值，不要因为一个附属文件把会话开不起来。
         .unwrap_or_default();
+    // 本机媒体能力（media.image.generate / image.edit）是同步调用，出图常常
+    // 超过 60s；桥的等待时间必须覆盖 provider 超时，否则会出现「服务端已完成、
+    // 返回值却因桥超时被丢掉」的假失败。
+    let local_media = local_media_tool_timeout_ms();
     longest_downstream
         .max(BRIDGE_DEFAULT_TOOL_TIMEOUT_MS)
+        .max(local_media)
         .min(DOWNSTREAM_MAX_TOOL_TIMEOUT_MS)
+}
+
+/// 本机媒体能力的桥等待时间：provider 超时 + 收尾余量。
+///
+/// 与 `app::local_image` 读同一个环境变量，避免两处超时漂移。
+fn local_media_tool_timeout_ms() -> u64 {
+    let seconds = std::env::var("HIMIND_LOCAL_IMAGE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| (10..=900).contains(value))
+        .unwrap_or(180);
+    seconds.saturating_add(60).saturating_mul(1000)
 }
 
 fn append_managed_model_profile(
@@ -3162,6 +3179,21 @@ fn himind_mcp_arguments(options: &Options) -> Vec<String> {
 }
 
 fn himind_mcp_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    // 显式覆盖：用于开发态验收（例如 release companion 正被其它会话占用时，
+    // 指向同一份代码构建出的 `himind-agent.exe --mcp`），也让排障不必改代码。
+    if let Some(explicit) = env::var_os("HIMIND_AGENT_MCP_EXECUTABLE")
+        .filter(|value| !value.is_empty())
+    {
+        let path = std::path::PathBuf::from(explicit);
+        if !path.is_file() {
+            return Err(format!(
+                "HIMIND_AGENT_MCP_EXECUTABLE 指向的文件不存在: {}",
+                path.display()
+            )
+            .into());
+        }
+        return Ok(path);
+    }
     let current = env::current_exe()?;
     let mut candidates = Vec::new();
     if let Some(parent) = current.parent() {
@@ -4379,7 +4411,8 @@ mod tests {
                 models: vec!["local-model".to_string(), "local-fast".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: "sk-local-secret".to_string(),
+                                media: Default::default(),
+api_key: "sk-local-secret".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-gateway").unwrap();
@@ -4461,7 +4494,8 @@ mod tests {
                 models: vec!["deepseek-chat".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: "sk-deepseek-secret".to_string(),
+                                media: Default::default(),
+api_key: "sk-deepseek-secret".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("deepseek").unwrap();
@@ -4584,7 +4618,8 @@ mod tests {
                 models: vec!["kimi-k3".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: "sk-anthropic-secret".to_string(),
+                                media: Default::default(),
+api_key: "sk-anthropic-secret".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-anthropic").unwrap();

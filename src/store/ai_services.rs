@@ -56,6 +56,24 @@ impl AIServiceProtocol {
     }
 }
 
+/// 本机媒体能力槽位名（与 `media.*` 能力一一对应，不带 `media.` 前缀）。
+pub(crate) const CAP_IMAGE_GENERATE: &str = "image.generate";
+pub(crate) const CAP_IMAGE_EDIT: &str = "image.edit";
+pub(crate) const CAP_VIDEO_GENERATE: &str = "video.generate";
+pub(crate) const SUPPORTED_MEDIA_CAPABILITIES: &[&str] =
+    &[CAP_IMAGE_GENERATE, CAP_IMAGE_EDIT, CAP_VIDEO_GENERATE];
+/// 未显式声明适配器时的默认值（OpenAI Images 兼容协议）。
+pub(crate) const DEFAULT_MEDIA_ADAPTER: &str = "openai-images";
+
+/// 一个服务在某个媒体能力上使用的适配器与模型。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct MediaModelBinding {
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct CustomAIService {
     pub id: String,
@@ -68,6 +86,10 @@ pub(crate) struct CustomAIService {
     pub image_model: String,
     /// 生图适配器：`openai-images`（默认）或 `ark-images`（火山方舟/豆包）。
     pub image_adapter: String,
+    /// 媒体能力槽位：`image.generate` / `image.edit` / `video.generate` → 适配器 + 模型。
+    /// `image_model` / `image_adapter` 是 `image.generate` 槽位的旧投影，二者保持一致。
+    #[serde(default)]
+    pub media: std::collections::BTreeMap<String, MediaModelBinding>,
     /// DPAPI 加密后的 API Key，不落明文。
     encrypted_api_key: String,
     pub created_at: String,
@@ -86,6 +108,8 @@ struct PersistedCustomAIService {
     image_model: String,
     #[serde(default)]
     image_adapter: String,
+    #[serde(default)]
+    media: std::collections::BTreeMap<String, MediaModelBinding>,
     encrypted_api_key: String,
     created_at: String,
     updated_at: String,
@@ -96,8 +120,12 @@ struct PersistedAIServiceSelection {
     #[serde(default)]
     active_service_id: String,
     /// 生图默认使用的本机服务（`media.image.generate`）。留空表示自动解析。
+    /// 这是 `media_services["image.generate"]` 的旧投影。
     #[serde(default)]
     image_service_id: String,
+    /// 各媒体能力的默认服务：`image.generate` / `image.edit` / `video.generate`。
+    #[serde(default)]
+    media_services: std::collections::BTreeMap<String, String>,
 }
 
 impl From<PersistedCustomAIService> for CustomAIService {
@@ -111,6 +139,7 @@ impl From<PersistedCustomAIService> for CustomAIService {
             models: value.models,
             image_model: value.image_model,
             image_adapter: value.image_adapter,
+            media: value.media,
             encrypted_api_key: value.encrypted_api_key,
             created_at: value.created_at,
             updated_at: value.updated_at,
@@ -129,6 +158,7 @@ impl From<&CustomAIService> for PersistedCustomAIService {
             models: value.models.clone(),
             image_model: value.image_model.clone(),
             image_adapter: value.image_adapter.clone(),
+            media: value.media.clone(),
             encrypted_api_key: value.encrypted_api_key.clone(),
             created_at: value.created_at.clone(),
             updated_at: value.updated_at.clone(),
@@ -150,6 +180,9 @@ pub(crate) struct CustomAIServiceInput {
     /// 生图适配器（`openai-images` / `ark-images`）。可留空，缺省 `openai-images`。
     #[serde(default)]
     pub image_adapter: String,
+    /// 媒体能力槽位（`image.generate` / `image.edit` / `video.generate` 等）。
+    #[serde(default)]
+    pub media: std::collections::BTreeMap<String, MediaModelBinding>,
     /// 写入明文 Key；读取时返回的公开视图不含此字段。
     #[serde(default)]
     pub api_key: String,
@@ -166,6 +199,7 @@ impl CustomAIService {
             "models": self.models,
             "image_model": self.image_model,
             "image_adapter": self.image_adapter,
+            "media": self.media,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         })
@@ -187,7 +221,25 @@ fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
         serde_json::from_slice(&fs::read(path)?)?;
     Ok(persisted
         .into_iter()
-        .map(|(id, item)| (id, item.into()))
+        .map(|(id, item)| {
+            let mut service: CustomAIService = item.into();
+            // 旧配置只有 `image_model` / `image_adapter`：读时补能力槽位。
+            if service.media.is_empty() && !service.image_model.trim().is_empty() {
+                let adapter = if service.image_adapter.trim().is_empty() {
+                    DEFAULT_MEDIA_ADAPTER.to_string()
+                } else {
+                    service.image_adapter.trim().to_string()
+                };
+                service.media.insert(
+                    CAP_IMAGE_GENERATE.to_string(),
+                    MediaModelBinding {
+                        adapter,
+                        model: service.image_model.trim().to_string(),
+                    },
+                );
+            }
+            (id, service)
+        })
         .collect())
 }
 
@@ -238,6 +290,7 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
         "services": services.iter().map(|item| item.public_json()).collect::<Vec<_>>(),
         "active_service_id": active_id()?.unwrap_or_default(),
         "image_service_id": image_service_id()?.unwrap_or_default(),
+        "media_services": load_selection()?.media_services,
     }))
 }
 
@@ -253,6 +306,51 @@ pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box
     let now = crate::app::ai_provider_import::unix_now_seconds().to_string();
     let mut services = load_all()?;
     let existing = services.get(&id);
+    // 能力槽位是事实源；`image_model` / `image_adapter` 作为 `image.generate`
+    // 槽位的旧投影一并写回，保证旧版本 Agent 仍能读到生图配置。
+    let mut media = input
+        .media
+        .iter()
+        .filter_map(|(capability, binding)| {
+            let model = binding.model.trim();
+            if model.is_empty() {
+                return None;
+            }
+            let adapter = if binding.adapter.trim().is_empty() {
+                DEFAULT_MEDIA_ADAPTER.to_string()
+            } else {
+                binding.adapter.trim().to_string()
+            };
+            Some((
+                capability.trim().to_string(),
+                MediaModelBinding {
+                    adapter,
+                    model: model.to_string(),
+                },
+            ))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if !input.image_model.trim().is_empty() {
+        let adapter = if input.image_adapter.trim().is_empty() {
+            DEFAULT_MEDIA_ADAPTER.to_string()
+        } else {
+            input.image_adapter.trim().to_string()
+        };
+        media.insert(
+            CAP_IMAGE_GENERATE.to_string(),
+            MediaModelBinding {
+                adapter,
+                model: input.image_model.trim().to_string(),
+            },
+        );
+    }
+    let legacy = media.get(CAP_IMAGE_GENERATE).cloned().unwrap_or_default();
+    let legacy_image_model = legacy.model.clone();
+    let legacy_image_adapter = if legacy.model.is_empty() {
+        String::new()
+    } else {
+        legacy.adapter.clone()
+    };
     let encrypted_api_key = if input.api_key.trim().is_empty() {
         existing
             .map(|item| item.encrypted_api_key.clone())
@@ -272,8 +370,9 @@ pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
             .collect(),
-        image_model: input.image_model.trim().to_string(),
-        image_adapter: input.image_adapter.trim().to_string(),
+        image_model: legacy_image_model.clone(),
+        image_adapter: legacy_image_adapter.clone(),
+        media,
         encrypted_api_key,
         created_at: existing
             .map(|item| item.created_at.clone())
@@ -307,42 +406,76 @@ pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn
     Ok((service.clone(), api_key))
 }
 
-/// 解析本机生图要用的服务与明文 Key。
+/// 取某个服务在指定媒体能力上的「适配器 + 模型」；未配置该能力时返回 `None`。
 ///
-/// `service` 为空时按「显式指定的生图服务 → 激活服务（且已配生图模型）→
-/// 唯一一个配了生图模型的服务」解析；否则必须是 `custom:<id>`。
-/// 该解析只读本机状态库（DPAPI 解密），不触碰 AI 工作台。
-pub(crate) fn resolve_image_service(
+/// `image.generate` 会回落到 `image_model` / `image_adapter` 这两个旧字段，
+/// 保证升级前后行为一致。
+pub(crate) fn binding_for(
+    service: &CustomAIService,
+    capability: &str,
+) -> Option<(String, String)> {
+    let capability = capability.trim();
+    if let Some(binding) = service.media.get(capability) {
+        let model = binding.model.trim();
+        if !model.is_empty() {
+            let adapter = if binding.adapter.trim().is_empty() {
+                DEFAULT_MEDIA_ADAPTER.to_string()
+            } else {
+                binding.adapter.trim().to_string()
+            };
+            return Some((adapter, model.to_string()));
+        }
+    }
+    if capability == CAP_IMAGE_GENERATE && !service.image_model.trim().is_empty() {
+        let adapter = if service.image_adapter.trim().is_empty() {
+            DEFAULT_MEDIA_ADAPTER.to_string()
+        } else {
+            service.image_adapter.trim().to_string()
+        };
+        return Some((adapter, service.image_model.trim().to_string()));
+    }
+    None
+}
+
+/// 解析某个媒体能力要用的服务与明文 Key。
+///
+/// `service` 为空时按「该能力的默认服务 → 激活服务（且已配该能力）→ 唯一支持该
+/// 能力的服务」解析；否则必须是 `custom:<id>`。只读本机状态库（DPAPI 解密），
+/// 不触碰 AI 工作台。
+pub(crate) fn resolve_media_service(
+    capability: &str,
     service: &str,
 ) -> Result<(CustomAIService, String), Box<dyn Error>> {
+    let capability = capability.trim();
     let service = service.trim();
     if !service.is_empty() {
         let id = service.strip_prefix("custom:").ok_or_else(|| {
-            format!("不支持的服务源：{service}；本机生图只接受 custom:<id>，留空表示自动选择")
+            format!("不支持的服务源：{service}；本机媒体能力只接受 custom:<id>，留空表示自动选择")
         })?;
         return load_secret(id);
     }
-    if let Some(id) = image_service_id()? {
+    if let Some(id) = media_service_id(capability)? {
         if let Ok(found) = load_secret(&id) {
             return Ok(found);
         }
     }
     if let Some((active, api_key)) = active_service_with_secret()? {
-        if !active.image_model.trim().is_empty() {
+        if binding_for(&active, capability).is_some() {
             return Ok((active, api_key));
         }
     }
     let candidates = list()?
         .into_iter()
-        .filter(|item| !item.image_model.trim().is_empty())
+        .filter(|item| binding_for(item, capability).is_some())
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [only] => load_secret(&only.id),
-        [] => Err(
-            "没有配置「生图模型」的本机 AI 服务；请先在「AI 服务」里为某个服务填写生图模型".into(),
-        ),
+        [] => Err(format!(
+            "没有为本机 AI 服务配置「{capability}」能力；请先在「AI 服务」里为该能力填写模型"
+        )
+        .into()),
         many => Err(format!(
-            "有多个可生图的本机服务，请显式指定 service 或设置默认生图服务：{}",
+            "有多个服务支持 {capability}，请显式指定 service 或设置该能力的默认服务：{}",
             many.iter()
                 .map(|item| format!("custom:{}", item.id))
                 .collect::<Vec<_>>()
@@ -350,6 +483,13 @@ pub(crate) fn resolve_image_service(
         )
         .into()),
     }
+}
+
+/// 解析本机生图（`media.image.generate`）要用的服务与明文 Key。
+pub(crate) fn resolve_image_service(
+    service: &str,
+) -> Result<(CustomAIService, String), Box<dyn Error>> {
+    resolve_media_service(CAP_IMAGE_GENERATE, service)
 }
 
 fn load_selection() -> Result<PersistedAIServiceSelection, Box<dyn Error>> {
@@ -373,14 +513,43 @@ pub(crate) fn active_id() -> Result<Option<String>, Box<dyn Error>> {
     Ok((!id.is_empty()).then_some(id))
 }
 
-/// 生图默认使用的本机服务；留空表示按「激活服务 → 唯一生图服务」自动解析。
-pub(crate) fn image_service_id() -> Result<Option<String>, Box<dyn Error>> {
-    let id = load_selection()?.image_service_id.trim().to_string();
-    Ok((!id.is_empty()).then_some(id))
+/// 某个媒体能力的默认服务；留空表示按「激活服务 → 唯一支持该能力的服务」自动解析。
+pub(crate) fn media_service_id(capability: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let capability = capability.trim();
+    let selection = load_selection()?;
+    if let Some(id) = selection.media_services.get(capability) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return Ok(Some(id));
+        }
+    }
+    if capability == CAP_IMAGE_GENERATE {
+        let id = selection.image_service_id.trim().to_string();
+        if !id.is_empty() {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
-/// 指定（或清除）生图默认使用的本机服务；不影响对话使用的激活服务。
-pub(crate) fn set_image_service(id: &str) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+/// 生图默认使用的本机服务（`media.image.generate`）。
+pub(crate) fn image_service_id() -> Result<Option<String>, Box<dyn Error>> {
+    media_service_id(CAP_IMAGE_GENERATE)
+}
+
+/// 指定（或清除）某个媒体能力的默认服务；不影响对话使用的激活服务。
+pub(crate) fn set_media_service(
+    capability: &str,
+    id: &str,
+) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    let capability = capability.trim();
+    if !SUPPORTED_MEDIA_CAPABILITIES.contains(&capability) {
+        return Err(format!(
+            "不支持的本机媒体能力：{capability}；可选 {}",
+            SUPPORTED_MEDIA_CAPABILITIES.join("、")
+        )
+        .into());
+    }
     let id = id.trim();
     let selected = if id.is_empty() {
         None
@@ -393,12 +562,27 @@ pub(crate) fn set_image_service(id: &str) -> Result<Option<CustomAIService>, Box
         )
     };
     let mut selection = load_selection()?;
-    selection.image_service_id = selected
+    let value = selected
         .as_ref()
         .map(|service| service.id.clone())
         .unwrap_or_default();
+    if value.is_empty() {
+        selection.media_services.remove(capability);
+    } else {
+        selection
+            .media_services
+            .insert(capability.to_string(), value.clone());
+    }
+    if capability == CAP_IMAGE_GENERATE {
+        selection.image_service_id = value;
+    }
     write_selection(&selection)?;
     Ok(selected)
+}
+
+/// 指定（或清除）生图默认使用的本机服务；是 [`set_media_service`] 的旧入口。
+pub(crate) fn set_image_service(id: &str) -> Result<Option<CustomAIService>, Box<dyn Error>> {
+    set_media_service(CAP_IMAGE_GENERATE, id)
 }
 
 pub(crate) fn active_service() -> Result<Option<CustomAIService>, Box<dyn Error>> {
@@ -521,7 +705,10 @@ pub(crate) fn list_models(id: &str) -> Result<Vec<String>, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_base_url, AIServiceProtocol, CustomAIServiceInput};
+    use super::{
+        binding_for, validate_base_url, AIServiceProtocol, CustomAIServiceInput,
+        MediaModelBinding, CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE, CAP_VIDEO_GENERATE,
+    };
     use std::io::{Read, Write};
     use std::path::PathBuf;
 
@@ -560,7 +747,8 @@ mod tests {
                 models: vec!["gpt-test".to_string(), "gpt-test-2".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: "sk-test-secret-123".to_string(),
+                                media: Default::default(),
+api_key: "sk-test-secret-123".to_string(),
             };
             let saved = super::upsert(input).expect("upsert custom service");
             assert_eq!(saved.id, "my-gateway");
@@ -596,7 +784,8 @@ mod tests {
                 models: vec!["model-a".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: "sk-original".to_string(),
+                                media: Default::default(),
+api_key: "sk-original".to_string(),
             })
             .expect("create service");
             super::upsert(CustomAIServiceInput {
@@ -608,7 +797,8 @@ mod tests {
                 models: vec!["model-b".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: String::new(),
+                                media: Default::default(),
+api_key: String::new(),
             })
             .expect("update service without rotating key");
             let (service, api_key) = super::load_secret("editable").expect("load service");
@@ -631,7 +821,8 @@ mod tests {
                     models: vec!["model-a".to_string()],
                     image_model: String::new(),
                     image_adapter: String::new(),
-                    api_key: format!("sk-{id}"),
+                                        media: Default::default(),
+api_key: format!("sk-{id}"),
                 })
                 .expect("create service");
             }
@@ -668,7 +859,8 @@ mod tests {
                 models: vec!["chat-model".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                api_key: "sk-chat".to_string(),
+                                media: Default::default(),
+api_key: "sk-chat".to_string(),
             })
             .expect("chat service");
             super::upsert(CustomAIServiceInput {
@@ -680,7 +872,8 @@ mod tests {
                 models: vec!["doubao-seed".to_string()],
                 image_model: "doubao-seedream-5-0-pro".to_string(),
                 image_adapter: "ark-images".to_string(),
-                api_key: "sk-image".to_string(),
+                                media: Default::default(),
+api_key: "sk-image".to_string(),
             })
             .expect("image service");
 
@@ -708,6 +901,130 @@ mod tests {
     }
 
     #[test]
+    fn media_slots_cover_edit_and_mirror_the_legacy_image_projection() {
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_IMAGE_GENERATE.to_string(),
+                MediaModelBinding {
+                    adapter: "ark-images".to_string(),
+                    model: "doubao-seedream-5-0-pro".to_string(),
+                },
+            );
+            media.insert(
+                CAP_IMAGE_EDIT.to_string(),
+                MediaModelBinding {
+                    adapter: "ark-images".to_string(),
+                    model: "doubao-seededit-4-0-i2i".to_string(),
+                },
+            );
+            let saved = super::upsert(CustomAIServiceInput {
+                id: "multimodal".to_string(),
+                display_name: "多能力服务".to_string(),
+                base_url: "https://ark.example/api/v3".to_string(),
+                protocol: AIServiceProtocol::OpenaiChat,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-x".to_string(),
+            })
+            .expect("upsert");
+
+            // 能力槽位是事实源，`image_model` / `image_adapter` 是 image.generate 的旧投影。
+            assert_eq!(saved.media.len(), 2);
+            assert_eq!(saved.image_model, "doubao-seedream-5-0-pro");
+            assert_eq!(saved.image_adapter, "ark-images");
+            assert_eq!(
+                binding_for(&saved, CAP_IMAGE_EDIT),
+                Some(("ark-images".to_string(), "doubao-seededit-4-0-i2i".to_string()))
+            );
+            assert!(binding_for(&saved, CAP_VIDEO_GENERATE).is_none());
+
+            // 重新读盘后槽位仍在（持久化 round-trip）。
+            let (reloaded, _) = super::load_secret("multimodal").expect("reload");
+            assert_eq!(reloaded.media.len(), 2);
+        });
+    }
+
+    #[test]
+    fn legacy_image_fields_are_backfilled_into_the_generate_slot() {
+        with_isolated_home(|| {
+            super::upsert(CustomAIServiceInput {
+                id: "legacy".to_string(),
+                display_name: "旧配置".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: "gpt-image-1".to_string(),
+                image_adapter: "openai-images".to_string(),
+                media: std::collections::BTreeMap::new(),
+                api_key: "sk-legacy".to_string(),
+            })
+            .expect("upsert legacy");
+            let (service, _) = super::load_secret("legacy").expect("load");
+            assert_eq!(
+                binding_for(&service, CAP_IMAGE_GENERATE),
+                Some(("openai-images".to_string(), "gpt-image-1".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn each_media_capability_can_pin_its_own_service() {
+        with_isolated_home(|| {
+            for (id, image_model) in [("only-generate", "img-a"), ("only-edit", "")] {
+                super::upsert(CustomAIServiceInput {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    base_url: format!("https://{id}.example/v1"),
+                    protocol: AIServiceProtocol::OpenaiResponses,
+                    model: "chat".to_string(),
+                    models: vec!["chat".to_string()],
+                    image_model: image_model.to_string(),
+                    image_adapter: String::new(),
+                    media: if id == "only-edit" {
+                        let mut media = std::collections::BTreeMap::new();
+                        media.insert(
+                            CAP_IMAGE_EDIT.to_string(),
+                            MediaModelBinding {
+                                adapter: "openai-images-edit".to_string(),
+                                model: "edit-model".to_string(),
+                            },
+                        );
+                        media
+                    } else {
+                        std::collections::BTreeMap::new()
+                    },
+                    api_key: "sk".to_string(),
+                })
+                .expect("upsert");
+            }
+
+            super::set_media_service(CAP_IMAGE_GENERATE, "only-generate").unwrap();
+            super::set_media_service(CAP_IMAGE_EDIT, "only-edit").unwrap();
+
+            assert_eq!(
+                super::media_service_id(CAP_IMAGE_GENERATE).unwrap().as_deref(),
+                Some("only-generate")
+            );
+            assert_eq!(
+                super::media_service_id(CAP_IMAGE_EDIT).unwrap().as_deref(),
+                Some("only-edit")
+            );
+            // image.generate 的旧入口读的是同一个槽位
+            assert_eq!(
+                super::image_service_id().unwrap().as_deref(),
+                Some("only-generate")
+            );
+            assert!(super::set_media_service("video.generate", "only-edit").is_ok());
+            assert!(super::set_media_service("tts.generate", "only-edit").is_err());
+        });
+    }
+
+    #[test]
     fn rejects_invalid_service_input() {
         assert!(validate_base_url("file:///etc/passwd").is_err());
         assert!(validate_base_url("https://user:pass@host/v1").is_err());
@@ -721,7 +1038,8 @@ mod tests {
             models: Vec::new(),
             image_model: String::new(),
             image_adapter: String::new(),
-            api_key: "k".to_string(),
+                        media: Default::default(),
+api_key: "k".to_string(),
         };
         let err = super::upsert(invalid).err().expect("must reject");
         assert!(err.to_string().contains("只允许"));

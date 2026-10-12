@@ -2867,9 +2867,39 @@ pub(crate) fn save_ai_service(
     #[allow(clippy::too_many_arguments)]
     image_model: Option<String>,
     image_adapter: Option<String>,
+    image_edit_model: Option<String>,
+    image_edit_adapter: Option<String>,
+    video_model: Option<String>,
+    video_adapter: Option<String>,
     api_key: String,
 ) -> Result<serde_json::Value, String> {
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
+    // 媒体能力槽位：表单里的「生图 / 改图」两行各自映射到一个槽位。
+    let mut media = std::collections::BTreeMap::new();
+    let image_model = image_model.unwrap_or_default();
+    let image_adapter = image_adapter.unwrap_or_default();
+    let image_edit_model = image_edit_model.unwrap_or_default();
+    let image_edit_adapter = image_edit_adapter.unwrap_or_default();
+    let video_model = video_model.unwrap_or_default();
+    let video_adapter = video_adapter.unwrap_or_default();
+    if !video_model.trim().is_empty() {
+        media.insert(
+            crate::store::ai_services::CAP_VIDEO_GENERATE.to_string(),
+            crate::store::ai_services::MediaModelBinding {
+                adapter: video_adapter.trim().to_string(),
+                model: video_model.trim().to_string(),
+            },
+        );
+    }
+    if !image_edit_model.trim().is_empty() {
+        media.insert(
+            crate::store::ai_services::CAP_IMAGE_EDIT.to_string(),
+            crate::store::ai_services::MediaModelBinding {
+                adapter: image_edit_adapter.trim().to_string(),
+                model: image_edit_model.trim().to_string(),
+            },
+        );
+    }
     let service =
         crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
             id,
@@ -2878,8 +2908,9 @@ pub(crate) fn save_ai_service(
             protocol,
             model,
             models,
-            image_model: image_model.unwrap_or_default(),
-            image_adapter: image_adapter.unwrap_or_default(),
+            image_model,
+            image_adapter,
+            media,
             api_key,
         })
         .map_err(|e| e.to_string())?;
@@ -2941,20 +2972,32 @@ pub(crate) fn set_active_ai_service(
 pub(crate) fn set_image_ai_service(
     state: State<'_, AgentState>,
     id: String,
+    capability: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let selected = crate::store::ai_services::set_image_service(&id).map_err(|e| e.to_string())?;
+    let capability = capability
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::store::ai_services::CAP_IMAGE_GENERATE)
+        .to_string();
+    let selected = crate::store::ai_services::set_media_service(&capability, &id)
+        .map_err(|e| e.to_string())?;
     if let Some(service) = selected.as_ref() {
         state.approval_manager.add_log(
             "info",
-            &format!("已将本机模型服务设为生图默认服务: {}", service.display_name),
+            &format!(
+                "已将本机模型服务设为 {capability} 的默认服务: {}",
+                service.display_name
+            ),
         );
     } else {
         state
             .approval_manager
-            .add_log("info", "已清除生图默认服务，恢复自动选择");
+            .add_log("info", &format!("已清除 {capability} 的默认服务，恢复自动选择"));
     }
     Ok(json!({
-        "image_service_id": selected.map(|service| service.id).unwrap_or_default(),
+        "capability": capability,
+        "service_id": selected.map(|service| service.id).unwrap_or_default(),
     }))
 }
 

@@ -2602,6 +2602,8 @@ export type CustomAIService = {
     image_model: string;
     /** 生图适配器：空/openai-images = OpenAI Images；ark-images = 火山方舟（豆包）。 */
     image_adapter: string;
+    /** 媒体能力槽位：`image.generate` / `image.edit` / `video.generate` → 适配器 + 模型。 */
+    media?: Record<string, { adapter: string; model: string }>;
     created_at: string;
     updated_at: string;
 };
@@ -2634,7 +2636,12 @@ export type ManagedAIServiceSummary = {
 };
 
 export type AIServiceListResult = {
-    custom: { services: CustomAIService[]; active_service_id?: string; image_service_id?: string };
+    custom: {
+        services: CustomAIService[];
+        active_service_id?: string;
+        image_service_id?: string;
+        media_services?: Record<string, string>;
+    };
     managed: ManagedAIServiceSummary;
     clients: AIProviderImportOverview;
 };
@@ -3038,7 +3045,7 @@ export const agentApi = {
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -3048,10 +3055,14 @@ export const agentApi = {
             models: input.models,
             imageModel: input.image_model,
             imageAdapter: input.image_adapter,
+            imageEditModel: input.image_edit_model,
+            imageEditAdapter: input.image_edit_adapter,
+            videoModel: input.video_model,
+            videoAdapter: input.video_adapter,
             apiKey: input.api_key,
         }),
     setActiveAIService: (id: string) => invoke<{ active_service_id: string }>('set_active_ai_service', { id }),
-    setImageAIService: (id: string) => invoke<{ image_service_id: string }>('set_image_ai_service', { id }),
+    setImageAIService: (id: string, capability = 'image.generate') => invoke<{ capability: string; service_id: string }>('set_image_ai_service', { id, capability }),
     removeAIService: (id: string) => invoke<boolean>('remove_ai_service', { id }),
     importAIClient: (target: string, service?: string, replace = false) => invoke<Record<string, unknown>>('import_ai_client', { target, service, replace }),
     removeAIClient: (target: string) => invoke<Record<string, unknown>>('remove_ai_client', { target }),

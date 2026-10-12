@@ -32,10 +32,14 @@ type AiProvidersPanelProps = {
     models: string[];
     image_model: string;
     image_adapter: string;
+    image_edit_model: string;
+    image_edit_adapter: string;
+    video_model: string;
+    video_adapter: string;
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
-  onSetImageAIService: (id: string) => Promise<void>;
+  onSetImageAIService: (id: string, capability?: string) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
   onOpenAccount: () => void;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
@@ -51,6 +55,10 @@ const emptyDraft = {
   models: '',
   image_model: '',
   image_adapter: '',
+  image_edit_model: '',
+  image_edit_adapter: '',
+  video_model: '',
+  video_adapter: '',
   api_key: '',
 };
 
@@ -127,13 +135,23 @@ export function AiProvidersPanel({
     ? '本机默认配置'
     : managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
 
-  const imageCapableServices = customServices.filter((service) => service.image_model.trim() !== '');
+  function serviceSupports(service: CustomAIService, capability: string) {
+    const slot = service.media?.[capability];
+    if (slot?.model?.trim()) return true;
+    return capability === 'image.generate' && service.image_model.trim() !== '';
+  }
 
-  async function changeImageRoute(id: string) {
-    if (id === imageServiceId || settingActive) return;
+  const mediaRouteValue = (capability: string) => {
+    const configured = aiServices?.custom?.media_services?.[capability] ?? '';
+    if (configured) return configured;
+    return capability === 'image.generate' ? imageServiceId : '';
+  };
+
+  async function changeImageRoute(capability: string, id: string) {
+    if (id === mediaRouteValue(capability) || settingActive) return;
     setSettingActive(true);
     try {
-      await onSetImageAIService(id);
+      await onSetImageAIService(id, capability);
     } finally {
       setSettingActive(false);
     }
@@ -168,6 +186,10 @@ export function AiProvidersPanel({
       models: preset.models.join(', '),
       image_model: '',
       image_adapter: '',
+      image_edit_model: '',
+      image_edit_adapter: '',
+      video_model: '',
+      video_adapter: '',
       api_key: '',
     });
   }
@@ -198,6 +220,10 @@ export function AiProvidersPanel({
         models: draft.models.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
         image_model: draft.image_model.trim(),
         image_adapter: draft.image_adapter,
+        image_edit_model: draft.image_edit_model.trim(),
+        image_edit_adapter: draft.image_edit_adapter,
+        video_model: draft.video_model.trim(),
+        video_adapter: draft.video_adapter,
         api_key: draft.api_key.trim(),
       });
       setDraft(emptyDraft);
@@ -250,6 +276,10 @@ export function AiProvidersPanel({
       models: service.models.join(', '),
       image_model: service.image_model ?? '',
       image_adapter: service.image_adapter ?? '',
+      image_edit_model: service.media?.['image.edit']?.model ?? '',
+      image_edit_adapter: service.media?.['image.edit']?.adapter ?? '',
+      video_model: service.media?.['video.generate']?.model ?? '',
+      video_adapter: service.media?.['video.generate']?.adapter ?? '',
       api_key: '',
     });
     setFormError('');
@@ -296,14 +326,32 @@ export function AiProvidersPanel({
       ) : null}
 
       {serviceCount ? (
-        <div className="ai-service-route" role="group" aria-label="AI 生图使用的模型来源">
-          <span className="ai-service-route-label">AI 生图使用</span>
-          <select className="ai-service-route-select" aria-label="AI 生图使用的模型来源" value={imageServiceId} disabled={settingActive} onChange={(event) => void changeImageRoute(event.target.value)}>
-            <option value="">自动选择（跟随已配生图模型的服务）</option>
-            {imageCapableServices.map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
-          </select>
-          <span className="ai-service-route-hint">{imageCapableServices.length ? '只影响 media.image.generate 使用的服务，与对话模型分开。' : '还没有来源填写生图模型；编辑来源并在「生图模型」里填写后即可选择。'}</span>
-        </div>
+        <>
+          <div className="ai-service-route" role="group" aria-label="AI 生图使用的模型来源">
+            <span className="ai-service-route-label">AI 生图使用</span>
+            <select className="ai-service-route-select" aria-label="AI 生图使用的模型来源" value={mediaRouteValue('image.generate')} disabled={settingActive} onChange={(event) => void changeImageRoute('image.generate', event.target.value)}>
+              <option value="">自动选择（跟随已配生图模型的服务）</option>
+              {customServices.filter((service) => serviceSupports(service, 'image.generate')).map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
+            </select>
+            <span className="ai-service-route-hint">只影响 media.image.generate 使用的服务，与对话模型分开。</span>
+          </div>
+          <div className="ai-service-route" role="group" aria-label="AI 改图使用的模型来源">
+            <span className="ai-service-route-label">AI 改图使用</span>
+            <select className="ai-service-route-select" aria-label="AI 改图使用的模型来源" value={mediaRouteValue('image.edit')} disabled={settingActive} onChange={(event) => void changeImageRoute('image.edit', event.target.value)}>
+              <option value="">自动选择</option>
+              {customServices.filter((service) => serviceSupports(service, 'image.edit')).map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
+            </select>
+            <span className="ai-service-route-hint">{customServices.some((service) => serviceSupports(service, 'image.edit')) ? '只影响 media.image.edit（图生图）使用的服务。' : '还没有来源填写改图模型；编辑来源并在「改图模型」里填写后即可选择。'}</span>
+          </div>
+          <div className="ai-service-route" role="group" aria-label="AI 生视频使用的模型来源">
+            <span className="ai-service-route-label">AI 生视频使用</span>
+            <select className="ai-service-route-select" aria-label="AI 生视频使用的模型来源" value={mediaRouteValue('video.generate')} disabled={settingActive} onChange={(event) => void changeImageRoute('video.generate', event.target.value)}>
+              <option value="">自动选择</option>
+              {customServices.filter((service) => serviceSupports(service, 'video.generate')).map((service) => <option key={service.id} value={service.id}>{service.display_name}</option>)}
+            </select>
+            <span className="ai-service-route-hint">{customServices.some((service) => serviceSupports(service, 'video.generate')) ? '只影响 media.video.generate（异步任务，配合 media.job.get/wait 查询）。' : '还没有来源填写生视频模型；编辑来源并在「生视频模型」里填写后即可选择。'}</span>
+          </div>
+        </>
       ) : null}
 
       <section className="ai-client-section">
@@ -383,6 +431,10 @@ export function AiProvidersPanel({
                   <label className="field-label ai-service-field"><span>默认模型</span><input value={draft.model} onChange={(event) => setDraft((current) => ({ ...current, model: event.target.value }))} placeholder="如 gpt-test" /></label>
                   <label className="field-label ai-service-field"><span>生图模型（可选）</span><input value={draft.image_model} onChange={(event) => setDraft((current) => ({ ...current, image_model: event.target.value }))} placeholder="如 gpt-image-1 / doubao-seedream-4-0" /></label>
                   <label className="field-label ai-service-field"><span>生图协议</span><select value={draft.image_adapter} onChange={(event) => setDraft((current) => ({ ...current, image_adapter: event.target.value }))}><option value="">OpenAI 兼容（默认）</option><option value="ark-images">火山方舟（豆包）</option></select></label>
+                  <label className="field-label ai-service-field"><span>改图模型（可选）</span><input value={draft.image_edit_model} onChange={(event) => setDraft((current) => ({ ...current, image_edit_model: event.target.value }))} placeholder="如 doubao-seededit-4-0-i2i / gpt-image-1" /></label>
+                  <label className="field-label ai-service-field"><span>改图协议</span><select value={draft.image_edit_adapter} onChange={(event) => setDraft((current) => ({ ...current, image_edit_adapter: event.target.value }))}><option value="">OpenAI Images Edits</option><option value="ark-images">火山方舟（豆包）</option></select></label>
+                  <label className="field-label ai-service-field"><span>生视频模型（可选）</span><input value={draft.video_model} onChange={(event) => setDraft((current) => ({ ...current, video_model: event.target.value }))} placeholder="如 doubao-seedance-2-5-…" /></label>
+                  <label className="field-label ai-service-field"><span>生视频协议</span><select value={draft.video_adapter} onChange={(event) => setDraft((current) => ({ ...current, video_adapter: event.target.value }))}><option value="">火山方舟（Seedance）</option><option value="ark-video">火山方舟（Seedance）</option></select></label>
                 </div>
               </div>
 

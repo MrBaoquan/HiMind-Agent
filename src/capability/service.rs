@@ -238,6 +238,11 @@ enum CapabilityHandler {
     MediaJobGet,
     MediaJobCancel,
     MediaImageGenerateLocal,
+    MediaImageEditLocal,
+    MediaVideoGenerateLocal,
+    MediaJobGetLocal,
+    MediaJobWaitLocal,
+    MediaJobCancelLocal,
     PluginCapability(String),
     DownstreamMcp(String),
     McpServerList,
@@ -744,6 +749,19 @@ impl CapabilityGateway {
                         "models": { "type": "array", "items": { "type": "string" } },
                         "image_model": { "type": "string" },
                         "image_adapter": { "type": "string", "enum": ["", "openai-images", "ark-images"] },
+                        "media": {
+                            "type": "object",
+                            "description": "媒体能力槽位：image.generate / image.edit / video.generate → { adapter, model }",
+                            "additionalProperties": {
+                                "type": "object",
+                                "properties": {
+                                    "adapter": { "type": "string" },
+                                    "model": { "type": "string" }
+                                },
+                                "required": ["model"],
+                                "additionalProperties": false
+                            }
+                        },
                         "api_key": { "type": "string" }
                     },
                     "required": ["id", "display_name", "base_url", "protocol", "model"],
@@ -779,12 +797,18 @@ impl CapabilityGateway {
             ),
             registration(
                 "ai.service.image.set",
-                "设置生图服务",
-                "指定本机哪个 AI 服务用于生图（media.image.generate）；传空字符串清除，恢复自动选择。不影响对话使用的服务。",
+                "设置媒体能力服务",
+                "指定本机哪个 AI 服务用于某个媒体能力（image.generate / image.edit / video.generate）；传空字符串清除，恢复自动选择。不影响对话使用的服务。",
                 "local_write",
                 json!({
                     "type": "object",
-                    "properties": { "id": { "type": "string", "maxLength": 64 } },
+                    "properties": {
+                        "id": { "type": "string", "maxLength": 64 },
+                        "capability": {
+                            "type": "string",
+                            "enum": ["image.generate", "image.edit", "video.generate"]
+                        }
+                    },
                     "required": ["id"],
                     "additionalProperties": false
                 }),
@@ -2707,6 +2731,11 @@ impl CapabilityGateway {
             // 命名规则：`media.*` 属于 Agent 本机能力（用户自己的服务与 Key），
             // 工作台提供的媒体通道统一放在 `workbench.media.*` 下。
             local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，独立模式同样可用。", "local_write", media_image_generate_local_schema(), CapabilityHandler::MediaImageGenerateLocal),
+            local_media_registration("media.image.edit", "编辑图片（本机）", "用本机配置的图片模型按参考图改图（图生图）：参考图可以是工作区内的图片路径或上一轮生成结果的 media:<id>；结果落盘并登记 media_id，便于继续多轮修改。不依赖 AI 工作台。", "local_write", media_image_edit_local_schema(), CapabilityHandler::MediaImageEditLocal),
+            local_media_registration("media.video.generate", "生成视频（本机）", "用本机配置的生视频模型提交文生视频 / 图生视频任务（可选参考图，来源同改图）；视频为异步任务，立即返回 job_id，用 media.job.get / media.job.wait 查询、media.job.cancel 取消。不依赖 AI 工作台。", "local_write", media_video_generate_local_schema(), CapabilityHandler::MediaVideoGenerateLocal),
+            local_media_registration("media.job.get", "查看本机媒体任务", "查询本机媒体任务（生视频等）的状态、进度与产物。", "read_only", media_job_local_schema(), CapabilityHandler::MediaJobGetLocal),
+            local_media_registration("media.job.wait", "等待本机媒体任务", "轮询等待本机媒体任务到达终态或超时；适合在对话里等待短视频生成。", "read_only", media_job_wait_local_schema(), CapabilityHandler::MediaJobWaitLocal),
+            local_media_registration("media.job.cancel", "取消本机媒体任务", "取消仍在排队或执行中的本机媒体任务。", "local_write", media_job_local_schema(), CapabilityHandler::MediaJobCancelLocal),
             media_registration("workbench.media.image.generate", "生成图片（工作台）", "由 AI 工作台媒体通道根据提示词生成图片，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("image".into(), "generate".into())),
             media_registration("workbench.media.image.edit", "编辑图片（工作台）", "由 AI 工作台媒体通道根据提示词和参考图片编辑图像，返回可查询的媒体任务。", "network_write", media_generate_schema(true), CapabilityHandler::MediaSubmit("image".into(), "edit".into())),
             media_registration("workbench.media.video.generate", "生成视频（工作台）", "由 AI 工作台媒体通道根据提示词和可选参考素材生成视频，返回可查询的媒体任务。", "network_write", media_generate_schema(false), CapabilityHandler::MediaSubmit("video".into(), "generate".into())),
@@ -3463,9 +3492,16 @@ impl CapabilityGateway {
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                let selected = crate::store::ai_services::set_image_service(id)?;
+                let capability = input
+                    .get("capability")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(crate::store::ai_services::CAP_IMAGE_GENERATE);
+                let selected = crate::store::ai_services::set_media_service(capability, id)?;
                 Ok(serde_json::json!({
-                    "image_service_id": selected.map(|service| service.id).unwrap_or_default(),
+                    "capability": capability,
+                    "service_id": selected.map(|service| service.id).unwrap_or_default(),
                 }))
             }
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
@@ -4088,6 +4124,11 @@ impl CapabilityGateway {
             CapabilityHandler::MediaImageGenerateLocal => {
                 crate::app::local_image::generate(&input)
             }
+            CapabilityHandler::MediaImageEditLocal => crate::app::local_image::edit(&input),
+            CapabilityHandler::MediaVideoGenerateLocal => crate::app::local_video::generate(&input),
+            CapabilityHandler::MediaJobGetLocal => crate::app::local_video::job_get(&input),
+            CapabilityHandler::MediaJobWaitLocal => crate::app::local_video::job_wait(&input),
+            CapabilityHandler::MediaJobCancelLocal => crate::app::local_video::job_cancel(&input),
             CapabilityHandler::PluginCapability(id) => {
                 validate_mcp_capability_workspace(context, &id, &input)?;
                 let output = invoke_plugin_capability(
@@ -6213,6 +6254,8 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
             | CapabilityHandler::SoftwareDistributionPublish
             | CapabilityHandler::MediaSubmit(_, _)
             | CapabilityHandler::MediaJobCancel
+            | CapabilityHandler::MediaVideoGenerateLocal
+            | CapabilityHandler::MediaJobWaitLocal
     );
     descriptor.execution_mode = if long_running { "long_running" } else { "sync" }.to_string();
     descriptor.supports_progress = long_running;
@@ -6227,6 +6270,8 @@ fn apply_registry_metadata(descriptor: &mut CapabilityDescriptor, handler: &Capa
             | CapabilityHandler::SvnExhibitRepositoryImportLocal
             | CapabilityHandler::MediaSubmit(_, _)
             | CapabilityHandler::MediaJobCancel
+            | CapabilityHandler::MediaJobCancelLocal
+            | CapabilityHandler::MediaVideoGenerateLocal
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout
     );
     descriptor.approval_required =
@@ -7478,7 +7523,8 @@ fn media_registration(
 fn capability_id_aliases(capability_id: &str) -> Option<&'static str> {
     match capability_id.trim() {
         // 媒体：`media.*` 由工作台交还 Agent 本机，工作台通道迁到 `workbench.media.*`。
-        "media.image.edit" => Some("workbench.media.image.edit"),
+        // `media.image.edit` 已由本机图生图能力占用（`media.*` = 本机执行），
+        // 不能被别名劫持到工作台契约上；其余工作台媒体能力保留旧 ID 过渡别名。
         "media.video.generate" => Some("workbench.media.video.generate"),
         "media.audio.speech" => Some("workbench.media.audio.speech"),
         "media.audio.transcribe" => Some("workbench.media.audio.transcribe"),
@@ -7751,6 +7797,101 @@ fn media_image_generate_local_schema() -> Value {
             }
         },
         "required": ["prompt"],
+        "additionalProperties": false
+    })
+}
+
+fn media_image_edit_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8000,
+                "description": "改图要求（提示词）"
+            },
+            "input_images": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": { "type": "string", "maxLength": 2000 },
+                "description": "参考图：工作区内的绝对路径，或上一轮结果的 media:<id>"
+            },
+            "mask": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "可选蒙版（仅 openai-images-edit 适配器使用）"
+            },
+            "service": {
+                "type": "string",
+                "maxLength": 80,
+                "description": "服务源：custom:<id>；留空表示按「改图默认服务 → 激活服务 → 唯一支持改图的服务」解析"
+            },
+            "model": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "改图模型；留空表示使用服务上配置的 image.edit 槽位"
+            },
+            "size": { "type": "string", "maxLength": 32 },
+            "quality": { "type": "string", "maxLength": 32 },
+            "n": { "type": "integer", "minimum": 1, "maximum": 4 },
+            "output_dir": { "type": "string", "maxLength": 2000 },
+            "filename": { "type": "string", "maxLength": 120 },
+            "inline": { "type": "boolean", "description": "是否把结果内联返回给 AI 对话，默认 true" },
+            "parameters": {
+                "type": "object",
+                "description": "provider 专属参数（透传给改图请求体）",
+                "additionalProperties": true
+            }
+        },
+        "required": ["prompt", "input_images"],
+        "additionalProperties": false
+    })
+}
+
+fn media_video_generate_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "prompt": { "type": "string", "minLength": 1, "maxLength": 8000, "description": "视频内容描述" },
+            "input_images": {
+                "type": "array",
+                "maxItems": 2,
+                "items": { "type": "string", "maxLength": 2000 },
+                "description": "可选参考图（首帧/尾帧）：工作区内绝对路径或 media:<id>"
+            },
+            "duration_seconds": { "type": "number", "minimum": 1, "maximum": 60, "description": "视频时长（秒）" },
+            "ratio": { "type": "string", "maxLength": 16, "description": "画面比例，如 16:9 / 9:16" },
+            "resolution": { "type": "string", "maxLength": 16, "description": "分辨率档位，如 720p / 1080p" },
+            "service": { "type": "string", "maxLength": 80, "description": "服务源：custom:<id>；留空表示自动选择" },
+            "model": { "type": "string", "maxLength": 160, "description": "生视频模型；留空使用服务上的 video.generate 槽位" },
+            "output_dir": { "type": "string", "maxLength": 2000 },
+            "filename": { "type": "string", "maxLength": 120 },
+            "parameters": { "type": "object", "additionalProperties": true, "description": "provider 专属参数" }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+    })
+}
+
+fn media_job_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "job_id": { "type": "string", "minLength": 1, "maxLength": 160 } },
+        "required": ["job_id"],
+        "additionalProperties": false
+    })
+}
+
+fn media_job_wait_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "job_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 900 }
+        },
+        "required": ["job_id"],
         "additionalProperties": false
     })
 }
@@ -8711,6 +8852,8 @@ mod tests {
         assert!(visible
             .iter()
             .any(|item| item.id == "media.image.generate"));
+        // 图生图同样是本机能力，独立模式必须可见。
+        assert!(visible.iter().any(|item| item.id == "media.image.edit"));
         // 工作台媒体通道在独立模式下整体不可见。
         assert!(!visible
             .iter()
@@ -9181,7 +9324,8 @@ mod tests {
                 models: vec!["chat-model".to_string()],
                 image_model: "image-model".to_string(),
                 image_adapter: String::new(),
-                api_key: "sk-test-image".to_string(),
+                                media: Default::default(),
+api_key: "sk-test-image".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-image").unwrap();
@@ -9315,9 +9459,19 @@ mod tests {
     }
 
     #[test]
+    fn local_media_capabilities_are_not_shadowed_by_retired_aliases() {
+        for id in ["media.image.generate", "media.image.edit"] {
+            assert_eq!(
+                capability_id_aliases(id),
+                None,
+                "`{id}` 由本机能力占用，不能再有退役别名"
+            );
+        }
+    }
+
+    #[test]
     fn retired_ids_resolve_to_the_current_namespace() {
         for (legacy, current) in [
-            ("media.image.edit", "workbench.media.image.edit"),
             ("media.video.generate", "workbench.media.video.generate"),
             ("media.audio.speech", "workbench.media.audio.speech"),
             ("media.audio.transcribe", "workbench.media.audio.transcribe"),

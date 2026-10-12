@@ -23,12 +23,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::store::ai_services::AIServiceProtocol;
+use crate::store::ai_services::{CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 180;
 const MAX_REQUEST_COUNT: u64 = 4;
 const MAX_RESPONSE_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INLINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INPUT_IMAGES: usize = 4;
+const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_PROMPT_CHARS: usize = 8_000;
 const WORKSPACE_MEDIA_DIR: &str = ".himind";
 const WORKSPACE_MEDIA_SUBDIR: &str = "media";
@@ -37,44 +40,84 @@ const AGENT_MEDIA_SUBDIR: &str = "media";
 const ADAPTER_OPENAI_IMAGES: &str = "openai-images";
 /// 火山方舟（豆包 Seedream）图像协议（`/api/v3/images/generations`）。
 const ADAPTER_ARK_IMAGES: &str = "ark-images";
+/// OpenAI 图生图（multipart `/v1/images/edits`）。
+const ADAPTER_OPENAI_IMAGES_EDIT: &str = "openai-images-edit";
 
-/// 能力入口：解析服务与参数，然后执行生图。
+/// 能力入口：解析服务与参数，然后执行生图（`image.generate`）。
 pub(crate) fn generate(input: &Value) -> Result<Value, Box<dyn Error>> {
     let request = ImageRequest::parse(input)?;
-    let (service, api_key) = crate::store::ai_services::resolve_image_service(&request.service)?;
-    if matches!(service.protocol, AIServiceProtocol::Anthropic) {
-        return Err(format!(
-            "服务「{}」使用 Anthropic 协议，不支持 OpenAI Images 生图；请改用 openai-chat/openai-responses 服务",
-            service.display_name
-        )
-        .into());
-    }
-    let model = request
-        .model
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            let configured = service.image_model.trim().to_string();
-            (!configured.is_empty()).then_some(configured)
-        })
-        .ok_or_else(|| {
-            format!(
-                "服务「{}」尚未配置生图模型；请在该服务上填写生图模型（image_model），或在调用时传入 model",
-                service.display_name
-            )
-        })?;
-    let adapter = normalize_image_adapter(&service.image_adapter)?;
+    let (service, api_key) =
+        crate::store::ai_services::resolve_media_service(CAP_IMAGE_GENERATE, &request.service)?;
+    let (adapter, model) = resolve_binding(&service, CAP_IMAGE_GENERATE, request.model.as_deref())?;
     let output_dir = resolve_output_dir(request.output_dir.as_deref())?;
-    call_images_api(
+    call_generate_api(
         &service.base_url,
-        adapter,
+        &adapter,
         &api_key,
         &service.id,
-        &service.display_name,
         &model,
         &request,
         &output_dir,
     )
+}
+
+/// 能力入口：图生图 / 改图（`image.edit`）。
+///
+/// 参考图可以是本机绝对路径，也可以是之前生成结果的 `media:<id>`；
+/// 默认要求参考图位于当前会话工作区内。
+pub(crate) fn edit(input: &Value) -> Result<Value, Box<dyn Error>> {
+    let request = ImageRequest::parse(input)?;
+    if request.input_images.is_empty() {
+        return Err("input_images 不能为空：请给出参考图的本机路径或 media:<id>".into());
+    }
+    let (service, api_key) =
+        crate::store::ai_services::resolve_media_service(CAP_IMAGE_EDIT, &request.service)?;
+    let (adapter, model) = resolve_binding(&service, CAP_IMAGE_EDIT, request.model.as_deref())?;
+    let output_dir = resolve_output_dir(request.output_dir.as_deref())?;
+    call_edit_api(
+        &service.base_url,
+        &adapter,
+        &api_key,
+        &service.id,
+        &model,
+        &request,
+        &output_dir,
+    )
+}
+
+/// 取服务在指定能力上的「适配器 + 模型」；`model` 参数可覆盖槽位里的模型。
+fn resolve_binding(
+    service: &crate::store::ai_services::CustomAIService,
+    capability: &str,
+    requested_model: Option<&str>,
+) -> Result<(String, String), Box<dyn Error>> {
+    if matches!(
+        service.protocol,
+        crate::store::ai_services::AIServiceProtocol::Anthropic
+    ) {
+        return Err(format!(
+            "服务「{}」使用 Anthropic 协议，不支持 OpenAI Images 媒体能力；请改用 openai-chat/openai-responses 服务",
+            service.display_name
+        )
+        .into());
+    }
+    let binding = crate::store::ai_services::binding_for(service, capability);
+    let requested = requested_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (binding, requested) {
+        (Some((adapter, model)), Some(override_model)) => Ok((adapter, override_model.to_string())),
+        (Some(binding), None) => Ok(binding),
+        (None, Some(override_model)) => Ok((
+            crate::store::ai_services::DEFAULT_MEDIA_ADAPTER.to_string(),
+            override_model.to_string(),
+        )),
+        (None, None) => Err(format!(
+            "服务「{}」尚未配置「{capability}」能力；请在该服务上填写对应模型，或在调用时传入 model",
+            service.display_name
+        )
+        .into()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +134,10 @@ struct ImageRequest {
     /// provider 专属参数（如方舟的 `watermark`、`sequential_image_generation`），
     /// 直接合并进请求体；同名时以显式字段（model/prompt/size/…）为准。
     parameters: Option<serde_json::Map<String, Value>>,
+    /// 图生图的参考图：本机绝对路径或 `media:<id>`。
+    input_images: Vec<String>,
+    /// 可选蒙版（仅 `openai-images-edit` 使用）。
+    mask: Option<String>,
 }
 
 impl ImageRequest {
@@ -135,6 +182,26 @@ impl ImageRequest {
                 Some(Value::Object(map)) => Some(map.clone()),
                 Some(_) => return Err("parameters 必须是对象".into()),
             },
+            input_images: match input.get("input_images") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => {
+                    let mut result = Vec::new();
+                    for item in items {
+                        let value = item
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .ok_or("input_images 只能是字符串数组")?;
+                        result.push(value.to_string());
+                    }
+                    if result.len() > MAX_INPUT_IMAGES {
+                        return Err(format!("input_images 最多 {MAX_INPUT_IMAGES} 张").into());
+                    }
+                    result
+                }
+                Some(_) => return Err("input_images 必须是字符串数组".into()),
+            },
+            mask: optional_string(input, "mask", 2000)?,
         })
     }
 }
@@ -176,18 +243,17 @@ fn optional_token(
 }
 
 /// 真正调用 provider 的入口；把「解析服务」与「发起请求」分开，便于单测。
-fn call_images_api(
+fn call_generate_api(
     base_url: &str,
     adapter: &str,
     api_key: &str,
     service_id: &str,
-    service_label: &str,
     model: &str,
     request: &ImageRequest,
     output_dir: &Path,
 ) -> Result<Value, Box<dyn Error>> {
     if api_key.trim().is_empty() {
-        return Err(format!("服务「{service_label}」没有可用的 API Key").into());
+        return Err("所选本机 AI 服务没有可用的 API Key".into());
     }
     let adapter = normalize_image_adapter(adapter)?;
     let url = images_url_for(adapter, base_url)?;
@@ -228,6 +294,32 @@ fn call_images_api(
     }
     let payload = body_value;
 
+    materialize_outputs(
+        &client,
+        &payload,
+        request,
+        output_dir,
+        CAP_IMAGE_GENERATE,
+        service_id,
+        model,
+        base_url,
+        "已生成",
+    )
+}
+
+/// 把 provider 返回的图片落盘、登记为 `media_id`，并组装成能力返回值。
+#[allow(clippy::too_many_arguments)]
+fn materialize_outputs(
+    client: &Client,
+    payload: &Value,
+    request: &ImageRequest,
+    output_dir: &Path,
+    capability: &str,
+    service_id: &str,
+    model: &str,
+    base_url: &str,
+    verb: &str,
+) -> Result<Value, Box<dyn Error>> {
     let items = payload
         .get("data")
         .and_then(Value::as_array)
@@ -265,6 +357,21 @@ fn call_images_api(
         crate::store::atomic_file::atomic_write(&path, &bytes)
             .map_err(|error| format!("图片写入失败：{}（{error}）", path.display()))?;
         let (width, height) = image_dimensions(&bytes);
+        let sha256 = hex_sha256(&bytes);
+        let path_text = path.to_string_lossy().to_string();
+        let record = crate::store::media_registry::register(crate::store::media_registry::NewMedia {
+            path: &path_text,
+            kind: "image",
+            mime_type: mime,
+            size_bytes: bytes.len() as u64,
+            sha256: &sha256,
+            width: width.unwrap_or_default(),
+            height: height.unwrap_or_default(),
+            duration_seconds: 0.0,
+            capability,
+            service_id,
+            prompt: &request.prompt,
+        })?;
         if request.inline && bytes.len() <= MAX_INLINE_BYTES {
             inline_blocks.push(json!({
                 "type": "image",
@@ -273,11 +380,12 @@ fn call_images_api(
             }));
         }
         files.push(json!({
-            "path": path.to_string_lossy(),
+            "media_id": record.id,
+            "path": path_text,
             "name": path.file_name().and_then(|value| value.to_str()).unwrap_or_default(),
             "mime_type": mime,
             "size_bytes": bytes.len(),
-            "sha256": hex_sha256(&bytes),
+            "sha256": sha256,
             "width": width,
             "height": height,
             "revised_prompt": item.get("revised_prompt").and_then(Value::as_str),
@@ -292,6 +400,7 @@ fn call_images_api(
         "mode": "local",
         "provider": provider_label(base_url),
         "service_id": service_id,
+        "capability": capability,
         "model": model,
         "output_dir": output_dir.to_string_lossy(),
         "files": files,
@@ -301,7 +410,7 @@ fn call_images_api(
     }
     let mut content = vec![json!({
         "type": "text",
-        "text": format!("已生成 {} 张图片：\n{}", paths.len(), paths.join("\n")),
+        "text": format!("{verb} {} 张图片：\n{}\n后续可用 media:<id> 引用继续改图。", paths.len(), paths.join("\n")),
     })];
     content.extend(inline_blocks);
     Ok(json!({
@@ -314,13 +423,223 @@ fn call_images_api(
 fn normalize_image_adapter(raw: &str) -> Result<&'static str, Box<dyn Error>> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "openai" | "openai-images" | "openai_images" => Ok(ADAPTER_OPENAI_IMAGES),
+        "openai-edit" | "openai-images-edit" | "openai_images_edit" => {
+            Ok(ADAPTER_OPENAI_IMAGES_EDIT)
+        }
         "ark" | "ark-images" | "ark_images" | "volcengine" | "doubao" | "seedream" => {
             Ok(ADAPTER_ARK_IMAGES)
         }
-        other => {
-            Err(format!("不支持的生图适配器：{other}；可选 openai-images、ark-images").into())
+        other => Err(format!(
+            "不支持的媒体适配器：{other}；可选 openai-images、openai-images-edit、ark-images"
+        )
+        .into()),
+    }
+}
+
+/// 图生图 / 改图的参考图。
+pub(crate) struct InputImage {
+    pub(crate) name: String,
+    pub(crate) mime: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// 解析参考图：`media:<id>` 走媒体登记表，否则按本机绝对路径读取。
+///
+/// 当会话工作区可知时，参考图必须位于该工作区内，避免把工作区外的任意文件
+/// 悄悄发给第三方模型。
+pub(crate) fn resolve_input_image(reference: &str) -> Result<InputImage, Box<dyn Error>> {
+    let reference = reference.trim();
+    let (path, source) = match crate::store::media_registry::resolve_reference(reference)? {
+        Some(record) => (PathBuf::from(&record.path), format!("media:{}", record.id)),
+        None => (PathBuf::from(reference), reference.to_string()),
+    };
+    if !path.is_absolute() {
+        return Err(format!("参考图必须是绝对路径或 media:<id>：{reference}").into());
+    }
+    if let Some(workspace) = crate::extension_workspace::session_root() {
+        let resolved = crate::path_guard::resolve_real_path(&path)?;
+        if !crate::path_guard::path_is_within(&workspace, &resolved) {
+            return Err(format!(
+                "参考图必须位于当前会话工作区内：{}（如需工作区外素材请先用 media.asset.import 登记）",
+                path.display()
+            )
+            .into());
         }
     }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("读取参考图失败：{}（{error}）", path.display()))?;
+    if bytes.len() > MAX_INPUT_IMAGE_BYTES {
+        return Err(format!(
+            "参考图 {} 超过 {} MiB 上限",
+            source,
+            MAX_INPUT_IMAGE_BYTES / (1024 * 1024)
+        )
+        .into());
+    }
+    let mime = sniff_mime(&bytes).to_string();
+    if !mime.starts_with("image/") {
+        return Err(format!("参考图 {source} 不是受支持的图片格式（PNG/JPEG/WEBP/GIF）").into());
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("input.png")
+        .to_string();
+    Ok(InputImage { name, mime, bytes })
+}
+
+pub(crate) fn data_url(image: &InputImage) -> String {
+    format!(
+        "data:{};base64,{}",
+        image.mime,
+        base64::engine::general_purpose::STANDARD.encode(&image.bytes)
+    )
+}
+
+/// 按适配器执行图生图：方舟走 JSON（`image` 字段），OpenAI 走 multipart edits。
+fn call_edit_api(
+    base_url: &str,
+    adapter: &str,
+    api_key: &str,
+    service_id: &str,
+    model: &str,
+    request: &ImageRequest,
+    output_dir: &Path,
+) -> Result<Value, Box<dyn Error>> {
+    if api_key.trim().is_empty() {
+        return Err("所选本机 AI 服务没有可用的 API Key".into());
+    }
+    let adapter = normalize_image_adapter(adapter)?;
+    let images = request
+        .input_images
+        .iter()
+        .map(|reference| resolve_input_image(reference))
+        .collect::<Result<Vec<_>, _>>()?;
+    let client = Client::builder().timeout(request_timeout()).build()?;
+
+    match adapter {
+        ADAPTER_OPENAI_IMAGES_EDIT => {
+            if images.len() != 1 {
+                return Err(
+                    "openai-images-edit 只接受 1 张参考图；多图改图请使用 ark-images".into(),
+                );
+            }
+            let mut form = reqwest::blocking::multipart::Form::new()
+                .text("model", model.to_string())
+                .text("prompt", request.prompt.clone())
+                .text("n", request.n.to_string());
+            if let Some(size) = &request.size {
+                form = form.text("size", size.clone());
+            }
+            if let Some(quality) = &request.quality {
+                form = form.text("quality", quality.clone());
+            }
+            let image = &images[0];
+            let part = reqwest::blocking::multipart::Part::bytes(image.bytes.clone())
+                .file_name(image.name.clone())
+                .mime_str(&image.mime)?;
+            form = form.part("image", part);
+            if let Some(mask) = request.mask.as_deref() {
+                let mask = resolve_input_image(mask)?;
+                let part = reqwest::blocking::multipart::Part::bytes(mask.bytes.clone())
+                    .file_name(mask.name.clone())
+                    .mime_str(&mask.mime)?;
+                form = form.part("mask", part);
+            }
+            let url = images_edit_url(base_url)?;
+            let response = client
+                .post(&url)
+                .bearer_auth(api_key.trim())
+                .multipart(form)
+                .send()
+                .map_err(|error| format!("调用图生图接口失败：{error}"))?;
+            let status = response.status();
+            let payload = read_json(response)?;
+            if !status.is_success() {
+                return Err(format!("图生图接口返回 {status}：{}", describe_error(&payload)).into());
+            }
+            materialize_outputs(
+                &client,
+                &payload,
+                request,
+                output_dir,
+                CAP_IMAGE_EDIT,
+                service_id,
+                model,
+                base_url,
+                "已生成",
+            )
+        }
+        ADAPTER_ARK_IMAGES => {
+            let mut body = request.parameters.clone().unwrap_or_default();
+            body.insert("model".to_string(), json!(model));
+            body.insert("prompt".to_string(), json!(request.prompt));
+            body.insert("n".to_string(), json!(request.n));
+            body.insert("response_format".to_string(), json!("b64_json"));
+            if let Some(size) = &request.size {
+                body.insert("size".to_string(), json!(size));
+            }
+            if let Some(quality) = &request.quality {
+                body.insert("quality".to_string(), json!(quality));
+            }
+            body.entry("watermark".to_string())
+                .or_insert_with(|| json!(false));
+            // 方舟用 `image` 承载参考图，支持单张字符串或多张数组。
+            let encoded = images.iter().map(data_url).collect::<Vec<_>>();
+            body.insert(
+                "image".to_string(),
+                if encoded.len() == 1 {
+                    json!(encoded[0])
+                } else {
+                    json!(encoded)
+                },
+            );
+            let url = images_url_for(adapter, base_url)?;
+            let mut payload = Value::Object(body);
+            let (mut status, mut body_value) = post_images(&client, &url, api_key, &payload)?;
+            if !status.is_success() && rejects_response_format(&body_value) {
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("response_format");
+                }
+                let retry = post_images(&client, &url, api_key, &payload)?;
+                status = retry.0;
+                body_value = retry.1;
+            }
+            if !status.is_success() {
+                return Err(format!("图生图接口返回 {status}：{}", describe_error(&body_value)).into());
+            }
+            materialize_outputs(
+                &client,
+                &body_value,
+                request,
+                output_dir,
+                CAP_IMAGE_EDIT,
+                service_id,
+                model,
+                base_url,
+                "已生成",
+            )
+        }
+        other => Err(format!("适配器 {other} 暂不支持图生图（image.edit）").into()),
+    }
+}
+
+/// `{base_url}/v1/images/edits`；`base_url` 已经带 `/v1` 时不重复追加。
+fn images_edit_url(base_url: &str) -> Result<String, Box<dyn Error>> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("AI 服务 base_url 为空".into());
+    }
+    let parsed = url::Url::parse(base).map_err(|_| "AI 服务 base_url 不是合法 URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("AI 服务 base_url 仅支持 http/https".into());
+    }
+    let root = if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    };
+    Ok(format!("{root}/images/edits"))
 }
 
 /// OpenAI Images 协议地址（保留给旧调用点）：`{base_url}/v1/images/generations`。
@@ -690,12 +1009,11 @@ mod tests {
         let base_url = fake_provider(body);
         let output_dir = temp_dir("inline");
         let request = ImageRequest::parse(&json!({ "prompt": "一只猫" })).unwrap();
-        let result = call_images_api(
+        let result = call_generate_api(
             &base_url,
             ADAPTER_OPENAI_IMAGES,
             "test-key",
             "svc_1",
-            "测试服务",
             "gpt-image-1",
             &request,
             &output_dir,
@@ -722,12 +1040,11 @@ mod tests {
         let base_url = fake_provider(body);
         let output_dir = temp_dir("plain");
         let request = ImageRequest::parse(&json!({ "prompt": "一只猫", "inline": false })).unwrap();
-        let result = call_images_api(
+        let result = call_generate_api(
             &base_url,
             ADAPTER_OPENAI_IMAGES,
             "test-key",
             "svc_1",
-            "测试服务",
             "gpt-image-1",
             &request,
             &output_dir,
@@ -775,30 +1092,103 @@ mod tests {
                 let _ = stream.flush();
             }
         });
+        let _guard = crate::store::paths::test_env_lock();
+        let home = temp_dir("ark-home");
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &home);
         let output_dir = temp_dir("ark");
         let request =
             ImageRequest::parse(
                 &json!({ "prompt": "一只猫", "inline": false, "parameters": { "watermark": true } }),
             )
                 .unwrap();
-        let result = call_images_api(
+        let result = call_generate_api(
             &format!("http://{address}"),
             ADAPTER_ARK_IMAGES,
             "test-key",
             "svc_ark",
-            "火山方舟",
             "doubao-seedream-4-0",
             &request,
             &output_dir,
         )
         .unwrap();
 
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let text = captured.lock().unwrap().clone();
         assert!(text.contains("POST /api/v3/images/generations"), "{text}");
         // 调用方显式给的 watermark 优先于默认值。
         assert!(text.contains("\"watermark\":true"), "{text}");
         assert!(PathBuf::from(result["files"][0]["path"].as_str().unwrap()).is_file());
         let _ = fs::remove_dir_all(&output_dir);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ark_edit_sends_the_reference_image_and_registers_media_id() {
+        let body = format!("{{\"data\":[{{\"b64_json\":\"{TINY_PNG_B64}\"}}]}}");
+        let body: &'static str = Box::leak(body.into_boxed_str());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&captured);
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                *sink.lock().unwrap() = read_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let _guard = crate::store::paths::test_env_lock();
+        let home = temp_dir("edit-home");
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &home);
+
+        let output_dir = temp_dir("edit-out");
+        let source_dir = temp_dir("edit-src");
+        let source = source_dir.join("ref.png");
+        fs::write(&source, decode_base64(TINY_PNG_B64).unwrap()).unwrap();
+        let request = ImageRequest::parse(&json!({
+            "prompt": "把背景换成夜景",
+            "input_images": [source.to_string_lossy()],
+            "inline": false,
+        }))
+        .unwrap();
+        let result = call_edit_api(
+            &format!("http://{address}"),
+            ADAPTER_ARK_IMAGES,
+            "test-key",
+            "svc_ark",
+            "doubao-seedream-5-0-pro",
+            &request,
+            &output_dir,
+        )
+        .unwrap();
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+
+        let text = captured.lock().unwrap().clone();
+        assert!(text.contains("POST /api/v3/images/generations"), "{text}");
+        assert!(text.contains(r#""image":"#), "{text}");
+        assert!(text.contains("data:image/png;base64,"), "{text}");
+        assert_eq!(result["capability"], "image.edit");
+        let media_id = result["files"][0]["media_id"].as_str().unwrap();
+        assert!(media_id.starts_with("media_"), "{media_id}");
+        assert!(PathBuf::from(result["files"][0]["path"].as_str().unwrap()).is_file());
+        let _ = fs::remove_dir_all(&output_dir);
+        let _ = fs::remove_dir_all(&source_dir);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -831,12 +1221,11 @@ mod tests {
         });
         let output_dir = temp_dir("retry");
         let request = ImageRequest::parse(&json!({ "prompt": "图" })).unwrap();
-        let error = call_images_api(
+        let error = call_generate_api(
             &format!("http://{address}/v1"),
             ADAPTER_OPENAI_IMAGES,
             "test-key",
             "svc_1",
-            "测试服务",
             "gpt-image-1",
             &request,
             &output_dir,
@@ -867,12 +1256,11 @@ mod tests {
         });
         let output_dir = temp_dir("error");
         let request = ImageRequest::parse(&json!({ "prompt": "图" })).unwrap();
-        let error = call_images_api(
+        let error = call_generate_api(
             &format!("http://{address}/v1"),
             ADAPTER_OPENAI_IMAGES,
             "test-key",
             "svc_1",
-            "测试服务",
             "unknown-model",
             &request,
             &output_dir,

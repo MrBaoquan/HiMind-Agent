@@ -48,10 +48,14 @@ type AiConnectionsPageProps = {
     models: string[];
     image_model: string;
     image_adapter: string;
+    image_edit_model: string;
+    image_edit_adapter: string;
+    video_model: string;
+    video_adapter: string;
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
-  onSetImageAIService: (id: string) => Promise<void>;
+  onSetImageAIService: (id: string, capability?: string) => Promise<void>;
   onRemoveAIService: (id: string) => Promise<void>;
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
