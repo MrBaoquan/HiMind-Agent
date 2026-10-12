@@ -7520,7 +7520,16 @@ fn capability_id_aliases(capability_id: &str) -> Option<&'static str> {
 ///
 /// 只做机械可判定的部分：分隔符/字符集、段数与长度、版本后缀、重复段。
 /// 领域与动作词表属于评审规则，不在这里硬编码，避免把历史命名空间一次判死。
-fn capability_id_naming_violations(id: &str) -> Vec<&'static str> {
+pub(crate) fn capability_id_naming_violations(id: &str) -> Vec<&'static str> {
+    capability_id_naming_violations_allow(id, &[])
+}
+
+/// 与 [`capability_id_naming_violations`] 相同，但允许额外的首段域（ADR 0119 插件规则：
+/// 插件能力可以用自己的命名空间作为首段，例如 `work-log.project.path.map`）。
+pub(crate) fn capability_id_naming_violations_allow(
+    id: &str,
+    extra_domains: &[&str],
+) -> Vec<&'static str> {
     let rules = capability_naming_rules();
     let max_len = rules["id"]["maxLength"].as_u64().unwrap_or(48) as usize;
     let min_segments = rules["id"]["minSegments"].as_u64().unwrap_or(2) as usize;
@@ -7552,9 +7561,12 @@ fn capability_id_naming_violations(id: &str) -> Vec<&'static str> {
             break;
         }
     }
-    if let (Some(first), false) = (segments.first(), domains.is_empty()) {
-        if !domains.contains(first) {
-            violations.push("首段必须是 ADR 0119 领域注册表中的边界");
+    if let Some(first) = segments.first() {
+        if !domains.is_empty()
+            && !domains.contains(first)
+            && !extra_domains.iter().any(|domain| domain == first)
+        {
+            violations.push("首段必须是 ADR 0119 领域注册表（或插件命名空间）中的边界");
         }
     }
     if let Some(last) = segments.last() {
@@ -9117,7 +9129,7 @@ mod tests {
             ("media-library.library.search", "子段与父段语义重复"),
             ("one.two.three.four.five.six", "段数超出规则文件区间"),
             // 插件命名空间不在内核领域注册表里：由插件校验器按 capability_namespace 单独校验。
-            ("work-log.project.path.set", "首段必须是 ADR 0119 领域注册表中的边界"),
+            ("work-log.project.path.set", "首段必须是 ADR 0119 领域注册表（或插件命名空间）中的边界"),
         ] {
             let rules = capability_id_naming_violations(id);
             assert!(

@@ -286,6 +286,14 @@ pub(crate) fn test(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dy
     if !dependency_issues.is_empty() {
         return Err(format!("插件候选包依赖预检未通过: {}", dependency_issues.join("; ")).into());
     }
+    let naming_issues = crate::capability::plugin::plugin_capability_naming_issues(&draft.manifest);
+    if !naming_issues.is_empty() {
+        return Err(format!(
+            "插件候选包能力 ID 命名未通过（ADR 0119）: {}",
+            naming_issues.join("; ")
+        )
+        .into());
+    }
     let root = draft_version_root(plugin_id, version).join("test-package");
     if root.exists() {
         fs::remove_dir_all(&root)?;
@@ -336,6 +344,7 @@ pub(crate) fn test(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dy
         "manifest": "passed",
         "dependencies": "passed",
         "package": "passed",
+        "capability_naming": "passed",
         "runtime": runtime,
         "lifecycle": {
             "registered": registered_before_cleanup,

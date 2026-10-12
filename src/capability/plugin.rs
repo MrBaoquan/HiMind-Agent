@@ -175,6 +175,9 @@ pub(crate) struct PluginManifest {
     pub categories: Vec<String>,
     #[serde(default = "default_plugin_governance")]
     pub governance: String,
+    /// 能力命名空间（ADR 0119）：留空时取插件 ID 的可读 slug（`com.himind.work-log` → `work-log`）。
+    #[serde(default)]
+    pub capability_namespace: String,
     #[serde(default)]
     pub capabilities: Vec<PluginCapabilityManifest>,
     #[serde(default)]
@@ -427,6 +430,45 @@ fn merge_development_items(
         taken_over.overrides_installed_version = Some(installed_version);
         items[index] = taken_over;
     }
+}
+
+/// 插件能力命名空间：优先用清单声明，否则取插件 ID 的最后一段 slug。
+pub(crate) fn plugin_capability_namespace(manifest: &PluginManifest) -> String {
+    let declared = manifest.capability_namespace.trim().trim_end_matches('.');
+    if !declared.is_empty() {
+        return declared.to_string();
+    }
+    manifest
+        .id
+        .rsplit('.')
+        .next()
+        .unwrap_or(manifest.id.as_str())
+        .trim()
+        .to_string()
+}
+
+/// ADR 0119 插件规则：能力 ID 必须结构合规，且以插件命名空间开头。
+///
+/// 返回可读问题列表；为空表示通过。规则事实源与内核共用
+/// `contracts/capability-naming-rules.json`。
+pub(crate) fn plugin_capability_naming_issues(manifest: &PluginManifest) -> Vec<String> {
+    let namespace = plugin_capability_namespace(manifest);
+    let allowed = [namespace.as_str()];
+    let mut issues = Vec::new();
+    for capability in &manifest.capabilities {
+        let id = capability.id.trim();
+        for rule in crate::capability::service::capability_id_naming_violations_allow(id, &allowed) {
+            issues.push(format!("{id}: {rule}"));
+        }
+        if !namespace.is_empty() && id != namespace && !id.starts_with(&format!("{namespace}.")) {
+            issues.push(format!(
+                "{id}: 能力 ID 必须以插件命名空间 `{namespace}.` 开头"
+            ));
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
 }
 
 pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
@@ -1909,6 +1951,46 @@ mod tests {
     }
 
     #[test]
+    fn capability_naming_gate_uses_the_plugin_namespace_and_adr_0119_rules() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.work-log",
+            "name": "工时日志工具",
+            "version": "1.0.0",
+            "capabilities": [
+                { "id": "work-log.project.path.map" },
+                { "id": "work-log.project.mapPath" },
+                { "id": "document.inspect" },
+                { "id": "work-log.project.path.map.v1" }
+            ]
+        }))
+        .expect("manifest");
+
+        assert_eq!(plugin_capability_namespace(&manifest), "work-log");
+        let issues = plugin_capability_naming_issues(&manifest);
+        // 合规项不应出现在问题列表里。
+        assert!(!issues.iter().any(|item| item.starts_with("work-log.project.path.map:")));
+        // 驼峰、丢命名空间、版本后缀都必须被抓到。
+        assert!(issues.iter().any(|item| item.contains("mapPath")), "{issues:?}");
+        assert!(
+            issues.iter().any(|item| item.contains("document.inspect") && item.contains("命名空间")),
+            "{issues:?}"
+        );
+        assert!(issues.iter().any(|item| item.contains("版本不得进入能力 ID")), "{issues:?}");
+
+        // 显式声明的命名空间优先于 ID slug 推导。
+        let declared: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "com.himind.image-optimizer",
+            "name": "图片优化工具",
+            "version": "1.0.0",
+            "capability_namespace": "image-optimizer",
+            "capabilities": [{ "id": "image-optimizer.optimize" }]
+        }))
+        .unwrap();
+        assert_eq!(plugin_capability_namespace(&declared), "image-optimizer");
+        assert!(plugin_capability_naming_issues(&declared).is_empty());
+    }
+
+    #[test]
     fn capability_timeout_respects_the_declared_upper_bound() {
         let capability = PluginCapabilityManifest {
             id: "example.long".to_string(),
@@ -2290,6 +2372,7 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
@@ -2331,6 +2414,7 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
@@ -2375,6 +2459,7 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
@@ -2419,6 +2504,7 @@ mod tests {
             min_agent_version: String::new(),
             categories: Vec::new(),
             governance: "optional".to_string(),
+            capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
