@@ -1349,6 +1349,18 @@ fn install_archive(archive_path: &Path, item: &PluginCatalogItem) -> Result<(), 
     crate::capability::plugin::validate_plugin_version(&candidate_manifest.version)?;
     ensure_agent_version_supported(&candidate_manifest.min_agent_version)?;
     validate_local_dependencies(&candidate_manifest)?;
+    // 能力 ID 是全局唯一资源。装完才发现重名，用户只会得到一条被遮蔽的幽灵能力，
+    // 所以要在碰文件系统之前就拒掉：安装要么完整可用，要么完全不落盘。
+    let conflict_issues =
+        crate::capability::plugin::plugin_install_conflict_issues(&candidate_manifest)?;
+    if !conflict_issues.is_empty() {
+        return Err(format!(
+            "插件 {} 的能力 ID 与已占用能力冲突，已拒绝安装：{}",
+            item.plugin_id,
+            conflict_issues.join("；")
+        )
+        .into());
+    }
     let root = plugin_root(&item.plugin_id)?;
     fs::create_dir_all(root.join("versions"))?;
     let root_guard = crate::path_guard::TrustedRoot::new(&root)?;
@@ -1812,6 +1824,52 @@ mod tests {
         assert!(
             !home.join("plugins").join("escaped").exists(),
             "安装不能把目录写到插件目录之外"
+        );
+
+        match previous_home {
+            Some(value) => env::set_var("HIMIND_AGENT_HOME", value),
+            None => env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = fs::remove_file(&archive);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// 能力 ID 是全局唯一资源：与内核内置能力重名的插件必须在落盘前就被拒，
+    /// 否则装出来只是一条被内置能力遮蔽、永远调不到的幽灵能力。
+    #[test]
+    fn refuses_plugin_package_whose_capability_id_is_already_owned() {
+        let home = env::temp_dir().join(format!("himind-plugin-conflict-{}", unique_suffix()));
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = env::var_os("HIMIND_AGENT_HOME");
+        fs::create_dir_all(&home).unwrap();
+        env::set_var("HIMIND_AGENT_HOME", &home);
+
+        let archive =
+            env::temp_dir().join(format!("himind-plugin-conflict-{}.hmpkg", unique_suffix()));
+        write_plugin_manifest_archive(
+            &archive,
+            &serde_json::json!({
+                "id": "com.example.conflict",
+                "name": "重名测试插件",
+                "description": "能力 ID 与内核内置能力重名",
+                "version": "1.0.0",
+                "entry": "plugin.exe",
+                "runtime": "process-jsonrpc-stdio",
+                "capabilities": [{"id": "system.health"}],
+            }),
+        );
+
+        let item = catalog_plugin("com.example.conflict", "重名测试插件", "1.0.0", Vec::new());
+        let error = install_archive(&archive, &item)
+            .expect_err("与内核内置能力重名的插件必须拒绝安装")
+            .to_string();
+        assert!(
+            error.contains("冲突") && error.contains("system.health"),
+            "失败原因应当点名冲突的能力 ID: {error}"
+        );
+        assert!(
+            !home.join("plugins").join("com.example.conflict").exists(),
+            "被拒绝的安装不能留下插件目录"
         );
 
         match previous_home {

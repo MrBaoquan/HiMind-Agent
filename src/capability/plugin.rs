@@ -584,6 +584,30 @@ pub(crate) fn plugin_capability_conflict_issues(
     issues
 }
 
+/// 安装前冲突预检：候选清单的能力 ID 是否已被内核内置能力或其它已启用插件占用。
+///
+/// `manifest.id` 是候选插件自身：升级时它旧版本占的能力不算冲突，所以要排除掉自己。
+/// 内置能力集合取自内核的 builtin 分支（只建 builtin，不触发下游 MCP 与业务目录发现）。
+///
+/// 返回可读问题列表；为空表示可以安装。
+pub(crate) fn plugin_install_conflict_issues(
+    manifest: &PluginManifest,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut occupied = installed_capability_owners(&manifest.id)?;
+    let gateway = crate::capability::service::CapabilityGateway::new(
+        crate::Options::from_env(),
+        std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::types::LocalWorkerStatus::default(),
+        )),
+    );
+    for id in gateway.builtin_capability_ids()? {
+        occupied
+            .entry(id)
+            .or_insert_with(|| "内核内置能力".to_string());
+    }
+    Ok(plugin_capability_conflict_issues(manifest, &occupied))
+}
+
 /// 记录插件的能力 ID 冲突。
 ///
 /// 冲突是结构性问题而不是调用失败：只写 `last_error` 让 `plugin.list` 能曝光，
