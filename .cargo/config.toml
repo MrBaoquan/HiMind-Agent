@@ -1,0 +1,11 @@
+# 测试线程栈。
+#
+# libtest 为每个测试线程分配的默认栈是 2 MB，而 `CapabilityGateway` 构建整张内建注册表
+# （`build_registry_scoped` 里那个上百项的能力数组 + 各自的 JSON Schema）需要更深的调用栈。
+# 能力集随本机媒体能力增补后，`capability::service` 里几个注册表整表用例会越过 2 MB 直接
+# 栈溢出（STATUS_STACK_OVERFLOW 崩溃），看起来像“用例没跑”而不是断言失败，很难定位。
+#
+# 只影响 cargo 启动的进程（测试二进制里新建线程的栈）；发布二进制自身的栈由链接器决定，
+# 生产侧一直正常，所以不改动它。
+[env]
+RUST_MIN_STACK = "8388608"

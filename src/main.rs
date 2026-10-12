@@ -3532,20 +3532,20 @@ mod tests {
                 "exhibit_repository_import_local",
                 "workspace.exhibit.repository.import",
             ),
-            ("project_repository_create", "project.repository.create"),
+            ("project_repository_create", "svn.project.repository.create"),
             (
                 "project_repository_exhibits_access_ensure",
-                "project.repository.exhibits_access.ensure",
+                "svn.project.repository.exhibits-access.ensure",
             ),
             (
                 "exhibit_repository_path_create",
-                "exhibit.repository_path.create",
+                "svn.exhibit.repository-path.create",
             ),
             ("exhibit_workspace_checkout", "svn.exhibit.workspace.checkout"),
-            ("exhibit_repository_clone", "exhibit.repository.clone"),
-            ("project_acl_preview", "project.repository.acl.preview"),
-            ("project_acl_apply", "project.repository.acl.apply"),
-            ("project_acl_reconcile", "project.repository.acl.reconcile"),
+            ("exhibit_repository_clone", "svn.exhibit.repository.clone"),
+            ("project_acl_preview", "svn.project.repository.acl.preview"),
+            ("project_acl_apply", "svn.project.repository.acl.apply"),
+            ("project_acl_reconcile", "svn.project.repository.acl.reconcile"),
         ];
         for (task_type, capability_id) in expected {
             assert_eq!(
@@ -3864,16 +3864,16 @@ fn legacy_task_capability(task_type: &str) -> Option<&'static str> {
         "upload_placeholder" => Some("workspace.placeholder.upload"),
         "smb_upload" => Some("storage.smb.upload"),
         "exhibit_repository_import_local" => Some("workspace.exhibit.repository.import"),
-        "project_repository_create" => Some("project.repository.create"),
+        "project_repository_create" => Some("svn.project.repository.create"),
         "project_repository_exhibits_access_ensure" => {
-            Some("project.repository.exhibits_access.ensure")
+            Some("svn.project.repository.exhibits-access.ensure")
         }
-        "exhibit_repository_path_create" => Some("exhibit.repository_path.create"),
+        "exhibit_repository_path_create" => Some("svn.exhibit.repository-path.create"),
         "exhibit_workspace_checkout" => Some("svn.exhibit.workspace.checkout"),
-        "exhibit_repository_clone" => Some("exhibit.repository.clone"),
-        "project_acl_preview" => Some("project.repository.acl.preview"),
-        "project_acl_apply" => Some("project.repository.acl.apply"),
-        "project_acl_reconcile" => Some("project.repository.acl.reconcile"),
+        "exhibit_repository_clone" => Some("svn.exhibit.repository.clone"),
+        "project_acl_preview" => Some("svn.project.repository.acl.preview"),
+        "project_acl_apply" => Some("svn.project.repository.acl.apply"),
+        "project_acl_reconcile" => Some("svn.project.repository.acl.reconcile"),
         _ => None,
     }
 }
@@ -3903,18 +3903,18 @@ fn is_central_svn_management_task(task: &Task) -> bool {
     matches!(
         explicit_task_capability(task),
         Some(
-            "project.repository.create"
-                | "project.repository.exhibits_access.ensure"
-                | "exhibit.repository_path.create"
-                | "exhibit.repository.initialize"
-                | "exhibit.repository.clone"
-                | "project.repository.acl.preview"
-                | "project.repository.acl.apply"
-                | "project.repository.acl.reconcile"
-                | "project.repository.archive"
-                | "exhibit.repository.restore"
-                | "project.repository.prune"
-                | "project.repository.archive_drill"
+            "svn.project.repository.create"
+                | "svn.project.repository.exhibits-access.ensure"
+                | "svn.exhibit.repository-path.create"
+                | "svn.exhibit.repository.initialize"
+                | "svn.exhibit.repository.clone"
+                | "svn.project.repository.acl.preview"
+                | "svn.project.repository.acl.apply"
+                | "svn.project.repository.acl.reconcile"
+                | "svn.project.repository.archive"
+                | "svn.exhibit.repository.restore"
+                | "svn.project.repository.prune"
+                | "svn.project.repository.archive-drill"
                 | "svn.user.provision"
         )
     )
@@ -4229,7 +4229,7 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "project.repository.create",
+                    "svn.project.repository.create",
                     task.payload.clone().unwrap_or_else(|| json!({})),
                 )?;
                 report_task(
@@ -4275,7 +4275,7 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "project.repository.exhibits_access.ensure",
+                    "svn.project.repository.exhibits-access.ensure",
                     task.payload.clone().unwrap_or_else(|| json!({})),
                 )
             }
@@ -4325,7 +4325,7 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "exhibit.repository_path.create",
+                    "svn.exhibit.repository-path.create",
                     json!({
                         "project_id": request.project_id,
                         "exhibit_id": request.exhibit_id,
@@ -4348,7 +4348,7 @@ fn execute_task(
                 let mut cancel_guard = TaskCancelGuard::new();
                 let mut execution_context = CapabilityExecutionContext::new(
                     task.id.clone(),
-                    "exhibit.repository.initialize_template",
+                    "svn.exhibit.repository.initialize-template",
                     request.exhibit_id.clone(),
                     || cancel_guard.check(client, options, agent_id, &task.id),
                     |progress, detail| {
@@ -4386,7 +4386,7 @@ fn execute_task(
                 let mut cancel_guard = TaskCancelGuard::new();
                 let mut execution_context = CapabilityExecutionContext::new(
                     task.id.clone(),
-                    "exhibit.repository.initialize_template".to_string(),
+                    "svn.exhibit.repository.initialize-template".to_string(),
                     request.exhibit_id.clone(),
                     || cancel_guard.check(client, options, agent_id, &task.id),
                     |progress, detail| {
@@ -4401,7 +4401,7 @@ fn execute_task(
                     options,
                     agent_id,
                     &task,
-                    "exhibit.repository.initialize_template",
+                    "svn.exhibit.repository.initialize-template",
                     serde_json::to_value(request)?,
                     &mut execution_context,
                 )

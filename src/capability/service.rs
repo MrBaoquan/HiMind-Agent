@@ -2077,7 +2077,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnWorkspaceOpen,
             ),
             registration(
-                "exhibit.repository_path.create",
+                "svn.exhibit.repository-path.create",
                 "创建展项 SVN 目录",
                 "由 Edge Worker 使用受管 SVN 管理账号在项目仓库的 trunk/exhibits 下创建固定展项 ID 目录。",
                 "admin_action",
@@ -2094,7 +2094,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnExhibitRepositoryPathCreate,
             ),
             registration(
-                "exhibit.repository.initialize_template",
+                "svn.exhibit.repository.initialize-template",
                 "初始化展项工程模板",
                 "使用当前用户的个人 SVN 凭据，将受控 Unity 或 Unreal 模板写入已准备好的展项目录并应用忽略属性。",
                 "network_write",
@@ -2114,7 +2114,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnExhibitRepositoryInitialize,
             ),
             registration(
-                "exhibit.repository.clone",
+                "svn.exhibit.repository.clone",
                 "克隆展项 SVN 仓库",
                 "由 Edge Worker 在同一 SVN 服务中将源展项仓库复制到目标展项目录。",
                 "admin_action",
@@ -2151,7 +2151,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnExhibitRepositoryImportLocal,
             ),
             registration(
-                "project.repository.acl.preview",
+                "svn.project.repository.acl.preview",
                 "预览项目 SVN 权限",
                 "读取项目受管 SVN 路径的当前权限，并生成待应用的差异计划。",
                 "read_only",
@@ -2159,7 +2159,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnProjectAclPreview,
             ),
             registration(
-                "project.repository.acl.apply",
+                "svn.project.repository.acl.apply",
                 "应用项目 SVN 权限",
                 "校验预览摘要后应用项目 SVN 权限计划。",
                 "R3",
@@ -2167,7 +2167,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnProjectAclApply,
             ),
             registration(
-                "project.repository.acl.reconcile",
+                "svn.project.repository.acl.reconcile",
                 "收敛项目 SVN 权限",
                 "按期望状态收敛项目受管 SVN 路径的访问权限。",
                 "R3",
@@ -2175,7 +2175,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnProjectAclReconcile,
             ),
             registration(
-                "project.repository.create",
+                "svn.project.repository.create",
                 "创建项目 SVN 仓库",
                 "由 Edge Worker 使用节点安全存储中的 SvnAdmin 管理凭据，按项目唯一 ID 创建物理仓库。",
                 "admin_action",
@@ -2193,7 +2193,7 @@ impl CapabilityGateway {
                 CapabilityHandler::SvnRepositoryCreate,
             ),
             registration(
-                "project.repository.exhibits_access.ensure",
+                "svn.project.repository.exhibits-access.ensure",
                 "配置项目展项目录访问权限",
                 "由 Edge Worker 使用受管 SvnAdmin 凭据开放仓库祖先节点只读遍历、默认隔离展项目录，并保留具体展项用户 ACL。",
                 "admin_action",
@@ -2966,7 +2966,7 @@ impl CapabilityGateway {
         if is_svn_admin_capability(capability_id) {
             return Err("集中 SVN 管理能力仅由 Edge Worker 执行".into());
         }
-        if capability_id == "exhibit.repository.initialize_template"
+        if capability_id == "svn.exhibit.repository.initialize-template"
             && !is_edge_prepared_template_invocation(context, &input)
         {
             return Err(
@@ -5881,23 +5881,23 @@ fn is_svn_admin_capability(capability_id: &str) -> bool {
     matches!(
         capability_id,
         "svn.user.provision"
-            | "project.repository.create"
-            | "project.repository.exhibits_access.ensure"
-            | "exhibit.repository_path.create"
-            | "exhibit.repository.initialize"
-            | "exhibit.repository.clone"
-            | "project.repository.acl.preview"
-            | "project.repository.acl.apply"
-            | "project.repository.acl.reconcile"
-            | "project.repository.archive"
-            | "exhibit.repository.restore"
-            | "project.repository.prune"
-            | "project.repository.archive_drill"
+            | "svn.project.repository.create"
+            | "svn.project.repository.exhibits-access.ensure"
+            | "svn.exhibit.repository-path.create"
+            | "svn.exhibit.repository.initialize"
+            | "svn.exhibit.repository.clone"
+            | "svn.project.repository.acl.preview"
+            | "svn.project.repository.acl.apply"
+            | "svn.project.repository.acl.reconcile"
+            | "svn.project.repository.archive"
+            | "svn.exhibit.repository.restore"
+            | "svn.project.repository.prune"
+            | "svn.project.repository.archive-drill"
     )
 }
 
 fn is_task_scoped_capability(capability_id: &str) -> bool {
-    capability_id == "exhibit.repository.initialize_template"
+    capability_id == "svn.exhibit.repository.initialize-template"
 }
 
 /// Template writes use the signed-in user's SVN account, but the target path
@@ -6226,6 +6226,27 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         | "workbench.media.audio.transcribe" => Some(crate::api::oauth::MEDIA_SUBMIT_SCOPE),
         "workbench.media.job.get" => Some(crate::api::oauth::MEDIA_READ_SCOPE),
         "workbench.media.job.cancel" => Some(crate::api::oauth::MEDIA_CANCEL_SCOPE),
+        // 命名收敛 P5（worker-only SVN 集中管理能力，2026-10-12）：这批能力被
+        // list_capabilities 的可见性过滤挡住，长期不在命名门禁的视野内。统一迁到 `svn.`
+        // 边界，并把下划线改成连字符；Agent 侧保留调用侧别名，Dashboard 侧同一发布里
+        // 双认新旧两名，等旧名在途任务排空后再删别名。
+        "project.repository.create" => Some("svn.project.repository.create"),
+        "project.repository.exhibits_access.ensure" => {
+            Some("svn.project.repository.exhibits-access.ensure")
+        }
+        "exhibit.repository_path.create" => Some("svn.exhibit.repository-path.create"),
+        "exhibit.repository.initialize" => Some("svn.exhibit.repository.initialize"),
+        "exhibit.repository.initialize_template" => {
+            Some("svn.exhibit.repository.initialize-template")
+        }
+        "exhibit.repository.clone" => Some("svn.exhibit.repository.clone"),
+        "exhibit.repository.restore" => Some("svn.exhibit.repository.restore"),
+        "project.repository.acl.preview" => Some("svn.project.repository.acl.preview"),
+        "project.repository.acl.apply" => Some("svn.project.repository.acl.apply"),
+        "project.repository.acl.reconcile" => Some("svn.project.repository.acl.reconcile"),
+        "project.repository.archive" => Some("svn.project.repository.archive"),
+        "project.repository.archive_drill" => Some("svn.project.repository.archive-drill"),
+        "project.repository.prune" => Some("svn.project.repository.prune"),
         _ => None,
     }
 }
@@ -7523,13 +7544,11 @@ fn media_registration(
 fn capability_id_aliases(capability_id: &str) -> Option<&'static str> {
     match capability_id.trim() {
         // 媒体：`media.*` 由工作台交还 Agent 本机，工作台通道迁到 `workbench.media.*`。
-        // `media.image.edit` 已由本机图生图能力占用（`media.*` = 本机执行），
-        // 不能被别名劫持到工作台契约上；其余工作台媒体能力保留旧 ID 过渡别名。
-        "media.video.generate" => Some("workbench.media.video.generate"),
+        // 本机媒体能力（media.image.*、media.video.generate、media.job.*）已经占用
+        // 了这些 ID —— `media.*` = 本机执行，不能被别名劫持到工作台契约上；
+        // 只有本机没有对应能力的语音两条保留旧 ID 过渡别名。
         "media.audio.speech" => Some("workbench.media.audio.speech"),
         "media.audio.transcribe" => Some("workbench.media.audio.transcribe"),
-        "media.job.get" => Some("workbench.media.job.get"),
-        "media.job.cancel" => Some("workbench.media.job.cancel"),
         // 命名收敛 P1（硬违规批次，2026-10-12）。
         "ai.service.custom.list_models" => Some("ai.service.custom.model.list"),
         "exhibit.migration_source.scan" => Some("workspace.exhibit.migration.scan"),
@@ -8071,13 +8090,13 @@ mod tests {
 
     #[test]
     fn svn_admin_capabilities_are_worker_only() {
-        assert!(is_svn_admin_capability("project.repository.create"));
+        assert!(is_svn_admin_capability("svn.project.repository.create"));
         assert!(is_svn_admin_capability("svn.user.provision"));
-        assert!(is_svn_admin_capability("project.repository.archive"));
+        assert!(is_svn_admin_capability("svn.project.repository.archive"));
         assert!(!is_svn_admin_capability("svn.exhibit.workspace.checkout"));
         assert!(!is_svn_admin_capability("workspace.exhibit.repository.import"));
         assert!(!is_svn_admin_capability(
-            "exhibit.repository.initialize_template"
+            "svn.exhibit.repository.initialize-template"
         ));
     }
 
@@ -8098,7 +8117,7 @@ mod tests {
         let direct_error = gateway
             .invoke(
                 &InvocationContext::new(InvocationSource::Mcp, "ai-client:test"),
-                "exhibit.repository.initialize_template",
+                "svn.exhibit.repository.initialize-template",
                 input.clone(),
             )
             .unwrap_err()
@@ -8113,7 +8132,7 @@ mod tests {
                     "prerequisite_task_id": "tsk-edge"
                 }));
         let missing_identity = gateway
-            .invoke(&context, "exhibit.repository.initialize_template", {
+            .invoke(&context, "svn.exhibit.repository.initialize-template", {
                 let mut value = input.clone();
                 value["svn_username"] = json!("");
                 value
@@ -8817,7 +8836,7 @@ mod tests {
                     crate::capability::types::InvocationSource::LocalHttp,
                     "local-user",
                 ),
-                "project.repository.create",
+                "svn.project.repository.create",
                 json!({}),
             )
             .unwrap_err()
@@ -8860,9 +8879,9 @@ mod tests {
             .any(|item| item.id.starts_with("workbench.media.")));
         for capability_id in [
             "svn.user.provision",
-            "project.repository.create",
-            "exhibit.repository_path.create",
-            "project.repository.acl.apply",
+            "svn.project.repository.create",
+            "svn.exhibit.repository-path.create",
+            "svn.project.repository.acl.apply",
         ] {
             assert!(
                 !visible.iter().any(|item| item.id == capability_id),
@@ -8871,7 +8890,7 @@ mod tests {
         }
         assert!(!visible
             .iter()
-            .any(|item| item.id == "exhibit.repository.initialize_template"));
+            .any(|item| item.id == "svn.exhibit.repository.initialize-template"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8884,7 +8903,7 @@ mod tests {
         let error = gateway
             .invoke(
                 &InvocationContext::new(InvocationSource::Mcp, "ai-client:test"),
-                "project.repository.create",
+                "svn.project.repository.create",
                 json!({}),
             )
             .unwrap_err()
@@ -8924,7 +8943,8 @@ mod tests {
         assert!(visible
             .iter()
             .any(|item| item.id == "workbench.media.video.generate"));
-        assert!(!visible.iter().any(|item| item.id == "media.video.generate"));
+        // media.video.generate 现在由本机异步视频能力拥有（不再是被别名吸收的工作台 ID）。
+        assert!(visible.iter().any(|item| item.id == "media.video.generate"));
         for capability_id in [
             "ai.client.list",
             "ai.client.status",
@@ -9400,36 +9420,34 @@ api_key: "sk-test-image".to_string(),
     }
     #[test]
     fn capability_ids_obey_the_naming_spec() {
-        // 固定 Connected 模式：ControlPlane 能力只在已对接模式下可见，若跟随进程
-        // 全局模式，用例会随其他测试的切换而漏检一半能力。
+        // 走 builtin-only 分支而不是 list_capabilities()：后者按可见性过滤掉
+        // worker-only（SVN 集中管理）与任务范围能力，那批 ID 因此长期不在命名门禁
+        // 的视野内 —— 曾经有 12 个 worker-only 能力违规却一直是绿的。
         let mut options = crate::Options::from_env();
         options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
         let gateway =
             CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
-        let descriptors = gateway
-            .list_capabilities(&InvocationContext::new(
-                crate::capability::types::InvocationSource::LocalHttp,
-                "naming-spec",
-            ))
-            .expect("capability registry");
+        let registry = gateway
+            .build_registry_scoped(false)
+            .expect("builtin capability registry");
 
         // 只校验内核与内建 Provider 的能力；插件能力由插件仓库按同一规范自证。
         let mut offending: Vec<String> = Vec::new();
-        for descriptor in descriptors
-            .iter()
-            .filter(|item| item.source.starts_with("builtin"))
-        {
+        for registration in registry.values() {
+            let descriptor = &registration.descriptor;
             let rules = capability_id_naming_violations(&descriptor.id);
             if !rules.is_empty() {
                 offending.push(format!("{} -> {rules:?}", descriptor.id));
             }
             // 边界一致性：`media.*` 必须 local，`workbench.*` 必须 control_plane。
-            if let Some(problem) =
-                capability_boundary_availability_violation(&descriptor.id, &descriptor.availability.as_str())
-            {
+            if let Some(problem) = capability_boundary_availability_violation(
+                &descriptor.id,
+                &descriptor.availability.as_str(),
+            ) {
                 offending.push(format!("{} -> {problem}", descriptor.id));
             }
         }
+        offending.sort();
 
         let planned: BTreeMap<&str, &str> = LEGACY_CAPABILITY_ID_MIGRATIONS
             .iter()
@@ -9472,11 +9490,8 @@ api_key: "sk-test-image".to_string(),
     #[test]
     fn retired_ids_resolve_to_the_current_namespace() {
         for (legacy, current) in [
-            ("media.video.generate", "workbench.media.video.generate"),
             ("media.audio.speech", "workbench.media.audio.speech"),
             ("media.audio.transcribe", "workbench.media.audio.transcribe"),
-            ("media.job.get", "workbench.media.job.get"),
-            ("media.job.cancel", "workbench.media.job.cancel"),
             ("ai.service.custom.list_models", "ai.service.custom.model.list"),
             ("exhibit.migration_source.scan", "workspace.exhibit.migration.scan"),
             ("exhibit.repository.import_local", "workspace.exhibit.repository.import"),
