@@ -22,9 +22,9 @@ use crate::app::system::{
 };
 use crate::runtime::builtin::BuiltinAIRuntimeEvent;
 use crate::runtime::distribution::{
-    resolve_configured_runtime_component, ResolvedRuntimeComponent, RuntimeDistributionSource,
-    RUNTIME_CHANNEL, RUNTIME_CONTRACT, RUNTIME_ENGINE_ID, RUNTIME_MAX_PACKAGE_BYTES,
-    RUNTIME_PRODUCT_ID,
+    resolve_configured_runtime_component, use_local_manifest_scoped, ResolvedRuntimeComponent,
+    RuntimeDistributionSource, RUNTIME_CHANNEL, RUNTIME_CONTRACT, RUNTIME_ENGINE_ID,
+    RUNTIME_MAX_PACKAGE_BYTES, RUNTIME_PRODUCT_ID,
 };
 use crate::runtime::process;
 use crate::runtime::{execute_managed, AgentRunEnvelope, PROVIDER_BUILTIN};
@@ -592,6 +592,99 @@ pub(crate) fn probe() -> RuntimeInstallationReport {
             "compatibility_error": compatibility_error.unwrap_or_default(),
             "sandbox": "windows-restricted-token"
         }),
+    }
+}
+
+/// The Runtime package the installer left behind, if this Agent is running from
+/// an installed layout.
+///
+/// The installer stages the signed archive under `<install>/resources/runtime/`
+/// and keeps it precisely so a repair does not need the Dashboard or the
+/// network. The Agent lives at `<install>/versions/<version>/himind-agent.exe`,
+/// so the manifest is one to three directories up depending on whether this is
+/// an installed layout, a portable unpack, or a development build.
+fn bundled_runtime_manifest() -> Option<PathBuf> {
+    bundled_runtime_manifest_from(&std::env::current_exe().ok()?)
+}
+
+fn bundled_runtime_manifest_from(executable: &Path) -> Option<PathBuf> {
+    let mut directory = executable.parent()?;
+    for _ in 0..3 {
+        let candidate = directory
+            .join("resources")
+            .join("runtime")
+            .join("himind-runtime-release.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        directory = directory.parent()?;
+    }
+    None
+}
+
+/// Reinstall the Runtime when first launch finds it missing or unusable.
+///
+/// Installing is preflight-gated but no longer preflight-blocked (see
+/// `verify_staged_runtime`), so a machine that could not run the staged CLI
+/// during setup still ends up with a Runtime on disk. The remaining failure
+/// modes are the ones that happen *after* setup - antivirus quarantining a
+/// file, a half-copied version directory, a state.json that no longer points at
+/// a real executable - and those all look the same from here: the Runtime is
+/// not `ready`. Repairing them from the bundled package costs nothing when the
+/// Runtime is healthy, which is the common case, so this is safe to call on
+/// every launch.
+///
+/// Returns a reason when the Runtime is still not usable, for the caller to log.
+pub(crate) fn ensure_installed_runtime_healthy(options: &Options) -> Option<String> {
+    let current = status();
+    if current.status == "ready" {
+        return None;
+    }
+    // Prefer the package that shipped with this Agent: it is local, signed, and
+    // works with no Dashboard and no network. The guard restores the previous
+    // distribution source when it drops, so this does not leak into other work.
+    let bundled = bundled_runtime_manifest();
+    let _override = bundled
+        .as_ref()
+        .and_then(|path| use_local_manifest_scoped(&path.to_string_lossy()).ok());
+    let source = if _override.is_some() {
+        "bundled package"
+    } else {
+        "configured source"
+    };
+    let client_instance_id = format!("himind-agent-runtime-{}", crate::store::paths::profile_name());
+    let mut ignore_progress = |_: &str, _: u8, _: &str| {};
+    match install_with_report(options, &client_instance_id, &mut ignore_progress) {
+        Ok((repaired, degraded)) => {
+            let detail = if degraded.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "；降级能力：{}",
+                    degraded
+                        .iter()
+                        .map(|item| item.capability.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            crate::app::crash::record_event(
+                "info",
+                &format!(
+                    "运行时自愈完成（{source}）：{} -> {}{detail}",
+                    current.status, repaired.version
+                ),
+            );
+            None
+        }
+        Err(error) => {
+            let reason = format!(
+                "运行时自愈失败（{source}，当前状态 {}）：{error}",
+                current.status
+            );
+            crate::app::crash::record_event("warn", &reason);
+            Some(reason)
+        }
     }
 }
 
@@ -1544,14 +1637,16 @@ fn install_runtime_archive(
     } else {
         manifest.engine_version.as_str()
     };
-    let degraded =
-        match verify_staged_runtime(&temporary.join(&executable), &temporary, engine_version) {
-            Ok(degraded) => degraded,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&temporary);
-                return Err(error);
-            }
-        };
+    // Preflight never fails the install: it reports per-capability degradations
+    // for payload problems and logs (without blocking) anything that is merely a
+    // property of this machine.
+    let degraded = verify_staged_runtime(
+        &temporary.join(&executable),
+        &temporary,
+        engine_version,
+        &manifest.capabilities,
+        report_progress,
+    );
     // Runtime versions are content-addressed (`version-sha256prefix`) and
     // immutable. Never rename the currently active version out of the way:
     // Windows keeps running executables/directories open, so doing so makes
@@ -1653,107 +1748,150 @@ fn remove_directory_with_retry(path: &Path) -> Result<(), std::io::Error> {
     Err(last_error.expect("remove retry must record an error"))
 }
 
+/// Preflight a staged Runtime before it is published into the version directory.
+///
+/// This function never fails the installation. The split it makes is between
+/// what the *package* promises and what *this machine* can currently do:
+///
+/// * Payload checks (are the bundled Office files there?) are deterministic
+///   properties of the ZIP. A missing payload means the capability cannot work
+///   anywhere, so it is reported as a [`RuntimeCapabilityDegradation`] and drops
+///   out of the advertised capability set - the install still completes, because
+///   the rest of the Runtime is fine.
+/// * Execution checks (`dsh --version`, `--help`, `--dump-default-config`) depend
+///   on the machine: antivirus and AppLocker can block the binary during install,
+///   a locked or disconnected session can make it fail, and a policy can forbid
+///   it outright. None of that says the package is bad, and blocking the install
+///   on it is what made first install fail on machines that were otherwise
+///   healthy. These are recorded as notes in the install log and retried by the
+///   runtime health check at first launch, but they never abort.
+///
+/// Package integrity - signature, size, SHA-256, the runtime.json contract - is
+/// verified by the caller before this runs, so a corrupt ZIP is still rejected.
 fn verify_staged_runtime(
     executable: &Path,
     workspace: &Path,
     expected_version: &str,
-) -> Result<Vec<RuntimeCapabilityDegradation>, String> {
+    declared_capabilities: &[String],
+    report: &mut dyn FnMut(&str, u8, &str),
+) -> Vec<RuntimeCapabilityDegradation> {
+    let mut degraded = Vec::new();
+    let note = |report: &mut dyn FnMut(&str, u8, &str), message: String| {
+        report("preflight", 94, &message);
+    };
+
+    // Best-effort CLI probes. A failure is a machine condition, not a package
+    // defect, so it is logged and stepped over.
     let preflight_home = workspace.join(".himind-preflight");
-    fs::create_dir_all(&preflight_home)
-        .map_err(|error| format!("创建 Runtime 预检目录失败: {error}"))?;
-    let result = (|| -> Result<Vec<RuntimeCapabilityDegradation>, String> {
-        let run = |arguments: &[&str]| -> Result<String, String> {
-            let mut command = Command::new(executable);
-            process::remove_himind_secret_environment(&mut command);
-            configure_runtime_environment(&mut command, executable);
-            command
-                .args(arguments)
-                .current_dir(workspace)
-                .env(DSH_HOME_ENV, &preflight_home)
-                .env("DSH_TELEMETRY_MODE", "DISABLED")
-                .env("NO_COLOR", "1")
-                .env_remove("DEEPSEEK_API_KEY")
-                .env_remove("OPENAI_API_KEY")
-                .env_remove("ANTHROPIC_API_KEY")
-                .env_remove("GOOGLE_API_KEY")
-                .env_remove("GEMINI_API_KEY")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            process::configure_hidden_process(&mut command);
-            let output = command
-                .output()
-                .map_err(|error| format!("启动 Runtime 预检失败: {error}"))?;
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .trim()
-            .to_string();
-            if !output.status.success() {
-                return Err(format!(
-                    "Runtime CLI 预检失败 (exit={}): {}",
-                    output.status.code().unwrap_or(-1),
-                    process::summarize_output(&combined, 2_000)
-                ));
-            }
-            Ok(combined)
-        };
-        let version = run(&["--version"])?;
-        if !version
-            .lines()
-            .any(|line| line.trim().contains(expected_version))
-        {
+    if let Err(error) = fs::create_dir_all(&preflight_home) {
+        note(
+            report,
+            format!("跳过 Runtime 自检：无法创建预检目录 ({error})"),
+        );
+        return degraded;
+    }
+    let run = |arguments: &[&str]| -> Result<String, String> {
+        let mut command = Command::new(executable);
+        process::remove_himind_secret_environment(&mut command);
+        configure_runtime_environment(&mut command, executable);
+        command
+            .args(arguments)
+            .current_dir(workspace)
+            .env(DSH_HOME_ENV, &preflight_home)
+            .env("DSH_TELEMETRY_MODE", "DISABLED")
+            .env("NO_COLOR", "1")
+            .env_remove("DEEPSEEK_API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("GOOGLE_API_KEY")
+            .env_remove("GEMINI_API_KEY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process::configure_hidden_process(&mut command);
+        let output = command
+            .output()
+            .map_err(|error| format!("启动 Runtime 预检失败: {error}"))?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .trim()
+        .to_string();
+        if !output.status.success() {
             return Err(format!(
-                "Runtime CLI 版本与 manifest 不一致: expected={expected_version}, actual={}",
-                first_line(&version)
+                "Runtime CLI 预检失败 (exit={}): {}",
+                output.status.code().unwrap_or(-1),
+                process::summarize_output(&combined, 2_000)
             ));
         }
-        run(&["--profile", "headless", "--help"])?;
-        run(&["--profile", "headless", "--dump-default-config"])?;
-
-        // Capabilities in runtime.json are a contract, not an optimistic
-        // label.  Verify the files that make the bundled Windows features
-        // usable before committing the staged directory.  This prevents a
-        // partially published ZIP (for example one missing the optional
-        // LibreOffice package) from being reported as installed and ready.
-        let manifest: RuntimePackageManifest = serde_json::from_slice(
-            &fs::read(workspace.join("runtime.json"))
-                .map_err(|error| format!("读取 Runtime manifest 失败: {error}"))?,
-        )
-        .map_err(|error| format!("Runtime manifest 无效: {error}"))?;
-        // Office is a packaging-completeness contract: the check above only
-        // looks at whether the bundled LibreOfficeKit files are present, so a
-        // failure means the ZIP itself is incomplete and must not be installed.
-        if manifest.capabilities.iter().any(|value| value == "office") {
-            verify_staged_office_bundle(workspace)?;
-        }
-        // Screen control is the one capability whose preflight depends on the
-        // machine rather than the package: PowerShell, UI Automation, screen
-        // capture permission and locked/disconnected sessions all decide the
-        // outcome. A machine that cannot do screen control must still be able
-        // to install the Agent, so the package is still required to be
-        // complete but the runtime self-test only degrades the capability.
-        let mut degraded = Vec::new();
-        if manifest
-            .capabilities
-            .iter()
-            .any(|value| value == "computer-use")
-        {
-            verify_staged_computer_use_package(workspace)?;
-            if let Err(reason) = verify_staged_computer_use_runtime(workspace) {
-                degraded.push(RuntimeCapabilityDegradation {
-                    capability: "computer-use".to_string(),
-                    reason,
-                });
+        Ok(combined)
+    };
+    match run(&["--version"]) {
+        Ok(version) => {
+            if !version
+                .lines()
+                .any(|line| line.trim().contains(expected_version))
+            {
+                note(
+                    report,
+                    format!(
+                        "Runtime CLI 版本与 manifest 不一致 (expected={expected_version}, actual={})，将在首次启动时重试",
+                        first_line(&version)
+                    ),
+                );
             }
         }
-        Ok(degraded)
-    })();
-    let cleanup = fs::remove_dir_all(&preflight_home)
-        .map_err(|error| format!("清理 Runtime 预检目录失败: {error}"));
-    result.and_then(|degraded| cleanup.map(|_| degraded))
+        Err(error) => note(
+            report,
+            format!("跳过 Runtime CLI 版本自检，将在首次启动时重试: {error}"),
+        ),
+    }
+    for arguments in [
+        ["--profile", "headless", "--help"],
+        ["--profile", "headless", "--dump-default-config"],
+    ] {
+        if let Err(error) = run(&arguments) {
+            note(
+                report,
+                format!(
+                    "跳过 Runtime CLI 自检 `{}`，将在首次启动时重试: {error}",
+                    arguments.join(" ")
+                ),
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&preflight_home);
+
+    // Payload checks. These are properties of the published package, so a
+    // failure means the capability genuinely cannot work and is dropped from the
+    // advertised set rather than aborting the install.
+    if declared_capabilities.iter().any(|value| value == "office") {
+        if let Err(reason) = verify_staged_office_bundle(workspace) {
+            degraded.push(RuntimeCapabilityDegradation {
+                capability: "office".to_string(),
+                reason,
+            });
+        }
+    }
+    if declared_capabilities.iter().any(|value| value == "computer-use") {
+        if let Err(reason) = verify_staged_computer_use_package(workspace) {
+            degraded.push(RuntimeCapabilityDegradation {
+                capability: "computer-use".to_string(),
+                reason,
+            });
+        } else if let Err(reason) = verify_staged_computer_use_runtime(workspace) {
+            // The screen-control self-test depends on the machine (PowerShell,
+            // UI Automation, capture permission, an unlocked session), so a
+            // failure degrades the capability rather than failing the install.
+            degraded.push(RuntimeCapabilityDegradation {
+                capability: "computer-use".to_string(),
+                reason,
+            });
+        }
+    }
+    degraded
 }
 
 fn verify_staged_office_bundle(workspace: &Path) -> Result<(), String> {
@@ -4011,8 +4149,8 @@ mod tests {
         render_himind_agent_overlay, render_himind_profile_patch,
         render_himind_profile_patch_from_base, safe_relative_path,
         safe_segment, skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
-        validate_runtime_agent_compatibility, versioned_home, InteractiveEventProjector,
-        InteractiveLaunch, ModelRouteSource, HIMIND_HEADLESS_PROFILE,
+        validate_runtime_agent_compatibility, verify_staged_runtime, versioned_home,
+        InteractiveEventProjector, InteractiveLaunch, ModelRouteSource, HIMIND_HEADLESS_PROFILE,
     };
     use crate::api::ai::AIUserCredential;
     use crate::app::mcp_settings::McpServerConfig;
@@ -4367,6 +4505,149 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(names, again_names, "{profile} merge is not idempotent");
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Installation must not be blocked by anything that is a property of the
+    /// machine rather than of the package.
+    ///
+    /// This is the guarantee that first install depends on: a locked session,
+    /// antivirus or AppLocker can stop the staged CLI from running, and an
+    /// incomplete Office payload means only Office is unusable. Neither may
+    /// abort the install, and the payload gap must be reported as a degradation
+    /// so the capability set stays honest.
+    #[test]
+    fn preflight_never_fails_the_install_and_degrades_only_the_missing_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // A staged "executable" that cannot run: every CLI probe must fail here.
+        let executable = root.join("bin/dsh.cmd");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "not an executable format").unwrap();
+
+        let declared = ["interactive", "headless", "workflow", "office"]
+            .map(str::to_string)
+            .to_vec();
+        let mut notes = Vec::new();
+        let mut collect = |stage: &str, _percent: u8, message: &str| {
+            notes.push(format!("{stage}: {message}"));
+        };
+
+        // Office declared but no LibreOfficeKit payload staged anywhere.
+        let degraded = verify_staged_runtime(&executable, &root, "0.2.0-rc.6", &declared, &mut collect);
+        assert_eq!(
+            degraded
+                .iter()
+                .map(|item| item.capability.as_str())
+                .collect::<Vec<_>>(),
+            vec!["office"],
+            "an incomplete Office payload must degrade Office, not fail the install"
+        );
+        // The CLI probes failed and were recorded rather than propagated.
+        assert!(
+            notes.iter().any(|note| note.contains("CLI")),
+            "unrunnable CLI probes must be recorded as notes: {notes:?}"
+        );
+
+        // Stage the payload the previous run reported missing: Office is then
+        // advertised with nothing degraded.
+        let native = root.join("node_modules/@deepseek-ai/libreoffice-kit-win32-x64");
+        std::fs::create_dir_all(native.join("bin")).unwrap();
+        std::fs::write(native.join("bin/libreoffice-kit.exe"), "stub").unwrap();
+        for file in [
+            "concrt140.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "msvcp140_2.dll",
+            "msvcp140_atomic_wait.dll",
+            "msvcp140_codecvt_ids.dll",
+            "vccorlib140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "vcruntime140_threads.dll",
+        ] {
+            std::fs::write(native.join("bin").join(file), "stub").unwrap();
+        }
+        let cli = root.join("node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "stub").unwrap();
+        let mut quiet = |_: &str, _: u8, _: &str| {};
+        assert!(
+            verify_staged_runtime(&executable, &root, "0.2.0-rc.6", &declared, &mut quiet).is_empty(),
+            "a complete payload must not degrade Office"
+        );
+
+        // A capability that is not declared is not checked at all, so a slim
+        // Runtime never reports Office it was built without.
+        let slim = ["interactive", "headless", "workflow"]
+            .map(str::to_string)
+            .to_vec();
+        std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+        assert!(
+            verify_staged_runtime(&executable, &root, "0.2.0-rc.6", &slim, &mut quiet).is_empty(),
+            "an undeclared capability must not be checked"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_runtime_manifest_is_found_from_the_installed_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-bundled-runtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The installed layout: <root>/versions/<version>/himind-agent.exe with
+        // the package at <root>/resources/runtime/.
+        let resources = root.join("resources/runtime");
+        std::fs::create_dir_all(&resources).unwrap();
+        let manifest = resources.join("himind-runtime-release.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        let version_dir = root.join("versions/0.2.0-rc.6");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let executable = version_dir.join("himind-agent.exe");
+        std::fs::write(&executable, "stub").unwrap();
+
+        assert_eq!(
+            super::bundled_runtime_manifest_from(&executable),
+            Some(manifest.clone()),
+            "the installed layout must be discovered from the Agent executable"
+        );
+
+        // The walk covers up to three levels, so a portable unpack that keeps
+        // the binaries shallower is found too.
+        let loose = root.join("target/debug/himind-agent.exe");
+        std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        std::fs::write(&loose, "stub").unwrap();
+        assert_eq!(
+            super::bundled_runtime_manifest_from(&loose),
+            Some(manifest.clone()),
+            "an executable up to three levels below the install root must be found"
+        );
+
+        // Outside any install layout the walk terminates and reports nothing, so
+        // a development build never claims a bundled package.
+        let outside = root.join("nested/resource-check-bin/himind-agent.exe");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "stub").unwrap();
+        std::fs::remove_dir_all(&resources).unwrap();
+        assert_eq!(
+            super::bundled_runtime_manifest_from(&outside),
+            None,
+            "a missing bundled package must report None rather than searching forever"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

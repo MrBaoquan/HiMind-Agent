@@ -198,6 +198,11 @@ pub(crate) fn status() -> BuiltinAIRuntimeStatus {
     active_adapter().status()
 }
 
+/// Repair the installed Runtime if first launch finds it unusable.
+pub(crate) fn ensure_installed_runtime_healthy(options: &Options) -> Option<String> {
+    deepseek_harness::ensure_installed_runtime_healthy(options)
+}
+
 pub(crate) fn check_update(
     options: &Options,
     client_instance_id: &str,

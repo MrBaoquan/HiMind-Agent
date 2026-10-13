@@ -184,6 +184,10 @@ Section "HiMind Agent 核心组件" SEC_AGENT
 
   ; Runtime is shipped with the installer. First launch does not depend on
   ; Dashboard availability or a separate Node/Office installation.
+  ; Clear the directory first: the package from an earlier install is kept for
+  ; offline repair, so without this an upgrade would leave the old version's
+  ; archive behind next to the new one.
+  RMDir /r "$INSTDIR\resources\runtime"
   SetOutPath "$INSTDIR\resources\runtime"
   File "${RUNTIME_DIR}\himind-runtime-release.json"
   File "${RUNTIME_DIR}\${RUNTIME_PACKAGE}"
@@ -248,13 +252,14 @@ Section "HiMind Agent 核心组件" SEC_AGENT
     MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装失败，安装已中止，Agent 未启动。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log"
     Abort
   ${EndIf}
-  ; The Runtime has been imported into $INSTDIR\runtimes\ above, so the staged
-  ; copy only served this install. Drop it - including packages left behind by
-  ; older installers - so the Runtime is not stored twice on disk (and inside
-  ; Agent backups). A reinstall re-extracts it from the installer.
-  Delete "$INSTDIR\resources\runtime\*.zip"
-  Delete "$INSTDIR\resources\runtime\*.json"
-  RMDir "$INSTDIR\resources\runtime"
+  ; Keep the staged Runtime package. The Runtime is already imported into
+  ; $INSTDIR\runtimes\ above, but the signed archive stays here as the offline
+  ; repair source: if a later launch finds the Runtime missing or unusable
+  ; (antivirus quarantining a file, a half-finished copy, a corrupt state.json)
+  ; the Agent reinstalls from this package without needing the Dashboard or the
+  ; network. Agent backups deliberately exclude `resources/` and `runtimes/`
+  ; (see src/app/backup.rs), so keeping it does not inflate them, and a reinstall
+  ; overwrites it with the current version.
 
   SetOutPath "$INSTDIR\previous"
   SetOutPath "$INSTDIR\logs"

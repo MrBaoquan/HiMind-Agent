@@ -562,6 +562,10 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
                     },
                 );
             start_pending_updater_repair(Arc::clone(&service_approval_manager));
+            start_runtime_self_heal(
+                service_options.clone(),
+                Arc::clone(&service_approval_manager),
+            );
             service_approval_manager
                 .add_log("info", &format!("Agent 已启动，本地服务: 127.0.0.1:{port}"));
             println!("local agent app service listening on http://127.0.0.1:{port}");
@@ -622,6 +626,18 @@ fn start_extension_storage_hygiene() {
 fn start_mcp_catalog_refresh(state_path: std::path::PathBuf) {
     thread::spawn(move || {
         crate::app::mcp_catalog::refresh_if_stale(&state_path);
+    });
+}
+
+/// 启动后台确认本机运行时可用：安装期不再因环境问题中止安装（见
+/// `verify_staged_runtime`），代价是磁盘上的运行时可能缺失或已损坏。这里用
+/// 随安装包留下的签名归档做一次离线自愈——健康时几乎不花时间，所以每次启动
+/// 都跑。修复失败只记日志，不挡窗口。
+fn start_runtime_self_heal(options: crate::Options, approval_manager: Arc<ApprovalManager>) {
+    thread::spawn(move || {
+        if let Some(reason) = crate::runtime::builtin::ensure_installed_runtime_healthy(&options) {
+            approval_manager.add_log("warn", &reason);
+        }
     });
 }
 
