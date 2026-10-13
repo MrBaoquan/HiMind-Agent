@@ -1079,7 +1079,6 @@ function AgentApp() {
   }
 
   async function refreshReviewProgress() {
-    if (!dashboardEnabled()) return;
     const [pluginResult, skillResult, projectResult, remoteProjectResult] = await Promise.allSettled([
       agentApi.pluginSubmissions(),
       agentApi.skillSubmissions(),
@@ -1220,7 +1219,7 @@ function AgentApp() {
                   ? refreshSettingsPageData()
                   : Promise.resolve();
     operation.catch(console.error);
-  }, [dashboardEnabled()]);
+  }, []);
 
   // 各页面都不再挂手动刷新按钮，统一留一个逃生口：F5 / Ctrl+R 强制刷新当前页数据。
   // 设置窗口里的连接状态同样会随外部工具变化，所以这个逃生口也覆盖设置窗口。
