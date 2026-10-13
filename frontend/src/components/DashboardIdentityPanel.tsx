@@ -22,7 +22,7 @@ type DashboardIdentityPanelProps = {
   aiToolSummary: string;
   busy?: boolean;
   onStartAuthorization: () => void;
-  /** 未登记时把人带到工作台的一键绑定页：登记码由工作台送回本机，不需要用户去找码。 */
+  /** 尚未授权时打开工作台完成绑定与授权。 */
   onStartEnrollment: () => void;
   onCancelAuthorization: () => void;
   onOpenAuthorization: () => void;
@@ -92,7 +92,7 @@ export function DashboardIdentityPanel({
           {dashboardEnabled ? (identity?.authorized
             ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />取消授权</button>
             : identity?.state === 'not_enrolled'
-              ? <button className="btn btn-primary" disabled={busy || flowActive} onClick={onStartEnrollment}><ArrowUpRight size={15} />去登记</button>
+              ? <button className="btn btn-primary" disabled={busy || flowActive} onClick={onStartEnrollment}><ArrowUpRight size={15} />授权</button>
               : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />授权</button>) : null}
         </div>
       </div>
@@ -124,7 +124,7 @@ function identityDescription(identity: DashboardIdentityStatus | null) {
   }
   if (identity.state === 'dashboard_unavailable') return '授权仍然有效，但暂时无法连接工作台';
   // 没连过工作台不是故障：本机 AI、能力与自动化都照常可用。
-  if (identity.state === 'not_enrolled') return '这台电脑还没登记到工作台，需要时可以重新连接。';
+  if (identity.state === 'not_enrolled') return '这台电脑还没授权到工作台。';
   if (identity.state === 'expired') return '登录已过期，需要重新登录';
   if (identity.state === 'requires_login') return '登录已失效，需要重新登录';
   return '本机功能不受影响。';
