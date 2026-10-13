@@ -198,7 +198,9 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   // 没有手动选过时：优先有扩展的那个工作区，其次看后端当前绑定的目录
   // （「添加工作区」和「在扩展开发中打开」都会更新绑定，于是刚加完就落在它上面）。
   const boundKey = workspaceItems.find(item => item.key === normalizeFsPath(props.workspace.root))?.key || '';
-  const activeKey = workspaceItems.some(item => item.key === selectedWorkspace)
+  // 「工作台项目」不是目录工作区，不在 workspaceItems 里，所以它必须单独放行，
+  // 否则选中它会被下面的兜底逻辑当成「没选过」而改回某个真实目录，点了没反应。
+  const activeKey = selectedWorkspace === UNMANAGED_KEY || workspaceItems.some(item => item.key === selectedWorkspace)
     ? selectedWorkspace
     : (workspaceItems.find(item => item.extensionCount > 0)?.key || boundKey || workspaceItems[0]?.key || '');
   const activeItem = workspaceItems.find(item => item.key === activeKey) || null;
