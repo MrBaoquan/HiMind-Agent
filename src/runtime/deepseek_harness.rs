@@ -2731,11 +2731,17 @@ fn merge_profile_package(path: &Path, defaults: &str) -> Result<(), Box<dyn Erro
         .unwrap_or_default();
     if let Some(existing) = profile.get("bundles").and_then(Value::as_array) {
         for bundle in existing {
-            // These entries were incorrectly shipped as bundles before the
-            // Office provider moved to its native DSH row.  Remove only the
-            // managed mistakes; preserve all other user-installed bundles.
+            // Managed bundle entries the Agent used to write but must not keep.
+            // The Office two were incorrectly shipped as bundles before the
+            // Office provider moved to its native DSH row. Screen control left
+            // the base Runtime for the same reason Office did - the payload is
+            // no longer carried - so a profile written by an older Agent still
+            // names a bundle that is not on disk, and DSH would try to resolve
+            // it. Remove only these known entries; preserve every other
+            // user-installed bundle.
             if bundle == "@deepseek-ai/dsh-skill-office"
                 || bundle == "@deepseek-ai/dsh-office-to-pdf"
+                || bundle == "dsh-computer-use-win"
             {
                 continue;
             }
@@ -4292,6 +4298,75 @@ mod tests {
         assert!(bundles
             .iter()
             .any(|value| value == "@deepseek-ai/dsh-web-app"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A profile written by an older Agent still names bundles the base Runtime
+    /// no longer carries. Merging only ever adds, so without the managed-bundle
+    /// skip list every session would re-add them and DSH would try to resolve a
+    /// bundle that is not on disk.
+    #[test]
+    fn profile_package_merge_drops_managed_bundles_an_older_agent_wrote() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-profile-package-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (profile, template) in [
+            (
+                "himind",
+                include_str!("../../runtime-profiles/himind/package.json"),
+            ),
+            (
+                "himind-headless",
+                include_str!("../../runtime-profiles/himind-headless/package.json"),
+            ),
+        ] {
+            let path = root.join(format!("{profile}.package.json"));
+            std::fs::write(
+                &path,
+                r#"{"name":"himind-profile","private":true,"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","dsh-computer-use-win","@deepseek-ai/dsh-skill-office","@deepseek-ai/dsh-office-to-pdf","@example/user-plugin"]}}}"#,
+            )
+            .unwrap();
+            merge_profile_package(&path, template).unwrap();
+            let package: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let bundles = package["dsh"]["profile"]["bundles"].as_array().unwrap();
+            let names = bundles.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>();
+            for managed in [
+                "dsh-computer-use-win",
+                "@deepseek-ai/dsh-skill-office",
+                "@deepseek-ai/dsh-office-to-pdf",
+            ] {
+                assert!(
+                    !names.contains(&managed),
+                    "{profile} kept the managed bundle {managed}: {names:?}"
+                );
+            }
+            assert!(
+                names.contains(&"@example/user-plugin"),
+                "{profile} dropped the user bundle: {names:?}"
+            );
+            assert!(
+                names.contains(&"@deepseek-ai/dsh-base"),
+                "{profile} lost a template bundle: {names:?}"
+            );
+            // Idempotent: a second session must not resurrect what the first removed.
+            merge_profile_package(&path, template).unwrap();
+            let again: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let again_names = again["dsh"]["profile"]["bundles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, again_names, "{profile} merge is not idempotent");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

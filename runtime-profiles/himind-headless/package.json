@@ -6,8 +6,7 @@
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
-        "@deepseek-ai/dsh-headless",
-        "dsh-computer-use-win"
+        "@deepseek-ai/dsh-headless"
       ]
     }
   }

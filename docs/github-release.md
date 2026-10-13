@@ -61,7 +61,7 @@ himind-agent runtime install --manifest .\himind-runtime-release.json
 
 `runtime install` 在写入安装目录前会做完整预检：制品大小、SHA-256、RSA-PSS 签名、解压内容、`runtime.json` 契约，然后跑 CLI 与能力自检。
 
-- **包完整性**（LibreOfficeKit helper 与随包 MSVC 运行库、`dsh-computer-use-win` 控制包文件）缺失属于发布缺陷，仍按失败处理。
+- **包完整性**按 Runtime 声明的 `capabilities` 分支：声明了 `office` 才要求 LibreOfficeKit helper 与随包 MSVC 运行库完整，声明了 `computer-use` 才要求 `dsh-computer-use-win` 控制包文件完整——这类缺失属于发布缺陷，仍按失败处理。两者默认都不在基础 Runtime 里（Office 由扩展按机安装、屏幕控制按需装配），所以正常情况下这两项检查都不触发。
 - **依赖本机的自检**（屏幕控制 self-test：PowerShell + UI Automation + 活动窗口截屏）失败只**降级**该能力：安装继续，`computer-use` 从已安装契约的 `capabilities` 中剔除，`runtime status` 与界面如实少报该能力。锁屏、断开的远程桌面、安全软件拦截 UIA/截屏都会命中这里。
 - 每次执行都会把进度、降级项与结果逐行写入 `<agent_home>/logs/runtime-install.log`（最后一行始终是原因），退出码：`0` 完全就绪、`2` 已安装但能力降级、其它为失败。Windows 安装器据此在失败弹窗里直接显示日志最后一行，并把完整日志留在安装目录。
 
