@@ -1339,6 +1339,26 @@ function AgentApp() {
     };
   }, [dashboardAuthorization?.state]);
 
+  // 账号面板打开时也轮询身份与连接。
+  //
+  // 授权是在浏览器里完成的，而「设置」是独立 webview：主窗口与设置窗口各有自己的
+  // React 状态，互不可见。只在"发起授权的那个窗口"轮询的话，另一个窗口会一直停在
+  // 「授权」不刷新 —— 用户看到的就是"授权完了还显示授权"。
+  useEffect(() => {
+    if (!dashboardEnabled() || page !== 'settings') return;
+    let stopped = false;
+    const timer = window.setInterval(() => {
+      if (stopped) return;
+      void Promise.all([refreshDashboardIdentity(), refreshWorkbenchConnections()]).catch((error) => {
+        console.error(error);
+      });
+    }, 4000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [page]);
+
   function dismissNotification(id: number) {
     setMessages(current => current.filter(item => item.id !== id));
   }
