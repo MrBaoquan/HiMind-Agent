@@ -3666,6 +3666,8 @@ fn workspace_dsh_home(version: &str, workspace: &Path) -> Result<PathBuf, String
     fs::create_dir_all(&managed)
         .map_err(|error| format!("创建工作区 DSH 管理目录失败: {error}"))?;
     ensure_workspace_profiles(&shared, &target, &managed)?;
+    // rail 的分组与会话内容跨工作区共享，见 `share_rail_state`。
+    share_rail_state(&shared, &target, &managed)?;
 
     // Preserve the user's shared DSH global instructions as a source snapshot.
     // The generated target AGENTS.md is owned by HiMind and is rebuilt before
@@ -3739,6 +3741,193 @@ fn ensure_workspace_profiles(shared: &Path, target: &Path, managed: &Path) -> Re
             .map_err(|error| format!("写入 DSH Profile 隔离记录失败: {error}"))?;
     }
     Ok(())
+}
+
+/// DSH 的 rail 把「工作区分组 + 组内会话」记在 `$DSH_HOME/storages/workspace.json`，
+/// 会话内容落在 `$DSH_HOME/sessions/`。
+///
+/// 会话按工作区各占一个 home（见 `workspace_dsh_home`），于是每个 home 只看得到自己
+/// 那一个工作区，界面上表现为「会话彼此隔离」：在 A 工作区开的会话，B 工作区里看不见。
+/// 把这两处共享出去（目录联接），各组共用一份登记与会话内容，rail 就能一次列出所有
+/// 工作区。home 里的 `AGENTS.md`、profiles 仍按工作区隔离，指令不会互相覆盖。
+///
+/// 首次运行会把各工作区 home 里已有的登记与会话并进共享目录，再换成联接；迁移是
+/// 幂等的，已联接的 home 直接跳过。
+const DSH_RAIL_SHARED_ENTRIES: &[&str] = &["storages", "sessions"];
+const DSH_WORKSPACE_REGISTRY: &str = "workspace.json";
+
+fn share_rail_state(shared: &Path, target: &Path, managed: &Path) -> Result<(), String> {
+    for entry in DSH_RAIL_SHARED_ENTRIES {
+        let source = shared.join(entry);
+        fs::create_dir_all(&source)
+            .map_err(|error| format!("创建共享 DSH 目录 {entry} 失败: {error}"))?;
+        let destination = target.join(entry);
+        if linked_to(&destination, &source) {
+            continue;
+        }
+        migrate_rail_entry(entry, &destination, &source)?;
+        remove_link_or_dir(&destination)?;
+        link_directory(&destination, &source)?;
+        let _ = fs::write(
+            managed.join(format!("{entry}-link")),
+            source.to_string_lossy().as_bytes(),
+        );
+    }
+    Ok(())
+}
+
+/// 目录联接也走 `canonicalize`，联接目标一致即视为已共享。
+fn linked_to(destination: &Path, source: &Path) -> bool {
+    match (destination.canonicalize(), source.canonicalize()) {
+        (Ok(current), Ok(expected)) => current == expected,
+        _ => false,
+    }
+}
+
+/// `exists()` 对断掉的联接返回 false，这里用 `symlink_metadata` 判存在。
+fn path_present(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn remove_link_or_dir(path: &Path) -> Result<(), String> {
+    if !path_present(path) {
+        return Ok(());
+    }
+    // 联接先remove_dir删链接本身，否则会把共享目录的内容一起删掉。
+    #[cfg(windows)]
+    if fs::remove_dir(path).is_ok() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path)
+        .map_err(|error| format!("清理旧 DSH 目录失败 {}: {error}", path.display()))
+}
+
+/// 把工作区 home 里已有的 rail 数据并进共享目录，不覆盖共享侧已有的同名项。
+fn migrate_rail_entry(entry: &str, destination: &Path, source: &Path) -> Result<(), String> {
+    if !path_present(destination) {
+        return Ok(());
+    }
+    let registry = destination.join(DSH_WORKSPACE_REGISTRY);
+    if entry == "storages" && registry.is_file() {
+        merge_workspace_registry(&registry, &source.join(DSH_WORKSPACE_REGISTRY))?;
+    }
+    let Ok(children) = fs::read_dir(destination) else {
+        return Ok(());
+    };
+    for child in children.flatten() {
+        let name = child.file_name();
+        if name == std::ffi::OsStr::new(DSH_WORKSPACE_REGISTRY) {
+            continue;
+        }
+        let from = child.path();
+        let to = source.join(&name);
+        if path_present(&to) {
+            continue;
+        }
+        // 两侧都在同一个 DSH homes 根下，同卷，rename 即可。
+        fs::rename(&from, &to)
+            .map_err(|error| format!("迁移 DSH 数据失败 {}: {error}", from.display()))?;
+    }
+    Ok(())
+}
+
+/// 合并两份 rail 登记：工作区、组内会话、归档与置顶都取并集。
+fn merge_workspace_registry(local: &Path, shared: &Path) -> Result<(), String> {
+    let Some(local_value) = fs::read_to_string(local)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return Ok(());
+    };
+    let mut merged = fs::read_to_string(shared)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "unit": { "name": "workspace", "version": 2 },
+                "global": {
+                    "initialized": true,
+                    "workspaceIds": [],
+                    "archivedSessionIds": [],
+                    "pinnedSessionIds": []
+                },
+                "tables": { "workspaces": {} }
+            })
+        });
+    merge_workspace_value(&mut merged, &local_value);
+    let text = serde_json::to_vec_pretty(&merged).map_err(|error| error.to_string())?;
+    fs::write(shared, text).map_err(|error| format!("写入共享 DSH 工作区登记失败: {error}"))
+}
+
+fn merge_workspace_value(merged: &mut Value, local: &Value) {
+    for key in ["workspaceIds", "archivedSessionIds", "pinnedSessionIds"] {
+        let source = local.pointer(&format!("/global/{key}")).cloned();
+        union_string_array(
+            merged.pointer_mut(&format!("/global/{key}")),
+            source.as_ref(),
+        );
+    }
+    let Some(local_workspaces) = local
+        .pointer("/tables/workspaces")
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(merged_workspaces) = merged
+        .pointer_mut("/tables/workspaces")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (id, value) in local_workspaces {
+        match merged_workspaces.get_mut(id) {
+            None => {
+                merged_workspaces.insert(id.clone(), value.clone());
+            }
+            Some(existing) => {
+                let sessions = value.get("sessionIds").cloned();
+                union_string_array(existing.get_mut("sessionIds"), sessions.as_ref());
+            }
+        }
+    }
+}
+
+fn union_string_array(target: Option<&mut Value>, source: Option<&Value>) {
+    let Some(source_items) = source.and_then(Value::as_array) else {
+        return;
+    };
+    let Some(target_items) = target.and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in source_items {
+        if !target_items.contains(item) {
+            target_items.push(item.clone());
+        }
+    }
+}
+
+fn link_directory(destination: &Path, source: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(destination)
+            .arg(source)
+            .status()
+            .map_err(|error| format!("创建 DSH 共享目录联接失败: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "无法创建 DSH 共享目录联接：{}",
+                destination.display()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(source, destination)
+            .map_err(|error| format!("创建 DSH 共享目录链接失败: {error}"))
+    }
 }
 
 fn native_dsh_home(version: &str) -> Result<PathBuf, String> {
@@ -4496,6 +4685,72 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rail_state_is_shared_across_workspace_homes() {
+        let registry = super::DSH_WORKSPACE_REGISTRY;
+        let root = std::env::temp_dir().join(format!("himind-rail-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = root.join("interactive");
+        let target = shared.join("workspaces").join("abc");
+        let managed = target.join(".himind");
+        std::fs::create_dir_all(&managed).unwrap();
+
+        // 工作区 home 自带一份登记与一条会话内容。
+        std::fs::create_dir_all(target.join("storages")).unwrap();
+        std::fs::write(
+            target.join("storages").join(registry),
+            br#"{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":["w1"],"archivedSessionIds":[],"pinnedSessionIds":[]},"tables":{"workspaces":{"w1":{"path":"C:/a","title":"a","sessionIds":["s1"]}}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(target.join("sessions").join("--a--")).unwrap();
+        std::fs::write(target.join("sessions").join("--a--").join("log"), b"x").unwrap();
+
+        // 共享侧已经有一条别的工作区的记录。
+        std::fs::create_dir_all(shared.join("storages")).unwrap();
+        std::fs::write(
+            shared.join("storages").join(registry),
+            br#"{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":["w2"],"archivedSessionIds":[],"pinnedSessionIds":[]},"tables":{"workspaces":{"w2":{"path":"C:/b","title":"b","sessionIds":["s2"]}}}}"#,
+        )
+        .unwrap();
+
+        super::share_rail_state(&shared, &target, &managed).unwrap();
+
+        // 登记取并集：本工作区的与共享侧已有的都在。
+        let merged = std::fs::read_to_string(shared.join("storages").join(registry)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let workspaces = value
+            .pointer("/tables/workspaces")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert!(workspaces.contains_key("w1"), "本工作区登记应并入共享");
+        assert!(workspaces.contains_key("w2"), "共享侧已有登记应保留");
+        let ids = value
+            .pointer("/global/workspaceIds")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert!(ids.iter().any(|item| item == "w1") && ids.iter().any(|item| item == "w2"));
+
+        // 会话内容搬进共享目录，两个目录都变成指向共享侧的联接。
+        assert!(shared.join("sessions").join("--a--").join("log").is_file());
+        assert!(super::linked_to(
+            &target.join("storages"),
+            &shared.join("storages")
+        ));
+        assert!(super::linked_to(
+            &target.join("sessions"),
+            &shared.join("sessions")
+        ));
+
+        // 幂等：再跑一次不报错，也不重复迁移。
+        super::share_rail_state(&shared, &target, &managed).unwrap();
+        assert!(super::linked_to(
+            &target.join("storages"),
+            &shared.join("storages")
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
