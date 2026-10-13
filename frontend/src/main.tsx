@@ -561,6 +561,10 @@ function AgentApp() {
       const independent = statusRef.current?.mode === 'independent' || statusRef.current?.dashboard_enabled === false;
       // 账号设置页的主数据是连接清单，和审批设置并行拉，谁先到谁先渲染。
       void refreshWorkbenchConnections();
+      // 更新状态也要在这里取：主窗口的 refreshInitialPage 和 60 秒更新轮询都对设置
+      // 窗口提前返回（设置窗口不重复拉主窗口那批全局目录），而「通用 → 软件更新」
+      // 面板正好在设置窗口里。少了这一句，它会一直停在「当前版本 v— / 正在读取更新状态」。
+      void refreshUpdateStatus().catch(console.error);
       // 本机 SVN 账号也是账号页的主数据。它由本机用户自己选择并写在本地加密存储，
       // 与工作台登录身份无关；漏掉这一步，已配置的账号会显示成「待配置」。
       void refreshSvnConnections().catch(error => console.error(error));
@@ -1195,7 +1199,22 @@ function AgentApp() {
     return () => window.clearInterval(timer);
   }, [workflowCenter]);
 
+  // 每个页面第一次显示时读一次自己的数据。
+  //
+  // 这个效应原来依赖 `[]`：只在挂载时按「启动那一页」派发一次，从别的页面点进来的
+  // 页面没有第二个触发点。后果分两种：
+  //  -「开发工作区」会一直停在「正在读取工作区和扩展」——它的数据只由这里派发，
+  //    也不在启动预加载里（见 refreshInitialPage）；
+  //  -「我的能力」「市场」的插件清单与市场目录、以及设置窗口里切换到的另一块面板，
+  //    会停在空态或旧数据上（这两页的常驻转圈由启动预载的 registry 兜住了，不会卡死）。
+  // 两者都只有 F5 那条逃生口能补，所以改成按页派发。
+  //
+  // 用 ref 记住已经读过的页面：切走再回来沿用已有数据，不重复扫工作区目录；
+  // F5 仍然可以强制刷新。设置窗口也走这里：它同样只有「设置 / AI」两块数据。
+  const loadedPages = useRef<Set<string>>(new Set());
   useEffect(() => {
+    if (loadedPages.current.has(page)) return;
+    loadedPages.current.add(page);
     const operation = page === 'dashboard'
       ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings(), refreshProjectionSyncStatus(), refreshLocalUsage()])
       : page === 'ai'
@@ -1219,7 +1238,7 @@ function AgentApp() {
                   ? refreshSettingsPageData()
                   : Promise.resolve();
     operation.catch(console.error);
-  }, []);
+  }, [page]);
 
   // 各页面都不再挂手动刷新按钮，统一留一个逃生口：F5 / Ctrl+R 强制刷新当前页数据。
   // 设置窗口里的连接状态同样会随外部工具变化，所以这个逃生口也覆盖设置窗口。
