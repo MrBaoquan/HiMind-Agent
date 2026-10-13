@@ -1220,7 +1220,7 @@ function AgentApp() {
                   ? refreshSettingsPageData()
                   : Promise.resolve();
     operation.catch(console.error);
-  }, [page]);
+  }, [dashboardEnabled()]);
 
   // 各页面都不再挂手动刷新按钮，统一留一个逃生口：F5 / Ctrl+R 强制刷新当前页数据。
   // 设置窗口里的连接状态同样会随外部工具变化，所以这个逃生口也覆盖设置窗口。
@@ -1339,20 +1339,24 @@ function AgentApp() {
     };
   }, [dashboardAuthorization?.state]);
 
-  // 账号面板打开时也轮询身份与连接。
+  // 每个窗口都轮询身份与连接（不依赖当前路由）。
+  //
+  // 授权是在浏览器里完成的，而「设置」是独立 webview：主窗口与设置窗口各有自己的
+  // React 状态、互不可见；只在某个窗口/某个路由上轮询的话，另一个窗口会一直停在旧
+  // 状态 —— 用户看到的就是「授权完了还显示授权」。
   //
   // 授权是在浏览器里完成的，而「设置」是独立 webview：主窗口与设置窗口各有自己的
   // React 状态，互不可见。只在"发起授权的那个窗口"轮询的话，另一个窗口会一直停在
   // 「授权」不刷新 —— 用户看到的就是"授权完了还显示授权"。
   useEffect(() => {
-    if (!dashboardEnabled() || page !== 'settings') return;
+    if (!dashboardEnabled()) return;
     let stopped = false;
     const timer = window.setInterval(() => {
       if (stopped) return;
       void Promise.all([refreshDashboardIdentity(), refreshWorkbenchConnections()]).catch((error) => {
         console.error(error);
       });
-    }, 4000);
+    }, 5000);
     return () => {
       stopped = true;
       window.clearInterval(timer);
