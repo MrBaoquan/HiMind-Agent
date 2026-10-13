@@ -1946,7 +1946,7 @@ function AgentApp() {
       onOpenDashboard={() => run(agentApi.openDashboard)}
       onRequeueProjectionDeadLetters={requeueProjectionDeadLetters}
       onStartAuthorization={startDashboardAuthorization}
-      onStartEnrollment={() => run(agentApi.openWorkbenchAgentBindingPage)}
+      onStartEnrollment={() => run(() => agentApi.openWorkbenchAgentBindingPage())}
       onCancelAuthorization={cancelDashboardAuthorization}
       onOpenAuthorization={() => run(agentApi.openDashboardAuthorizationPage)}
       onRefreshIdentity={() => run(refreshDashboardIdentity)}

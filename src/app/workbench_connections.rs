@@ -159,6 +159,51 @@ pub(crate) fn switch_workbench_connection(
     snapshot(&state)
 }
 
+/// 打开指定连接对应工作台的「Agent 绑定」页。
+///
+/// 登记码只由工作台签发，而且工作台从不把它显示给用户，所以 agent 侧不该让用户去
+/// 「找码」，而是把人带到工作台上那条一键绑定路径：用户在那里点一下，工作台签发登记码
+/// 并直接 POST 回本机 `/enroll`，全程不需要人看码、抄码。
+///
+/// 两个必须按连接算的点：
+/// 1. 工作台地址不是唯一的 —— 一台机器可以登记多个工作台连接，所以这里按连接 id 取
+///    `api_base`，而不是用当前激活连接的地址（否则会打开另一个工作台）；
+/// 2. 链接里带上本机 Agent 的 loopback 端口（`agent_port`）：开发态听 18082、装机态听
+///    18181，工作台若按自己写死的端口推码，跨配置时会推到没人监听的端口上。
+#[tauri::command]
+pub(crate) fn open_workbench_agent_binding_page(
+    state: State<'_, AgentState>,
+    id: Option<String>,
+) -> Result<(), String> {
+    let store = store_of(&state)?;
+    let wanted = id.unwrap_or_default().trim().to_string();
+    let connection = if wanted.is_empty() {
+        let active = store.active_connection_id().to_string();
+        store
+            .connections()
+            .iter()
+            .find(|connection| connection.id == active)
+    } else {
+        store
+            .connections()
+            .iter()
+            .find(|connection| connection.id == wanted)
+    }
+    .ok_or_else(|| {
+        if wanted.is_empty() {
+            "当前没有可绑定的工作台连接".to_string()
+        } else {
+            format!("未知的工作台连接: {wanted}")
+        }
+    })?;
+    let target = format!(
+        "{}/system/agent-devices?agent_port={}",
+        connection.api_base.trim_end_matches('/'),
+        state.options.local_port
+    );
+    crate::app::system::open_url(&target).map_err(|error| error.to_string())
+}
+
 /// Pair with a workbench: probe, register an Agent identity against it, then
 /// keep it active.
 ///

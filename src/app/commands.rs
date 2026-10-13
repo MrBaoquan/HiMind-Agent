@@ -1508,21 +1508,6 @@ pub(crate) fn logout_local_login(
     Ok(local_login_status_json())
 }
 
-/// 打开工作台的 Agent 绑定页。
-///
-/// 登记码只由工作台签发，而且工作台从不把它显示给用户 —— 所以 agent 侧不该让用户去
-/// 「找码」，而是把人直接带到工作台上那条一键绑定路径：用户在那里点一下，工作台签发
-/// 登记码并直接 POST 回本机 `127.0.0.1:<local_port>/enroll`，全程不需要人看码、抄码。
-/// 手填登记码保留给浏览器访问不到本机（内网限制、跨机代绑）的场景。
-#[tauri::command]
-pub(crate) fn open_workbench_agent_binding_page(
-    state: State<'_, AgentState>,
-) -> Result<(), String> {
-    let base = state.options.api_base();
-    let target = format!("{}/system/agent-devices", base.trim_end_matches('/'));
-    open_url(&target).map_err(|error| error.to_string())
-}
-
 #[tauri::command]
 pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), String> {
     open_url(&state.options.api_base()).map_err(|e| e.to_string())

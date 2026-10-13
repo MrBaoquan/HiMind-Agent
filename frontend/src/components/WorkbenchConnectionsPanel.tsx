@@ -41,8 +41,8 @@ type WorkbenchConnectionsPanelProps = {
   onRemove: (connection: WorkbenchConnection) => void;
   onSwitch: (connection: WorkbenchConnection) => void;
   onEnroll: (id: string, enrollmentToken: string) => Promise<void>;
-  /** 打开工作台的 Agent 绑定页：登记码由工作台签发后直接送回本机，用户不需要看到它。 */
-  onOpenBindingPage: () => void;
+  /** 打开某个连接的 Agent 绑定页：登记码由该工作台签发后直接送回本机，用户不需要看到它。 */
+  onOpenBindingPage: (id: string) => void;
   onProbe: (apiBase: string) => Promise<WorkbenchProbe>;
   onAuthorize: (connection: WorkbenchConnection) => void;
   onRevoke: () => void;
@@ -393,7 +393,7 @@ function EnrollConnectionDialog({
   connection: WorkbenchConnection;
   onClose: () => void;
   onSubmit: (id: string, enrollmentToken: string) => Promise<void>;
-  onOpenBindingPage: () => void;
+  onOpenBindingPage: (id: string) => void;
 }) {
   const [token, setToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -424,7 +424,7 @@ function EnrollConnectionDialog({
           <div className="field-group">
             <p className="field-hint">登记码只由工作台签发，工作台不会把它显示给你。直接在工作台里绑定最快：在那里点一下，登记码会由工作台送回本机，你不需要看到或输入它。</p>
             <div className="actions-row">
-              <button type="button" className="btn btn-primary" disabled={submitting} onClick={onOpenBindingPage}><ArrowUpRight size={15} />打开工作台绑定本机</button>
+              <button type="button" className="btn btn-primary" disabled={submitting} onClick={() => onOpenBindingPage(connection.id)}><ArrowUpRight size={15} />打开工作台绑定本机</button>
             </div>
           </div>
           <details className="field-group">
