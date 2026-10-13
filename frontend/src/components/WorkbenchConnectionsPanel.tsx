@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ArrowUpRight, Cloud, MoreHorizontal, PencilLine, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
 import type { DashboardAuthorizationProgress, DashboardIdentityStatus, WorkbenchConnection, WorkbenchConnectionsSnapshot, WorkbenchProbe } from '../services/agentApi';
 import { ActionMenu, ActionMenuItem } from './ActionMenu';
@@ -43,6 +43,8 @@ type WorkbenchConnectionsPanelProps = {
   onEnroll: (id: string, enrollmentToken: string) => Promise<void>;
   /** 打开某个连接的 Agent 绑定页：登记码由该工作台签发后直接送回本机，用户不需要看到它。 */
   onOpenBindingPage: (id: string) => void;
+  /** 轮询刷新连接状态：绑定在浏览器里完成，本机要自己发现「已经登记上了」。 */
+  onPoll: () => void;
   onProbe: (apiBase: string) => Promise<WorkbenchProbe>;
   onAuthorize: (connection: WorkbenchConnection) => void;
   onRevoke: () => void;
@@ -68,6 +70,7 @@ export function WorkbenchConnectionsPanel({
   onSwitch,
   onEnroll,
   onOpenBindingPage,
+  onPoll,
   onProbe,
   onAuthorize,
   onRevoke,
@@ -75,6 +78,13 @@ export function WorkbenchConnectionsPanel({
   const [addOpen, setAddOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<WorkbenchConnection | null>(null);
   const [enrollTarget, setEnrollTarget] = useState<WorkbenchConnection | null>(null);
+  const enrollTargetRegistered = enrollTarget
+    ? snapshot?.connections.find(item => item.id === enrollTarget.id)?.registered === true
+    : false;
+  // 绑定成功即自动收窗：用户不需要记得回来关掉它，关掉后行上就是「待授权」。
+  useEffect(() => {
+    if (enrollTargetRegistered) setEnrollTarget(null);
+  }, [enrollTargetRegistered]);
 
   const connections = snapshot?.connections || [];
   const active = connections.find(connection => connection.active) || null;
@@ -143,7 +153,7 @@ export function WorkbenchConnectionsPanel({
       </div>
       {addOpen ? <AddConnectionDialog onClose={() => setAddOpen(false)} onProbe={onProbe} onSubmit={onAdd} /> : null}
       {renameTarget ? <RenameConnectionDialog connection={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={onRename} /> : null}
-      {enrollTarget ? <EnrollConnectionDialog connection={enrollTarget} onClose={() => setEnrollTarget(null)} onSubmit={onEnroll} onOpenBindingPage={onOpenBindingPage} /> : null}
+      {enrollTarget ? <EnrollConnectionDialog connection={enrollTarget} onClose={() => setEnrollTarget(null)} onSubmit={onEnroll} onOpenBindingPage={onOpenBindingPage} onPoll={onPoll} /> : null}
     </section>
   );
 }
@@ -389,15 +399,24 @@ function EnrollConnectionDialog({
   onClose,
   onSubmit,
   onOpenBindingPage,
+  onPoll,
 }: {
   connection: WorkbenchConnection;
   onClose: () => void;
   onSubmit: (id: string, enrollmentToken: string) => Promise<void>;
   onOpenBindingPage: (id: string) => void;
+  onPoll: () => void;
 }) {
   const [token, setToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+
+  // 绑定是在工作台页面里完成的，本机收不到本地事件 —— 弹窗打开期间定期刷新连接状态，
+  // 用户在工作台点完就能看到这里翻成「已登记」。
+  useEffect(() => {
+    const timer = window.setInterval(onPoll, 3000);
+    return () => window.clearInterval(timer);
+  }, [onPoll]);
 
   const submit = async () => {
     if (!token.trim()) return;
@@ -423,6 +442,7 @@ function EnrollConnectionDialog({
         <div className="modal-body">
           <div className="field-group">
             <p className="field-hint">登记码只由工作台签发，工作台不会把它显示给你。直接在工作台里绑定最快：在那里点一下，登记码会由工作台送回本机，你不需要看到或输入它。</p>
+            <p className="field-hint">在工作台完成绑定后，这里的状态会自动更新；看到「待授权」就可以关掉本窗口，去点授权。</p>
             <div className="actions-row">
               <button type="button" className="btn btn-primary" disabled={submitting} onClick={() => onOpenBindingPage(connection.id)}><ArrowUpRight size={15} />打开工作台绑定本机</button>
             </div>

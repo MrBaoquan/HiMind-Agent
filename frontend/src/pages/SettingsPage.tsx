@@ -911,6 +911,7 @@ export function SettingsPage({
             onSwitch={onSwitchWorkbenchConnection}
             onEnroll={onEnrollWorkbenchConnection}
             onOpenBindingPage={(id) => void agentApi.openWorkbenchAgentBindingPage(id)}
+            onPoll={() => void onRefreshWorkbenchConnections()}
             onProbe={onProbeWorkbenchConnection}
             onAuthorize={onAuthorizeWorkbenchConnection}
             onRevoke={onRevokeAuthorization}
