@@ -9,7 +9,7 @@ HiMind AI（DSH）会话可以同时打开多个工作目录，每个目录各�
 
 | 每目录独立的东西 | 位置 | 作用 |
 | --- | --- | --- |
-| DSH home | `profiles/<profile>/runtimes/deepseek-harness/homes/<hash>` | 会话目录、存储、凭据都按目录隔离 |
+| DSH home | `profiles/<profile>/runtimes/deepseek-harness/homes/interactive/workspaces/<hash>` | 凭据、`AGENTS.md`、profiles 按目录隔离；rail 的 `storages/`、`sessions/` 跨目录共享（见下） |
 | Agent 入口端口 | `21600 + hash(home) % 1200` | 每个目录一个浏览器 origin |
 | overlay | `homes/<hash>/agent.<hash>.patch.yml` | 把 `HIMIND_AI_WORKSPACE` 钉在该目录 |
 | Host 进程 | 一个 node 进程 | 会话、工具调用、模型请求 |
@@ -17,6 +17,21 @@ HiMind AI（DSH）会话可以同时打开多个工作目录，每个目录各�
 关键点：**一个 origin 一个 localStorage**。DSH 用 `dsh.sessions.current` 记住
 当前会话、用 `dsh.workspace.view.v5` 记住 rail 展开状态，两者都按 origin 存，
 所以两个目录天然不会共用「当前工作区」。
+
+### rail 的登记与会话内容跨目录共享
+
+`storages/`（rail 的工作区分组与会话索引）与 `sessions/`（会话内容）在各目录的
+home 之间不是各自一份，而是**目录联接指向共享目录**
+（`homes/interactive/storages`、`homes/interactive/sessions`）。这样打开任一目录的
+会话，rail 里都能同时看到所有目录及其会话，不必回扩展开发页切来切去——对齐主流
+客户端的会话列表。首次运行会把各 home 已有的登记**取并集**合并、会话内容搬进共享
+目录，幂等且按 home 打标记；`share_rail_state()` 负责这件事。
+
+隔离的边界仍在：`AGENTS.md`（该目录选中的项目规则）、`profiles`、凭据都还按目录
+各自一份，所以并发目录之间不会互相覆盖项目规则；origin 也仍按 home 派生，上面那条
+「一个 origin 一个 localStorage」不受影响。
+
+代价：多个 Host 进程会同时读写同一份 rail 登记与会话目录。
 
 ## 并发开发到底卡在哪里
 
@@ -141,7 +156,8 @@ Worker 是否运行。在「设置 → 账号 → HiMind 账号」里对当前�
 ## 使用方式
 
 在拓展工作区里对每个要并行开发的拓展点「用 AI 开发」，每个拓展会打开自己的
-HiMind AI 窗口。各窗口可以同时发任务，互不阻塞；rail 里各自保留自己的会话记录。
+HiMind AI 窗口。各窗口可以同时发任务，互不阻塞；rail 里列出所有工作区及其会话，
+在任一窗口都能看到并切到别处开的会话（共享机制见上）。
 
 工作区页面本身是**只读的上下文**：顶部说清「默认工作区是哪个仓库」，列表按工作区
 分组，每个分组头有「用 AI 开发」直接开一条绑定该目录的会话。会话按目录寻址
@@ -173,8 +189,8 @@ $env:HIMIND_STABLE_MS = "20000"
 node .tmp-dsh-probe\concurrent-dev-run.mjs run v5-warmup
 ```
 
-断言只看会话面板里的模型回复，不看左侧 rail（rail 里每个目录名都会出现一次，
-拿整页文本断言会假阳性）。
+断言只看会话面板里的模型回复，不看左侧 rail（rail 共享之后每个工作区名都会出现，
+拿整页文本断言必然假阳性）。
 
 会话日志是逐条工具调用耗时的一手证据（多 zstd 帧拼接，需要逐帧解压）：
 
