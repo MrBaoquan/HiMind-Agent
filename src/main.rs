@@ -186,6 +186,11 @@ fn main() {
             eprintln!("auth command failed: {error}");
             std::process::exit(1);
         }
+    } else if let Some(arguments) = diagnostics_cli_arguments() {
+        if let Err(error) = run_diagnostics_cli(&options, &arguments) {
+            eprintln!("diagnostics command failed: {error}");
+            std::process::exit(1);
+        }
     } else if let Some(arguments) = trust_cli_arguments() {
         if let Err(error) = run_trust_cli(&options, &arguments) {
             eprintln!("trust command failed: {error}");
@@ -437,6 +442,64 @@ fn cli_command_arguments(command: &str) -> Option<Vec<String>> {
 
 fn trust_cli_arguments() -> Option<Vec<String>> {
     cli_command_arguments("trust")
+}
+
+fn diagnostics_cli_arguments() -> Option<Vec<String>> {
+    cli_command_arguments("diagnostics")
+}
+
+/// `himind-agent diagnostics export [--output <path>]`
+///
+/// The UI already has an export button, but the case that needs logs most is the
+/// one where the UI does not come up at all — a blank or missing window leaves
+/// nothing to click. This entry point has no dependency on the WebView, so a
+/// user with a broken install can still produce a bundle to send.
+fn run_diagnostics_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut output: Option<PathBuf> = None;
+    let mut rest = arguments;
+    while let Some((token, tail)) = rest.split_first() {
+        match token.as_str() {
+            "export" => {}
+            "--output" | "-o" => {
+                let (path, tail) = tail
+                    .split_first()
+                    .ok_or("--output requires a path: himind-agent diagnostics export --output <file>")?;
+                if path.trim().is_empty() {
+                    return Err("--output requires a non-empty path".into());
+                }
+                output = Some(PathBuf::from(path));
+                rest = tail;
+                continue;
+            }
+            other => {
+                return Err(format!(
+                    "unknown diagnostics argument: {other}\r\nusage: himind-agent diagnostics export [--output <file>]"
+                )
+                .into())
+            }
+        }
+        rest = tail;
+    }
+    let destination = match output {
+        Some(path) => path,
+        // Default next to the other logs, where support already tells users to
+        // look, and where the directory is guaranteed writable.
+        None => store::paths::agent_home().join("diagnostics").join(format!(
+            "himind-agent-diagnostics-{}.zip",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        )),
+    };
+    // The worker status comes from a running UI process, which is precisely what
+    // a command-line collection cannot see. Report it as unavailable rather than
+    // guessing; the logs in the bundle carry the real evidence.
+    let worker = crate::store::types::LocalWorkerStatus::default();
+    let path = crate::app::diagnostics::export_bundle_from(&destination, options, &worker, "cli")?;
+    println!("{}", path.display());
+    println!("如需发送给支持人员，请附上该文件。诊断包不含密码与凭据。");
+    Ok(())
 }
 
 fn engineering_cli_arguments() -> Option<Vec<String>> {

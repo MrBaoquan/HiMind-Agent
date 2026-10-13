@@ -243,13 +243,23 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   StrCpy $R7 "未生成安装日志，请展开本页的「详细信息」查看 Agent 输出。"
   runtime_reason_ready:
 
+  ; On any failure, collect a diagnostics bundle before showing the dialog, so
+  ; the user has something to send without being walked through it by hand. This
+  ; does not change the outcome - it only produces a file - and a failure to
+  ; collect is ignored, because the dialog still names the reason below.
+  StrCmp $0 "0" runtime_bundle_skipped
+  StrCmp $0 "2" runtime_bundle_skipped
+  nsExec::ExecToLog '"$INSTDIR\versions\${PRODUCT_VERSION}\himind-agent.exe" diagnostics export'
+  Pop $R3
+  runtime_bundle_skipped:
+
   ${If} $0 == "error"
-    MessageBox MB_ICONSTOP|MB_OK "无法启动 HiMind AI 运行时安装程序，安装已中止，Agent 未启动。$\r$\n$\r$\n请检查安全软件是否拦截了 $INSTDIR 下的程序，然后重新运行安装程序。"
+    MessageBox MB_ICONSTOP|MB_OK "无法启动 HiMind AI 运行时安装程序，安装已中止，Agent 未启动。$\r$\n$\r$\n请检查安全软件是否拦截了 $INSTDIR 下的程序，然后重新运行安装程序。$\r$\n$\r$\n诊断包目录：$LOCALAPPDATA\HiMindAgent\diagnostics"
     Abort
   ${ElseIf} $0 == 2
-    MessageBox MB_ICONEXCLAMATION|MB_OK "HiMind Agent 已安装，但部分本机能力暂不可用（例如屏幕控制）。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log"
+    MessageBox MB_ICONEXCLAMATION|MB_OK "HiMind Agent 已安装，但部分本机能力暂不可用。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log$\r$\n诊断包目录：$LOCALAPPDATA\HiMindAgent\diagnostics"
   ${ElseIf} $0 != 0
-    MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装失败，安装已中止，Agent 未启动。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log"
+    MessageBox MB_ICONSTOP|MB_OK "HiMind AI 运行时安装失败，安装已中止，Agent 未启动。$\r$\n$\r$\n原因：$R7$\r$\n$\r$\n完整日志：$INSTDIR\logs\runtime-install.log$\r$\n$\r$\n诊断包（可直接发给技术支持）：$LOCALAPPDATA\HiMindAgent\diagnostics"
     Abort
   ${EndIf}
   ; Keep the staged Runtime package. The Runtime is already imported into

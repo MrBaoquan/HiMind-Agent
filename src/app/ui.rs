@@ -86,6 +86,25 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     // 托盘图标。必须在 Tauri 创建任何 WebView 之前把目录按 profile 定下来。
     let webview_data_dir = crate::store::paths::apply_webview_user_data_dir(port);
     println!("webview user data dir: {}", webview_data_dir.display());
+    // Record the launch context before anything can fail to build. A blank or
+    // missing main window has no other trace - WebView2 creation failure is
+    // silent on Windows - so this line is what lets a support case tell "never
+    // started" apart from "started but rendered nothing".
+    crate::app::crash::record_event(
+        "info",
+        &format!(
+            "界面启动：version={} profile={} port={} mode={} webview_user_data_dir={}",
+            crate::VERSION,
+            crate::store::paths::profile_name(),
+            port,
+            if options.mode().dashboard_enabled() {
+                "connected"
+            } else {
+                "independent"
+            },
+            webview_data_dir.display()
+        ),
+    );
     let initial_plugin_view = options.plugin_view_launch();
     let initial_open_target = options.protocol_open_target();
 
@@ -200,6 +219,22 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     };
     let builder = builder
         .register_uri_scheme_protocol("plugin-ui", |_ctx, request| plugin_ui_response(request))
+        // The embedded UI is served from the binary, so a bundle that did not
+        // make it in, or an asset the page cannot resolve, shows up as a blank
+        // window with nothing in any log. Recording Started/Finished per webview
+        // separates "the page never began loading" (WebView creation failed)
+        // from "it began and never finished" (asset resolution failed).
+        .on_page_load(|webview, payload| {
+            crate::app::crash::record_event(
+                "info",
+                &format!(
+                    "界面页面加载：window={} event={:?} url={}",
+                    webview.label(),
+                    payload.event(),
+                    payload.url()
+                ),
+            );
+        })
         .manage(state)
         .on_window_event(|window, event| match (window.label(), event) {
             ("main", WindowEvent::CloseRequested { api, .. }) => {
@@ -592,7 +627,15 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             Ok(())
         });
 
-    builder.run(tauri::generate_context!())?;
+    let run_result = builder.run(tauri::generate_context!());
+    match &run_result {
+        Ok(()) => crate::app::crash::record_event("info", "界面已退出"),
+        Err(error) => crate::app::crash::record_event(
+            "error",
+            &format!("界面启动或运行失败：{error}"),
+        ),
+    }
+    run_result?;
 
     Ok(())
 }
@@ -930,10 +973,21 @@ fn position_approval_popup(manager: &tauri::AppHandle, window: &tauri::WebviewWi
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
+    let Some(window) = app.get_webview_window("main") else {
+        // The main window comes from tauri.conf.json, so its absence means
+        // creation failed (typically a WebView2 environment that could not be
+        // created). That is a distinguishable failure only if it is written
+        // down; the user just sees a tray icon with nothing behind it.
+        crate::app::crash::record_event("error", "主窗口不存在，无法显示（界面创建可能失败）");
+        return;
+    };
+    let _ = window.unminimize();
+    if let Err(error) = window.show() {
+        crate::app::crash::record_event("error", &format!("显示主窗口失败：{error}"));
+        return;
+    }
+    if let Err(error) = window.set_focus() {
+        crate::app::crash::record_event("warn", &format!("主窗口置前失败：{error}"));
     }
 }
 

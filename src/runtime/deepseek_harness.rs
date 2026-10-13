@@ -476,8 +476,6 @@ struct RuntimePackageManifest {
     runtime_contract: String,
     engine_id: String,
     version: String,
-    #[serde(default)]
-    engine_version: String,
     executable: String,
     #[serde(default)]
     min_agent_version: String,
@@ -1632,21 +1630,9 @@ fn install_runtime_archive(
         let _ = fs::remove_dir_all(&temporary);
         return Err("Runtime manifest 与 Runtime Distribution 发布信息不一致。".to_string());
     }
-    let engine_version = if manifest.engine_version.trim().is_empty() {
-        manifest.version.as_str()
-    } else {
-        manifest.engine_version.as_str()
-    };
-    // Preflight never fails the install: it reports per-capability degradations
-    // for payload problems and logs (without blocking) anything that is merely a
-    // property of this machine.
-    let degraded = verify_staged_runtime(
-        &temporary.join(&executable),
-        &temporary,
-        engine_version,
-        &manifest.capabilities,
-        report_progress,
-    );
+    // Preflight never fails the install and no longer runs the staged CLI: it
+    // reports per-capability degradations for payload problems only.
+    let degraded = verify_staged_runtime(&temporary, &manifest.capabilities);
     // Runtime versions are content-addressed (`version-sha256prefix`) and
     // immutable. Never rename the currently active version out of the way:
     // Windows keeps running executables/directories open, so doing so makes
@@ -1750,119 +1736,28 @@ fn remove_directory_with_retry(path: &Path) -> Result<(), std::io::Error> {
 
 /// Preflight a staged Runtime before it is published into the version directory.
 ///
-/// This function never fails the installation. The split it makes is between
-/// what the *package* promises and what *this machine* can currently do:
+/// This function never fails the installation, and it no longer runs the staged
+/// CLI. What is left is the check that is a property of the *package*: are the
+/// bundled capability payloads actually there? A missing payload means that
+/// capability cannot work on any machine, so it is reported as a
+/// [`RuntimeCapabilityDegradation`] and drops out of the advertised capability
+/// set — the install still completes, because the rest of the Runtime is fine.
 ///
-/// * Payload checks (are the bundled Office files there?) are deterministic
-///   properties of the ZIP. A missing payload means the capability cannot work
-///   anywhere, so it is reported as a [`RuntimeCapabilityDegradation`] and drops
-///   out of the advertised capability set - the install still completes, because
-///   the rest of the Runtime is fine.
-/// * Execution checks (`dsh --version`, `--help`, `--dump-default-config`) depend
-///   on the machine: antivirus and AppLocker can block the binary during install,
-///   a locked or disconnected session can make it fail, and a policy can forbid
-///   it outright. None of that says the package is bad, and blocking the install
-///   on it is what made first install fail on machines that were otherwise
-///   healthy. These are recorded as notes in the install log and retried by the
-///   runtime health check at first launch, but they never abort.
+/// The CLI probes (`--version`, `--help`, `--dump-default-config`) used to run
+/// here and were removed rather than demoted. They depend on the machine, not on
+/// the package (antivirus and AppLocker can block the binary during setup, a
+/// locked or disconnected session can make it fail), so they could not be
+/// trusted either way: as a gate they aborted healthy installs, and as a note
+/// they only cost three process launches while the same checks run again at
+/// first launch, by then on a settled machine, in `status()`.
 ///
-/// Package integrity - signature, size, SHA-256, the runtime.json contract - is
+/// Package integrity — signature, size, SHA-256, the runtime.json contract — is
 /// verified by the caller before this runs, so a corrupt ZIP is still rejected.
 fn verify_staged_runtime(
-    executable: &Path,
     workspace: &Path,
-    expected_version: &str,
     declared_capabilities: &[String],
-    report: &mut dyn FnMut(&str, u8, &str),
 ) -> Vec<RuntimeCapabilityDegradation> {
     let mut degraded = Vec::new();
-    let note = |report: &mut dyn FnMut(&str, u8, &str), message: String| {
-        report("preflight", 94, &message);
-    };
-
-    // Best-effort CLI probes. A failure is a machine condition, not a package
-    // defect, so it is logged and stepped over.
-    let preflight_home = workspace.join(".himind-preflight");
-    if let Err(error) = fs::create_dir_all(&preflight_home) {
-        note(
-            report,
-            format!("跳过 Runtime 自检：无法创建预检目录 ({error})"),
-        );
-        return degraded;
-    }
-    let run = |arguments: &[&str]| -> Result<String, String> {
-        let mut command = Command::new(executable);
-        process::remove_himind_secret_environment(&mut command);
-        configure_runtime_environment(&mut command, executable);
-        command
-            .args(arguments)
-            .current_dir(workspace)
-            .env(DSH_HOME_ENV, &preflight_home)
-            .env("DSH_TELEMETRY_MODE", "DISABLED")
-            .env("NO_COLOR", "1")
-            .env_remove("DEEPSEEK_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("GOOGLE_API_KEY")
-            .env_remove("GEMINI_API_KEY")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        process::configure_hidden_process(&mut command);
-        let output = command
-            .output()
-            .map_err(|error| format!("启动 Runtime 预检失败: {error}"))?;
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .trim()
-        .to_string();
-        if !output.status.success() {
-            return Err(format!(
-                "Runtime CLI 预检失败 (exit={}): {}",
-                output.status.code().unwrap_or(-1),
-                process::summarize_output(&combined, 2_000)
-            ));
-        }
-        Ok(combined)
-    };
-    match run(&["--version"]) {
-        Ok(version) => {
-            if !version
-                .lines()
-                .any(|line| line.trim().contains(expected_version))
-            {
-                note(
-                    report,
-                    format!(
-                        "Runtime CLI 版本与 manifest 不一致 (expected={expected_version}, actual={})，将在首次启动时重试",
-                        first_line(&version)
-                    ),
-                );
-            }
-        }
-        Err(error) => note(
-            report,
-            format!("跳过 Runtime CLI 版本自检，将在首次启动时重试: {error}"),
-        ),
-    }
-    for arguments in [
-        ["--profile", "headless", "--help"],
-        ["--profile", "headless", "--dump-default-config"],
-    ] {
-        if let Err(error) = run(&arguments) {
-            note(
-                report,
-                format!(
-                    "跳过 Runtime CLI 自检 `{}`，将在首次启动时重试: {error}",
-                    arguments.join(" ")
-                ),
-            );
-        }
-    }
-    let _ = fs::remove_dir_all(&preflight_home);
 
     // Payload checks. These are properties of the published package, so a
     // failure means the capability genuinely cannot work and is dropped from the
@@ -1877,14 +1772,6 @@ fn verify_staged_runtime(
     }
     if declared_capabilities.iter().any(|value| value == "computer-use") {
         if let Err(reason) = verify_staged_computer_use_package(workspace) {
-            degraded.push(RuntimeCapabilityDegradation {
-                capability: "computer-use".to_string(),
-                reason,
-            });
-        } else if let Err(reason) = verify_staged_computer_use_runtime(workspace) {
-            // The screen-control self-test depends on the machine (PowerShell,
-            // UI Automation, capture permission, an unlocked session), so a
-            // failure degrades the capability rather than failing the install.
             degraded.push(RuntimeCapabilityDegradation {
                 capability: "computer-use".to_string(),
                 reason,
@@ -1942,41 +1829,6 @@ fn verify_staged_computer_use_package(workspace: &Path) -> Result<(), String> {
         return Err(
             "Runtime 声明支持屏幕控制，但缺少 dsh-computer-use-win Windows 控制包。".to_string(),
         );
-    }
-    Ok(())
-}
-
-/// Runs the packaged screen-control self-test. Failure is environmental (no
-/// interactive desktop, blocked UI Automation/screen capture, endpoint
-/// protection, locked session) and only degrades the capability.
-fn verify_staged_computer_use_runtime(workspace: &Path) -> Result<(), String> {
-    let package = workspace.join("node_modules/dsh-computer-use-win");
-    let node = workspace.join("node.exe");
-    let mut command = Command::new(node);
-    command
-        .arg(package.join("mcp/server.mjs"))
-        .arg("--self-test")
-        .current_dir(workspace)
-        .env(DSH_HOME_ENV, workspace.join(".himind-preflight"))
-        .env("DSH_TELEMETRY_MODE", "DISABLED")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    process::configure_hidden_process(&mut command);
-    let output = command
-        .output()
-        .map_err(|error| format!("启动 Windows 屏幕控制预检失败: {error}"))?;
-    if !output.status.success() {
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Err(format!(
-            "Windows 屏幕控制预检失败: {}",
-            process::summarize_output(combined.trim(), 2_000)
-        ));
     }
     Ok(())
 }
@@ -4508,14 +4360,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Installation must not be blocked by anything that is a property of the
-    /// machine rather than of the package.
+    /// Installation must not be blocked by the package, and the capability set
+    /// must not claim a payload that is not there.
     ///
-    /// This is the guarantee that first install depends on: a locked session,
-    /// antivirus or AppLocker can stop the staged CLI from running, and an
-    /// incomplete Office payload means only Office is unusable. Neither may
-    /// abort the install, and the payload gap must be reported as a degradation
-    /// so the capability set stays honest.
+    /// This is the guarantee first install depends on: an incomplete Office
+    /// payload means only Office is unusable, never that the install fails.
+    /// The staged CLI is not run at all any more - it was a three-process cost
+    /// that decided nothing, because the machine-dependent checks run again at
+    /// first launch on a settled machine.
     #[test]
     fn preflight_never_fails_the_install_and_degrades_only_the_missing_payload() {
         let root = std::env::temp_dir().join(format!(
@@ -4527,21 +4379,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        // A staged "executable" that cannot run: every CLI probe must fail here.
-        let executable = root.join("bin/dsh.cmd");
-        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        std::fs::write(&executable, "not an executable format").unwrap();
 
         let declared = ["interactive", "headless", "workflow", "office"]
             .map(str::to_string)
             .to_vec();
-        let mut notes = Vec::new();
-        let mut collect = |stage: &str, _percent: u8, message: &str| {
-            notes.push(format!("{stage}: {message}"));
-        };
 
         // Office declared but no LibreOfficeKit payload staged anywhere.
-        let degraded = verify_staged_runtime(&executable, &root, "0.2.0-rc.6", &declared, &mut collect);
+        let degraded = verify_staged_runtime(&root, &declared);
         assert_eq!(
             degraded
                 .iter()
@@ -4549,11 +4393,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["office"],
             "an incomplete Office payload must degrade Office, not fail the install"
-        );
-        // The CLI probes failed and were recorded rather than propagated.
-        assert!(
-            notes.iter().any(|note| note.contains("CLI")),
-            "unrunnable CLI probes must be recorded as notes: {notes:?}"
         );
 
         // Stage the payload the previous run reported missing: Office is then
@@ -4578,9 +4417,8 @@ mod tests {
         let cli = root.join("node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js");
         std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
         std::fs::write(&cli, "stub").unwrap();
-        let mut quiet = |_: &str, _: u8, _: &str| {};
         assert!(
-            verify_staged_runtime(&executable, &root, "0.2.0-rc.6", &declared, &mut quiet).is_empty(),
+            verify_staged_runtime(&root, &declared).is_empty(),
             "a complete payload must not degrade Office"
         );
 
@@ -4591,8 +4429,17 @@ mod tests {
             .to_vec();
         std::fs::remove_dir_all(root.join("node_modules")).unwrap();
         assert!(
-            verify_staged_runtime(&executable, &root, "0.2.0-rc.6", &slim, &mut quiet).is_empty(),
+            verify_staged_runtime(&root, &slim).is_empty(),
             "an undeclared capability must not be checked"
+        );
+
+        // Nothing the preflight does touches the staged CLI: a Runtime whose
+        // executable is garbage still installs, because payload checks look only
+        // at payload files.
+        std::fs::write(root.join("node.exe"), "not an executable").unwrap();
+        assert!(
+            verify_staged_runtime(&root, &declared).len() == 1,
+            "the staged CLI must not be executed during preflight"
         );
 
         let _ = std::fs::remove_dir_all(root);

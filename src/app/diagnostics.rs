@@ -14,6 +14,19 @@ pub(crate) fn export_bundle(
     options: &Options,
     worker: &LocalWorkerStatus,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    export_bundle_from(destination, options, worker, "ui")
+}
+
+/// `origin` records how the bundle was collected. A bundle pulled from the
+/// command line while the window is blank must be distinguishable from one the
+/// user exported from a working UI, because the worker fields below are only
+/// meaningful in the first case.
+pub(crate) fn export_bundle_from(
+    destination: &Path,
+    options: &Options,
+    worker: &LocalWorkerStatus,
+    origin: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -22,27 +35,15 @@ pub(crate) fn export_bundle(
     let zip_options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     archive.start_file("diagnostics.json", zip_options)?;
-    archive.write_all(serde_json::to_vec_pretty(&snapshot(options, worker))?.as_slice())?;
-
-    let log_dir = crate::store::paths::agent_home().join("logs");
-    for name in [
-        "agent-events.jsonl",
-        "agent-events.jsonl.1",
-        "agent-events.jsonl.2",
-        "svn-events.jsonl",
-        "svn-events.jsonl.1",
-        "svn-events.jsonl.2",
-    ] {
-        let path = log_dir.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        archive.start_file(format!("logs/{name}"), zip_options)?;
-        let mut source = fs::File::open(path)?;
-        let mut content = Vec::new();
-        source.read_to_end(&mut content)?;
-        archive.write_all(&content)?;
-    }
+    archive.write_all(
+        serde_json::to_vec_pretty(&snapshot(options, worker, origin))?.as_slice(),
+    )?;
+    add_logs(
+        &mut archive,
+        &crate::store::paths::agent_home().join("logs"),
+        &crate::app::crash::crash_dir(),
+        zip_options,
+    )?;
 
     archive.start_file("feedback.txt", zip_options)?;
     archive.write_all(
@@ -58,7 +59,62 @@ pub(crate) fn export_bundle(
     Ok(destination.to_path_buf())
 }
 
-fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
+/// Everything a support case needs has to be in here, because the user should
+/// not have to be walked through copying files by hand. `runtime-install.log`
+/// carries the reason the Runtime import failed (the installer already reads its
+/// last line for its failure dialog) and the crash directory is where a panic or
+/// an abort leaves its report, so both belong in the bundle.
+fn add_logs<W: Write + std::io::Seek>(
+    archive: &mut zip::ZipWriter<W>,
+    log_dir: &Path,
+    crash_dir: &Path,
+    options: FileOptions,
+) -> Result<(), Box<dyn Error>> {
+    for name in [
+        "agent-events.jsonl",
+        "agent-events.jsonl.1",
+        "agent-events.jsonl.2",
+        "runtime-install.log",
+        "agent-updater.log",
+        "svn-events.jsonl",
+        "svn-events.jsonl.1",
+        "svn-events.jsonl.2",
+    ] {
+        add_file(archive, &log_dir.join(name), &format!("logs/{name}"), options)?;
+    }
+    if let Ok(entries) = fs::read_dir(crash_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            add_file(archive, &path, &format!("logs/crashes/{name}"), options)?;
+        }
+    }
+    Ok(())
+}
+
+fn add_file<W: Write + std::io::Seek>(
+    archive: &mut zip::ZipWriter<W>,
+    source: &Path,
+    entry: &str,
+    options: FileOptions,
+) -> Result<(), Box<dyn Error>> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    archive.start_file(entry, options)?;
+    let mut file = fs::File::open(source)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    archive.write_all(&content)?;
+    Ok(())
+}
+
+fn snapshot(options: &Options, worker: &LocalWorkerStatus, origin: &str) -> Value {
     let state = match load_agent_state(&options.state_path) {
         Ok(state) => json!({
             "readable": true,
@@ -102,6 +158,7 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
     let state_file = &options.state_path;
     json!({
         "generated_at": unix_now(),
+        "collected_by": origin,
         "agent": {
             "version": VERSION,
             "profile": crate::store::paths::profile_name(),
@@ -110,6 +167,13 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "native_dpapi": cfg!(windows),
+        },
+        // The Runtime is the other half of the install and the usual suspect
+        // when a session will not start, so report what the Agent currently
+        // believes about it rather than only the Agent's own identity.
+        "runtime": runtime_snapshot(),
+        "webview": {
+            "user_data_dir": webview_dir(options.local_port),
         },
         "worker": {
             "online": worker.dashboard_worker_online,
@@ -128,6 +192,30 @@ fn snapshot(options: &Options, worker: &LocalWorkerStatus) -> Value {
         "user_authorization": authorization,
         "distribution_trust": trust,
     })
+}
+
+/// What the Agent currently believes about the Runtime.
+///
+/// `status()` shells out to the Runtime CLI, which is exactly the thing that
+/// usually fails on a broken machine, so it is captured best-effort: a failure
+/// is recorded as the reason rather than aborting the whole bundle.
+fn runtime_snapshot() -> Value {
+    match serde_json::to_value(crate::runtime::builtin::status()) {
+        Ok(value) => value,
+        Err(error) => json!({ "readable": false, "error": error.to_string() }),
+    }
+}
+
+/// The WebView2 user data directory this process would use.
+///
+/// A second Agent instance pointing at the same directory makes WebView2
+/// creation fail with no error anywhere, which shows up as a tray icon with no
+/// main window. Recording the path is what distinguishes that from a rendering
+/// failure.
+fn webview_dir(port: u16) -> String {
+    crate::store::paths::webview_user_data_dir(port)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn sanitized_api_base(value: &str) -> String {
@@ -150,7 +238,7 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::export_bundle;
+    use super::export_bundle_from;
     use crate::api::client::save_agent_state;
     use crate::api::types::AgentState;
     use crate::store::types::LocalWorkerStatus;
@@ -205,7 +293,13 @@ mod tests {
             task_execution: Arc::new(RwLock::new(None)),
         };
         let destination = root.join("diagnostics.zip");
-        export_bundle(&destination, &options, &LocalWorkerStatus::default()).unwrap();
+        export_bundle_from(
+            &destination,
+            &options,
+            &LocalWorkerStatus::default(),
+            "cli",
+        )
+        .unwrap();
         let file = fs::File::open(&destination).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let mut diagnostics = String::new();
@@ -219,6 +313,75 @@ mod tests {
         assert!(!diagnostics.contains(credential));
         assert!(!diagnostics.contains("password"));
         assert!(!diagnostics.contains("token=secret"));
+        // A bundle pulled from the command line must say so: it was collected
+        // because the window would not come up, so its worker fields are
+        // placeholders rather than observations, and the runtime and WebView2
+        // facts are what the reader should go on.
+        assert!(diagnostics.contains("\"collected_by\": \"cli\""));
+        assert!(diagnostics.contains("\"runtime\""));
+        assert!(diagnostics.contains("user_data_dir"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The bundle is what a support case is opened with, so it has to carry the
+    /// logs that explain a failed install — a user should never be walked
+    /// through copying files by hand.
+    #[test]
+    fn bundle_carries_install_logs_and_crash_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-diagnostics-logs-{}-{}",
+            std::process::id(),
+            super::unix_now()
+        ));
+        let logs = root.join("logs");
+        let crashes = root.join("crashes");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&crashes).unwrap();
+        fs::write(logs.join("runtime-install.log"), "error: 运行时安装失败").unwrap();
+        fs::write(logs.join("agent-updater.log"), "updater line").unwrap();
+        fs::write(logs.join("agent-events.jsonl"), "{\"level\":\"info\"}\n").unwrap();
+        fs::write(logs.join("svn-events.jsonl"), "{}\n").unwrap();
+        fs::write(crashes.join("crash-1.txt"), "panic report").unwrap();
+
+        let destination = root.join("bundle.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&destination).unwrap());
+        super::add_logs(
+            &mut writer,
+            &logs,
+            &crashes,
+            super::FileOptions::default(),
+        )
+        .unwrap();
+        writer.finish().unwrap();
+
+        let mut archive = zip::ZipArchive::new(fs::File::open(&destination).unwrap()).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            "logs/runtime-install.log",
+            "logs/agent-updater.log",
+            "logs/agent-events.jsonl",
+            "logs/svn-events.jsonl",
+            "logs/crashes/crash-1.txt",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "bundle is missing {expected}: {names:?}"
+            );
+        }
+
+        // A log that does not exist must not break the bundle: a fresh install
+        // has no crash reports and no updater log yet.
+        let mut sparse = zip::ZipWriter::new(fs::File::create(root.join("sparse.zip")).unwrap());
+        assert!(super::add_logs(
+            &mut sparse,
+            &root.join("nowhere"),
+            &root.join("nowhere-crashes"),
+            super::FileOptions::default(),
+        )
+        .is_ok());
+
         let _ = fs::remove_dir_all(root);
     }
 }
