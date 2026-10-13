@@ -217,7 +217,7 @@ function ConnectionRow({
           {close => (
             <>
               <ActionMenuItem icon={<PencilLine size={15} />} label="重命名" onClick={() => { close(); onRename(); }} />
-              <ActionMenuItem icon={<KeyRound size={15} />} label="手填登记码" onClick={() => { close(); onEnroll(); }} />
+              <ActionMenuItem icon={<KeyRound size={15} />} label="手填授权码" onClick={() => { close(); onEnroll(); }} />
               <ActionMenuItem
                 icon={<Trash2 size={15} />}
                 label="移除"
@@ -293,7 +293,7 @@ function AddConnectionDialog({
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div className="modal workbench-connection-modal" role="dialog" aria-modal="true" aria-labelledby="workbench-add-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header">
-          <div><h3 id="workbench-add-title">连接工作台</h3><p>填地址 → 登记 → 登录账号；完成后本机开始接收该工作台的任务。</p></div>
+          <div><h3 id="workbench-add-title">连接工作台</h3><p>填地址连接，之后在工作台点一下完成授权。</p></div>
           <IconButton icon={X} label="关闭" onClick={onClose} />
         </div>
         <div className="modal-body">
@@ -320,9 +320,9 @@ function AddConnectionDialog({
             {purpose === '自定义' ? <input style={{ marginTop: 8 }} autoComplete="off" placeholder="例如：测试环境" value={customPurpose} disabled={submitting} onChange={event => setCustomPurpose(event.target.value)} /> : null}
           </div>
           <div className="field-group">
-            <label className="field-label" htmlFor="workbench-enrollment-token">登记码（可选）</label>
-            <input id="workbench-enrollment-token" autoComplete="off" placeholder="工作台生成的登记码" value={enrollmentToken} disabled={submitting} onChange={event => setEnrollmentToken(event.target.value)} />
-            <p className="field-hint">留空即可，绑定时会自动登记。</p>
+            <label className="field-label" htmlFor="workbench-enrollment-token">授权码（可选）</label>
+            <input id="workbench-enrollment-token" autoComplete="off" placeholder="由工作台或管理员签发" value={enrollmentToken} disabled={submitting} onChange={event => setEnrollmentToken(event.target.value)} />
+            <p className="field-hint">留空即可，连接后在工作台点一下即可授权。</p>
           </div>
           {error ? <div className="inline-feedback visible workbench-connection-error" role="alert">{error}</div> : null}
           <div className="modal-actions">
@@ -428,7 +428,7 @@ function EnrollConnectionDialog({
       await onSubmit(connection.id, token.trim());
       onClose();
     } catch (cause) {
-      setError(failureText(cause, '登记失败'));
+      setError(failureText(cause, '授权失败'));
     } finally {
       setSubmitting(false);
     }
@@ -443,15 +443,15 @@ function EnrollConnectionDialog({
         </div>
         <div className="modal-body">
           <div className="field-group">
-            <p className="field-hint">在工作台点一下完成绑定，登记码会自动回到本机。</p>
+            <p className="field-hint">在工作台点一下即可，授权码会自动回到本机。</p>
             <p className="field-hint">绑定完成后这里会自动更新，无需刷新。</p>
             <div className="actions-row">
               <button type="button" className="btn btn-primary" disabled={submitting} onClick={() => onOpenBindingPage(connection.id)}><ArrowUpRight size={15} />打开工作台绑定本机</button>
             </div>
           </div>
           <details className="field-group">
-            <summary className="field-hint">手填登记码</summary>
-            <label className="field-label" htmlFor="workbench-enroll-token">登记码</label>
+            <summary className="field-hint">手填授权码</summary>
+            <label className="field-label" htmlFor="workbench-enroll-token">授权码</label>
             <input id="workbench-enroll-token" autoComplete="off" placeholder="由工作台或管理员签发" value={token} disabled={submitting} onChange={event => setToken(event.target.value)} />
             <p className="field-hint">由工作台或管理员签发，有有效期。</p>
           </details>
@@ -460,7 +460,7 @@ function EnrollConnectionDialog({
             <span />
             <div className="actions-row">
               <button type="button" className="btn" disabled={submitting} onClick={onClose}>取消</button>
-              <button type="button" className="btn btn-primary" disabled={!token.trim() || submitting} onClick={() => void submit()}>{submitting ? <BusyIndicator size={15} /> : null}登记</button>
+              <button type="button" className="btn btn-primary" disabled={!token.trim() || submitting} onClick={() => void submit()}>{submitting ? <BusyIndicator size={15} /> : null}授权</button>
             </div>
           </div>
         </div>

@@ -71,20 +71,20 @@ function enrollFailureText(error: unknown): string {
   const detail = errorDetail(error);
   const lower = detail.toLowerCase();
   if (lower.includes('401') || lower.includes('403') || lower.includes('unauthorized') || lower.includes('forbidden')) {
-    return '登记码无效或已过期，请在 HiMind 工作台重新生成后重试。';
+    return '授权码无效或已过期，请在工作台重新生成后重试。';
   }
   if (lower.includes('404')) return '这个地址不是可用的 HiMind 工作台，请检查工作台地址。';
-  if (lower.includes('409') || lower.includes('已登记')) return '这台设备已在工作台登记过，请在工作台确认设备状态。';
+  if (lower.includes('409') || lower.includes('已登记')) return '这台设备已在工作台绑定过，请在工作台确认设备状态。';
   if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('超时')) {
-    return '登记超时，请检查网络和工作台地址后重试。';
+    return '连接超时，请检查网络和工作台地址后重试。';
   }
   if (lower.includes('connection refused') || lower.includes('dns') || lower.includes('network') || lower.includes('网络')) {
     return '无法连接该工作台，请检查地址和网络后重试。';
   }
-  // 后端已经把状态翻成产品文案时直接采用（它一定提到「登记」这件事）。
-  if (detail.includes('登记')) return detail;
-  console.error('工作台登记失败', error);
-  return '登记失败，请稍后重试；如果一直失败，请确认工作台地址和登记码。';
+  // 后端已经把状态翻成产品文案时直接采用。
+  if (detail.trim()) return detail;
+  console.error('工作台授权失败', error);
+  return '授权失败，请稍后重试；如果一直失败，请确认工作台地址。';
 }
 
 /**
@@ -1655,13 +1655,13 @@ function AgentApp() {
       setWorkbenchConnections(next);
       const token = draft.enrollmentToken.trim();
       if (!token) {
-        notify('success', '已添加工作台，登记后即可接收任务');
+        notify('success', '已添加工作台，授权后即可接收任务');
         return;
       }
       const normalize = (value: string) => value.trim().replace(/\/+$/, '').toLowerCase();
       const added = next.connections.find(connection => normalize(connection.api_base) === normalize(draft.apiBase));
       if (!added) {
-        notify('success', '已添加工作台，请在列表中完成登记');
+        notify('success', '已添加工作台，请在列表中完成授权');
         return;
       }
       setWorkbenchBusyId(`enroll:${added.id}`);
@@ -1671,7 +1671,7 @@ function AgentApp() {
         throw new UserFacingError(enrollFailureText(error));
       }
       await refreshAfterWorkbenchChange();
-      notify('success', '工作台登记完成，请登录账号');
+      notify('success', '工作台已连接，请完成授权');
     } catch (error) {
       throw error instanceof UserFacingError ? error : new Error(formatError(error, '连接工作台失败'));
     } finally {
@@ -1684,7 +1684,7 @@ function AgentApp() {
     try {
       setWorkbenchConnections(await agentApi.enrollWorkbenchConnection(id, enrollmentToken));
       await refreshAfterWorkbenchChange();
-      notify('success', '工作台登记完成，请登录账号');
+      notify('success', '工作台已连接，请完成授权');
     } catch (error) {
       throw new UserFacingError(enrollFailureText(error));
     } finally {
