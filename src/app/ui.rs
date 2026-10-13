@@ -331,6 +331,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::save_local_login,
             super::commands::logout_local_login,
             super::commands::open_dashboard_page,
+            super::commands::open_workbench_agent_binding_page,
             super::commands::open_inner_admin_page,
             super::commands::open_agent_directory,
             super::commands::show_main_window,

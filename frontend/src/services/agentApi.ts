@@ -2739,6 +2739,7 @@ export const agentApi = {
     dashboardAuthorizationProgress: () => invoke<DashboardAuthorizationProgress>('get_dashboard_authorization_progress'),
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
     openDashboardAuthorizationPage: () => invoke('open_dashboard_authorization_page'),
+    openWorkbenchAgentBindingPage: () => invoke('open_workbench_agent_binding_page'),
     revokeDashboardAuthorization: () => invoke('revoke_dashboard_authorization'),
     workbenchConnections: () => invoke<WorkbenchConnectionsSnapshot>('list_workbench_connections'),
     addWorkbenchConnection: (apiBase: string, displayName: string, purpose: string) =>

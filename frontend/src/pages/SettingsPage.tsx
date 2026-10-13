@@ -910,6 +910,7 @@ export function SettingsPage({
             onRemove={onRemoveWorkbenchConnection}
             onSwitch={onSwitchWorkbenchConnection}
             onEnroll={onEnrollWorkbenchConnection}
+            onOpenBindingPage={() => void agentApi.openWorkbenchAgentBindingPage()}
             onProbe={onProbeWorkbenchConnection}
             onAuthorize={onAuthorizeWorkbenchConnection}
             onRevoke={onRevokeAuthorization}

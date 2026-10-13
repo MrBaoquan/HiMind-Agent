@@ -24,6 +24,7 @@ type DashboardPageProps = {
   onOpenDashboard: () => void;
   onRequeueProjectionDeadLetters: () => void;
   onStartAuthorization: () => void;
+  onStartEnrollment: () => void;
   onCancelAuthorization: () => void;
   onOpenAuthorization: () => void;
   onRefreshIdentity: () => void;
@@ -56,6 +57,7 @@ export function DashboardPage({
   onOpenDashboard,
   onRequeueProjectionDeadLetters,
   onStartAuthorization,
+  onStartEnrollment,
   onCancelAuthorization,
   onOpenAuthorization,
   onRefreshIdentity,
@@ -140,6 +142,7 @@ export function DashboardPage({
         aiToolSummary={aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已连接` : '未安装'}
         busy={identityBusy}
         onStartAuthorization={onStartAuthorization}
+        onStartEnrollment={onStartEnrollment}
         onCancelAuthorization={onCancelAuthorization}
         onOpenAuthorization={onOpenAuthorization}
         onRefresh={onRefreshIdentity}

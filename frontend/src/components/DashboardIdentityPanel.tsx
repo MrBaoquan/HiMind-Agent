@@ -22,6 +22,8 @@ type DashboardIdentityPanelProps = {
   aiToolSummary: string;
   busy?: boolean;
   onStartAuthorization: () => void;
+  /** 未登记时把人带到工作台的一键绑定页：登记码由工作台送回本机，不需要用户去找码。 */
+  onStartEnrollment: () => void;
   onCancelAuthorization: () => void;
   onOpenAuthorization: () => void;
   onRefresh: () => void;
@@ -42,6 +44,7 @@ export function DashboardIdentityPanel({
   aiToolSummary,
   busy,
   onStartAuthorization,
+  onStartEnrollment,
   onCancelAuthorization,
   onOpenAuthorization,
   onRefresh,
@@ -86,7 +89,11 @@ export function DashboardIdentityPanel({
         </div>
         <div className="identity-actions">
           <button className="btn btn-icon" title="刷新账号状态" aria-label="刷新账号状态" disabled={busy} onClick={onRefresh}><RefreshCw size={15} /></button>
-          {dashboardEnabled ? (identity?.authorized ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />取消授权</button> : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || identity?.state === 'not_enrolled' || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />授权</button>) : null}
+          {dashboardEnabled ? (identity?.authorized
+            ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />取消授权</button>
+            : identity?.state === 'not_enrolled'
+              ? <button className="btn btn-primary" disabled={busy || flowActive} onClick={onStartEnrollment}><ArrowUpRight size={15} />去登记</button>
+              : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />授权</button>) : null}
         </div>
       </div>
       <div className="workspace-status-metrics" aria-label="桌面端运行状态">

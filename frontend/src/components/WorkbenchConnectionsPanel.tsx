@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Cloud, MoreHorizontal, PencilLine, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
+import { ArrowUpRight, Cloud, MoreHorizontal, PencilLine, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
 import type { DashboardAuthorizationProgress, DashboardIdentityStatus, WorkbenchConnection, WorkbenchConnectionsSnapshot, WorkbenchProbe } from '../services/agentApi';
 import { ActionMenu, ActionMenuItem } from './ActionMenu';
 import { BusyIndicator } from './BusyIndicator';
@@ -41,6 +41,8 @@ type WorkbenchConnectionsPanelProps = {
   onRemove: (connection: WorkbenchConnection) => void;
   onSwitch: (connection: WorkbenchConnection) => void;
   onEnroll: (id: string, enrollmentToken: string) => Promise<void>;
+  /** 打开工作台的 Agent 绑定页：登记码由工作台签发后直接送回本机，用户不需要看到它。 */
+  onOpenBindingPage: () => void;
   onProbe: (apiBase: string) => Promise<WorkbenchProbe>;
   onAuthorize: (connection: WorkbenchConnection) => void;
   onRevoke: () => void;
@@ -65,6 +67,7 @@ export function WorkbenchConnectionsPanel({
   onRemove,
   onSwitch,
   onEnroll,
+  onOpenBindingPage,
   onProbe,
   onAuthorize,
   onRevoke,
@@ -140,7 +143,7 @@ export function WorkbenchConnectionsPanel({
       </div>
       {addOpen ? <AddConnectionDialog onClose={() => setAddOpen(false)} onProbe={onProbe} onSubmit={onAdd} /> : null}
       {renameTarget ? <RenameConnectionDialog connection={renameTarget} onClose={() => setRenameTarget(null)} onSubmit={onRename} /> : null}
-      {enrollTarget ? <EnrollConnectionDialog connection={enrollTarget} onClose={() => setEnrollTarget(null)} onSubmit={onEnroll} /> : null}
+      {enrollTarget ? <EnrollConnectionDialog connection={enrollTarget} onClose={() => setEnrollTarget(null)} onSubmit={onEnroll} onOpenBindingPage={onOpenBindingPage} /> : null}
     </section>
   );
 }
@@ -307,7 +310,7 @@ function AddConnectionDialog({
           <div className="field-group">
             <label className="field-label" htmlFor="workbench-enrollment-token">登记码（可选）</label>
             <input id="workbench-enrollment-token" autoComplete="off" placeholder="工作台生成的登记码" value={enrollmentToken} disabled={submitting} onChange={event => setEnrollmentToken(event.target.value)} />
-            <p className="field-hint">填了就在连接时一并登记；留空先连上，之后再补登记也可以。</p>
+            <p className="field-hint">留空即可：登记码由工作台在绑定时自动送回本机。只有浏览器访问不到本机、或跨机代绑时才需要手工填（由工作台或管理员签发）。</p>
           </div>
           {error ? <div className="inline-feedback visible workbench-connection-error" role="alert">{error}</div> : null}
           <div className="modal-actions">
@@ -385,10 +388,12 @@ function EnrollConnectionDialog({
   connection,
   onClose,
   onSubmit,
+  onOpenBindingPage,
 }: {
   connection: WorkbenchConnection;
   onClose: () => void;
   onSubmit: (id: string, enrollmentToken: string) => Promise<void>;
+  onOpenBindingPage: () => void;
 }) {
   const [token, setToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -417,10 +422,17 @@ function EnrollConnectionDialog({
         </div>
         <div className="modal-body">
           <div className="field-group">
-            <label className="field-label" htmlFor="workbench-enroll-token">登记码</label>
-            <input id="workbench-enroll-token" autoComplete="off" placeholder="工作台生成的登记码" value={token} disabled={submitting} onChange={event => setToken(event.target.value)} />
-              <p className="field-hint">登记后工作台会记下本机身份；还需登录账号。</p>
+            <p className="field-hint">登记码只由工作台签发，工作台不会把它显示给你。直接在工作台里绑定最快：在那里点一下，登记码会由工作台送回本机，你不需要看到或输入它。</p>
+            <div className="actions-row">
+              <button type="button" className="btn btn-primary" disabled={submitting} onClick={onOpenBindingPage}><ArrowUpRight size={15} />打开工作台绑定本机</button>
+            </div>
           </div>
+          <details className="field-group">
+            <summary className="field-hint">高级：手填登记码（浏览器访问不到本机、或跨机代绑时使用）</summary>
+            <label className="field-label" htmlFor="workbench-enroll-token">登记码</label>
+            <input id="workbench-enroll-token" autoComplete="off" placeholder="由工作台或管理员签发" value={token} disabled={submitting} onChange={event => setToken(event.target.value)} />
+            <p className="field-hint">来源：工作台「系统 → Agent 设备」里绑定本机，或由管理员签发；登记码有有效期，过期需要重新签发。</p>
+          </details>
           {error ? <div className="inline-feedback visible workbench-connection-error" role="alert">{error}</div> : null}
           <div className="modal-actions">
             <span />
