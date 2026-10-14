@@ -1598,9 +1598,40 @@ fn codex_himind_models_path() -> PathBuf {
     codex_config_path().join(CODEX_HIMIND_MODELS_FILE)
 }
 
-// Codex 直连采用 DeepSeek 官方接入范式：model_catalog_json 指向独立模型目录，
-// Codex 重启后 /model 即可列出 HiMind 全量模型；key 按官方做法明文写入
-// experimental_bearer_token（仅本机 config.toml）。
+/// Codex 内置模型目录已收录的官方模型族。
+///
+/// `model_catalog_json` 是**整体替换**语义：一旦写入，Codex 只认目录里的模型，内置
+/// 定义对所有同名 slug 让位。用自建模板覆盖官方 slug 会连带丢掉内置能力元数据 ——
+/// 图像输入（Computer Use / Browser 需要截图）、`tool_mode: "code_mode_only"`、
+/// `node_repl_*`、`web_search_tool_type`，以及 medium/xhigh/ultra 推理档位与思考
+/// 摘要。因此官方 slug 必须交给 Codex 内置目录，绝不写进自建目录。
+///
+/// 这正是 cc-switch 的做法：面向官方模型的供应商（云渡）不生成目录，只有自定义
+/// 模型的供应商（DeepSeek 等）才生成，从而避免遮蔽内置定义。
+fn is_codex_native_model(model: &str) -> bool {
+    let slug = model.trim();
+    if slug.starts_with("gpt-") || slug.starts_with("codex-") {
+        return true;
+    }
+    // o 系列（o1/o3/o4 及 -mini/-pro 变体）。
+    let bytes = slug.as_bytes();
+    bytes.len() > 1 && bytes[0] == b'o' && bytes[1].is_ascii_digit()
+}
+
+/// 需要自建目录条目的模型 = Codex 内置目录不认识的第三方模型。
+///
+/// 返回空表示整份目录都不必生成（沿用 Codex 内置目录，官方能力保持完整）。
+fn codex_catalog_models(models: &[String]) -> Vec<String> {
+    models
+        .iter()
+        .filter(|model| !is_codex_native_model(model))
+        .cloned()
+        .collect()
+}
+
+// Codex 直连只接管必要字段：provider 端点、默认模型、登录方式，以及**按需**生成的
+// 模型目录。官方模型沿用 Codex 内置目录（对齐 cc-switch），只有第三方模型才写
+// model_catalog_json；key 按官方做法明文写入 experimental_bearer_token（仅本机 config.toml）。
 fn import_codex(
     options: &Options,
     expected_user_id: &str,
@@ -1622,22 +1653,49 @@ fn import_codex(
     }
     let models = available_models(&credential)?;
     let preferred = preferred_model(&credential)?;
-    let catalog = build_codex_models_json(&models)?;
+    // 只为 Codex 不认识的模型生成目录；官方模型沿用内置定义（见 is_codex_native_model）。
+    let catalog_models = codex_catalog_models(&models);
+    let catalog = if catalog_models.is_empty() {
+        None
+    } else {
+        Some(build_codex_models_json(&catalog_models)?)
+    };
+    // 写了目录就整体替换，默认模型必须落在目录内。
+    let default_model = if catalog.is_none() || catalog_models.iter().any(|model| model == &preferred)
+    {
+        preferred.clone()
+    } else {
+        catalog_models[0].clone()
+    };
     let config_file = config_path.join("config.toml");
     let original_config = if config_file.is_file() {
         fs::read_to_string(&config_file)?
     } else {
         String::new()
     };
-    let config = build_codex_config_toml(&original_config, &credential, &models_path, &preferred)?;
-    let catalog_backup = backup_and_write(&models_path, catalog.as_bytes())?;
+    let config = build_codex_config_toml(
+        &original_config,
+        &credential,
+        catalog.as_ref().map(|_| models_path.as_path()),
+        &default_model,
+    )?;
+    let catalog_backup = match &catalog {
+        Some(catalog) => backup_and_write(&models_path, catalog.as_bytes())?,
+        None => {
+            // 切回官方模型目录时清掉旧的 HiMind 目录，避免留下误导状态。
+            if models_path.is_file() {
+                fs::remove_file(&models_path)?;
+            }
+            None
+        }
+    };
     let config_backup = backup_and_write(&config_file, config.as_bytes())?;
     Ok(AIProviderImportResult {
         ok: true,
         target: "codex".to_string(),
         status: "configured".to_string(),
         model_count: models.len(),
-        model: preferred,
+        model: default_model,
         config_path: config_path
             .join("config.toml")
             .to_string_lossy()
@@ -1651,7 +1709,9 @@ fn import_codex(
     })
 }
 
-// 生成 Codex 直连（wire_api="responses"）的模型目录。条目形状对齐 cc-switch 的
+// 生成 Codex 直连（wire_api="responses"）的模型目录。调用方必须先用
+// `codex_catalog_models` 过滤掉 Codex 内置模型 —— 目录是整体替换语义，混入官方
+// slug 会遮蔽内置能力定义。条目形状对齐 cc-switch 的
 // `codex_native_responses_template.json`（其把 /responses 第三方网关归为
 // NativeResponses 档，用的就是这份中性模板）：
 //  * 每行必带 `base_instructions`（中性身份指令）。Codex 0.150 起目录解析器把
@@ -1712,25 +1772,39 @@ fn capitalize(value: &str) -> String {
     }
 }
 
-// config.toml 保留式合并：只接管 Codex 直连必需字段与 [model_providers.himind]，
-// mcp_servers、notify、marketplaces、plugins、[projects] 等用户配置原样保留。
+// config.toml 保留式合并：只接管 Codex 直连必需字段、可选的模型目录与
+// [model_providers.himind]，mcp_servers、notify、marketplaces、plugins、[projects]
+// 等用户配置原样保留。
+//
+// `model_reasoning_effort` 只在缺失时补默认值：用户（或 cc-switch，如云渡的 xhigh）
+// 已选好的档位必须保留，不能被固定值改写。
+// `catalog_path` 为 None 表示沿用 Codex 内置模型目录，此时要移除自建目录引用。
 fn build_codex_config_toml(
     original: &str,
     credential: &AIClientCredential,
-    models_path: &Path,
-    preferred: &str,
+    catalog_path: Option<&Path>,
+    model: &str,
 ) -> Result<String, Box<dyn Error>> {
     let endpoint = normalized_base_url(&credential.access.base_url)?;
-    let catalog_value = models_path.to_string_lossy().replace('\\', "/");
     let mut document = original
         .parse::<DocumentMut>()
         .map_err(|error| format!("Codex config.toml 格式无效：{error}"))?;
-    document["model"] = value(preferred);
+    document["model"] = value(model);
     document["model_provider"] = value(CODEX_PROVIDER_ID);
     document["preferred_auth_method"] = value("apikey");
     document["forced_login_method"] = value("api");
-    document["model_reasoning_effort"] = value("high");
-    document["model_catalog_json"] = value(catalog_value.as_str());
+    if document.get("model_reasoning_effort").is_none() {
+        document["model_reasoning_effort"] = value("high");
+    }
+    match catalog_path {
+        Some(path) => {
+            let catalog_value = path.to_string_lossy().replace('\\', "/");
+            document["model_catalog_json"] = value(catalog_value.as_str());
+        }
+        None => {
+            document.remove("model_catalog_json");
+        }
+    }
     let providers = document
         .as_table_mut()
         .entry("model_providers")
@@ -1762,12 +1836,15 @@ fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
         .ok()
         .unwrap_or_default();
     let imported = !models.is_empty() || codex_managed_provider_present(&config_file);
+    let catalog_configured = codex_managed_catalog_configured(&config_file, &models_path);
     AIProviderImportStatus {
         target: "codex".to_string(),
         state: if imported { "imported" } else { "not_imported" }.to_string(),
         client_detected,
-        detail: if imported && models.is_empty() {
+        detail: if imported && models.is_empty() && catalog_configured {
             "检测到 Codex 已配置 HiMind 供应商，但缺少模型目录（himind-models.json）；重新导入可自动重建".to_string()
+        } else if imported && models.is_empty() {
+            "已配置 HiMind 供应商，沿用 Codex 内置模型目录（官方模型能力保持完整）".to_string()
         } else if imported {
             format!(
                 "已写入 {} 个 HiMind 模型；重启 Codex 后可在 /model 选择",
@@ -1784,6 +1861,23 @@ fn codex_import_status(_options: &Options) -> AIProviderImportStatus {
         service: String::new(),
         ..Default::default()
     }
+}
+
+/// config.toml 的 `model_catalog_json` 是否指向 HiMind 自建目录。
+///
+/// 官方模型供应商不写目录，因此“没有目录文件”不等于“导入损坏”——必须结合该引用
+/// 才能区分「沿用内置目录」与「目录丢失」。
+fn codex_managed_catalog_configured(config_file: &Path, models_path: &Path) -> bool {
+    let catalog_target = models_path.to_string_lossy().replace('\\', "/");
+    fs::read_to_string(config_file)
+        .ok()
+        .and_then(|text| text.parse::<DocumentMut>().ok())
+        .is_some_and(|document| {
+            document
+                .get("model_catalog_json")
+                .and_then(|item| item.as_str())
+                .is_some_and(|value| value.replace('\\', "/") == catalog_target)
+        })
 }
 
 fn codex_managed_provider_present(config_file: &Path) -> bool {
@@ -7287,10 +7381,12 @@ mod tests {
         build_opencode_config, build_qoder_config, build_qwen_code_settings,
         build_vscode_enrollment_url, build_zcode_config, build_zcode_provider_rules,
         bundled_vscode_vsix_candidates, chat_completions_url, classify_anthropic_probe,
-        classify_openai_probe, compare_extension_versions,
+        classify_openai_probe, codex_catalog_models, codex_managed_catalog_configured,
+        compare_extension_versions,
         consume_vscode_enrollment, continue_himind_models, create_vscode_enrollment,
         crush_himind_models, ensure_anthropic_compatible, ensure_openai_compatible,
-        ensure_vscode_chat_provider_allowlist, find_vscode_extension_version, known_adapters,
+        ensure_vscode_chat_provider_allowlist, find_vscode_extension_version, is_codex_native_model,
+        known_adapters,
         legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
         migrate_workbuddy_sessions, opencode_anthropic_base_url, opencode_npm_for_protocol,
         label_satisfies_protocol, protocol_gate,
@@ -7868,6 +7964,92 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_codex_native_models() {
+        for slug in [
+            "gpt-6.1-sol",
+            "gpt-5.5",
+            "gpt-daybreak-blue-latest",
+            "codex-auto-review",
+            "o3",
+            "o4-mini",
+        ] {
+            assert!(is_codex_native_model(slug), "{slug} 应视为 Codex 内置模型");
+        }
+        for slug in ["deepseek-v4-flash", "glm-5.3", "qwen3.5-397b-a17b", "kimi-k3"] {
+            assert!(!is_codex_native_model(slug), "{slug} 不应视为 Codex 内置模型");
+        }
+    }
+
+    /// 目录是整体替换语义：官方 slug 一旦进入自建目录，内置能力（图像输入、xhigh/ultra
+    /// 档位、思考摘要等）就会被遮蔽，因此必须过滤掉。
+    #[test]
+    fn codex_catalog_models_excludes_native_models() {
+        let models = vec![
+            "gpt-6.1-sol".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "gpt-5.5".to_string(),
+            "glm-5.3".to_string(),
+        ];
+        assert_eq!(
+            codex_catalog_models(&models),
+            vec!["deepseek-v4-flash".to_string(), "glm-5.3".to_string()]
+        );
+        // 全为官方模型时不生成目录。
+        assert!(codex_catalog_models(&["gpt-6.1-sol".to_string()]).is_empty());
+    }
+
+    /// 官方模型供应商（如云渡）沿用 Codex 内置目录：不写 model_catalog_json，
+    /// 并清掉历史遗留的自建目录引用，同时保留用户已选好的推理档位。
+    #[test]
+    fn codex_config_drops_catalog_for_native_models() {
+        let original = r#"model_catalog_json = "C:/Users/Admin/.codex/himind-models.json"
+model_reasoning_effort = "xhigh"
+"#;
+        let config = build_codex_config_toml(
+            original,
+            &credential(&["gpt-6.1-sol"]),
+            None,
+            "gpt-6.1-sol",
+        )
+        .unwrap();
+        assert!(config.contains("model = \"gpt-6.1-sol\""));
+        assert!(config.contains("model_provider = \"himind\""));
+        assert!(config.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(
+            !config.contains("model_catalog_json"),
+            "内置模型不得携带自建目录引用：{config}"
+        );
+    }
+
+    #[test]
+    fn codex_managed_catalog_reference_is_detected() {
+        let stamp = format!("{}-{}", std::process::id(), super::unix_now_millis());
+        let dir = std::env::temp_dir().join(format!("himind-codex-catalog-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_file = dir.join("config.toml");
+        let models_path = dir.join("himind-models.json");
+
+        std::fs::write(
+            &config_file,
+            "model_catalog_json = \"../himind-models.json\"\n",
+        )
+        .unwrap();
+        assert!(!codex_managed_catalog_configured(&config_file, &models_path));
+
+        let normalized = models_path.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            &config_file,
+            format!("model_catalog_json = \"{normalized}\"\n"),
+        )
+        .unwrap();
+        assert!(codex_managed_catalog_configured(&config_file, &models_path));
+
+        std::fs::write(&config_file, "model = \"gpt-6.1-sol\"\n").unwrap();
+        assert!(!codex_managed_catalog_configured(&config_file, &models_path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn codex_config_merge_preserves_user_sections() {
         let original = r#"model_reasoning_effort = "medium"
 
@@ -7885,7 +8067,7 @@ wire_api = "responses"
         let config = build_codex_config_toml(
             original,
             &credential(&["deepseek-v4-flash"]),
-            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            Some(Path::new(r"C:\Users\Admin\.codex\himind-models.json")),
             "deepseek-v4-flash",
         )
         .unwrap();
@@ -7899,7 +8081,8 @@ wire_api = "responses"
         assert!(config.contains("[model_providers.himind]"));
         assert!(config.contains("experimental_bearer_token = \"test-secret-key\""));
         assert!(config.contains("base_url = \"https://ai.example.com/v1\""));
-        assert!(config.contains("model_reasoning_effort = \"high\""));
+        // 用户已选好的推理档位必须保留（对齐 cc-switch：只在缺失时补默认值）。
+        assert!(config.contains("model_reasoning_effort = \"medium\""));
         assert!(config.contains("notify = [\"codex-notify.exe\", \"turn-ended\"]"));
         assert!(config.contains("[mcp_servers.unityMCP]"));
         assert!(config.contains("[model_providers.deepseek]"));
@@ -7911,7 +8094,7 @@ wire_api = "responses"
         let error = build_codex_config_toml(
             "model = [",
             &credential(&["deepseek-v4-flash"]),
-            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            Some(Path::new(r"C:\Users\Admin\.codex\himind-models.json")),
             "deepseek-v4-flash",
         )
         .unwrap_err();
@@ -7925,7 +8108,7 @@ wire_api = "responses"
         let codex = build_codex_config_toml(
             "",
             &chat,
-            Path::new(r"C:\Users\Admin\.codex\himind-models.json"),
+            Some(Path::new(r"C:\Users\Admin\.codex\himind-models.json")),
             "model-a",
         )
         .unwrap();
