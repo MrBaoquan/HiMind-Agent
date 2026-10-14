@@ -2549,6 +2549,17 @@ tr:last-child td { border-bottom: 0; }
 .ai-service-client-chip { display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border: 1px solid #bfdbfe; border-radius: 5px; color: #1d4ed8; background: #eff6ff; }
 .ai-service-client-chip button { display: inline-grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; }
 .ai-service-client-chip button:disabled { opacity: .55; cursor: wait; }
+.ai-client-copy .ai-service-balance { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
+.ai-client-copy .ai-service-balance-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; color: var(--text-muted); font-size: 11px; }
+.ai-client-copy .ai-service-balance-copy > span { overflow: visible; color: var(--text); font-weight: 600; text-overflow: clip; white-space: normal; }
+.ai-client-copy .ai-service-balance-copy > small { color: var(--text-subtle); font-size: 10px; }
+.ai-client-copy .ai-service-balance-copy > .ai-service-balance-label { color: var(--text-muted); font-size: 10px; }
+.ai-client-copy .ai-service-balance-suggestion-label { color: var(--primary, #315efb); font-size: 10px; }
+.ai-client-copy .ai-service-balance-copy > .ai-service-balance-error { color: var(--danger, #b42318); }
+.ai-client-copy .ai-service-balance-refresh { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; min-height: 24px; padding: 2px 7px; font-size: 10px; white-space: nowrap; }
+.ai-client-copy .ai-service-balance-refresh:disabled { opacity: .65; cursor: wait; }
+.ai-service-balance-suggestion { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.ai-service-balance-suggestion .btn { min-height: 26px; padding: 3px 9px; font-size: 11px; white-space: nowrap; }
 /* 行内「谁在用」：`.ai-client-copy span` 默认是单行省略，这里要改回可换行，
    否则第二个工具名会被裁掉。选择器带 .ai-client-copy 前缀才压得住那条规则。 */
 .ai-client-copy .ai-service-imported-clients { overflow: visible; white-space: normal; text-overflow: clip; }
@@ -4062,6 +4073,8 @@ tr:last-child td { border-bottom: 0; }
   .ai-client-icon { width: 34px; height: 34px; }
   .ai-client-copy { padding-top: 1px; }
   .ai-client-copy strong, .ai-client-copy span { white-space: normal; overflow-wrap: anywhere; }
+  .ai-client-copy .ai-service-balance { align-items: flex-start; flex-wrap: wrap; }
+  .ai-client-copy .ai-service-balance-refresh { margin-left: auto; }
   .ai-client-row > .pill { grid-column: 2; justify-self: start; }
   .ai-client-registration-actions { grid-column: 1 / -1; min-width: 0; justify-content: stretch; padding-top: 9px; }
   .ai-client-registration-actions > .btn { flex: 1 1 132px; }

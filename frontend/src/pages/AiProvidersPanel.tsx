@@ -4,8 +4,9 @@ import { Pill } from '../components/Common';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { useConfirm } from '../components/ConfirmDialog';
 import { fallbackAiServicePresets, type AiServicePreset } from './aiServicePresets';
+import { inferBalanceProfile } from './balanceProfileMatching';
 import { clientLabel } from '../utils/clientLabels';
-import type { AIProviderImportStatus, AIServiceListResult, AIServiceProtocol, AIServiceTemplateListResult, CustomAIService, ManagedAIServiceSummary } from '../services/agentApi';
+import type { AIProviderImportStatus, AIServiceBalanceSnapshot, AIServiceListResult, AIServiceProtocol, AIServiceTemplateListResult, CustomAIService, ManagedAIServiceSummary } from '../services/agentApi';
 
 const protocolOptions: Array<{ value: AIServiceProtocol; label: string }> = [
   { value: 'openai-responses', label: 'OpenAI Responses' },
@@ -18,6 +19,29 @@ const protocolLabels: Record<AIServiceProtocol, string> = {
   'openai-chat': 'Chat',
   anthropic: 'Anthropic',
 };
+
+const balanceProfileOptions = [
+  { value: 'deepseek', label: 'DeepSeek 官方账户余额' },
+  { value: 'kimi', label: 'Kimi / Moonshot 官方账户余额' },
+  { value: 'kimi-coding', label: 'Kimi Coding Plan 套餐配额' },
+  { value: 'zhipu-plan', label: '智谱 GLM Coding Plan 配额' },
+  { value: 'minimax-plan-cn', label: 'MiniMax Coding Plan 国内版' },
+  { value: 'minimax-plan-en', label: 'MiniMax Coding Plan 国际版' },
+  { value: 'stepfun', label: 'StepFun 官方账户余额' },
+  { value: 'siliconflow', label: 'SiliconFlow 国内账户余额' },
+  { value: 'siliconflow-en', label: 'SiliconFlow 国际站余额' },
+  { value: 'openrouter', label: 'OpenRouter 账户余额' },
+  { value: 'novita', label: 'Novita AI 账户余额' },
+  { value: 'relay-balance', label: '兼容中转 · /user/balance' },
+  { value: 'new-api', label: 'New API · 用户额度' },
+  { value: 'sub2api', label: 'Sub2API · 用量余额' },
+  { value: 'opencode-go', label: 'OpenCode Go · 套餐窗口' },
+] as const;
+
+function balanceProfileForPreset(baseUrl: string): string {
+  return inferBalanceProfile(baseUrl) ?? '';
+}
+
 
 type AiProvidersPanelProps = {
   aiServices: AIServiceListResult | null;
@@ -36,6 +60,9 @@ type AiProvidersPanelProps = {
     image_edit_adapter: string;
     video_model: string;
     video_adapter: string;
+    balance_profile_id: string;
+    balance_access_token: string;
+    balance_user_id: string;
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
@@ -44,6 +71,7 @@ type AiProvidersPanelProps = {
   onOpenAccount: () => void;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
+  onFetchBalance: (id: string) => Promise<AIServiceBalanceSnapshot>;
 };
 
 const emptyDraft = {
@@ -59,6 +87,9 @@ const emptyDraft = {
   image_edit_adapter: '',
   video_model: '',
   video_adapter: '',
+  balance_profile_id: '',
+  balance_access_token: '',
+  balance_user_id: '',
   api_key: '',
 };
 
@@ -73,6 +104,7 @@ export function AiProvidersPanel({
   onOpenAccount,
   onFetchModels,
   onFetchSavedModels,
+  onFetchBalance,
 }: AiProvidersPanelProps) {
   const [formOpen, setFormOpen] = useState(false);
   const [editingServiceId, setEditingServiceId] = useState<string | null>(null);
@@ -80,6 +112,9 @@ export function AiProvidersPanel({
   const [saving, setSaving] = useState(false);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [formError, setFormError] = useState('');
+  const [balanceSnapshots, setBalanceSnapshots] = useState<Record<string, AIServiceBalanceSnapshot>>(aiServices?.custom?.balances ?? {});
+  const [balanceRefreshingId, setBalanceRefreshingId] = useState<string | null>(null);
+  const [balanceErrors, setBalanceErrors] = useState<Record<string, string>>({});
   const [settingActive, setSettingActive] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState<string>('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -94,6 +129,10 @@ export function AiProvidersPanel({
   const clientStatuses = aiServices?.clients?.targets ?? [];
   const serviceCount = customServices.length + (independentMode || !managed.available ? 0 : 1);
   const editing = editingServiceId !== null;
+
+  useEffect(() => {
+    setBalanceSnapshots(aiServices?.custom?.balances ?? {});
+  }, [aiServices?.custom?.balances]);
 
   useEffect(() => {
     if (!formOpen) {
@@ -190,6 +229,9 @@ export function AiProvidersPanel({
       image_edit_adapter: '',
       video_model: '',
       video_adapter: '',
+      balance_profile_id: balanceProfileForPreset(preset.base_url),
+      balance_access_token: '',
+      balance_user_id: '',
       api_key: '',
     });
   }
@@ -208,6 +250,10 @@ export function AiProvidersPanel({
 
   async function saveService() {
     if (!draft.id.trim() || !draft.display_name.trim() || !draft.base_url.trim() || !draft.model.trim() || (!editing && !draft.api_key.trim())) return;
+    if (draft.balance_profile_id === 'new-api' && !draft.balance_user_id.trim()) {
+      setFormError('New API 余额查询需要填写 User ID。');
+      return;
+    }
     setFormError('');
     setSaving(true);
     try {
@@ -224,6 +270,9 @@ export function AiProvidersPanel({
         image_edit_adapter: draft.image_edit_adapter,
         video_model: draft.video_model.trim(),
         video_adapter: draft.video_adapter,
+        balance_profile_id: draft.balance_profile_id,
+        balance_access_token: draft.balance_access_token.trim(),
+        balance_user_id: draft.balance_user_id.trim(),
         api_key: draft.api_key.trim(),
       });
       setDraft(emptyDraft);
@@ -234,6 +283,23 @@ export function AiProvidersPanel({
       setFormError(formatAIServiceError(error, '保存服务失败，请检查连接信息后重试。'));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function refreshBalance(serviceId: string) {
+    if (balanceRefreshingId) return;
+    setBalanceRefreshingId(serviceId);
+    setBalanceErrors((current) => ({ ...current, [serviceId]: '' }));
+    try {
+      const snapshot = await onFetchBalance(serviceId);
+      setBalanceSnapshots((current) => ({ ...current, [serviceId]: snapshot }));
+    } catch (error) {
+      setBalanceErrors((current) => ({
+        ...current,
+        [serviceId]: formatAIServiceError(error, '余额查询失败，请稍后重试。'),
+      }));
+    } finally {
+      setBalanceRefreshingId(null);
     }
   }
 
@@ -280,6 +346,9 @@ export function AiProvidersPanel({
       image_edit_adapter: service.media?.['image.edit']?.adapter ?? '',
       video_model: service.media?.['video.generate']?.model ?? '',
       video_adapter: service.media?.['video.generate']?.adapter ?? '',
+      balance_profile_id: service.balance_profile_id ?? '',
+      balance_access_token: '',
+      balance_user_id: service.balance_user_id ?? '',
       api_key: '',
     });
     setFormError('');
@@ -370,6 +439,11 @@ export function AiProvidersPanel({
               service={service}
               active={chatRouteValue === service.id}
               clientStatuses={clientStatuses}
+              balanceSnapshot={balanceSnapshots[service.id]}
+              balanceLoading={balanceRefreshingId === service.id}
+              balanceBusy={balanceRefreshingId !== null}
+              balanceError={balanceErrors[service.id] ?? ''}
+              onRefreshBalance={() => void refreshBalance(service.id)}
               onEdit={() => openEditService(service)}
               onRemove={() => void onRemoveAIService(service.id)}
             />
@@ -439,6 +513,25 @@ export function AiProvidersPanel({
               </div>
 
               <div className="ai-service-form-group">
+                <div className="ai-service-group-label">余额与套餐额度</div>
+                <div className="ai-service-form-grid">
+                  <label className="field-label ai-service-field ai-service-field-wide"><span>余额/额度查询模板</span><select value={draft.balance_profile_id} onChange={(event) => setDraft((current) => ({ ...current, balance_profile_id: event.target.value }))}>
+                    <option value="">不查询账户余额</option>
+                    {balanceProfileOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select></label>
+                </div>
+                {!draft.balance_profile_id && inferBalanceProfile(draft.base_url) ? <div className="ai-service-balance-suggestion">
+                  <small className="ai-service-hint">按 HTTPS 主机建议：{balanceProfileOptions.find((option) => option.value === inferBalanceProfile(draft.base_url))?.label}。不会自动发起网络请求。</small>
+                  <button type="button" className="btn" onClick={() => setDraft((current) => ({ ...current, balance_profile_id: inferBalanceProfile(current.base_url) ?? '' }))}>应用建议</button>
+                </div> : null}
+                {draft.balance_profile_id === 'new-api' ? <div className="ai-service-form-grid">
+                  <label className="field-label ai-service-field"><span>New API Access Token（可留空使用 API Key）</span><input type="password" value={draft.balance_access_token} onChange={(event) => setDraft((current) => ({ ...current, balance_access_token: event.target.value }))} placeholder={editing ? '留空以保留当前 Token' : 'Access Token'} /></label>
+                  <label className="field-label ai-service-field"><span>New API User ID</span><input value={draft.balance_user_id} onChange={(event) => setDraft((current) => ({ ...current, balance_user_id: event.target.value }))} placeholder="用户 ID" /></label>
+                </div> : null}
+                <small className="ai-service-hint">仅手动查询；中转请求留在服务同源。New API 按 500,000 quota ≈ $1 换算。OpenCode Go 接口未公开文档，可能变更。</small>
+              </div>
+
+              <div className="ai-service-form-group">
                 <div className="ai-service-group-label">凭据</div>
                 <div className="ai-service-form-grid">
                   <label className="field-label ai-service-field ai-service-field-wide"><span>API Key</span><input type="password" value={draft.api_key} onChange={(event) => setDraft((current) => ({ ...current, api_key: event.target.value }))} placeholder={editing ? '留空以保留当前 Key' : 'sk-...'} /></label>
@@ -497,10 +590,40 @@ function SourceUsageChips({ clients }: { clients: AIProviderImportStatus[] }) {
   );
 }
 
-function CustomSourceRow({ service, active, clientStatuses, onEdit, onRemove }: {
+function formatBalanceAmount(value: number, currency: string) {
+  const amount = Number.isFinite(value) ? value.toFixed(2) : '—';
+  if (currency === 'CNY') return `¥${amount}`;
+  if (currency === 'USD') return `$${amount}`;
+  return `${amount} ${currency}`;
+}
+
+function formatBalanceObservedAt(timestamp: string) {
+  const seconds = Number(timestamp);
+  const date = Number.isFinite(seconds) && seconds > 0
+    ? new Date(seconds * 1000)
+    : new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString();
+}
+
+function balanceComponentLabel(key: string) {
+  const labels: Record<string, string> = {
+    granted_balance: '赠送余额',
+    topped_up_balance: '充值余额',
+    cash_balance: '现金余额',
+    voucher_balance: '代金券余额',
+  };
+  return labels[key] ?? key;
+}
+
+function CustomSourceRow({ service, active, clientStatuses, balanceSnapshot, balanceLoading, balanceBusy, balanceError, onRefreshBalance, onEdit, onRemove }: {
   service: CustomAIService;
   active: boolean;
   clientStatuses: AIProviderImportStatus[];
+  balanceSnapshot?: AIServiceBalanceSnapshot;
+  balanceLoading: boolean;
+  balanceBusy: boolean;
+  balanceError: string;
+  onRefreshBalance: () => void;
   onEdit: () => void;
   onRemove: () => void;
 }) {
@@ -515,6 +638,28 @@ function CustomSourceRow({ service, active, clientStatuses, onEdit, onRemove }: 
       <div className="ai-client-copy">
         <strong>{service.display_name}</strong>
         <span title={summary}>{summary}</span>
+        {!service.balance_profile_id && service.suggested_balance_profile_id ? <small className="ai-service-balance-suggestion-label">检测建议：{balanceProfileOptions.find((option) => option.value === service.suggested_balance_profile_id)?.label ?? '手动配置'}</small> : null}
+        {service.balance_profile_id ? (
+          <div className="ai-service-balance" aria-live="polite">
+            <div className="ai-service-balance-copy">
+              {balanceSnapshot?.kind === 'quota' ? <>
+                <small className="ai-service-balance-label">{balanceSnapshot.plan_name ?? '套餐配额'}</small>
+                {balanceSnapshot.quota_windows.map((window) => <span key={window.name} title={window.resets_at ? `重置时间 ${formatBalanceObservedAt(window.resets_at)}` : undefined}>
+                  {window.name} 剩余 {window.remaining_percent.toFixed(0)}%
+                </span>)}
+              </> : balanceSnapshot ? balanceSnapshot.balances.map((balance, index) => (
+                <span key={`${balance.currency}-${index}`} title={Object.entries(balance.components ?? {}).map(([key, value]) => `${balanceComponentLabel(key)} ${formatBalanceAmount(value, balance.currency)}`).join(' · ')}>
+                  {balanceSnapshot.kind === 'usage' ? <><small className="ai-service-balance-label">{balanceSnapshot.plan_name ? `${balanceSnapshot.plan_name} · ` : ''}剩余</small> </> : <small className="ai-service-balance-label">余额 </small>}{balanceSnapshot.is_available === false ? '账户不可用 · ' : ''}{formatBalanceAmount(balance.available, balance.currency)}
+                </span>
+              )) : <><small className="ai-service-balance-label">余额/额度</small><span>{balanceLoading ? '正在查询…' : '尚未查询'}</span></>}
+              {balanceSnapshot?.observed_at ? <small>更新于 {formatBalanceObservedAt(balanceSnapshot.observed_at)}</small> : null}
+              {balanceError ? <small className="ai-service-balance-error" role="status">{balanceError}</small> : null}
+            </div>
+            <button type="button" className="btn ai-service-balance-refresh" onClick={onRefreshBalance} disabled={balanceBusy} aria-label={`${service.display_name} 查询余额`}>
+              {balanceLoading ? <BusyIndicator size={12} /> : <RefreshCw size={12} />}{balanceSnapshot ? '刷新' : '查询'}
+            </button>
+          </div>
+        ) : null}
         <SourceUsageChips clients={boundClients} />
       </div>
       <Pill kind={boundClients.length ? 'success' : 'neutral'}>{boundClients.length ? `已分发 ${boundClients.length} 个` : '未分发'}</Pill>

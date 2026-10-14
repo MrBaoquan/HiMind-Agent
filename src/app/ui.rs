@@ -473,6 +473,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::remove_ai_client,
             super::commands::fetch_ai_service_models,
             super::commands::fetch_saved_ai_service_models,
+            super::commands::fetch_saved_ai_service_balance,
             super::commands::get_skill_catalog,
             super::commands::import_local_skill,
             super::commands::import_github_skill,

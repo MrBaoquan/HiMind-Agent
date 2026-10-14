@@ -5,6 +5,7 @@ import { AiToolsPanel } from './AiToolsPanel';
 import { AiProvidersPanel } from './AiProvidersPanel';
 import type {
   AIServiceProtocol,
+  AIServiceBalanceSnapshot,
   AIServiceListResult,
   AIServiceTemplateListResult,
   AcpRuntimeProfileInput,
@@ -52,6 +53,9 @@ type AiConnectionsPageProps = {
     image_edit_adapter: string;
     video_model: string;
     video_adapter: string;
+    balance_profile_id: string;
+    balance_access_token: string;
+    balance_user_id: string;
     api_key: string;
   }) => Promise<void>;
   onSetActiveAIService: (id: string) => Promise<void>;
@@ -61,6 +65,7 @@ type AiConnectionsPageProps = {
   onRemoveAIClient: (target: string) => Promise<void>;
   onFetchModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => Promise<string[]>;
   onFetchSavedModels: (id: string, base_url: string) => Promise<string[]>;
+  onFetchBalance: (id: string) => Promise<AIServiceBalanceSnapshot>;
   onSaveAcpProfile: (input: AcpRuntimeProfileInput) => Promise<void>;
   onSetAcpProfileEnabled: (providerId: string, enabled: boolean) => Promise<void>;
   onRemoveAcpProfile: (providerId: string) => Promise<void>;
@@ -109,6 +114,7 @@ export function AiConnectionsPage({
   onRemoveAIClient,
   onFetchModels,
   onFetchSavedModels,
+  onFetchBalance,
   onSaveAcpProfile,
   onSetAcpProfileEnabled,
   onRemoveAcpProfile,
@@ -176,6 +182,7 @@ export function AiConnectionsPage({
             onOpenAccount={onOpenAccount}
             onFetchModels={onFetchModels}
             onFetchSavedModels={onFetchSavedModels}
+            onFetchBalance={onFetchBalance}
           />
         </div>
       ) : (

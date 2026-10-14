@@ -1,5 +1,6 @@
 pub(crate) mod acp_profiles;
 pub(crate) mod acp_sessions;
+pub(crate) mod ai_service_balances;
 pub(crate) mod ai_services;
 pub(crate) mod approval_outbox;
 pub(crate) mod atomic_file;

@@ -2871,6 +2871,9 @@ pub(crate) fn save_ai_service(
     image_edit_adapter: Option<String>,
     video_model: Option<String>,
     video_adapter: Option<String>,
+    balance_profile_id: Option<String>,
+    balance_access_token: Option<String>,
+    balance_user_id: Option<String>,
     api_key: String,
 ) -> Result<serde_json::Value, String> {
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
@@ -2900,20 +2903,28 @@ pub(crate) fn save_ai_service(
             },
         );
     }
-    let service =
-        crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
-            id,
-            display_name,
-            base_url,
-            protocol,
-            model,
-            models,
-            image_model,
-            image_adapter,
-            media,
-            api_key,
-        })
-        .map_err(|e| e.to_string())?;
+    let input = crate::store::ai_services::CustomAIServiceInput {
+        id,
+        display_name,
+        base_url,
+        protocol,
+        model,
+        models,
+        image_model,
+        image_adapter,
+        media,
+        api_key,
+    };
+    let service = match balance_profile_id.as_deref() {
+        Some(profile_id) => crate::store::ai_services::upsert_with_balance_profile(
+            input,
+            Some(profile_id),
+            balance_access_token.as_deref(),
+            balance_user_id.as_deref(),
+        ),
+        None => crate::store::ai_services::upsert(input),
+    }
+    .map_err(|e| e.to_string())?;
     if crate::store::ai_services::active_id()
         .map_err(|e| e.to_string())?
         .as_deref()
@@ -3027,6 +3038,18 @@ pub(crate) fn fetch_saved_ai_service_models(
     let models = crate::store::ai_services::fetch_models(&base_url, &api_key, service.protocol)
         .map_err(|e| e.to_string())?;
     Ok(json!({ "models": models }))
+}
+
+#[tauri::command]
+pub(crate) async fn fetch_saved_ai_service_balance(
+    id: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = crate::app::ai_service_balance::refresh_saved_balance(&id)?;
+        serde_json::to_value(snapshot).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

@@ -2034,6 +2034,7 @@ function AgentApp() {
       onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型服务已删除', '删除模型服务失败')}
       onFetchModels={(input) => agentApi.fetchAIServiceModels(input).then((result) => result.models)}
       onFetchSavedModels={(id, baseUrl) => agentApi.fetchSavedAIServiceModels(id, baseUrl).then((result) => result.models)}
+      onFetchBalance={(id) => agentApi.fetchSavedAIServiceBalance(id)}
       onImportAIClient={async (target, service, replace) => {
         try {
           const result = await agentApi.importAIClient(target, service, replace);

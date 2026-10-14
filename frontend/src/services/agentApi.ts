@@ -2604,6 +2604,9 @@ export type CustomAIService = {
     image_adapter: string;
     /** 媒体能力槽位：`image.generate` / `image.edit` / `video.generate` → 适配器 + 模型。 */
     media?: Record<string, { adapter: string; model: string }>;
+    balance_profile_id?: string | null;
+    balance_user_id?: string | null;
+    suggested_balance_profile_id?: string | null;
     created_at: string;
     updated_at: string;
 };
@@ -2635,9 +2638,28 @@ export type ManagedAIServiceSummary = {
     status?: string;
 };
 
+export type AIServiceBalanceCurrency = {
+    currency: string;
+    available: number;
+    total?: number | null;
+    components: Record<string, number>;
+};
+
+export type AIServiceBalanceSnapshot = {
+    provider_profile_id: string;
+    kind: 'balance' | 'usage' | 'quota';
+    balances: AIServiceBalanceCurrency[];
+    plan_name?: string | null;
+    quota_windows: Array<{ name: string; used_percent: number; remaining_percent: number; resets_at?: string | null }>;
+    is_available?: boolean | null;
+    /** Unix timestamp in seconds. */
+    observed_at: string;
+};
+
 export type AIServiceListResult = {
     custom: {
         services: CustomAIService[];
+        balances?: Record<string, AIServiceBalanceSnapshot>;
         active_service_id?: string;
         image_service_id?: string;
         media_services?: Record<string, string>;
@@ -3040,13 +3062,14 @@ export const agentApi = {
     capabilities: () => invoke<CapabilityItem[]>('get_agent_capabilities'),
     fetchAIServiceModels: (input: { base_url: string; api_key: string; protocol: AIServiceProtocol }) => invoke<AIServiceModelListResult>('fetch_ai_service_models', { baseUrl: input.base_url, apiKey: input.api_key, protocol: input.protocol }),
     fetchSavedAIServiceModels: (id: string, baseUrl: string) => invoke<AIServiceModelListResult>('fetch_saved_ai_service_models', { id, baseUrl }),
+    fetchSavedAIServiceBalance: (id: string) => invoke<AIServiceBalanceSnapshot>('fetch_saved_ai_service_balance', { id }),
     listAIServices: () => invoke<AIServiceListResult>('list_ai_services'),
     listAIServiceTemplates: () => invoke<AIServiceTemplateListResult>('list_ai_service_templates'),
     acpRuntimeProfiles: () => invoke<AcpRuntimeProfileSnapshot>('list_acp_runtime_profiles'),
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -3060,6 +3083,9 @@ export const agentApi = {
             imageEditAdapter: input.image_edit_adapter,
             videoModel: input.video_model,
             videoAdapter: input.video_adapter,
+            balanceProfileId: input.balance_profile_id,
+            balanceAccessToken: input.balance_access_token,
+            balanceUserId: input.balance_user_id,
             apiKey: input.api_key,
         }),
     setActiveAIService: (id: string) => invoke<{ active_service_id: string }>('set_active_ai_service', { id }),

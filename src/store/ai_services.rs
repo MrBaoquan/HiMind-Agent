@@ -8,6 +8,23 @@ use super::credentials::{protect_secret_for_current_user, unprotect_secret_for_c
 
 const STORE_FILE: &str = "ai-services.json";
 const SELECTION_FILE: &str = "ai-service-selection.json";
+pub(crate) const SUPPORTED_BALANCE_PROFILES: &[&str] = &[
+    "deepseek",
+    "kimi",
+    "kimi-coding",
+    "zhipu-plan",
+    "minimax-plan-cn",
+    "minimax-plan-en",
+    "stepfun",
+    "siliconflow",
+    "siliconflow-en",
+    "openrouter",
+    "novita",
+    "relay-balance",
+    "new-api",
+    "sub2api",
+    "opencode-go",
+];
 
 /// Anthropic Messages 协议要求的版本头；`/v1/models` 与 `/v1/messages` 共用。
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -90,6 +107,14 @@ pub(crate) struct CustomAIService {
     /// `image_model` / `image_adapter` 是 `image.generate` 槽位的旧投影，二者保持一致。
     #[serde(default)]
     pub media: std::collections::BTreeMap<String, MediaModelBinding>,
+    /// Provider-specific account-balance endpoint profile, independent of the chat protocol.
+    #[serde(default)]
+    pub balance_profile_id: Option<String>,
+    #[serde(default)]
+    pub balance_user_id: Option<String>,
+    /// Optional New API access token, separately DPAPI-protected.
+    #[serde(default)]
+    encrypted_balance_access_token: Option<String>,
     /// DPAPI 加密后的 API Key，不落明文。
     encrypted_api_key: String,
     pub created_at: String,
@@ -110,6 +135,12 @@ struct PersistedCustomAIService {
     image_adapter: String,
     #[serde(default)]
     media: std::collections::BTreeMap<String, MediaModelBinding>,
+    #[serde(default)]
+    balance_profile_id: Option<String>,
+    #[serde(default)]
+    balance_user_id: Option<String>,
+    #[serde(default)]
+    encrypted_balance_access_token: Option<String>,
     encrypted_api_key: String,
     created_at: String,
     updated_at: String,
@@ -140,6 +171,9 @@ impl From<PersistedCustomAIService> for CustomAIService {
             image_model: value.image_model,
             image_adapter: value.image_adapter,
             media: value.media,
+            balance_profile_id: value.balance_profile_id,
+            balance_user_id: value.balance_user_id,
+            encrypted_balance_access_token: value.encrypted_balance_access_token,
             encrypted_api_key: value.encrypted_api_key,
             created_at: value.created_at,
             updated_at: value.updated_at,
@@ -159,6 +193,9 @@ impl From<&CustomAIService> for PersistedCustomAIService {
             image_model: value.image_model.clone(),
             image_adapter: value.image_adapter.clone(),
             media: value.media.clone(),
+            balance_profile_id: value.balance_profile_id.clone(),
+            balance_user_id: value.balance_user_id.clone(),
+            encrypted_balance_access_token: value.encrypted_balance_access_token.clone(),
             encrypted_api_key: value.encrypted_api_key.clone(),
             created_at: value.created_at.clone(),
             updated_at: value.updated_at.clone(),
@@ -200,6 +237,10 @@ impl CustomAIService {
             "image_model": self.image_model,
             "image_adapter": self.image_adapter,
             "media": self.media,
+            "balance_profile_id": self.balance_profile_id,
+            "balance_user_id": self.balance_user_id,
+            "suggested_balance_profile_id":
+                crate::app::ai_service_balance::suggest_balance_profile(&self.base_url),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         })
@@ -288,6 +329,7 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
     let services = list()?;
     Ok(serde_json::json!({
         "services": services.iter().map(|item| item.public_json()).collect::<Vec<_>>(),
+        "balances": crate::store::ai_service_balances::list(),
         "active_service_id": active_id()?.unwrap_or_default(),
         "image_service_id": image_service_id()?.unwrap_or_default(),
         "media_services": load_selection()?.media_services,
@@ -295,6 +337,32 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
 }
 
 pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box<dyn Error>> {
+    upsert_internal(input, None, None, None)
+}
+
+/// Upserts a service while explicitly selecting or clearing its balance-query profile.
+/// The legacy `upsert` entry point preserves an existing profile for non-UI callers.
+pub(crate) fn upsert_with_balance_profile(
+    input: CustomAIServiceInput,
+    balance_profile_id: Option<&str>,
+    balance_access_token: Option<&str>,
+    balance_user_id: Option<&str>,
+) -> Result<CustomAIService, Box<dyn Error>> {
+    let profile = match balance_profile_id.map(str::trim) {
+        Some("") | None => None,
+        Some(value) => Some(normalize_balance_profile_id(value)?),
+    };
+    let access_token = balance_access_token.map(str::trim).filter(|value| !value.is_empty());
+    let user_id = balance_user_id.map(str::trim).filter(|value| !value.is_empty());
+    upsert_internal(input, Some(profile), access_token, user_id.map(str::to_string))
+}
+
+fn upsert_internal(
+    input: CustomAIServiceInput,
+    profile_override: Option<Option<String>>,
+    balance_access_token: Option<&str>,
+    balance_user_id: Option<String>,
+) -> Result<CustomAIService, Box<dyn Error>> {
     let id = normalize_id(&input.id)?;
     validate_base_url(&input.base_url)?;
     if input.display_name.trim().is_empty() {
@@ -306,6 +374,33 @@ pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box
     let now = crate::app::ai_provider_import::unix_now_seconds().to_string();
     let mut services = load_all()?;
     let existing = services.get(&id);
+    let normalized_base_url = input.base_url.trim().trim_end_matches('/').to_string();
+    let balance_profile_id = profile_override
+        .unwrap_or_else(|| existing.and_then(|item| item.balance_profile_id.clone()));
+    let api_key_replaced = !input.api_key.trim().is_empty();
+    let balance_user_id = if balance_profile_id.as_deref() == Some("new-api") {
+        balance_user_id.or_else(|| existing.and_then(|item| item.balance_user_id.clone()))
+    } else {
+        None
+    };
+    if balance_profile_id.as_deref() == Some("new-api") && balance_user_id.is_none() {
+        return Err("New API 余额查询需要填写 User ID".into());
+    }
+    let encrypted_balance_access_token = if balance_profile_id.as_deref() == Some("new-api") {
+        match balance_access_token {
+            Some(token) => Some(protect_secret_for_current_user(token)?),
+            None => existing.and_then(|item| item.encrypted_balance_access_token.clone()),
+        }
+    } else {
+        None
+    };
+    let invalidate_balance = existing.is_some_and(|item| {
+        item.base_url != normalized_base_url
+            || item.balance_profile_id != balance_profile_id
+            || item.balance_user_id != balance_user_id
+            || item.encrypted_balance_access_token != encrypted_balance_access_token
+            || api_key_replaced
+    });
     // 能力槽位是事实源；`image_model` / `image_adapter` 作为 `image.generate`
     // 槽位的旧投影一并写回，保证旧版本 Agent 仍能读到生图配置。
     let mut media = input
@@ -361,7 +456,7 @@ pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box
     let service = CustomAIService {
         id: id.clone(),
         display_name: input.display_name.trim().to_string(),
-        base_url: input.base_url.trim().trim_end_matches('/').to_string(),
+        base_url: normalized_base_url,
         protocol: input.protocol,
         model: input.model.trim().to_string(),
         models: input
@@ -373,14 +468,20 @@ pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box
         image_model: legacy_image_model.clone(),
         image_adapter: legacy_image_adapter.clone(),
         media,
+        balance_profile_id,
+        balance_user_id,
+        encrypted_balance_access_token,
         encrypted_api_key,
         created_at: existing
             .map(|item| item.created_at.clone())
             .unwrap_or_else(|| now.clone()),
         updated_at: now,
     };
-    services.insert(id, service.clone());
+    services.insert(id.clone(), service.clone());
     save_all(&services)?;
+    if invalidate_balance {
+        let _ = crate::store::ai_service_balances::remove(&id);
+    }
     Ok(service)
 }
 
@@ -390,11 +491,33 @@ pub(crate) fn remove(id: &str) -> Result<bool, Box<dyn Error>> {
     let removed = services.remove(id).is_some();
     if removed {
         save_all(&services)?;
+        let _ = crate::store::ai_service_balances::remove(id);
         if active_id()?.as_deref() == Some(id) {
             set_active("")?;
         }
     }
     Ok(removed)
+}
+
+fn normalize_balance_profile_id(value: &str) -> Result<String, Box<dyn Error>> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if SUPPORTED_BALANCE_PROFILES.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(format!("不支持的余额查询档案：{value}").into())
+    }
+}
+
+pub(crate) fn load_balance_credentials(
+    id: &str,
+) -> Result<(CustomAIService, String, Option<String>, Option<String>), Box<dyn Error>> {
+    let (service, api_key) = load_secret(id)?;
+    let access_token = service
+        .encrypted_balance_access_token
+        .as_deref()
+        .map(unprotect_secret_for_current_user)
+        .transpose()?;
+    Ok((service.clone(), api_key, access_token, service.balance_user_id.clone()))
 }
 
 pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn Error>> {
@@ -769,6 +892,122 @@ api_key: "sk-test-secret-123".to_string(),
                 super::load_secret("my-gateway").is_err(),
                 "removed service must not resolve"
             );
+        });
+    }
+
+    fn balance_test_service(api_key: &str) -> CustomAIServiceInput {
+        CustomAIServiceInput {
+            id: "deepseek-account".to_string(),
+            display_name: "DeepSeek 余额测试".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            protocol: AIServiceProtocol::OpenaiResponses,
+            model: "deepseek-chat".to_string(),
+            models: vec!["deepseek-chat".to_string()],
+            image_model: String::new(),
+            image_adapter: String::new(),
+            media: Default::default(),
+            api_key: api_key.to_string(),
+        }
+    }
+
+    #[test]
+    fn balance_profile_is_persisted_preserved_and_cache_cleared_on_key_rotation() {
+        with_isolated_home(|| {
+            let service = super::upsert_with_balance_profile(
+                balance_test_service("sk-first"),
+                Some(" DeepSeek "),
+                None,
+                None,
+            )
+            .expect("save profile");
+            assert_eq!(service.balance_profile_id.as_deref(), Some("deepseek"));
+
+            let (reloaded, _) = super::load_secret("deepseek-account").expect("reload service");
+            assert_eq!(reloaded.balance_profile_id.as_deref(), Some("deepseek"));
+            assert!(super::upsert_with_balance_profile(
+                balance_test_service(""),
+                Some("unknown"),
+                None,
+                None,
+            )
+                .is_err());
+
+            let cached = crate::store::ai_service_balances::AISourceBalanceSnapshot {
+                provider_profile_id: "deepseek".to_string(),
+                kind: "balance".to_string(),
+                balances: vec![crate::store::ai_service_balances::BalanceCurrency {
+                    currency: "USD".to_string(),
+                    available: 1.25,
+                    total: Some(1.25),
+                    components: Default::default(),
+                }],
+                plan_name: None,
+                quota_windows: Vec::new(),
+                is_available: Some(true),
+                observed_at: "1".to_string(),
+            };
+            crate::store::ai_service_balances::save("deepseek-account", cached)
+                .expect("cache balance");
+
+            let preserved = super::upsert(balance_test_service(""))
+                .expect("legacy update preserves profile");
+            assert_eq!(preserved.balance_profile_id.as_deref(), Some("deepseek"));
+            assert!(crate::store::ai_service_balances::list().contains_key("deepseek-account"));
+
+            super::upsert(balance_test_service("sk-rotated"))
+                .expect("rotate API key");
+            assert!(!crate::store::ai_service_balances::list().contains_key("deepseek-account"));
+        });
+    }
+
+    #[test]
+    fn new_api_balance_token_is_encrypted_and_not_returned_in_public_service() {
+        with_isolated_home(|| {
+            let mut input = balance_test_service("sk-inference");
+            let saved = super::upsert_with_balance_profile(
+                input.clone(),
+                Some("new-api"),
+                Some("access-token-secret"),
+                Some("42"),
+            )
+            .expect("save New API credentials");
+            assert_eq!(saved.balance_profile_id.as_deref(), Some("new-api"));
+            assert_eq!(saved.balance_user_id.as_deref(), Some("42"));
+            let public = saved.public_json().to_string();
+            assert!(!public.contains("access-token-secret"));
+            assert!(!public.contains("encrypted_balance_access_token"));
+
+            let (loaded, api_key, access_token, user_id) =
+                super::load_balance_credentials("deepseek-account").expect("load balance credentials");
+            assert_eq!(api_key, "sk-inference");
+            assert_eq!(access_token.as_deref(), Some("access-token-secret"));
+            assert_eq!(user_id.as_deref(), Some("42"));
+
+            input.display_name = "updated".to_string();
+            let preserved = super::upsert_with_balance_profile(input, Some("new-api"), None, Some("43"))
+                .expect("preserve saved access token when editing without re-entering it");
+            assert_eq!(preserved.balance_user_id.as_deref(), Some("43"));
+            let (_, _, access_token, _) = super::load_balance_credentials("deepseek-account")
+                .expect("reload preserved access token");
+            assert_eq!(access_token.as_deref(), Some("access-token-secret"));
+        });
+    }
+
+    #[test]
+    fn public_service_suggests_balance_template_from_exact_base_url_only() {
+        with_isolated_home(|| {
+            let mut input = balance_test_service("sk-suggest");
+            input.base_url = "https://api.openrouter.ai/api/v1".to_string();
+            let saved = super::upsert(input).expect("save matching service");
+            let public = saved.public_json();
+            assert_eq!(public["suggested_balance_profile_id"], "openrouter");
+            assert!(public.get("encrypted_balance_access_token").is_none());
+
+            let mut custom = balance_test_service("sk-custom");
+            custom.id = "custom-relay".to_string();
+            custom.base_url = "https://openrouter.ai.attacker.example/v1".to_string();
+            let public = super::upsert(custom).expect("save custom host").public_json();
+            assert!(public["suggested_balance_profile_id"].is_null());
         });
     }
 

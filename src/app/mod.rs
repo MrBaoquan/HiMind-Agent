@@ -59,3 +59,4 @@ pub(crate) mod update_source;
 pub(crate) mod workbench_connections;
 pub(crate) mod workflow_approval;
 pub(crate) mod workflow_manager;
+pub(crate) mod ai_service_balance;
