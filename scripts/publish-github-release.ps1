@@ -6,6 +6,7 @@ param(
     [string]$PrivateKeyPath,
     [string]$PublicKeyPath,
     [string]$SigningKeyId,
+    [string]$RuntimeReleaseDirectory,
     [string]$WindowsCodeSigningCertificateThumbprint,
     [string]$WindowsTimestampUrl = "http://timestamp.sectigo.com",
     [string]$ReleaseNotes = "",
@@ -74,6 +75,41 @@ $ReleaseDirectory = Join-Path $OutputRoot $Version
 if (Test-Path -LiteralPath $ReleaseDirectory) { throw "Release output already exists: $ReleaseDirectory" }
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 
+if (-not $RuntimeReleaseDirectory) {
+    $runtimeRoot = Join-Path (Split-Path -Parent $Root) "manual-releases\deepseek-harness-runtime\github"
+    $runtimeCandidates = @(Get-ChildItem -LiteralPath $runtimeRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "himind-runtime-release.json") -PathType Leaf })
+    if ($runtimeCandidates.Count -eq 0) {
+        throw "No signed HiMind AI Runtime release is available. Pass -RuntimeReleaseDirectory or prepare manual-releases/deepseek-harness-runtime/github/runtime-<version>."
+    }
+    $newestRuntime = $null
+    $newestRuntimeKey = $null
+    foreach ($candidate in $runtimeCandidates) {
+        if ($candidate.Name -notmatch '^runtime-(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$') {
+            throw "Runtime release directory is not a valid version: $($candidate.Name)"
+        }
+        $core = '{0:D6}.{1:D6}.{2:D6}' -f [int]$Matches[1], [int]$Matches[2], [int]$Matches[3]
+        $prerelease = $Matches[4]
+        if ([string]::IsNullOrEmpty($prerelease)) {
+            $key = "$core~1"
+        } else {
+            $prereleaseKey = ($prerelease -split '\.' | ForEach-Object {
+                    if ($_ -match '^\d+$') { '{0:D10}' -f [int]$_ } else { "~$_" }
+                }) -join '.'
+            $key = "$core~0.$prereleaseKey"
+        }
+        if ($null -eq $newestRuntimeKey -or [string]::CompareOrdinal($key, $newestRuntimeKey) -gt 0) {
+            $newestRuntime = $candidate
+            $newestRuntimeKey = $key
+        }
+    }
+    $RuntimeReleaseDirectory = $newestRuntime.FullName
+}
+$RuntimeReleaseDirectory = [IO.Path]::GetFullPath($RuntimeReleaseDirectory)
+if (-not (Test-Path -LiteralPath (Join-Path $RuntimeReleaseDirectory "himind-runtime-release.json") -PathType Leaf)) {
+    throw "Runtime release manifest not found: $RuntimeReleaseDirectory"
+}
+
 $oldPublicKey = [Environment]::GetEnvironmentVariable("HIMIND_SIGNING_PUBLIC_KEY_PATH", "Process")
 $oldKeyId = [Environment]::GetEnvironmentVariable("HIMIND_SIGNING_KEY_ID", "Process")
 try {
@@ -122,6 +158,7 @@ if ($hasSigning) {
     $installerArgs.PublicKeyPath = $PublicKeyPath
     $installerArgs.SigningKeyId = $SigningKeyId
 }
+$installerArgs.RuntimeReleaseDirectory = $RuntimeReleaseDirectory
 & (Join-Path $PSScriptRoot "build-installer.ps1") @installerArgs | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "Independent Agent installer build failed." }
 
