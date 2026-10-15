@@ -40,7 +40,8 @@ Unicode true
 !define PRODUCT_REGISTRY_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\HiMindAgent"
 !define PRODUCT_RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 !define PRODUCT_PROTOCOL_KEY "Software\Classes\himind-agent"
-!define PRODUCT_LAUNCH_ARGS '--api ${API_BASE} --local-app --local-port 18181'
+!define PRODUCT_LAUNCH_ARGS '--api ${API_BASE} --local-app --local-port 18181 --show'
+!define PRODUCT_AUTOSTART_ARGS '--api ${API_BASE} --local-app --local-port 18181'
 
 Name "${PRODUCT_NAME}"
 Caption "${PRODUCT_NAME} 安装程序"
@@ -291,7 +292,7 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   WriteRegStr HKCU "${PRODUCT_PROTOCOL_KEY}\shell\open\command" "" '"$INSTDIR\himind-agent-launcher.exe" ${PRODUCT_LAUNCH_ARGS} --protocol-url "%1"'
 
   ${If} $StartWithWindowsState == ${BST_CHECKED}
-    WriteRegStr HKCU "${PRODUCT_RUN_KEY}" "HiMindAgent" '"$INSTDIR\himind-agent-launcher.exe" ${PRODUCT_LAUNCH_ARGS}'
+    WriteRegStr HKCU "${PRODUCT_RUN_KEY}" "HiMindAgent" '"$INSTDIR\himind-agent-launcher.exe" ${PRODUCT_AUTOSTART_ARGS}'
   ${Else}
     DeleteRegValue HKCU "${PRODUCT_RUN_KEY}" "HiMindAgent"
   ${EndIf}

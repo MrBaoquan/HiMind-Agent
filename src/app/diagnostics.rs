@@ -9,6 +9,220 @@ use crate::api::client::load_agent_state;
 use crate::store::types::LocalWorkerStatus;
 use crate::{Options, VERSION};
 
+/// Run checks that do not require the WebView or a running Agent window.
+///
+/// The command is intentionally machine-readable so support can ask users to
+/// attach one small JSON file instead of transcribing a message box. Exit code
+/// 0 means no failed check, 2 means warnings, and 1 means an installation
+/// check failed.
+pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<dyn Error>> {
+    let executable = std::env::current_exe()?;
+    let root = crate::install_layout::installation_root_from_executable(&executable);
+    let mut checks = Vec::new();
+    let mut failures = 0_u32;
+    let mut warnings = 0_u32;
+
+    let installed = crate::install_layout::executable_is_installed(&executable);
+    push_check(
+        &mut checks,
+        &mut failures,
+        "installed_layout",
+        installed,
+        if installed {
+            "安装目录结构完整"
+        } else {
+            "当前可执行文件不在完整安装布局中"
+        },
+        "error",
+    );
+
+    for (name, path) in [
+        ("launcher", root.join(crate::install_layout::LAUNCHER_FILE)),
+        ("updater", root.join(crate::install_layout::UPDATER_FILE)),
+        ("icon", root.join("himind-agent.ico")),
+        (
+            "active_version",
+            root.join(crate::install_layout::ACTIVE_VERSION_FILE),
+        ),
+    ] {
+        let present = path.is_file();
+        push_check(
+            &mut checks,
+            &mut failures,
+            name,
+            present,
+            if present {
+                "文件存在"
+            } else {
+                "文件缺失"
+            },
+            "error",
+        );
+    }
+
+    let icon_path = root.join("himind-agent.ico");
+    match inspect_ico(&icon_path) {
+        Ok(report) => {
+            if !report.valid {
+                failures += 1;
+            }
+            checks.push(json!({
+                "name": "icon_format",
+                "ok": report.valid,
+                "severity": if report.valid { "info" } else { "error" },
+                "message": report.message,
+                "sizes": report.sizes,
+            }));
+        }
+        Err(error) => {
+            failures += 1;
+            checks.push(json!({ "name": "icon_format", "ok": false, "severity": "error", "message": error.to_string() }));
+        }
+    }
+
+    let webview_dir = crate::store::paths::webview_user_data_dir(options.local_port);
+    match probe_writable_directory(&webview_dir) {
+        Ok(()) => checks.push(json!({ "name": "webview_data_dir", "ok": true, "severity": "info", "message": "WebView2 用户数据目录可写", "path": webview_dir })),
+        Err(error) => {
+            failures += 1;
+            checks.push(json!({ "name": "webview_data_dir", "ok": false, "severity": "error", "message": error.to_string(), "path": webview_dir }));
+        }
+    }
+
+    let runtime = runtime_snapshot();
+    let runtime_compatible = runtime
+        .get("compatible_with_agent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !runtime_compatible {
+        warnings += 1;
+    }
+    checks.push(json!({
+        "name": "runtime",
+        "ok": runtime_compatible,
+        "severity": if runtime_compatible { "info" } else { "warning" },
+        "message": if runtime_compatible { "内置运行时可用" } else { "内置运行时不可用或尚未完成首次自愈" },
+        "status": runtime,
+    }));
+
+    let shortcut = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join("Desktop").join("HiMind Agent.lnk"));
+    if let Some(path) = shortcut {
+        let exists = path.is_file();
+        if !exists {
+            warnings += 1;
+        }
+        checks.push(json!({ "name": "desktop_shortcut", "ok": exists, "severity": if exists { "info" } else { "warning" }, "message": if exists { "桌面快捷方式存在" } else { "未找到桌面快捷方式（安装时可能未勾选）" }, "path": path }));
+    }
+
+    let result = json!({
+        "schema_version": 1,
+        "generated_at": unix_now(),
+        "agent_version": VERSION,
+        "executable": executable,
+        "installation_root": root,
+        "profile": crate::store::paths::profile_name(),
+        "local_port": options.local_port,
+        "checks": checks,
+        "summary": { "failures": failures, "warnings": warnings },
+    });
+    let exit_code = if failures > 0 {
+        1
+    } else if warnings > 0 {
+        2
+    } else {
+        0
+    };
+    Ok((result, exit_code))
+}
+
+fn push_check(
+    checks: &mut Vec<Value>,
+    failures: &mut u32,
+    name: &str,
+    ok: bool,
+    message: &str,
+    severity: &str,
+) {
+    if !ok && severity == "error" {
+        *failures += 1;
+    }
+    checks.push(json!({ "name": name, "ok": ok, "severity": severity, "message": message }));
+}
+
+struct IcoReport {
+    valid: bool,
+    message: String,
+    sizes: Vec<u16>,
+}
+
+fn inspect_ico(path: &Path) -> Result<IcoReport, Box<dyn Error>> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < 6 || bytes[0..4] != [0, 0, 1, 0] {
+        return Ok(IcoReport {
+            valid: false,
+            message: "ICO 头无效".into(),
+            sizes: Vec::new(),
+        });
+    }
+    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+    let mut sizes = Vec::new();
+    for index in 0..count {
+        let offset = 6 + index * 16;
+        if offset + 16 > bytes.len() {
+            return Ok(IcoReport {
+                valid: false,
+                message: "ICO 目录被截断".into(),
+                sizes,
+            });
+        }
+        let width = if bytes[offset] == 0 {
+            256
+        } else {
+            bytes[offset] as u16
+        };
+        let height = if bytes[offset + 1] == 0 {
+            256
+        } else {
+            bytes[offset + 1] as u16
+        };
+        let size = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into()?) as usize;
+        let data_offset = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into()?) as usize;
+        let out_of_bounds = data_offset
+            .checked_add(size)
+            .map(|end| end > bytes.len())
+            .unwrap_or(true);
+        if width != height || out_of_bounds {
+            return Ok(IcoReport {
+                valid: false,
+                message: "ICO 图像条目无效".into(),
+                sizes,
+            });
+        }
+        sizes.push(width);
+    }
+    let required = [16, 24, 32, 48, 64, 256];
+    let valid = required.iter().all(|size| sizes.contains(size));
+    Ok(IcoReport {
+        valid,
+        message: if valid {
+            "ICO 包含完整的桌面/快捷方式尺寸".into()
+        } else {
+            "ICO 缺少 Windows 快捷方式所需的多尺寸图像".into()
+        },
+        sizes,
+    })
+}
+
+fn probe_writable_directory(path: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(path)?;
+    let probe = path.join(format!(".doctor-{}.tmp", std::process::id()));
+    fs::write(&probe, b"himind")?;
+    fs::remove_file(probe)?;
+    Ok(())
+}
+
 pub(crate) fn export_bundle(
     destination: &Path,
     options: &Options,

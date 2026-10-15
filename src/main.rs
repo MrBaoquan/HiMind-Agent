@@ -274,6 +274,13 @@ fn main() {
     } else if options.local_app {
         if let Err(error) = app::ui::run_tauri_app(options) {
             eprintln!("agent ui failed: {error}");
+            app::crash::record_event("error", &format!("Agent 界面启动失败：{error}"));
+            app::crash::show_startup_notice(
+                "HiMind Agent 无法启动",
+                &format!(
+                    "HiMind Agent 没有成功打开窗口。\n\n{error}\n\n可运行“HiMind Agent\\himind-agent-launcher.exe diagnostics check”检查安装，并用 diagnostics export 导出诊断包。"
+                ),
+            );
             std::process::exit(1);
         }
         app::crash::record_event("info", "Agent 正常退出");
@@ -455,6 +462,14 @@ fn diagnostics_cli_arguments() -> Option<Vec<String>> {
 /// nothing to click. This entry point has no dependency on the WebView, so a
 /// user with a broken install can still produce a bundle to send.
 fn run_diagnostics_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if arguments.iter().any(|argument| argument == "check") {
+        if arguments.len() != 1 {
+            return Err("diagnostics check 不接受其它参数".into());
+        }
+        let (report, exit_code) = crate::app::diagnostics::check_installation(options)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        std::process::exit(exit_code);
+    }
     let mut output: Option<PathBuf> = None;
     let mut rest = arguments;
     while let Some((token, tail)) = rest.split_first() {
@@ -473,7 +488,7 @@ fn run_diagnostics_cli(options: &Options, arguments: &[String]) -> Result<(), Bo
             }
             other => {
                 return Err(format!(
-                    "unknown diagnostics argument: {other}\r\nusage: himind-agent diagnostics export [--output <file>]"
+                    "unknown diagnostics argument: {other}\r\nusage: himind-agent diagnostics check | export [--output <file>]"
                 )
                 .into())
             }
@@ -899,7 +914,7 @@ fn run_market_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 let _ = next(1)?;
                 index += 2;
             }
-            "--once" | "--local-app" | "--reenroll" => {
+            "--once" | "--local-app" | "--show" | "--reenroll" => {
                 index += 1;
             }
             other => {
@@ -3251,6 +3266,10 @@ impl Options {
         parse_protocol_open(&env::args().collect::<Vec<_>>())
     }
 
+    pub(crate) fn show_window(&self) -> bool {
+        env::args().any(|argument| argument == "--show")
+    }
+
     fn from_env() -> Self {
         // An explicit address is a *selector*, not the answer: it picks which
         // workbench connection this process starts on (ADR 0008). Without one
@@ -3302,6 +3321,7 @@ impl Options {
                 }
                 "--once" => once = true,
                 "--local-app" => local_app = true,
+                "--show" => {}
                 "--mode" if i + 1 < args.len() => {
                     // This is a process-local debugging override. The panel
                     // remains the product setting and is persisted separately.
@@ -3604,11 +3624,17 @@ mod tests {
                 "exhibit_repository_path_create",
                 "svn.exhibit.repository-path.create",
             ),
-            ("exhibit_workspace_checkout", "svn.exhibit.workspace.checkout"),
+            (
+                "exhibit_workspace_checkout",
+                "svn.exhibit.workspace.checkout",
+            ),
             ("exhibit_repository_clone", "svn.exhibit.repository.clone"),
             ("project_acl_preview", "svn.project.repository.acl.preview"),
             ("project_acl_apply", "svn.project.repository.acl.apply"),
-            ("project_acl_reconcile", "svn.project.repository.acl.reconcile"),
+            (
+                "project_acl_reconcile",
+                "svn.project.repository.acl.reconcile",
+            ),
         ];
         for (task_type, capability_id) in expected {
             assert_eq!(
@@ -4219,8 +4245,14 @@ fn execute_task(
             }
             "upload_code" => {
                 let input = task.payload.clone().unwrap_or_else(|| json!({}));
-                let mut execution =
-                    task_execution_context(client, options, agent_id, &task, "workspace.code.upload", &input);
+                let mut execution = task_execution_context(
+                    client,
+                    options,
+                    agent_id,
+                    &task,
+                    "workspace.code.upload",
+                    &input,
+                );
                 invoke_dashboard_capability_with_execution(
                     options,
                     agent_id,

@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 fn main() {
     if let Err(error) = run() {
         eprintln!("agent launcher failed: {error}");
+        show_error("HiMind Agent 无法启动", &error.to_string());
         std::process::exit(1);
     }
 }
@@ -30,6 +31,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let mcp_mode = arguments.iter().any(|argument| argument == "--mcp");
+    let cli_mode = is_cli_launch(&arguments);
     // Release Agent is a GUI-subsystem binary on Windows. MCP clients require
     // a console process with an attached stdio stream, so always select the
     // same-version companion when the launcher is used for MCP.
@@ -53,7 +55,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if env::var_os("HIMIND_REQUIRE_SIGNED_UPDATES").is_none() {
         command.env("HIMIND_REQUIRE_SIGNED_UPDATES", "true");
     }
-    if mcp_mode {
+    if mcp_mode || cli_mode {
         // MCP clients own the stdio contract. The launcher must stay attached
         // until the selected Agent exits and must propagate its exit code.
         command.stdin(Stdio::inherit());
@@ -65,6 +67,49 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     command.spawn()?;
     Ok(())
+}
+
+fn is_cli_launch(arguments: &[String]) -> bool {
+    let value_flags = ["--api", "--profile", "--state", "--local-port", "--mode"];
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if argument.starts_with('-') {
+            index += if value_flags.contains(&argument) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return matches!(argument, "diagnostics" | "runtime" | "trust");
+    }
+    false
+}
+
+fn show_error(title: &str, message: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let wide = |value: &str| {
+            value
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
+        };
+        let title = wide(title);
+        let message = wide(message);
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (title, message);
 }
 
 fn is_protocol_launch(arguments: &[String]) -> bool {

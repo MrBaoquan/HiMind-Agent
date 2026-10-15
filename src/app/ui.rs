@@ -620,6 +620,16 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             start_extension_storage_hygiene();
             start_mcp_catalog_refresh(app.state::<AgentState>().state_path.clone());
             fit_main_window_to_monitor(app);
+            if app.get_webview_window("main").is_none() {
+                let message =
+                    "主窗口创建失败。通常是 WebView2 未安装、用户数据目录被占用，或安全软件拦截了界面资源。";
+                crate::app::crash::record_event("error", message);
+                crate::app::crash::show_startup_notice("HiMind Agent 无法打开窗口", message);
+                return Err(message.into());
+            }
+            if service_options.show_window() {
+                show_main_window(app.handle());
+            }
             if let Some(launch) = initial_plugin_view.as_ref() {
                 open_plugin_view(app.handle(), &launch.plugin_id, &launch.view_id)?;
             } else if let Some(target) = initial_open_target {
@@ -631,10 +641,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     let run_result = builder.run(tauri::generate_context!());
     match &run_result {
         Ok(()) => crate::app::crash::record_event("info", "界面已退出"),
-        Err(error) => crate::app::crash::record_event(
-            "error",
-            &format!("界面启动或运行失败：{error}"),
-        ),
+        Err(error) => {
+            crate::app::crash::record_event("error", &format!("界面启动或运行失败：{error}"))
+        }
     }
     run_result?;
 

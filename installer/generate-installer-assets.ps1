@@ -168,4 +168,31 @@ try {
     $script:BrandIcon.Dispose()
 }
 
+# Fail the release build if the shortcut icon is not a real multi-size ICO.
+# Windows Explorer may display a generic white icon for a malformed ICO while
+# NSIS still accepts it, so this is a packaging gate rather than a cosmetic
+# check. Keep the parser dependency-free and verify every PNG payload is fully
+# inside the file.
+$iconBytes = [IO.File]::ReadAllBytes($iconPath)
+if ($iconBytes.Length -lt 6 -or [BitConverter]::ToUInt16($iconBytes, 0) -ne 0 -or [BitConverter]::ToUInt16($iconBytes, 2) -ne 1) {
+    throw "Generated installer icon has an invalid ICO header."
+}
+$entryCount = [BitConverter]::ToUInt16($iconBytes, 4)
+if ($entryCount -ne $iconSizes.Count) { throw "Generated installer icon entry count is invalid." }
+for ($index = 0; $index -lt $entryCount; $index++) {
+    $offset = 6 + (16 * $index)
+    $width = [int]$iconBytes[$offset]
+    if ($width -eq 0) { $width = 256 }
+    $height = [int]$iconBytes[$offset + 1]
+    if ($height -eq 0) { $height = 256 }
+    $payloadSize = [BitConverter]::ToUInt32($iconBytes, $offset + 8)
+    $payloadOffset = [BitConverter]::ToUInt32($iconBytes, $offset + 12)
+    if ($width -ne $height -or $payloadOffset + $payloadSize -gt $iconBytes.Length) {
+        throw "Generated installer icon contains an invalid image entry ($width x $height)."
+    }
+    if ($iconBytes[$payloadOffset] -ne 0x89 -or $iconBytes[$payloadOffset + 1] -ne 0x50 -or $iconBytes[$payloadOffset + 2] -ne 0x4E -or $iconBytes[$payloadOffset + 3] -ne 0x47) {
+        throw "Generated installer icon entry $width x $height is not a PNG payload."
+    }
+}
+
 Write-Host "Installer assets generated: $outputPath"

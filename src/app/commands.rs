@@ -1803,11 +1803,18 @@ pub(crate) fn open_agent_directory() -> Result<(), String> {
 
 #[tauri::command]
 pub(crate) fn show_main_window(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    Ok(())
+    let Some(window) = app.get_webview_window("main") else {
+        crate::app::crash::record_event("error", "用户请求显示主窗口，但主窗口不存在");
+        return Err("主窗口不存在；请运行 diagnostics check 并导出诊断包".to_string());
+    };
+    window.show().map_err(|error| {
+        crate::app::crash::record_event("error", &format!("用户请求显示主窗口失败：{error}"));
+        error.to_string()
+    })?;
+    window.set_focus().map_err(|error| {
+        crate::app::crash::record_event("warn", &format!("主窗口置前失败：{error}"));
+        error.to_string()
+    })
 }
 
 #[tauri::command]
