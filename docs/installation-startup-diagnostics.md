@@ -147,6 +147,24 @@ HiMind AI 会话启动失败: HiMind AI 页面认证失败：HiMind AI 页面返
   `HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH` / `HIMIND_EXTENSION_SIGNING_KEY_ID`），安装器写的文件
   继续作为可轮换的覆盖层；撤销清单优先于任何来源，撤销过的 key ID 即使内嵌也不会重新生效。
 
+### 8. 更新装完又被自动回退：健康门禁把「存储写不进去」当成「新版本起不来」
+
+现场表现是「升级到新版、窗口和 HiMind AI 都能用，过一会儿版本又退回旧版，并提示更新没有完成」。这句提示对应更新状态 `rolled_back`，而它只有一条代码路径会写：更新器把新版本拉起后做 30 秒健康检查，没有「确认」就杀掉新进程、删掉版本目录、把旧版本拉回来。
+
+判据本身有两处毛病：
+
+- 健康检查读 `GET /health`，要求 `status=online`、`version` 等于目标版本、`executable_path` 等于刚写入的目标 Agent。0.3.75 及更早还额外要求 `data\agent-state.json` 存在——数据目录写不进去的机器（ACL 受限、SQLite 报 `attempt to write a readonly database` 的机器）永远满足不了这一条，于是每次更新都在 30 秒后回退掉一个完全健康的新版本。
+- 同一段判定也无法回答「是谁答的 `/health`」：端口被上一个进程占着时，旧版本会用自己的版本号回答，判定照样认为新版本没起来。
+
+0.3.76 起：
+
+- 状态文件是否存在退出判定，只留一条日志警告；判定只看 status、版本、执行路径三项硬事实。
+- 版本比较容忍 `v` 前缀与空白，执行路径比较大小写不敏感。
+- 健康窗口 30 秒放宽到 90 秒（新版本首次启动要迁移数据、建 WebView2 profile），观测变化逐条写进 `logs/agent-updater.log`，便于区分「连不上」「版本不符」「路径不符」。
+- 判死前先看「更新器启动的那个进程是否还活着、镜像是否就是刚写入的目标 Agent」，进程在就不杀。
+- 内置 VSIX 与 launcher 替换失败不再回退整个 Agent，只记为警告；只有活动版本指针写不进去才报错。
+- 失败原因写进设置页提示与 `logs/agent-updater.log`；`diagnostics check` 新增 `agent_update`（更新状态 + 日志尾部 12 行）与 `storage_writable`（数据目录可写性）。
+- 启动期顺带清除本 Agent 自己 SQLite 文件与状态文件的只读属性，`attempt to write a readonly database` 的另一种成因也一并处理。
 ## 用户排查步骤
 
 在 PowerShell 中执行以下命令。路径带空格时保留引号。
@@ -178,7 +196,7 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | 双击后反复闪出黑窗口 | `scripts/startup-window-watch.ps1` 输出里的控制台窗口标题与「processes started under a HiMind process」父进程链 | 标题/父进程是 `icacls.exe` 或 `node.exe` 说明是 0.3.68 及更早的启动期探测与沙箱预热，升级到 0.3.70+；`cmd.exe` 出现在开 HiMind AI 会话时说明是 DSH 目录联接（0.3.71 起隐藏）；标题是 launcher 自身说明 launcher 退回了控制台子系统，重新安装正式包；注意类名是 `PseudoConsoleWindow` 的窗口也要算，0.3.70 之前的采样脚本会漏报 |
 | 双击完全无反应 | `launcher` 检查和安装目录是否存在 | 从 PowerShell 运行 launcher，读取弹窗原因；检查安全软件/AppLocker 拦截记录 |
 | 自更新后双击只见到托盘、没有窗口 | 快捷方式参数（右键属性→目标）是否仍带 `--show` | 0.3.69 及更早：双击第二次可把窗口唤到前台，或重新运行安装器重建快捷方式；0.3.70 起默认显示窗口，不再依赖该参数 |
-| 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
+| 更新后版本又回到旧版本，提示「更新没有完成，仍在使用上一版本」 | `diagnostics check` 的 `agent_update`（含 `logs/agent-updater.log` 尾部）、`storage_writable` | 0.3.75 及更早：数据目录不可写时健康检查必然失败，升级到 0.3.76 后重试；日志里 `Agent 未通过健康检查…原因=` 指明判据（连接失败 / 版本不符 / 路径不符），`更新完成但留有警告` 说明更新已成功、只是可选步骤没做到 || 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
 | 窗口打开后白屏 | `agent-events.jsonl` 的 `界面页面加载` 记录 | 有 Started 无 Finished 通常是资源/WebView 加载问题；没有 Started 通常是 WebView 创建失败 |
 | HiMind AI 会话报「页面认证失败：HTTP 502 Bad Gateway」 | `diagnostics check` 的 `himind_ai_rail_links`、`loopback_proxy_bypass`、`himind_ai_session`，以及 `agent-events.jsonl` 里的「HiMind AI 会话启动失败」 | 三种成因各自可判：`himind_ai_rail_links.broken` 非空 = 工作区会话目录联接不受信（0.3.72 起自动重建）；`loopback_proxy_bypass` 为 warning = 系统代理接管了发往 127.0.0.1 的请求（把 127.0.0.1、localhost 加进绕过列表或设 NO_PROXY；0.3.74 起 Agent 自己的环回请求不再走代理）；诊断里出现 `dsh: warning: 1 entry did not activate` 加 `ERR_INVALID_ARG_TYPE ... paths[0]` = profile 里的 Office 行缺 Runtime 路径（0.3.74 起该行自解析并会就地升级） |
 | 会话能开，但 Office/文档能力不可用，DSH 报 `1 entry did not activate` | 会话诊断里的原始错误、各工作区 `profiles\himind\cordis.patch.yml` 是否含 `id: skill-office` | 0.3.74 起该行自解析 Runtime 路径，会话准备时就地升级旧行；更早版本升级 Agent |

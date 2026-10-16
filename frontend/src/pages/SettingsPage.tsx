@@ -1278,13 +1278,24 @@ function describeUpdateMessage(status: AgentUpdateStatus | null) {
   if (!status) return '正在读取更新信息。';
   if (status.status === 'checking') return '请稍候。';
   if (status.status === 'downloading') return '下载完成后会通知你。';
-  if (status.status === 'ready') return '重启 HiMind Agent 后完成安装。';
   if (status.status === 'installing') return '更新完成后会自动重新启动。';
-  if (status.status === 'failed') return '暂时无法完成更新，请稍后重试。';
-  if (status.status === 'rolled_back') return '更新没有完成，仍在使用上一版本。';
+  // 更新器的原文（版本不符、执行路径不符、健康检查未确认、VSIX 未更新…）比笼统的
+  // 「更新没有完成」有用得多；它写了就照实带上，免得只剩一句无法排查的结论。
+  const reason = (status.last_error || '').trim();
+  if (status.status === 'rolled_back') {
+    return reason
+      ? `更新没有完成，仍在使用上一版本。原因：${reason}`
+      : '更新没有完成，仍在使用上一版本。';
+  }
+  if (status.status === 'failed') {
+    return reason ? `更新未完成：${reason}` : '暂时无法完成更新，请稍后重试。';
+  }
+  if (status.status === 'ready') {
+    return reason ? `${reason}。重启 HiMind Agent 后完成安装。` : '重启 HiMind Agent 后完成安装。';
+  }
+  if (reason) return reason;
   return status.release_notes || 'HiMind Agent 会定期检查更新。';
 }
-
 function BackupDetails({ summary, items }: { summary: string; items: string[] }) {
   return (
     <details className="backup-details">

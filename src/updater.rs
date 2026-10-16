@@ -122,63 +122,84 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
     let _ = fs::remove_file(&staged);
     let _ = fs::remove_file(&staged_mcp);
     thread::sleep(Duration::from_millis(300));
-    if launch_and_confirm(&args, &target, &args.target_version) {
-        log_update(
-            args,
-            &format!("新 Agent 健康检查通过：{}", target.display()),
-        );
-        if let Some(extension) = staged_vscode_extension.as_deref() {
-            if let Err(error) = install_vscode_extension(&root, extension) {
-                let _ = terminate_process_for_path(&target);
-                let _ = fs::remove_dir_all(&target_dir);
-                let _ = launch_for_recovery(args, &current, &args.from_version);
-                return Err(format!("更新 VS Code 扩展失败，已回滚 Agent：{error}").into());
-            }
+    let mut warning = String::new();
+    match launch_and_confirm(&args, &target, &args.target_version) {
+        LaunchOutcome::Confirmed => {}
+        LaunchOutcome::UnconfirmedButAlive(reason) => {
+            // The new process is up and its image is the version just written:
+            // an inconclusive /health is not a reason to throw that away.
+            append_warning(
+                &mut warning,
+                &format!("新版本已启动，但健康检查未确认：{reason}"),
+            );
+            log_update(args, &format!("保留新版本继续运行：{warning}"));
         }
-        if !had_active_version {
-            if let Err(error) = replace_helper(
-                &root.join(install_layout::LAUNCHER_FILE),
-                &root.join("himind-agent-launcher.previous.exe"),
-                &staged_launcher,
-            ) {
-                let _ = terminate_process_for_path(&target);
-                let _ = fs::remove_dir_all(&target_dir);
-                let _ = launch_for_recovery(args, &current, &args.from_version);
-                return Err(format!("首次迁移无法更新稳定 launcher：{error}").into());
-            }
-        }
-        if let Err(error) = install_layout::write_active_version(&root, &args.target_version) {
-            let _ = terminate_process_for_path(&target);
+        LaunchOutcome::Failed(reason) => {
+            log_update(
+                args,
+                "新 Agent 启动检查失败，开始保留当前版本并恢复旧 Agent",
+            );
             let _ = fs::remove_dir_all(&target_dir);
             let _ = launch_for_recovery(args, &current, &args.from_version);
-            return Err(format!("写入 Agent 活动版本指针失败：{error}").into());
+            let detail = format!("新版本启动检查失败，已保留当前版本：{reason}");
+            let _ = report_update_result(args, "rolled_back", &detail);
+            let _ = update_local_status(args, "rolled_back", &detail);
+            return Err(detail.into());
         }
-        let _ = fs::remove_file(&staged_launcher);
-        if let Err(error) = schedule_updater_self_replace(&root, &staged_updater, &staged_package) {
-            let detail = format!("Agent 已更新，但 updater 将在后续更新中重试：{error}");
-            let _ = update_local_status(args, "idle", "");
-            let _ = report_update_result(args, "update_success", &detail);
-            return Ok(());
+    }
+    if let Some(extension) = staged_vscode_extension.as_deref() {
+        if let Err(error) = install_vscode_extension(&root, extension) {
+            // 内置 VSIX 是可选资产：文件被占用或被杀软拦下时换不进去，不值得把
+            // 已经跑起来的新版本撤掉；下一次更新或重新安装会再试一次。
+            append_warning(&mut warning, &format!("内置 HiMind VSIX 未更新：{error}"));
+            log_update(args, &warning);
         }
+    }
+    if !had_active_version {
+        if let Err(error) = replace_helper(
+            &root.join(install_layout::LAUNCHER_FILE),
+            &root.join("himind-agent-launcher.previous.exe"),
+            &staged_launcher,
+        ) {
+            append_warning(&mut warning, &format!("稳定 launcher 未替换：{error}"));
+            log_update(args, &warning);
+        }
+    }
+    if let Err(error) = install_layout::write_active_version(&root, &args.target_version) {
+        // 活动版本指针是「哪个版本算数」的唯一依据：写不进去说明安装目录本身有
+        // 问题，此时回退同样不可靠，如实报错并保留新进程。
+        let detail = format!("写入 Agent 活动版本指针失败：{error}");
+        log_update(args, &detail);
+        let _ = report_update_result(args, "update_failed", &detail);
+        let _ = update_local_status(args, "failed", &detail);
+        return Err(detail.into());
+    }
+    let _ = fs::remove_file(&staged_launcher);
+    if let Err(error) = schedule_updater_self_replace(&root, &staged_updater, &staged_package) {
+        append_warning(
+            &mut warning,
+            &format!("updater 将在后续更新中重试：{error}"),
+        );
+    }
+    if warning.is_empty() {
         let _ = update_local_status(args, "idle", "");
         let _ = report_update_result(args, "update_success", "");
-        return Ok(());
+    } else {
+        // 更新算成功，但把没做到的那部分原样写给用户和更新服务，免得只剩一句
+        // 「更新没有完成」。
+        log_update(args, &format!("更新完成但留有警告：{warning}"));
+        let _ = update_local_status(args, "idle", &warning);
+        let _ = report_update_result(args, "update_success", &warning);
     }
-    log_update(
-        args,
-        "新 Agent 健康检查失败，开始保留当前版本并恢复旧 Agent",
-    );
-    let _ = fs::remove_dir_all(&target_dir);
-    let _ = launch_for_recovery(args, &current, &args.from_version);
-    let _ = report_update_result(
-        args,
-        "rolled_back",
-        "new Agent failed health check; previous version kept",
-    );
-    let _ = update_local_status(args, "rolled_back", "新版本启动检查失败，已保留当前版本");
-    Err("new Agent failed health check; previous version was kept".into())
+    Ok(())
 }
 
+fn append_warning(target: &mut String, message: &str) {
+    if !target.is_empty() {
+        target.push_str("；");
+    }
+    target.push_str(message);
+}
 fn mark_install_failed_if_pending(args: &UpdateArgs, error: &str) -> Result<(), Box<dyn Error>> {
     let path = args.state_path.with_file_name("agent-update-state.json");
     if !path.is_file() {
@@ -248,7 +269,30 @@ fn read_json_value(path: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
-fn launch_and_confirm(args: &UpdateArgs, executable: &Path, expected_version: &str) -> bool {
+/// How long the updater waits for the freshly written version to answer
+/// /health. A first launch of a new version may spend this time on data
+/// migrations, storage repair and WebView2 profile creation before the local
+/// service binds, so a slow first start must never be mistaken for a broken
+/// version.
+const HEALTH_PROBE_TIMEOUT_SECS: u64 = 90;
+
+/// What the health probe proved about the Agent the updater just launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchOutcome {
+    /// /health answered with the expected version and this very executable.
+    Confirmed,
+    /// /health did not settle the question, but the process this updater
+    /// started is still running from the target executable.
+    UnconfirmedButAlive(String),
+    /// The new Agent is no longer running from the target path.
+    Failed(String),
+}
+
+fn launch_and_confirm(
+    args: &UpdateArgs,
+    executable: &Path,
+    expected_version: &str,
+) -> LaunchOutcome {
     launch_and_confirm_with_policy(args, executable, expected_version, true)
 }
 
@@ -256,7 +300,10 @@ fn launch_and_confirm(args: &UpdateArgs, executable: &Path, expected_version: &s
 // the previous Agent process is unusable. Keep that process alive so a
 // transient probe failure cannot leave the installation without an Agent.
 fn launch_for_recovery(args: &UpdateArgs, executable: &Path, expected_version: &str) -> bool {
-    launch_and_confirm_with_policy(args, executable, expected_version, false)
+    matches!(
+        launch_and_confirm_with_policy(args, executable, expected_version, false),
+        LaunchOutcome::Confirmed | LaunchOutcome::UnconfirmedButAlive(_)
+    )
 }
 
 fn launch_and_confirm_with_policy(
@@ -264,7 +311,7 @@ fn launch_and_confirm_with_policy(
     executable: &Path,
     expected_version: &str,
     terminate_on_failure: bool,
-) -> bool {
+) -> LaunchOutcome {
     let root = install_layout::installation_root_from_executable(executable);
     let trusted_keys = root.join("trusted-keys");
     let mut command = Command::new(executable);
@@ -278,47 +325,52 @@ fn launch_and_confirm_with_policy(
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            log_update(
-                args,
-                &format!("启动 Agent 失败：{}：{}", executable.display(), error),
-            );
-            return false;
+            let reason = format!("启动 Agent 失败：{}：{}", executable.display(), error);
+            log_update(args, &reason);
+            return LaunchOutcome::Failed(reason);
         }
     };
-    if wait_for_health(
+    let assessment = probe_health(
         args.local_port,
-        &args.api_base,
         &args.state_path,
         expected_version,
         executable,
         child.id(),
-    ) {
-        return true;
+    );
+    for warning in &assessment.warnings {
+        log_update(args, &format!("健康检查警告：{warning}"));
     }
+    if assessment.confirmed {
+        log_update(
+            args,
+            &format!("新 Agent 健康检查通过：{}", executable.display()),
+        );
+        return LaunchOutcome::Confirmed;
+    }
+    // The probe only reports what /health said. A leftover Agent holding the
+    // port, a state file that was never written, or a first start that is still
+    // migrating all look like "not healthy" without being one. Only the process
+    // this updater started can decide whether the new version is actually up.
+    let alive = pid_runs_from(child.id(), executable);
     log_update(
         args,
         &format!(
-            "Agent 未通过健康检查：path={}，expected_version={}，pid={}",
+            "Agent 未通过健康检查：path={}，expected_version={}，pid={}，原因={}，目标进程存活={}",
             executable.display(),
             expected_version,
-            child.id()
+            child.id(),
+            assessment.reason,
+            alive
         ),
     );
+    if alive {
+        return LaunchOutcome::UnconfirmedButAlive(assessment.reason);
+    }
     if terminate_on_failure {
         let _ = terminate_single(child.id());
-    } else {
-        log_update(
-            args,
-            &format!(
-                "回退 Agent 探活未确认，保留进程继续运行：path={}，pid={}",
-                executable.display(),
-                child.id()
-            ),
-        );
     }
-    false
+    LaunchOutcome::Failed(assessment.reason)
 }
-
 fn wait_for_old_agent_exit(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
     let pid = if args.wait_pid != 0 {
         args.wait_pid
@@ -555,27 +607,45 @@ fn staged_path_allowed(staged: &Path, installation_root: &Path) -> bool {
     staged.starts_with(&root)
 }
 
-fn wait_for_health(
+/// The verdict of one /health conversation, plus everything the probe noticed
+/// without letting it decide the outcome.
+struct HealthAssessment {
+    confirmed: bool,
+    reason: String,
+    warnings: Vec<String>,
+}
+
+/// Ask the freshly launched Agent about itself until it answers or the budget
+/// runs out.
+///
+/// /health is served by the local Agent itself. It must never be routed
+/// through an HTTP proxy, which can turn a healthy local response into a
+/// proxy-generated 502 and make both upgrade and rollback look failed.
+fn probe_health(
     port: u16,
-    api_base: &str,
     state_path: &Path,
     target_version: &str,
     executable: &Path,
     pid: u32,
-) -> bool {
-    // /health is served by the local Agent itself. It must never be routed
-    // through an HTTP proxy, which can turn a healthy local response into a
-    // proxy-generated 502 and make both upgrade and rollback look failed.
+) -> HealthAssessment {
     let client = match Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()
     {
         Ok(value) => value,
-        Err(_) => return false,
+        Err(error) => {
+            return HealthAssessment {
+                confirmed: false,
+                reason: format!("无法创建本地健康检查客户端：{error}"),
+                warnings: Vec::new(),
+            }
+        }
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS);
     let mut last_observation = "尚未收到本地服务响应".to_string();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut logged_observation = String::new();
     while Instant::now() < deadline {
         match client.get(format!("http://127.0.0.1:{port}/health")).send() {
             Ok(response) => {
@@ -584,15 +654,21 @@ fn wait_for_health(
                 } else {
                     match response.json::<serde_json::Value>() {
                         Ok(payload) => {
-                            last_observation = health_mismatch_reason(
-                                &payload,
-                                target_version,
-                                executable,
-                                state_path,
-                            );
-                            if last_observation == "ok" {
-                                return true;
+                            let assessment =
+                                assess_health(&payload, target_version, executable, state_path);
+                            for warning in assessment.warnings {
+                                if !warnings.contains(&warning) {
+                                    warnings.push(warning);
+                                }
                             }
+                            if assessment.confirmed {
+                                return HealthAssessment {
+                                    confirmed: true,
+                                    reason: "ok".to_string(),
+                                    warnings,
+                                };
+                            }
+                            last_observation = assessment.reason;
                         }
                         Err(error) => {
                             last_observation = format!("/health 响应不是合法 JSON：{error}");
@@ -604,9 +680,22 @@ fn wait_for_health(
                 last_observation = format!("连接本地 /health 失败：{error}");
             }
         }
+        // Log every change of observation. "connect failed" and "version
+        // mismatch" are different bugs, and the updater log is the only trace
+        // that survives a rollback.
+        if last_observation != logged_observation {
+            logged_observation = last_observation.clone();
+            append_update_log(
+                state_path,
+                &format!("健康检查观测：pid={pid}，{last_observation}"),
+            );
+        }
         if !executable.exists() {
-            append_update_log(state_path, "健康检查中止：目标 Agent 可执行文件已不存在");
-            return false;
+            return HealthAssessment {
+                confirmed: false,
+                reason: "目标 Agent 可执行文件已不存在".to_string(),
+                warnings,
+            };
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -617,8 +706,11 @@ fn wait_for_health(
             port, target_version, pid, last_observation
         ),
     );
-    let _ = api_base;
-    false
+    HealthAssessment {
+        confirmed: false,
+        reason: last_observation,
+        warnings,
+    }
 }
 
 fn health_matches_update(
@@ -627,64 +719,126 @@ fn health_matches_update(
     executable: &Path,
     state_path: &Path,
 ) -> bool {
-    health_mismatch_reason(payload, target_version, executable, state_path) == "ok"
+    assess_health(payload, target_version, executable, state_path).confirmed
 }
 
-fn health_mismatch_reason(
+/// Judge one /health payload.
+///
+/// The facts that prove the new Agent is up are the status, the version and the
+/// executable path. Storage is deliberately not one of them: an Agent whose
+/// data root is not writable still starts, serves the window and answers
+/// /health, and reading that pre-existing machine problem as "the new version
+/// failed" is what turns a working update into a rollback.
+fn assess_health(
     payload: &serde_json::Value,
     target_version: &str,
     executable: &Path,
     state_path: &Path,
-) -> String {
+) -> HealthAssessment {
+    let mut warnings = Vec::new();
     if target_version.trim().is_empty() {
-        return "目标版本为空".to_string();
+        return HealthAssessment {
+            confirmed: false,
+            reason: "目标版本为空".to_string(),
+            warnings,
+        };
     }
     if payload.get("status").and_then(|value| value.as_str()) != Some("online") {
-        return format!(
-            "Agent 状态不是 online：{}",
-            payload
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("缺失")
-        );
+        return HealthAssessment {
+            confirmed: false,
+            reason: format!(
+                "Agent 状态不是 online：{}",
+                payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("缺失")
+            ),
+            warnings,
+        };
     }
-    if payload.get("version").and_then(|value| value.as_str()) != Some(target_version) {
-        return format!(
-            "Agent 版本不一致：实际={}，期望={}",
-            payload
-                .get("version")
-                .and_then(|value| value.as_str())
-                .unwrap_or("缺失"),
-            target_version
-        );
+    let reported_version = payload
+        .get("version")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !versions_match(target_version, &reported_version) {
+        return HealthAssessment {
+            confirmed: false,
+            reason: format!(
+                "Agent 版本不一致：实际={}，期望={}",
+                if reported_version.trim().is_empty() {
+                    "缺失"
+                } else {
+                    reported_version.as_str()
+                },
+                target_version
+            ),
+            warnings,
+        };
     }
     if !state_path.is_file() {
-        return format!("Agent 状态文件不存在：{}", state_path.display());
+        warnings.push(format!(
+            "Agent 状态文件不存在：{}（属于存储问题，不是版本问题）",
+            state_path.display()
+        ));
     }
-    let Some(reported_path) = payload
+    match payload
         .get("executable_path")
         .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return "健康信息缺少 executable_path".to_string();
-    };
-    match (
-        fs::canonicalize(executable),
-        fs::canonicalize(Path::new(reported_path)),
-    ) {
-        (Ok(expected), Ok(actual)) if plain_path(&expected) == plain_path(&actual) => {
-            "ok".to_string()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(reported_path) => {
+            if !executable_paths_match(executable, Path::new(reported_path)) {
+                return HealthAssessment {
+                    confirmed: false,
+                    reason: format!(
+                        "Agent 执行路径不一致：实际={}，期望={}",
+                        reported_path,
+                        executable.display()
+                    ),
+                    warnings,
+                };
+            }
         }
-        (Ok(expected), Ok(actual)) => format!(
-            "Agent 执行路径不一致：实际={}，期望={}",
-            plain_path(&actual).display(),
-            plain_path(&expected).display()
-        ),
-        (Err(error), _) => format!("无法解析目标 Agent 路径：{error}"),
-        (_, Err(error)) => format!("无法解析健康信息中的执行路径：{error}"),
+        None => warnings.push("健康信息缺少 executable_path，无法核对执行路径".to_string()),
+    }
+    HealthAssessment {
+        confirmed: true,
+        reason: "ok".to_string(),
+        warnings,
     }
 }
 
+/// Version strings reach this comparison from three places: the release
+/// metadata, the active-version pointer and the running binary. Only two of
+/// them are normalized, so compare them the way a person reads them instead of
+/// failing an upgrade over a `v` prefix or a stray space.
+fn versions_match(expected: &str, actual: &str) -> bool {
+    normalize_version(expected) == normalize_version(actual)
+}
+
+fn normalize_version(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn executable_paths_match(expected: &Path, reported: &Path) -> bool {
+    let expected =
+        plain_path(&fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf()));
+    let reported =
+        plain_path(&fs::canonicalize(reported).unwrap_or_else(|_| reported.to_path_buf()));
+    if expected == reported {
+        return true;
+    }
+    // 规范化失败时（8.3 短名、目录项尚未刷新）退回按大小写不敏感的全路径比较。
+    expected
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&reported.to_string_lossy())
+}
 fn log_update(context: &UpdateArgs, message: &str) {
     append_update_log(&context.state_path, message);
 }
@@ -735,6 +889,44 @@ fn running_agent_pids(current_executable: &Path) -> Vec<u32> {
     Vec::new()
 }
 
+/// True only when `pid` is alive and its image is exactly `executable`.
+///
+/// A health probe cannot tell which process answered /health: a leftover Agent
+/// holding the port replies with the old version. So "the new Agent did not come
+/// up" has to be decided by looking at the process this updater started, not at
+/// whoever answered the port.
+fn pid_runs_from(pid: u32, executable: &Path) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    let target =
+        plain_path(&fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf()));
+    let target = powershell_escape_single_quoted(&target.to_string_lossy());
+    let script = format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue; if ($p -and $p.ExecutablePath -and $p.ExecutablePath.Equals('{target}', [System.StringComparison]::OrdinalIgnoreCase)) {{ 'match' }} else {{ 'miss' }}"
+    );
+    for shell in ["pwsh", "powershell"] {
+        let Ok(output) = Command::new(shell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("match") {
+            return true;
+        }
+        if stdout.contains("miss") {
+            return false;
+        }
+    }
+    // 查询不可用时保守处理：进程还在，就不把它当成启动失败。
+    process_exists(pid)
+}
 fn process_exists(pid: u32) -> bool {
     let mut command = Command::new("tasklist");
     command.creation_flags(CREATE_NO_WINDOW);
@@ -776,8 +968,8 @@ mod tests {
         prepare_version_directory, read_active_version, write_active_version,
     };
     use super::{
-        canonical_staged_helper, health_matches_update, plain_path, read_json_value,
-        replace_helper, staged_path_allowed, wait_for_health,
+        assess_health, canonical_staged_helper, health_matches_update, plain_path, probe_health,
+        read_json_value, replace_helper, staged_path_allowed,
     };
     use serde_json::json;
     use std::fs;
@@ -954,7 +1146,7 @@ mod tests {
         for key in keys {
             std::env::set_var(key, "http://127.0.0.1:9");
         }
-        let healthy = wait_for_health(port, "", &state, "0.3.0", &executable, 0);
+        let healthy = probe_health(port, &state, "0.3.0", &executable, 0);
         for (key, value) in previous {
             if let Some(value) = value {
                 std::env::set_var(key, value);
@@ -964,9 +1156,93 @@ mod tests {
         }
         server.join().unwrap();
         let _ = fs::remove_dir_all(root);
-        assert!(healthy);
+        assert!(healthy.confirmed, "{}", healthy.reason);
     }
 
+    #[test]
+    fn health_confirmation_survives_a_missing_state_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-health-state-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("himind-agent.exe");
+        fs::write(&executable, b"agent").unwrap();
+        // Deliberately never created: a machine whose data root is not writable
+        // has no state file, and that says nothing about the new version.
+        let state = root.join("agent-state.json");
+        let payload = json!({
+            "status": "online",
+            "version": "0.3.76",
+            "executable_path": executable,
+        });
+
+        let assessment = assess_health(&payload, "0.3.76", &executable, &state);
+        assert!(assessment.confirmed, "{}", assessment.reason);
+        assert!(
+            assessment
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("状态文件不存在")),
+            "{:?}",
+            assessment.warnings
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn health_confirmation_tolerates_version_prefix_and_padding() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-health-version-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("himind-agent.exe");
+        let state = root.join("agent-state.json");
+        fs::write(&executable, b"agent").unwrap();
+        fs::write(&state, b"{}").unwrap();
+        let payload = json!({
+            "status": "online",
+            "version": "0.3.76",
+            "executable_path": executable,
+        });
+
+        assert!(assess_health(&payload, " v0.3.76 ", &executable, &state).confirmed);
+        assert!(!assess_health(&payload, "0.3.77", &executable, &state).confirmed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn health_confirmation_rejects_a_foreign_executable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-health-foreign-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("himind-agent.exe");
+        let other = root.join("other-agent.exe");
+        let state = root.join("agent-state.json");
+        fs::write(&target, b"agent").unwrap();
+        fs::write(&other, b"agent").unwrap();
+        fs::write(&state, b"{}").unwrap();
+        let payload = json!({
+            "status": "online",
+            "version": "0.3.76",
+            "executable_path": other,
+        });
+
+        let assessment = assess_health(&payload, "0.3.76", &target, &state);
+        assert!(!assessment.confirmed);
+        assert!(
+            assessment.reason.contains("执行路径不一致"),
+            "{}",
+            assessment.reason
+        );
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn validates_and_replaces_staged_helper() {
         let unique = SystemTime::now()

@@ -228,6 +228,24 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
         }
         changed = true;
     }
+
+    if matches!(status.status.as_str(), "rolled_back" | "failed")
+        && !status.available_version.is_empty()
+        && staged_payload_available(&status)
+    {
+        // 上一次装到一半失败、更新包却还完整地躺在暂存目录里：让用户能直接
+        // 「重启并更新」再试一次，而不是被迫重新下载。失败原因留在 last_error。
+        let target_is_newer =
+            crate::skill::resolver::compare_versions(&status.available_version, crate::VERSION)
+                == std::cmp::Ordering::Greater;
+        if target_is_newer {
+            status.status = "ready".to_string();
+            if status.last_error.trim().is_empty() {
+                status.last_error = "上一次更新没有完成，更新包仍在，可以直接重试".to_string();
+            }
+            changed = true;
+        }
+    }
     if status.status == "ready" && !staged_payload_available(&status) {
         status.status = "available".to_string();
         status.downloaded_bytes = 0;
@@ -999,6 +1017,46 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn load_restores_a_rolled_back_update_when_the_package_survives() {
+        let root = temporary_test_root("rolled-back-install");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let state_path = root.join("agent-state.json");
+        let mut status = AgentUpdateStatus::default();
+        status.status = "rolled_back".to_string();
+        status.available_version = "9.8.7".to_string();
+        status.release_id = "release-9".to_string();
+        status.last_error = "新版本启动检查失败，已保留当前版本：Agent 状态文件不存在".to_string();
+        status.package_type = "directory-zip".to_string();
+        let staged_package = staging.join("himind-agent-9.8.7.zip");
+        fs::write(&staged_package, b"zip").unwrap();
+        status.staged_package_path = staged_package.to_string_lossy().to_string();
+        for (file, slot) in [
+            ("himind-agent.exe", "agent"),
+            ("himind-agent-mcp.exe", "mcp"),
+            ("himind-agent-updater.exe", "updater"),
+            ("himind-agent-launcher.exe", "launcher"),
+        ] {
+            let path = staging.join(file);
+            fs::write(&path, b"binary").unwrap();
+            let value = path.to_string_lossy().to_string();
+            match slot {
+                "agent" => status.staged_agent_path = value,
+                "mcp" => status.staged_mcp_path = value,
+                "updater" => status.staged_updater_path = value,
+                _ => status.staged_launcher_path = value,
+            }
+        }
+        save(&state_path, &status).unwrap();
+
+        let loaded = load(&state_path).unwrap();
+
+        assert_eq!(loaded.status, "ready");
+        assert_eq!(loaded.available_version, "9.8.7");
+        assert!(loaded.last_error.contains("启动检查失败"));
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn applies_directory_distribution_manifest() {
         let mut status = AgentUpdateStatus::default();

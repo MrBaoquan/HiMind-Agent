@@ -117,6 +117,47 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         }));
     }
 
+    let update_health = agent_update_snapshot(
+        &options.state_path,
+        &root.join("logs").join("agent-updater.log"),
+    );
+    let update_needs_attention = update_health
+        .get("needs_attention")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if update_needs_attention {
+        warnings += 1;
+    }
+    checks.push(json!({
+        "name": "agent_update",
+        "ok": !update_needs_attention,
+        "severity": if update_needs_attention { "warning" } else { "info" },
+        "message": update_health.get("message").cloned().unwrap_or(Value::Null),
+        "detail": update_health,
+    }));
+
+    // 「attempt to write a readonly database」这类故障来自数据目录本身，跟版本
+    // 无关，却会被更新器的健康检查当成「新版本起不来」。这里先如实说清楚。
+    let data_dir = crate::store::paths::agent_home().join("data");
+    match probe_writable_directory(&data_dir) {
+        Ok(()) => checks.push(json!({
+            "name": "storage_writable",
+            "ok": true,
+            "severity": "info",
+            "message": "Agent 数据目录可写",
+            "path": data_dir,
+        })),
+        Err(error) => {
+            failures += 1;
+            checks.push(json!({
+                "name": "storage_writable",
+                "ok": false,
+                "severity": "error",
+                "message": format!("Agent 数据目录不可写：{error}；SQLite 会报 attempt to write a readonly database，状态文件也可能写不进去"),
+                "path": data_dir,
+            }));
+        }
+    }
     let protocol = protocol_registration_snapshot(&root, options);
     if protocol
         .get("registered")
@@ -847,6 +888,13 @@ fn repair_startup_storage_once(local_port: u16) -> Vec<String> {
                 )),
             }
         }
+        // SQLite 的「attempt to write a readonly database」不只来自 ACL：文件上的只读属性一样能让它写不进去，而这种属性一次误操作就会被留下。这几条都是
+        // 本 Agent 自己的文件，清掉属性是安全的。
+        for path in startup_storage_readonly_targets() {
+            if let Some(message) = clear_readonly_attribute(&path) {
+                messages.push(message);
+            }
+        }
         return messages;
     }
     #[cfg(not(windows))]
@@ -856,6 +904,116 @@ fn repair_startup_storage_once(local_port: u16) -> Vec<String> {
     }
 }
 
+/// 最近一次软件更新的结论、失败原因和更新器日志尾部。
+///
+/// 更新失败时界面上只有一句「更新没有完成」，真正的判定（版本不符、执行路径不
+/// 符、代理把环回请求改写成 502、状态文件缺失）只写在 `logs/agent-updater.log`
+/// 里，而那正是需要用户贴出来的东西。这里把状态和日志尾部一起给出，就不用再让
+/// 用户去翻文件、也不用猜是哪一层。
+fn agent_update_snapshot(state_path: &Path, updater_log: &Path) -> Value {
+    let status_path = state_path.with_file_name("agent-update-state.json");
+    let status = if status_path.is_file() {
+        fs::read(&status_path)
+            .ok()
+            .and_then(|bytes| {
+                let bytes = bytes
+                    .strip_prefix(&[0xEF, 0xBB, 0xBF])
+                    .unwrap_or(bytes.as_slice());
+                serde_json::from_slice::<Value>(bytes).ok()
+            })
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let status_text = status
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let last_error = status
+        .get("last_error")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let log_tail = read_log_tail(updater_log, 12);
+    let log_mentions_failure = log_tail.iter().any(|line| {
+        line.contains("健康检查超时")
+            || line.contains("未通过健康检查")
+            || line.contains("启动检查失败")
+            || line.contains("更新完成但留有警告")
+    });
+    let message = if status_text == "rolled_back" {
+        format!("最近一次更新已回退到上一版本：{last_error}")
+    } else if status_text == "failed" {
+        format!("最近一次更新失败：{last_error}")
+    } else if !last_error.is_empty() {
+        format!("最近一次更新的提示：{last_error}")
+    } else if log_mentions_failure {
+        format!(
+            "更新器日志里有失败记录：{}",
+            log_tail.last().cloned().unwrap_or_default()
+        )
+    } else {
+        "最近一次更新没有失败记录".to_string()
+    };
+    let needs_attention = matches!(status_text.as_str(), "failed" | "rolled_back")
+        || (!last_error.is_empty() && status_text != "idle")
+        || log_mentions_failure;
+    json!({
+        "needs_attention": needs_attention,
+        "message": message,
+        "status": status_text,
+        "current_version": status.get("current_version").cloned().unwrap_or(Value::Null),
+        "available_version": status.get("available_version").cloned().unwrap_or(Value::Null),
+        "last_error": last_error,
+        "updater_log": updater_log,
+        "updater_log_tail": log_tail,
+        "state_path": status_path,
+    })
+}
+
+fn read_log_tail(path: &Path, lines: usize) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let all = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    all[all.len().saturating_sub(lines)..]
+        .iter()
+        .map(|line| line.to_string())
+        .collect()
+}
+/// SQLite 报「attempt to write a readonly database」不一定来自 ACL：文件上的只读
+/// 属性同样能让它写不进去，而这种属性一次误操作就会被留下。
+fn startup_storage_readonly_targets() -> Vec<PathBuf> {
+    let root = crate::store::paths::agent_home();
+    let database = root.join(crate::store::local_runs::LOCAL_RUN_DB_FILE);
+    vec![
+        database.clone(),
+        PathBuf::from(format!("{}-wal", database.display())),
+        PathBuf::from(format!("{}-shm", database.display())),
+        root.join("data").join("agent-state.json"),
+        root.join("data").join("agent-update-state.json"),
+    ]
+}
+
+/// 清掉文件上的只读属性；返回一条可读说明，没有可做的事时返回 None。
+#[cfg(windows)]
+fn clear_readonly_attribute(path: &Path) -> Option<String> {
+    let permissions = fs::metadata(path).ok()?.permissions();
+    if !permissions.readonly() {
+        return None;
+    }
+    let mut cleared = permissions.clone();
+    cleared.set_readonly(false);
+    match fs::set_permissions(path, cleared) {
+        Ok(()) => Some(format!("已清除只读属性：{}", path.display())),
+        Err(error) => Some(format!("清除只读属性失败：{}：{error}", path.display())),
+    }
+}
 fn storage_integrity_snapshot(local_port: u16) -> Value {
     let items = startup_storage_targets(local_port)
         .iter()
