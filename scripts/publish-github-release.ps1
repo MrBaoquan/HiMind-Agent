@@ -130,11 +130,15 @@ if (-not $RuntimeReleaseDirectory) {
             throw "Runtime release directory is not a valid version: $($candidate.Name)"
         }
         $core = '{0:D6}.{1:D6}.{2:D6}' -f [int]$Matches[1], [int]$Matches[2], [int]$Matches[3]
-        $prerelease = $Matches[4]
-        if ([string]::IsNullOrEmpty($prerelease)) {
+        # NOT `$prerelease`: the script declares a [switch]$Prerelease parameter and
+        # PowerShell variables are case-insensitive, so assigning the string here
+        # threw "Cannot convert ... to SwitchParameter" and the automatic Runtime
+        # selection never completed.
+        $prereleaseText = $Matches[4]
+        if ([string]::IsNullOrEmpty($prereleaseText)) {
             $key = "$core~1"
         } else {
-            $prereleaseKey = ($prerelease -split '\.' | ForEach-Object {
+            $prereleaseKey = ($prereleaseText -split '\.' | ForEach-Object {
                     if ($_ -match '^\d+$') { '{0:D10}' -f [int]$_ } else { "~$_" }
                 }) -join '.'
             $key = "$core~0.$prereleaseKey"
