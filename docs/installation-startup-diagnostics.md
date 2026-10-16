@@ -99,6 +99,29 @@ HiMind AI 会话启动失败: HiMind AI 页面认证失败：HiMind AI 页面返
 - 0.3.72 起会话准备阶段自己判定并重建这两个联接，不再需要人工介入；`HiMind AI 页面认证失败` 的
   报错也会附上 Runtime 的 stdout/stderr 摘要，不再只有一句结论。
 
+同一条 502 还有两种成因，判据完全不同：
+
+- **系统代理接管了环回请求。** `verify_browser_entry` 用的是 reqwest 的默认客户端，而 reqwest 0.12
+  默认启用 `system-proxy`：Windows 上它会读 WinINET 的 `ProxyEnable`/`ProxyServer`/`ProxyOverride`，
+  而那份绕过列表是按 NO_PROXY 语义解析的，`127.*`、`<local>` 这类 WinINET 写法既不是 CIDR 也不是
+  域名，匹配不到 `127.0.0.1`。代理不在本机时它访问不到我们的环回端口，只能回 502，界面于是报
+  「页面认证失败」而页面本身健康。`diagnostics check` 的 `loopback_proxy_bypass` 直接给结论；修法是
+  把 `127.0.0.1` 与 `localhost` 加进代理绕过列表，或设置 `NO_PROXY=127.0.0.1,localhost` 后重启 Agent。
+  0.3.74 起本模块的每个环回客户端都显式 `no_proxy()`，并给会话派生的子进程注入环回 NO_PROXY；
+  Agent 自己不再受影响，同机其它工具仍可能被这次代理接管。
+- **profile 里的 Office 能力行拿不到 Runtime 路径。** DSH 诊断里会同时出现
+
+  ```text
+  dsh: warning: 1 entry did not activate
+  skill-office (@deepseek-ai/dsh-skill-office): TypeError [ERR_INVALID_ARG_TYPE]: The "paths[0]" argument must be of type string. Received undefined
+  ```
+
+  受管 profile 的 `skill-office` 行过去只认 `HIMIND_DSH_RUNTIME_ROOT` / `HIMIND_DSH_NODE`，而这两个
+  变量只有 headless 那条派生路径注入过，交互式 Web 会话没有，于是 `path.resolve(undefined, …)` 在配置
+  装配阶段就抛错。0.3.74 起该行自己就能算出 Runtime 根目录（环境变量缺失时从 `process.argv[1]` 反推），
+  交互式会话也补上了这两个变量，Runtime 的 `bin\dsh.cmd` 同样会自行导出；会话准备阶段会把磁盘上的
+  旧行就地升级，不需要用户手改 profile。
+
 ### 7. 官方扩展源显示「未找到受信的签名公钥：himind-extension-production-2026」
 
 官方扩展源 `MrBaoquan/himind-extensions` 的发布清单一律用 `himind-extension-production-2026`
@@ -155,7 +178,8 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | 自更新后双击只见到托盘、没有窗口 | 快捷方式参数（右键属性→目标）是否仍带 `--show` | 0.3.69 及更早：双击第二次可把窗口唤到前台，或重新运行安装器重建快捷方式；0.3.70 起默认显示窗口，不再依赖该参数 |
 | 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
 | 窗口打开后白屏 | `agent-events.jsonl` 的 `界面页面加载` 记录 | 有 Started 无 Finished 通常是资源/WebView 加载问题；没有 Started 通常是 WebView 创建失败 |
-| HiMind AI 会话报「页面返回 502」 | `diagnostics check` 的 `himind_ai_rail_links`、`agent-events.jsonl` 里的「HiMind AI 会话启动失败」 | `broken` 非空即工作区会话目录联接不受信：删除并用 `mklink /J` 重建该联接；0.3.72 起自动重建 |
+| HiMind AI 会话报「页面认证失败：HTTP 502 Bad Gateway」 | `diagnostics check` 的 `himind_ai_rail_links`、`loopback_proxy_bypass`、`himind_ai_session`，以及 `agent-events.jsonl` 里的「HiMind AI 会话启动失败」 | 三种成因各自可判：`himind_ai_rail_links.broken` 非空 = 工作区会话目录联接不受信（0.3.72 起自动重建）；`loopback_proxy_bypass` 为 warning = 系统代理接管了发往 127.0.0.1 的请求（把 127.0.0.1、localhost 加进绕过列表或设 NO_PROXY；0.3.74 起 Agent 自己的环回请求不再走代理）；诊断里出现 `dsh: warning: 1 entry did not activate` 加 `ERR_INVALID_ARG_TYPE ... paths[0]` = profile 里的 Office 行缺 Runtime 路径（0.3.74 起该行自解析并会就地升级） |
+| 会话能开，但 Office/文档能力不可用，DSH 报 `1 entry did not activate` | 会话诊断里的原始错误、各工作区 `profiles\himind\cordis.patch.yml` 是否含 `id: skill-office` | 0.3.74 起该行自解析 Runtime 路径，会话准备时就地升级旧行；更早版本升级 Agent |
 | 扩展源显示「未找到受信的签名公钥：<key-id>」 | `diagnostics check` 的 `extension_source_health` 与 `extension_source_trust` | 把 `<key-id>.pem` 放进 `trusted-keys`（`manage-trusted-signing-key.ps1 -Action import`）；自建来源也可把验证策略改为 `optional`；0.3.72+ 官方扩展公钥已内嵌 |
 
 ## 发布门禁

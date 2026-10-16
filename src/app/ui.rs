@@ -1579,6 +1579,14 @@ fn start_builtin_ai_session_inner(
     } else {
         Command::new(&launch.executable)
     };
+    // 交互会话和 headless 会话必须给 Runtime 同一套环境：受管的 Office 能力行
+    // 用它定位 Runtime 自带的 skill-office 与 libreoffice-kit 负载。漏掉它时
+    // DSH 在装配配置阶段就抛 ERR_INVALID_ARG_TYPE，Office 条目激活失败，Web
+    // 入口跟着回 502——界面只报「页面认证失败」，看起来像网络或凭据问题。
+    crate::runtime::deepseek_harness::configure_runtime_environment(
+        &mut command,
+        &launch.executable,
+    );
     command
         .args(["--profile", "himind", "--patch"])
         .arg(&launch.agent_patch)

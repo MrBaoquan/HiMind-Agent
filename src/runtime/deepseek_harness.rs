@@ -2184,7 +2184,7 @@ fn dsh_command(executable: &std::ffi::OsStr) -> Command {
 /// Point DSH's native Office configuration at the immutable Runtime that is
 /// actually launching this process.  No PATH mutation or system executable
 /// discovery is involved, and external Runtime paths remain supported.
-fn configure_runtime_environment(command: &mut Command, executable: &Path) {
+pub(crate) fn configure_runtime_environment(command: &mut Command, executable: &Path) {
     let Some(runtime_root) = executable.parent().and_then(Path::parent) else {
         return;
     };
@@ -2193,6 +2193,21 @@ fn configure_runtime_environment(command: &mut Command, executable: &Path) {
         "HIMIND_DSH_NODE",
         runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
     );
+    command.env("NO_PROXY", loopback_no_proxy());
+}
+
+/// 环回地址永不走代理。
+///
+/// 代理进程不在本机时它访问不到我们的 127.0.0.1，只会把本机请求变成
+/// 502 Bad Gateway。Agent 自己的环回客户端用 `no_proxy()` 显式关闭代理，
+/// 会话里派生的子进程（git、curl、脚本）只能靠环境变量，所以这里把环回条目
+/// 并进继承来的值，而不是覆盖用户已有的例外。
+fn loopback_no_proxy() -> String {
+    const LOOPBACK: &str = "127.0.0.1,localhost,::1";
+    match env::var("NO_PROXY").or_else(|_| env::var("no_proxy")) {
+        Ok(value) if !value.trim().is_empty() => format!("{LOOPBACK},{value}"),
+        _ => LOOPBACK.to_string(),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2365,8 +2380,7 @@ fn ensure_profile_patch(
 /// The Office skill provider row HiMind owns. DSH keeps it in its native skill
 /// registry and settings surfaces, so HiMind edits the row rather than hiding
 /// Office behind its own surface.
-const MANAGED_OFFICE_SKILL_ROW: &str = "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')\"\n        node: !!js \"process.env.HIMIND_DSH_NODE\"\n        cli: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')\"\n";
-
+const MANAGED_OFFICE_SKILL_ROW: &str = "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"(() => { const path = process.getBuiltinModule('node:path'); const root = process.env.HIMIND_DSH_RUNTIME_ROOT || (process.argv[1] ? path.resolve(process.argv[1], '..', '..', '..', '..', '..') : process.cwd()); return path.join(root, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets'); })()\"\n        node: !!js \"process.env.HIMIND_DSH_NODE || process.execPath\"\n        cli: !!js \"(() => { const path = process.getBuiltinModule('node:path'); const root = process.env.HIMIND_DSH_RUNTIME_ROOT || (process.argv[1] ? path.resolve(process.argv[1], '..', '..', '..', '..', '..') : process.cwd()); return path.join(root, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js'); })()\"\n";
 /// Headless has no Web bundle to mount Office conversion, so it needs the
 /// conversion provider row as well.
 const MANAGED_OFFICE_CONVERT_ROW: &str =
@@ -2417,15 +2431,115 @@ fn effective_runtime_capabilities(declared: &[String], executable: &Path) -> Vec
     capabilities
 }
 
-/// Upgrade profiles created by older Agent versions without replacing the
-/// user's DSH patch rows.  The rows are deliberately ordinary DSH rows so the
-/// native plugin inventory and settings UI remain the source of truth.
+/// Comment every managed capability block carries, so the block can be taken
+/// back out together with the note that explains it.
+const MANAGED_ROW_COMMENT: &str = "# HiMind managed";
+
+/// Marker that identifies a row written by the current Agent.
 ///
-/// Office is the one capability HiMind installs per machine rather than
-/// carrying in the base Runtime, so these rows are reconciled against the
-/// engine on disk: added when Office is installable, taken back out when it is
-/// not. Removal only ever drops the exact managed text below, so a user's own
-/// variant of the row is left alone.
+/// The runtime's own YAML writer folds long scalars, so the literal the Agent
+/// wrote and the literal on disk stop matching as soon as the user edits any
+/// setting in the runtime's UI. Recognising the current revision by this
+/// substring keeps the row usable, and the older one upgradeable, either way.
+const MANAGED_ROW_REVISION_MARKER: &str = "process.argv[1]";
+
+/// Byte range of the managed `- insert:` block that carries `id: <row_id>`.
+///
+/// Rows are located by id instead of by their exact text because DSH rewrites
+/// this file itself (folding long scalars, re-indenting rows) whenever its own
+/// settings surface saves. Matching by id is what keeps the managed rows
+/// repairable and removable on a profile that has been through DSH.
+fn managed_row_block(source: &str, row_id: &str) -> Option<(usize, usize)> {
+    let marker = format!("- id: {row_id}");
+    let mut marker_start = None;
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if line.trim_start().starts_with(&marker) {
+            marker_start = Some(start);
+            break;
+        }
+    }
+    let marker_start = marker_start?;
+
+    // The owning `- insert:` is the last one above the row.
+    let mut insert = None;
+    let mut offset = 0usize;
+    for line in source[..marker_start].split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- insert:") {
+            insert = Some((start, line.len() - trimmed.len()));
+        }
+    }
+    let (insert_start, indent) = insert?;
+
+    // The managed comment directly above the block belongs to it, otherwise
+    // removal leaves the explanation behind.
+    let mut start = insert_start;
+    if let Some(previous_end) = source[..insert_start].rfind('\n') {
+        let line_start = source[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if source[line_start..previous_end]
+            .trim_start()
+            .starts_with(MANAGED_ROW_COMMENT)
+        {
+            start = line_start;
+        }
+    }
+
+    // The block ends at the next row that is indented no deeper than the block.
+    let mut end = source.len();
+    let mut offset = start;
+    for line in source[start..].split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        if line_start <= marker_start {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- ") && line.len() - trimmed.len() <= indent {
+            end = line_start;
+            break;
+        }
+    }
+    // Blank lines before the next row separate rows; they are not part of the
+    // block, so a rewrite neither grows nor shrinks the gap.
+    while end > start && source[start..end].ends_with("\n\n") {
+        end -= 1;
+    }
+    Some((start, end))
+}
+
+/// 还原 YAML 双引号标量里的续行转义（反斜杠 + 换行 + 缩进）。
+///
+/// `serde_yaml` 在重新序列化这份 patch 时会按列宽折行，折点可能落在标识符
+/// 中间，于是磁盘上的文本与常量里写的字面量不再逐字相等。判断「这一行是不是
+/// 当前版本写的」之前先还原折行，比较才稳定。
+fn unfold_yaml_line_breaks(text: &str) -> String {
+    let mut unfolded = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(current) = chars.next() {
+        if current != '\\' {
+            unfolded.push(current);
+            continue;
+        }
+        if !matches!(chars.peek().copied(), Some('\n') | Some('\r')) {
+            unfolded.push(current);
+            continue;
+        }
+        while matches!(
+            chars.peek().copied(),
+            Some('\n') | Some('\r') | Some(' ') | Some('\t')
+        ) {
+            chars.next();
+        }
+    }
+    unfolded
+}
 fn ensure_managed_capability_rows(
     path: &Path,
     office_installed: bool,
@@ -2434,30 +2548,30 @@ fn ensure_managed_capability_rows(
     let headless = path.to_string_lossy().contains(HIMIND_HEADLESS_PROFILE);
     let rows: &[(&str, &str)] = if headless {
         &[
-            ("id: skill-office", MANAGED_OFFICE_SKILL_ROW),
-            ("id: office-to-pdf", MANAGED_OFFICE_CONVERT_ROW),
+            ("skill-office", MANAGED_OFFICE_SKILL_ROW),
+            ("office-to-pdf", MANAGED_OFFICE_CONVERT_ROW),
         ]
     } else {
-        &[("id: skill-office", MANAGED_OFFICE_SKILL_ROW)]
+        &[("skill-office", MANAGED_OFFICE_SKILL_ROW)]
     };
     let mut updated = source.clone();
-    // Add or drop each managed row as a whole. Appending them in one write keeps
-    // every row's own leading and trailing newlines intact, which is what makes
-    // the removal below able to find the exact text it wrote earlier.
-    let additions: String = rows
-        .iter()
-        .filter(|(row_id, _)| !updated.contains(*row_id))
-        .map(|(_, row)| *row)
-        .collect();
-    if office_installed {
-        if !additions.is_empty() {
-            updated = format!("{}{additions}", updated.trim_end());
-        }
-    } else {
-        for (_, row) in rows {
-            if updated.contains(row) {
-                updated = updated.replace(row, "");
+    for (row_id, row) in rows {
+        let block = managed_row_block(&updated, row_id);
+        match (block, office_installed) {
+            // Rewrite in place when the row is not the current revision: an
+            // older row only works while the launching process injects the
+            // Runtime paths, the current one resolves them by itself.
+            (Some((start, end)), true) => {
+                if !unfold_yaml_line_breaks(&updated[start..end])
+                    .contains(MANAGED_ROW_REVISION_MARKER)
+                {
+                    let replacement = format!("{}\n", row.trim_start_matches('\n'));
+                    updated.replace_range(start..end, &replacement);
+                }
             }
+            (Some((start, end)), false) => updated.replace_range(start..end, ""),
+            (None, true) => updated = format!("{}{row}", updated.trim_end()),
+            (None, false) => {}
         }
     }
     if updated == source {
@@ -2468,7 +2582,6 @@ fn ensure_managed_capability_rows(
     fs::write(path, normalized)?;
     Ok(())
 }
-
 fn migrate_managed_profile_patch(path: &Path) -> Result<(), Box<dyn Error>> {
     let source = fs::read_to_string(path)?;
     if !source.contains(HIMIND_AGENT_PATCH_MARKER) && !source.contains("serverName: \"himind\"") {
@@ -4241,10 +4354,11 @@ fn first_line(value: &str) -> String {
 mod tests {
     use super::{
         active_independent_provider_config, agent_owned_route_is_viable,
-        agent_owned_route_is_viable_with, append_independent_service_profile, degraded_notice,
-        dsh_run_home, dsh_skill_name, effective_runtime_capabilities, ensure_interactive_home,
-        ensure_managed_capability_rows, ensure_profile_patch, first_line, himind_mcp_arguments,
-        link_is_traversable, managed_model_catalog, merge_profile_package,
+        agent_owned_route_is_viable_with, append_independent_service_profile,
+        configure_runtime_environment, degraded_notice, dsh_run_home, dsh_skill_name,
+        effective_runtime_capabilities, ensure_interactive_home, ensure_managed_capability_rows,
+        ensure_profile_patch, first_line, himind_mcp_arguments, link_is_traversable,
+        loopback_no_proxy, managed_model_catalog, merge_profile_package,
         migrate_legacy_managed_settings, native_dsh_provider_config, no_tools_overlay_text,
         parse_native_dsh_provider_config, parse_runtime_version, recent_workspace_in,
         release_agent_owned_model_route, remove_managed_runtime, render_himind_agent_overlay,
@@ -5065,27 +5179,122 @@ mod tests {
     /// The Office rows an Agent from before the base Runtime dropped Office wrote
     /// into the profile, exactly as that version wrote them.
     ///
-    /// Removal finds the managed rows by this exact text, so a profile written by
-    /// the older Agent is only cleaned up while the constants still match what it
-    /// wrote. If a future edit reformats them, that machine keeps advertising
-    /// Office on a Runtime that has no engine to serve it - a silent failure, not
-    /// a loud one. Hence `managed_rows_still_match_what_older_agents_wrote`.
+    /// Kept verbatim as the historical literal: the managed rows are matched by
+    /// id, so this text only has to stay byte-accurate for the tests that pin the
+    /// upgrade path from those older Agents.
     const HISTORICAL_OFFICE_SKILL_ROW: &str = "\n\n# HiMind managed Office provider.\n- insert:\n    - id: skill-office\n      name: '@deepseek-ai/dsh-skill-office'\n      config:\n        assetRoot: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'dsh-skill-office', 'assets')\"\n        node: !!js \"process.env.HIMIND_DSH_NODE\"\n        cli: !!js \"process.getBuiltinModule('node:path').resolve(process.env.HIMIND_DSH_RUNTIME_ROOT, 'node_modules', '@deepseek-ai', 'libreoffice-kit', 'lib', 'cli.js')\"\n";
     const HISTORICAL_OFFICE_CONVERT_ROW: &str =
         "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n";
 
     #[test]
-    fn managed_rows_still_match_what_older_agents_wrote() {
+    fn runtime_environment_points_at_the_launching_runtime() {
+        let runtime_root = Path::new("C:/HiMind/runtimes/deepseek-harness/versions/0.2.0-rc.6");
+        let executable = runtime_root.join("bin").join("dsh.cmd");
+        let mut command = std::process::Command::new("cmd.exe");
+        configure_runtime_environment(&mut command, &executable);
+        let environment: BTreeMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
         assert_eq!(
-            super::MANAGED_OFFICE_SKILL_ROW,
-            HISTORICAL_OFFICE_SKILL_ROW,
-            "reformatting the managed Office row would strand it on upgraded machines"
+            environment
+                .get("HIMIND_DSH_RUNTIME_ROOT")
+                .cloned()
+                .flatten(),
+            Some(runtime_root.to_string_lossy().to_string())
         );
+        assert_eq!(
+            environment.get("HIMIND_DSH_NODE").cloned().flatten(),
+            Some(
+                runtime_root
+                    .join(if cfg!(windows) { "node.exe" } else { "node" })
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        let no_proxy = environment
+            .get("NO_PROXY")
+            .cloned()
+            .flatten()
+            .unwrap_or_default();
+        assert!(no_proxy.contains("127.0.0.1"));
+        assert!(no_proxy.contains("localhost"));
+        assert_eq!(
+            loopback_no_proxy().split(',').next(),
+            Some("127.0.0.1"),
+            "loopback entries come first and never replace the user's own exceptions"
+        );
+    }
+
+    #[test]
+    fn managed_office_row_resolves_the_runtime_without_help_from_the_launcher() {
+        // The Agent injects HIMIND_DSH_RUNTIME_ROOT for every Runtime it starts,
+        // but the row must not depend on that: a session started by any other
+        // path died with ERR_INVALID_ARG_TYPE on process.env.HIMIND_DSH_RUNTIME_ROOT,
+        // which took the Office entry, and with it the whole Web entry (HTTP 502),
+        // down with it.
+        assert!(super::MANAGED_OFFICE_SKILL_ROW.contains("process.argv[1]"));
+        assert!(!super::MANAGED_OFFICE_SKILL_ROW
+            .contains("resolve(process.env.HIMIND_DSH_RUNTIME_ROOT,"));
+        assert!(super::MANAGED_OFFICE_SKILL_ROW.contains("process.env.HIMIND_DSH_NODE ||"));
         assert_eq!(
             super::MANAGED_OFFICE_CONVERT_ROW,
             HISTORICAL_OFFICE_CONVERT_ROW,
             "reformatting the managed conversion row would strand it on upgraded machines"
         );
+    }
+
+    #[test]
+    fn older_and_reformatted_office_rows_are_still_recognised() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-office-recognise-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profiles").join(super::HIMIND_PROFILE);
+        std::fs::create_dir_all(&profile).unwrap();
+        let path = profile.join("cordis.patch.yml");
+        let mut source = include_str!("../../runtime-profiles/himind/cordis.patch.yml")
+            .trim_end()
+            .to_string();
+        source.push_str(HISTORICAL_OFFICE_SKILL_ROW);
+        source.push_str("\n- id: user-owned-row\n  config:\n    enabled: true\n");
+        std::fs::write(&path, &source).unwrap();
+
+        // The row an older Agent wrote is recognised and rewritten in place, so
+        // the profile never carries two Office rows.
+        ensure_managed_capability_rows(&path, true).unwrap();
+        let upgraded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(upgraded.matches("id: skill-office").count(), 1);
+        assert!(upgraded.contains(super::MANAGED_ROW_REVISION_MARKER));
+        assert!(upgraded.contains("id: user-owned-row"));
+
+        // DSH re-serialises this file with its own YAML writer, which folds long
+        // double-quoted scalars with a trailing backslash. The row has to stay
+        // the same managed row after that, otherwise a machine that removes the
+        // Office engine keeps a row pointing at a package it no longer has.
+        let folded = upgraded.replace(
+            "'node:path'); const root",
+            "'node:path'); const ro\\
+          ot",
+        );
+        assert_ne!(folded, upgraded);
+        std::fs::write(&path, &folded).unwrap();
+        ensure_managed_capability_rows(&path, false).unwrap();
+        let cleaned = std::fs::read_to_string(&path).unwrap();
+        assert!(!cleaned.contains("id: skill-office"));
+        assert!(cleaned.contains("id: user-owned-row"));
+        assert!(cleaned.contains("id: system-prompt"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

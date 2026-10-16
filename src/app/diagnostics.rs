@@ -303,6 +303,34 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         "detail": rail_links,
     }));
 
+    let loopback_proxy = loopback_proxy_snapshot();
+    let loopback_proxied = loopback_proxy
+        .get("proxied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if loopback_proxied {
+        warnings += 1;
+    }
+    checks.push(json!({
+        "name": "loopback_proxy_bypass",
+        "ok": !loopback_proxied,
+        "severity": if loopback_proxied { "warning" } else { "info" },
+        "message": if loopback_proxied {
+            format!(
+                "系统代理 {} 会接管发往 127.0.0.1 的请求，HiMind AI 页面可能以 502 失败；\
+                 把 127.0.0.1 与 localhost 加进代理绕过列表（WinINET 的 127.* 写法不算），\
+                 或设置 NO_PROXY=127.0.0.1,localhost 后重启 Agent",
+                loopback_proxy
+                    .get("proxy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知")
+            )
+        } else {
+            "发往环回地址的请求不会被系统代理接管".to_string()
+        },
+        "detail": loopback_proxy,
+    }));
+
     let session_health = builtin_ai_session_snapshot(options);
     let session_failure = session_health
         .get("last_failure")
@@ -373,6 +401,104 @@ fn push_check(
     checks.push(json!({ "name": name, "ok": ok, "severity": severity, "message": message }));
 }
 
+/// 系统代理会不会接管发往 127.0.0.1 的请求。
+///
+/// reqwest 默认启用 system-proxy：Windows 上它读 WinINET 的 ProxyEnable /
+/// ProxyServer / ProxyOverride，绕过列表按 NO_PROXY 语义解析。`127.*`、
+/// `<local>` 这类 WinINET 写法既不是 CIDR 也不是域名，匹配不到 127.0.0.1，
+/// 于是本机环回请求会被交给代理；代理不在本机时它访问不到我们的 127.0.0.1，
+/// 只能回 502 Bad Gateway——「HiMind AI 页面认证失败：HTTP 502 Bad Gateway」
+/// 的一种来源就是这条，页面本身其实健康。
+fn loopback_proxy_snapshot() -> Value {
+    let mut env_proxy = None;
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                env_proxy = Some((key.to_string(), value));
+                break;
+            }
+        }
+    }
+    let env_bypass = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    let registry = registry_proxy_settings();
+    let registry_proxy = registry
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let registry_bypass = registry
+        .get("bypass")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // 环境变量优先于注册表，读取顺序与 reqwest 一致。
+    let (source, proxy, bypass) = match env_proxy {
+        Some((_, value)) => ("env", Some(value), env_bypass.clone()),
+        None => ("registry", registry_proxy, registry_bypass.clone()),
+    };
+    let proxied = proxy.is_some() && !bypasses_loopback(&bypass);
+    json!({
+        "proxied": proxied,
+        "source": source,
+        "proxy": proxy,
+        "bypass": bypass,
+        "env_bypass": env_bypass,
+        "registry": registry,
+    })
+}
+
+/// 只回答一个问题：这份绕过列表覆盖环回地址吗。
+///
+/// 判据与 reqwest 的匹配规则一致：条目按逗号或分号切开，只认 `*`、精确主机名
+/// 和 CIDR。`127.*`、`<local>` 这些 WinINET 写法在这里匹配不到 127.0.0.1，
+/// 所以它们**不算**绕过——这正是需要点出来的坑。
+fn bypasses_loopback(list: &str) -> bool {
+    list.split([',', ';'])
+        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
+        .any(|entry| {
+            matches!(
+                entry.as_str(),
+                "*" | "127.0.0.1" | "127.0.0.0/8" | "127.0.0.1/32" | "localhost" | "::1" | "[::1]"
+            )
+        })
+}
+
+#[cfg(windows)]
+fn registry_proxy_settings() -> Value {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+    else {
+        return json!({});
+    };
+    let enabled = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
+    let server = key
+        .get_value::<String, _>("ProxyServer")
+        .unwrap_or_default();
+    let bypass = key
+        .get_value::<String, _>("ProxyOverride")
+        .unwrap_or_default();
+    json!({
+        "enabled": enabled,
+        "server": if enabled { server } else { String::new() },
+        "bypass": bypass,
+    })
+}
+
+#[cfg(not(windows))]
+fn registry_proxy_settings() -> Value {
+    json!({})
+}
 /// 扩展源信任快照：受信 key ID、以及每个「已启用」来源的缓存目录实际用到的 key ID。
 ///
 /// 一条用未受信公钥签名的条目会让整个 GitHub 来源显示为不可用，而界面只给出

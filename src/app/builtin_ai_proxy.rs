@@ -442,8 +442,14 @@ impl BuiltinAiProxy {
 
 impl BuiltinAiProxyControl {
     pub(crate) fn verify_browser_entry(&self) -> Result<(), String> {
+        // reqwest 0.12 默认启用 system-proxy：Windows 上它读 WinINET 注册表，
+        // 而那份绕过列表里的 `127.*` 既不是 CIDR 也不是域名，环回请求因此会被
+        // 交给系统代理。代理不在本机时它访问不到我们的 127.0.0.1，只能回
+        // 502 Bad Gateway——界面报「HiMind AI 页面认证失败」，而页面其实是好的。
+        // 本模块的每个请求都发给 Agent 自己监听的环回端口，一律禁用代理。
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
+            .no_proxy()
             .build()
             .map_err(|error| format!("创建 HiMind AI 页面验证客户端失败: {error}"))?;
         let mut endpoint =
@@ -679,6 +685,7 @@ impl BuiltinAiProxyControl {
         }
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
             .map_err(|error| format!("创建 DSH 模型同步客户端失败: {error}"))?;
         let described = self.call_api(&client, "settings/describe", json!({}))?;
@@ -802,6 +809,7 @@ impl BuiltinAiProxyControl {
     pub(crate) fn call_runtime_api(&self, endpoint: &str, args: Value) -> Result<Value, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
+            .no_proxy()
             .build()
             .map_err(|error| format!("创建 DSH 控制客户端失败: {error}"))?;
         self.call_api(&client, endpoint, args)
@@ -821,6 +829,7 @@ impl BuiltinAiProxyControl {
         }
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
+            .no_proxy()
             .build()
             .map_err(|error| format!("创建 DSH 响应客户端失败: {error}"))?;
         let mut endpoint =
@@ -862,6 +871,7 @@ impl BuiltinAiProxyControl {
     pub(crate) fn probe_runtime_api(&self, endpoint: &str, args: Value) -> Result<Value, String> {
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
+            .no_proxy()
             .build()
             .map_err(|error| format!("创建 DSH 能力探测客户端失败: {error}"))?;
         self.call_api(&client, endpoint, args)
