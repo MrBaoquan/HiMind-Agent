@@ -317,9 +317,11 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         "severity": if loopback_proxied { "warning" } else { "info" },
         "message": if loopback_proxied {
             format!(
-                "系统代理 {} 会接管发往 127.0.0.1 的请求，HiMind AI 页面可能以 502 失败；\
-                 把 127.0.0.1 与 localhost 加进代理绕过列表（WinINET 的 127.* 写法不算），\
-                 或设置 NO_PROXY=127.0.0.1,localhost 后重启 Agent",
+                "系统代理 {} 会接管发往 127.0.0.1 的请求：绕过列表里的 127.*、<local>、localhost \
+                 这些写法在代理匹配器里都不成立。Agent 0.3.74 起自己的环回请求一律不走代理，\
+                 但 0.3.73 及更早的版本会以「页面返回 502 Bad Gateway」失败，会话里派生的 \
+                 git/curl 等子进程也仍会走代理；把 127.0.0.1 加进代理绕过列表，或设置 \
+                 NO_PROXY=127.0.0.1 后重启 Agent",
                 loopback_proxy
                     .get("proxy")
                     .and_then(Value::as_str)
@@ -456,20 +458,51 @@ fn loopback_proxy_snapshot() -> Value {
     })
 }
 
-/// 只回答一个问题：这份绕过列表覆盖环回地址吗。
+/// 环回地址的字面量形式：Agent 的环回客户端把 host 固定成 `127.0.0.1`。
+const LOOPBACK_IPV4: u32 = 0x7f00_0001;
+
+/// 只回答一个问题：按 reqwest（curl 语义）的规则，这份绕过列表覆盖 `127.0.0.1` 吗。
 ///
-/// 判据与 reqwest 的匹配规则一致：条目按逗号或分号切开，只认 `*`、精确主机名
-/// 和 CIDR。`127.*`、`<local>` 这些 WinINET 写法在这里匹配不到 127.0.0.1，
-/// 所以它们**不算**绕过——这正是需要点出来的坑。
+/// 判据逐字对应 hyper-util 的匹配器：条目按逗号或分号切开，能解析成 IP 或 CIDR 的
+/// 进 IP 匹配器，其余当域名；请求主机是 IP 字面量时只看 IP 匹配器。所以 `localhost`
+/// 不算数（那是域名条目），`127.*`、`<local>` 这类 WinINET 写法解析失败、同样不算数。
+/// 这正是「浏览器能打开 localhost，Agent 却不能」的由来。
 fn bypasses_loopback(list: &str) -> bool {
     list.split([',', ';'])
-        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
-        .any(|entry| {
-            matches!(
-                entry.as_str(),
-                "*" | "127.0.0.1" | "127.0.0.0/8" | "127.0.0.1/32" | "localhost" | "::1" | "[::1]"
-            )
-        })
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .any(|entry| entry_covers_loopback(&entry))
+}
+
+fn entry_covers_loopback(entry: &str) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    if let Some((base, prefix)) = entry.split_once('/') {
+        let (Ok(prefix), Ok(base)) = (prefix.parse::<u32>(), parse_ipv4(base)) else {
+            return false;
+        };
+        if prefix > 32 {
+            return false;
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        return (base & mask) == (LOOPBACK_IPV4 & mask);
+    }
+    matches!(parse_ipv4(entry), Ok(value) if value == LOOPBACK_IPV4)
+}
+
+fn parse_ipv4(value: &str) -> Result<u32, ()> {
+    let octets: Vec<u8> = value
+        .split('.')
+        .map(|part| part.parse::<u8>().map_err(|_| ()))
+        .collect::<Result<_, _>>()?;
+    let [a, b, c, d] = octets.as_slice() else {
+        return Err(());
+    };
+    Ok(u32::from_be_bytes([*a, *b, *c, *d]))
 }
 
 #[cfg(windows)]
@@ -1483,6 +1516,23 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wininet_style_bypass_entries_do_not_cover_loopback() {
+        // 现场机器的 ProxyOverride 正是这一串：浏览器按 WinINET 规则放行 localhost，
+        // 而环回客户端的主机是 127.0.0.1 这个 IP 字面量，代理匹配器只看 IP 条目，
+        // 于是请求照样被交给代理——代理不在本机时就是那句 502。
+        assert!(!super::bypasses_loopback(
+            "localhost;127.*;192.168.*;<local>"
+        ));
+        assert!(!super::bypasses_loopback(""));
+        assert!(super::bypasses_loopback("127.0.0.1"));
+        assert!(super::bypasses_loopback("127.0.0.0/8"));
+        assert!(super::bypasses_loopback("127.0.0.1/32"));
+        assert!(super::bypasses_loopback("example.com,127.0.0.1"));
+        assert!(!super::bypasses_loopback("10.0.0.0/8,example.com"));
+        assert!(!super::bypasses_loopback("127.0.0.1.example.com"));
+    }
+
     use super::{
         builtin_ai_session_snapshot_from_path, export_bundle_from, startup_evidence_from_path,
     };
