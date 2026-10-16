@@ -4,12 +4,12 @@ use serde_json::json;
 use std::env;
 use std::error::Error;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("agent launcher failed: {error}");
+        report_launcher_problem(&format!("agent launcher failed: {error}"));
         if let Ok(executable) = env::current_exe() {
             if let Some(root) = executable.parent() {
                 record_launcher_event(root, "error", &format!("launcher 启动失败：{error}"));
@@ -32,17 +32,33 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let trusted_keys = root.join("trusted-keys");
     let arguments = validated_arguments(env::args().skip(1).collect())?;
+    let mcp_mode = arguments.iter().any(|argument| argument == "--mcp");
+    let cli_mode = is_cli_launch(&arguments);
+    // A desktop launch is the one entry point whose console nobody reads: it
+    // exists only because Windows hands a console-subsystem binary a console
+    // window when Explorer starts it. Detach before anything else can slow the
+    // launch down, so that window goes away instead of sitting over the desktop
+    // until the Agent window appears.
+    let detach_console = !mcp_mode && !cli_mode && launcher_owns_its_console();
+    if detach_console {
+        detach_launcher_console();
+    }
     if !is_protocol_launch(&arguments) {
         if let Err(error) = repair_protocol_registration(&root, &arguments) {
             let message = format!(
                 "agent protocol registration repair failed: {error}；普通用户启动将继续，但协议唤起可能不可用。请运行 diagnostics check 检查 HKCU\\Software\\Classes 权限和 Low integrity 标记。"
             );
             record_launcher_event(&root, "error", &message);
-            eprintln!("{message}");
+            report_launcher_problem(&message);
+        }
+        if let Err(error) = repair_autostart_registration(&root, &arguments) {
+            let message = format!(
+                "agent autostart registration repair failed: {error}；普通用户启动将继续，但登录自启可能会弹出用户没有主动打开的窗口。请运行 diagnostics check 检查 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 权限。"
+            );
+            record_launcher_event(&root, "error", &message);
+            report_launcher_problem(&message);
         }
     }
-    let mcp_mode = arguments.iter().any(|argument| argument == "--mcp");
-    let cli_mode = is_cli_launch(&arguments);
     // Release Agent is a GUI-subsystem binary on Windows. MCP clients require
     // a console process with an attached stdio stream, so always select the
     // same-version companion when the launcher is used for MCP.
@@ -73,6 +89,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         let mut child = command.spawn()?;
         let status = child.wait()?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+    if detach_console {
+        // Nothing can render text any more, and a child that inherits a closed
+        // console handle fails on its first `println!`. Give it a null sink:
+        // everything that matters is already in `logs/agent-events.jsonl`.
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
     }
     command.spawn()?;
     Ok(())
@@ -105,6 +129,54 @@ fn record_launcher_event(root: &Path, level: &str, message: &str) {
             .open(path)
             .and_then(|mut file| file.write_all(text.as_bytes()));
     }
+}
+
+/// Whether the console this process is attached to exists only because of it.
+///
+/// A desktop launch is started by Explorer, which has no console, so Windows
+/// creates one for the launcher — that window is the black frame users see while
+/// the Agent starts. A launch from a terminal or a script shares that caller's
+/// console, and there the console output *is* the feedback, so it has to stay.
+#[cfg(windows)]
+fn launcher_owns_its_console() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    // One entry is this process alone. A larger answer includes the shell (or
+    // overflows the buffer), and zero means there is no console at all — nothing
+    // to preserve in either case.
+    let mut attached = [0_u32; 2];
+    let count = unsafe { GetConsoleProcessList(attached.as_mut_ptr(), attached.len() as u32) };
+    count <= 1
+}
+
+#[cfg(not(windows))]
+fn launcher_owns_its_console() -> bool {
+    false
+}
+
+/// Drop the console window Windows created for a desktop launch.
+///
+/// The launcher stays a console-subsystem binary so that the `diagnostics`,
+/// `runtime` and `trust` subcommands — and the MCP tunnel — keep a usable stdio.
+/// A desktop launch needs none of that, and the window it gets is never wanted.
+/// `FreeConsole` only detaches this process: a launcher-owned console is
+/// destroyed together with its window, a shared one is left alone. Deliberately
+/// no `ShowWindow(SW_HIDE)` — on a shared console that would hide the user's own
+/// terminal window.
+#[cfg(windows)]
+fn detach_launcher_console() {
+    unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+}
+
+#[cfg(not(windows))]
+fn detach_launcher_console() {}
+
+/// `eprintln!` panics when the standard error handle is gone, which is exactly
+/// the state after a desktop launch detaches its console — and a panic here would
+/// abort the launch before the user sees anything. The same message is already in
+/// `logs/agent-events.jsonl`, so a failed write needs no report of its own.
+fn report_launcher_problem(message: &str) {
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(stderr, "{message}");
 }
 
 fn is_cli_launch(arguments: &[String]) -> bool {
@@ -194,10 +266,25 @@ fn is_protocol_launch(arguments: &[String]) -> bool {
         .any(|argument| argument == "--protocol-url")
 }
 
+/// 本机安装版需要维护的两条 HKCU 注册项内容。
+///
+/// `command` 与 `autostart_command` 必须与安装器写入的形式逐字一致
+/// （`PRODUCT_LAUNCH_ARGS` / `PRODUCT_AUTOSTART_ARGS` 展开后的整串）：启动器只在
+/// 注册项已经指向本次安装时才跳过写入，拼写不同会让每次双击都去改注册表；在注册
+/// 表项 ACL 只允许高完整性令牌写入的机器上，那次写入会失败并报
+/// "拒绝访问 (os error 5)"。
+struct LaunchRegistration {
+    command: String,
+    autostart_command: String,
+    launcher: PathBuf,
+    api_base: String,
+    local_port: u16,
+}
+
 fn protocol_registration_command(
     root: &Path,
     arguments: &[String],
-) -> Result<Option<String>, Box<dyn Error>> {
+) -> Result<Option<LaunchRegistration>, Box<dyn Error>> {
     if is_protocol_launch(arguments) || !installed_layout_is_valid(root) {
         return Ok(None);
     }
@@ -233,13 +320,18 @@ fn protocol_registration_command(
     let mode_argument = mode
         .map(|value| format!(" --mode {value}"))
         .unwrap_or_default();
-    Ok(Some(format!(
-        "\"{}\" --api \"{}\"{} --local-app --local-port {} --protocol-url \"%1\"",
-        launcher.display(),
-        api_base,
-        mode_argument,
-        port
-    )))
+    let executable = launcher.display();
+    Ok(Some(LaunchRegistration {
+        command: format!(
+            "\"{executable}\" --api {api_base}{mode_argument} --local-app --local-port {port} --show --protocol-url \"%1\""
+        ),
+        autostart_command: format!(
+            "\"{executable}\" --api {api_base}{mode_argument} --local-app --local-port {port} --hidden"
+        ),
+        launcher,
+        api_base: api_base.to_string(),
+        local_port: port,
+    }))
 }
 
 fn unique_argument_value<'a>(
@@ -272,7 +364,7 @@ fn repair_protocol_registration(root: &Path, arguments: &[String]) -> Result<(),
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
-    let Some(command) = protocol_registration_command(root, arguments)? else {
+    let Some(registration) = protocol_registration_command(root, arguments)? else {
         return Ok(());
     };
     let icon_path = root.join("himind-agent.ico");
@@ -301,7 +393,8 @@ fn repair_protocol_registration(root: &Path, arguments: &[String]) -> Result<(),
         if current_description == "URL:HiMind Agent Protocol"
             && current_url_protocol.is_empty()
             && current_icon.eq_ignore_ascii_case(&icon_path.to_string_lossy())
-            && current_command == command
+            && launch_registration_matches(&current_command, &registration)
+            && registration_tokens(&current_command).contains(&"--protocol-url")
         {
             return Ok(());
         }
@@ -313,8 +406,90 @@ fn repair_protocol_registration(root: &Path, arguments: &[String]) -> Result<(),
     let (icon, _) = hkcu.create_subkey(r"Software\Classes\himind-agent\DefaultIcon")?;
     icon.set_value("", &icon_path.to_string_lossy().as_ref())?;
     let (open, _) = hkcu.create_subkey(r"Software\Classes\himind-agent\shell\open\command")?;
-    open.set_value("", &command)?;
+    open.set_value("", &registration.command)?;
     Ok(())
+}
+
+/// 读写 HKCU 的登录自启项，让升级到「默认显示主窗口」的版本后不会每次登录都
+/// 弹出一个用户没有主动打开的窗口。
+///
+/// 只在自启项**已经存在**时才维护：用户没勾选「开机启动」时安装器不写这一项，
+/// 启动器也不替用户创建。
+#[cfg(windows)]
+fn repair_autostart_registration(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let Some(registration) = protocol_registration_command(root, arguments)? else {
+        return Ok(());
+    };
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(run) = hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run") else {
+        return Ok(());
+    };
+    let Ok(current) = run.get_value::<String, _>("HiMindAgent") else {
+        return Ok(());
+    };
+    if launch_registration_matches(&current, &registration) && command_requests_background(&current)
+    {
+        return Ok(());
+    }
+    let (run, _) = hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")?;
+    run.set_value("HiMindAgent", &registration.autostart_command)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn repair_autostart_registration(root: &Path, arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let _ = protocol_registration_command(root, arguments)?;
+    Ok(())
+}
+
+/// 把注册表里的命令行切成 token，去掉包裹的引号。
+fn registration_tokens(command: &str) -> Vec<&str> {
+    command
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'))
+        .collect()
+}
+
+/// 已有的注册命令是否已经指向本次安装（同一个启动器、同一个 API 地址与端口）。
+///
+/// 用语义比对而不是逐字比对：安装器写的是宏展开后的整串，启动器自己拼的串可能在
+/// 引号、参数顺序或 `--mode` 上有差别。逐字比对会把两份等价的注册判成不一致，于是
+/// 每次双击都去写注册表——在 ACL 只允许高完整性令牌写入的机器上，那正是用户看到的
+/// `agent protocol registration repair failed: 拒绝访问。 (os error 5)`。
+fn launch_registration_matches(command: &str, expected: &LaunchRegistration) -> bool {
+    let tokens = registration_tokens(command);
+    let Some(registered_launcher) = tokens.first() else {
+        return false;
+    };
+    if !registered_launcher.eq_ignore_ascii_case(&expected.launcher.to_string_lossy()) {
+        return false;
+    }
+    if !tokens.iter().any(|token| *token == "--local-app") {
+        return false;
+    }
+    let value_of = |name: &str| -> Option<&str> {
+        tokens
+            .iter()
+            .position(|token| *token == name)
+            .and_then(|index| tokens.get(index + 1).copied())
+    };
+    if value_of("--api") != Some(expected.api_base.as_str()) {
+        return false;
+    }
+    if value_of("--local-port") != Some(expected.local_port.to_string().as_str()) {
+        return false;
+    }
+    true
+}
+
+/// 已有命令是否明确要求后台启动（登录自启项必须带 `--hidden`）。
+fn command_requests_background(command: &str) -> bool {
+    registration_tokens(command)
+        .iter()
+        .any(|token| *token == "--hidden" || *token == "--background")
 }
 
 #[cfg(not(windows))]
@@ -352,7 +527,10 @@ fn is_safe_open_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{arguments_with_default_state, protocol_registration_command, validated_arguments};
+    use super::{
+        arguments_with_default_state, command_requests_background, launch_registration_matches,
+        protocol_registration_command, validated_arguments,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -414,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_installed_launch_builds_current_protocol_command() {
+    fn normal_installed_launch_builds_installer_compatible_registrations() {
         let root = installed_root("repair");
         let arguments = vec![
             "--api".into(),
@@ -423,16 +601,66 @@ mod tests {
             "--local-port".into(),
             "18181".into(),
         ];
-        let command = protocol_registration_command(&root, &arguments)
+        let registration = protocol_registration_command(&root, &arguments)
             .unwrap()
             .unwrap();
+        let launcher = root.join("himind-agent-launcher.exe");
+        // 必须与安装器 `PRODUCT_LAUNCH_ARGS` / `PRODUCT_AUTOSTART_ARGS` 的展开结果
+        // 逐字一致，否则每次双击都会重写注册项——在注册项 ACL 只允许高完整性令牌
+        // 写入的机器上，那正是 "拒绝访问 (os error 5)" 的来源。
         assert_eq!(
-            command,
+            registration.command,
             format!(
-                "\"{}\" --api \"https://himind.example\" --local-app --local-port 18181 --protocol-url \"%1\"",
-                root.join("himind-agent-launcher.exe").display()
+                "\"{}\" --api https://himind.example --local-app --local-port 18181 --show --protocol-url \"%1\"",
+                launcher.display()
             )
         );
+        assert_eq!(
+            registration.autostart_command,
+            format!(
+                "\"{}\" --api https://himind.example --local-app --local-port 18181 --hidden",
+                launcher.display()
+            )
+        );
+        assert!(launch_registration_matches(
+            &registration.command,
+            &registration
+        ));
+        // 0.3.69 的启动器写的是带引号的 API 地址：语义相等就不要重写。
+        assert!(launch_registration_matches(
+            &format!(
+                "\"{}\" --api \"https://himind.example\" --local-app --local-port 18181 --show --protocol-url \"%1\"",
+                launcher.display()
+            ),
+            &registration
+        ));
+        // 0.3.68 及更早写入的登录自启项没有 --hidden：判成匹配（同一个启动器/API/
+        // 端口），但需要补后台标记。
+        let legacy_autostart = format!(
+            "\"{}\" --api https://himind.example --local-app --local-port 18181",
+            launcher.display()
+        );
+        assert!(launch_registration_matches(
+            &legacy_autostart,
+            &registration
+        ));
+        assert!(!command_requests_background(&legacy_autostart));
+        assert!(command_requests_background(&registration.autostart_command));
+        // 指向别的安装或别的 API 时不算匹配。
+        assert!(!launch_registration_matches(
+            &format!(
+                "\"{}\" --api https://himind.example --local-app --local-port 18181",
+                root.join("other-launcher.exe").display()
+            ),
+            &registration
+        ));
+        assert!(!launch_registration_matches(
+            &format!(
+                "\"{}\" --api https://other.example --local-app --local-port 18181",
+                launcher.display()
+            ),
+            &registration
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -448,10 +676,12 @@ mod tests {
             "--local-port".into(),
             "18181".into(),
         ];
-        let command = protocol_registration_command(&root, &arguments)
+        let registration = protocol_registration_command(&root, &arguments)
             .unwrap()
             .unwrap();
-        assert!(command.contains("--mode connected --local-app"));
+        assert!(registration
+            .command
+            .contains("--mode connected --local-app"));
         fs::remove_dir_all(root).unwrap();
     }
 

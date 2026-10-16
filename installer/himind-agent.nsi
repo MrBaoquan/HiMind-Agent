@@ -41,7 +41,7 @@ Unicode true
 !define PRODUCT_RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 !define PRODUCT_PROTOCOL_KEY "Software\Classes\himind-agent"
 !define PRODUCT_LAUNCH_ARGS '--api ${API_BASE} --local-app --local-port 18181 --show'
-!define PRODUCT_AUTOSTART_ARGS '--api ${API_BASE} --local-app --local-port 18181'
+!define PRODUCT_AUTOSTART_ARGS '--api ${API_BASE} --local-app --local-port 18181 --hidden'
 
 Name "${PRODUCT_NAME}"
 Caption "${PRODUCT_NAME} 安装程序"

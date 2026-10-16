@@ -914,7 +914,8 @@ fn run_market_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 let _ = next(1)?;
                 index += 2;
             }
-            "--once" | "--local-app" | "--show" | "--reenroll" => {
+            "--once" | "--local-app" | "--show" | "--hidden" | "--background"
+            | "--reenroll" => {
                 index += 1;
             }
             other => {
@@ -3199,6 +3200,9 @@ pub(crate) struct Options {
     once: bool,
     interval_seconds: u64,
     local_app: bool,
+    /// 登录自启等后台启动（--hidden）：保持窗口隐藏，只留托盘。桌面快捷方式与
+    /// 协议唤起都不带这个标记。
+    hidden: bool,
     local_port: u16,
     reenroll: bool,
     enrollment_token: String,
@@ -3208,6 +3212,16 @@ pub(crate) struct Options {
     task_execution: Arc<RwLock<Option<(String, String, String, String)>>>,
 }
 
+/// 后台启动标记：登录自启（Run 项）用 `--hidden`，桌面快捷方式与协议唤起不带它。
+///
+/// 单独抽成纯函数是为了让「默认显示窗口」这条规则有回归测试覆盖——0.3.69 曾把
+/// 主窗口改成只有 `--show` 才显示，而自更新不会重写快捷方式，结果升级用户的
+/// Agent 进程在跑却没有窗口。
+fn window_hidden_requested(arguments: &[String]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| argument == "--hidden" || argument == "--background")
+}
 impl Options {
     /// The Dashboard/API base of the active workbench connection.
     pub(crate) fn api_base(&self) -> String {
@@ -3266,8 +3280,13 @@ impl Options {
         parse_protocol_open(&env::args().collect::<Vec<_>>())
     }
 
+    /// 本次启动是否要把主窗口显示出来。
+    ///
+    /// 判据是「后台启动」而不是 --show：自更新只换二进制、不重写桌面快捷方式，
+    /// 0.3.69 的快捷方式里没有 --show，于是那些用户会出现「进程在跑、窗口不见」
+    /// 的启动回归。现在默认显示，只有登录自启显式要求后台启动时才隐藏。
     pub(crate) fn show_window(&self) -> bool {
-        env::args().any(|argument| argument == "--show")
+        !self.hidden
     }
 
     fn from_env() -> Self {
@@ -3290,6 +3309,7 @@ impl Options {
         let mut mode_override = None;
 
         let args: Vec<String> = env::args().collect();
+        let hidden = window_hidden_requested(&args);
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
@@ -3321,7 +3341,10 @@ impl Options {
                 }
                 "--once" => once = true,
                 "--local-app" => local_app = true,
+                // 0.3.69 的快捷方式带上它；现在显示窗口已经是默认行为，保留只为兼容。
                 "--show" => {}
+                // 取值由 window_hidden_requested 统一判定；这里消费掉，避免它被当成子命令。
+                "--hidden" | "--background" => {}
                 "--mode" if i + 1 < args.len() => {
                     // This is a process-local debugging override. The panel
                     // remains the product setting and is persisted separately.
@@ -3369,6 +3392,7 @@ impl Options {
             once,
             interval_seconds,
             local_app,
+            hidden,
             local_port,
             reenroll,
             enrollment_token,
@@ -3503,8 +3527,8 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 mod tests {
     use super::{
         cli_subcommand, default_local_port, parse_plugin_view_launch, parse_protocol_open,
-        should_run_acp, should_run_mcp, workflow_dispatch_limit, AgentOpenTarget, PluginViewLaunch,
-        SHIPPED_DASHBOARD_API_BASE,
+        should_run_acp, should_run_mcp, window_hidden_requested, workflow_dispatch_limit, AgentOpenTarget,
+        PluginViewLaunch, SHIPPED_DASHBOARD_API_BASE,
     };
     use crate::api::types::Task;
     use serde_json::json;
@@ -3516,6 +3540,26 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn gui_launch_shows_the_main_window_unless_background_was_requested() {
+        // 桌面快捷方式（含 0.3.69 之前写入、不带 --show 的旧快捷方式）与协议唤起
+        // 都必须显示窗口，否则升级用户会遇到「进程在跑、窗口不见」。
+        assert!(!window_hidden_requested(&[]));
+        assert!(!window_hidden_requested(&[
+            "--api".into(),
+            "https://himind.andcrane.com".into(),
+            "--local-app".into(),
+            "--local-port".into(),
+            "18181".into(),
+        ]));
+        assert!(!window_hidden_requested(&["--show".into()]));
+        // 登录自启才隐藏。
+        assert!(window_hidden_requested(&[
+            "--local-app".into(),
+            "--hidden".into()
+        ]));
+        assert!(window_hidden_requested(&["--background".into()]));
+    }
     #[test]
     fn cli_subcommand_ignores_flag_values_that_look_like_commands() {
         assert_eq!(

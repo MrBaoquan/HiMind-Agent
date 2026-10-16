@@ -8,7 +8,13 @@
 
 安装器以前只验证 Runtime 导入，然后在完成页启动 launcher。Tauri 主窗口在 `tauri.conf.json` 中配置为 `visible: false`，窗口是否成功创建依赖 WebView2 和用户数据目录；如果 WebView2 环境创建失败，进程可能仍然有托盘图标，但用户看不到主窗口。
 
-安装器现在使用两种参数：桌面快捷方式和安装完成启动使用 `--show`，登录自启继续只启动托盘驻留。主窗口缺失、显示失败和 `builder.run()` 失败都会写入 `%LOCALAPPDATA%\HiMindAgent\logs\agent-events.jsonl`，并弹出可见错误。
+现在的判据是**「后台启动」而不是 `--show`**：桌面快捷方式、协议唤起和安装完成启动一律显示主窗口，只有登录自启显式带 `--hidden` 时才驻留托盘。
+
+这条判据的方向很关键：自更新（工作台上的软件分发）只替换二进制、**不会重写桌面快捷方式**。0.3.69 曾把主窗口改成「只有 `--show` 才显示」，而 `--show` 只写在 0.3.69 安装器创建的快捷方式里，于是自更新上来的机器双击后进程在跑、窗口却永远不出现。默认显示消除了这类「升级即失联」的组合。
+
+launcher 同时把登录自启项（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `HiMindAgent`）同步成带 `--hidden` 的形式——只在自启项已存在时维护，用户没开「开机启动」时不会替用户创建。
+
+主窗口缺失、显示失败和 `builder.run()` 失败都会写入 `%LOCALAPPDATA%\HiMindAgent\logs\agent-events.jsonl`，并弹出可见错误。
 
 ### 2. WebView2 用户数据目录是进程级独占资源
 
@@ -51,6 +57,7 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | `agent protocol registration repair failed: Access denied` | `protocol_registration` 与启动日志中的 `source=launcher` | 以当前用户运行 `diagnostics check`；确认协议注册指向当前安装，若完整性为 Low，先运行 `repair-storage.ps1` 后重新双击 |
 | 第二次双击没有把窗口带到前台 | `agent-events.jsonl` 中的“第二次启动参数已转发” | 如果没有该记录，检查 launcher/单实例事件窗口；如果有记录但页面事件仍为空，按 WebView2 数据目录问题处理 |
 | 双击完全无反应 | `launcher` 检查和安装目录是否存在 | 从 PowerShell 运行 launcher，读取弹窗原因；检查安全软件/AppLocker 拦截记录 |
+| 自更新后双击只见到托盘、没有窗口 | 快捷方式参数（右键属性→目标）是否仍带 `--show` | 0.3.69 及更早：双击第二次可把窗口唤到前台，或重新运行安装器重建快捷方式；0.3.70 起默认显示窗口，不再依赖该参数 |
 | 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
 | 窗口打开后白屏 | `agent-events.jsonl` 的 `界面页面加载` 记录 | 有 Started 无 Finished 通常是资源/WebView 加载问题；没有 Started 通常是 WebView 创建失败 |
 

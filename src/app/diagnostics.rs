@@ -4,7 +4,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::process::Command;
+use windows_sys::Win32::Security::ACL;
+#[cfg(windows)]
 use zip::write::FileOptions;
 
 use crate::api::client::load_agent_state;
@@ -331,44 +332,53 @@ fn probe_writable_directory(path: &Path) -> Result<(), Box<dyn Error>> {
 /// WAL/SHM sidecars at Low integrity. Repairing the whole installation tree on
 /// every launch would traverse gigabytes of runtime files, so this function is
 /// deliberately narrow and best-effort.
+///
+/// The WebView launch path and the background-service path both call this
+/// during startup. The report is built once per process and replayed: it
+/// answers "what did this launch have to fix", so running the scan twice only
+/// doubled the work behind the same answer.
 pub(crate) fn repair_startup_storage(local_port: u16) -> Vec<String> {
+    static REPORT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    REPORT
+        .get_or_init(|| repair_startup_storage_once(local_port))
+        .clone()
+}
+
+/// Every storage path a normal launch depends on, in scan order.
+fn startup_storage_targets(local_port: u16) -> Vec<PathBuf> {
+    let root = crate::store::paths::agent_home();
+    let database = root.join(crate::store::local_runs::LOCAL_RUN_DB_FILE);
+    vec![
+        root.clone(),
+        root.join("data"),
+        root.join("logs"),
+        database.clone(),
+        PathBuf::from(format!("{}-wal", database.display())),
+        PathBuf::from(format!("{}-shm", database.display())),
+        crate::store::paths::webview_user_data_dir(local_port),
+    ]
+}
+
+fn repair_startup_storage_once(local_port: u16) -> Vec<String> {
     #[cfg(windows)]
     {
-        let root = crate::store::paths::agent_home();
-        let database = root.join(crate::store::local_runs::LOCAL_RUN_DB_FILE);
-        let webview = crate::store::paths::webview_user_data_dir(local_port);
-        let targets = [
-            root.clone(),
-            root.join("data"),
-            root.join("logs"),
-            database.clone(),
-            PathBuf::from(format!("{}-wal", database.display())),
-            PathBuf::from(format!("{}-shm", database.display())),
-            webview,
-        ];
         let mut messages = Vec::new();
-        for path in targets {
-            if !path.exists() {
+        for path in startup_storage_targets(local_port) {
+            let (level, _) = read_integrity_level(&path);
+            if !level.needs_repair() {
                 continue;
             }
-            let snapshot = integrity_snapshot(&path);
-            if snapshot
-                .get("level")
-                .and_then(Value::as_str)
-                .is_some_and(|level| level == "low" || level == "untrusted")
-            {
-                match repair_integrity(&path) {
-                    Ok(detail) => messages.push(format!(
-                        "已修复 Agent 存储完整性级别：{}（{}）",
-                        path.display(),
-                        detail
-                    )),
-                    Err(error) => messages.push(format!(
-                        "Agent 存储完整性级别修复失败：{}：{}",
-                        path.display(),
-                        error
-                    )),
-                }
+            match repair_integrity(&path) {
+                Ok(detail) => messages.push(format!(
+                    "已修复 Agent 存储完整性级别：{}（{}）",
+                    path.display(),
+                    detail
+                )),
+                Err(error) => messages.push(format!(
+                    "Agent 存储完整性级别修复失败：{}：{}",
+                    path.display(),
+                    error
+                )),
             }
         }
         return messages;
@@ -381,18 +391,7 @@ pub(crate) fn repair_startup_storage(local_port: u16) -> Vec<String> {
 }
 
 fn storage_integrity_snapshot(local_port: u16) -> Value {
-    let root = crate::store::paths::agent_home();
-    let database = root.join(crate::store::local_runs::LOCAL_RUN_DB_FILE);
-    let paths = [
-        root.clone(),
-        root.join("data"),
-        root.join("logs"),
-        database.clone(),
-        PathBuf::from(format!("{}-wal", database.display())),
-        PathBuf::from(format!("{}-shm", database.display())),
-        crate::store::paths::webview_user_data_dir(local_port),
-    ];
-    let items = paths
+    let items = startup_storage_targets(local_port)
         .iter()
         .map(|path| integrity_snapshot(path))
         .collect::<Vec<_>>();
@@ -412,37 +411,65 @@ fn storage_integrity_snapshot(local_port: u16) -> Value {
     })
 }
 
+/// Mandatory integrity level of one storage path.
+///
+/// Deliberately not `icacls`-based, for two reasons that both showed up in the
+/// field:
+///
+/// 1. The Agent is a GUI-subsystem process, so every console child it starts
+///    without `CREATE_NO_WINDOW` gets a console window of its own. Scanning
+///    seven paths at startup spawned seven `icacls.exe` processes, each with a
+///    visible console window — a couple of seconds of black windows flashing
+///    over the desktop before the main window could appear.
+/// 2. `icacls` prints the translated name of the mandatory label
+///    ("Low Mandatory Level" / "低强制级别"). Matching the English text
+///    reported `unknown` on a non-English system, so the repair never ran.
+///
+/// The level is the last sub-authority of the mandatory-label SID, which is
+/// exactly what the label name encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrityLevel {
+    Missing,
+    /// No explicit label ACE: the object inherits its parent's label.
+    Inherited,
+    Untrusted,
+    Low,
+    Medium,
+    High,
+    System,
+    Unknown,
+}
+
+impl IntegrityLevel {
+    fn label(self) -> &'static str {
+        match self {
+            IntegrityLevel::Missing => "missing",
+            IntegrityLevel::Inherited => "inherited",
+            IntegrityLevel::Untrusted => "untrusted",
+            IntegrityLevel::Low => "low",
+            IntegrityLevel::Medium => "medium",
+            IntegrityLevel::High => "high",
+            IntegrityLevel::System => "system",
+            IntegrityLevel::Unknown => "unknown",
+        }
+    }
+
+    /// The levels that make SQLite sidecars, protocol registration and
+    /// WebView2 unusable for a normal (Medium) launch.
+    fn needs_repair(self) -> bool {
+        matches!(self, IntegrityLevel::Untrusted | IntegrityLevel::Low)
+    }
+}
+
 #[cfg(windows)]
 fn integrity_snapshot(path: &Path) -> Value {
-    if !path.exists() {
-        return json!({ "path": path, "exists": false, "level": "missing" });
-    }
-    let output = Command::new("icacls").arg(path).output();
-    let Ok(output) = output else {
-        return json!({ "path": path, "exists": true, "level": "unknown", "query_error": "icacls 无法启动" });
-    };
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let lower = text.to_ascii_lowercase();
-    let level = if lower.contains("untrusted mandatory level") {
-        "untrusted"
-    } else if lower.contains("low mandatory level") {
-        "low"
-    } else if lower.contains("medium mandatory level") {
-        "medium"
-    } else if lower.contains("high mandatory level") {
-        "high"
-    } else {
-        "unknown"
-    };
+    let (level, rid) = read_integrity_level(path);
     json!({
         "path": path,
-        "exists": true,
-        "level": level,
-        "query_ok": output.status.success(),
+        "exists": level != IntegrityLevel::Missing,
+        "level": level.label(),
+        "mandatory_label_rid": rid,
+        "query_ok": level != IntegrityLevel::Unknown,
     })
 }
 
@@ -452,19 +479,120 @@ fn integrity_snapshot(path: &Path) -> Value {
 }
 
 #[cfg(windows)]
+fn read_integrity_level(path: &Path) -> (IntegrityLevel, Option<u32>) {
+    if !path.exists() {
+        return (IntegrityLevel::Missing, None);
+    }
+    match mandatory_label_rid(path) {
+        Ok(Some(rid)) => (integrity_level_for_rid(rid), Some(rid)),
+        // No label ACE means the object sits at its parent's level, which a
+        // normal launch can already write to.
+        Ok(None) => (IntegrityLevel::Inherited, None),
+        Err(_) => (IntegrityLevel::Unknown, None),
+    }
+}
+
+#[cfg(windows)]
+fn integrity_level_for_rid(rid: u32) -> IntegrityLevel {
+    // SECURITY_MANDATORY_*_RID. Each level owns a 0x1000-wide range: the base
+    // value is the level, `+0x100` is the write-up variant.
+    const LOW: u32 = 0x1000;
+    const MEDIUM: u32 = 0x2000;
+    const HIGH: u32 = 0x3000;
+    const SYSTEM: u32 = 0x4000;
+    const PROTECTED: u32 = 0x5000;
+    match rid {
+        value if value < LOW => IntegrityLevel::Untrusted,
+        value if value < MEDIUM => IntegrityLevel::Low,
+        value if value < HIGH => IntegrityLevel::Medium,
+        value if value < SYSTEM => IntegrityLevel::High,
+        value if value < PROTECTED => IntegrityLevel::System,
+        _ => IntegrityLevel::Unknown,
+    }
+}
+
+/// Last sub-authority of the object's mandatory-label SID, or `None` when the
+/// object carries no explicit label ACE.
+#[cfg(windows)]
+fn mandatory_label_rid(path: &Path) -> Result<Option<u32>, u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let name = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sacl,
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err(status);
+    }
+    let rid = unsafe { label_rid_in_sacl(sacl) };
+    unsafe { LocalFree(descriptor) };
+    Ok(rid)
+}
+
+#[cfg(windows)]
+unsafe fn label_rid_in_sacl(sacl: *const ACL) -> Option<u32> {
+    use windows_sys::Win32::Security::{
+        GetAce, GetSidSubAuthority, GetSidSubAuthorityCount, ACE_HEADER, SYSTEM_MANDATORY_LABEL_ACE,
+    };
+    use windows_sys::Win32::System::SystemServices::SYSTEM_MANDATORY_LABEL_ACE_TYPE;
+
+    if sacl.is_null() {
+        return None;
+    }
+    for index in 0..u32::from((*sacl).AceCount) {
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        if GetAce(sacl, index, &mut ace) == 0 || ace.is_null() {
+            continue;
+        }
+        if u32::from((*(ace as *const ACE_HEADER)).AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+            continue;
+        }
+        // `SidStart` is the first byte of an inline SID, not a pointer.
+        let label = &*(ace as *const SYSTEM_MANDATORY_LABEL_ACE);
+        let sid = std::ptr::addr_of!(label.SidStart) as *mut core::ffi::c_void;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            continue;
+        }
+        return Some(*GetSidSubAuthority(sid, u32::from(count - 1)));
+    }
+    None
+}
+
+#[cfg(windows)]
 fn repair_integrity(path: &Path) -> Result<String, Box<dyn Error>> {
     let level = if path.is_dir() { "(OI)(CI)M" } else { "M" };
-    let output = Command::new("icacls")
+    // `icacls` is a console program and the Agent has no console: without
+    // CREATE_NO_WINDOW Windows hands this child a console window of its own.
+    let output = crate::runtime::process::hidden_command("icacls")
         .arg(path)
         .arg("/setintegritylevel")
         .arg(level)
         .arg("/C")
         .output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr)
-            .trim()
-            .to_string()
-            .into());
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string().into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -907,6 +1035,7 @@ mod tests {
             once: false,
             interval_seconds: 10,
             local_app: true,
+            hidden: false,
             local_port: 18082,
             reenroll: false,
             enrollment_token: String::new(),
@@ -994,5 +1123,52 @@ mod tests {
         .is_ok());
 
         let _ = fs::remove_dir_all(root);
+    }
+    /// The startup scan has to read the integrity level without starting a
+    /// console program. A console child of this GUI process is handed a console
+    /// window of its own, so the `icacls`-per-path query this replaced flashed a
+    /// black window for every path it checked. Guard both halves: a normal file
+    /// is not flagged, and a Low label is still recognised.
+    #[cfg(windows)]
+    #[test]
+    fn integrity_reader_sees_labels_without_a_console_query() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-integrity-reader-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("probe.txt");
+        fs::write(&file, b"probe").unwrap();
+
+        let (level, rid) = super::read_integrity_level(&file);
+        assert!(
+            !level.needs_repair(),
+            "a freshly created file must not be scheduled for repair: {level:?} rid={rid:?}"
+        );
+
+        let labelled = std::process::Command::new("icacls")
+            .arg(&file)
+            .arg("/setintegritylevel")
+            .arg("L")
+            .arg("/C")
+            .output()
+            .expect("icacls ships with Windows");
+        assert!(
+            labelled.status.success(),
+            "could not set a Low label for the test: {}",
+            String::from_utf8_lossy(&labelled.stderr)
+        );
+
+        let (level, rid) = super::read_integrity_level(&file);
+        assert_eq!(rid, Some(0x1000), "a Low label reads as SID RID 0x1000");
+        assert!(level.needs_repair(), "a Low label must trigger a repair");
+
+        assert_eq!(
+            super::read_integrity_level(&root.join("missing.txt")).0,
+            super::IntegrityLevel::Missing
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
