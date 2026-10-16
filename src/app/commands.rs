@@ -1750,41 +1750,79 @@ pub(crate) fn reload_builtin_ai_tool_context(state: State<'_, AgentState>) {
 }
 
 fn present_builtin_ai_start_error(error: &str) -> String {
+    let (headline, keep_detail) = present_builtin_ai_start_headline(error);
+    let detail = error
+        .trim()
+        .strip_prefix("无法进入扩展项目工作区：")
+        .unwrap_or(error.trim());
+    if !keep_detail || detail.is_empty() || detail == headline {
+        return headline.to_string();
+    }
+    // 结论用换行和原始错误分开：界面把第一行当结论、后面放进可展开的原始错误，
+    // 排查时不用再去翻事件日志。
+    format!(
+        "{headline}\n{}",
+        crate::runtime::process::summarize_output(detail, 1_200)
+    )
+}
+
+/// 会话启动失败的一句话结论，以及是否值得把原始错误附在后面。
+///
+/// 早期版本在这里把原始错误整段收成一句「HiMind AI 暂时无法启动，请稍后重试」，
+/// 界面又不认识这句话，最终显示成「服务暂时不可用，请稍后重试」——spawn 的系统
+/// 错误码和 Runtime 的诊断输出全被丢掉，这就是这类问题长期无法远程定位的原因。
+///
+/// 返回值第二项是「原文有没有额外信息」：前几类的原始错误本身就是给用户看的
+/// 结论，附上去只是噪音；启动失败、目录注册失败和兜底这几类才必须带上原文。
+fn present_builtin_ai_start_headline(error: &str) -> (&'static str, bool) {
     let normalized = error.to_lowercase();
     if normalized.contains("运行时尚未安装")
         || normalized.contains("runtime is not installed")
         || normalized.contains("runtime is unavailable")
     {
-        return "请先安装 HiMind AI 运行时，再开始对话。".to_string();
+        return ("请先安装 HiMind AI 运行时，再开始对话。", false);
     }
     if normalized.contains("请先登录")
         || normalized.contains("授权已失效")
         || normalized.contains("授权已过期")
         || normalized.contains("missing scope")
     {
-        return "需要登录 HiMind 账号后才能开始对话".to_string();
+        return ("需要登录 HiMind 账号后才能开始对话", false);
     }
     if normalized.contains("尚未生成 ai 凭证")
         || normalized.contains("没有可用的 ai 服务")
         || normalized.contains("没有可用渠道")
     {
-        return "当前账号暂未分配可用模型服务".to_string();
+        return ("当前账号暂未分配可用模型服务", false);
     }
     if normalized.contains("尚未安装") || normalized.contains("组件状态") {
-        return "HiMind AI 运行时需要修复，请在设置中处理".to_string();
+        return ("HiMind AI 运行时需要修复，请在设置中处理", false);
+    }
+    // 下面几条是 start_builtin_ai_session 自己拼出来的结论，必须排在
+    // 「dsh / workspace / session」兜底之前：否则诊断输出里出现这些词，
+    // 真实的启动失败会被误判成工作区目录问题。
+    let process_never_started = normalized.contains("无法启动 himind ai")
+        || normalized.contains("没有返回启动输出");
+    if process_never_started {
+        return ("HiMind AI 进程没有启动", true);
+    }
+    if normalized.contains("启动超时") {
+        return ("HiMind AI 启动超时", true);
+    }
+    if normalized.contains("页面认证失败") {
+        return ("HiMind AI 页面认证失败", true);
+    }
+    if normalized.contains("启动失败") {
+        return ("HiMind AI 启动失败", true);
     }
     if normalized.contains("扩展项目工作区")
         || normalized.contains("dsh")
         || normalized.contains("workspace")
         || normalized.contains("session")
     {
-        let detail = error
-            .trim()
-            .strip_prefix("无法进入扩展项目工作区：")
-            .unwrap_or(error.trim());
-        return format!("无法进入项目工作区：{detail}");
+        return ("无法进入项目工作区", true);
     }
-    "HiMind AI 暂时无法启动，请稍后重试".to_string()
+    ("HiMind AI 暂时无法启动", true)
 }
 
 #[tauri::command]
@@ -7486,8 +7524,27 @@ mod tests {
             present_builtin_ai_start_error(
                 "无法进入扩展项目工作区：注册 DSH 工作区失败（workspace-invalid-path）：path is invalid"
             ),
-            "无法进入项目工作区：注册 DSH 工作区失败（workspace-invalid-path）：path is invalid"
+            "无法进入项目工作区\n注册 DSH 工作区失败（workspace-invalid-path）：path is invalid"
         );
+    }
+
+    /// 结论行和原始错误分两行：界面上的「会话没有启动」必须能展开看到真实原因。
+    #[test]
+    fn startup_failure_keeps_the_original_error() {
+        let presented =
+            present_builtin_ai_start_error("无法启动 HiMind AI：拒绝访问。 (os error 5)");
+        assert_eq!(presented.lines().next().unwrap(), "HiMind AI 进程没有启动");
+        assert!(presented.contains("os error 5"));
+    }
+
+    /// Runtime 诊断里带 dsh 字样时不能把结论劫持成「无法进入项目工作区」；
+    /// 页面认证失败才是这一场的真实结论。
+    #[test]
+    fn page_probe_failure_is_not_reported_as_a_workspace_problem() {
+        let presented = present_builtin_ai_start_error(
+            "HiMind AI 页面认证失败：HTTP 502 Bad Gateway: dsh session workspace storage unavailable",
+        );
+        assert_eq!(presented.lines().next().unwrap(), "HiMind AI 页面认证失败");
     }
 
     /// 计划面是"加法"：老界面依赖的原字段必须原样保留，计划只能作为附加字段出现，

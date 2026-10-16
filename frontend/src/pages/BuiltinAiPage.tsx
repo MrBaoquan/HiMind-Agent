@@ -52,6 +52,9 @@ export function BuiltinAiPage({
   const [frameStalled, setFrameStalled] = useState(false);
   const frameRetry = useRef(0);
   const [connectionError, setConnectionError] = useState('');
+  // 结论之外的原始错误。之前这一层被「服务暂时不可用」盖掉，恰恰是
+  // 「会话没有启动」最难排查的地方，所以单独留一个字段给用户展开。
+  const [connectionDetail, setConnectionDetail] = useState('');
   const [sessionNotice, setSessionNotice] = useState('');
   const [extensionsOpen, setExtensionsOpen] = useState(false);
   const [syncingModels, setSyncingModels] = useState(false);
@@ -196,6 +199,7 @@ export function BuiltinAiPage({
     if (connecting) return;
     setConnecting(true);
     setConnectionError('');
+    setConnectionDetail('');
     frameRetry.current = 0;
     setFrameStalled(false);
     setFrameLoaded(false);
@@ -210,7 +214,9 @@ export function BuiltinAiPage({
     } catch (error) {
       setSessionUrl('');
       setSessionNotice('');
-      setConnectionError(presentConnectionError(error));
+      const presented = presentConnectionError(error);
+      setConnectionError(presented.message);
+      setConnectionDetail(presented.detail);
     } finally {
       setConnecting(false);
     }
@@ -220,6 +226,7 @@ export function BuiltinAiPage({
     if (browserOpening || connecting || !runtimeReady || !canStartSession) return;
     setBrowserOpening(true);
     setConnectionError('');
+    setConnectionDetail('');
     try {
       const url = await agentApi.openBuiltinAiWeb(builtinAiSessionTarget(workspaceTarget));
       if (url && url !== sessionUrl) {
@@ -230,7 +237,9 @@ export function BuiltinAiPage({
         setFrameKey(key => key + 1);
       }
     } catch (error) {
-      setConnectionError(presentConnectionError(error));
+      const presented = presentConnectionError(error);
+      setConnectionError(presented.message);
+      setConnectionDetail(presented.detail);
     } finally {
       setBrowserOpening(false);
     }
@@ -241,6 +250,7 @@ export function BuiltinAiPage({
     handledWorkspaceRequest.current = workspaceRequestRevision;
     setSessionUrl('');
     setConnectionError('');
+    setConnectionDetail('');
     void connect();
   }, [connect, connecting, workspaceRequestRevision]);
 
@@ -404,6 +414,7 @@ export function BuiltinAiPage({
             icon={<CircleAlert size={22} />}
             title="会话没有启动"
             description={connectionError}
+            detail={connectionDetail}
             actions={<>
               <button type="button" className="btn btn-primary" onClick={() => void connect()}><PlugZap size={15} />重新连接</button>
               {!identity?.authorized && !independentMode ? <button type="button" className="btn" disabled={authorizationBusy} onClick={onStartAuthorization}><LogIn size={15} />登录 HiMind</button> : null}
@@ -436,6 +447,7 @@ export function BuiltinAiPage({
           setSessionUrl('');
           setFrameLoaded(false);
           setConnectionError('');
+          setConnectionDetail('');
         }}
         onToolContextChanged={onToolContextChanged}
         onOpenMcpTools={onOpenMcpTools}
@@ -530,8 +542,8 @@ function formatActivityTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function WorkspaceStatus({ icon, title, description, actions, tone = 'default' }: { icon: ReactNode; title: string; description: string; actions?: ReactNode; tone?: 'default' | 'error' }) {
-  return <div className={`builtin-ai-state ${tone}`} role={tone === 'error' ? 'alert' : 'status'}><span className="builtin-ai-state-icon">{icon}</span><h3>{title}</h3><p>{description}</p>{actions ? <div className="builtin-ai-state-actions">{actions}</div> : null}</div>;
+function WorkspaceStatus({ icon, title, description, detail, actions, tone = 'default' }: { icon: ReactNode; title: string; description: string; detail?: string; actions?: ReactNode; tone?: 'default' | 'error' }) {
+  return <div className={`builtin-ai-state ${tone}`} role={tone === 'error' ? 'alert' : 'status'}><span className="builtin-ai-state-icon">{icon}</span><h3>{title}</h3><p>{description}</p>{detail ? <details className="builtin-ai-state-detail"><summary>查看原始错误</summary><pre>{detail}</pre></details> : null}{actions ? <div className="builtin-ai-state-actions">{actions}</div> : null}</div>;
 }
 
 function RuntimeInstallationStatus({ installation }: { installation: BuiltinAIRuntimeInstallationStatus }) {
@@ -573,34 +585,47 @@ function runtimeActionLabel(operation: string) {
   return '安装';
 }
 
-function presentConnectionError(error: unknown) {
-  const detail = errorDetail(error);
-  const normalized = detail.toLowerCase();
+function presentConnectionError(error: unknown): { message: string; detail: string } {
+  const raw = errorDetail(error).trim();
+  // Rust 侧给出结论时会用换行附上原始错误；分类只看结论行，否则原始错误里
+  // 出现 dsh / workspace 这类字样就会把结论带偏。
+  const separator = raw.indexOf('\n');
+  const headline = (separator >= 0 ? raw.slice(0, separator) : raw).trim();
+  const detail = separator >= 0 ? raw.slice(separator + 1).trim() : '';
+  const normalized = headline.toLowerCase();
+  const present = (message: string) => ({ message, detail });
   if (normalized.includes('dsh web authentication required')
     || normalized.includes('reopen the url printed by dsh web')) {
-    return '网页会话认证已失效，请使用“打开网页版”重新建立会话。';
+    return present('网页会话认证已失效，请使用“打开网页版”重新建立会话。');
   }
   if (normalized.includes('independent mode')
     || normalized.includes('dsh 原生')
     || normalized.includes('settings.yaml')
     || (normalized.includes('provider') && normalized.includes('原生服务配置'))) {
-    return '本机模型服务尚未配置，请在设置中完成配置后重试。';
+    return present('本机模型服务尚未配置，请在设置中完成配置后重试。');
   }
-  if (normalized.includes('登录 himind')) return '当前登录状态已失效，请重新登录。';
+  if (normalized.includes('登录 himind')) return present('当前登录状态已失效，请重新登录。');
   // 本机服务缺字段是最常见的自建服务故障，先于通用的「ai 服务」兜底认出来，
   // 否则会被误导成「账号没有分配服务」去找管理员。
-  if (normalized.includes('模型或 base url')) return '本机模型服务的模型或 Base URL 不完整，请到「设置 → AI 连接 → 模型服务」补全。';
+  if (normalized.includes('模型或 base url')) return present('本机模型服务的模型或 Base URL 不完整，请到「设置 → AI 连接 → 模型服务」补全。');
   // 后端同类错误改叫「模型服务」后也该命中这一条兜底，但不能按「模型服务」泛匹配，
   // 否则会把下面的「dsh 不可用」等更具体的本机故障也误判成账号没分配服务。
   if (normalized.includes('ai 服务') || normalized.includes('暂未分配可用模型服务')) {
-    return '当前账号暂未分配可用的模型服务，请联系管理员。';
+    return present('当前账号暂未分配可用的模型服务，请联系管理员。');
   }
-  if (normalized.includes('运行时') && normalized.includes('修复')) return 'HiMind AI 需要修复，请在设置中处理。';
-  if ((normalized.includes('运行时') || normalized.includes('组件')) && normalized.includes('安装')) return '请先安装 HiMind AI，再开始对话。';
-  if (normalized.includes('项目工作区') || normalized.includes('workspace')) return '当前项目目录不可用，请重新选择后再试。';
-  if (normalized.includes('dsh')) return '本机模型服务暂时不可用，请在设置中检查配置。';
-  if (normalized.includes('正在启动')) return '会话仍在准备中，请稍后重新连接。';
-  return '服务暂时不可用，请稍后重试。';
+  if (normalized.includes('运行时') && normalized.includes('修复')) return present('HiMind AI 需要修复，请在设置中处理。');
+  if ((normalized.includes('运行时') || normalized.includes('组件')) && normalized.includes('安装')) return present('请先安装 HiMind AI，再开始对话。');
+  // 会话进程根本没起来：spawn 的系统错误码（例如拒绝访问）只在原始错误里，
+  // 所以这条不再给一句空泛的结论，直接把用户指向展开区。
+  if (normalized.includes('进程没有启动')) return present('HiMind AI 的进程没有启动，请查看下方原始错误。');
+  if (normalized.includes('启动超时')) return present('HiMind AI 启动超时，运行时没有就绪。');
+  if (normalized.includes('页面认证失败')) return present('HiMind AI 页面认证失败，通常是会话目录或运行时启动异常。');
+  if (normalized.includes('启动失败')) return present('HiMind AI 启动失败，请查看下方原始错误。');
+  if (normalized.includes('项目工作区') || normalized.includes('workspace')) return present('当前项目目录不可用，请重新选择后再试。');
+  if (normalized.includes('dsh')) return present('本机模型服务暂时不可用，请在设置中检查配置。');
+  if (normalized.includes('正在启动')) return present('会话仍在准备中，请稍后重新连接。');
+  // 兜底也不再吞掉原文：认不出来时原文比一句「服务暂时不可用」有用得多。
+  return present(headline || '服务暂时不可用，请稍后重试。');
 }
 
 function builtinAiSessionTarget(workspaceTarget: BuiltinAiWorkspaceTarget) {

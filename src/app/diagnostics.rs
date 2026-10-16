@@ -303,6 +303,33 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         "detail": rail_links,
     }));
 
+    let session_health = builtin_ai_session_snapshot(options);
+    let session_failure = session_health
+        .get("last_failure")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let session_ok = session_failure.is_null();
+    if !session_ok {
+        warnings += 1;
+    }
+    checks.push(json!({
+        "name": "himind_ai_session",
+        "ok": session_ok,
+        "severity": if session_ok { "info" } else { "warning" },
+        "message": if session_ok {
+            "事件日志里没有尚未消除的 HiMind AI 会话启动失败".to_string()
+        } else {
+            format!(
+                "最近一次 HiMind AI 会话启动失败：{}",
+                session_failure
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("原因未记录")
+            )
+        },
+        "detail": session_health,
+    }));
+
     let result = json!({
         "schema_version": 1,
         "generated_at": unix_now(),
@@ -318,6 +345,7 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         "extension_trust": extension_trust,
         "extension_source_health": source_health,
         "himind_ai_rail_links": rail_links,
+        "builtin_ai_session": session_health,
         "checks": checks,
         "summary": { "failures": failures, "warnings": warnings },
     });
@@ -1005,6 +1033,98 @@ fn startup_evidence_from_path(path: &Path) -> Value {
     })
 }
 
+const BUILTIN_AI_SESSION_FAILURE_MARKER: &str = "HiMind AI 会话启动失败";
+const BUILTIN_AI_SESSION_SUCCESS_MARKERS: [&str; 2] =
+    ["HiMind AI 会话已启动", "HiMind AI 已进入扩展"];
+
+/// HiMind AI 会话的最近结论，外加启动前置事实。
+///
+/// 界面上的「会话没有启动 / 服务暂时不可用」不带原因，真正的原因只有
+/// `start_builtin_ai_session` 写进事件日志的那一条。这里把它捞出来，用户跑一次
+/// `diagnostics check` 就能看到原因，不必翻日志或找人上机。
+fn builtin_ai_session_snapshot(options: &Options) -> Value {
+    let path = crate::store::paths::agent_home()
+        .join("logs")
+        .join("agent-events.jsonl");
+    let mut snapshot = builtin_ai_session_snapshot_from_path(&path);
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("launch".to_string(), builtin_ai_launch_snapshot(options));
+    }
+    snapshot
+}
+
+/// 只认「最近一次会话结论」：逆序先撞上的那一条才算数，后面成功过一次就说明
+/// 已经翻篇。扫描上限刻意设成和 startup_evidence 同一量级，避免长跑机器的
+/// 日志把报告撑大。
+fn builtin_ai_session_snapshot_from_path(path: &Path) -> Value {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut last_failure: Option<Value> = None;
+    let mut last_success: Option<Value> = None;
+    for line in text.lines().rev().take(4_000) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+        if let Some((_, reason)) = message.split_once(BUILTIN_AI_SESSION_FAILURE_MARKER) {
+            last_failure = Some(json!({
+                "at": value.get("time").cloned().unwrap_or(Value::Null),
+                "timestamp": value.get("timestamp").cloned().unwrap_or(Value::Null),
+                "reason": crate::runtime::process::summarize_output(
+                    reason.trim_start_matches([':', '：', ' ']),
+                    600,
+                ),
+            }));
+            break;
+        }
+        if BUILTIN_AI_SESSION_SUCCESS_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker))
+        {
+            last_success = Some(json!({
+                "at": value.get("time").cloned().unwrap_or(Value::Null),
+                "message": message,
+            }));
+            break;
+        }
+    }
+    json!({
+        "path": path,
+        "last_failure": last_failure,
+        "last_success": last_success,
+    })
+}
+
+/// 会话启动的前置事实：运行时能否解析、home 与工作区落在哪里、有没有可用的模型
+/// 凭据。这里只走会话启动本身的第一步（解析与自愈，拉起进程之前），所以能在
+/// 诊断里直接执行；不含密钥内容，只报凭据是否存在。
+fn builtin_ai_launch_snapshot(options: &Options) -> Value {
+    let workspace = crate::runtime::builtin::recent_interactive_workspace();
+    match crate::runtime::builtin::prepare_interactive_launch_allow_degraded(
+        options,
+        workspace.as_deref(),
+    ) {
+        Ok(launch) => json!({
+            "ok": true,
+            "executable": launch.executable,
+            "executable_present": launch.executable.is_file(),
+            "home": launch.home,
+            "workspace": launch.workspace,
+            "permission_mode": launch.permission_mode,
+            "service_source": launch.service_source,
+            "default_model": launch.default_model,
+            "api_key_present": !launch.api_key.trim().is_empty(),
+            "api_key_env": launch.api_key_env,
+            "base_url": sanitized_api_base(&launch.base_url),
+            "control_plane_notice": launch.control_plane_notice,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+            "workspace": workspace,
+        }),
+    }
+}
+
 pub(crate) fn export_bundle(
     destination: &Path,
     options: &Options,
@@ -1237,7 +1357,9 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_bundle_from, startup_evidence_from_path};
+    use super::{
+        builtin_ai_session_snapshot_from_path, export_bundle_from, startup_evidence_from_path,
+    };
     use crate::api::client::save_agent_state;
     use crate::api::types::AgentState;
     use crate::store::types::LocalWorkerStatus;
@@ -1278,6 +1400,49 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Started"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builtin_ai_session_snapshot_only_reports_an_uncleared_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-session-evidence-{}-{}",
+            std::process::id(),
+            super::unix_now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("agent-events.jsonl");
+        fs::write(
+            &log,
+            concat!(
+                "{\"time\":\"10:00:00\",\"timestamp\":1,\"message\":\"HiMind AI 会话启动失败: HiMind AI 启动超时（等待 20 秒），请检查运行时状态\"}\n",
+                "{\"time\":\"10:01:00\",\"timestamp\":2,\"message\":\"HiMind AI 会话已启动\"}\n",
+                "{\"time\":\"10:02:00\",\"timestamp\":3,\"message\":\"HiMind AI 会话启动失败: 无法启动 HiMind AI：拒绝访问。 (os error 5)\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let snapshot = builtin_ai_session_snapshot_from_path(&log);
+        assert!(snapshot["last_failure"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("os error 5"));
+        assert!(snapshot["last_success"].is_null());
+
+        fs::write(
+            &log,
+            concat!(
+                "{\"timestamp\":3,\"message\":\"HiMind AI 会话启动失败: 无法启动 HiMind AI：拒绝访问。 (os error 5)\"}\n",
+                "{\"timestamp\":4,\"message\":\"HiMind AI 已进入扩展工作区: F:\\\\work\"}\n"
+            ),
+        )
+        .unwrap();
+        let cleared = builtin_ai_session_snapshot_from_path(&log);
+        assert!(cleared["last_failure"].is_null());
+        assert!(cleared["last_success"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("已进入扩展工作区"));
         let _ = fs::remove_dir_all(root);
     }
 
