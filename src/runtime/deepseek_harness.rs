@@ -3724,7 +3724,11 @@ fn ensure_workspace_profiles(shared: &Path, target: &Path, managed: &Path) -> Re
     if !node_modules.exists() {
         #[cfg(windows)]
         {
-            let status = std::process::Command::new("cmd.exe")
+            // 目录联接只能靠 mklink /J 落地，而 cmd.exe 是控制台程序：
+            // Agent 是 GUI 子系统、没有控制台，看不见的父进程派生控制台子进程时
+            // Windows 会给子进程新开一个窗口。每条会话启动都会走到这里，所以
+            // 漏掉隐藏就是一个肉眼可见的黑窗口。hidden_command 是唯一的入口。
+            let status = crate::runtime::process::hidden_command("cmd.exe")
                 .args(["/D", "/C", "mklink", "/J"])
                 .arg(&node_modules)
                 .arg(&source)
@@ -3909,7 +3913,8 @@ fn union_string_array(target: Option<&mut Value>, source: Option<&Value>) {
 fn link_directory(destination: &Path, source: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("cmd.exe")
+        // 同上：cmd.exe 必须隐藏启动，否则每建一条目录联接就闪一个黑窗口。
+        let status = crate::runtime::process::hidden_command("cmd.exe")
             .args(["/D", "/C", "mklink", "/J"])
             .arg(destination)
             .arg(source)

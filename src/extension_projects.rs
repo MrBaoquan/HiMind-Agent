@@ -606,7 +606,9 @@ fn resolve_source_commit(workspace_path: &str, recorded: &str) -> String {
         return String::new();
     }
     let path = workspace.strip_prefix(r"\\?\").unwrap_or(workspace);
-    let output = std::process::Command::new("git")
+    // 重定向标准输出并不能阻止 Windows 给控制台子进程开窗口：git 必须有
+    // CREATE_NO_WINDOW，否则提交候选制品时会在桌面上闪一个黑窗口。
+    let output = crate::runtime::process::hidden_command("git")
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "HEAD"])

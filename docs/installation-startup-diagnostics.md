@@ -41,6 +41,12 @@ launcher 同时把登录自启项（`HKCU\Software\Microsoft\Windows\CurrentVers
 - 存储完整性级别改为直接读强制标签 SID，启动期不再启动任何 icacls；只有确实需要修复时才调用一次 `icacls /setintegritylevel`，并且带 `CREATE_NO_WINDOW`。
 - launcher 派生的每个子进程都带 `CREATE_NO_WINDOW`：没有控制台的父进程若派生控制台子进程（MCP companion、Agent 内部的命令行助手），否则 Windows 会给它新开一个窗口。
 
+启动路径之外还有同类泄漏，0.3.71 一并修掉：
+
+- **每次启动 HiMind AI 会话都会闪黑窗口。** 工作区 DSH home 的 `profiles\node_modules` 目录联接、以及 `storages`/`sessions` 的共享联接都靠 `cmd.exe /D /C mklink /J` 落地，而这两处没有带 `CREATE_NO_WINDOW`。`profiles` 联接每次会话都会被删掉重建，所以「多轮黑窗口不停出现、消失」在开会话时同样成立。现在两处都走 `runtime::process::hidden_command`。
+- **提交候选制品时的 git。** `extension_projects::resolve_source_commit` 用 `git -C <工作区> rev-parse HEAD` 兜底提交号，重定向了标准输出但没有隐藏窗口——重定向并不阻止 Windows 给控制台子进程开窗口。同样改走 `hidden_command`。
+- **工作区构建脚本。** Unreal 的 RunUAT 与 `.ps1`/`.cmd` 构建脚本原先靠调用方在 spawn 处补 `CREATE_NO_WINDOW`，现在由 `native_build_command`/`script_build_command` 自己带上，避免下一个调用方漏掉。
+
 测量手段（不需要管理员权限，只读）：
 
 ```powershell
@@ -48,7 +54,23 @@ cd <安装目录或仓库>
 .\scripts\startup-window-watch.ps1 -Seconds 20
 ```
 
-脚本用与桌面快捷方式相同的方式启动 Agent（`Start-Process` 走 ShellExecute），并以 5 ms 间隔枚举顶层窗口，报告期间出现的每个控制台窗口的类名、标题、进程和存活时长。控制台窗口的标题就是窗口里跑的那个程序，所以标题出现 `C:\WINDOWS\system32\icacls.exe` 就说明是启动期的 icacls 探测。`-NoLaunch` 可在自己双击快捷方式时只做采样。期望结果是一行 `RESULT: no console window appeared`；`package.ps1` 另有子系统断言（launcher/Agent 必须是 GUI、MCP companion 必须是控制台），打包阶段就会拦住回归。
+脚本用与桌面快捷方式相同的方式启动 Agent（`Start-Process` 走 ShellExecute），记录期间出现的每个顶层窗口（类名、标题、进程、存活时长）和每个新进程（含父进程链）。控制台窗口的标题就是窗口里跑的那个程序，所以标题出现 `C:\WINDOWS\system32\icacls.exe` 就说明是启动期的 icacls 探测。`-NoLaunch` 可在自己双击快捷方式时只做记录。
+
+两处工具本身的坑，都已经修掉，看历史结论时要留意：
+
+- 窗口采集原先用 `EnumWindows` 每 5 ms 采样一次，实测每次循环要 ~20 ms，15 ms 的控制台窗口会被整轮跳过。现在用 `SetWinEventHook` 事件驱动，没有采样间隙；同时用 Toolhelp32 快照记录新进程和父进程链，作为窗口太短看不到时的兜底证据。
+- 控制台窗口的类名在这台机器上是 `PseudoConsoleWindow`（由 console 客户端进程持有），默认终端宿主再叠一个 `CASCADIA_HOSTING_WINDOW_CLASS` 窗口。旧版脚本把 `PseudoConsoleWindow` 从控制台计数里排除，**会把闪黑窗口的启动报成 quiet**。现在三个类名都计入。
+- 判定标准也变了：旧版打 `RESULT: no console window appeared`，现在打 `RESULT: no console window was shown - this start is quiet.`；按行名判断的地方要跟着改。
+
+自检：把 `-Target` 指向 `cmd.exe` 应看到 2 个控制台窗口（`PseudoConsoleWindow` 与终端宿主窗口），这同时验证了工具不是「永远报 quiet」。
+
+```powershell
+.\scripts\startup-window-watch.ps1 -Seconds 8 -Target "$env:SystemRoot\System32\cmd.exe" -Arguments @('/D','/C','timeout 2')
+```
+
+本机实测（0.3.70 安装版，干净冷启动，事件驱动记录 28 s）：`console windows that appeared and were shown: 0`，主窗口在双击后约 5.6 s 出现；同一台机器同一个工具在 `cmd.exe` 目标上报告 2 个控制台窗口。启动期仍会派生 `git`、`node`、`powershell`、`cmd`（拓展源对账、沙箱写权限预热 5 个工作区、客户端探测），它们的 `conhost` 子进程都在，但都没有窗口——说明这些位置都已经带上隐藏标志。
+
+`package.ps1` 现在有两道门禁：子系统断言（launcher/Agent 必须是 GUI、MCP companion 必须是控制台）和 `scripts/check-console-spawns.ps1`（字面量控制台程序不得在没带隐藏标志的函数里派生），打包阶段就会拦住回归。
 ## 用户排查步骤
 
 在 PowerShell 中执行以下命令。路径带空格时保留引号。
@@ -77,7 +99,7 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | 日志反复出现 `attempt to write a readonly database` | `storage_integrity`、`local-runs.sqlite3-wal` 和 `local-runs.sqlite3-shm` | 退出 Agent 后运行安装目录中的 `repair-storage.ps1`；它只修复 Agent 数据、SQLite sidecar 和 WebView2 目录的完整性级别，不删除数据库 |
 | `agent protocol registration repair failed: Access denied` | `protocol_registration` 与启动日志中的 `source=launcher` | 以当前用户运行 `diagnostics check`；确认协议注册指向当前安装，若完整性为 Low，先运行 `repair-storage.ps1` 后重新双击 |
 | 第二次双击没有把窗口带到前台 | `agent-events.jsonl` 中的“第二次启动参数已转发” | 如果没有该记录，检查 launcher/单实例事件窗口；如果有记录但页面事件仍为空，按 WebView2 数据目录问题处理 |
-| 双击后反复闪出黑窗口 | `scripts/startup-window-watch.ps1` 输出里的控制台窗口标题 | 标题是 `icacls.exe` 说明是 0.3.69 及更早的启动期探测，升级到 0.3.70；标题是 launcher 自身说明 launcher 退回了控制台子系统，重新安装正式包 |
+| 双击后反复闪出黑窗口 | `scripts/startup-window-watch.ps1` 输出里的控制台窗口标题与「processes started under a HiMind process」父进程链 | 标题/父进程是 `icacls.exe` 或 `node.exe` 说明是 0.3.68 及更早的启动期探测与沙箱预热，升级到 0.3.70+；`cmd.exe` 出现在开 HiMind AI 会话时说明是 DSH 目录联接（0.3.71 起隐藏）；标题是 launcher 自身说明 launcher 退回了控制台子系统，重新安装正式包；注意类名是 `PseudoConsoleWindow` 的窗口也要算，0.3.70 之前的采样脚本会漏报 |
 | 双击完全无反应 | `launcher` 检查和安装目录是否存在 | 从 PowerShell 运行 launcher，读取弹窗原因；检查安全软件/AppLocker 拦截记录 |
 | 自更新后双击只见到托盘、没有窗口 | 快捷方式参数（右键属性→目标）是否仍带 `--show` | 0.3.69 及更早：双击第二次可把窗口唤到前台，或重新运行安装器重建快捷方式；0.3.70 起默认显示窗口，不再依赖该参数 |
 | 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
@@ -93,13 +115,13 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 .\scripts\build-installer.ps1 -ReleaseDirectory .\artifacts\<version> -RequireAuthenticode
 ```
 
-启动窗口门禁：`package.ps1` 会断言 launcher 与 Agent 是 GUI 子系统、MCP companion 是控制台子系统；安装完成后在桌面双击快捷方式，并用
+启动窗口门禁：`package.ps1` 有两道断言——launcher 与 Agent 是 GUI 子系统、MCP companion 是控制台子系统；以及 `scripts/check-console-spawns.ps1`，字面量控制台程序（cmd、powershell、git、node、icacls、taskkill…）不得在没带 `hidden_command`/`configure_hidden_process`/`creation_flags` 的函数里派生。安装完成后在桌面双击快捷方式，并用
 
 ```powershell
 .\scripts\startup-window-watch.ps1 -Seconds 20
 ```
 
-确认输出为 `RESULT: no console window appeared`。
+确认输出为 `RESULT: no console window was shown - this start is quiet.`。
 
 在干净 Windows 用户环境验证：安装、桌面快捷方式图标、双击显示主窗口、注销后自动启动只显示托盘、从托盘打开主窗口、卸载后快捷方式和协议注册清理。将 `diagnostics check` 作为安装后冒烟测试；不要把“安装器进度完成”当成桌面可用的唯一信号。
 

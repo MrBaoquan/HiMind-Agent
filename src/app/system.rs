@@ -1684,6 +1684,10 @@ fn native_build_command(
             format!("-targetplatform={uat_platform}"),
             format!("-architecture={architecture}"),
         ]);
+        // 构建输出全部写进作业日志再回给界面，没有任何人需要看这个窗口；这里自己
+        // 带上 CREATE_NO_WINDOW，而不是指望调用方记得加（`cmd.exe` 的窗口就是用户
+        // 看到的黑窗口）。
+        crate::runtime::process::configure_hidden_process(&mut command);
         return Ok(command);
     }
     Err("未识别的工程引擎".into())
@@ -1706,10 +1710,12 @@ fn script_build_command(script: &Path) -> Result<Command, Box<dyn Error>> {
                 "-File",
             ])
             .arg(command_path(script));
+        crate::runtime::process::configure_hidden_process(&mut command);
         Ok(command)
     } else if matches!(extension.as_str(), "cmd" | "bat") {
         let mut command = Command::new("cmd.exe");
         command.args(["/D", "/S", "/C"]).arg(command_path(script));
+        crate::runtime::process::configure_hidden_process(&mut command);
         Ok(command)
     } else {
         Err("不支持的构建脚本类型".into())

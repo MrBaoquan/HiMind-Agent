@@ -78,6 +78,18 @@ foreach ($Name in $ExpectedSubsystem.Keys) {
     }
 }
 
+# Console-spawn gate: the Agent and the launcher are GUI-subsystem binaries with
+# no console, so a console child started without CREATE_NO_WINDOW gets a window
+# of its own on the desktop - the black windows users report. The subsystem gate
+# above only proves the *parent* cannot flash; this one checks the spawn sites.
+$ConsoleSpawnGate = Join-Path $PSScriptRoot "check-console-spawns.ps1"
+if (Test-Path -LiteralPath $ConsoleSpawnGate -PathType Leaf) {
+    & $ConsoleSpawnGate
+    if ($LASTEXITCODE -ne 0) {
+        throw "A console program is spawned without CREATE_NO_WINDOW; a desktop start would flash a black window."
+    }
+}
+
 $RepairScript = Join-Path $PSScriptRoot "repair-storage.ps1"
 if (Test-Path -LiteralPath $RepairScript -PathType Leaf) {
     Copy-Item -LiteralPath $RepairScript -Destination (Join-Path $ReleaseDirectory "repair-storage.ps1")

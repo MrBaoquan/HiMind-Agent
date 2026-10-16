@@ -1,28 +1,40 @@
 <#
 .SYNOPSIS
-    Measure what a HiMind Agent start puts on screen.
+    Record what a HiMind Agent start puts on screen.
 
 .DESCRIPTION
     A desktop double-click must not flash console windows over the desktop, and
     the main window must appear. This script starts the Agent the way the desktop
-    shortcut does (ShellExecute through Start-Process, so a console-subsystem
-    launcher would get a console window) and then samples every top-level window
-    every few milliseconds, so windows that live a few hundred milliseconds are
-    caught with their class, title, owner and lifetime.
+    shortcut does (ShellExecute through Start-Process) and records every top-level
+    window the desktop creates, plus every process that starts, for the recording
+    window.
 
-    A console window takes the title of the console program running inside it,
-    so a flashing window titled `C:\WINDOWS\system32\icacls.exe` means the Agent
-    spawned icacls. Only windows that appeared during the sampling window are
-    reported: windows that were already there are the desktop's, not the Agent's.
+    Two instruments, because either one alone can lie:
 
-    Read-only apart from starting the Agent. Use -NoLaunch to sample a start you
+    * windows come from SetWinEventHook, which the system calls for every window
+      creation and show. Sampling EnumWindows every few milliseconds looks cheaper
+      but ran every ~20 ms in practice, which walks straight past a console window
+      that lives 15 ms.
+    * processes come from a Toolhelp32 snapshot, recording each new pid with its
+      parent. That is the fallback when a window is too short-lived to be seen:
+      the process chain still says who started what.
+
+    A console window appears when a console program is started without
+    CREATE_NO_WINDOW. On Windows 11 the window class of such a child can be
+    `PseudoConsoleWindow` as well as `ConsoleWindowClass`, and the default
+    terminal host adds a `CASCADIA_HOSTING_WINDOW_CLASS` window; all three are
+    counted. An earlier version filtered `PseudoConsoleWindow` out of its console
+    count, which is how a flashing start could be reported as quiet.
+
+    A console window takes the title of the console program running inside it, so
+    a window titled `C:\WINDOWS\system32\icacls.exe` means the Agent spawned
+    icacls.
+
+    Read-only apart from starting the Agent. Use -NoLaunch to record a start you
     trigger yourself (double-click the desktop shortcut) instead.
 
 .PARAMETER Seconds
-    Sampling window. A cold start that reaches the main window takes 5-15 s.
-
-.PARAMETER IntervalMs
-    Window sampling interval. 5 ms is enough to see console windows.
+    Recording window. A cold start that reaches the main window takes 5-15 s.
 
 .PARAMETER Target
     Executable to start. Defaults to the installed launcher, which is what the
@@ -30,21 +42,21 @@
 
 .PARAMETER Arguments
     Arguments for the target. Defaults to the installed shortcut's arguments.
+    Pass an array for several values: -Arguments @('--api', 'https://...').
 
 .PARAMETER NoLaunch
-    Only sample; do not start anything.
+    Only record; do not start anything.
 
 .EXAMPLE
     .\scripts\startup-window-watch.ps1 -Seconds 20
 
 .EXAMPLE
-    # Sample a start you trigger yourself from the desktop.
+    # Record a start you trigger yourself from the desktop.
     .\scripts\startup-window-watch.ps1 -Seconds 20 -NoLaunch
 #>
 [CmdletBinding()]
 param(
-    [int]$Seconds = 20,
-    [int]$IntervalMs = 5,
+    [int]$Seconds = 30,
     [string]$Target,
     [string[]]$Arguments,
     [switch]$NoLaunch
@@ -67,46 +79,49 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
-public sealed class WindowSighting
+public sealed class StartupWindowRow
 {
-    public string Title = "";
-    public string ClassName = "";
+    public double AtMs;
+    public double LastMs;
+    public uint Event;
+    public bool Preexisting;
     public uint ProcessId;
     public string ProcessName = "";
-    public double FirstSeenMs;
-    public double LastSeenMs;
-    public bool Preexisting;
+    public string ClassName = "";
+    public string Title = "";
     public bool Visible;
     public bool EverVisible;
-    public bool IsConsole;
-    public double LifetimeMs { get { return Math.Max(0.0, LastSeenMs - FirstSeenMs); } }
+    public double LifetimeMs { get { return Math.Max(0.0, LastMs - AtMs); } }
 }
 
-public static class StartupWindowWatch
+public sealed class StartupProcessRow
 {
-    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    public double AtMs;
+    public double LastMs;
+    public bool Preexisting;
+    public uint ProcessId;
+    public uint ParentProcessId;
+    public string Name = "";
+}
 
-    [DllImport("user32.dll")]
-    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+public sealed class StartupRecording
+{
+    public List<StartupWindowRow> Windows = new List<StartupWindowRow>();
+    public List<StartupProcessRow> Processes = new List<StartupProcessRow>();
+}
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr hWnd);
-
+public static class StartupRecorder
+{
+    // Console window classes. PseudoConsoleWindow is what this Windows build
+    // hands a console child of a GUI process; the default terminal host adds a
+    // CASCADIA window on top. Leaving any of them out of the count is how a
+    // flashing start was reported as quiet.
     private static readonly string[] ConsoleClasses = new string[]
     {
-        "ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "PseudoConsoleWindow"
+        "ConsoleWindowClass", "PseudoConsoleWindow", "CASCADIA_HOSTING_WINDOW_CLASS"
     };
 
-    private static bool IsConsoleClass(string value)
+    public static bool IsConsoleClass(string value)
     {
         foreach (var candidate in ConsoleClasses)
         {
@@ -115,132 +130,306 @@ public static class StartupWindowWatch
         return false;
     }
 
-    public static List<WindowSighting> Sample(int totalMs, int intervalMs, out int passes)
+    private delegate void WinEventDelegate(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
     {
-        var sightings = new List<WindowSighting>();
-        var current = new Dictionary<string, WindowSighting>();
-        var names = new Dictionary<uint, string>();
-        var stopwatch = Stopwatch.StartNew();
-        var firstPass = true;
-        var count = 0;
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int ptX;
+        public int ptY;
+    }
 
-        while (stopwatch.ElapsedMilliseconds < totalMs)
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PROCESSENTRY32W
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    [DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr hmod, WinEventDelegate callback, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] private static extern bool UnhookWinEvent(IntPtr hook);
+    [DllImport("user32.dll")] private static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder buffer, int count);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder buffer, int count);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool Process32FirstW(IntPtr snapshot, ref PROCESSENTRY32W entry);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32W entry);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
+    private static List<StartupWindowRow> windowRows;
+    // Keyed by window handle, not by handle and title: a window that is retitled
+    // is the same window, and keying by title turned "an existing window was
+    // shown" into "a window appeared".
+    private static Dictionary<IntPtr, StartupWindowRow> rowByHandle;
+    private static List<StartupProcessRow> processRows;
+    private static Dictionary<uint, StartupProcessRow> processIndex;
+    // Names come from the Toolhelp snapshot rather than Process.GetProcessById:
+    // opening a protected process throws, and the exception storm from doing that
+    // once per desktop window made a 3 second recording take 75 seconds under
+    // Windows PowerShell 5.1.
+    private static Dictionary<uint, string> processNames;
+
+    private static string ClassOf(IntPtr hwnd)
+    {
+        var buffer = new StringBuilder(256);
+        GetClassName(hwnd, buffer, buffer.Capacity);
+        return buffer.ToString();
+    }
+
+    private static string TitleOf(IntPtr hwnd)
+    {
+        var buffer = new StringBuilder(2048);
+        GetWindowText(hwnd, buffer, buffer.Capacity);
+        return buffer.ToString();
+    }
+
+    private static string ProcessNameOf(uint pid)
+    {
+        if (pid == 0) { return "Idle"; }
+        string name;
+        return processNames.TryGetValue(pid, out name) ? name : "<unknown>";
+    }
+
+    private static StartupWindowRow Sight(IntPtr hwnd, uint evt, bool preexisting)
+    {
+        StartupWindowRow row;
+        if (rowByHandle.TryGetValue(hwnd, out row))
         {
-            var now = stopwatch.Elapsed.TotalMilliseconds;
-            var stillCurrent = new HashSet<string>();
+            string title = TitleOf(hwnd);
+            if (!string.IsNullOrEmpty(title)) { row.Title = title; }
+            row.LastMs = Clock.Elapsed.TotalMilliseconds;
+            if (IsWindowVisible(hwnd)) { row.EverVisible = true; }
+            return row;
+        }
 
-            EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        row = new StartupWindowRow();
+        row.AtMs = preexisting ? 0 : Clock.Elapsed.TotalMilliseconds;
+        row.LastMs = Clock.Elapsed.TotalMilliseconds;
+        row.Event = evt;
+        row.Preexisting = preexisting;
+        row.ProcessId = pid;
+        row.ProcessName = ProcessNameOf(pid);
+        row.ClassName = ClassOf(hwnd);
+        row.Title = TitleOf(hwnd);
+        row.Visible = IsWindowVisible(hwnd);
+        row.EverVisible = row.Visible;
+        rowByHandle[hwnd] = row;
+        windowRows.Add(row);
+        return row;
+    }
+
+    private static void OnWindowEvent(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        if (idObject != 0 || hwnd == IntPtr.Zero) { return; }
+        Sight(hwnd, evt, false);
+    }
+
+    private static void SnapshotProcesses(bool baseline)
+    {
+        double now = Clock.Elapsed.TotalMilliseconds;
+        var entry = new PROCESSENTRY32W();
+        uint entrySize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+        entry.dwSize = entrySize;
+        IntPtr snapshot = CreateToolhelp32Snapshot(0x2, 0);
+        if (snapshot == new IntPtr(-1)) { return; }
+        try
+        {
+            if (Process32FirstW(snapshot, ref entry))
             {
-                var classBuffer = new StringBuilder(256);
-                GetClassName(hWnd, classBuffer, classBuffer.Capacity);
-                var className = classBuffer.ToString();
-                var titleBuffer = new StringBuilder(2048);
-                GetWindowText(hWnd, titleBuffer, titleBuffer.Capacity);
-                var title = titleBuffer.ToString();
-                uint processId = 0;
-                GetWindowThreadProcessId(hWnd, out processId);
-
-                // Console hosts retitle one window as each console program runs
-                // inside it, so a sighting is a handle *and* a title.
-                var key = hWnd.ToString() + "|" + className + "|" + title;
-                stillCurrent.Add(key);
-
-                WindowSighting sighting;
-                if (!current.TryGetValue(key, out sighting))
+                do
                 {
-                    sighting = new WindowSighting();
-                    sighting.Title = title;
-                    sighting.ClassName = className;
-                    sighting.ProcessId = processId;
-                    sighting.Visible = IsWindowVisible(hWnd);
-                    sighting.EverVisible = sighting.Visible;
-                    sighting.IsConsole = IsConsoleClass(className);
-                    sighting.Preexisting = firstPass;
-                    sighting.FirstSeenMs = now;
-                    current[key] = sighting;
-                    sightings.Add(sighting);
-                }
-                sighting.LastSeenMs = now;
-                if (IsWindowVisible(hWnd)) { sighting.EverVisible = true; }
-                return true;
-            }, IntPtr.Zero);
-
-            foreach (var key in new List<string>(current.Keys))
-            {
-                if (!stillCurrent.Contains(key)) { current.Remove(key); }
+                    processNames[entry.th32ProcessID] = entry.szExeFile;
+                    StartupProcessRow row;
+                    if (!processIndex.TryGetValue(entry.th32ProcessID, out row))
+                    {
+                        row = new StartupProcessRow();
+                        row.AtMs = now;
+                        row.Preexisting = baseline;
+                        row.ProcessId = entry.th32ProcessID;
+                        row.ParentProcessId = entry.th32ParentProcessID;
+                        row.Name = entry.szExeFile;
+                        processIndex[row.ProcessId] = row;
+                        processRows.Add(row);
+                    }
+                    row.LastMs = now;
+                    entry.dwSize = entrySize;
+                } while (Process32NextW(snapshot, ref entry));
             }
-
-            System.Threading.Thread.Sleep(Math.Max(1, intervalMs));
-            firstPass = false;
-            count++;
         }
-
-        foreach (var sighting in sightings)
+        finally
         {
-            string name;
-            if (!names.TryGetValue(sighting.ProcessId, out name))
+            CloseHandle(snapshot);
+        }
+    }
+
+    public static StartupRecording Run(int seconds)
+    {
+        windowRows = new List<StartupWindowRow>();
+        rowByHandle = new Dictionary<IntPtr, StartupWindowRow>();
+        processRows = new List<StartupProcessRow>();
+        processIndex = new Dictionary<uint, StartupProcessRow>();
+        processNames = new Dictionary<uint, string>();
+
+        // Baseline and process table first: everything already on the desktop
+        // belongs to the desktop, not to this start. Windows that existed before
+        // the hook was installed produce no creation event of their own, so they
+        // are sighted once here and stay marked as preexisting - otherwise the
+        // first show or focus event for the user's existing window would be
+        // reported as a window this start created.
+        SnapshotProcesses(true);
+        var baseline = new List<IntPtr>();
+        EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) { baseline.Add(hWnd); return true; }, IntPtr.Zero);
+        foreach (IntPtr hwnd in baseline) { Sight(hwnd, 0, true); }
+
+        var callback = new WinEventDelegate(OnWindowEvent);
+        IntPtr hook = SetWinEventHook(0x0001, 0x8002, IntPtr.Zero, callback, 0, 0, 0x0002);
+        if (hook == IntPtr.Zero) { throw new InvalidOperationException("SetWinEventHook failed"); }
+
+        double deadline = Clock.Elapsed.TotalSeconds + seconds;
+        try
+        {
+            while (Clock.Elapsed.TotalSeconds < deadline)
             {
-                try { name = Process.GetProcessById((int)sighting.ProcessId).ProcessName; }
-                catch { name = "<exited>"; }
-                names[sighting.ProcessId] = name;
+                MSG message;
+                while (PeekMessage(out message, IntPtr.Zero, 0, 0, 1)) { }
+                SnapshotProcesses(false);
+                System.Threading.Thread.Sleep(8);
             }
-            sighting.ProcessName = name;
+        }
+        finally
+        {
+            UnhookWinEvent(hook);
+            GC.KeepAlive(callback);
         }
 
-        passes = count;
-        return sightings;
+        var recording = new StartupRecording();
+        recording.Windows = windowRows;
+        recording.Processes = processRows;
+        return recording;
     }
 }
 "@
 
-$durationMs = $Seconds * 1000
+$startedAt = Get-Date
 $launched = $null
 if (-not $NoLaunch) {
-    Write-Host "sampling $Seconds s at $IntervalMs ms; starting: $Target"
-    Write-Host "  arguments: $($Arguments -join ' ')"
+    Write-Host ("recording {0} s; starting: {1}" -f $Seconds, $Target)
+    Write-Host ("  arguments: {0}" -f ($Arguments -join ' '))
     $launched = Start-Process -FilePath $Target -ArgumentList $Arguments -PassThru
 }
 else {
-    Write-Host "sampling $Seconds s at $IntervalMs ms; waiting for a start you trigger by hand"
+    Write-Host ("recording {0} s; waiting for a start you trigger by hand" -f $Seconds)
 }
 
-$passes = 0
-$sightings = [StartupWindowWatch]::Sample($durationMs, $IntervalMs, [ref]$passes)
+$recording = [StartupRecorder]::Run($Seconds)
 
 if ($launched) {
     $launched | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
 
-$new = @($sightings | Where-Object { -not $_.Preexisting })
-$newConsole = @($new | Where-Object { $_.IsConsole -and $_.ClassName -ne 'PseudoConsoleWindow' } | Sort-Object FirstSeenMs)
-$agentWindows = @($new | Where-Object { $_.ProcessName -like 'himind-*' } | Sort-Object FirstSeenMs)
+$windows = @($recording.Windows | Where-Object { -not $_.Preexisting })
+$processes = @($recording.Processes | Where-Object { -not $_.Preexisting })
+$consoleWindows = @($windows | Where-Object { [StartupRecorder]::IsConsoleClass($_.ClassName) -and $_.EverVisible } | Sort-Object AtMs)
+$hiddenConsoleWindows = @($windows | Where-Object { [StartupRecorder]::IsConsoleClass($_.ClassName) -and -not $_.EverVisible } | Sort-Object AtMs)
+$agentWindows = @($windows | Where-Object { $_.ProcessName -like 'himind-*' } | Sort-Object AtMs)
 
-Write-Host ''
-Write-Host ("sampled {0} passes; {1} windows appeared during the sampling window" -f $passes, $new.Count)
-Write-Host ("console windows that appeared: {0}" -f $newConsole.Count)
-
-if ($newConsole.Count -gt 0) {
-    Write-Host ''
-    $newConsole | Format-Table -AutoSize @{Name = 'At(ms)'; Expression = { [int]$_.FirstSeenMs } }, `
-        @{Name = 'Lived(ms)'; Expression = { [int]$_.LifetimeMs } }, ClassName, ProcessName, @{Name = 'Shown'; Expression = { $_.EverVisible } }, Title
+# Ancestry for the process table: name(pid) <- parent <- grandparent.
+$byPid = @{}
+foreach ($process in $processes) { $byPid[[int]$process.ProcessId] = $process }
+function Get-ProcessChain {
+    param([int]$ProcessId)
+    $parts = New-Object System.Collections.Generic.List[string]
+    $current = $ProcessId
+    for ($depth = 0; $depth -lt 8 -and $byPid.ContainsKey($current); $depth++) {
+        $entry = $byPid[$current]
+        $parts.Add(('{0}({1})' -f $entry.Name, $entry.ProcessId))
+        $current = [int]$entry.ParentProcessId
+    }
+    return ($parts -join ' <- ')
+}
+function Test-ChainHasHimind {
+    param([int]$ProcessId)
+    $current = $ProcessId
+    for ($depth = 0; $depth -lt 8 -and $byPid.ContainsKey($current); $depth++) {
+        $entry = $byPid[$current]
+        if ($entry.Name -like 'himind-*') { return $true }
+        $current = [int]$entry.ParentProcessId
+    }
+    return $false
 }
 
+$spawnedByAgent = @($processes | Where-Object { (Test-ChainHasHimind -ProcessId ([int]$_.ProcessId)) -and $_.Name -notlike 'himind-*' } | Sort-Object AtMs)
+
+Write-Host ''
+Write-Host ("recorded {0:HH:mm:ss.fff} - {1:HH:mm:ss.fff}; {2} windows appeared, {3} processes started" -f $startedAt, (Get-Date), $windows.Count, $processes.Count)
+
+Write-Host ''
+if ($consoleWindows.Count -gt 0) {
+    Write-Host ("console windows that appeared and were shown: {0}" -f $consoleWindows.Count) -ForegroundColor Yellow
+    $consoleWindows | Format-Table -AutoSize @{Name = 'At(ms)'; Expression = { [int]$_.AtMs } }, `
+        @{Name = 'Lived(ms)'; Expression = { [int]$_.LifetimeMs } }, ClassName, ProcessName, Title
+}
+else {
+    Write-Host 'console windows that appeared and were shown: 0' -ForegroundColor Green
+}
+if ($hiddenConsoleWindows.Count -gt 0) {
+    Write-Host ("console windows created without a window (CREATE_NO_WINDOW): {0}" -f $hiddenConsoleWindows.Count)
+    $hiddenConsoleWindows | Group-Object ProcessName | Sort-Object Count -Descending | ForEach-Object {
+        Write-Host ("  {0,3} x {1}" -f $_.Count, $_.Name)
+    }
+}
+
+Write-Host ''
 if ($agentWindows.Count -gt 0) {
-    Write-Host 'windows created by HiMind processes during the start:'
-    $agentWindows | Format-Table -AutoSize @{Name = 'At(ms)'; Expression = { [int]$_.FirstSeenMs } }, `
-        @{Name = 'Lived(ms)'; Expression = { [int]$_.LifetimeMs } }, ClassName, ProcessName, @{Name = 'Shown'; Expression = { $_.EverVisible } }, Title
+    Write-Host 'windows created by HiMind processes during this start:'
+    $agentWindows | Format-Table -AutoSize @{Name = 'At(ms)'; Expression = { [int]$_.AtMs } }, `
+        @{Name = 'Lived(ms)'; Expression = { [int]$_.LifetimeMs } }, ClassName, ProcessName, `
+        @{Name = 'Shown'; Expression = { $_.EverVisible } }, Title
 }
 else {
-    Write-Host 'no window owned by a HiMind process appeared during the sampling window' -ForegroundColor Yellow
+    Write-Host 'no window owned by a HiMind process appeared during the recording' -ForegroundColor Yellow
 }
 
 Write-Host ''
-if ($newConsole.Count -eq 0) {
-    Write-Host 'RESULT: no console window appeared - the start is quiet.' -ForegroundColor Green
+if ($spawnedByAgent.Count -gt 0) {
+    Write-Host 'processes started under a HiMind process (this is where a flash comes from):'
+    $spawnedByAgent | Format-Table -AutoSize @{Name = 'At(ms)'; Expression = { [int]$_.AtMs } }, `
+        @{Name = 'Lived(ms)'; Expression = { [int]($_.LastMs - $_.AtMs) } }, Name, `
+        @{Name = 'Chain'; Expression = { Get-ProcessChain -ProcessId ([int]$_.ProcessId) } }
 }
 else {
-    Write-Host ("RESULT: {0} console window(s) flashed during this start." -f $newConsole.Count) -ForegroundColor Yellow
-    $newConsole | Group-Object Title | Sort-Object Count -Descending | ForEach-Object {
+    Write-Host 'no process was started under a HiMind process during the recording'
+}
+
+Write-Host ''
+if ($consoleWindows.Count -eq 0) {
+    Write-Host 'RESULT: no console window was shown - this start is quiet.' -ForegroundColor Green
+}
+else {
+    Write-Host ("RESULT: {0} console window(s) flashed during this start." -f $consoleWindows.Count) -ForegroundColor Yellow
+    $consoleWindows | Group-Object Title | Sort-Object Count -Descending | ForEach-Object {
         Write-Host ("  {0,3} x {1}" -f $_.Count, $(if ($_.Name) { $_.Name } else { '<untitled>' }))
     }
+    Write-Host 'A title naming a program path (icacls.exe, cmd.exe, node.exe) is the program the Agent started; fix that spawn site to use runtime::process::hidden_command.'
 }
