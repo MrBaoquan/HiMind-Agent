@@ -118,9 +118,11 @@ HiMind AI 会话启动失败: HiMind AI 页面认证失败：HiMind AI 页面返
 
   受管 profile 的 `skill-office` 行过去只认 `HIMIND_DSH_RUNTIME_ROOT` / `HIMIND_DSH_NODE`，而这两个
   变量只有 headless 那条派生路径注入过，交互式 Web 会话没有，于是 `path.resolve(undefined, …)` 在配置
-  装配阶段就抛错。0.3.74 起该行自己就能算出 Runtime 根目录（环境变量缺失时从 `process.argv[1]` 反推），
-  交互式会话也补上了这两个变量，Runtime 的 `bin\dsh.cmd` 同样会自行导出；会话准备阶段会把磁盘上的
-  旧行就地升级，不需要用户手改 profile。
+  装配阶段就抛错。这条**只让 Office 条目不激活**（实测页面 `GET /` 仍是 200），所以它和上面的 502 是
+  两条独立结论，只是常常一起出现在同一段诊断里：判 502 看 `loopback_proxy_bypass` 与
+  `himind_ai_rail_links`，判 Office 能力看 `1 entry did not activate`。0.3.74 起该行自己就能算出
+  Runtime 根目录（环境变量缺失时从 `process.argv[1]` 反推），交互式会话也补上了这两个变量，Runtime 的
+  `bin\dsh.cmd` 同样会自行导出；会话准备阶段会把磁盘上的旧行就地升级，不需要用户手改 profile。
 
 ### 7. 官方扩展源显示「未找到受信的签名公钥：himind-extension-production-2026」
 

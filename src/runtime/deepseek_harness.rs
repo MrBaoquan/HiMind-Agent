@@ -5235,9 +5235,10 @@ mod tests {
     fn managed_office_row_resolves_the_runtime_without_help_from_the_launcher() {
         // The Agent injects HIMIND_DSH_RUNTIME_ROOT for every Runtime it starts,
         // but the row must not depend on that: a session started by any other
-        // path died with ERR_INVALID_ARG_TYPE on process.env.HIMIND_DSH_RUNTIME_ROOT,
-        // which took the Office entry, and with it the whole Web entry (HTTP 502),
-        // down with it.
+        // path failed activation with ERR_INVALID_ARG_TYPE on
+        // process.env.HIMIND_DSH_RUNTIME_ROOT. That killed the Office entry only
+        // (the page itself still answered 200), so it is a separate defect from
+        // the 502 the same diagnostic output can carry.
         assert!(super::MANAGED_OFFICE_SKILL_ROW.contains("process.argv[1]"));
         assert!(!super::MANAGED_OFFICE_SKILL_ROW
             .contains("resolve(process.env.HIMIND_DSH_RUNTIME_ROOT,"));
