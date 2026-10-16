@@ -122,6 +122,17 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 ```
 
 确认输出为 `RESULT: no console window was shown - this start is quiet.`。
+上面的录制只覆盖「双击启动」这一条路。**冷启动安静不等于会话路径安静**：工作区已经建好目录联接的机器上，开会话不会再跑 `mklink`，冷启动录制永远是 0；只有新工作区、新机器、或联接被清掉的机器才复现。会话路径要单独验收——用一个全新工作区走一次真实的会话准备，同时录制：
+
+```powershell
+$probe = Join-Path $env:TEMP 'himind-session-probe'; New-Item -ItemType Directory -Force -Path $probe | Out-Null
+.\scripts\startup-window-watch.ps1 -Seconds 45 -NoLaunch   # 另开一个窗口跑，进入录制后再执行下一行
+& "$env:LOCALAPPDATA\HiMindAgent\versions\<版本>\himind-agent.exe" --profile production ai ask $probe 'hi'
+```
+
+判定同上：`RESULT: no console window was shown - this start is quiet.`。0.3.71 之前这一步会看到 3 个 `PseudoConsoleWindow`（`cmd.exe`，即三次 `mklink /J`）加 3 个 `CASCADIA_HOSTING_WINDOW_CLASS`。`ai ask` 会先做会话准备再取凭据，所以即使凭据不可用、对话失败，联接这一步也已经跑过了，判定仍然有效。
+
+探针用完要清理两处：探针工作区目录，以及它在 `<runtime>\homes\interactive\workspaces\<指纹>` 下新建的 DSH home（先删 `profiles\node_modules`、`storages`、`sessions` 三个联接本身，再删目录，直接递归删除会跟着联接删到共享目录里去）。
 
 在干净 Windows 用户环境验证：安装、桌面快捷方式图标、双击显示主窗口、注销后自动启动只显示托盘、从托盘打开主窗口、卸载后快捷方式和协议注册清理。将 `diagnostics check` 作为安装后冒烟测试；不要把“安装器进度完成”当成桌面可用的唯一信号。
 
