@@ -71,6 +71,57 @@ cd <安装目录或仓库>
 本机实测（0.3.70 安装版，干净冷启动，事件驱动记录 28 s）：`console windows that appeared and were shown: 0`，主窗口在双击后约 5.6 s 出现；同一台机器同一个工具在 `cmd.exe` 目标上报告 2 个控制台窗口。启动期仍会派生 `git`、`node`、`powershell`、`cmd`（拓展源对账、沙箱写权限预热 5 个工作区、客户端探测），它们的 `conhost` 子进程都在，但都没有窗口——说明这些位置都已经带上隐藏标志。
 
 `package.ps1` 现在有两道门禁：子系统断言（launcher/Agent 必须是 GUI、MCP companion 必须是控制台）和 `scripts/check-console-spawns.ps1`（字面量控制台程序不得在没带隐藏标志的函数里派生），打包阶段就会拦住回归。
+### 6. HiMind AI 会话以「页面返回 HTTP 502 Bad Gateway」失败
+
+会话启动的最后一步会把本机 Web 入口当浏览器访问一次（`verify_browser_entry`），拿到的不是
+2xx 就中止会话，日志里就是这一句：
+
+```text
+HiMind AI 会话启动失败: HiMind AI 页面认证失败：HiMind AI 页面返回 HTTP 502 Bad Gateway
+```
+
+这个 502 来自 DSH 自己的本机 Web 入口，不是网络。DSH 把每个工作区 home 的 `sessions`/`storages`
+指向共享目录，目录联接一旦被判成不受信挂载点（`ERROR_UNTRUSTED_MOUNT_POINT`），
+`session-persistence-jsonl` 与 `session-projection-cache` 激活失败，整个 Web 入口回 502，
+界面只会说「会话启动失败」。2026-10-15 目标机（`100.66.251.8`）现场就是这一条：日志里
+「沙箱写权限预热完成 …\HiMindAgent」与第一条 502 出现在同一秒，因为预热把 Agent 自己的数据目录
+当成了工作区，给整棵树加了沙箱 ACE。
+
+排查要点：
+
+- 判据是「联接能不能列目录」，不是「指向对不对」：`canonicalize` 仍能解析出目标，只有枚举会报
+  「The path cannot be traversed because it contains an untrusted mount point」。
+- `diagnostics check` 的 `himind_ai_rail_links` 会列出所有工作区的 `sessions`/`storages` 联接与
+  `traversable` 结论，`broken` 非空就是命中。
+- 手工修复：先 `cmd /c rmdir "<工作区 home>\sessions"`，再
+  `cmd /c mklink /J "<工作区 home>\sessions" "<共享 sessions 目录>"`，`storages` 同理；重建后
+  `traversable` 必须变回 `true`。这两个目录是共享数据，不能用递归删除去「清掉联接」。
+- 0.3.72 起会话准备阶段自己判定并重建这两个联接，不再需要人工介入；`HiMind AI 页面认证失败` 的
+  报错也会附上 Runtime 的 stdout/stderr 摘要，不再只有一句结论。
+
+### 7. 官方扩展源显示「未找到受信的签名公钥：himind-extension-production-2026」
+
+官方扩展源 `MrBaoquan/himind-extensions` 的发布清单一律用 `himind-extension-production-2026`
+签名，来源策略是 `required`；本机没有这把公钥时整条来源 `unavailable`，界面只给这一句。
+
+- 成因：发布脚本过去只把官方扩展公钥交给安装器写成 `trusted-keys\<key-id>.pem`，
+  `himind-agent.exe` 自己没内嵌。安装器参数一旦漏配，全部用户都会缺同一把公钥，而且只能靠重装恢复。
+- 诊断：`diagnostics check` 的 `extension_source_health`（各来源最后一次同步结论，来自
+  `data/extension-source-health.json`）与 `extension_source_trust`（缓存里实际用到的 key ID 与本机
+  受信公钥对比）。两者都把 key ID 直接写进 JSON，可以直接贴进工单。
+- 修复：把 `himind-extension-production-2026.pem` 放进安装目录的 `trusted-keys`，等价命令
+
+  ```powershell
+  pwsh scripts/release/manage-trusted-signing-key.ps1 -Action import `
+    -TrustedDirectory "$env:LOCALAPPDATA\HiMindAgent\trusted-keys" `
+    -KeyId himind-extension-production-2026 `
+    -PublicKeyPath C:\path\to\himind-extension-production-2026.pem
+  ```
+
+- 0.3.72 起官方扩展公钥在构建期内嵌进二进制（`build.rs` 读
+  `HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH` / `HIMIND_EXTENSION_SIGNING_KEY_ID`），安装器写的文件
+  继续作为可轮换的覆盖层；撤销清单优先于任何来源，撤销过的 key ID 即使内嵌也不会重新生效。
+
 ## 用户排查步骤
 
 在 PowerShell 中执行以下命令。路径带空格时保留引号。
@@ -104,6 +155,8 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | 自更新后双击只见到托盘、没有窗口 | 快捷方式参数（右键属性→目标）是否仍带 `--show` | 0.3.69 及更早：双击第二次可把窗口唤到前台，或重新运行安装器重建快捷方式；0.3.70 起默认显示窗口，不再依赖该参数 |
 | 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
 | 窗口打开后白屏 | `agent-events.jsonl` 的 `界面页面加载` 记录 | 有 Started 无 Finished 通常是资源/WebView 加载问题；没有 Started 通常是 WebView 创建失败 |
+| HiMind AI 会话报「页面返回 502」 | `diagnostics check` 的 `himind_ai_rail_links`、`agent-events.jsonl` 里的「HiMind AI 会话启动失败」 | `broken` 非空即工作区会话目录联接不受信：删除并用 `mklink /J` 重建该联接；0.3.72 起自动重建 |
+| 扩展源显示「未找到受信的签名公钥：<key-id>」 | `diagnostics check` 的 `extension_source_health` 与 `extension_source_trust` | 把 `<key-id>.pem` 放进 `trusted-keys`（`manage-trusted-signing-key.ps1 -Action import`）；自建来源也可把验证策略改为 `optional`；0.3.72+ 官方扩展公钥已内嵌 |
 
 ## 发布门禁
 

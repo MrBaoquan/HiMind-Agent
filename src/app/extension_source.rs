@@ -811,6 +811,7 @@ fn load_snapshot(refresh_remote: bool) -> Result<ExtensionSourceSnapshot, Box<dy
             source_dirty: local_revision.2,
             notices: Vec::new(),
         };
+        record_source_health(&source, &status);
         if let Some(mut catalog) = catalog {
             status.plugin_count = catalog.plugins.len();
             status.skill_count = catalog.skills.len();
@@ -3233,6 +3234,9 @@ pub(crate) fn validate_catalog(
             )?;
         }
         validate_catalog_signature(
+            "plugin",
+            &item.plugin_id,
+            &item.version,
             &item.signature,
             &item.signature_key_id,
             &item.signature_algorithm,
@@ -3258,6 +3262,9 @@ pub(crate) fn validate_catalog(
             )?;
         }
         validate_catalog_signature(
+            "skill",
+            &item.skill_id,
+            &item.version,
             &item.signature,
             &item.signature_key_id,
             &item.signature_algorithm,
@@ -3283,6 +3290,9 @@ pub(crate) fn validate_catalog(
             )?;
         }
         validate_catalog_signature(
+            "workflow",
+            &item.workflow_id,
+            &item.version,
             &item.signature,
             &item.signature_key_id,
             &item.signature_algorithm,
@@ -3308,6 +3318,9 @@ pub(crate) fn validate_catalog(
             )?;
         }
         validate_catalog_signature(
+            "expert",
+            &item.expert_id,
+            &item.version,
             &item.signature,
             &item.signature_key_id,
             &item.signature_algorithm,
@@ -3329,7 +3342,15 @@ pub(crate) fn validate_catalog(
     Ok(())
 }
 
+/// 校验目录条目的签名元数据，并在报错里点名是哪一条。
+///
+/// 一条签名不可用的条目会让整个来源变成「不可用」，而原始错误只说「未找到
+/// 受信的签名公钥：<key-id>」，用户既不知道是哪一条，也不知道公钥该放到哪里。
+/// 这里补上条目身份、key ID 和受信目录，让这条错误自己就是排查步骤。
 fn validate_catalog_signature(
+    kind: &str,
+    id: &str,
+    version: &str,
     signature: &str,
     key_id: &str,
     algorithm: &str,
@@ -3340,9 +3361,17 @@ fn validate_catalog_signature(
         key_id,
         algorithm,
         verification.requires_signature(),
-    )?;
+    )
+    .map_err(|error| format!("扩展源条目 {kind} {id}@{version} 的签名元数据不完整：{error}"))?;
     if !signature.is_empty() {
-        crate::app::system::trusted_signing_public_key(key_id)?;
+        crate::app::system::trusted_signing_public_key(key_id).map_err(|error| {
+            format!(
+                "扩展源条目 {kind} {id}@{version} 使用了本机不信任的签名公钥：{error}；\
+                 该条目用 key ID `{key_id}` 签名，请把 `{key_id}.pem` 放进受信公钥目录（{}），\
+                 或让发布方改用已受信的 key ID 重新签名。",
+                crate::app::system::trusted_signing_keys_directory_hint()
+            )
+        })?;
     }
     Ok(())
 }
@@ -4219,6 +4248,53 @@ fn cache_catalog(source: &ExtensionSourceConfig, catalog: &ExtensionSourceCatalo
         crate::app::crash::record_event(
             "warn",
             &format!("扩展源缓存写入失败: {} ({error})", source.id),
+        );
+    }
+}
+
+/// 每个来源的「最后一句话」台账。
+///
+/// 界面上的错误是一次性的：一次同步失败之后，用户重开面板往往只剩「扩展源尚未
+/// 同步」，真正的原因（缺公钥、404、清单非法）就丢了。诊断包要能离线说清
+/// 「哪条来源、什么时候、为什么不可用」，所以这里把结论落盘。
+fn source_health_path() -> PathBuf {
+    paths::agent_home().join("data/extension-source-health.json")
+}
+
+fn record_source_health(source: &ExtensionSourceConfig, status: &ExtensionSourceStatus) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let record = serde_json::json!({
+        "source_id": source.id,
+        "source_name": source.name,
+        "repository": source.repository,
+        "kind": if source.kind == ExtensionSourceKind::Local { "local" } else { "github" },
+        "state": status.state,
+        "using_cache": status.using_cache,
+        "error": status.error.trim(),
+        "updated_at": now,
+    });
+    record_source_health_at(&source_health_path(), &source.id, record);
+}
+
+fn record_source_health_at(path: &Path, source_id: &str, record: serde_json::Value) {
+    let mut document = fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if document.get(source_id) == Some(&record) {
+        return;
+    }
+    document.insert(source_id.to_string(), record);
+    let payload =
+        serde_json::to_vec_pretty(&serde_json::Value::Object(document)).unwrap_or_default();
+    if let Err(error) = atomic_file::atomic_write(path, &payload) {
+        crate::app::crash::record_event(
+            "warn",
+            &format!("扩展源健康台账写入失败: {source_id} ({error})"),
         );
     }
 }
@@ -5942,18 +6018,62 @@ mod tests {
 
     #[test]
     fn optional_source_allows_unsigned_catalog_but_rejects_partial_metadata() {
-        assert!(
-            validate_catalog_signature("", "", "", &ExtensionSourceVerification::Optional).is_ok()
-        );
         assert!(validate_catalog_signature(
+            "plugin",
+            "com.himind.extension-development-tools",
+            "1.4.3",
+            "",
+            "",
+            "",
+            &ExtensionSourceVerification::Optional
+        )
+        .is_ok());
+        assert!(validate_catalog_signature(
+            "plugin",
+            "com.himind.extension-development-tools",
+            "1.4.3",
             "c2ln",
             "",
             "rsa-pss-sha256",
             &ExtensionSourceVerification::Optional
         )
         .is_err());
+        assert!(validate_catalog_signature(
+            "plugin",
+            "com.himind.extension-development-tools",
+            "1.4.3",
+            "",
+            "",
+            "",
+            &ExtensionSourceVerification::Required
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn untrusted_catalog_signature_names_the_entry_and_the_key_id() {
+        // 版本目录里一条用未受信 key ID 签名的条目会让整个来源不可用；报错必须
+        // 自己说清是哪一条、用的哪个 key ID，否则用户只能看到一句「未找到受信的
+        // 签名公钥」而不知道从何下手。
+        let error = validate_catalog_signature(
+            "workflow",
+            "com.himind.workflow.software-release",
+            "1.1.0",
+            "c2ln",
+            "himind-untrusted-test-key",
+            "rsa-pss-sha256",
+            &ExtensionSourceVerification::Required,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
-            validate_catalog_signature("", "", "", &ExtensionSourceVerification::Required).is_err()
+            error.contains("com.himind.workflow.software-release@1.1.0"),
+            "{error}"
+        );
+        assert!(error.contains("himind-untrusted-test-key"), "{error}");
+        assert!(
+            error.contains("trusted-keys") || error.contains("受信公钥目录"),
+            "{error}"
         );
     }
 

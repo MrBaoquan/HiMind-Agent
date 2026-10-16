@@ -32,6 +32,13 @@ const EMBEDDED_UPDATE_PUBLIC_KEY_PEM: &str =
     include_str!(concat!(env!("OUT_DIR"), "/embedded-update-public-key.pem"));
 const EMBEDDED_UPDATE_KEY_ID: &str =
     include_str!(concat!(env!("OUT_DIR"), "/embedded-update-key-id.txt"));
+/// 官方扩展签名公钥（key ID 由构建时的 HIMIND_EXTENSION_SIGNING_KEY_ID 决定）。
+const EMBEDDED_EXTENSION_PUBLIC_KEY_PEM: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/embedded-extension-public-key.pem"
+));
+const EMBEDDED_EXTENSION_KEY_ID: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/embedded-extension-key-id.txt"));
 
 #[cfg(test)]
 pub(crate) fn signing_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -165,8 +172,11 @@ pub(crate) fn trusted_agent_update_key_ids() -> Vec<String> {
 }
 
 pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn Error>> {
+    let key_id = key_id.trim();
     if let Some(trusted_dir) = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR") {
         let trusted_dir = PathBuf::from(trusted_dir);
+        // 撤销优先于任何其它来源：内嵌公钥和目录里的公钥文件都不能让撤销过的
+        // key ID 重新生效，否则「轮换后旧签名继续可验」就是必然发生的。
         if signing_key_is_revoked(&trusted_dir, key_id)? {
             return Err(format!("签名公钥已被撤销：{key_id}").into());
         }
@@ -175,11 +185,102 @@ pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn
             return Ok(std::fs::read_to_string(public_key_path)?);
         }
     }
-    if key_id == EMBEDDED_UPDATE_KEY_ID.trim() && !EMBEDDED_UPDATE_PUBLIC_KEY_PEM.trim().is_empty()
-    {
-        return Ok(EMBEDDED_UPDATE_PUBLIC_KEY_PEM.to_string());
+    if let Some(embedded) = embedded_signing_public_key(key_id) {
+        return Ok(embedded.to_string());
     }
-    Err(format!("未找到受信的签名公钥：{key_id}").into())
+    Err(untrusted_signing_key_error(key_id).into())
+}
+
+/// 构建时内嵌的信任根：Agent 更新公钥与官方扩展公钥。
+///
+/// 两者都是「装完就能用」的前提。只把公钥交给安装器写文件的话，构建参数漏配
+/// （历史版本就是这么漏的）会让官方扩展源在全部用户机上不可用，且只能靠重装
+/// 恢复；内嵌之后升级即修复，安装器写的文件继续作为可轮换的覆盖层。
+fn embedded_signing_public_key(key_id: &str) -> Option<&'static str> {
+    for (id, pem) in [
+        (
+            EMBEDDED_UPDATE_KEY_ID.trim(),
+            EMBEDDED_UPDATE_PUBLIC_KEY_PEM,
+        ),
+        (
+            EMBEDDED_EXTENSION_KEY_ID.trim(),
+            EMBEDDED_EXTENSION_PUBLIC_KEY_PEM,
+        ),
+    ] {
+        if !id.is_empty() && id == key_id && !pem.trim().is_empty() {
+            return Some(pem);
+        }
+    }
+    None
+}
+
+/// 找不到受信公钥时的报错：说清是哪个 key ID、公钥该放哪里、还有什么退路。
+///
+/// 这句话是用户唯一能看到的线索，所以不能只说「未找到」。官方扩展源用固定
+/// key ID 签名，缺公钥是配置问题而不是网络问题；而自建来源可以主动降级为
+/// `optional`，这条退路必须写出来，否则用户只能卡住。
+fn untrusted_signing_key_error(key_id: &str) -> String {
+    let hint = trusted_signing_keys_directory_hint();
+    let known = trusted_signing_key_ids();
+    let present = if known.is_empty() {
+        "当前受信公钥目录里没有任何 .pem 公钥".to_string()
+    } else {
+        format!("当前受信公钥目录只有：{}", known.join("、"))
+    };
+    format!(
+        "未找到受信的签名公钥：{key_id}（{present}）。         把 {key_id}.pem 放进受信公钥目录 {hint} 后重试；         自建扩展源也可以在扩展源设置里把验证策略改为 optional。"
+    )
+}
+
+/// 内嵌信任根里的 key ID（诊断用）。
+pub(crate) fn trusted_embedded_key_ids() -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [
+        EMBEDDED_UPDATE_KEY_ID.trim(),
+        EMBEDDED_EXTENSION_KEY_ID.trim(),
+    ] {
+        if !id.is_empty() {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// 受信签名公钥目录的可读表述：环境变量优先，其次安装目录的 `trusted-keys`。
+///
+/// 提示、诊断和实际查找共用这一个口径：用户照着提示放的公钥，必须就是程序
+/// 真正会读的那一份，否则「按提示操作还是不行」。
+pub(crate) fn trusted_signing_keys_directory_hint() -> String {
+    if let Some(value) = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR") {
+        let value = value.to_string_lossy().trim().to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    crate::store::paths::agent_home()
+        .join("trusted-keys")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 受信签名公钥目录里已有的 key ID（按 `<key-id>.pem` 文件名）。
+///
+/// 只列文件名，不读公钥正文：诊断输出会被贴进工单，公钥正文没有诊断价值。
+pub(crate) fn trusted_signing_key_ids() -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(trusted_signing_keys_directory_hint()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("pem") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                ids.push(stem.to_string());
+            }
+        }
+    }
+    ids.sort();
+    ids
 }
 
 fn signing_key_is_revoked(trusted_dir: &Path, key_id: &str) -> Result<bool, Box<dyn Error>> {
@@ -3015,6 +3116,82 @@ mod tests {
         }
         assert!(error.to_string().contains("撤销"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoked_id_is_rejected_before_any_embedded_trust_root() {
+        // 内嵌信任根（Agent 更新公钥、官方扩展公钥）不能把撤销过的 key ID 救回来：
+        // 轮换后旧签名必须立刻失效，否则撤销清单形同虚设。
+        let _guard = signing_env_lock();
+        let embedded = EMBEDDED_UPDATE_KEY_ID.trim();
+        assert!(!embedded.is_empty(), "test build has no embedded update key");
+        let root = std::env::temp_dir().join(format!(
+            "himind-revoked-embedded-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("revoked-keys.json"),
+            serde_json::to_vec(&json!({ "revoked_key_ids": [embedded] })).unwrap(),
+        )
+        .unwrap();
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &root);
+        let result = trusted_signing_public_key(embedded);
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("\u{64a4}\u{9500}") || error.contains("revoked"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untrusted_key_error_names_the_key_and_the_directory() {
+        // 现场只有这一句话可看：必须自己说清缺的是哪个 key ID、公钥该放哪里、
+        // 以及自建来源可以降级为 optional，否则用户无从下手。
+        let _guard = signing_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-untrusted-key-hint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("some-other-key.pem"), b"public key").unwrap();
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", &root);
+        let result = trusted_signing_public_key("himind-extension-production-test");
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("himind-extension-production-test"), "{error}");
+        assert!(error.contains(&root.to_string_lossy().to_string()), "{error}");
+        assert!(error.contains("some-other-key"), "{error}");
+        assert!(error.contains("optional"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embedded_extension_key_is_trusted_when_the_build_carries_it() {
+        // 正式构建把官方扩展公钥写进二进制；没有它的构建跳过这条断言，避免把
+        // 「开发构建没有密钥」误判成失败。
+        let _guard = signing_env_lock();
+        let key_id = EMBEDDED_EXTENSION_KEY_ID.trim();
+        if key_id.is_empty() {
+            return;
+        }
+        let pem = trusted_signing_public_key(key_id).expect("embedded extension key must resolve");
+        assert!(RsaPublicKey::from_public_key_pem(&pem).is_ok());
     }
 
     #[test]

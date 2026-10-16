@@ -1675,7 +1675,14 @@ fn start_builtin_ai_session_inner(
         proxy.stop();
         crate::runtime::process::terminate_process_tree(&mut child);
         let _ = child.wait();
-        return Err(format!("HiMind AI 页面认证失败：{error}"));
+        // 页面验证失败的原因几乎都在 Runtime 的启动输出里（例如不受信的会话
+        // 目录联接会让会话持久化插件起不来、Web 入口回 502）。只报一句「认证
+        // 失败」等于把证据丢掉，所以这里和启动超时一样带上 Runtime 诊断。
+        return Err(builtin_ai_startup_error(
+            &format!("HiMind AI 页面认证失败：{error}"),
+            &diagnostics,
+            &launch.api_key,
+        ));
     }
     // The rail groups Sessions by Workspace and paints nothing for a closed
     // group, so the entry registers its own directory and opens the recorded

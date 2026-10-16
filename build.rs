@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_PUBLIC_KEY_PATH");
     println!("cargo:rerun-if-env-changed=HIMIND_SIGNING_KEY_ID");
+    println!("cargo:rerun-if-env-changed=HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH");
+    println!("cargo:rerun-if-env-changed=HIMIND_EXTENSION_SIGNING_KEY_ID");
     println!("cargo:rerun-if-changed=icons/icon.ico");
     // Windows agent threads run long-lived orchestration work (Dashboard
     // heartbeat/polling, plugin reconciliation, Skill rendering).  The MSVC
@@ -14,6 +16,7 @@ fn main() {
         println!("cargo:rustc-link-arg=/STACK:8388608");
     }
     write_embedded_update_key();
+    write_embedded_extension_key();
 
     let icon_path = Path::new("icons/icon.ico");
     if !icon_path.exists() {
@@ -21,6 +24,34 @@ fn main() {
         fs::write(icon_path, generate_ico()).expect("failed to write icon.ico");
     }
     tauri_build::build();
+}
+
+/// 内嵌官方扩展签名公钥。
+///
+/// 官方 GitHub 扩展源固定用 `himind-extension-production-2026` 验签。只靠安装器
+/// 把公钥写进 `trusted-keys`，任何一次构建参数漏配都会让所有用户看到
+/// 「未找到受信的签名公钥」，而且只能靠重装恢复；写进二进制以后升级即修复。
+fn write_embedded_extension_key() {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is required"));
+    let public_key = std::env::var_os("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let key_id = std::env::var("HIMIND_EXTENSION_SIGNING_KEY_ID").unwrap_or_default();
+    let configured = !public_key.trim().is_empty() && !key_id.trim().is_empty();
+    fs::write(
+        out_dir.join("embedded-extension-public-key.pem"),
+        if configured {
+            public_key
+        } else {
+            String::new()
+        },
+    )
+    .expect("failed to write embedded extension public key");
+    fs::write(
+        out_dir.join("embedded-extension-key-id.txt"),
+        if configured { key_id } else { String::new() },
+    )
+    .expect("failed to write embedded extension key id");
 }
 
 fn write_embedded_update_key() {

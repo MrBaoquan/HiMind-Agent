@@ -3765,8 +3765,15 @@ fn share_rail_state(shared: &Path, target: &Path, managed: &Path) -> Result<(), 
         let source = shared.join(entry);
         fs::create_dir_all(&source)
             .map_err(|error| format!("创建共享 DSH 目录 {entry} 失败: {error}"))?;
+        // 目录联接除了「指向对的目标」，还必须真的能走进去：Windows 会把某些
+        // 联接判成不受信挂载点，`canonicalize` 仍能解析出目标，但枚举目录会返回
+        // 「The path cannot be traversed because it contains an untrusted mount
+        // point」。DSH 的会话持久化插件正好要枚举这两个目录，激活失败后整个 Web
+        // 入口回 502，界面只报「HiMind AI 会话启动失败 / 页面认证失败」——
+        // 2026-10-16 现场就是这一条。判据取「能不能列目录」，不成立就重建联接：
+        // 重建是目前唯一验证过能恢复的做法。
         let destination = target.join(entry);
-        if linked_to(&destination, &source) {
+        if linked_to(&destination, &source) && link_is_traversable(&destination) {
             continue;
         }
         migrate_rail_entry(entry, &destination, &source)?;
@@ -3793,6 +3800,16 @@ fn path_present(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+fn link_is_traversable(path: &Path) -> bool {
+    fs::read_dir(path).is_ok()
+}
+
+fn is_reparse_point(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn remove_link_or_dir(path: &Path) -> Result<(), String> {
     if !path_present(path) {
         return Ok(());
@@ -3801,6 +3818,25 @@ fn remove_link_or_dir(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     if fs::remove_dir(path).is_ok() {
         return Ok(());
+    }
+    // 不受信的联接连 `remove_dir` 都会被拒（ERROR_UNTRUSTED_MOUNT_POINT），而
+    // `rmdir` 走的是另一条删除路径。递归删除绝不能兜在这里：对端是共享的
+    // `sessions`/`storages`，递归一旦跟进联接就会把用户的会话数据删掉。
+    #[cfg(windows)]
+    if is_reparse_point(path) {
+        crate::runtime::process::hidden_command("cmd.exe")
+            .args(["/D", "/C", "rmdir"])
+            .arg(path)
+            .status()
+            .map_err(|error| format!("删除无法遍历的 DSH 联接失败 {}: {error}", path.display()))?;
+        if !path_present(path) {
+            return Ok(());
+        }
+        return Err(format!(
+            "无法删除不受信的 DSH 联接 {}：请先执行 `cmd /c rmdir \"{}\"` 再重试",
+            path.display(),
+            path.display()
+        ));
     }
     fs::remove_dir_all(path)
         .map_err(|error| format!("清理旧 DSH 目录失败 {}: {error}", path.display()))
@@ -4188,7 +4224,8 @@ mod tests {
         agent_owned_route_is_viable_with, append_independent_service_profile, degraded_notice,
         dsh_run_home, dsh_skill_name, effective_runtime_capabilities,
         ensure_interactive_home, ensure_managed_capability_rows,
-        ensure_profile_patch, first_line, himind_mcp_arguments, managed_model_catalog,
+        ensure_profile_patch, first_line, himind_mcp_arguments, link_is_traversable,
+        managed_model_catalog,
         merge_profile_package, migrate_legacy_managed_settings, native_dsh_provider_config,
         no_tools_overlay_text, parse_native_dsh_provider_config, parse_runtime_version,
         recent_workspace_in, release_agent_owned_model_route, remove_managed_runtime,
@@ -6128,4 +6165,24 @@ api_key: "sk-anthropic-secret".to_string(),
             .unwrap()
             .contains("private arguments"));
     }
+
+    #[test]
+    fn rail_link_must_be_traversable_to_count_as_shared() {
+        // 判据是「能不能列目录」，不是「指向对不对」：不受信挂载点仍能解析出
+        // 目标，但枚举失败，DSH 的会话持久化插件就会起不来、Web 入口回 502。
+        let root = std::env::temp_dir().join(format!(
+            "himind-rail-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(link_is_traversable(&target));
+        assert!(!link_is_traversable(&root.join("missing")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }

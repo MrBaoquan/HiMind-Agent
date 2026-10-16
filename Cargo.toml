@@ -1,6 +1,6 @@
 [package]
 name = "himind-agent"
-version = "0.3.71"
+version = "0.3.72"
 edition = "2021"
 default-run = "himind-agent"
 

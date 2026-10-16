@@ -6,6 +6,8 @@ param(
     [string]$PrivateKeyPath,
     [string]$PublicKeyPath,
     [string]$SigningKeyId,
+    [string]$ExtensionPublicKeyPath,
+    [string]$ExtensionSigningKeyId,
     [string]$RuntimeReleaseDirectory,
     [string]$WindowsCodeSigningCertificateThumbprint,
     [string]$WindowsTimestampUrl = "http://timestamp.sectigo.com",
@@ -45,6 +47,45 @@ if (-not $hasSigning -and -not $AllowUnsigned) {
 }
 if ($SigningKeyId -and $SigningKeyId -notmatch '^[A-Za-z0-9._-]+$') {
     throw "SigningKeyId contains invalid characters."
+}
+
+# 官方扩展公钥（`himind-extension-production-2026.pem`）必须随安装包写进
+# `trusted-keys`，否则公开扩展目录里用这把密钥签名的条目会让整个官方扩展源显示为
+# 不可用（实测：来源状态 unavailable，错误只写「未找到受信的签名公钥」）。正式发布
+# 缺这份公钥视为配置错误，与缺少 Agent 自更新签名同样的口径：只有显式
+# `-AllowUnsigned` 的联调发布才允许不带。
+$ExtensionPublicKeyPath = Resolve-Setting $ExtensionPublicKeyPath "HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH"
+$ExtensionSigningKeyId = Resolve-Setting $ExtensionSigningKeyId "HIMIND_EXTENSION_SIGNING_KEY_ID"
+if ([string]::IsNullOrWhiteSpace($ExtensionPublicKeyPath)) {
+    foreach ($directory in @(
+            (Join-Path $env:LOCALAPPDATA "HiMind\signing\trusted"),
+            (Join-Path $env:ProgramData "HiMind\signing\trusted"))) {
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
+        $candidate = @(Get-ChildItem -LiteralPath $directory -Filter "himind-extension-*.pem" -File -ErrorAction SilentlyContinue |
+            Sort-Object -Property Name -Descending | Select-Object -First 1)
+        if ($candidate.Count -eq 1) {
+            $ExtensionPublicKeyPath = $candidate[0].FullName
+            if ([string]::IsNullOrWhiteSpace($ExtensionSigningKeyId)) {
+                $ExtensionSigningKeyId = [IO.Path]::GetFileNameWithoutExtension($candidate[0].Name)
+            }
+            break
+        }
+    }
+}
+if ($ExtensionPublicKeyPath -or $ExtensionSigningKeyId) {
+    if ([string]::IsNullOrWhiteSpace($ExtensionPublicKeyPath) -or [string]::IsNullOrWhiteSpace($ExtensionSigningKeyId)) {
+        throw "官方扩展签名公钥与 key ID 必须成对提供（-ExtensionPublicKeyPath/-ExtensionSigningKeyId 或 HIMIND_EXTENSION_SIGNING_*）。"
+    }
+    if ($ExtensionSigningKeyId -notmatch '^[A-Za-z0-9._-]+$') { throw "ExtensionSigningKeyId contains invalid characters." }
+    $ExtensionPublicKeyPath = [IO.Path]::GetFullPath($ExtensionPublicKeyPath)
+    if (-not (Test-Path -LiteralPath $ExtensionPublicKeyPath -PathType Leaf)) {
+        throw "Official extension signing public key not found: $ExtensionPublicKeyPath"
+    }
+} elseif (-not $AllowUnsigned) {
+    throw "正式 GitHub 发布要求官方扩展签名公钥：设 HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH/HIMIND_EXTENSION_SIGNING_KEY_ID、传 -ExtensionPublicKeyPath/-ExtensionSigningKeyId，或放到 `%LOCALAPPDATA%\HiMind\signing\trusted`；仅本机联调可显式用 -AllowUnsigned 跳过。"
+} else {
+    Write-Warning "未提供官方扩展签名公钥：该安装包不会写入 trusted-keys，官方扩展源在使用者机器上会显示为不可用。"
 }
 if ($hasSigning) {
     $PrivateKeyPath = [IO.Path]::GetFullPath($PrivateKeyPath)
@@ -112,10 +153,19 @@ if (-not (Test-Path -LiteralPath (Join-Path $RuntimeReleaseDirectory "himind-run
 
 $oldPublicKey = [Environment]::GetEnvironmentVariable("HIMIND_SIGNING_PUBLIC_KEY_PATH", "Process")
 $oldKeyId = [Environment]::GetEnvironmentVariable("HIMIND_SIGNING_KEY_ID", "Process")
+$oldExtensionPublicKey = [Environment]::GetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH", "Process")
+$oldExtensionKeyId = [Environment]::GetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_KEY_ID", "Process")
 try {
     if ($hasSigning) {
         [Environment]::SetEnvironmentVariable("HIMIND_SIGNING_PUBLIC_KEY_PATH", $PublicKeyPath, "Process")
         [Environment]::SetEnvironmentVariable("HIMIND_SIGNING_KEY_ID", $SigningKeyId, "Process")
+    }
+    # The official extension trust root is compiled into the binary, not only
+    # written by the installer: a missing installer argument used to leave every
+    # user without the key and only a reinstall could fix it.
+    if ($ExtensionPublicKeyPath) {
+        [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH", $ExtensionPublicKeyPath, "Process")
+        [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_KEY_ID", $ExtensionSigningKeyId, "Process")
     }
     $packageArgs = @{ Version = $Version; OutputDirectory = $OutputRoot; Configuration = "release" }
     if ($WindowsCodeSigningCertificateThumbprint) {
@@ -131,6 +181,8 @@ try {
 finally {
     [Environment]::SetEnvironmentVariable("HIMIND_SIGNING_PUBLIC_KEY_PATH", $oldPublicKey, "Process")
     [Environment]::SetEnvironmentVariable("HIMIND_SIGNING_KEY_ID", $oldKeyId, "Process")
+    [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH", $oldExtensionPublicKey, "Process")
+    [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_KEY_ID", $oldExtensionKeyId, "Process")
 }
 
 $portableArchive = Join-Path $OutputRoot "himind-agent-$Version-windows-x64.zip"
@@ -158,9 +210,21 @@ if ($hasSigning) {
     $installerArgs.PublicKeyPath = $PublicKeyPath
     $installerArgs.SigningKeyId = $SigningKeyId
 }
+if ($ExtensionPublicKeyPath) {
+    $installerArgs.ExtensionPublicKeyPath = $ExtensionPublicKeyPath
+    $installerArgs.ExtensionSigningKeyId = $ExtensionSigningKeyId
+    $installerArgs.RequireExtensionSigningKey = $true
+}
 $installerArgs.RuntimeReleaseDirectory = $RuntimeReleaseDirectory
 & (Join-Path $PSScriptRoot "build-installer.ps1") @installerArgs | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "Independent Agent installer build failed." }
+
+# 把公钥本身作为发布资产留下：已经装好的旧版本不会因为安装器修复而更新
+# `trusted-keys`，运维脚本 `manage-trusted-signing-key.ps1 -Action import`
+# 和手工补文件都需要这份 pem 的下载地址。
+if ($ExtensionPublicKeyPath) {
+    Copy-Item -LiteralPath $ExtensionPublicKeyPath -Destination (Join-Path $ReleaseDirectory "$ExtensionSigningKeyId.pem") -Force
+}
 
 $signaturePath = Join-Path $ReleaseDirectory "himind-agent-update.signature.json"
 if ($hasSigning) {
@@ -243,5 +307,6 @@ if (-not $SkipGhRelease) {
     installer = (Get-ChildItem -LiteralPath $ReleaseDirectory -Filter "himind-agent-*-setup.exe" -File | Select-Object -First 1).Name
     update_archive = "himind-agent-update.zip"
     signed = $hasSigning
+    extension_signing_key_id = if ($ExtensionSigningKeyId) { $ExtensionSigningKeyId } else { "" }
     github_release_created = (-not $SkipGhRelease)
 } | ConvertTo-Json

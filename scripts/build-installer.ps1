@@ -12,6 +12,7 @@ param(
     [string]$SigningKeyId,
     [string]$ExtensionPublicKeyPath,
     [string]$ExtensionSigningKeyId,
+    [switch]$RequireExtensionSigningKey,
     [string]$VSCodeExtensionPath,
     [string]$RuntimeReleaseDirectory,
     [string]$WindowsCodeSigningCertificateThumbprint,
@@ -111,8 +112,45 @@ function Resolve-KeyPair {
     return ""
 }
 
+# 官方扩展公钥必须随安装包写进 `trusted-keys`：公开扩展目录里有用
+# `himind-extension-production-2026` 签名的条目，缺了这份公钥，那些条目所在的
+# 整个来源都会显示为「不可用」。本机发布常常只记得带 Agent 自更新公钥，所以这里
+# 按已知落点自动发现；`-RequireExtensionSigningKey` 决定缺失时是失败还是仅告警。
+function Resolve-ExtensionSigningKey {
+    param([string]$KeyPath, [string]$KeyId, [switch]$Required)
+    if (($KeyPath -and -not $KeyId) -or ($KeyId -and -not $KeyPath)) {
+        throw "Extension signing public key path and key ID must be provided together."
+    }
+    if ($KeyPath) {
+        $resolved = [IO.Path]::GetFullPath($KeyPath)
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "Extension signing public key was not found: $resolved" }
+        if ($KeyId -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid extension signing key ID." }
+        return [pscustomobject]@{ Path = $resolved; KeyId = $KeyId }
+    }
+    $candidates = @()
+    foreach ($directory in @(
+            (Join-Path $env:LOCALAPPDATA "HiMind\signing\trusted"),
+            (Join-Path $env:ProgramData "HiMind\signing\trusted"))) {
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
+        $candidates += @(Get-ChildItem -LiteralPath $directory -Filter "himind-extension-*.pem" -File -ErrorAction SilentlyContinue)
+    }
+    if ($candidates.Count -eq 0) {
+        if ($Required) {
+            throw "Official extension signing public key was not found. Pass -ExtensionPublicKeyPath/-ExtensionSigningKeyId or set HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH/HIMIND_EXTENSION_SIGNING_KEY_ID. Without it the installer ships no official extension trust root and every user sees the official extension source as unavailable."
+        }
+        Write-Warning "未找到官方扩展签名公钥：安装包不会写入 trusted-keys，官方扩展源在使用者机器上会显示为不可用。"
+        return $null
+    }
+    $key = @($candidates | Sort-Object -Property Name -Descending)[0]
+    $discoveredKeyId = [IO.Path]::GetFileNameWithoutExtension($key.Name)
+    if ($discoveredKeyId -notmatch '^[A-Za-z0-9._-]+$') { throw "Discovered extension signing key ID is invalid: $discoveredKeyId" }
+    Write-Host "Using official extension signing public key: $($key.FullName) (key ID $discoveredKeyId)"
+    return [pscustomobject]@{ Path = $key.FullName; KeyId = $discoveredKeyId }
+}
+
 $PublicKey = Resolve-KeyPair $PublicKeyPath $SigningKeyId "update signing"
-$ExtensionPublicKey = Resolve-KeyPair $ExtensionPublicKeyPath $ExtensionSigningKeyId "extension signing"
+$ExtensionKey = Resolve-ExtensionSigningKey $ExtensionPublicKeyPath $ExtensionSigningKeyId -Required:$RequireExtensionSigningKey
 $CompilerArguments = @(
     "/INPUTCHARSET", "UTF8",
     "/DRELEASE=$ReleasePath",
@@ -128,7 +166,7 @@ if ($RuntimeRelease) {
     $CompilerArguments += @("/DRUNTIME_DIR=$RuntimeRelease", "/DRUNTIME_PACKAGE=$RuntimePackageName")
 }
 if ($PublicKey) { $CompilerArguments += @("/DTRUSTED_PUBLIC_KEY=$PublicKey", "/DSIGNING_KEY_ID=$SigningKeyId") }
-if ($ExtensionPublicKey) { $CompilerArguments += @("/DTRUSTED_EXTENSION_PUBLIC_KEY=$ExtensionPublicKey", "/DEXTENSION_SIGNING_KEY_ID=$ExtensionSigningKeyId") }
+if ($ExtensionKey) { $CompilerArguments += @("/DTRUSTED_EXTENSION_PUBLIC_KEY=$($ExtensionKey.Path)", "/DEXTENSION_SIGNING_KEY_ID=$($ExtensionKey.KeyId)") }
 & $MakeNsisPath @CompilerArguments (Join-Path $Root "installer\himind-agent.nsi")
 if ($LASTEXITCODE -ne 0) { throw "Agent installer build failed." }
 
@@ -147,5 +185,6 @@ if ($Thumbprint) {
     path = $OutFile
     version = $Version
     default_mode = $DefaultMode
+    extension_signing_key_id = if ($ExtensionKey) { $ExtensionKey.KeyId } else { "" }
     sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $OutFile).Hash.ToLowerInvariant()
 } | ConvertTo-Json

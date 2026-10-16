@@ -100,9 +100,16 @@ Runtime Release 通过主仓库脚本发布：
 ```powershell
 $env:HIMIND_SIGNING_PRIVATE_KEY_PATH = "C:\keys\himind-agent-private.pem"
 $env:HIMIND_SIGNING_PUBLIC_KEY_PATH = "C:\keys\himind-agent-public.pem"
-$env:HIMIND_SIGNING_KEY_ID = "release-2026"
+$env:HIMIND_SIGNING_KEY_ID = "himind-production-2026"
+# 官方扩展公钥：安装器把它写进本机 trusted-keys。缺它时公开扩展目录里用
+# himind-extension-production-2026 签名的条目会让整个官方扩展源显示为不可用，
+# 因此正式发布默认要求它，只有 -AllowUnsigned 的联调发布跳过。
+$env:HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH = "$env:LOCALAPPDATA\HiMind\signing\trusted\himind-extension-production-2026.pem"
+$env:HIMIND_EXTENSION_SIGNING_KEY_ID = "himind-extension-production-2026"
 ./scripts/publish-github-release.ps1
 ```
+
+两个 key ID 是两条独立信任链：`himind-production-2026` 用于 Agent 自更新，`himind-extension-production-2026` 用于官方扩展制品。未显式给出扩展公钥时，发布脚本会在 `%LOCALAPPDATA%\HiMind\signing\trusted`、`%ProgramData%\HiMind\signing\trusted` 里按 `himind-extension-*.pem` 自动发现；一个都找不到且没有 `-AllowUnsigned` 时会直接失败。公钥本身也会作为发布资产留在 Release 目录，供旧安装补 `trusted-keys`。
 
 私钥只用于本机签名，不会写入 Release、Agent 状态或日志。构建时公钥会嵌入 Agent，并由安装器写入 `trusted-keys`，更新器据此校验签名。
 

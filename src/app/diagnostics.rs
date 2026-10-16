@@ -216,6 +216,93 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         checks.push(json!({ "name": "desktop_shortcut", "ok": exists, "severity": if exists { "info" } else { "warning" }, "message": if exists { "桌面快捷方式存在" } else { "未找到桌面快捷方式（安装时可能未勾选）" }, "path": path }));
     }
 
+    let extension_trust = extension_trust_snapshot();
+    let untrusted_keys = extension_trust
+        .get("untrusted_key_ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !untrusted_keys.is_empty() {
+        failures += 1;
+    }
+    checks.push(json!({
+        "name": "extension_source_trust",
+        "ok": untrusted_keys.is_empty(),
+        "severity": if untrusted_keys.is_empty() { "info" } else { "error" },
+        "message": if untrusted_keys.is_empty() {
+            "已启用扩展源的缓存目录全部使用本机受信公钥".to_string()
+        } else {
+            format!(
+                "扩展源不可用：目录里有条目使用本机不受信的签名公钥 {}（把对应的 <key-id>.pem 放进受信公钥目录即可修复）",
+                untrusted_keys.join("、")
+            )
+        },
+        "detail": extension_trust,
+    }));
+
+    let source_health = extension_source_health_snapshot();
+    let failing_sources = source_health
+        .get("failing")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !failing_sources.is_empty() {
+        warnings += 1;
+    }
+    checks.push(json!({
+        "name": "extension_source_health",
+        "ok": failing_sources.is_empty(),
+        "severity": if failing_sources.is_empty() { "info" } else { "warning" },
+        "message": if failing_sources.is_empty() {
+            "已启用扩展源没有记录到同步失败".to_string()
+        } else {
+            format!(
+                "扩展源最近一次同步失败：{}。缺签名公钥时把 <key-id>.pem 放进受信公钥目录即可；自建来源也可把验证策略改成 optional",
+                failing_sources
+                    .iter()
+                    .map(|item| format!(
+                        "{}（{}）",
+                        item.get("source_name").and_then(Value::as_str).unwrap_or("来源"),
+                        item.get("error").and_then(Value::as_str).unwrap_or("未知原因")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("；")
+            )
+        },
+        "detail": source_health,
+    }));
+
+    let rail_links = dsh_rail_link_snapshot();
+    let broken_links = rail_links
+        .get("broken")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !broken_links.is_empty() {
+        failures += 1;
+    }
+    checks.push(json!({
+        "name": "himind_ai_rail_links",
+        "ok": broken_links.is_empty(),
+        "severity": if broken_links.is_empty() { "info" } else { "error" },
+        "message": if broken_links.is_empty() {
+            "HiMind AI 工作区的会话目录联接可遍历".to_string()
+        } else {
+            format!(
+                "有 {} 处 HiMind AI 会话目录联接不可遍历（不受信挂载点），会话会以「页面返回 502」失败；\
+                 重建这些联接即可修复，重跑安装器或执行 scripts/repair-storage.ps1 均可",
+                broken_links.len()
+            )
+        },
+        "detail": rail_links,
+    }));
+
     let result = json!({
         "schema_version": 1,
         "generated_at": unix_now(),
@@ -228,6 +315,9 @@ pub(crate) fn check_installation(options: &Options) -> Result<(Value, i32), Box<
         "storage_integrity": storage_integrity_snapshot(options.local_port),
         "protocol_registration": protocol_registration_snapshot(&root, options),
         "startup_evidence": startup_evidence(),
+        "extension_trust": extension_trust,
+        "extension_source_health": source_health,
+        "himind_ai_rail_links": rail_links,
         "checks": checks,
         "summary": { "failures": failures, "warnings": warnings },
     });
@@ -253,6 +343,195 @@ fn push_check(
         *failures += 1;
     }
     checks.push(json!({ "name": name, "ok": ok, "severity": severity, "message": message }));
+}
+
+/// 扩展源信任快照：受信 key ID、以及每个「已启用」来源的缓存目录实际用到的 key ID。
+///
+/// 一条用未受信公钥签名的条目会让整个 GitHub 来源显示为不可用，而界面只给出
+/// 一句话。这里在离线状态下（只读缓存，不访问网络）把「哪条目录、缺哪个公钥」
+/// 变成可附在工单里的结构化证据。只统计配置里 `enabled` 的来源，避免把已经停用
+/// 的历史缓存算成故障。
+/// 已启用来源的「最后一次同步结论」，来自扩展源自己落盘的台账。
+///
+/// 缓存目录只在同步成功过之后才有内容，所以只查缓存会把「从没成功过的来源」
+/// 报成一切正常——现场这台机器就是这样：目录为空、界面只报一句缺公钥。
+fn extension_source_health_snapshot() -> Value {
+    let path = crate::store::paths::agent_home()
+        .join("data")
+        .join("extension-source-health.json");
+    let document = fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let mut failing = Vec::new();
+    if let Some(object) = document.as_object() {
+        let mut entries = object.values().collect::<Vec<_>>();
+        entries.sort_by_key(|value| {
+            value
+                .get("source_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
+        for entry in entries {
+            let error = entry
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if !error.is_empty() {
+                failing.push(entry.clone());
+            }
+        }
+    }
+    json!({
+        "path": path.to_string_lossy(),
+        "sources": document,
+        "failing": failing,
+    })
+}
+
+/// HiMind AI 每个工作区的会话目录联接健康度。
+///
+/// DSH 把工作区的 `sessions`/`storages` 指向共享目录，枚举不到就说明联接被判成
+/// 不受信挂载点，会话持久化插件随之起不来、Web 入口回 502。这里只读枚举，把
+/// 「哪个工作区的哪个联接坏了」变成能直接附在工单里的证据。
+fn dsh_rail_link_snapshot() -> Value {
+    let root = crate::store::paths::agent_home()
+        .join("runtimes")
+        .join("deepseek-harness")
+        .join("homes")
+        .join("interactive")
+        .join("workspaces");
+    let mut links = Vec::new();
+    let mut broken = Vec::new();
+    if let Ok(workspaces) = fs::read_dir(&root) {
+        for workspace in workspaces.flatten() {
+            for entry in ["sessions", "storages"] {
+                let path = workspace.path().join(entry);
+                if fs::symlink_metadata(&path).is_err() {
+                    continue;
+                }
+                let traversable = fs::read_dir(&path).is_ok();
+                let value = json!({
+                    "workspace": workspace.file_name().to_string_lossy(),
+                    "entry": entry,
+                    "path": path.to_string_lossy(),
+                    "traversable": traversable,
+                });
+                if !traversable {
+                    broken.push(value.clone());
+                }
+                links.push(value);
+            }
+        }
+    }
+    json!({
+        "workspaces_root": root.to_string_lossy(),
+        "links": links,
+        "broken": broken,
+    })
+}
+
+fn extension_trust_snapshot() -> Value {
+    let home = crate::store::paths::agent_home();
+    let trusted = crate::app::system::trusted_signing_key_ids();
+    let embedded = crate::app::system::trusted_embedded_key_ids();
+    let mut enabled = Vec::<(String, String)>::new();
+    if let Ok(raw) = fs::read(home.join("data").join("extension-sources.json")) {
+        if let Ok(settings) = serde_json::from_slice::<Value>(&raw) {
+            if let Some(sources) = settings.get("sources").and_then(Value::as_array) {
+                for source in sources.iter() {
+                    if source.get("enabled").and_then(Value::as_bool) != Some(true) {
+                        continue;
+                    }
+                    let id = source
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = source
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    enabled.push((id, name));
+                }
+            }
+        }
+    }
+
+    let mut sources = Vec::new();
+    let mut untrusted = Vec::<String>::new();
+    let cache = home.join("data").join("extension-source-cache");
+    for (id, name) in &enabled {
+        let path = cache.join(format!("{id}.json"));
+        let Ok(raw) = fs::read(&path) else {
+            sources.push(json!({
+                "source_id": id,
+                "source_name": name,
+                "cached_catalog": false,
+                "signature_key_ids": Vec::<String>::new(),
+                "untrusted_key_ids": Vec::<String>::new(),
+            }));
+            continue;
+        };
+        let Ok(catalog) = serde_json::from_slice::<Value>(&raw) else {
+            sources.push(json!({
+                "source_id": id,
+                "source_name": name,
+                "cached_catalog": false,
+                "signature_key_ids": Vec::<String>::new(),
+                "untrusted_key_ids": Vec::<String>::new(),
+            }));
+            continue;
+        };
+        let mut key_ids = Vec::<String>::new();
+        let mut source_untrusted = Vec::<String>::new();
+        for collection in ["plugins", "skills", "workflows", "experts"] {
+            let Some(items) = catalog.get(collection).and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items.iter() {
+                let id = item
+                    .get("signature_key_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                if !key_ids.contains(&id) {
+                    key_ids.push(id.clone());
+                }
+                if !trusted.contains(&id)
+                    && !embedded.contains(&id)
+                    && !source_untrusted.contains(&id)
+                {
+                    source_untrusted.push(id.clone());
+                }
+                if (!trusted.contains(&id) && !embedded.contains(&id)) && !untrusted.contains(&id) {
+                    untrusted.push(id.clone());
+                }
+            }
+        }
+        sources.push(json!({
+            "source_id": id,
+            "source_name": name,
+            "cached_catalog": true,
+            "signature_key_ids": key_ids,
+            "untrusted_key_ids": source_untrusted,
+        }));
+    }
+
+    json!({
+        "trusted_keys_directory": crate::app::system::trusted_signing_keys_directory_hint(),
+        "trusted_key_ids": trusted,
+        "embedded_key_ids": embedded,
+        "sources": sources,
+        "untrusted_key_ids": untrusted,
+    })
 }
 
 struct IcoReport {
