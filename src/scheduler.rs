@@ -899,16 +899,29 @@ pub(crate) fn run_due(gateway: CapabilityGateway, now: i64) -> Result<Value, Box
 pub(crate) fn start_scheduler(gateway: CapabilityGateway) {
     let _ = std::thread::Builder::new()
         .name("himind-scheduler".to_string())
-        .spawn(move || loop {
-            let now = now_epoch();
-            if let Err(error) = run_due(gateway.clone(), now) {
-                eprintln!("scheduler tick failed: {error}");
+        .spawn(move || {
+            let mut last_stale_error = String::new();
+            loop {
+                let now = now_epoch();
+                if let Err(error) = run_due(gateway.clone(), now) {
+                    eprintln!("scheduler tick failed: {error}");
+                }
+                // 顺手收尾被中断的运行：进程死了就没人续租，界面不该永远显示“执行中”。
+                if let Err(error) = abandon_stale_runs() {
+                    let message = error.to_string();
+                    if message != last_stale_error {
+                        eprintln!("scheduler stale-run sweep failed: {message}");
+                        crate::app::crash::record_event(
+                            "error",
+                            &format!("调度器僵尸运行清理失败：{message}"),
+                        );
+                        last_stale_error = message;
+                    }
+                } else {
+                    last_stale_error.clear();
+                }
+                std::thread::sleep(std::time::Duration::from_secs(30));
             }
-            // 顺手收尾被中断的运行：进程死了就没人续租，界面不该永远显示“执行中”。
-            if let Err(error) = abandon_stale_runs() {
-                eprintln!("scheduler stale-run sweep failed: {error}");
-            }
-            std::thread::sleep(std::time::Duration::from_secs(30));
         });
 }
 

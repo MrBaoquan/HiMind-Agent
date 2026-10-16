@@ -16,7 +16,7 @@
 //! 边界：预热失败不影响会话。缺少 `node.exe` 或 ACL 模块（例如
 //! `HIMIND_DSH_EXECUTABLE` 指向的开发构建）就是「少了一次加速」，只记一行日志。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 预热结果。三种情况要区分开：跳过不是失败，失败要留下证据。
 #[derive(Debug, PartialEq, Eq)]
@@ -51,6 +51,9 @@ impl WarmupOutcome {
 /// 预热一个工作区。调用方拿到的是 `Result` 语义的结论，不抛异常：
 /// 会话启动路径不允许因为预热而失败。
 pub(crate) fn warm(executable: &Path, workspace: &Path) -> WarmupOutcome {
+    if let Some(reason) = protected_workspace_reason(executable, workspace) {
+        return WarmupOutcome::Skipped(reason);
+    }
     platform::warm(executable, workspace)
 }
 
@@ -59,6 +62,13 @@ pub(crate) fn warm(executable: &Path, workspace: &Path) -> WarmupOutcome {
 /// 同一个工作区在预热途中被再次请求时直接返回：厂商模块按路径加了跨进程锁，
 /// 排队两次没有意义，只会多起一个 node 进程。
 pub(crate) fn spawn(executable: &Path, workspace: &Path) {
+    if let Some(reason) = protected_workspace_reason(executable, workspace) {
+        crate::approval::manager::append_event_log(
+            "info",
+            &format!("沙箱写权限预热跳过 {}：{reason}", workspace.display()),
+        );
+        return;
+    }
     let Some(key) = claim(workspace) else {
         return;
     };
@@ -98,6 +108,16 @@ pub(crate) fn spawn_batch(executable: &Path, workspaces: Vec<std::path::PathBuf>
             let started = std::time::Instant::now();
             let mut warmed = 0usize;
             for workspace in workspaces {
+                // A historical workspace binding can point at the Agent's own
+                // data/runtime directory. Do not let a protected path make us
+                // stop before warming the remaining real workspaces.
+                if let Some(reason) = protected_workspace_reason(&executable, &workspace) {
+                    crate::approval::manager::append_event_log(
+                        "info",
+                        &format!("沙箱写权限预热跳过 {}：{reason}", workspace.display()),
+                    );
+                    continue;
+                }
                 let Some(key) = claim(&workspace) else {
                     continue;
                 };
@@ -138,6 +158,62 @@ fn release(key: &str) {
     if let Ok(mut in_flight) = in_flight().lock() {
         in_flight.remove(key);
     }
+}
+
+/// Paths owned by the Agent are storage/runtime inputs, never user workspaces.
+///
+/// The ACL warmup grants a persistent write ACE recursively. Applying it to
+/// `agent_home()` or WebView2 data changes the integrity label of the whole
+/// install/profile. A previous recent-workspace record did exactly that and
+/// left WebView2 and SQLite sidecar files unusable for a normal launch. Keep
+/// this guard in the warmup layer as a final defence even when callers already
+/// filter their workspace lists.
+fn protected_workspace_reason(executable: &Path, workspace: &Path) -> Option<String> {
+    let candidate = path_key(workspace);
+    protected_roots(executable).into_iter().find_map(|root| {
+        let root = path_key(&root);
+        if candidate == root || candidate.starts_with(&(root.clone() + "\\")) {
+            Some(format!("Agent 管理目录（{}）禁止 ACL 预热", root))
+        } else {
+            None
+        }
+    })
+}
+
+fn protected_roots(executable: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![crate::store::paths::agent_home()];
+
+    // Production WebView2 data lives beside (rather than under) agent_home.
+    // Protect both the selected instance and its stable parent so an old
+    // `--local-port` cannot escape the guard.
+    let webview = crate::store::paths::webview_user_data_dir(18181);
+    let webview_root = if webview
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("instance-"))
+    {
+        webview.parent().unwrap_or(&webview).to_path_buf()
+    } else {
+        webview
+    };
+    roots.push(webview_root);
+
+    // A custom runtime may be supplied outside the normal profile root. Its
+    // version directory is still Agent-managed and must never be a workspace.
+    if let Some(version_root) = executable.parent().and_then(Path::parent) {
+        roots.push(version_root.to_path_buf());
+    }
+    roots
+}
+
+fn path_key(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let value = canonical.to_string_lossy().replace('/', "\\");
+    let value = value
+        .strip_prefix(r"\\?\")
+        .or_else(|| value.strip_prefix(r"\\.\"))
+        .unwrap_or(&value);
+    value.trim_end_matches('\\').to_ascii_lowercase()
 }
 
 /// 去重键：同一个工作区可能以两种写法到达——工作区绑定里存的是规范前缀形式
@@ -342,6 +418,29 @@ mod tests {
         release(&first);
         assert!(claim(&workspace).is_some());
         release(&workspace.to_string_lossy().to_ascii_lowercase());
+    }
+
+    #[test]
+    fn agent_managed_paths_are_never_acl_warmed() {
+        let executable = std::env::temp_dir()
+            .join("himind-runtime")
+            .join("bin")
+            .join("dsh.cmd");
+        let agent_home = crate::store::paths::agent_home();
+        assert!(protected_workspace_reason(&executable, &agent_home).is_some());
+        assert!(protected_workspace_reason(&executable, &agent_home.join("data")).is_some());
+
+        let webview = crate::store::paths::webview_user_data_dir(18181);
+        assert!(protected_workspace_reason(&executable, &webview).is_some());
+    }
+
+    #[test]
+    fn unrelated_workspace_remains_eligible_for_warmup() {
+        let root = temp_root("user-workspace");
+        let executable = root.join("runtime").join("bin").join("dsh.cmd");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        assert!(protected_workspace_reason(&executable, &root).is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     /// 同一个工作区的两种写法必须归一到同一把键：真实日志里工作区绑定给的是

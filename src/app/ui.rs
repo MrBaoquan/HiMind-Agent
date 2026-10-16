@@ -3,7 +3,10 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -49,6 +52,18 @@ static BUILTIN_AI_SESSIONS: OnceLock<Mutex<HashMap<String, BuiltinAiSession>>> =
 /// 正在启动的工作区集合，避免同一个目录被并发启动两次。
 static BUILTIN_AI_STARTING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
+/// WebView2 页面加载阶段。静态配置窗口由 Tauri 在 setup 之前创建，创建失败时
+/// 旧版本只有一个永远存在的 `WebviewWindow` 句柄，既没有错误也没有页面事件。
+/// 显式创建主窗口后用这个状态驱动启动看门狗，才能把「窗口对象存在」和「页面
+/// 真的开始渲染」区分开，并在没有页面事件时切换到隔离的数据目录重试。
+static MAIN_PAGE_STATE: OnceLock<Arc<AtomicU8>> = OnceLock::new();
+
+/// TrayIcon 本身是 Tauri resource，但显式持有一个 clone 可以避免资源生命周期
+/// 依赖局部变量和运行时 resource table 的实现细节；同时让诊断能够记录“托盘已
+/// 创建”这个启动阶段事实。
+static TRAY_ICON_HANDLE: OnceLock<Mutex<Option<tauri::tray::TrayIcon<tauri::Wry>>>> =
+    OnceLock::new();
+
 fn builtin_ai_sessions() -> &'static Mutex<HashMap<String, BuiltinAiSession>> {
     BUILTIN_AI_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -81,11 +96,19 @@ pub(crate) fn current_builtin_ai_notice(workspace: Option<&Path>) -> Option<Stri
 
 pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let port = options.local_port;
+    // Repair legacy Low-integrity data before Tauri asks WebView2 to open its
+    // profile. The repair is targeted and best-effort; a user must still get
+    // the normal local service and an actionable diagnostics log if it fails.
+    for message in crate::app::diagnostics::repair_startup_storage(port) {
+        crate::app::crash::record_event("warn", &message);
+    }
     // WebView2 的用户数据目录是进程级独占的：开发实例（或并行实例）跟正在
     // 运行的生产实例共用一个目录时，后启动的进程会静默建不出主窗口，只剩
     // 托盘图标。必须在 Tauri 创建任何 WebView 之前把目录按 profile 定下来。
     let webview_data_dir = crate::store::paths::apply_webview_user_data_dir(port);
     println!("webview user data dir: {}", webview_data_dir.display());
+    let main_page_state = Arc::new(AtomicU8::new(0));
+    let _ = MAIN_PAGE_STATE.set(Arc::clone(&main_page_state));
     // Record the launch context before anything can fail to build. A blank or
     // missing main window has no other trace - WebView2 creation failure is
     // silent on Windows - so this line is what lets a support case tell "never
@@ -213,6 +236,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             } else if let Some(target) = crate::parse_protocol_open(&args) {
                 open_agent_open_target(app, target);
             } else if !args.iter().any(|argument| argument == "--protocol-url") {
+                crate::app::crash::record_event("info", "单实例唤起请求：显示主窗口");
                 show_main_window(app);
             }
         }))
@@ -225,6 +249,18 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         // separates "the page never began loading" (WebView creation failed)
         // from "it began and never finished" (asset resolution failed).
         .on_page_load(|webview, payload| {
+            let event_name = format!("{:?}", payload.event());
+            if webview.label() == "main" {
+                if event_name == "Started" {
+                    if let Some(state) = MAIN_PAGE_STATE.get() {
+                        state.store(1, Ordering::Release);
+                    }
+                } else if event_name == "Finished" {
+                    if let Some(state) = MAIN_PAGE_STATE.get() {
+                        state.store(2, Ordering::Release);
+                    }
+                }
+            }
             crate::app::crash::record_event(
                 "info",
                 &format!(
@@ -577,6 +613,61 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::invoke_plugin_view_capability,
         ])
         .setup(move |app| {
+            crate::app::crash::record_event(
+                "info",
+                &format!(
+                    "主窗口创建开始：data_directory={}",
+                    webview_data_dir.display()
+                ),
+            );
+            let main_window = match create_main_window(app.handle(), &webview_data_dir) {
+                Ok(window) => {
+                    crate::app::crash::record_event("info", "主窗口对象创建成功");
+                    window
+                }
+                Err(primary_error) => {
+                    crate::app::crash::record_event(
+                        "error",
+                        &format!("主窗口首次创建失败：{primary_error}"),
+                    );
+                    // Tauri can leave a partially-created label behind when
+                    // WebView2 creation fails. Wait for the asynchronous
+                    // destroy to finish before retrying; otherwise the retry
+                    // reports the misleading "label main already exists".
+                    if !destroy_main_window_and_wait(app.handle(), None) {
+                        crate::app::crash::record_event(
+                            "error",
+                            "主窗口首次创建失败后，旧窗口标签在重试前未释放",
+                        );
+                    }
+                    let recovery_dir = fresh_webview_recovery_dir();
+                    match create_main_window(app.handle(), &recovery_dir) {
+                        Ok(window) => {
+                            crate::app::crash::record_event(
+                                "warn",
+                                &format!(
+                                    "主窗口已使用隔离 WebView2 数据目录恢复：{}",
+                                    recovery_dir.display()
+                                ),
+                            );
+                            window
+                        }
+                        Err(recovery_error) => {
+                            let message = format!(
+                                "主窗口创建失败（默认目录：{primary_error}；隔离目录：{recovery_error}）"
+                            );
+                            crate::app::crash::record_event("error", &message);
+                            crate::app::crash::show_startup_notice(
+                                "HiMind Agent 无法打开窗口",
+                                &format!(
+                                    "{message}\n\n请运行 diagnostics export，将诊断包发送给支持人员。"
+                                ),
+                            );
+                            return Err(message.into());
+                        }
+                    }
+                }
+            };
             super::service::start_background_services(
                 &service_options,
                 service_worker_status,
@@ -620,13 +711,12 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             start_extension_storage_hygiene();
             start_mcp_catalog_refresh(app.state::<AgentState>().state_path.clone());
             fit_main_window_to_monitor(app);
-            if app.get_webview_window("main").is_none() {
-                let message =
-                    "主窗口创建失败。通常是 WebView2 未安装、用户数据目录被占用，或安全软件拦截了界面资源。";
-                crate::app::crash::record_event("error", message);
-                crate::app::crash::show_startup_notice("HiMind Agent 无法打开窗口", message);
-                return Err(message.into());
-            }
+            start_main_window_watchdog(
+                app.handle().clone(),
+                main_window,
+                Arc::clone(&main_page_state),
+                service_options.show_window(),
+            );
             if service_options.show_window() {
                 show_main_window(app.handle());
             }
@@ -648,6 +738,150 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     run_result?;
 
     Ok(())
+}
+
+/// Create the main window explicitly instead of relying on Tauri's static
+/// window bootstrap. Static windows are constructed before `setup`, which
+/// prevents the Agent from recording the WebView2 error or retrying with a
+/// clean profile when the existing profile is locked/corrupt.
+fn create_main_window(
+    app: &tauri::AppHandle,
+    data_directory: &Path,
+) -> Result<tauri::WebviewWindow<tauri::Wry>, tauri::Error> {
+    if let Some(parent) = data_directory.parent() {
+        std::fs::create_dir_all(parent).map_err(tauri::Error::from)?;
+    }
+    std::fs::create_dir_all(data_directory).map_err(tauri::Error::from)?;
+    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("HiMind Agent")
+        .inner_size(1280.0, 820.0)
+        .min_inner_size(1024.0, 680.0)
+        .visible(false)
+        .decorations(false)
+        .resizable(true)
+        .center()
+        .data_directory(data_directory.to_path_buf())
+        .build()
+}
+
+/// A failed WebView2 environment must not poison every future launch. Keep
+/// the user's original profile untouched and use a new directory for the
+/// recovery attempt; the normal profile will be reused on the next launch if
+/// the runtime has repaired itself.
+fn fresh_webview_recovery_dir() -> PathBuf {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = crate::store::paths::agent_home()
+        .join("webview-recovery")
+        .join(format!("{}-{}", now, std::process::id()));
+    let _ = std::fs::create_dir_all(&path);
+    path
+}
+
+/// If the WebView object exists but never emits a page event, the process used
+/// to stay alive with a port and no window. After a short grace period destroy
+/// that object and retry once in an isolated profile. Every branch is recorded
+/// in `agent-events.jsonl`, so support can distinguish a slow page from a
+/// WebView2 environment failure.
+fn start_main_window_watchdog(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow<tauri::Wry>,
+    page_state: Arc<AtomicU8>,
+    show_on_recovery: bool,
+) {
+    thread::Builder::new()
+        .name("himind-main-window-watchdog".to_string())
+        .spawn(move || {
+            thread::sleep(Duration::from_secs(15));
+            let state = page_state.load(Ordering::Acquire);
+            if state >= 2 {
+                crate::app::crash::record_event("info", "主窗口页面在启动看门狗期限内完成加载");
+                return;
+            }
+
+            let stage = if state == 1 {
+                "页面已开始但在 15 秒内未完成"
+            } else {
+                "15 秒内未收到页面 Started 事件"
+            };
+            crate::app::crash::record_event("error", &format!("主窗口 WebView2 异常：{stage}"));
+
+            // A page that is still loading may simply be slow on a cold
+            // machine. Give it another short interval before replacing it;
+            // this also avoids destroying a window while its first event is
+            // queued behind the Windows message pump.
+            thread::sleep(Duration::from_secs(10));
+            let state = page_state.load(Ordering::Acquire);
+            if state >= 2 {
+                crate::app::crash::record_event("info", "主窗口页面延迟完成加载");
+                return;
+            }
+
+            if !destroy_main_window_and_wait(&app, Some(&window)) {
+                let message =
+                    "主窗口 WebView2 异常，但旧窗口标签未释放，已停止重复重试。";
+                crate::app::crash::record_event("error", message);
+                crate::app::crash::show_startup_notice(
+                    "HiMind Agent 无法打开窗口",
+                    &format!(
+                        "{message}\n\n请运行 diagnostics export，将诊断包发送给支持人员。"
+                    ),
+                );
+                return;
+            }
+            let recovery_dir = fresh_webview_recovery_dir();
+            match create_main_window(&app, &recovery_dir) {
+                Ok(recovery_window) => {
+                    page_state.store(0, Ordering::Release);
+                    crate::app::crash::record_event(
+                        "warn",
+                        &format!(
+                            "主窗口已销毁并切换到隔离 WebView2 数据目录：{}",
+                            recovery_dir.display()
+                        ),
+                    );
+                    if show_on_recovery {
+                        let _ = recovery_window.show();
+                        let _ = recovery_window.set_focus();
+                    }
+                }
+                Err(error) => {
+                    crate::app::crash::record_event(
+                        "error",
+                        &format!("隔离 WebView2 数据目录重试失败：{error}"),
+                    );
+                    crate::app::crash::show_startup_notice(
+                        "HiMind Agent 无法打开窗口",
+                        "WebView2 页面在默认目录和隔离目录中都没有启动。请运行 diagnostics export，将诊断包发送给支持人员。",
+                    );
+                }
+            }
+        })
+        .ok();
+}
+
+/// Tauri's `destroy` schedules native window teardown. A same-label build in
+/// the next statement can therefore race the teardown and fail with
+/// `a webview with label main already exists`. Poll the app's resource table
+/// for a bounded period before attempting a recovery window.
+fn destroy_main_window_and_wait(
+    app: &tauri::AppHandle,
+    window: Option<&tauri::WebviewWindow<tauri::Wry>>,
+) -> bool {
+    if let Some(window) = window {
+        let _ = window.destroy();
+    } else if let Some(window) = app.get_webview_window("main") {
+        let _ = window.destroy();
+    }
+    for _ in 0..40 {
+        if app.get_webview_window("main").is_none() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    app.get_webview_window("main").is_none()
 }
 
 /// 启动后台把客户端技能目录扫一遍：清掉旧版 `<id>/current` 布局与渲染中断
@@ -787,7 +1021,7 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
     start_update_tray_watcher(handle.clone(), install_update_item.clone());
     start_approval_tray_watcher(handle.clone(), approval_item.clone());
 
-    let _tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
         .tooltip(format!("HiMind Agent · {mode_label}"))
@@ -850,6 +1084,16 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
             }
         })
         .build(handle)?;
+
+    TRAY_ICON_HANDLE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| "托盘句柄状态锁已损坏")?
+        .replace(tray.clone());
+    crate::app::crash::record_event(
+        "info",
+        &format!("托盘图标创建成功：mode={mode_label} port={port}"),
+    );
 
     Ok(())
 }

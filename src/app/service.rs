@@ -129,6 +129,13 @@ pub(crate) fn start_background_services(
     approval_mgr: Option<Arc<ApprovalManager>>,
     capability_gateway: CapabilityGateway,
 ) -> Result<(), Box<dyn Error>> {
+    // Older builds could accidentally mark the Agent data root Low integrity
+    // while warming a recent workspace. Repair only the small set of startup
+    // storage paths before SQLite/WebView2 workers open them; failure is
+    // diagnostic-only and must never prevent the local service from starting.
+    for message in crate::app::diagnostics::repair_startup_storage(options.local_port) {
+        crate::app::crash::record_event("warn", &message);
+    }
     let workflow_approval_manager = approval_mgr.clone().unwrap_or_else(ApprovalManager::global);
     crate::app::workflow_approval::start_workflow_approval_bridge(
         capability_gateway.clone(),

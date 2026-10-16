@@ -50,6 +50,10 @@ foreach ($Name in @("himind-agent.exe", "himind-agent-launcher.exe", "himind-age
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Built binary is missing: $Source" }
     Copy-Item -LiteralPath $Source -Destination (Join-Path $ReleaseDirectory $Name)
 }
+$RepairScript = Join-Path $PSScriptRoot "repair-storage.ps1"
+if (Test-Path -LiteralPath $RepairScript -PathType Leaf) {
+    Copy-Item -LiteralPath $RepairScript -Destination (Join-Path $ReleaseDirectory "repair-storage.ps1")
+}
 
 $Thumbprint = if ($WindowsCodeSigningCertificateThumbprint) {
     $WindowsCodeSigningCertificateThumbprint

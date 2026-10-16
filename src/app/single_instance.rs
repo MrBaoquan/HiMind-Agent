@@ -112,6 +112,10 @@ mod platform {
                     unsafe { CreateMutexW(std::ptr::null(), true.into(), mutex_name.as_ptr()) };
 
                 if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                    crate::app::crash::record_event(
+                        "info",
+                        &format!("收到第二次启动请求：scope={scope}"),
+                    );
                     unsafe {
                         let hwnd = FindWindowW(class_name.as_ptr(), window_name.as_ptr());
 
@@ -140,9 +144,18 @@ mod platform {
 
                             SendMessageW(hwnd, WM_COPYDATA, 0, &cds as *const _ as _);
 
+                            crate::app::crash::record_event(
+                                "info",
+                                "第二次启动参数已转发到现有 Agent 实例",
+                            );
+
                             app.cleanup_before_exit();
                             std::process::exit(0);
                         }
+                        crate::app::crash::record_event(
+                            "warn",
+                            "第二次启动请求未找到现有 Agent 的事件窗口，将继续当前实例初始化",
+                        );
                     }
                 } else {
                     app.manage(MutexHandle(hmutex as _));
@@ -154,6 +167,10 @@ mod platform {
                     let userdata = Box::into_raw(Box::new(userdata));
                     let hwnd = create_event_target_window::<R>(&class_name, &window_name, userdata);
                     app.manage(TargetWindowHandle(hwnd as _));
+                    crate::app::crash::record_event(
+                        "info",
+                        &format!("单实例事件窗口已注册：scope={scope}"),
+                    );
                 }
 
                 Ok(())

@@ -20,7 +20,7 @@
 
 ### 4. 启动错误以前容易丢失
 
-安装版 Agent 是 Windows GUI 子系统，标准错误输出对双击用户不可见。现在 launcher 自身启动失败会弹窗；Agent UI 启动失败会记录错误并弹窗。诊断命令和诊断包不依赖 WebView，可以在白屏或无窗口时使用。
+安装版 Agent 是 Windows GUI 子系统，标准错误输出对双击用户不可见。现在 launcher 自身启动失败会弹窗；Agent UI 启动失败会记录错误并弹窗。诊断命令和诊断包不依赖 WebView，可以在白屏或无窗口时使用。主窗口由 setup 阶段显式创建，默认 WebView2 数据目录失败时会保留原目录并用隔离目录重试；若窗口对象创建成功但 15 秒内没有页面事件，启动看门狗会再次隔离重试。
 
 ## 用户排查步骤
 
@@ -28,15 +28,15 @@
 
 ```powershell
 $root = "$env:LOCALAPPDATA\HiMindAgent"
-& "$root\himind-agent-launcher.exe" diagnostics check
+& "$root\himind-agent-launcher.exe" --state "$root\data\agent-state.json" diagnostics check
 ```
 
-该命令输出 JSON 并使用退出码：`0` 表示检查通过，`2` 表示存在警告，`1` 表示安装布局或关键依赖失败。检查内容包括：版本目录和 `active-version`、launcher/updater、ICO 格式、WebView2 用户数据目录可写性、内置 Runtime 状态和桌面快捷方式。
+该命令输出 JSON 并使用退出码：`0` 表示检查通过，`2` 表示存在警告，`1` 表示安装布局或关键依赖失败。`--state` 必须放在 `diagnostics` 子命令之前。检查内容包括：版本目录和 `active-version`、launcher/updater、ICO 格式、WebView2 用户数据目录可写性和锁文件、最近启动是否出现页面 `Started/Finished` 事件、内置 Runtime 状态和桌面快捷方式。
 
 导出支持包：
 
 ```powershell
-& "$root\himind-agent-launcher.exe" diagnostics export
+& "$root\himind-agent-launcher.exe" --state "$root\data\agent-state.json" diagnostics export
 ```
 
 默认输出到 `%LOCALAPPDATA%\HiMindAgent\diagnostics\`。支持包包含 `diagnostics.json`、界面启动记录、Runtime 安装日志、更新日志、SVN 日志和崩溃转储，不包含密码、Agent credential 或 OAuth token。
@@ -46,7 +46,10 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | 现象 | 优先检查 | 处理 |
 | --- | --- | --- |
 | 白色/通用图标 | `diagnostics check` 的 `icon_format` | 重新安装同一版本；若仍失败，收集诊断包和安装器 SHA-256 |
-| 托盘图标存在但没有窗口 | `agent-events.jsonl` 是否有“主窗口不存在”或 WebView2 目录错误 | 退出所有 HiMind Agent 进程后重试；确认 `%LOCALAPPDATA%\com.himind.agent` 可写 |
+| 进程和本地端口存在但没有窗口/托盘 | `startup_page_event`、`webview_data_lock` 和 `agent-events.jsonl` | 先运行 `diagnostics export`；退出所有 HiMind Agent 进程后重试，让新版本的隔离目录自愈；不要在 SSH Session 0 中启动 GUI |
+| 日志反复出现 `attempt to write a readonly database` | `storage_integrity`、`local-runs.sqlite3-wal` 和 `local-runs.sqlite3-shm` | 退出 Agent 后运行安装目录中的 `repair-storage.ps1`；它只修复 Agent 数据、SQLite sidecar 和 WebView2 目录的完整性级别，不删除数据库 |
+| `agent protocol registration repair failed: Access denied` | `protocol_registration` 与启动日志中的 `source=launcher` | 以当前用户运行 `diagnostics check`；确认协议注册指向当前安装，若完整性为 Low，先运行 `repair-storage.ps1` 后重新双击 |
+| 第二次双击没有把窗口带到前台 | `agent-events.jsonl` 中的“第二次启动参数已转发” | 如果没有该记录，检查 launcher/单实例事件窗口；如果有记录但页面事件仍为空，按 WebView2 数据目录问题处理 |
 | 双击完全无反应 | `launcher` 检查和安装目录是否存在 | 从 PowerShell 运行 launcher，读取弹窗原因；检查安全软件/AppLocker 拦截记录 |
 | 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
 | 窗口打开后白屏 | `agent-events.jsonl` 的 `界面页面加载` 记录 | 有 Started 无 Finished 通常是资源/WebView 加载问题；没有 Started 通常是 WebView 创建失败 |

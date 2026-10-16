@@ -154,6 +154,7 @@ Section "HiMind Agent 核心组件" SEC_AGENT
   SetOutPath "$INSTDIR"
   File "${RELEASE}\himind-agent-launcher.exe"
   File "${RELEASE}\himind-agent-updater.exe"
+  File "${RELEASE}\repair-storage.ps1"
   File /oname=himind-agent.ico "${ASSET_DIR}\himind-agent.ico"
   !ifdef TRUSTED_PUBLIC_KEY
     !ifndef SIGNING_KEY_ID
