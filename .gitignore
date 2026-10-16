@@ -9,6 +9,9 @@
 /artifacts/
 /releases/
 /artifacts-github/
+# 发布暂存目录按版本命名（artifacts-github-v0.3.67 等），发完就不再需要，
+# 留在工作树里会把子模块判成脏，进而挡住父仓「工作区必须干净」的发布前置。
+/artifacts-github-*/
 /.env
 /.env.*
 !/.env.example
