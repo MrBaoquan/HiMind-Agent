@@ -48,8 +48,20 @@ $Arguments = @("sign", "/fd", "SHA256", "/sha1", $Thumbprint)
 if ($MachineStore) { $Arguments += "/sm" }
 if (-not $SkipTimestamp) { $Arguments += @("/tr", $TimestampUri.AbsoluteUri, "/td", "SHA256") }
 $Arguments += $Artifact
-& $SignToolPath @Arguments
-if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed: $Artifact" }
+# Signing is the one release step that depends on a remote timestamp authority and
+# on nothing holding the freshly written binary. Both fail intermittently: a
+# 0.3.72 run aborted on `SignerSign() failed (0x80093102)` for the launcher, and
+# the identical command a minute later succeeded. Retry before failing a release.
+$Signed = $false
+foreach ($Attempt in 1..3) {
+    & $SignToolPath @Arguments
+    if ($LASTEXITCODE -eq 0) { $Signed = $true; break }
+    if ($Attempt -lt 3) {
+        Write-Warning "signtool attempt $Attempt failed (exit $LASTEXITCODE); retrying: $Artifact"
+        Start-Sleep -Seconds 5
+    }
+}
+if (-not $Signed) { throw "Authenticode signing failed: $Artifact" }
 
 $Signature = Get-AuthenticodeSignature -LiteralPath $Artifact
 if (-not $Signature.SignerCertificate) {
