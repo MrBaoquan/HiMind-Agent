@@ -3364,14 +3364,11 @@ fn validate_catalog_signature(
     )
     .map_err(|error| format!("扩展源条目 {kind} {id}@{version} 的签名元数据不完整：{error}"))?;
     if !signature.is_empty() {
-        crate::app::system::trusted_signing_public_key(key_id).map_err(|error| {
-            format!(
-                "扩展源条目 {kind} {id}@{version} 使用了本机不信任的签名公钥：{error}；\
-                 该条目用 key ID `{key_id}` 签名，请把 `{key_id}.pem` 放进受信公钥目录（{}），\
-                 或让发布方改用已受信的 key ID 重新签名。",
-                crate::app::system::trusted_signing_keys_directory_hint()
-            )
-        })?;
+        // 底层错误已经说清「哪个 key ID 不受信、公钥放哪里」，这里只补上
+        // 「是哪一条条目」——一条坏条目会让整个来源不可用，没有条目身份的
+        // 报错让人无处下手。
+        crate::app::system::trusted_signing_public_key(key_id)
+            .map_err(|error| format!("扩展源条目 {kind} {id}@{version} 无法验签：{error}"))?;
     }
     Ok(())
 }
