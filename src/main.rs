@@ -914,8 +914,7 @@ fn run_market_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
                 let _ = next(1)?;
                 index += 2;
             }
-            "--once" | "--local-app" | "--show" | "--hidden" | "--background"
-            | "--reenroll" => {
+            "--once" | "--local-app" | "--show" | "--hidden" | "--background" | "--reenroll" => {
                 index += 1;
             }
             other => {
@@ -3527,8 +3526,8 @@ fn parse_plugin_view_launch(args: &[String]) -> Option<PluginViewLaunch> {
 mod tests {
     use super::{
         cli_subcommand, default_local_port, parse_plugin_view_launch, parse_protocol_open,
-        should_run_acp, should_run_mcp, window_hidden_requested, workflow_dispatch_limit, AgentOpenTarget,
-        PluginViewLaunch, SHIPPED_DASHBOARD_API_BASE,
+        should_run_acp, should_run_mcp, window_hidden_requested, workflow_dispatch_limit,
+        AgentOpenTarget, PluginViewLaunch, SHIPPED_DASHBOARD_API_BASE,
     };
     use crate::api::types::Task;
     use serde_json::json;

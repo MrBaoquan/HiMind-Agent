@@ -142,9 +142,7 @@ struct ImageRequest {
 
 impl ImageRequest {
     fn parse(input: &Value) -> Result<Self, Box<dyn Error>> {
-        let object = input
-            .as_object()
-            .ok_or("生图参数必须是 JSON 对象")?;
+        let object = input.as_object().ok_or("生图参数必须是 JSON 对象")?;
         let prompt = input
             .get("prompt")
             .and_then(Value::as_str)
@@ -342,11 +340,9 @@ fn materialize_outputs(
             }
         };
         if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(format!(
-                "生成图片超过 {} MiB 上限",
-                MAX_IMAGE_BYTES / (1024 * 1024)
-            )
-            .into());
+            return Err(
+                format!("生成图片超过 {} MiB 上限", MAX_IMAGE_BYTES / (1024 * 1024)).into(),
+            );
         }
         let mime = sniff_mime(&bytes);
         let path = output_dir.join(output_file_name(
@@ -359,19 +355,20 @@ fn materialize_outputs(
         let (width, height) = image_dimensions(&bytes);
         let sha256 = hex_sha256(&bytes);
         let path_text = path.to_string_lossy().to_string();
-        let record = crate::store::media_registry::register(crate::store::media_registry::NewMedia {
-            path: &path_text,
-            kind: "image",
-            mime_type: mime,
-            size_bytes: bytes.len() as u64,
-            sha256: &sha256,
-            width: width.unwrap_or_default(),
-            height: height.unwrap_or_default(),
-            duration_seconds: 0.0,
-            capability,
-            service_id,
-            prompt: &request.prompt,
-        })?;
+        let record =
+            crate::store::media_registry::register(crate::store::media_registry::NewMedia {
+                path: &path_text,
+                kind: "image",
+                mime_type: mime,
+                size_bytes: bytes.len() as u64,
+                sha256: &sha256,
+                width: width.unwrap_or_default(),
+                height: height.unwrap_or_default(),
+                duration_seconds: 0.0,
+                capability,
+                service_id,
+                prompt: &request.prompt,
+            })?;
         if request.inline && bytes.len() <= MAX_INLINE_BYTES {
             inline_blocks.push(json!({
                 "type": "image",
@@ -556,7 +553,9 @@ fn call_edit_api(
             let status = response.status();
             let payload = read_json(response)?;
             if !status.is_success() {
-                return Err(format!("图生图接口返回 {status}：{}", describe_error(&payload)).into());
+                return Err(
+                    format!("图生图接口返回 {status}：{}", describe_error(&payload)).into(),
+                );
             }
             materialize_outputs(
                 &client,
@@ -606,7 +605,9 @@ fn call_edit_api(
                 body_value = retry.1;
             }
             if !status.is_success() {
-                return Err(format!("图生图接口返回 {status}：{}", describe_error(&body_value)).into());
+                return Err(
+                    format!("图生图接口返回 {status}：{}", describe_error(&body_value)).into(),
+                );
             }
             materialize_outputs(
                 &client,
@@ -907,7 +908,10 @@ fn is_blocked_output_dir(path: &Path) -> bool {
     if path.parent().is_none() {
         return true;
     }
-    let normalized = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
     let trimmed = normalized.trim_end_matches('\\');
     trimmed.ends_with(":\\")
         || trimmed.contains("\\windows")
@@ -919,8 +923,8 @@ fn is_blocked_output_dir(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     /// 1x1 PNG，用于在测试里冒充 provider 返回的 `b64_json`。
@@ -1028,7 +1032,10 @@ mod tests {
         assert_eq!(file["height"], 1);
         let path = PathBuf::from(file["path"].as_str().unwrap());
         assert!(path.is_file());
-        assert_eq!(fs::read(&path).unwrap(), decode_base64(TINY_PNG_B64).unwrap());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            decode_base64(TINY_PNG_B64).unwrap()
+        );
         assert_eq!(result["content"][1]["type"], "image");
         let _ = fs::remove_dir_all(&output_dir);
     }
@@ -1064,11 +1071,11 @@ mod tests {
             normalize_image_adapter("OpenAI-Images").unwrap(),
             ADAPTER_OPENAI_IMAGES
         );
-        assert_eq!(normalize_image_adapter("doubao").unwrap(), ADAPTER_ARK_IMAGES);
         assert_eq!(
-            normalize_image_adapter("ark").unwrap(),
+            normalize_image_adapter("doubao").unwrap(),
             ADAPTER_ARK_IMAGES
         );
+        assert_eq!(normalize_image_adapter("ark").unwrap(), ADAPTER_ARK_IMAGES);
         assert!(normalize_image_adapter("midjourney").is_err());
     }
 
@@ -1097,11 +1104,10 @@ mod tests {
         let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
         std::env::set_var("HIMIND_AGENT_HOME", &home);
         let output_dir = temp_dir("ark");
-        let request =
-            ImageRequest::parse(
-                &json!({ "prompt": "一只猫", "inline": false, "parameters": { "watermark": true } }),
-            )
-                .unwrap();
+        let request = ImageRequest::parse(
+            &json!({ "prompt": "一只猫", "inline": false, "parameters": { "watermark": true } }),
+        )
+        .unwrap();
         let result = call_generate_api(
             &format!("http://{address}"),
             ADAPTER_ARK_IMAGES,
@@ -1209,7 +1215,11 @@ mod tests {
                     return;
                 };
                 drain_request(&mut stream);
-                let status = if index == 0 { "400 Bad Request" } else { "200 OK" };
+                let status = if index == 0 {
+                    "400 Bad Request"
+                } else {
+                    "200 OK"
+                };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),

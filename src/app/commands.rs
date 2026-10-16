@@ -1801,8 +1801,8 @@ fn present_builtin_ai_start_headline(error: &str) -> (&'static str, bool) {
     // 下面几条是 start_builtin_ai_session 自己拼出来的结论，必须排在
     // 「dsh / workspace / session」兜底之前：否则诊断输出里出现这些词，
     // 真实的启动失败会被误判成工作区目录问题。
-    let process_never_started = normalized.contains("无法启动 himind ai")
-        || normalized.contains("没有返回启动输出");
+    let process_never_started =
+        normalized.contains("无法启动 himind ai") || normalized.contains("没有返回启动输出");
     if process_never_started {
         return ("HiMind AI 进程没有启动", true);
     }
@@ -2612,7 +2612,9 @@ pub(crate) async fn restart_inference_gateway(
     tauri::async_runtime::spawn_blocking(move || {
         let resolver_options = options.clone();
         crate::app::inference_gateway::restart(
-            Some(crate::app::inference_gateway::configured_port(&options.state_path)),
+            Some(crate::app::inference_gateway::configured_port(
+                &options.state_path,
+            )),
             Box::new(move || crate::app::ai_provider_import::gateway_bindings(&resolver_options)),
         )
         .map_err(|error| error.to_string())?;
@@ -2690,7 +2692,9 @@ pub(crate) async fn set_inference_gateway_port(
         crate::app::inference_gateway::set_configured_port(&options.state_path, port)?;
         let resolver_options = options.clone();
         crate::app::inference_gateway::restart(
-            Some(crate::app::inference_gateway::configured_port(&options.state_path)),
+            Some(crate::app::inference_gateway::configured_port(
+                &options.state_path,
+            )),
             Box::new(move || crate::app::ai_provider_import::gateway_bindings(&resolver_options)),
         )?;
         Ok(inference_gateway_status_value(&options))
@@ -2909,8 +2913,7 @@ pub(crate) fn save_ai_service(
     protocol: String,
     model: String,
     models: Vec<String>,
-    #[allow(clippy::too_many_arguments)]
-    image_model: Option<String>,
+    #[allow(clippy::too_many_arguments)] image_model: Option<String>,
     image_adapter: Option<String>,
     image_edit_model: Option<String>,
     image_edit_adapter: Option<String>,
@@ -3047,9 +3050,10 @@ pub(crate) fn set_image_ai_service(
             ),
         );
     } else {
-        state
-            .approval_manager
-            .add_log("info", &format!("已清除 {capability} 的默认服务，恢复自动选择"));
+        state.approval_manager.add_log(
+            "info",
+            &format!("已清除 {capability} 的默认服务，恢复自动选择"),
+        );
     }
     Ok(json!({
         "capability": capability,

@@ -421,7 +421,10 @@ mod tests {
             agent_server_id_for("development"),
             "himind-agent-development"
         );
-        assert_eq!(agent_server_id_for("ecs-staging"), "himind-agent-ecs-staging");
+        assert_eq!(
+            agent_server_id_for("ecs-staging"),
+            "himind-agent-ecs-staging"
+        );
         assert_ne!(agent_server_id_for("development"), AGENT_SERVER_ID);
     }
 

@@ -1661,12 +1661,12 @@ fn import_codex(
         Some(build_codex_models_json(&catalog_models)?)
     };
     // 写了目录就整体替换，默认模型必须落在目录内。
-    let default_model = if catalog.is_none() || catalog_models.iter().any(|model| model == &preferred)
-    {
-        preferred.clone()
-    } else {
-        catalog_models[0].clone()
-    };
+    let default_model =
+        if catalog.is_none() || catalog_models.iter().any(|model| model == &preferred) {
+            preferred.clone()
+        } else {
+            catalog_models[0].clone()
+        };
     let config_file = config_path.join("config.toml");
     let original_config = if config_file.is_file() {
         fs::read_to_string(&config_file)?
@@ -2542,7 +2542,9 @@ fn read_kimi_code_himind_models(path: &Path) -> Result<Vec<String>, Box<dyn Erro
     Ok(result)
 }
 
-fn cancel_kimi_code(restore: Option<&Value>) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+fn cancel_kimi_code(
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let path = kimi_code_config_path();
     let client_detected = path.is_file();
     let original = if path.is_file() {
@@ -2550,7 +2552,9 @@ fn cancel_kimi_code(restore: Option<&Value>) -> Result<AIProviderImportCancelRes
     } else {
         String::new()
     };
-    let previous = restore.and_then(|value| value.get("settings")).and_then(Value::as_str);
+    let previous = restore
+        .and_then(|value| value.get("settings"))
+        .and_then(Value::as_str);
     let (updated, removed) = strip_kimi_code_himind(&original, previous)?;
     let backup = if removed {
         backup_and_write(&path, updated.as_bytes())?
@@ -2829,7 +2833,9 @@ fn kimi_code_owned_snapshot() -> Option<Value> {
     settings_file_snapshot(&kimi_code_config_path())
 }
 
-fn cancel_qwen_code(restore: Option<&Value>) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
+fn cancel_qwen_code(
+    restore: Option<&Value>,
+) -> Result<AIProviderImportCancelResult, Box<dyn Error>> {
     let path = qwen_code_settings_path();
     let client_detected = path.is_file();
     let original = if path.is_file() {
@@ -2837,7 +2843,9 @@ fn cancel_qwen_code(restore: Option<&Value>) -> Result<AIProviderImportCancelRes
     } else {
         String::new()
     };
-    let previous = restore.and_then(|value| value.get("settings")).and_then(Value::as_str);
+    let previous = restore
+        .and_then(|value| value.get("settings"))
+        .and_then(Value::as_str);
     let (updated, removed) = strip_qwen_code_himind(&original, previous)?;
     let backup = if removed {
         backup_and_write(&path, updated.as_bytes())?
@@ -4868,10 +4876,7 @@ fn build_crush_config(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        entry.insert(
-            "provider".to_string(),
-            json!(DECLARATIVE_PROVIDER_ID),
-        );
+        entry.insert("provider".to_string(), json!(DECLARATIVE_PROVIDER_ID));
         entry.insert("model".to_string(), json!(preferred));
         slots.insert(slot.to_string(), Value::Object(entry));
     }
@@ -5397,9 +5402,7 @@ fn strip_crush_himind(
     let mut drop_slots = false;
     if let Some(slots) = root.get_mut("models").and_then(Value::as_object_mut) {
         for slot in ["large", "small"] {
-            let points_at_himind = slots
-                .get(slot)
-                .is_some_and(is_crush_himind_slot);
+            let points_at_himind = slots.get(slot).is_some_and(is_crush_himind_slot);
             if !points_at_himind {
                 continue;
             }
@@ -7382,20 +7385,18 @@ mod tests {
         build_vscode_enrollment_url, build_zcode_config, build_zcode_provider_rules,
         bundled_vscode_vsix_candidates, chat_completions_url, classify_anthropic_probe,
         classify_openai_probe, codex_catalog_models, codex_managed_catalog_configured,
-        compare_extension_versions,
-        consume_vscode_enrollment, continue_himind_models, create_vscode_enrollment,
-        crush_himind_models, ensure_anthropic_compatible, ensure_openai_compatible,
-        ensure_vscode_chat_provider_allowlist, find_vscode_extension_version, is_codex_native_model,
-        known_adapters,
-        legacy_workbuddy_model_id, managed_workbuddy_model_ids, merge_workbuddy_models,
-        migrate_workbuddy_sessions, opencode_anthropic_base_url, opencode_npm_for_protocol,
-        label_satisfies_protocol, protocol_gate,
-        parse_vscode_cli_version, parse_vscode_extension_version, parse_vscode_import_status,
-        push_vscode_registry_value, qoder_himind_models, read_cc_switch_managed_models,
-        read_cc_switch_managed_settings, read_codex_model_catalog, remove_workbuddy_models,
-        strip_aider_himind, strip_claude_himind, strip_codex_himind, strip_continue_himind,
-        strip_crush_himind, strip_kimi_code_himind, strip_opencode_himind, strip_qoder_himind,
-        strip_qwen_code_himind, strip_zcode_himind, strip_zcode_rules_himind,
+        compare_extension_versions, consume_vscode_enrollment, continue_himind_models,
+        create_vscode_enrollment, crush_himind_models, ensure_anthropic_compatible,
+        ensure_openai_compatible, ensure_vscode_chat_provider_allowlist,
+        find_vscode_extension_version, is_codex_native_model, known_adapters,
+        label_satisfies_protocol, legacy_workbuddy_model_id, managed_workbuddy_model_ids,
+        merge_workbuddy_models, migrate_workbuddy_sessions, opencode_anthropic_base_url,
+        opencode_npm_for_protocol, parse_vscode_cli_version, parse_vscode_extension_version,
+        parse_vscode_import_status, protocol_gate, push_vscode_registry_value, qoder_himind_models,
+        read_cc_switch_managed_models, read_cc_switch_managed_settings, read_codex_model_catalog,
+        remove_workbuddy_models, strip_aider_himind, strip_claude_himind, strip_codex_himind,
+        strip_continue_himind, strip_crush_himind, strip_kimi_code_himind, strip_opencode_himind,
+        strip_qoder_himind, strip_qwen_code_himind, strip_zcode_himind, strip_zcode_rules_himind,
         vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
         write_cc_switch_provider, zcode_himind_models, AIClientCredential, AIProviderImportRequest,
         ProbeVerdict, ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION,
@@ -7562,10 +7563,9 @@ mod tests {
             },
         );
         // 空 target 不应出现在上报里。
-        bindings.clients.insert(
-            "  ".to_string(),
-            super::AIProviderImportBinding::default(),
-        );
+        bindings
+            .clients
+            .insert("  ".to_string(), super::AIProviderImportBinding::default());
         super::save_import_bindings(&options, &bindings).unwrap();
 
         let report = super::heartbeat_ai_client_bindings(&options);
@@ -7975,8 +7975,16 @@ mod tests {
         ] {
             assert!(is_codex_native_model(slug), "{slug} 应视为 Codex 内置模型");
         }
-        for slug in ["deepseek-v4-flash", "glm-5.3", "qwen3.5-397b-a17b", "kimi-k3"] {
-            assert!(!is_codex_native_model(slug), "{slug} 不应视为 Codex 内置模型");
+        for slug in [
+            "deepseek-v4-flash",
+            "glm-5.3",
+            "qwen3.5-397b-a17b",
+            "kimi-k3",
+        ] {
+            assert!(
+                !is_codex_native_model(slug),
+                "{slug} 不应视为 Codex 内置模型"
+            );
         }
     }
 
@@ -8005,13 +8013,9 @@ mod tests {
         let original = r#"model_catalog_json = "C:/Users/Admin/.codex/himind-models.json"
 model_reasoning_effort = "xhigh"
 "#;
-        let config = build_codex_config_toml(
-            original,
-            &credential(&["gpt-6.1-sol"]),
-            None,
-            "gpt-6.1-sol",
-        )
-        .unwrap();
+        let config =
+            build_codex_config_toml(original, &credential(&["gpt-6.1-sol"]), None, "gpt-6.1-sol")
+                .unwrap();
         assert!(config.contains("model = \"gpt-6.1-sol\""));
         assert!(config.contains("model_provider = \"himind\""));
         assert!(config.contains("model_reasoning_effort = \"xhigh\""));
@@ -8034,7 +8038,10 @@ model_reasoning_effort = "xhigh"
             "model_catalog_json = \"../himind-models.json\"\n",
         )
         .unwrap();
-        assert!(!codex_managed_catalog_configured(&config_file, &models_path));
+        assert!(!codex_managed_catalog_configured(
+            &config_file,
+            &models_path
+        ));
 
         let normalized = models_path.to_string_lossy().replace('\\', "/");
         std::fs::write(
@@ -8045,7 +8052,10 @@ model_reasoning_effort = "xhigh"
         assert!(codex_managed_catalog_configured(&config_file, &models_path));
 
         std::fs::write(&config_file, "model = \"gpt-6.1-sol\"\n").unwrap();
-        assert!(!codex_managed_catalog_configured(&config_file, &models_path));
+        assert!(!codex_managed_catalog_configured(
+            &config_file,
+            &models_path
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8779,8 +8789,16 @@ command = "uvx.exe"
         let (updated, _) = merge_workbuddy_models(source, &credential(&["gpt-4.1"])).unwrap();
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert!(root.is_array());
-        assert!(root.as_array().unwrap().iter().any(|item| item["id"] == "personal"));
-        assert!(root.as_array().unwrap().iter().any(|item| item["id"] == "gpt-4.1"));
+        assert!(root
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "personal"));
+        assert!(root
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "gpt-4.1"));
     }
 
     #[test]
@@ -8799,7 +8817,10 @@ command = "uvx.exe"
         let empty: Value = serde_json::from_str("[]").unwrap();
         assert!(managed_workbuddy_model_ids(&empty).is_empty());
         let wired: Value = serde_json::from_str(r#"[{"id":"gpt-4.1","vendor":"HiMind"}]"#).unwrap();
-        assert_eq!(managed_workbuddy_model_ids(&wired), vec!["gpt-4.1".to_string()]);
+        assert_eq!(
+            managed_workbuddy_model_ids(&wired),
+            vec!["gpt-4.1".to_string()]
+        );
     }
 
     #[test]
@@ -8869,9 +8890,13 @@ command = "uvx.exe"
     #[test]
     fn strip_kimi_code_restores_previous_default_model() {
         let original = "default_model = \"existing/model\"\n[hooks]\nenabled = true\n";
-        let updated =
-            build_kimi_code_config(original, &credential(&["kimi-k3"]), &["kimi-k3".to_string()], "kimi-k3")
-                .unwrap();
+        let updated = build_kimi_code_config(
+            original,
+            &credential(&["kimi-k3"]),
+            &["kimi-k3".to_string()],
+            "kimi-k3",
+        )
+        .unwrap();
         assert!(updated.contains("default_model = \"himind/kimi-k3\""));
         let (restored, changed) = strip_kimi_code_himind(&updated, Some(original)).unwrap();
         assert!(changed);
@@ -9443,7 +9468,8 @@ command = "uvx.exe"
     #[test]
     fn strips_crush_himind_keeps_slots_pointing_elsewhere() {
         let original = r#"{"providers":{"himind":{"type":"openai"}},"models":{"large":{"provider":"anthropic","model":"claude"},"small":{"provider":"himind","model":"model-a"}}}"#;
-        let (updated, changed) = strip_crush_himind(original, ProviderConfigFormat::Json, None).unwrap();
+        let (updated, changed) =
+            strip_crush_himind(original, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(root["models"]["large"]["provider"], "anthropic");
@@ -9505,7 +9531,8 @@ command = "uvx.exe"
     #[test]
     fn strips_qoder_himind_and_keeps_reasoning_effort() {
         let original = r#"{"model":{"name":"himind/model-a","reasoningEffort":"high"},"providers":{"himind":{"protocol":"openai"},"other":{"protocol":"openai"}}}"#;
-        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json, None).unwrap();
+        let (updated, changed) =
+            strip_qoder_himind(original, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert!(root["providers"].get("himind").is_none());
@@ -9517,7 +9544,8 @@ command = "uvx.exe"
     #[test]
     fn strips_qoder_himind_keeps_foreign_default_model() {
         let original = r#"{"model":{"name":"other/model"},"providers":{"himind":{}}}"#;
-        let (updated, changed) = strip_qoder_himind(original, ProviderConfigFormat::Json, None).unwrap();
+        let (updated, changed) =
+            strip_qoder_himind(original, ProviderConfigFormat::Json, None).unwrap();
         assert!(changed);
         let root: Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(root["model"]["name"], "other/model");
@@ -9527,8 +9555,7 @@ command = "uvx.exe"
     // Qoder 的取消：有导入前快照时，默认模型还原到用户原值，而不是清成空。
     #[test]
     fn strips_qoder_himind_restores_previous_default_model() {
-        let original =
-            r#"{"model":{"name":"other/model","reasoningEffort":"high"},"providers":{"other":{"protocol":"openai"}}}"#;
+        let original = r#"{"model":{"name":"other/model","reasoningEffort":"high"},"providers":{"other":{"protocol":"openai"}}}"#;
         let content = build_qoder_config(
             original,
             ProviderConfigFormat::Json,
@@ -9714,13 +9741,28 @@ command = "uvx.exe"
     fn label_satisfies_protocol_treats_both_openai_wire_formats_as_openai() {
         let mut credential = credential(&["model-a"]);
         credential.access.protocol = "openai-chat".to_string();
-        assert!(label_satisfies_protocol(&credential, super::RequiredProtocol::OpenAi));
-        assert!(!label_satisfies_protocol(&credential, super::RequiredProtocol::Anthropic));
+        assert!(label_satisfies_protocol(
+            &credential,
+            super::RequiredProtocol::OpenAi
+        ));
+        assert!(!label_satisfies_protocol(
+            &credential,
+            super::RequiredProtocol::Anthropic
+        ));
         credential.access.protocol = "openai-responses".to_string();
-        assert!(label_satisfies_protocol(&credential, super::RequiredProtocol::OpenAi));
+        assert!(label_satisfies_protocol(
+            &credential,
+            super::RequiredProtocol::OpenAi
+        ));
         credential.access.protocol = "anthropic".to_string();
-        assert!(label_satisfies_protocol(&credential, super::RequiredProtocol::Anthropic));
-        assert!(!label_satisfies_protocol(&credential, super::RequiredProtocol::OpenAi));
+        assert!(label_satisfies_protocol(
+            &credential,
+            super::RequiredProtocol::Anthropic
+        ));
+        assert!(!label_satisfies_protocol(
+            &credential,
+            super::RequiredProtocol::OpenAi
+        ));
     }
 
     // Anthropic 探针判读：2xx 成立；404 不成立；错误信封与 anthropic-* 头也算讲该协议。
@@ -9743,7 +9785,11 @@ command = "uvx.exe"
             ProbeVerdict::Supported
         );
         assert_eq!(
-            classify_anthropic_probe(400, &["anthropic-ratelimit-requests-limit".to_string()], "{}"),
+            classify_anthropic_probe(
+                400,
+                &["anthropic-ratelimit-requests-limit".to_string()],
+                "{}"
+            ),
             ProbeVerdict::Supported
         );
         assert_eq!(
@@ -9768,7 +9814,10 @@ command = "uvx.exe"
             ProbeVerdict::Unsupported
         );
         assert_eq!(classify_openai_probe(401, "{}"), ProbeVerdict::Unsupported);
-        assert_eq!(classify_openai_probe(404, "not found"), ProbeVerdict::Unsupported);
+        assert_eq!(
+            classify_openai_probe(404, "not found"),
+            ProbeVerdict::Unsupported
+        );
     }
 
     #[test]

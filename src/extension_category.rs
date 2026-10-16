@@ -23,7 +23,10 @@ const CAPABILITY_CATEGORY_PREFIXES: &[(&str, &[&str])] = &[
     ("media.audio", &["audio-sound"]),
     ("document.", &["docs-knowledge"]),
     ("docs.", &["docs-knowledge"]),
-    ("workbench.business.exhibit.workspace", &["collaboration-delivery"]),
+    (
+        "workbench.business.exhibit.workspace",
+        &["collaboration-delivery"],
+    ),
     ("workbench.business.", &["collaboration-delivery"]),
     ("workbench.exhibit.", &["collaboration-delivery"]),
     ("workbench.project.", &["collaboration-delivery"]),

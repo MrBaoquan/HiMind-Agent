@@ -3124,7 +3124,10 @@ mod tests {
         // 轮换后旧签名必须立刻失效，否则撤销清单形同虚设。
         let _guard = signing_env_lock();
         let embedded = EMBEDDED_UPDATE_KEY_ID.trim();
-        assert!(!embedded.is_empty(), "test build has no embedded update key");
+        assert!(
+            !embedded.is_empty(),
+            "test build has no embedded update key"
+        );
         let root = std::env::temp_dir().join(format!(
             "himind-revoked-embedded-key-{}-{}",
             std::process::id(),
@@ -3147,7 +3150,10 @@ mod tests {
             None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
         }
         let error = result.unwrap_err().to_string();
-        assert!(error.contains("\u{64a4}\u{9500}") || error.contains("revoked"), "{error}");
+        assert!(
+            error.contains("\u{64a4}\u{9500}") || error.contains("revoked"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3174,8 +3180,14 @@ mod tests {
             None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
         }
         let error = result.unwrap_err().to_string();
-        assert!(error.contains("himind-extension-production-test"), "{error}");
-        assert!(error.contains(&root.to_string_lossy().to_string()), "{error}");
+        assert!(
+            error.contains("himind-extension-production-test"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&root.to_string_lossy().to_string()),
+            "{error}"
+        );
         assert!(error.contains("some-other-key"), "{error}");
         assert!(error.contains("optional"), "{error}");
         let _ = std::fs::remove_dir_all(root);

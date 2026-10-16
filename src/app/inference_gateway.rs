@@ -1624,7 +1624,10 @@ mod tests {
         set_configured_port(&state_path, 19_250).unwrap();
         assert_eq!(configured_port(&state_path), 19_250);
         assert!(dir.join("data").join(GATEWAY_CONFIG_FILE).is_file());
-        assert!(set_configured_port(&state_path, 0).is_err(), "0 不是合法端口");
+        assert!(
+            set_configured_port(&state_path, 0).is_err(),
+            "0 不是合法端口"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

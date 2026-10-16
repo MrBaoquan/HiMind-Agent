@@ -1578,7 +1578,12 @@ mod destructive_tests {
         let manager = ApprovalManager::new_in(home.clone());
         manager.update_profile("trusted", true).unwrap();
         assert!(matches!(
-            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
+            manager.get_mode_for_key(
+                "system.filesystem.delete",
+                ApprovalMode::Manual,
+                true,
+                Some("R3")
+            ),
             ApprovalMode::AutoApprove
         ));
         assert!(matches!(
@@ -1828,7 +1833,12 @@ mod destructive_tests {
             .update_rule("ai.client.import", "auto_approve")
             .unwrap();
         assert!(matches!(
-            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
+            manager.get_mode_for_key(
+                "system.filesystem.delete",
+                ApprovalMode::Manual,
+                true,
+                Some("R3")
+            ),
             ApprovalMode::AutoApprove
         ));
 
@@ -1847,7 +1857,12 @@ mod destructive_tests {
         )
         .unwrap();
         assert!(matches!(
-            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R3")),
+            manager.get_mode_for_key(
+                "system.filesystem.delete",
+                ApprovalMode::Manual,
+                true,
+                Some("R3")
+            ),
             ApprovalMode::Manual
         ));
         manager.bind_identity("user-b", "agent-a").unwrap();
@@ -1961,7 +1976,12 @@ mod destructive_tests {
         manager.update_profile("full_access", true).unwrap();
 
         assert!(matches!(
-            manager.get_mode_for_key("system.filesystem.delete", ApprovalMode::Manual, true, Some("R4")),
+            manager.get_mode_for_key(
+                "system.filesystem.delete",
+                ApprovalMode::Manual,
+                true,
+                Some("R4")
+            ),
             ApprovalMode::AutoApprove
         ));
         drop(manager);

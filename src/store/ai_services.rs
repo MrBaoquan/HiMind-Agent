@@ -352,9 +352,18 @@ pub(crate) fn upsert_with_balance_profile(
         Some("") | None => None,
         Some(value) => Some(normalize_balance_profile_id(value)?),
     };
-    let access_token = balance_access_token.map(str::trim).filter(|value| !value.is_empty());
-    let user_id = balance_user_id.map(str::trim).filter(|value| !value.is_empty());
-    upsert_internal(input, Some(profile), access_token, user_id.map(str::to_string))
+    let access_token = balance_access_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let user_id = balance_user_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    upsert_internal(
+        input,
+        Some(profile),
+        access_token,
+        user_id.map(str::to_string),
+    )
 }
 
 fn upsert_internal(
@@ -517,7 +526,12 @@ pub(crate) fn load_balance_credentials(
         .as_deref()
         .map(unprotect_secret_for_current_user)
         .transpose()?;
-    Ok((service.clone(), api_key, access_token, service.balance_user_id.clone()))
+    Ok((
+        service.clone(),
+        api_key,
+        access_token,
+        service.balance_user_id.clone(),
+    ))
 }
 
 pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn Error>> {
@@ -533,10 +547,7 @@ pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn
 ///
 /// `image.generate` 会回落到 `image_model` / `image_adapter` 这两个旧字段，
 /// 保证升级前后行为一致。
-pub(crate) fn binding_for(
-    service: &CustomAIService,
-    capability: &str,
-) -> Option<(String, String)> {
+pub(crate) fn binding_for(service: &CustomAIService, capability: &str) -> Option<(String, String)> {
     let capability = capability.trim();
     if let Some(binding) = service.media.get(capability) {
         let model = binding.model.trim();
@@ -829,8 +840,8 @@ pub(crate) fn list_models(id: &str) -> Result<Vec<String>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_for, validate_base_url, AIServiceProtocol, CustomAIServiceInput,
-        MediaModelBinding, CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE, CAP_VIDEO_GENERATE,
+        binding_for, validate_base_url, AIServiceProtocol, CustomAIServiceInput, MediaModelBinding,
+        CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE, CAP_VIDEO_GENERATE,
     };
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -870,8 +881,8 @@ mod tests {
                 models: vec!["gpt-test".to_string(), "gpt-test-2".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-test-secret-123".to_string(),
+                media: Default::default(),
+                api_key: "sk-test-secret-123".to_string(),
             };
             let saved = super::upsert(input).expect("upsert custom service");
             assert_eq!(saved.id, "my-gateway");
@@ -930,7 +941,7 @@ api_key: "sk-test-secret-123".to_string(),
                 None,
                 None,
             )
-                .is_err());
+            .is_err());
 
             let cached = crate::store::ai_service_balances::AISourceBalanceSnapshot {
                 provider_profile_id: "deepseek".to_string(),
@@ -949,13 +960,12 @@ api_key: "sk-test-secret-123".to_string(),
             crate::store::ai_service_balances::save("deepseek-account", cached)
                 .expect("cache balance");
 
-            let preserved = super::upsert(balance_test_service(""))
-                .expect("legacy update preserves profile");
+            let preserved =
+                super::upsert(balance_test_service("")).expect("legacy update preserves profile");
             assert_eq!(preserved.balance_profile_id.as_deref(), Some("deepseek"));
             assert!(crate::store::ai_service_balances::list().contains_key("deepseek-account"));
 
-            super::upsert(balance_test_service("sk-rotated"))
-                .expect("rotate API key");
+            super::upsert(balance_test_service("sk-rotated")).expect("rotate API key");
             assert!(!crate::store::ai_service_balances::list().contains_key("deepseek-account"));
         });
     }
@@ -978,14 +988,16 @@ api_key: "sk-test-secret-123".to_string(),
             assert!(!public.contains("encrypted_balance_access_token"));
 
             let (loaded, api_key, access_token, user_id) =
-                super::load_balance_credentials("deepseek-account").expect("load balance credentials");
+                super::load_balance_credentials("deepseek-account")
+                    .expect("load balance credentials");
             assert_eq!(api_key, "sk-inference");
             assert_eq!(access_token.as_deref(), Some("access-token-secret"));
             assert_eq!(user_id.as_deref(), Some("42"));
 
             input.display_name = "updated".to_string();
-            let preserved = super::upsert_with_balance_profile(input, Some("new-api"), None, Some("43"))
-                .expect("preserve saved access token when editing without re-entering it");
+            let preserved =
+                super::upsert_with_balance_profile(input, Some("new-api"), None, Some("43"))
+                    .expect("preserve saved access token when editing without re-entering it");
             assert_eq!(preserved.balance_user_id.as_deref(), Some("43"));
             let (_, _, access_token, _) = super::load_balance_credentials("deepseek-account")
                 .expect("reload preserved access token");
@@ -1006,7 +1018,9 @@ api_key: "sk-test-secret-123".to_string(),
             let mut custom = balance_test_service("sk-custom");
             custom.id = "custom-relay".to_string();
             custom.base_url = "https://openrouter.ai.attacker.example/v1".to_string();
-            let public = super::upsert(custom).expect("save custom host").public_json();
+            let public = super::upsert(custom)
+                .expect("save custom host")
+                .public_json();
             assert!(public["suggested_balance_profile_id"].is_null());
         });
     }
@@ -1023,8 +1037,8 @@ api_key: "sk-test-secret-123".to_string(),
                 models: vec!["model-a".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-original".to_string(),
+                media: Default::default(),
+                api_key: "sk-original".to_string(),
             })
             .expect("create service");
             super::upsert(CustomAIServiceInput {
@@ -1036,8 +1050,8 @@ api_key: "sk-original".to_string(),
                 models: vec!["model-b".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: String::new(),
+                media: Default::default(),
+                api_key: String::new(),
             })
             .expect("update service without rotating key");
             let (service, api_key) = super::load_secret("editable").expect("load service");
@@ -1060,8 +1074,8 @@ api_key: String::new(),
                     models: vec!["model-a".to_string()],
                     image_model: String::new(),
                     image_adapter: String::new(),
-                                        media: Default::default(),
-api_key: format!("sk-{id}"),
+                    media: Default::default(),
+                    api_key: format!("sk-{id}"),
                 })
                 .expect("create service");
             }
@@ -1098,8 +1112,8 @@ api_key: format!("sk-{id}"),
                 models: vec!["chat-model".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-chat".to_string(),
+                media: Default::default(),
+                api_key: "sk-chat".to_string(),
             })
             .expect("chat service");
             super::upsert(CustomAIServiceInput {
@@ -1111,8 +1125,8 @@ api_key: "sk-chat".to_string(),
                 models: vec!["doubao-seed".to_string()],
                 image_model: "doubao-seedream-5-0-pro".to_string(),
                 image_adapter: "ark-images".to_string(),
-                                media: Default::default(),
-api_key: "sk-image".to_string(),
+                media: Default::default(),
+                api_key: "sk-image".to_string(),
             })
             .expect("image service");
 
@@ -1177,7 +1191,10 @@ api_key: "sk-image".to_string(),
             assert_eq!(saved.image_adapter, "ark-images");
             assert_eq!(
                 binding_for(&saved, CAP_IMAGE_EDIT),
-                Some(("ark-images".to_string(), "doubao-seededit-4-0-i2i".to_string()))
+                Some((
+                    "ark-images".to_string(),
+                    "doubao-seededit-4-0-i2i".to_string()
+                ))
             );
             assert!(binding_for(&saved, CAP_VIDEO_GENERATE).is_none());
 
@@ -1246,7 +1263,9 @@ api_key: "sk-image".to_string(),
             super::set_media_service(CAP_IMAGE_EDIT, "only-edit").unwrap();
 
             assert_eq!(
-                super::media_service_id(CAP_IMAGE_GENERATE).unwrap().as_deref(),
+                super::media_service_id(CAP_IMAGE_GENERATE)
+                    .unwrap()
+                    .as_deref(),
                 Some("only-generate")
             );
             assert_eq!(
@@ -1277,8 +1296,8 @@ api_key: "sk-image".to_string(),
             models: Vec::new(),
             image_model: String::new(),
             image_adapter: String::new(),
-                        media: Default::default(),
-api_key: "k".to_string(),
+            media: Default::default(),
+            api_key: "k".to_string(),
         };
         let err = super::upsert(invalid).err().expect("must reject");
         assert!(err.to_string().contains("只允许"));

@@ -650,7 +650,10 @@ pub(crate) fn ensure_installed_runtime_healthy(options: &Options) -> Option<Stri
     } else {
         "configured source"
     };
-    let client_instance_id = format!("himind-agent-runtime-{}", crate::store::paths::profile_name());
+    let client_instance_id = format!(
+        "himind-agent-runtime-{}",
+        crate::store::paths::profile_name()
+    );
     let mut ignore_progress = |_: &str, _: u8, _: &str| {};
     match install_with_report(options, &client_instance_id, &mut ignore_progress) {
         Ok((repaired, degraded)) => {
@@ -804,7 +807,13 @@ pub(crate) fn install_with_report(
     options: &Options,
     client_instance_id: &str,
     report_progress: &mut dyn FnMut(&str, u8, &str),
-) -> Result<(DeepSeekHarnessRuntimeStatus, Vec<RuntimeCapabilityDegradation>), String> {
+) -> Result<
+    (
+        DeepSeekHarnessRuntimeStatus,
+        Vec<RuntimeCapabilityDegradation>,
+    ),
+    String,
+> {
     install_resolved_with_report(options, client_instance_id, "0.0.0", report_progress)
 }
 
@@ -825,8 +834,13 @@ pub(crate) fn update_with_progress(
     if !runtime.cli_compatible || runtime.version.trim().is_empty() {
         return Err("HiMind AI 运行时尚未安装".to_string());
     }
-    install_resolved_with_report(options, client_instance_id, &runtime.version, report_progress)
-        .map(|(status, _)| status)
+    install_resolved_with_report(
+        options,
+        client_instance_id,
+        &runtime.version,
+        report_progress,
+    )
+    .map(|(status, _)| status)
 }
 
 fn install_resolved_with_report(
@@ -834,7 +848,13 @@ fn install_resolved_with_report(
     client_instance_id: &str,
     current_version: &str,
     report_progress: &mut dyn FnMut(&str, u8, &str),
-) -> Result<(DeepSeekHarnessRuntimeStatus, Vec<RuntimeCapabilityDegradation>), String> {
+) -> Result<
+    (
+        DeepSeekHarnessRuntimeStatus,
+        Vec<RuntimeCapabilityDegradation>,
+    ),
+    String,
+> {
     report_progress("resolving", 5, "正在检查可用的 HiMind AI 运行时");
     let update = resolve_configured_runtime_component(
         options,
@@ -1656,11 +1676,7 @@ fn install_runtime_archive(
     // capability that failed its preflight must not stay advertised.
     let mut accepted = manifest.capabilities.clone();
     if !degraded.is_empty() {
-        accepted.retain(|capability| {
-            !degraded
-                .iter()
-                .any(|item| item.capability == *capability)
-        });
+        accepted.retain(|capability| !degraded.iter().any(|item| item.capability == *capability));
     }
     let executable_path = target.join(executable);
     let capabilities = effective_runtime_capabilities(&accepted, &executable_path);
@@ -1770,7 +1786,10 @@ fn verify_staged_runtime(
             });
         }
     }
-    if declared_capabilities.iter().any(|value| value == "computer-use") {
+    if declared_capabilities
+        .iter()
+        .any(|value| value == "computer-use")
+    {
         if let Err(reason) = verify_staged_computer_use_package(workspace) {
             degraded.push(RuntimeCapabilityDegradation {
                 capability: "computer-use".to_string(),
@@ -2350,7 +2369,8 @@ const MANAGED_OFFICE_SKILL_ROW: &str = "\n\n# HiMind managed Office provider.\n-
 
 /// Headless has no Web bundle to mount Office conversion, so it needs the
 /// conversion provider row as well.
-const MANAGED_OFFICE_CONVERT_ROW: &str = "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n";
+const MANAGED_OFFICE_CONVERT_ROW: &str =
+    "\n- insert:\n    - id: office-to-pdf\n      name: '@deepseek-ai/dsh-office-to-pdf'\n";
 
 /// Whether this machine can actually do Office work.
 ///
@@ -3276,8 +3296,8 @@ fn himind_mcp_arguments(options: &Options) -> Vec<String> {
 fn himind_mcp_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
     // 显式覆盖：用于开发态验收（例如 release companion 正被其它会话占用时，
     // 指向同一份代码构建出的 `himind-agent.exe --mcp`），也让排障不必改代码。
-    if let Some(explicit) = env::var_os("HIMIND_AGENT_MCP_EXECUTABLE")
-        .filter(|value| !value.is_empty())
+    if let Some(explicit) =
+        env::var_os("HIMIND_AGENT_MCP_EXECUTABLE").filter(|value| !value.is_empty())
     {
         let path = std::path::PathBuf::from(explicit);
         if !path.is_file() {
@@ -4222,15 +4242,13 @@ mod tests {
     use super::{
         active_independent_provider_config, agent_owned_route_is_viable,
         agent_owned_route_is_viable_with, append_independent_service_profile, degraded_notice,
-        dsh_run_home, dsh_skill_name, effective_runtime_capabilities,
-        ensure_interactive_home, ensure_managed_capability_rows,
-        ensure_profile_patch, first_line, himind_mcp_arguments, link_is_traversable,
-        managed_model_catalog,
-        merge_profile_package, migrate_legacy_managed_settings, native_dsh_provider_config,
-        no_tools_overlay_text, parse_native_dsh_provider_config, parse_runtime_version,
-        recent_workspace_in, release_agent_owned_model_route, remove_managed_runtime,
-        render_himind_agent_overlay, render_himind_profile_patch,
-        render_himind_profile_patch_from_base, safe_relative_path,
+        dsh_run_home, dsh_skill_name, effective_runtime_capabilities, ensure_interactive_home,
+        ensure_managed_capability_rows, ensure_profile_patch, first_line, himind_mcp_arguments,
+        link_is_traversable, managed_model_catalog, merge_profile_package,
+        migrate_legacy_managed_settings, native_dsh_provider_config, no_tools_overlay_text,
+        parse_native_dsh_provider_config, parse_runtime_version, recent_workspace_in,
+        release_agent_owned_model_route, remove_managed_runtime, render_himind_agent_overlay,
+        render_himind_profile_patch, render_himind_profile_patch_from_base, safe_relative_path,
         safe_segment, skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
         validate_runtime_agent_compatibility, verify_staged_runtime, versioned_home,
         InteractiveEventProjector, InteractiveLaunch, ModelRouteSource, HIMIND_HEADLESS_PROFILE,
@@ -4557,7 +4575,10 @@ mod tests {
             let package: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             let bundles = package["dsh"]["profile"]["bundles"].as_array().unwrap();
-            let names = bundles.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>();
+            let names = bundles
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>();
             for managed in [
                 "dsh-computer-use-win",
                 "@deepseek-ai/dsh-skill-office",
@@ -5056,11 +5077,13 @@ mod tests {
     #[test]
     fn managed_rows_still_match_what_older_agents_wrote() {
         assert_eq!(
-            super::MANAGED_OFFICE_SKILL_ROW, HISTORICAL_OFFICE_SKILL_ROW,
+            super::MANAGED_OFFICE_SKILL_ROW,
+            HISTORICAL_OFFICE_SKILL_ROW,
             "reformatting the managed Office row would strand it on upgraded machines"
         );
         assert_eq!(
-            super::MANAGED_OFFICE_CONVERT_ROW, HISTORICAL_OFFICE_CONVERT_ROW,
+            super::MANAGED_OFFICE_CONVERT_ROW,
+            HISTORICAL_OFFICE_CONVERT_ROW,
             "reformatting the managed conversion row would strand it on upgraded machines"
         );
     }
@@ -5189,8 +5212,8 @@ mod tests {
                 models: vec!["local-model".to_string(), "local-fast".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-local-secret".to_string(),
+                media: Default::default(),
+                api_key: "sk-local-secret".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-gateway").unwrap();
@@ -5272,8 +5295,8 @@ api_key: "sk-local-secret".to_string(),
                 models: vec!["deepseek-chat".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-deepseek-secret".to_string(),
+                media: Default::default(),
+                api_key: "sk-deepseek-secret".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("deepseek").unwrap();
@@ -5396,8 +5419,8 @@ api_key: "sk-deepseek-secret".to_string(),
                 models: vec!["kimi-k3".to_string()],
                 image_model: String::new(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-anthropic-secret".to_string(),
+                media: Default::default(),
+                api_key: "sk-anthropic-secret".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-anthropic").unwrap();
@@ -6184,5 +6207,4 @@ api_key: "sk-anthropic-secret".to_string(),
         assert!(!link_is_traversable(&root.join("missing")));
         let _ = std::fs::remove_dir_all(root);
     }
-
 }

@@ -4121,9 +4121,7 @@ impl CapabilityGateway {
             }
             CapabilityHandler::MediaJobGet => crate::api::media::get(&self.options, input),
             CapabilityHandler::MediaJobCancel => crate::api::media::cancel(&self.options, input),
-            CapabilityHandler::MediaImageGenerateLocal => {
-                crate::app::local_image::generate(&input)
-            }
+            CapabilityHandler::MediaImageGenerateLocal => crate::app::local_image::generate(&input),
             CapabilityHandler::MediaImageEditLocal => crate::app::local_image::edit(&input),
             CapabilityHandler::MediaVideoGenerateLocal => crate::app::local_video::generate(&input),
             CapabilityHandler::MediaJobGetLocal => crate::app::local_video::job_get(&input),
@@ -6184,18 +6182,24 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
             Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE)
         }
         "workbench.business.project.list" => Some(crate::api::oauth::BUSINESS_PROJECT_READ_SCOPE),
-        "workbench.business.project.create" | "workbench.business.project.update" | "workbench.business.project.delete" => {
+        "workbench.business.project.create"
+        | "workbench.business.project.update"
+        | "workbench.business.project.delete" => {
             Some(crate::api::oauth::BUSINESS_PROJECT_WRITE_SCOPE)
         }
         "workbench.business.exhibit.list" => Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE),
-        "workbench.business.exhibit.create" | "workbench.business.exhibit.update" | "workbench.business.exhibit.delete" => {
+        "workbench.business.exhibit.create"
+        | "workbench.business.exhibit.update"
+        | "workbench.business.exhibit.delete" => {
             Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE)
         }
         "workbench.business.project.managers.replace"
         | "workbench.business.project.owners.replace"
         | "workbench.business.exhibit.crew.replace"
         | "workbench.business.exhibit.crew.append"
-        | "workbench.business.exhibit.crew.remove" => Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE),
+        | "workbench.business.exhibit.crew.remove" => {
+            Some(crate::api::oauth::BUSINESS_PEOPLE_WRITE_SCOPE)
+        }
         "workbench.business.people.search" => Some(crate::api::oauth::BUSINESS_PEOPLE_READ_SCOPE),
         "workbench.business.requirement.list" | "workbench.business.requirement.get" => {
             Some(crate::api::oauth::BUSINESS_REQUIREMENT_READ_SCOPE)
@@ -6209,11 +6213,15 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         | "workbench.business.requirement.comment" => {
             Some(crate::api::oauth::BUSINESS_REQUIREMENT_WRITE_SCOPE)
         }
-        "workbench.business.project.exhibit.attach" | "workbench.business.project.exhibit.detach" => {
+        "workbench.business.project.exhibit.attach"
+        | "workbench.business.project.exhibit.detach" => {
             Some(crate::api::oauth::BUSINESS_PROJECT_WRITE_SCOPE)
         }
-        "workbench.business.exhibit.workspace.get" => Some(crate::api::oauth::BUSINESS_WORKSPACE_READ_SCOPE),
-        "workbench.business.exhibit.workspace.bind" | "workbench.business.exhibit.workspace.checkout" => {
+        "workbench.business.exhibit.workspace.get" => {
+            Some(crate::api::oauth::BUSINESS_WORKSPACE_READ_SCOPE)
+        }
+        "workbench.business.exhibit.workspace.bind"
+        | "workbench.business.exhibit.workspace.checkout" => {
             Some(crate::api::oauth::BUSINESS_WORKSPACE_WRITE_SCOPE)
         }
         "workbench.operation.get" => Some(crate::api::oauth::OPERATION_READ_SCOPE),
@@ -6551,7 +6559,9 @@ fn dashboard_route_for(capability_id: &str) -> Option<String> {
         }
         "workbench.business.people.search" => "/api/integrations/ai/business/people/search",
         "workbench.business.requirement.list" => "/api/integrations/ai/business/requirements",
-        "workbench.business.requirement.get" => "/api/integrations/ai/business/requirements/{requirement_id}",
+        "workbench.business.requirement.get" => {
+            "/api/integrations/ai/business/requirements/{requirement_id}"
+        }
         "workbench.business.requirement.create" => "/api/integrations/ai/business/requirements",
         "workbench.business.requirement.update"
         | "workbench.business.requirement.cancel"
@@ -7668,7 +7678,10 @@ pub(crate) fn capability_id_structure_violations(id: &str) -> Vec<&'static str> 
     }
     for segment in &segments {
         let valid = !segment.is_empty()
-            && segment.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
+            && segment
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_lowercase())
             && !segment.ends_with('-')
             && segment
                 .chars()
@@ -7737,8 +7750,7 @@ fn capability_boundary_availability_violation(id: &str, availability: &str) -> O
 /// 待整改的历史内置能力 ID → 目标 ID（**只允许减少**）。
 ///
 /// 改好一个就从这里删一个；新增能力不得加入此清单，否则门禁失败。
-const LEGACY_CAPABILITY_ID_MIGRATIONS: &[(&str, &str)] = &[
-];
+const LEGACY_CAPABILITY_ID_MIGRATIONS: &[(&str, &str)] = &[];
 /// 本机生图能力：与 `media_registration` 共用媒体命名空间，但服务源是本机自定义
 /// AI 服务，不经过 AI 工作台，因此在独立模式下也必须保持可见可用。
 fn local_media_registration(
@@ -8122,7 +8134,9 @@ mod tests {
         assert!(is_svn_admin_capability("svn.user.provision"));
         assert!(is_svn_admin_capability("svn.project.repository.archive"));
         assert!(!is_svn_admin_capability("svn.exhibit.workspace.checkout"));
-        assert!(!is_svn_admin_capability("workspace.exhibit.repository.import"));
+        assert!(!is_svn_admin_capability(
+            "workspace.exhibit.repository.import"
+        ));
         assert!(!is_svn_admin_capability(
             "svn.exhibit.repository.initialize-template"
         ));
@@ -8799,7 +8813,10 @@ mod tests {
                 CapabilityHandler::InnerAdminSyncExhibits,
             ),
             ("workspace.code.upload", CapabilityHandler::UploadCode),
-            ("workspace.placeholder.upload", CapabilityHandler::UploadPlaceholder),
+            (
+                "workspace.placeholder.upload",
+                CapabilityHandler::UploadPlaceholder,
+            ),
             ("storage.smb.upload", CapabilityHandler::SmbUpload),
             (
                 "workspace.exhibit.repository.import",
@@ -8893,12 +8910,12 @@ mod tests {
             .iter()
             .any(|item| item.id == "workspace.exhibit.status"));
         assert!(visible.iter().any(|item| item.id == "svn.connection.test"));
-        assert!(!visible.iter().any(|item| item.id == "workbench.context.resolve"));
+        assert!(!visible
+            .iter()
+            .any(|item| item.id == "workbench.context.resolve"));
         // 本机生图只依赖用户自己的 OpenAI 兼容服务，不经过 AI 工作台，
         // 因此独立模式必须保持可见、可用。
-        assert!(visible
-            .iter()
-            .any(|item| item.id == "media.image.generate"));
+        assert!(visible.iter().any(|item| item.id == "media.image.generate"));
         // 图生图同样是本机能力，独立模式必须可见。
         assert!(visible.iter().any(|item| item.id == "media.image.edit"));
         // 工作台媒体通道在独立模式下整体不可见。
@@ -8964,7 +8981,9 @@ mod tests {
             .iter()
             .any(|item| { is_svn_admin_capability(&item.id) }));
         assert!(visible.iter().any(|item| item.id == "system.health"));
-        assert!(visible.iter().any(|item| item.id == "workbench.context.resolve"));
+        assert!(visible
+            .iter()
+            .any(|item| item.id == "workbench.context.resolve"));
         // 本机生图在已对接模式下同样可见（服务源是用户自己的服务）。
         assert!(visible.iter().any(|item| item.id == "media.image.generate"));
         // 工作台媒体通道只在已对接模式投影，且不与 media.* 抢命名。
@@ -9239,8 +9258,12 @@ mod tests {
             dynamic.dashboard_route.as_deref(),
             Some("/api/integrations/ai/business/examples")
         );
-        assert!(!visible.iter().any(|item| item.id == "workbench.context.resolve"));
-        assert!(!visible.iter().any(|item| item.id == "workbench.operation.get"));
+        assert!(!visible
+            .iter()
+            .any(|item| item.id == "workbench.context.resolve"));
+        assert!(!visible
+            .iter()
+            .any(|item| item.id == "workbench.operation.get"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9376,8 +9399,8 @@ mod tests {
                 models: vec!["chat-model".to_string()],
                 image_model: "image-model".to_string(),
                 image_adapter: String::new(),
-                                media: Default::default(),
-api_key: "sk-test-image".to_string(),
+                media: Default::default(),
+                api_key: "sk-test-image".to_string(),
             })
             .unwrap();
             crate::store::ai_services::set_active("local-image").unwrap();
@@ -9410,10 +9433,7 @@ api_key: "sk-test-image".to_string(),
         assert_eq!(value["model"], "image-model");
         let path = std::path::PathBuf::from(value["files"][0]["path"].as_str().unwrap());
         assert!(path.is_file(), "生成的图片必须落盘：{}", path.display());
-        assert!(received
-            .lock()
-            .unwrap()
-            .contains("/v1/images/generations"));
+        assert!(received.lock().unwrap().contains("/v1/images/generations"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9441,7 +9461,10 @@ api_key: "sk-test-image".to_string(),
             ("media-library.library.search", "子段与父段语义重复"),
             ("one.two.three.four.five.six", "段数超出规则文件区间"),
             // 插件命名空间不在内核领域注册表里：由插件校验器按 capability_namespace 单独校验。
-            ("work-log.project.path.set", "首段必须是 ADR 0119 领域注册表（或插件命名空间）中的边界"),
+            (
+                "work-log.project.path.set",
+                "首段必须是 ADR 0119 领域注册表（或插件命名空间）中的边界",
+            ),
         ] {
             let rules = capability_id_naming_violations(id);
             assert!(
@@ -9496,7 +9519,9 @@ api_key: "sk-test-image".to_string(),
         // 待整改清单只能减少：改好一个就必须从清单里删掉，避免清单腐烂。
         for (legacy, target) in LEGACY_CAPABILITY_ID_MIGRATIONS {
             assert!(
-                offending.iter().any(|entry| entry.starts_with(&format!("{legacy} ->"))),
+                offending
+                    .iter()
+                    .any(|entry| entry.starts_with(&format!("{legacy} ->"))),
                 "`{legacy}` 现在已经合规，请从待整改清单移除（目标 `{target}`）"
             );
             assert!(
@@ -9524,20 +9549,44 @@ api_key: "sk-test-image".to_string(),
         for (legacy, current) in [
             ("media.audio.speech", "workbench.media.audio.speech"),
             ("media.audio.transcribe", "workbench.media.audio.transcribe"),
-            ("ai.service.custom.list_models", "ai.service.custom.model.list"),
-            ("exhibit.migration_source.scan", "workspace.exhibit.migration.scan"),
-            ("exhibit.repository.import_local", "workspace.exhibit.repository.import"),
-            ("inner_admin.login_status", "network.inner-admin.login.status"),
-            ("inner_admin.sync_exhibits", "network.inner-admin.exhibit.sync"),
+            (
+                "ai.service.custom.list_models",
+                "ai.service.custom.model.list",
+            ),
+            (
+                "exhibit.migration_source.scan",
+                "workspace.exhibit.migration.scan",
+            ),
+            (
+                "exhibit.repository.import_local",
+                "workspace.exhibit.repository.import",
+            ),
+            (
+                "inner_admin.login_status",
+                "network.inner-admin.login.status",
+            ),
+            (
+                "inner_admin.sync_exhibits",
+                "network.inner-admin.exhibit.sync",
+            ),
             ("mcp.registration.apply_all", "mcp.registration.apply-all"),
             ("mcp.registration.remove_all", "mcp.registration.remove-all"),
             ("system.open_folder", "system.folder.open"),
             ("exhibit.workspace.build", "workspace.exhibit.build"),
-            ("exhibit.workspace.build.cancel", "workspace.exhibit.build.cancel"),
-            ("exhibit.workspace.build.status", "workspace.exhibit.build.status"),
+            (
+                "exhibit.workspace.build.cancel",
+                "workspace.exhibit.build.cancel",
+            ),
+            (
+                "exhibit.workspace.build.status",
+                "workspace.exhibit.build.status",
+            ),
             ("exhibit.workspace.open", "workspace.exhibit.open"),
             ("exhibit.workspace.status.local", "workspace.exhibit.status"),
-            ("exhibit.workspace.checkout", "svn.exhibit.workspace.checkout"),
+            (
+                "exhibit.workspace.checkout",
+                "svn.exhibit.workspace.checkout",
+            ),
             ("exhibit.workspace.status", "svn.exhibit.workspace.status"),
             ("exhibit.workspace.update", "svn.exhibit.workspace.update"),
             ("filesystem.delete", "system.filesystem.delete"),
@@ -9546,13 +9595,25 @@ api_key: "sk-test-image".to_string(),
             ("github.account.remove", "vcs.github.account.remove"),
             ("github.account.set", "vcs.github.account.set"),
             ("github.app.authorize.poll", "vcs.github.app.authorize.poll"),
-            ("github.app.authorize.start", "vcs.github.app.authorize.start"),
-            ("github.app.installation.select", "vcs.github.app.installation.select"),
-            ("github.app.installations", "vcs.github.app.installation.list"),
+            (
+                "github.app.authorize.start",
+                "vcs.github.app.authorize.start",
+            ),
+            (
+                "github.app.installation.select",
+                "vcs.github.app.installation.select",
+            ),
+            (
+                "github.app.installations",
+                "vcs.github.app.installation.list",
+            ),
             ("scan.projects", "workspace.project.scan"),
             ("upload.code", "workspace.code.upload"),
             ("upload.placeholder", "workspace.placeholder.upload"),
-            ("software.distribution.release.publish", "distribution.release.publish"),
+            (
+                "software.distribution.release.publish",
+                "distribution.release.publish",
+            ),
         ] {
             assert_eq!(capability_id_aliases(legacy), Some(current), "{legacy}");
             // 别名目标本身必须是新规范下的合规 ID。

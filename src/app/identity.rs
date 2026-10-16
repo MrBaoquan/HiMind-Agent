@@ -174,33 +174,31 @@ pub(crate) fn identity_status(options: &Options) -> DashboardIdentityStatus {
     }
 
     match oauth::fetch_user_info(options) {
-        Ok(info) => {
-            DashboardIdentityStatus {
-                state: if info.active {
-                    "authorized"
-                } else {
-                    "disabled"
-                }
-                .to_string(),
-                authorized: info.active,
-                online_verified: true,
-                dashboard_base: options.api_base().clone(),
-                user_name: info.name,
-                user_id: info.sub,
-                agent_id: info.agent_id,
-                scopes: split_scopes(&info.scope),
-                refresh_expires_at: snapshot.refresh_expires_at,
-                last_verified_at: unix_now(),
-                svn_username: info.svn_username,
-                svn_provisioning_status: info.svn_provisioning_status,
-                svn_provisioning_error: info.svn_provisioning_error,
-                error: if info.active {
-                    String::new()
-                } else {
-                    "Dashboard 用户已停用".to_string()
-                },
+        Ok(info) => DashboardIdentityStatus {
+            state: if info.active {
+                "authorized"
+            } else {
+                "disabled"
             }
-        }
+            .to_string(),
+            authorized: info.active,
+            online_verified: true,
+            dashboard_base: options.api_base().clone(),
+            user_name: info.name,
+            user_id: info.sub,
+            agent_id: info.agent_id,
+            scopes: split_scopes(&info.scope),
+            refresh_expires_at: snapshot.refresh_expires_at,
+            last_verified_at: unix_now(),
+            svn_username: info.svn_username,
+            svn_provisioning_status: info.svn_provisioning_status,
+            svn_provisioning_error: info.svn_provisioning_error,
+            error: if info.active {
+                String::new()
+            } else {
+                "Dashboard 用户已停用".to_string()
+            },
+        },
         Err(error) => {
             let message = error.to_string();
             let normalized = message.to_ascii_lowercase();

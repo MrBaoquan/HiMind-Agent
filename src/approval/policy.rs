@@ -30,8 +30,12 @@ pub(crate) fn destructive_request_type(capability_id: &str) -> Option<RequestTyp
     let id = capability_id.trim().to_ascii_lowercase();
     match id.as_str() {
         "system.filesystem.delete" | "workspace.delete" => Some(RequestType::FilesystemDelete),
-        "workbench.business.project.delete" | "project.delete" => Some(RequestType::BusinessProjectDelete),
-        "workbench.business.exhibit.delete" | "exhibit.delete" => Some(RequestType::BusinessExhibitDelete),
+        "workbench.business.project.delete" | "project.delete" => {
+            Some(RequestType::BusinessProjectDelete)
+        }
+        "workbench.business.exhibit.delete" | "exhibit.delete" => {
+            Some(RequestType::BusinessExhibitDelete)
+        }
         // Full replacement and detach operations can remove existing business
         // relationships even though they are exposed as network writes.
         "workbench.business.project.managers.replace"
@@ -150,13 +154,21 @@ mod tests {
 
     #[test]
     fn business_and_filesystem_deletes_are_r3() {
-        assert_eq!(effective_risk_level("workbench.business.project.delete", "R1"), "R3");
-        assert_eq!(effective_risk_level("system.filesystem.delete", "read_only"), "R3");
+        assert_eq!(
+            effective_risk_level("workbench.business.project.delete", "R1"),
+            "R3"
+        );
+        assert_eq!(
+            effective_risk_level("system.filesystem.delete", "read_only"),
+            "R3"
+        );
     }
 
     #[test]
     fn ordinary_writes_are_not_promoted_to_destructive() {
-        assert!(!is_destructive_capability("workbench.business.project.update"));
+        assert!(!is_destructive_capability(
+            "workbench.business.project.update"
+        ));
         assert_eq!(
             effective_risk_level("workbench.business.project.update", "network_write"),
             "R2"
@@ -227,7 +239,10 @@ mod tests {
 
     #[test]
     fn legacy_catalog_risk_aliases_map_to_unified_tiers() {
-        assert_eq!(effective_risk_level("workbench.context.resolve", "read_only"), "R1");
+        assert_eq!(
+            effective_risk_level("workbench.context.resolve", "read_only"),
+            "R1"
+        );
         assert_eq!(
             effective_risk_level("project.update", "network_write"),
             "R2"

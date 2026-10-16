@@ -513,14 +513,16 @@ fn is_valid_namespace(namespace: &str) -> bool {
     !namespace.is_empty()
         && namespace.split('.').all(|segment| {
             !segment.is_empty()
-                && segment.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
+                && segment
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_lowercase())
                 && !segment.ends_with('-')
                 && segment
                     .chars()
                     .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
         })
 }
-
 
 /// 已安装且启用的插件占用的能力 ID → 归属描述。
 ///
@@ -2125,14 +2127,26 @@ mod tests {
         assert_eq!(plugin_capability_namespace(&manifest), "work-log");
         let issues = plugin_capability_naming_issues(&manifest);
         // 合规项不应出现在问题列表里。
-        assert!(!issues.iter().any(|item| item.starts_with("work-log.project.path.map:")));
+        assert!(!issues
+            .iter()
+            .any(|item| item.starts_with("work-log.project.path.map:")));
         // 驼峰、丢命名空间、版本后缀都必须被抓到。
-        assert!(issues.iter().any(|item| item.contains("mapPath")), "{issues:?}");
         assert!(
-            issues.iter().any(|item| item.contains("document.inspect") && item.contains("命名空间")),
+            issues.iter().any(|item| item.contains("mapPath")),
             "{issues:?}"
         );
-        assert!(issues.iter().any(|item| item.contains("版本不得进入能力 ID")), "{issues:?}");
+        assert!(
+            issues
+                .iter()
+                .any(|item| item.contains("document.inspect") && item.contains("命名空间")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|item| item.contains("版本不得进入能力 ID")),
+            "{issues:?}"
+        );
 
         // 显式声明的命名空间优先于 ID slug 推导。
         let declared: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -2173,11 +2187,15 @@ mod tests {
         .unwrap();
         let multi_issues = plugin_capability_naming_issues(&multi);
         assert!(
-            !multi_issues.iter().any(|item| item.starts_with("wechat.miniprogram.code.upload:")),
+            !multi_issues
+                .iter()
+                .any(|item| item.starts_with("wechat.miniprogram.code.upload:")),
             "{multi_issues:?}"
         );
         assert!(
-            multi_issues.iter().any(|item| item.starts_with("wechat.code.upload:")),
+            multi_issues
+                .iter()
+                .any(|item| item.starts_with("wechat.code.upload:")),
             "{multi_issues:?}"
         );
 
@@ -2193,7 +2211,6 @@ mod tests {
         assert!(plugin_capability_naming_issues(&mismatched)
             .iter()
             .any(|item| item.contains("capability_namespace")));
-
     }
 
     #[test]
@@ -2220,7 +2237,9 @@ mod tests {
 
         let issues = plugin_capability_conflict_issues(&manifest, &occupied);
         assert!(
-            issues.iter().any(|item| item.contains("同一插件内重复声明")),
+            issues
+                .iter()
+                .any(|item| item.contains("同一插件内重复声明")),
             "{issues:?}"
         );
         assert!(
@@ -2231,7 +2250,9 @@ mod tests {
         );
         // 未被占用的 ID 不报；占用集里没被清单引用的 ID 也不报。
         assert!(
-            !issues.iter().any(|item| item.contains("work-log.entry.upsert")),
+            !issues
+                .iter()
+                .any(|item| item.contains("work-log.entry.upsert")),
             "{issues:?}"
         );
         assert_eq!(issues.len(), 2, "{issues:?}");

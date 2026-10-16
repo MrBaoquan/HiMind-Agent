@@ -1526,7 +1526,9 @@ mod tests {
     fn session_activation_is_invalidated_when_registry_generation_changes() {
         let mut session = McpSessionState {
             activated_capabilities: ["plugin.example.run".to_string()].into_iter().collect(),
-            default_activated: ["workbench.business.exhibit.list".to_string()].into_iter().collect(),
+            default_activated: ["workbench.business.exhibit.list".to_string()]
+                .into_iter()
+                .collect(),
             activation_generation: Some("sha256:one".to_string()),
             projection_changed: false,
             legacy_compatibility: false,
@@ -1534,7 +1536,9 @@ mod tests {
         };
         session.synchronize_generation("sha256:two");
         assert!(session.activated_capabilities.is_empty());
-        assert!(session.default_activated.contains("workbench.business.exhibit.list"));
+        assert!(session
+            .default_activated
+            .contains("workbench.business.exhibit.list"));
         assert!(session.take_projection_changed());
         assert_eq!(session.activation_generation.as_deref(), Some("sha256:two"));
     }

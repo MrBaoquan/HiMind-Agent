@@ -1141,8 +1141,7 @@ mod tests {
         let _guard = crate::store::paths::test_env_lock();
         let previous = env::var_os("HIMIND_AGENT_PROFILE");
         env::set_var("HIMIND_AGENT_PROFILE", "development");
-        let source =
-            r#"{"mcpServers":{"himind-agent":{"type":"stdio","command":"prod.exe","args":["--mcp"]}}}"#;
+        let source = r#"{"mcpServers":{"himind-agent":{"type":"stdio","command":"prod.exe","args":["--mcp"]}}}"#;
         let updated = merge_json_config(
             source,
             Path::new(r"C:\dev\target\release\himind-agent-mcp.exe"),
@@ -1195,7 +1194,9 @@ mod tests {
         }
         let value: Value = serde_json::from_str(&updated).unwrap();
         assert!(value["mcpServers"].get("himind-agent").is_none());
-        assert!(value["mcpServers"].get("himind-agent-development").is_some());
+        assert!(value["mcpServers"]
+            .get("himind-agent-development")
+            .is_some());
     }
 
     #[test]

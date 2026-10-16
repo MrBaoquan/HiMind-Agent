@@ -1,5 +1,6 @@
 pub(crate) mod ai_clients;
 pub(crate) mod ai_provider_import;
+pub(crate) mod ai_service_balance;
 pub(crate) mod ai_service_templates;
 pub(crate) mod anthropic_openai;
 pub(crate) mod backup;
@@ -59,4 +60,3 @@ pub(crate) mod update_source;
 pub(crate) mod workbench_connections;
 pub(crate) mod workflow_approval;
 pub(crate) mod workflow_manager;
-pub(crate) mod ai_service_balance;

@@ -393,7 +393,9 @@ pub fn heartbeat(
     agent_id: &str,
     credential: &str,
 ) -> Result<bool, Box<dyn Error>> {
-    heartbeat_with_runtime_installations(client, api_base, agent_id, credential, None, None, None, None)
+    heartbeat_with_runtime_installations(
+        client, api_base, agent_id, credential, None, None, None, None,
+    )
 }
 
 pub fn heartbeat_with_runtime_installations(

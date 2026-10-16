@@ -337,11 +337,9 @@ pub(crate) fn test_connection() -> Result<Value, Box<dyn Error>> {
 
 fn login_svn_user(username: &str, password: &str) -> Result<Value, Box<dyn Error>> {
     let executable = find_svn_executable().ok_or("SVN CLI was not found")?;
-    let (auth_arguments, stdin_payload) = svn_auth_arguments(Some(SVN_SERVICE_URL), username, password)?;
-    let mut arguments = vec![
-        "info".to_string(),
-        SVN_SERVICE_URL.to_string(),
-    ];
+    let (auth_arguments, stdin_payload) =
+        svn_auth_arguments(Some(SVN_SERVICE_URL), username, password)?;
+    let mut arguments = vec!["info".to_string(), SVN_SERVICE_URL.to_string()];
     arguments.extend(auth_arguments);
     let mut child = match Command::new(&executable)
         .args(&arguments)
@@ -4800,8 +4798,11 @@ where
 {
     let executable = find_svn_executable().ok_or("SVN CLI was not found")?;
     let mut command_arguments: Vec<String> = arguments.into_iter().collect();
-    let (auth_arguments, stdin_payload) =
-        svn_auth_arguments(svn_url_argument(&command_arguments).as_deref(), username, password)?;
+    let (auth_arguments, stdin_payload) = svn_auth_arguments(
+        svn_url_argument(&command_arguments).as_deref(),
+        username,
+        password,
+    )?;
     command_arguments.extend(auth_arguments);
     let mut child = Command::new(&executable)
         .args(&command_arguments)
@@ -6404,9 +6405,12 @@ mod tests {
 
     #[test]
     fn ascii_accounts_authenticate_through_username_and_password_stdin() {
-        let (arguments, stdin) =
-            svn_auth_arguments(Some("http://svn.example/repo/project"), "svn-user", "secret")
-                .unwrap();
+        let (arguments, stdin) = svn_auth_arguments(
+            Some("http://svn.example/repo/project"),
+            "svn-user",
+            "secret",
+        )
+        .unwrap();
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--username", "svn-user"]));
@@ -6417,7 +6421,8 @@ mod tests {
 
     #[test]
     fn empty_accounts_authenticate_anonymously() {
-        let (arguments, stdin) = svn_auth_arguments(Some("http://svn.example/repo"), "", "").unwrap();
+        let (arguments, stdin) =
+            svn_auth_arguments(Some("http://svn.example/repo"), "", "").unwrap();
         assert!(arguments.contains(&"--no-auth-cache".to_string()));
         assert!(!arguments.iter().any(|argument| argument == "--username"));
         assert!(stdin.is_none());
@@ -6457,10 +6462,7 @@ mod tests {
                 .as_deref(),
             Some("SVN")
         );
-        assert_eq!(
-            crate::svn::auth_cache::parse_basic_realm("Negotiate"),
-            None
-        );
+        assert_eq!(crate::svn::auth_cache::parse_basic_realm("Negotiate"), None);
     }
 
     #[test]
@@ -6618,5 +6620,4 @@ Develop.meta
 </target></status>"#;
         assert_eq!(svn_status_change_count_from_xml(xml).unwrap(), 2);
     }
-
 }

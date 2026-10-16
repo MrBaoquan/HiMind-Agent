@@ -623,8 +623,8 @@ fn json_target_state(
     let target_id = definition.id;
     let server_id = super::mcp_registry::agent_server_id();
     if definition.layout == JsonTargetLayout::OpenCode {
-        let Some(server) = server_collection(root, definition)
-            .and_then(|servers| servers.get(&server_id))
+        let Some(server) =
+            server_collection(root, definition).and_then(|servers| servers.get(&server_id))
         else {
             return None;
         };
@@ -643,8 +643,8 @@ fn json_target_state(
         let enabled_matches = server.get("enabled").and_then(Value::as_bool) != Some(false);
         return Some(command_matches && type_matches && enabled_matches);
     }
-    let Some(server) = server_collection(root, definition)
-        .and_then(|servers| servers.get(&server_id))
+    let Some(server) =
+        server_collection(root, definition).and_then(|servers| servers.get(&server_id))
     else {
         return None;
     };
@@ -1238,14 +1238,19 @@ mod tests {
             .into_iter()
             .find(|item| item.id == "cursor")
             .unwrap();
-        let snippet: Value =
-            serde_json::from_str(&manual_snippet_for_definition(&definition, "agent.exe", &[]))
-                .unwrap();
+        let snippet: Value = serde_json::from_str(&manual_snippet_for_definition(
+            &definition,
+            "agent.exe",
+            &[],
+        ))
+        .unwrap();
         match previous {
             Some(value) => std::env::set_var("HIMIND_AGENT_PROFILE", value),
             None => std::env::remove_var("HIMIND_AGENT_PROFILE"),
         }
-        assert!(snippet.pointer("/mcpServers/himind-agent-development").is_some());
+        assert!(snippet
+            .pointer("/mcpServers/himind-agent-development")
+            .is_some());
         assert!(snippet.pointer("/mcpServers/himind-agent").is_none());
     }
 

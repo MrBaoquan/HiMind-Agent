@@ -70,7 +70,8 @@ pub(crate) fn generate(input: &Value) -> Result<Value, Box<dyn Error>> {
             job.updated_at = now();
             media_jobs::save(&job)?;
             let mut value = job.to_json();
-            value["hint"] = json!("视频为异步任务：稍后用 media.job.get 查询，或用 media.job.wait 等待完成。");
+            value["hint"] =
+                json!("视频为异步任务：稍后用 media.job.get 查询，或用 media.job.wait 等待完成。");
             Ok(value)
         }
         Err(error) => {
@@ -166,7 +167,9 @@ fn refresh(mut job: MediaJob) -> Result<MediaJob, Box<dyn Error>> {
         "canceled" => job.status = media_jobs::STATUS_CANCELED.to_string(),
         "failed" => {
             job.status = media_jobs::STATUS_FAILED.to_string();
-            job.error = status.error.unwrap_or_else(|| "provider 报告生成失败".to_string());
+            job.error = status
+                .error
+                .unwrap_or_else(|| "provider 报告生成失败".to_string());
         }
         other => {
             job.status = media_jobs::STATUS_RUNNING.to_string();
@@ -200,9 +203,7 @@ fn submit_task(
     let mut content = vec![json!({ "type": "text", "text": prompt })];
     if let Some(images) = input.get("input_images").and_then(Value::as_array) {
         for item in images {
-            let reference = item
-                .as_str()
-                .ok_or("input_images 只能是字符串数组")?;
+            let reference = item.as_str().ok_or("input_images 只能是字符串数组")?;
             let image = resolve_input_image(reference)?;
             content.push(json!({
                 "type": "image_url",
@@ -249,7 +250,11 @@ fn submit_task(
         .ok_or_else(|| "生视频响应缺少任务 ID".into())
 }
 
-fn fetch_status(base_url: &str, api_key: &str, provider_job_id: &str) -> Result<ProviderStatus, Box<dyn Error>> {
+fn fetch_status(
+    base_url: &str,
+    api_key: &str,
+    provider_job_id: &str,
+) -> Result<ProviderStatus, Box<dyn Error>> {
     let client = client(request_timeout())?;
     let url = format!("{}/{}", tasks_url(base_url)?, provider_job_id);
     let response = client
@@ -313,7 +318,9 @@ fn cancel_task(base_url: &str, api_key: &str, provider_job_id: &str) -> Result<(
 /// 从 provider 返回里尽力找出视频地址（不同厂商字段名不一）。
 fn find_video_url(payload: &Value) -> Option<String> {
     let candidates = [
-        payload.get("content").and_then(|value| value.get("video_url")),
+        payload
+            .get("content")
+            .and_then(|value| value.get("video_url")),
         payload.get("video_url"),
         payload.get("output_url"),
         payload
@@ -360,7 +367,11 @@ fn download_video(url: &str, job: &MediaJob) -> Result<MediaJobOutput, Box<dyn E
     let dir = PathBuf::from(&job.output_dir);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("创建视频输出目录失败：{}（{error}）", dir.display()))?;
-    let path = dir.join(format!("{}-0.{}", sanitize_stem(&job.capability), extension));
+    let path = dir.join(format!(
+        "{}-0.{}",
+        sanitize_stem(&job.capability),
+        extension
+    ));
     let path = unique_path(path);
     crate::store::atomic_file::atomic_write(&path, &bytes)
         .map_err(|error| format!("视频写入失败：{}（{error}）", path.display()))?;
@@ -429,7 +440,11 @@ fn tasks_url(base_url: &str) -> Result<String, Box<dyn Error>> {
 }
 
 fn resolve_output_dir(explicit: Option<String>) -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(raw) = explicit.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(raw) = explicit
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
             return Err("output_dir 必须是绝对路径".into());
@@ -459,7 +474,10 @@ fn request_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn read_limited(response: reqwest::blocking::Response, limit: u64) -> Result<Vec<u8>, Box<dyn Error>> {
+fn read_limited(
+    response: reqwest::blocking::Response,
+    limit: u64,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut buffer = Vec::new();
     response.take(limit + 1).read_to_end(&mut buffer)?;
     if buffer.len() as u64 > limit {
@@ -520,7 +538,13 @@ fn sniff_video_mime(bytes: &[u8]) -> &'static str {
 fn sanitize_stem(value: &str) -> String {
     let stem: String = value
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = stem.trim_matches('-');
     if trimmed.is_empty() {
@@ -534,7 +558,11 @@ fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn now() -> u64 {
@@ -681,14 +709,20 @@ mod tests {
 
         let (submitted, finished) = result.expect("video pipeline");
         assert_eq!(submitted["status"], "queued");
-        assert!(submitted["job_id"].as_str().unwrap().starts_with("media_job_"));
+        assert!(submitted["job_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("media_job_"));
         assert_eq!(finished["status"], "succeeded");
         let output = &finished["outputs"][0];
         assert!(output["media_id"].as_str().unwrap().starts_with("media_"));
         assert!(PathBuf::from(output["path"].as_str().unwrap()).is_file());
 
         let text = captured.lock().unwrap().clone();
-        assert!(text.contains("POST /api/v3/contents/generations/tasks"), "{text}");
+        assert!(
+            text.contains("POST /api/v3/contents/generations/tasks"),
+            "{text}"
+        );
         assert!(text.contains("\"content\""), "{text}");
         assert!(text.contains("一只柯基在雪地里奔跑"), "{text}");
         let _ = std::fs::remove_dir_all(&home);

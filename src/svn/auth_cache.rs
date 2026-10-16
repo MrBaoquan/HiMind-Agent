@@ -227,7 +227,10 @@ mod tests {
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.starts_with("K 8\npasstype\nV 8\nwincrypt\n"));
-        assert!(body.contains(&format!("K 15\nsvn:realmstring\nV {}\n{PRODUCTION_REALM}\n", PRODUCTION_REALM.len())));
+        assert!(body.contains(&format!(
+            "K 15\nsvn:realmstring\nV {}\n{PRODUCTION_REALM}\n",
+            PRODUCTION_REALM.len()
+        )));
         assert!(body.contains("K 8\nusername\nV 9\n马宝全\n"));
         assert!(body.ends_with("END\n"));
 
