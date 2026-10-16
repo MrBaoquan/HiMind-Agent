@@ -50,6 +50,34 @@ foreach ($Name in @("himind-agent.exe", "himind-agent-launcher.exe", "himind-age
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Built binary is missing: $Source" }
     Copy-Item -LiteralPath $Source -Destination (Join-Path $ReleaseDirectory $Name)
 }
+# Subsystem gate: the Agent and the launcher must be Windows GUI binaries. A
+# console-subsystem launcher is handed a console window by Explorer before it can
+# detach it, and a console-subsystem Agent would give every console child
+# (icacls, cmd, helpers) a window of its own during startup — the black windows
+# users see between the double-click and the main window. The MCP companion
+# stays a console binary because stdio *is* its interface.
+function Get-PeSubsystem {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $Bytes = [IO.File]::ReadAllBytes($Path)
+    $PeOffset = [BitConverter]::ToInt32($Bytes, 0x3C)
+    if ([BitConverter]::ToUInt32($Bytes, $PeOffset) -ne 0x00004550) {
+        throw "Not a PE image: $Path"
+    }
+    return [BitConverter]::ToUInt16($Bytes, $PeOffset + 92)
+}
+$ExpectedSubsystem = @{
+    "himind-agent.exe"          = @{ Value = 2; Name = "GUI" }
+    "himind-agent-launcher.exe" = @{ Value = 2; Name = "GUI" }
+    "himind-agent-mcp.exe"      = @{ Value = 3; Name = "console" }
+}
+foreach ($Name in $ExpectedSubsystem.Keys) {
+    $Expectation = $ExpectedSubsystem[$Name]
+    $Actual = Get-PeSubsystem -Path (Join-Path $ReleaseDirectory $Name)
+    if ($Actual -ne $Expectation.Value) {
+        throw "$Name must be a $($Expectation.Name)-subsystem binary (subsystem $($Expectation.Value)), found $Actual; a console binary here flashes a black window at every desktop start."
+    }
+}
+
 $RepairScript = Join-Path $PSScriptRoot "repair-storage.ps1"
 if (Test-Path -LiteralPath $RepairScript -PathType Leaf) {
     Copy-Item -LiteralPath $RepairScript -Destination (Join-Path $ReleaseDirectory "repair-storage.ps1")

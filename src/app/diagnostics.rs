@@ -592,7 +592,10 @@ fn repair_integrity(path: &Path) -> Result<String, Box<dyn Error>> {
         .arg("/C")
         .output()?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string().into());
+        return Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()
+            .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -1132,10 +1135,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn integrity_reader_sees_labels_without_a_console_query() {
-        let root = std::env::temp_dir().join(format!(
-            "himind-integrity-reader-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("himind-integrity-reader-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let file = root.join("probe.txt");

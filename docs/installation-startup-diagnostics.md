@@ -1,6 +1,6 @@
 # HiMind Agent 安装与启动排查
 
-这份文档用于处理两类现场问题：桌面快捷方式显示为白色/通用图标，以及点击快捷方式后没有窗口。
+这份文档用于处理三类现场问题：桌面快捷方式显示为白色/通用图标，点击快捷方式后没有窗口，以及启动过程中反复闪出的黑色控制台窗口。
 
 ## 已确认的故障链
 
@@ -28,6 +28,27 @@ launcher 同时把登录自启项（`HKCU\Software\Microsoft\Windows\CurrentVers
 
 安装版 Agent 是 Windows GUI 子系统，标准错误输出对双击用户不可见。现在 launcher 自身启动失败会弹窗；Agent UI 启动失败会记录错误并弹窗。诊断命令和诊断包不依赖 WebView，可以在白屏或无窗口时使用。主窗口由 setup 阶段显式创建，默认 WebView2 数据目录失败时会保留原目录并用隔离目录重试；若窗口对象创建成功但 15 秒内没有页面事件，启动看门狗会再次隔离重试。
 
+### 5. 启动时反复闪出的黑窗口是控制台子进程
+
+0.3.69 及更早的启动路径上有两个控制台窗口来源：
+
+- **launcher 是控制台子系统程序。** Explorer 没有控制台，Windows 会先给它分配一个控制台窗口，launcher 只能在进程跑起来之后才 `FreeConsole`。用户看到的就是双击后先闪一个黑框，直到 Agent 窗口出现。
+- **Agent 是 GUI 子系统程序，却在启动时按 7 条存储路径各起一次 `icacls.exe` 读完整性标签。** GUI 进程没有控制台，于是每个 icacls 子进程都分到一个自己的控制台窗口——「多轮黑窗口不停出现、消失」正是这 7 次探测。0.3.69 还把主窗口显示判据放在 `--show` 上，所以这台机器上「窗口最后才出现」的黑框期比正常更长。
+
+0.3.70 的处理：
+
+- launcher 改成 Windows **GUI 子系统**，桌面双击不再创建控制台窗口；`diagnostics`、`runtime`、`trust` 子命令和 MCP 隧道不受影响，因为它们读的是调用方交下来的 std 句柄（有句柄就继承，没有就退化成 `NUL`，避免 `println!` 在无效句柄上 panic）。
+- 存储完整性级别改为直接读强制标签 SID，启动期不再启动任何 icacls；只有确实需要修复时才调用一次 `icacls /setintegritylevel`，并且带 `CREATE_NO_WINDOW`。
+- launcher 派生的每个子进程都带 `CREATE_NO_WINDOW`：没有控制台的父进程若派生控制台子进程（MCP companion、Agent 内部的命令行助手），否则 Windows 会给它新开一个窗口。
+
+测量手段（不需要管理员权限，只读）：
+
+```powershell
+cd <安装目录或仓库>
+.\scripts\startup-window-watch.ps1 -Seconds 20
+```
+
+脚本用与桌面快捷方式相同的方式启动 Agent（`Start-Process` 走 ShellExecute），并以 5 ms 间隔枚举顶层窗口，报告期间出现的每个控制台窗口的类名、标题、进程和存活时长。控制台窗口的标题就是窗口里跑的那个程序，所以标题出现 `C:\WINDOWS\system32\icacls.exe` 就说明是启动期的 icacls 探测。`-NoLaunch` 可在自己双击快捷方式时只做采样。期望结果是一行 `RESULT: no console window appeared`；`package.ps1` 另有子系统断言（launcher/Agent 必须是 GUI、MCP companion 必须是控制台），打包阶段就会拦住回归。
 ## 用户排查步骤
 
 在 PowerShell 中执行以下命令。路径带空格时保留引号。
@@ -56,6 +77,7 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 | 日志反复出现 `attempt to write a readonly database` | `storage_integrity`、`local-runs.sqlite3-wal` 和 `local-runs.sqlite3-shm` | 退出 Agent 后运行安装目录中的 `repair-storage.ps1`；它只修复 Agent 数据、SQLite sidecar 和 WebView2 目录的完整性级别，不删除数据库 |
 | `agent protocol registration repair failed: Access denied` | `protocol_registration` 与启动日志中的 `source=launcher` | 以当前用户运行 `diagnostics check`；确认协议注册指向当前安装，若完整性为 Low，先运行 `repair-storage.ps1` 后重新双击 |
 | 第二次双击没有把窗口带到前台 | `agent-events.jsonl` 中的“第二次启动参数已转发” | 如果没有该记录，检查 launcher/单实例事件窗口；如果有记录但页面事件仍为空，按 WebView2 数据目录问题处理 |
+| 双击后反复闪出黑窗口 | `scripts/startup-window-watch.ps1` 输出里的控制台窗口标题 | 标题是 `icacls.exe` 说明是 0.3.69 及更早的启动期探测，升级到 0.3.70；标题是 launcher 自身说明 launcher 退回了控制台子系统，重新安装正式包 |
 | 双击完全无反应 | `launcher` 检查和安装目录是否存在 | 从 PowerShell 运行 launcher，读取弹窗原因；检查安全软件/AppLocker 拦截记录 |
 | 自更新后双击只见到托盘、没有窗口 | 快捷方式参数（右键属性→目标）是否仍带 `--show` | 0.3.69 及更早：双击第二次可把窗口唤到前台，或重新运行安装器重建快捷方式；0.3.70 起默认显示窗口，不再依赖该参数 |
 | 安装器中止 | `logs\runtime-install.log` | 先看签名、磁盘空间和 Runtime 包完整性；把诊断包交给支持人员 |
@@ -70,6 +92,14 @@ $root = "$env:LOCALAPPDATA\HiMindAgent"
 .\scripts\package.ps1 -Version <version> -SkipBuild
 .\scripts\build-installer.ps1 -ReleaseDirectory .\artifacts\<version> -RequireAuthenticode
 ```
+
+启动窗口门禁：`package.ps1` 会断言 launcher 与 Agent 是 GUI 子系统、MCP companion 是控制台子系统；安装完成后在桌面双击快捷方式，并用
+
+```powershell
+.\scripts\startup-window-watch.ps1 -Seconds 20
+```
+
+确认输出为 `RESULT: no console window appeared`。
 
 在干净 Windows 用户环境验证：安装、桌面快捷方式图标、双击显示主窗口、注销后自动启动只显示托盘、从托盘打开主窗口、卸载后快捷方式和协议注册清理。将 `diagnostics check` 作为安装后冒烟测试；不要把“安装器进度完成”当成桌面可用的唯一信号。
 

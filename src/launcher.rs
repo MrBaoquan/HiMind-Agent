@@ -1,3 +1,16 @@
+//! `himind-agent-launcher.exe` resolves the active Agent version and starts it.
+//!
+//! On Windows it is a GUI-subsystem binary even though it is also a support CLI
+//! (`diagnostics`, `runtime`, `trust`) and the MCP entry point. A desktop
+//! double-click starts it from Explorer, which has no console, so a
+//! console-subsystem launcher gets a console window of its own — and Windows
+//! shows that window before the process can do anything about it. Detaching the
+//! console afterwards still leaves the flash the user sees between the
+//! double-click and the Agent window. A GUI-subsystem binary never gets one.
+//! Callers that need stdio are unaffected: they hand their own handles over, and
+//! the launcher passes them on (see `agent_stdio`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod install_layout;
 
 use serde_json::json;
@@ -34,13 +47,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let arguments = validated_arguments(env::args().skip(1).collect())?;
     let mcp_mode = arguments.iter().any(|argument| argument == "--mcp");
     let cli_mode = is_cli_launch(&arguments);
-    // A desktop launch is the one entry point whose console nobody reads: it
-    // exists only because Windows hands a console-subsystem binary a console
-    // window when Explorer starts it. Detach before anything else can slow the
-    // launch down, so that window goes away instead of sitting over the desktop
-    // until the Agent window appears.
-    let detach_console = !mcp_mode && !cli_mode && launcher_owns_its_console();
-    if detach_console {
+    // Desktop launches are the entry point whose console nobody reads. The
+    // launcher is GUI-subsystem so there is nothing to detach in the shipped
+    // build; detaching stays as the fallback for a console-subsystem build, and
+    // it has to run before anything else can slow the launch down.
+    let desktop_launch = !mcp_mode && !cli_mode;
+    if desktop_launch && launcher_owns_its_console() {
         detach_launcher_console();
     }
     if !is_protocol_launch(&arguments) {
@@ -80,6 +92,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     if env::var_os("HIMIND_REQUIRE_SIGNED_UPDATES").is_none() {
         command.env("HIMIND_REQUIRE_SIGNED_UPDATES", "true");
     }
+    // No console window for the child either: the launcher has no console, so a
+    // console-subsystem child (the MCP companion, or a helper the Agent starts)
+    // would allocate one of its own and put it on the desktop. Inherited std
+    // handles — what MCP and CLI callers actually read — are untouched.
+    configure_child_process(&mut command);
     if mcp_mode || cli_mode {
         // MCP clients own the stdio contract. The launcher must stay attached
         // until the selected Agent exits and must propagate its exit code.
@@ -90,17 +107,68 @@ fn run() -> Result<(), Box<dyn Error>> {
         let status = child.wait()?;
         std::process::exit(status.code().unwrap_or(1));
     }
-    if detach_console {
-        // Nothing can render text any more, and a child that inherits a closed
-        // console handle fails on its first `println!`. Give it a null sink:
-        // everything that matters is already in `logs/agent-events.jsonl`.
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
-    }
+    let (stdin, stdout, stderr) = agent_stdio();
+    command.stdin(stdin).stdout(stdout).stderr(stderr);
     command.spawn()?;
     Ok(())
 }
+
+/// Standard streams for a desktop-launched Agent.
+///
+/// Explorer hands a GUI-subsystem process no standard handles at all, and the
+/// Agent is GUI-subsystem too: Rust's `println!` panics on an invalid handle, so
+/// passing NULL through would abort the start before a window appeared. Handing
+/// the child `NUL` keeps the startup log out of a window nobody wants while
+/// `logs/agent-events.jsonl` keeps every line that matters. A start from a
+/// terminal does have handles, and there they stay inherited — that is how
+/// `himind-agent-launcher.exe --api ... --local-app` can still be read while
+/// debugging.
+fn agent_stdio() -> (Stdio, Stdio, Stdio) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        fn present(which: u32) -> bool {
+            let handle = unsafe { GetStdHandle(which) };
+            !handle.is_null() && handle != INVALID_HANDLE_VALUE
+        }
+
+        let stdout = if present(STD_OUTPUT_HANDLE) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        let stderr = if present(STD_ERROR_HANDLE) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        (Stdio::null(), stdout, stderr)
+    }
+    #[cfg(not(windows))]
+    {
+        (Stdio::null(), Stdio::inherit(), Stdio::inherit())
+    }
+}
+
+/// Start children without a console window of their own.
+///
+/// The launcher has no console, so a console-subsystem child would otherwise
+/// allocate one and flash it over the desktop. `CREATE_NO_WINDOW` only suppresses
+/// console allocation; inherited std handles, which is what MCP and CLI callers
+/// use, are untouched.
+#[cfg(windows)]
+fn configure_child_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_child_process(_command: &mut Command) {}
 
 /// The launcher is a Windows GUI-adjacent process, so stderr is invisible for
 /// a desktop double-click. Keep protocol-repair failures in the same bounded
@@ -133,10 +201,11 @@ fn record_launcher_event(root: &Path, level: &str, message: &str) {
 
 /// Whether the console this process is attached to exists only because of it.
 ///
-/// A desktop launch is started by Explorer, which has no console, so Windows
-/// creates one for the launcher — that window is the black frame users see while
-/// the Agent starts. A launch from a terminal or a script shares that caller's
-/// console, and there the console output *is* the feedback, so it has to stay.
+/// Only reachable in a console-subsystem build: the shipped launcher is
+/// GUI-subsystem and never has a console. Kept as the fallback, because a build
+/// without the subsystem attribute is exactly how the black startup window comes
+/// back. A launch from a terminal or a script shares that caller's console, and
+/// there the console output *is* the feedback, so it has to stay.
 #[cfg(windows)]
 fn launcher_owns_its_console() -> bool {
     use windows_sys::Win32::System::Console::GetConsoleProcessList;
@@ -155,13 +224,13 @@ fn launcher_owns_its_console() -> bool {
 
 /// Drop the console window Windows created for a desktop launch.
 ///
-/// The launcher stays a console-subsystem binary so that the `diagnostics`,
-/// `runtime` and `trust` subcommands — and the MCP tunnel — keep a usable stdio.
-/// A desktop launch needs none of that, and the window it gets is never wanted.
-/// `FreeConsole` only detaches this process: a launcher-owned console is
-/// destroyed together with its window, a shared one is left alone. Deliberately
-/// no `ShowWindow(SW_HIDE)` — on a shared console that would hide the user's own
-/// terminal window.
+/// Fallback for a console-subsystem build: the `diagnostics`, `runtime` and
+/// `trust` subcommands — and the MCP tunnel — keep a usable stdio without it,
+/// because a GUI-subsystem process still inherits the std handles of whoever
+/// started it. `FreeConsole` only detaches this process: a launcher-owned console
+/// is destroyed together with its window, a shared one is left alone.
+/// Deliberately no `ShowWindow(SW_HIDE)` — on a shared console that would hide
+/// the user's own terminal window.
 #[cfg(windows)]
 fn detach_launcher_console() {
     unsafe { windows_sys::Win32::System::Console::FreeConsole() };
