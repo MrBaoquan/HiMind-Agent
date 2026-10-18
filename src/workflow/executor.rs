@@ -85,12 +85,14 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
         }
         let mut context = self.context.clone();
         context.request_id = format!("{}:{}", self.context.request_id, step.id);
-        let capability = self
-            .gateway
-            .list_capabilities(&context)?
+        let capabilities = self.gateway.list_capabilities(&context)?;
+        // 主能力不可用时按清单里的候选 provider 执行。必须与预检用同一份声明顺序，
+        // 否则会出现「预检说能用候选、运行期却仍按主能力调」的错位。
+        let resolved_id = resolve_capability_id(package, step.capability_id.trim(), &capabilities);
+        let capability = capabilities
             .into_iter()
-            .find(|capability| capability.id == capability_id)
-            .ok_or_else(|| format!("capability not found: {capability_id}"))?;
+            .find(|capability| capability.id == resolved_id)
+            .ok_or_else(|| format!("capability not found: {resolved_id}"))?;
         let resolved =
             super::connector::resolve_connector_credentials_for_capability_with_redactions(
                 package,
@@ -98,7 +100,7 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
                 input,
             )?;
         let input = capability_input(&capability.input_schema, &resolved.input);
-        let output = self.gateway.invoke(&context, capability_id, input)?;
+        let output = self.gateway.invoke(&context, &resolved_id, input)?;
         let output = redact_connector_secret_values(output, &resolved.redactions);
         let (artifacts, usage) = workflow_result_metadata(&output)?;
         Ok(WorkflowStepExecution {
@@ -107,6 +109,34 @@ impl WorkflowStepExecutor for WorkflowGatewayExecutor {
             usage,
         })
     }
+}
+
+/// 这一步实际调用的能力：主能力可用就用主能力，否则按清单顺序挑第一个可用的候选。
+/// 与 `workflow::preflight` 的解析口径保持一致（ControlPlane 且无工作台 provider 视为不可用）。
+fn resolve_capability_id(
+    package: &WorkflowPackage,
+    requested: &str,
+    available: &[crate::capability::types::CapabilityDescriptor],
+) -> String {
+    let usable = super::capability_is_usable;
+    if available
+        .iter()
+        .any(|capability| capability.id == requested && usable(capability))
+    {
+        return requested.to_string();
+    }
+    package
+        .capability_alternatives
+        .get(requested)
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            available
+                .iter()
+                .any(|capability| capability.id == candidate.as_str() && usable(capability))
+        })
+        .cloned()
+        .unwrap_or_else(|| requested.to_string())
 }
 
 fn redact_connector_secret_values(value: Value, secrets: &[String]) -> Value {
@@ -259,6 +289,7 @@ mod tests {
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),
             capabilities: vec!["test.capability".to_string()],
+            capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,
             execution_policy: "strict".to_string(),

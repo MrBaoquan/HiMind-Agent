@@ -5,8 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -873,6 +874,188 @@ pub(crate) fn publish(
 }
 
 /// 便捷入口：读取本机凭据后发布，缺少凭据时给出可执行的提示。
+/// 把一个制品作为 GitHub Release 资产投递出去（独立模式可用）。
+///
+/// 与 `distribution.release.publish`（工作台）的区别是**语义**：这里只做「制品进
+/// Release」，不含组织级审核与不可变制品签名；调用方要清楚拿到的是仓库级发布。
+/// 用本机已授权 GitHub 账号的令牌，且尊重账号绑定的仓库白名单。
+pub(crate) fn publish_artifact_to_github(input: &Value) -> Result<Value, Box<dyn Error>> {
+    let workspace = input
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("workspace_root is required")?;
+    let artifact = input
+        .get("artifact_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("artifact_path is required")?;
+    // 只允许发布工作区内的文件：否则这条能力会变成「把本机任意文件推到 GitHub」。
+    let workspace_path = Path::new(workspace).canonicalize()?;
+    let artifact_path = Path::new(artifact).canonicalize()?;
+    if !artifact_path.starts_with(&workspace_path) {
+        return Err(format!("artifact_path must remain inside workspace_root: {artifact}").into());
+    }
+    let metadata = std::fs::metadata(&artifact_path)?;
+    if !metadata.is_file() {
+        return Err(format!("artifact_path is not a file: {artifact}").into());
+    }
+    let (repository, tag, asset_name) = resolve_publish_target(input, &workspace_path)?;
+    let kind = text_field(input, "kind");
+    let id = text_field(input, "id");
+    let version = text_field(input, "version");
+    let expected_sha256 = text_field(input, "expected_sha256");
+    let sha256 = format!("{:x}", Sha256::digest(std::fs::read(&artifact_path)?));
+    if !expected_sha256.is_empty() && !expected_sha256.eq_ignore_ascii_case(&sha256) {
+        return Err(format!(
+            "artifact sha256 mismatch: expected {expected_sha256}, actual {sha256}"
+        )
+        .into());
+    }
+    let plan = GithubPublishPlan {
+        kind: if kind.is_empty() {
+            "artifact".to_string()
+        } else {
+            kind
+        },
+        id: if id.is_empty() {
+            asset_name.clone()
+        } else {
+            id
+        },
+        version: if version.is_empty() {
+            tag.clone()
+        } else {
+            version
+        },
+        repository,
+        commit: String::new(),
+        branch: String::new(),
+        release_name: {
+            let name = text_field(input, "release_name");
+            if name.is_empty() {
+                tag.clone()
+            } else {
+                name
+            }
+        },
+        release_notes: text_field(input, "release_notes"),
+        channel: text_field(input, "channel"),
+        prerelease: input
+            .get("prerelease")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        artifacts: vec![GithubArtifact {
+            name: asset_name,
+            path: artifact_path,
+            sha256,
+            size_bytes: metadata.len(),
+            content_type: "application/octet-stream".to_string(),
+        }],
+        signature: None,
+    };
+    let outcome = publish_with_stored_credential(&plan, &PreviousRelease::default())?;
+    Ok(json!({
+        "released": true,
+        "repository": outcome.repository,
+        "tag": outcome.tag,
+        "release_id": outcome.release_id,
+        "html_url": outcome.html_url,
+        "asset_name": outcome.asset_name,
+        "sha256": outcome.sha256,
+        "size_bytes": outcome.size_bytes,
+        "reused_assets": outcome.reused_assets,
+        // 显式说清语义，免得被当成工作台发布
+        "review_required": false,
+        "signed": false,
+    }))
+}
+
+/// 解析发布目标：兼容「扩展制品」与「软件发布请求」两种入参形状。
+///
+/// 软件发布步骤（工作台）的请求带 product_id/product_name/version/channel…，没有
+/// repository；独立模式下改走 GitHub 时，从工作区的 git remote 推导目标仓库，
+/// 并用 release/<product_id>@<version> 作 tag。这样同一个步骤输入能同时喂给两个
+/// provider，不需要运行期改工作流输入。
+fn resolve_publish_target(
+    input: &Value,
+    workspace: &Path,
+) -> Result<(String, String, String), Box<dyn Error>> {
+    let explicit = text_field(input, "repository");
+    let repository = if explicit.is_empty() {
+        derive_repository_from_workspace(workspace)?
+    } else {
+        normalize_repository_slug(&explicit)?
+    };
+    let file_name = input
+        .get("artifact_path")
+        .and_then(Value::as_str)
+        .map(|value| {
+            Path::new(value)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let kind = text_field(input, "kind");
+    let id = text_field(input, "id");
+    let version = text_field(input, "version");
+    let product_id = text_field(input, "product_id");
+    let explicit_tag = text_field(input, "tag");
+    let provided_asset = text_field(input, "asset_name");
+    let (tag, default_asset) = if !kind.is_empty() && !id.is_empty() && !version.is_empty() {
+        (
+            tag_name(&kind, &id, &version)?,
+            asset_name(&kind, &id, &version)?,
+        )
+    } else if !product_id.is_empty() && !version.is_empty() {
+        (format!("release/{product_id}@{version}"), file_name)
+    } else if !explicit_tag.is_empty() {
+        (explicit_tag, file_name)
+    } else {
+        return Err(
+            "tag is required when kind/id/version and product_id/version are not provided".into(),
+        );
+    };
+    let asset_name = if provided_asset.is_empty() {
+        default_asset
+    } else {
+        provided_asset
+    };
+    Ok((repository, tag, asset_name))
+}
+
+/// 从工作区 git remote 推导发布仓库（独立模式下没有工作台告诉我们要发到哪）。
+fn derive_repository_from_workspace(workspace: &Path) -> Result<String, Box<dyn Error>> {
+    let Some(git) = crate::runtime::process::resolve_executable("git") else {
+        return Err("repository is required (未找到 git，无法从工作区推导发布仓库)".into());
+    };
+    let mut command = crate::runtime::process::hidden_command(&git);
+    command
+        .args(["remote", "get-url", "origin"])
+        .current_dir(workspace);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err("repository is required (工作区没有 git origin，无法推导发布仓库)".into());
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Err("repository is required (git origin 为空)".into());
+    }
+    normalize_repository_slug(&value)
+}
+
+fn text_field(input: &Value, field: &str) -> String {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(crate) fn publish_with_stored_credential(
     plan: &GithubPublishPlan,
     previous: &PreviousRelease,
@@ -980,6 +1163,88 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn publish_input(workspace: &Path, artifact: &Path) -> Value {
+        json!({
+            "workspace_root": workspace.to_string_lossy(),
+            "artifact_path": artifact.to_string_lossy(),
+            "repository": "example/repo",
+            "tag": "demo/v1.0.0",
+        })
+    }
+
+    #[test]
+    fn resolves_dashboard_shaped_publish_targets() {
+        // 独立模式下软件发布步骤仍然交来 workbench 形状的请求：没有 repository，
+        // 只有 product_id/version。这里必须能推导出发布目标，而不是报缺字段。
+        let root = std::env::temp_dir().join(format!("himind-gh-target-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let input = json!({
+            "workspace_root": root.to_string_lossy(),
+            "artifact_path": root.join("app.zip").to_string_lossy(),
+            "repository": "example/repo",
+            "product_id": "com.example.app",
+            "product_name": "示例应用",
+            "version": "1.2.3",
+            "channel": "stable",
+            "platform": "windows",
+            "architecture": "x64"
+        });
+        let (repository, tag, asset) = resolve_publish_target(&input, &root).unwrap();
+        assert_eq!(repository, "example/repo");
+        assert_eq!(tag, "release/com.example.app@1.2.3");
+        assert_eq!(asset, "app.zip");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_repository_without_a_git_origin_is_explained() {
+        let root = std::env::temp_dir().join(format!("himind-gh-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let input = json!({
+            "workspace_root": root.to_string_lossy(),
+            "artifact_path": root.join("app.zip").to_string_lossy(),
+            "product_id": "com.example.app",
+            "version": "1.0.0"
+        });
+        let error = resolve_publish_target(&input, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repository is required"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn publish_artifact_validates_its_inputs_before_touching_github() {
+        // 校验路径不碰网络：先缺必需字段、再越界制品、最后摘要不符，三种都必须在
+        // 拿到令牌之前就被拒绝 —— 否则一条「独立模式可用」的发布能力会变成随便推文件。
+        let root = std::env::temp_dir().join(format!("himind-gh-publish-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let artifact = root.join("demo.hmpkg");
+        std::fs::write(&artifact, b"payload").unwrap();
+
+        let missing =
+            publish_artifact_to_github(&json!({ "workspace_root": root.to_string_lossy() }))
+                .unwrap_err()
+                .to_string();
+        assert!(missing.contains("artifact_path"), "{missing}");
+
+        let outside = std::env::temp_dir().join("himind-gh-outside.hmpkg");
+        std::fs::write(&outside, b"payload").unwrap();
+        let mut input = publish_input(&root, &outside);
+        let escape = publish_artifact_to_github(&input).unwrap_err().to_string();
+        assert!(escape.contains("inside workspace_root"), "{escape}");
+
+        input = publish_input(&root, &artifact);
+        input["expected_sha256"] = json!("0".repeat(64));
+        let mismatch = publish_artifact_to_github(&input).unwrap_err().to_string();
+        assert!(mismatch.contains("sha256 mismatch"), "{mismatch}");
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]

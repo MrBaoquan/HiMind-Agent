@@ -67,6 +67,16 @@ pub(crate) use store::{InstalledWorkflow, WorkflowStore};
 
 pub(crate) const WORKFLOW_PACKAGE_SCHEMA_VERSION: &str = "workflow_package.v1";
 
+/// 能力在当下是否可用：控制面能力只有接上工作台（dashboard_provider）才算可用。
+///
+/// 预检与运行期必须共用这一条判据，否则会出现「预检说可用、运行期调不到」。
+pub(crate) fn capability_is_usable(
+    capability: &crate::capability::types::CapabilityDescriptor,
+) -> bool {
+    capability.availability != crate::capability::types::CapabilityAvailability::ControlPlane
+        || capability.dashboard_provider
+}
+
 pub(crate) fn workflow_approval_id(run_id: &str, step_id: &str) -> String {
     format!("workflow:{}:{}", run_id.trim(), step_id.trim())
 }
@@ -99,6 +109,15 @@ pub(crate) struct WorkflowPackage {
     pub optional_providers: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// 声明能力的候选提供方：主能力不可用时，任一候选可用即视为满足。
+    ///
+    /// 典型用途是控制面/独立模式的差异：软件发布工作流声明
+    /// `distribution.release.publish`（工作台发布，独立模式下不可用），同时把
+    /// `distribution.release.publish.github`（仓库级发布，Local）列为候选 —— 这样
+    /// 独立模式下预检不再把整条工作流拦死。预检会明确写出实际使用的是候选提供方，
+    /// 不静默降级。
+    #[serde(default)]
+    pub capability_alternatives: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub dependencies: WorkflowDependencies,
     #[serde(default)]
@@ -491,6 +510,19 @@ impl WorkflowPackage {
             return Err("workflow local_requirements must be an object".to_string());
         }
         validate_unique_text("capability", &self.capabilities)?;
+        for (primary, alternatives) in &self.capability_alternatives {
+            if !self.capabilities.iter().any(|item| item == primary) {
+                return Err(format!(
+                    "capability alternative declares an undeclared primary: {primary}"
+                ));
+            }
+            validate_unique_text("capability alternative", alternatives)?;
+            if alternatives.iter().any(|item| item == primary) {
+                return Err(format!(
+                    "capability alternative cannot point at its primary: {primary}"
+                ));
+            }
+        }
         validate_unique_text("optional provider", &self.optional_providers)?;
         validate_unique_text("supported runtime", &self.supported_runtimes)?;
         validate_dependency_refs("skill", &self.dependencies.skills)?;

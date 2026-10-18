@@ -267,11 +267,39 @@ pub(crate) fn preflight(
         .capabilities
         .iter()
         .map(|capability_id| {
-            let capability = capability_map.get(capability_id.as_str()).copied();
-            let available = capability.is_some_and(|capability| {
-                capability.availability != CapabilityAvailability::ControlPlane
-                    || capability.dashboard_provider
+            let usable = super::capability_is_usable;
+            let primary = capability_map
+                .get(capability_id.as_str())
+                .copied()
+                .filter(|capability| usable(capability));
+            // 主提供方不可用时看候选：独立模式下的 GitHub 发布就是靠这一条接住的。
+            let capability = primary.or_else(|| {
+                package
+                    .capability_alternatives
+                    .get(capability_id)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|candidate| {
+                        capability_map
+                            .get(candidate.as_str())
+                            .copied()
+                            .filter(|capability| usable(capability))
+                    })
             });
+            let available = capability.is_some();
+            if available && primary.is_none() {
+                push_warning(
+                    &mut diagnostics,
+                    "capability.alternative_provider",
+                    "dependencies",
+                    format!(
+                        "capability {capability_id} 的主提供方不可用，本次使用候选提供方 {}",
+                        capability.map(|item| item.id.as_str()).unwrap_or_default()
+                    ),
+                    "确认候选提供方的发布语义（例如仓库级发布不经过组织审核与制品签名）。",
+                    true,
+                );
+            }
             if !available {
                 push_blocker(
                     &mut diagnostics,
@@ -1493,6 +1521,7 @@ mod tests {
             local_requirements: json!({"required_tools": required_tools}),
             optional_providers: Vec::new(),
             capabilities: vec!["system.health".to_string()],
+            capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,
             execution_policy: "strict".to_string(),

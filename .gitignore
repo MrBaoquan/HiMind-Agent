@@ -17,6 +17,8 @@
 !/.env.example
 *.log
 *.tmp
+# 本地 e2e 截图、日志和临时验收产物，不作为源码提交。
+.acceptance/
 *.exe
 *.pdb
 

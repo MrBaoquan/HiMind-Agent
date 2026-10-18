@@ -36,6 +36,8 @@ type AiToolsPanelProps = {
   onOpenAccount: () => void;
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
+  /** 没有可用来源时，「模型」接线要给一条去「模型来源」的路，而不是只留一个禁用按钮。 */
+  onOpenModelSources: () => void;
   onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) => Promise<void>;
   gatewayBusy: boolean;
   onRestartGateway: () => void;
@@ -47,6 +49,12 @@ type AiToolsPanelProps = {
 };
 
 type Filter = 'all' | 'attention' | 'idle' | 'ready';
+
+/**
+ * 工具多到这个数才值得在列表头上摆一行筛选按钮。少于它时计数留在概览卡里，
+ * 两边用同一个阈值，同一组数字才不会在同一屏里出现两遍。
+ */
+const FILTER_ROW_MIN_TOOLS = 4;
 
 export function AiToolsPanel({
   targets,
@@ -67,6 +75,7 @@ export function AiToolsPanel({
   onOpenAccount,
   onImportAIClient,
   onRemoveAIClient,
+  onOpenModelSources,
   onSetBindingMode,
   gatewayBusy,
   onRestartGateway,
@@ -96,6 +105,8 @@ export function AiToolsPanel({
     [targets, clients, acpProfiles],
   );
 
+  // 一条可用来源都没有时，页面上所有「模型」接线都会落空：这件事要在列表之前说明。
+  const hasAnySource = managed.available || customServices.length > 0;
   const detected = connections.filter((item) => item.detected);
   const attention = detected.filter((item) => item.state === 'attention');
   const ready = detected.filter((item) => item.state === 'ready');
@@ -153,12 +164,15 @@ export function AiToolsPanel({
             <span>{headlineDescription}</span>
           </div>
         </div>
-        <div className="ai-overview-stats" aria-label="工具接入统计">
-          <div><span>已就绪</span><strong>{ready.length}</strong></div>
-          <div><span>待处理</span><strong className={attention.length ? 'warning-text' : ''}>{attention.length}</strong></div>
-          <div><span>未接入</span><strong>{idle.length}</strong></div>
-          <div><span>已发现</span><strong>{detected.length}</strong></div>
-        </div>
+        {/* 计数只出现一次：工具多到摆得下筛选按钮时交给按钮，概览卡不再重复一遍。 */}
+        {detected.length < FILTER_ROW_MIN_TOOLS ? (
+          <div className="ai-overview-stats" aria-label="工具接入统计">
+            <div><span>已就绪</span><strong>{ready.length}</strong></div>
+            <div><span>待处理</span><strong className={attention.length ? 'warning-text' : ''}>{attention.length}</strong></div>
+            <div><span>未接入</span><strong>{idle.length}</strong></div>
+            <div><span>已发现</span><strong>{detected.length}</strong></div>
+          </div>
+        ) : null}
         <div className="ai-overview-actions">
           <button className="btn btn-primary" disabled={Boolean(busyAction) || !actionable.length} onClick={onApplyAll}>
             <PlugZap size={15} />{busyAction === 'apply-all' ? '接入中' : actionable.length ? '接入全部' : '已接入'}
@@ -178,6 +192,8 @@ export function AiToolsPanel({
       ) : null}
 
       {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>工作台账号未连接</strong><span>不影响本机工具接入；需要工作台数据时再连接账号。</span></div><button className="btn" onClick={onOpenAccount}>连接账号</button></div> : null}
+
+      {!hasAnySource ? <div className="blocker"><CircleAlert size={18} /><div><strong>还没有模型来源</strong><span>接入工具后要给它一份模型配置，先添加一条来源。</span></div><button className="btn" onClick={onOpenModelSources}>新增模型来源</button></div> : null}
 
       <details className={`ai-advanced ai-gateway-advanced${gatewayStatus?.running ? ' is-running' : ''}`}>
         <summary>
@@ -202,7 +218,7 @@ export function AiToolsPanel({
       <section className="ai-client-section">
         <div className="ai-section-heading">
           <div><h3>工具</h3><span>展开任一工具，管理它的接入、模型与执行接线。</span></div>
-          {detected.length >= 4 ? (
+          {detected.length >= FILTER_ROW_MIN_TOOLS ? (
             <div className="ai-binding-filter" role="group" aria-label="筛选工具">
               <button type="button" aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>全部 <span>{detected.length}</span></button>
               <button type="button" aria-pressed={filter === 'attention'} onClick={() => setFilter('attention')}>待处理 <span>{attention.length}</span></button>
@@ -235,6 +251,7 @@ export function AiToolsPanel({
               onOpenDirectory={onOpenDirectory}
               onImportAIClient={onImportAIClient}
               onRemoveAIClient={onRemoveAIClient}
+              onOpenModelSources={onOpenModelSources}
               onSetBindingMode={onSetBindingMode}
               onSourceDraft={(value) => setSourceDraft((current) => ({ ...current, [item.key]: value }))}
               onSaveAcpProfile={onSaveAcpProfile}
@@ -373,6 +390,7 @@ function ToolRow(props: {
   onOpenDirectory: (path: string) => void;
   onImportAIClient: (target: string, service?: string, replace?: boolean) => Promise<void>;
   onRemoveAIClient: (target: string) => Promise<void>;
+  onOpenModelSources: () => void;
   onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) => Promise<void>;
   onSourceDraft: (value: string) => void;
   onSaveAcpProfile: (input: AcpRuntimeProfileInput) => Promise<void>;
@@ -385,7 +403,7 @@ function ToolRow(props: {
   const {
     item, expanded, rowBusy, busyAction, customServices, managed, managedLabel, gatewayClientSet,
     defaultSource, sourceDraft, acpProfiles, onToggle, onApplyTarget, onRemoveTarget, onCopyTarget,
-    onOpenDirectory, onImportAIClient, onRemoveAIClient, onSetBindingMode, onSourceDraft,
+    onOpenDirectory, onImportAIClient, onRemoveAIClient, onOpenModelSources, onSetBindingMode, onSourceDraft,
     onSaveAcpProfile, onSetAcpProfileEnabled, onRemoveAcpProfile, onRunRow, confirm,
   } = props;
 
@@ -400,6 +418,8 @@ function ToolRow(props: {
     { value: 'managed', label: managedLabel, disabled: !managed.available },
     ...customServices.map((service) => ({ value: `custom:${service.id}`, label: service.display_name })),
   ];
+  // 一条可用来源都没有时，这一格不能只留一个禁用下拉：说清缺什么并给出下一步。
+  const hasUsableSource = sourceOptions.some((option) => !option.disabled);
 
   async function changeSource(next: string) {
     if (!next || next === (item.model?.service ?? '')) return;
@@ -455,7 +475,10 @@ function ToolRow(props: {
             <div className="ai-tool-wire">
               <span className="ai-tool-wire-kind">模型</span>
               <span className="ai-tool-wire-state">
-                {modelImported ? <>
+                {!hasUsableSource ? <>
+                  <span className="status-dot" />
+                  <span className="muted">还没有可用的模型来源</span>
+                </> : modelImported ? <>
                   <span className={`status-dot ${gatewayMode ? 'warn' : 'success'}`} />
                   <select className="ai-service-route-select ai-tool-source-select" aria-label={`${item.name} 的模型来源`} title={sourceOptions.some((option) => option.value === (item.model?.service ?? '')) ? undefined : '当前绑定的来源没有记录，可在这里重新选择'} value={item.model?.service ?? ''} disabled={rowBusy} onChange={(event) => void changeSource(event.target.value)}>
                     {sourceOptions.map((option) => <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>)}
@@ -471,7 +494,9 @@ function ToolRow(props: {
                 </>}
               </span>
               <span className="ai-tool-wire-actions">
-                {modelImported ? <>
+                {!hasUsableSource ? (
+                  <button type="button" className="btn btn-primary ai-service-tool-btn" onClick={onOpenModelSources}><PlugZap size={14} />新增模型来源</button>
+                ) : modelImported ? <>
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} title={gatewayMode ? '切回直连：把真实地址与密钥写回该工具' : '切到网关：密钥留在 Agent'} onClick={() => void onRunRow(item.key, () => onSetBindingMode(item.key, gatewayMode ? 'direct' : 'gateway'))}>{rowBusy ? <BusyIndicator size={11} /> : null}{gatewayMode ? '切回直连' : '切到网关'}</button>
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} onClick={() => { void confirm({ title: `取消分发到 ${item.name}？`, description: '取消后该工具恢复自己的模型配置，服务仍可再分发。', confirmText: '取消分发' }).then((accepted) => { if (accepted) void onRunRow(item.key, () => onRemoveAIClient(item.key)); }); }}>{rowBusy ? <BusyIndicator size={11} /> : null}取消分发</button>
                 </> : (

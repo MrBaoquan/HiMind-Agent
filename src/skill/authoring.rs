@@ -459,7 +459,8 @@ pub(crate) fn test(
     let mut draft = read(skill_id, version)?;
     ensure_candidate_unchanged(&draft)?;
     let mut client_readiness = BTreeMap::new();
-    let mut readiness_blockers = Vec::new();
+    // 按原因归并：一条依赖缺失会在每个客户端上各报一次，逐条铺开就是八行同义句。
+    let mut readiness_blockers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for client_id in crate::skill::active_client_ids_for_manifest(&draft.manifest) {
         if client_readiness.contains_key(&client_id) {
             continue;
@@ -467,12 +468,12 @@ pub(crate) fn test(
         let readiness =
             SkillReadiness::resolve(&draft.manifest, capability_facts, VERSION, &client_id);
         if readiness.state == "blocked" {
-            readiness_blockers.extend(
-                readiness
-                    .reasons
-                    .iter()
-                    .map(|reason| format!("{client_id}: {reason}")),
-            );
+            for reason in &readiness.reasons {
+                readiness_blockers
+                    .entry(reason.clone())
+                    .or_insert_with(Vec::new)
+                    .push(client_id.clone());
+            }
         }
         client_readiness.insert(client_id, readiness);
     }
@@ -481,12 +482,27 @@ pub(crate) fn test(
     }
     let plugin_issues = plugin_dependency_issues(&draft.manifest.plugin_dependencies);
     if !readiness_blockers.is_empty() || !plugin_issues.is_empty() {
-        return Err(format!(
-            "Skill 本地预检未通过: {}{}",
-            readiness_blockers.join(", "),
-            plugin_issues.join(", ")
-        )
-        .into());
+        let client_total = client_readiness.len().max(1);
+        let mut parts: Vec<String> = readiness_blockers
+            .iter()
+            .map(|(reason, clients)| {
+                let scope = if clients.len() >= client_total {
+                    "全部客户端".to_string()
+                } else {
+                    let mut names = clients.clone();
+                    names.sort();
+                    let head: Vec<String> = names.iter().take(3).cloned().collect();
+                    format!(
+                        "{}{}",
+                        head.join("、"),
+                        if names.len() > head.len() { " 等" } else { "" }
+                    )
+                };
+                format!("{scope}：{reason}")
+            })
+            .collect();
+        parts.extend(plugin_issues);
+        return Err(format!("Skill 本地预检未通过: {}", parts.join("；")).into());
     }
     let snapshot = SkillTestSnapshot::capture(&draft.manifest, capability_facts)?;
     let test_result =

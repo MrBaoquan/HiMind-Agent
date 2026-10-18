@@ -12,7 +12,7 @@ import { extensionKindLabels, extensionKindOrder } from '../data/extensionKinds'
 import { agentApi } from '../services/agentApi';
 import { compareVersions } from './marketCatalog';
 import { formatCompactStamp, formatStamp } from '../timeFormat';
-import type { AuthoringPluginDraft, AuthoringSkillDraft, AuthoringWorkflowDraft, CreateExtensionProjectInput, DistributionPreview, DistributionStateEntry, DistributionTarget, ExpertAuthoringDraft, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, ExtensionSourceConfig, ExtensionWorkspaceEntry, ExtensionWorkspaceSettings, InstructionPackDraft, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
+import type { AuthoringPluginDraft, AuthoringSkillDraft, AuthoringWorkflowDraft, CreateExtensionProjectInput, DistributionPreview, DistributionStateEntry, DistributionTarget, ExpertAuthoringDraft, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionDevelopmentReadiness, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, ExtensionSourceConfig, ExtensionWorkspaceEntry, ExtensionWorkspaceSettings, InstructionPackDraft, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
 
 type DraftRef =
   | { kind: 'plugin'; value: AuthoringPluginDraft }
@@ -52,6 +52,23 @@ type WorkspaceItem = {
   extensionCount: number;
   running: boolean;
 };
+
+/// 「一键构建」的运行进度：建到第几个、正在建哪个扩展。
+type WorkspaceBuildProgress = { done: number; total: number; name: string };
+
+/// 「一键构建」里失败的那条扩展及其原因，由父层跑完整批后一次性交回。
+type WorkspaceBuildFailure = { name: string; message: string };
+
+/// 整批构建的结果：成功数、失败项、因为依赖没建起来而跳过的项。
+/// 跳过不算失败：依赖没成功时硬建只会再堆一条同义错误。
+type WorkspaceBuildOutcome = {
+  succeeded: number;
+  failures: WorkspaceBuildFailure[];
+  skipped: Array<{ name: string; reason: string }>;
+};
+
+/// 交给父层执行的构建项：依赖声明随行带上，执行侧才能判断先后与跳过。
+type WorkspaceBuildItem = { id: string; name: string; extensionId: string; dependencies: string[] };
 
 /// 「工作台项目」不是目录工作区，但需要一个固定键才能和左栏选中状态共用一套逻辑。
 const UNMANAGED_KEY = '__unmanaged__';
@@ -101,6 +118,9 @@ type DevelopmentPageProps = {
   onOpenProject: () => Promise<void>;
   onAssociateProject: (project: ExtensionRemoteProject) => Promise<void>;
   onBuild: (projectId: string, onProgress?: (stage: ExtensionBuildStage) => void) => Promise<void>;
+  /// 工作区级「一键构建」：按给定顺序跑同一条构建流水线，被依赖者没成功就跳过依赖者。
+  /// 单个扩展失败不打断后面的；失败与跳过原样交回页面，由本页一次性说明。
+  onBuildWorkspace: (projects: WorkspaceBuildItem[], onProgress?: (progress: WorkspaceBuildProgress) => void) => Promise<WorkspaceBuildOutcome>;
   onDevelopWithAi: (project: ExtensionProject) => void;
   /// 「用 AI 开发」：把某个扩展工作区交给 HiMind AI，直接开一条绑定该目录的会话。
   /// 与来源管理里的「设为当前工作区并打开扩展开发」是两件事，故不与 onDevelopWorkspace 同名。
@@ -137,6 +157,12 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
   const [removeProject, setRemoveProject] = useState<ExtensionProject | null>(null);
   const [runningSessions, setRunningSessions] = useState<Set<string>>(() => new Set());
   const [actionError, setActionError] = useState('');
+  /// 「一键构建」的运行状态：非空表示正在按顺序构建当前工作区里的扩展。
+  const [workspaceBuild, setWorkspaceBuild] = useState<WorkspaceBuildProgress | null>(null);
+  /// 构建执行源：装了扩展开发工具走插件执行器，没装就走内核实现。
+  const [readiness, setReadiness] = useState<ExtensionDevelopmentReadiness | null>(null);
+  /// 上一批失败的项：环境类（网络/超时）修好之后应当能直接重试，不必从头再造一遍。
+  const [failedBatch, setFailedBatch] = useState<Array<{ id: string; name: string }>>([]);
   /// 上一次新建扩展选的工作区。它是「上次选择」，不是「当前工作区」：
   /// 当前工作区由左栏选中决定，两者混用会让左栏点击变得有副作用。
   const [preferredWorkspace, setPreferredWorkspace] = useState(readPreferredWorkspace);
@@ -209,6 +235,12 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     () => (showingUnmanaged ? unassigned : models.filter(project => workspaceKeyFor(project, workspaceItems) === activeKey)),
     [activeKey, models, showingUnmanaged, unassigned, workspaceItems],
   );
+  // 「一键构建」只覆盖源码目录还在的扩展：远端协作项目、目录已被移走的项目没有
+  // 可构建的源码，混进来只会把一次点击变成一串失败。规则库项目也走这条流水线。
+  const buildableProjects = useMemo(
+    () => (showingUnmanaged ? [] : workspaceProjects.filter(project => project.local?.workspace_available)),
+    [showingUnmanaged, workspaceProjects],
+  );
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return workspaceProjects.filter(project => {
@@ -250,10 +282,75 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     if (selected && selected.key !== selectedKey) setSelectedKey(selected.key);
   }, [selected, selectedKey]);
 
+  // 工具链来源与 Go 可用性进页面时读一次：它决定要不要提示「插件类扩展建不了」。
+  useEffect(() => {
+    let disposed = false;
+    void agentApi.extensionDevelopmentReadiness()
+      .then(value => { if (!disposed) setReadiness(value); })
+      .catch(() => undefined);
+    return () => { disposed = true; };
+  }, []);
+
   const addWorkspace = async () => {
     setActionError('');
     try { await props.onAddWorkspace(); }
     catch (reason) { setActionError(failureText(reason, '添加工作区失败')); }
+  };
+  /// 一键构建：按依赖顺序把当前工作区里能构建的扩展交给父层跑完整条流水线。
+  /// 失败项一次说明；「重试失败项」只重跑上一批失败的那些。
+  const buildWorkspace = async (retryIds?: string[]) => {
+    if (!activeItem || workspaceBuild) return;
+    const pool = retryIds?.length
+      ? buildableProjects.filter(project => retryIds.includes(project.local!.id))
+      : buildableProjects;
+    if (!pool.length) return;
+    setActionError('');
+    setFailedBatch([]);
+    const ordered = orderByDependencies(pool);
+    setWorkspaceBuild({ done: 1, total: ordered.length, name: ordered[0].name });
+    try {
+      const outcome = await props.onBuildWorkspace(
+        ordered.map(project => ({
+          id: project.local!.id,
+          name: project.name,
+          extensionId: project.extensionId,
+          dependencies: declaredPluginDependencies(project),
+        })),
+        progress => setWorkspaceBuild(progress),
+      );
+      const { succeeded, failures, skipped } = outcome;
+      const retryable = failures.filter(item => retryableFailure(item.message));
+      const parts: string[] = [];
+      if (failures.length) {
+        // 同一条原因往往砸中一整批（工具链未就绪、依赖未装）：逐条罗列会把提示刷成
+        // 三千字，按原因归类 + 点名前三项才看得清。
+        const grouped = new Map<string, string[]>();
+        for (const item of failures) {
+          const reason = item.message.trim() || '构建失败';
+          grouped.set(reason, [...(grouped.get(reason) || []), item.name]);
+        }
+        parts.push(`失败 ${failures.length} 项：${[...grouped.entries()]
+          .map(([reason, names]) => `${reason}（${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}）`)
+          .join('；')}`);
+      }
+      if (skipped.length) {
+        parts.push(`跳过 ${skipped.length} 项：${skipped.map(item => `${item.name}（${item.reason}）`).join('；')}`);
+      }
+      if (retryable.length) {
+        parts.push(`其中 ${retryable.length} 项是网络/超时类，环境恢复后可点「重试失败项」`);
+      }
+      if (failures.length || skipped.length) {
+        setActionError(`一键构建：${succeeded}/${ordered.length} 成功；${parts.join('；')}`);
+      }
+      setFailedBatch(failures.map(item => {
+        const project = ordered.find(candidate => candidate.name === item.name);
+        return project ? { id: project.local!.id, name: item.name } : null;
+      }).filter((item): item is { id: string; name: string } => Boolean(item)));
+    } catch (reason) {
+      setActionError(failureText(reason, '一键构建失败'));
+    } finally {
+      setWorkspaceBuild(null);
+    }
   };
   const removeWorkspace = async (root: string, label: string) => {
     const accepted = await confirm({
@@ -279,18 +376,23 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
 
   return <div className="development-page">
       <PageHeader title="扩展开发" description={props.dashboardEnabled ? '创建、开发、测试并分发自己的 Agent 能力。' : '创建、开发和测试自己的 Agent 能力。'} actions={<>
-      {/* 只有一个工作区时左栏会收起，添加入口就移到页头，免得没有地方开始。 */}
-      {hasRail ? null : <button className="btn" title="添加本机开发目录" disabled={busy} onClick={() => void addWorkspace()}><FolderPlus size={15} />添加工作区</button>}
+      {/* 添加工作区在这一页只有这一个入口：左栏不再挂 +，空态只负责指路。 */}
+      <button className="btn" title="添加本机开发目录" disabled={busy} onClick={() => void addWorkspace()}><FolderPlus size={15} />添加工作区</button>
       {/* 页头动作给出文字标签，主操作仍是「新建扩展」一个；工作区和扩展列表在进入页面时读取。 */}
       <button className="btn" title="选择 HiMind 项目或扩展聚合仓库" disabled={busy} onClick={() => void props.onOpenProject()}><FolderOpen size={15} />添加已有项目</button>
       <button className="btn btn-primary" title="新建扩展" disabled={busy} onClick={() => setCreateOpen(true)}><Plus size={15} />新建扩展</button>
     </>} />
     {props.dashboardEnabled && props.invitations.length ? <InvitationInbox invitations={props.invitations} busyAction={props.busyAction} onRespond={props.onRespondInvitation} /> : null}
     {props.projectsError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>项目列表读取失败</strong><span>{props.projectsError}</span></div><button className="btn" onClick={props.onRefresh}>重试</button></div> : null}
-    {actionError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>操作未完成</strong><span>{actionError}</span></div><button className="btn" onClick={() => setActionError('')}>关闭</button></div> : null}
+    {actionError ? <div className="development-project-error"><CircleAlert size={16} /><div><strong>操作未完成</strong><span>{actionError}</span></div>
+      {failedBatch.length ? <button className="btn" disabled={busy} onClick={() => void buildWorkspace(failedBatch.map(item => item.id))}>重试失败项（{failedBatch.length}）</button> : null}
+      <button className="btn" onClick={() => setActionError('')}>关闭</button></div> : null}
+    {/* 构建、校验与打包已收回内核：没装扩展开发工具也能干活，但插件类扩展要 Go。 */}
+    {readiness?.provider === 'builtin' ? <p className="muted development-toolchain-note">正在使用内置扩展开发工具（未安装外置插件）：新建骨架、构建、校验与打包由 Agent 内核完成。</p> : null}
+    {readiness && !readiness.kernel.go.installed ? <div className="development-notice"><CircleAlert size={16} /><div><strong>Go 工具链未就绪</strong><span>插件类扩展需要 go 在 PATH 中；技能、工作流、专家、项目规则不受影响。</span></div></div> : null}
     {props.loading ? <div className="development-body development-body-loading" role="status"><BusyIndicator size={16} /><span>正在读取工作区和扩展</span></div> : <div className={`development-body ${hasRail ? 'has-rail' : ''}`}>
       {hasRail ? <aside className="development-rail" aria-label="开发工作区">
-        <div className="development-rail-head"><strong>工作区</strong><button className="btn btn-icon" title="添加工作区" aria-label="添加工作区" disabled={busy} onClick={() => void addWorkspace()}><Plus size={15} /></button></div>
+        <div className="development-rail-head"><strong>工作区</strong></div>
         <div className="development-rail-body">
           {workspaceItems.map(item => <WorkspaceRow
             key={item.key}
@@ -315,11 +417,14 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           <div className="development-workspace-copy">
             <strong>{props.loading ? '正在读取…' : showingUnmanaged ? '工作台项目' : activeItem?.label || '还没有工作区'}</strong>
             <small className={headProblem ? 'is-problem' : undefined} title={headPath || undefined}>{headMeta}</small>
+            {workspaceBuild ? <small role="status" title={workspaceBuild.name}>{`正在一键构建 ${workspaceBuild.done}/${workspaceBuild.total}${workspaceBuild.name ? ` · ${workspaceBuild.name}` : ''}`}</small> : null}
           </div>
           {!showingUnmanaged && activeItem ? <div className="development-workspace-actions">
             {/* 这一层是「整个仓库」，下面详情里是「单个扩展」。两个都叫「用 AI 开发」时
                 会话落在哪个目录看不出区别，所以这里写清范围，并按次级动作处理。 */}
             <button className="btn development-workspace-develop" title={activeItem.available ? `在 ${activeItem.root} 里开一条 AI 会话` : '目录当前不可用，先在文件资源管理器里恢复它'} disabled={busy || !activeItem.available} onClick={() => props.onDevelopWorkspaceWithAi(activeItem.root)}><MessageCircle size={15} />在工作区开发</button>
+            {/* 工作区级的批量动作：整个目录一个个点构建太费事，这里一次跑完。 */}
+            <button className="btn" title={buildableProjects.length ? `构建并启用这个工作区里的 ${buildableProjects.length} 个扩展` : '这个工作区里还没有可构建的扩展'} disabled={busy || !buildableProjects.length} onClick={() => void buildWorkspace()}>{workspaceBuild ? <BusyIndicator size={15} /> : <Hammer size={15} />}{workspaceBuild ? `构建 ${workspaceBuild.done}/${workspaceBuild.total}` : '一键构建'}</button>
             {/* 有左栏时，每个工作区的操作在它自己那一行；没有左栏时只能放到这里。 */}
             {hasRail ? null : <ActionMenu variant="icon" icon={<MoreHorizontal size={16} />} title="工作区操作">
               {close => <>
@@ -344,8 +449,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索扩展" /></label>
         </div> : null}
         {!activeItem && !showingUnmanaged ? <div className="development-workspace-empty">
-          <EmptyState icon={FolderPlus} title="还没有开发工作区" text="添加一个本机目录，就能在里面开发扩展。" />
-          <div className="development-workspace-empty-actions"><button className="btn btn-primary" disabled={busy} onClick={() => void addWorkspace()}><FolderPlus size={15} />添加工作区</button></div>
+          <EmptyState icon={FolderPlus} title="还没有开发工作区" text="用页头的「添加工作区」挑一个本机目录，就能在里面开发扩展。" />
         </div> : !workspaceProjects.length ? <div className="development-workspace-empty">
           <EmptyState icon={Blocks} title={showingUnmanaged ? '没有未关联的扩展' : '这个工作区还没有扩展'} text={showingUnmanaged ? '工作台上还没有「未关联本地目录」的扩展。' : '新建一个扩展，或者让 AI 直接在这个目录里开始开发。'} />
           {showingUnmanaged || !activeItem ? null : <div className="development-workspace-empty-actions">
@@ -885,7 +989,12 @@ function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: 
   // 有本机目录但当前版本还没构建过：说「开发中」等于什么都没说，
   // 「未构建」既准确又指出了下一步动作。
   if (!draft || draftVersion(draft) !== project.local.version) return { label: '未构建', tone: 'neutral' };
-  if (!dashboardEnabled) return { label: '已构建', tone: 'success' };
+  // 候选与本机启用是两件事：确认那一步没过时要说清，否则用户以为本地已经能用。
+  if (!dashboardEnabled) {
+    return draftIsActivated(draft)
+      ? { label: '已构建', tone: 'success' }
+      : { label: '已构建·未启用', tone: 'warn' };
+  }
   if (draft) {
     const currentRelease = project.submissions.find(item => item.value.version === draftVersion(draft) && item.value.release_status === 'published');
     if (currentRelease) return submissionStatus(currentRelease);
@@ -902,6 +1011,48 @@ function submissionStatus(submission: SubmissionRef): { label: string; tone: 'su
   if (submission.value.status === 'changes_requested') return { label: '需要修改', tone: 'warn' };
   if (submission.value.status === 'rejected') return { label: '未通过', tone: 'danger' };
   return { label: '待审核', tone: 'warn' };
+}
+
+/// 这个项目声明依赖的同仓库插件（技能/插件/工作流都写在 manifest.plugin_dependencies）。
+function declaredPluginDependencies(project: ProjectModel): string[] {
+  const draft = project.drafts.find(item => draftVersion(item) === project.local?.version) || project.drafts[0];
+  if (!draft || draft.kind === 'expert' || draft.kind === 'instruction') return [];
+  return (draft.value.manifest.plugin_dependencies || []).map(item => item.plugin_id).filter(Boolean);
+}
+
+/// 构建顺序：被依赖的插件先建。
+///
+/// 仓库里技能/工作流声明了对本仓库插件的依赖（媒体下载助手 → 媒体下载工具，
+/// 开发技能 → 扩展开发工具）。按列表顺序跑会先建依赖者，于是第一批「依赖未启用」
+/// 的失败里有一半是本可以避免的。循环依赖保持原顺序，不让它们永远排不上。
+function orderByDependencies(projects: ProjectModel[]): ProjectModel[] {
+  const pending = new Map(projects.map(project => [project.extensionId, project]));
+  const ordered: ProjectModel[] = [];
+  let progressed = true;
+  while (pending.size && progressed) {
+    progressed = false;
+    for (const [id, project] of [...pending]) {
+      const waitFor = declaredPluginDependencies(project).filter(dep => dep !== id && pending.has(dep));
+      if (waitFor.length) continue;
+      pending.delete(id);
+      ordered.push(project);
+      progressed = true;
+    }
+  }
+  return [...ordered, ...pending.values()];
+}
+
+/// 网络/超时类失败与「清单写错、编译不过」不同：环境恢复后重试就有意义。
+function retryableFailure(message: string): boolean {
+  // 后端的 friendly 文案会把网络类失败翻成「请稍后重试」，一并算进来。
+  return /(dial tcp|connection attempt failed|timed out|timeout|TLS handshake|connection reset|proxy\.golang\.org|502 Bad Gateway|503|504|下载失败|请稍后重试|拉取|network)/i.test(message);
+}
+
+/// 候选建出来 ≠ 本机已经能用了：试运行 + 确认那一步失败时，只报「已构建」会误导。
+function draftIsActivated(draft: DraftRef | undefined): boolean {
+  if (!draft) return false;
+  if (draft.kind === 'workflow') return draft.value.state === 'confirmed' || draft.value.state === 'submitted';
+  return Boolean(draft.value.confirmed_at);
 }
 
 function draftDependencies(draft: DraftRef | undefined, available: PluginCatalogItem[]) {

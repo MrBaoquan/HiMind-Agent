@@ -154,6 +154,28 @@ pub(crate) struct PluginCapabilityManifest {
     pub timeout_seconds: u64,
 }
 
+/// 插件声明的一条凭据需求。字段尽量少：凭据的语义由 Agent 侧统一解释。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct PluginCredentialRequest {
+    /// 插件内唯一的凭据标识（如 `wechat.app`）。
+    pub id: String,
+    /// 展示名（如「微信小程序 AppSecret」）。
+    #[serde(default)]
+    pub label: String,
+    /// api_key | oauth | userpass | cookie —— 只影响界面提示与字段拆分。
+    #[serde(default)]
+    pub kind: String,
+    /// 多字段凭据的字段名；留空表示单值。
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub docs_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct PluginManifest {
     pub id: String,
@@ -182,6 +204,13 @@ pub(crate) struct PluginManifest {
     pub capabilities: Vec<PluginCapabilityManifest>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// 插件声明的凭据需求（用户自己的账号/密钥）。
+    ///
+    /// S1 只做「声明 + Agent 统一保管」：值以 DPAPI 按当前 Windows 用户加密、按插件
+    /// 隔离，插件自己拿不到明文，只能查到「配没配」。凭据的轮换、审计、卸载清理都
+    /// 需要一个统一持有者，散在各插件目录里的配置文件一条都做不到。
+    #[serde(default)]
+    pub credentials: Vec<PluginCredentialRequest>,
     #[serde(default)]
     pub plugin_dependencies: Vec<PluginDependencyManifest>,
     #[serde(default)]
@@ -249,6 +278,10 @@ pub(crate) struct PluginRegistryItem {
     pub source: String,
     pub status: String,
     pub enabled: bool,
+    /// 条目语义：plugin（本地能力包）/ connector（特权集成：凭据、本机进程）
+    /// / provider（控制面契约适配，本地没有实现）。插件列表只展示前两类。
+    #[serde(default = "default_registry_kind")]
+    pub kind: String,
     pub path: String,
     pub development: bool,
     pub entry: String,
@@ -632,6 +665,8 @@ pub(crate) fn record_capability_conflict(plugin: &PluginRegistryItem, detail: &s
 
 pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> {
     let mut items = builtin_plugin_items();
+    let builtin_ids: std::collections::HashSet<String> =
+        items.iter().map(|item| item.id.clone()).collect();
     let root = plugin_registry_dir();
     if root.exists() {
         for entry in fs::read_dir(&root)?.flatten() {
@@ -653,8 +688,14 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
         // 去顶掉用户真正安装在 plugins/ 下的副本。
         .filter(|path| path.is_dir())
         .map(|path| read_plugin_item(path, true))
+        // 内置身份不允许被开发副本覆盖：同一 ID 只能对应一个插件。
+        .filter(|item| !builtin_ids.contains(&item.id))
         .collect();
     merge_development_items(&mut items, development_items);
+    // 同一 ID 只对应一个插件：内置条目是唯一身份，外部同 ID 副本一律忽略。
+    // 不能反过来让外置覆盖内置，否则同一个 ID 会同时存在两个实现，能力归属、
+    // 升级和卸载语义都会变得不可判定。这里独立成函数，便于用单测锁住优先级。
+    let mut items = dedupe_plugins_by_id(items);
     items.sort_by(|a, b| a.id.cmp(&b.id));
     // 来源/工作区门禁必须先于依赖解析生效，否则依赖被停用插件的插件仍会被注册。
     apply_disabled_source_gate(&mut items);
@@ -688,6 +729,28 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
         }
     }
     Ok(items)
+}
+
+fn dedupe_plugins_by_id(items: Vec<PluginRegistryItem>) -> Vec<PluginRegistryItem> {
+    let mut deduped: Vec<PluginRegistryItem> = Vec::with_capacity(items.len());
+    let mut index_by_id: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for item in items {
+        match index_by_id.get(&item.id).copied() {
+            Some(index) => {
+                // 内置条目无论扫描顺序如何都必须胜出；非内置副本之间保持
+                // 「后写入者生效」，用于已安装/开发版本的正常替换。
+                if item.source == "builtin" || deduped[index].source != "builtin" {
+                    deduped[index] = item;
+                }
+            }
+            None => {
+                index_by_id.insert(item.id.clone(), deduped.len());
+                deduped.push(item);
+            }
+        }
+    }
+    deduped
 }
 
 fn plugin_source_id(source: &str) -> Option<&str> {
@@ -896,6 +959,7 @@ pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Ve
                 availability: "local".to_string(),
                 source: "candidate".to_string(),
                 status: "installed".to_string(),
+                kind: "plugin".to_string(),
                 enabled: true,
                 path: String::new(),
                 development: true,
@@ -927,22 +991,55 @@ fn is_plugin_install_directory(path: &std::path::Path) -> bool {
             || path.join("current").join("plugin.json").is_file())
 }
 
-pub(crate) fn is_builtin_plugin(plugin_id: &str) -> bool {
-    matches!(
-        plugin_id,
-        "com.himind.builtin.svn"
-            | "com.himind.builtin.smb"
-            | "com.himind.builtin.inner-admin"
-            | "com.himind.dashboard-business"
-            | "com.himind.knowledge"
-    )
+/// 当前生效的那条插件是否就是内置条目（没有外置/开发副本覆盖）。
+///
+/// 卸载/停用守卫必须用这个判据，而不是"ID 是否出现在内置清单里"：
+/// 同一个 ID 可能既有内置兜底、又有用户安装的外置插件，后者应当可以卸载。
+pub(crate) fn effective_plugin_is_builtin(plugin_id: &str) -> bool {
+    scan_plugins()
+        .ok()
+        .and_then(|items| items.into_iter().find(|item| item.id == plugin_id))
+        .is_some_and(|item| item.source == "builtin")
+}
+
+/// 按 ID 取内置条目。仅看内核清单，不触发磁盘扫描；依赖判定和本地状态
+/// 都通过它把内置插件视为已安装。
+pub(crate) fn builtin_plugin_entry(plugin_id: &str) -> Option<PluginRegistryItem> {
+    builtin_plugin_items()
+        .into_iter()
+        .find(|item| item.id == plugin_id)
 }
 
 fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
     vec![
+        // 扩展开发工具以「内置插件」形态存在：注册表里可见（来源 builtin → UI 显示
+        // 「系统内置」）、不可卸载；能力由内核实现。同一 ID 的外部副本不加载、
+        // 不允许安装，避免同一个插件出现两个实现。
+        builtin_plugin(
+            "com.himind.extension-development-tools",
+            "扩展开发工具",
+            crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+            "随 Agent 发布的内置开发工具：新建骨架、校验、构建与打包，独立模式可用。",
+            &crate::extension_toolchain::BUILTIN_CAPABILITIES,
+            &[],
+        ),
+        builtin_plugin(
+            "com.himind.software-distribution",
+            "软件分发工具",
+            crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION,
+            "随 Agent 发布的软件分发内核：项目/制品检查与渠道版本解析；发布由 Agent 的 distribution.release.publish 提供。",
+            &[
+                "distribution.project.inspect",
+                "distribution.artifact.inspect",
+                "distribution.channel.resolve",
+                "distribution.release.resolve",
+            ],
+            &[],
+        ),
         builtin_plugin(
             "com.himind.builtin.svn",
             "SVN 个人账号与工作区",
+            crate::VERSION,
             "管理当前用户自己的 SVN 凭据和本机展项工作区。",
             &[
                 "svn.connection.list",
@@ -957,15 +1054,9 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             &["secret.svn.broker", "network.svn", "process.tortoisesvn"],
         ),
         builtin_plugin(
-            "com.himind.builtin.smb",
-            "SMB 共享资源",
-            "由 Dashboard 任务编排的受控共享目录读取与资源上传模块。",
-            &[],
-            &["fs.smb.broker", "network.internal"],
-        ),
-        builtin_plugin(
             "com.himind.builtin.inner-admin",
             "内网交付与上传",
+            crate::VERSION,
             "内网工程同步、代码预处理、分片上传和占位说明交付模块。",
             &["network.inner-admin.login.status"],
             &[
@@ -977,6 +1068,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
         builtin_plugin(
             "com.himind.dashboard-business",
             "项目业务助手",
+            crate::VERSION,
             "以当前用户身份读取 Dashboard 项目、展项、需求、IP 和我的工作聚合事实。",
             &[
                 "workbench.context.resolve",
@@ -989,6 +1081,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
         builtin_plugin(
             "com.himind.knowledge",
             "知识检索",
+            crate::VERSION,
             "以当前用户身份检索获准向外部 AI 工具开放的 Dashboard 知识空间。",
             &["workbench.knowledge.search"],
             &["dashboard.knowledge.search", "oauth.delegated_user"],
@@ -999,25 +1092,34 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
 fn builtin_plugin(
     id: &str,
     name: &str,
+    version: &str,
     description: &str,
     capability_ids: &[&str],
     permissions: &[&str],
 ) -> PluginRegistryItem {
-    let availability = if matches!(
-        id,
-        "com.himind.dashboard-business" | "com.himind.knowledge" | "com.himind.builtin.smb"
-    ) {
+    let availability = if matches!(id, "com.himind.dashboard-business" | "com.himind.knowledge") {
         "control_plane"
     } else {
         "local"
     };
+    let kind = if matches!(
+        id,
+        "com.himind.builtin.svn" | "com.himind.builtin.inner-admin"
+    ) {
+        "connector"
+    } else if matches!(id, "com.himind.dashboard-business" | "com.himind.knowledge") {
+        "provider"
+    } else {
+        "plugin"
+    };
     PluginRegistryItem {
         id: id.to_string(),
         name: name.to_string(),
+        kind: kind.to_string(),
         author_name: "马宝全".to_string(),
         description: description.to_string(),
         release_notes: description.to_string(),
-        version: crate::VERSION.to_string(),
+        version: version.to_string(),
         runtime: "builtin".to_string(),
         min_agent_version: crate::VERSION.to_string(),
         governance: "required".to_string(),
@@ -1208,6 +1310,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 governance,
                 availability,
                 source,
+                kind: "plugin".to_string(),
                 status: validation
                     .as_ref()
                     .map(|_| {
@@ -1254,6 +1357,7 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             availability: "local".to_string(),
             source: "local".to_string(),
             status: "failed".to_string(),
+            kind: "plugin".to_string(),
             enabled: false,
             path: path.to_string_lossy().to_string(),
             development,
@@ -1438,6 +1542,59 @@ pub(crate) fn invoke_plugin_capability(
         .ok_or_else(|| format!("plugin capability not found: {capability_id}"))?;
 
     invoke_plugin_capability_for_item(&plugin, capability_id, input, trusted_dashboard_url)
+}
+
+/// 候选包的运行时契约探针：只验证「能启动、能读一行 JSON、能写一行 JSON」，
+/// 不执行任何声明能力。构建流水线不应因为某个能力会访问网络、跑 30 秒任务或
+/// 修改用户数据而被卡住；这些属于能力测试，不是打包前置条件。
+pub(crate) fn probe_plugin_transport(plugin_id: &str) -> Result<Value, Box<dyn Error>> {
+    let plugin = scan_plugins()?
+        .into_iter()
+        .find(|item| item.id == plugin_id && item.enabled)
+        .ok_or_else(|| format!("plugin not found or unavailable: {plugin_id}"))?;
+    let capability = PluginCapabilityManifest {
+        id: "__himind.contract.probe".to_string(),
+        description: "候选包传输契约探针".to_string(),
+        input_schema: Value::Null,
+        risk_level: "read_only".to_string(),
+        availability: "local".to_string(),
+        timeout_seconds: 30,
+    };
+    let started = std::time::Instant::now();
+    let outcome = invoke_plugin_process(
+        &plugin,
+        &capability,
+        "__himind.contract.probe",
+        json!({}),
+        None,
+        Duration::from_secs(30),
+    );
+    let latency_ms = started.elapsed().as_millis();
+    match outcome {
+        Ok(output) => Ok(json!({
+            "state": "passed",
+            "probe": "transport",
+            "latency_ms": latency_ms,
+            "output": output,
+        })),
+        Err(error) => {
+            let capability_error = error
+                .downcast_ref::<PluginInvocationError>()
+                .is_some_and(|error| matches!(error, PluginInvocationError::Capability { .. }));
+            if capability_error {
+                // 未实现探针方法时插件返回 JSON-RPC error，这已经证明传输链路可用。
+                Ok(json!({
+                    "state": "passed",
+                    "probe": "transport",
+                    "outcome": "error_response",
+                    "latency_ms": latency_ms,
+                    "error": error.to_string(),
+                }))
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 pub(crate) fn invoke_plugin_capability_for_plugin(
@@ -2044,6 +2201,10 @@ pub(crate) fn parse_plugin_manifest(content: &str) -> Result<PluginManifest, ser
     serde_json::from_str(content.trim_start_matches('\u{feff}'))
 }
 
+fn default_registry_kind() -> String {
+    "plugin".to_string()
+}
+
 fn default_risk_level() -> String {
     "read_only".to_string()
 }
@@ -2053,7 +2214,16 @@ fn default_plugin_capability_timeout() -> u64 {
 }
 
 fn plugin_invocation_timeout(capability: &PluginCapabilityManifest, input: &Value) -> Duration {
-    let maximum = capability.timeout_seconds.clamp(1, 60 * 60);
+    // 第一方创作能力跑的是真实构建（go test/go build），工具内部封顶 10 分钟：
+    // 清单没声明上限时要按创作上限走，而不是 30 秒的插件默认值。
+    let maximum = if crate::extension_toolchain::is_authoring_capability(&capability.id) {
+        capability
+            .timeout_seconds
+            .max(crate::extension_toolchain::AUTHORING_CAPABILITY_TIMEOUT.as_secs())
+            .clamp(1, 60 * 60)
+    } else {
+        capability.timeout_seconds.clamp(1, 60 * 60)
+    };
     let requested = input
         .get("timeout_seconds")
         .and_then(Value::as_u64)
@@ -2084,6 +2254,42 @@ fn default_view_icon() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn authoring_capabilities_get_the_build_ceiling_not_the_plugin_default() {
+        // 构建类能力跑真实 go test/go build（工具内部封顶 10 分钟）。清单没声明
+        // 上限时，必须用创作上限，而不是 30 秒的插件默认值：否则一个 52 秒的
+        // 单测套件永远建不出来，调用方只看到一句「请稍后重试」。
+        let mut capability = PluginCapabilityManifest {
+            id: "extension.plugin.build".to_string(),
+            description: String::new(),
+            input_schema: Value::Null,
+            risk_level: default_risk_level(),
+            availability: String::new(),
+            timeout_seconds: default_plugin_capability_timeout(),
+        };
+        assert_eq!(
+            plugin_invocation_timeout(&capability, &Value::Null),
+            crate::extension_toolchain::AUTHORING_CAPABILITY_TIMEOUT
+        );
+
+        // 清单显式声明了更大的上限时，按声明的走（仍受 1 小时硬上限约束）。
+        capability.timeout_seconds = 3600;
+        assert_eq!(
+            plugin_invocation_timeout(&capability, &Value::Null),
+            Duration::from_secs(3600)
+        );
+
+        // 普通插件能力保持原来的 30 秒默认。
+        capability.id = "demo.echo".to_string();
+        capability.timeout_seconds = default_plugin_capability_timeout();
+        assert_eq!(
+            plugin_invocation_timeout(&capability, &Value::Null),
+            PLUGIN_TIMEOUT
+        );
+    }
+
     use super::*;
     use std::fs;
 
@@ -2328,7 +2534,14 @@ mod tests {
 
     #[test]
     fn required_plugin_dependency_blocks_missing_or_old_provider() {
-        let dependent = builtin_plugin("com.example.dependent", "依赖测试", "依赖测试", &[], &[]);
+        let dependent = builtin_plugin(
+            "com.example.dependent",
+            "依赖测试",
+            "1.0.0",
+            "依赖测试",
+            &[],
+            &[],
+        );
         let mut dependent = dependent;
         dependent.plugin_dependencies = vec![PluginDependencyManifest {
             plugin_id: "com.example.provider".to_string(),
@@ -2339,7 +2552,14 @@ mod tests {
         let missing = plugin_dependency_issues(&dependent, &[]);
         assert_eq!(missing, vec!["缺少必需插件 com.example.provider"]);
 
-        let mut old = builtin_plugin("com.example.provider", "能力提供者", "能力提供者", &[], &[]);
+        let mut old = builtin_plugin(
+            "com.example.provider",
+            "能力提供者",
+            "1.0.0",
+            "能力提供者",
+            &[],
+            &[],
+        );
         old.version = "1.0.0".to_string();
         let outdated = plugin_dependency_issues(&dependent, &[old]);
         assert_eq!(outdated, vec!["插件 com.example.provider 版本低于 2.0.0"]);
@@ -2350,6 +2570,7 @@ mod tests {
         let mut dependent = builtin_plugin(
             "com.example.dependent",
             "可选依赖测试",
+            "1.0.0",
             "可选依赖测试",
             &[],
             &[],
@@ -2365,19 +2586,34 @@ mod tests {
 
     #[test]
     fn required_plugin_dependency_cycle_blocks_every_cycle_member() {
-        let mut first = builtin_plugin("com.example.first", "第一个插件", "测试", &[], &[]);
+        let mut first =
+            builtin_plugin("com.example.first", "第一个插件", "1.0.0", "测试", &[], &[]);
         first.plugin_dependencies = vec![PluginDependencyManifest {
             plugin_id: "com.example.second".to_string(),
             required: true,
             min_version: "1.0.0".to_string(),
         }];
-        let mut second = builtin_plugin("com.example.second", "第二个插件", "测试", &[], &[]);
+        let mut second = builtin_plugin(
+            "com.example.second",
+            "第二个插件",
+            "1.0.0",
+            "测试",
+            &[],
+            &[],
+        );
         second.plugin_dependencies = vec![PluginDependencyManifest {
             plugin_id: "com.example.first".to_string(),
             required: true,
             min_version: "1.0.0".to_string(),
         }];
-        let mut upstream = builtin_plugin("com.example.upstream", "上游插件", "测试", &[], &[]);
+        let mut upstream = builtin_plugin(
+            "com.example.upstream",
+            "上游插件",
+            "1.0.0",
+            "测试",
+            &[],
+            &[],
+        );
         upstream.plugin_dependencies = vec![PluginDependencyManifest {
             plugin_id: "com.example.first".to_string(),
             required: true,
@@ -2517,6 +2753,97 @@ mod tests {
     }
 
     #[test]
+    fn extension_development_is_available_as_a_builtin_plugin() {
+        // 内部架构保持「插件结构」：注册表里有一个内置条目、能力清单可读、
+        // 且它不允许被卸载/停用；同一个 ID 不再有外置提供方。
+        let items = builtin_plugin_items();
+        let item = items
+            .iter()
+            .find(|item| item.id == "com.himind.extension-development-tools")
+            .expect("内置扩展开发工具条目必须存在（与外置插件同 ID）");
+        assert_eq!(item.source, "builtin");
+        assert_eq!(item.availability, "local");
+        assert_eq!(item.runtime, "builtin");
+        assert_eq!(
+            item.capabilities.len(),
+            crate::extension_toolchain::BUILTIN_CAPABILITIES.len(),
+            "内置条目只登记内核真正实现的能力"
+        );
+        // 同一 ID 只允许一个身份：内置条目恒定胜出，外部同 ID 副本被忽略。
+        assert_eq!(item.source, "builtin");
+    }
+
+    #[test]
+    fn builtin_entries_are_classified_and_never_empty() {
+        for item in builtin_plugin_items() {
+            assert!(
+                matches!(item.kind.as_str(), "plugin" | "connector" | "provider"),
+                "{} 的内置条目缺少合法 kind: {}",
+                item.id,
+                item.kind
+            );
+            // 除控制面 provider 外，内置条目必须有能力；不允许"空插件"。
+            if item.kind != "provider" {
+                assert!(
+                    !item.capabilities.is_empty(),
+                    "{} 是 {} 却没有声明任何能力",
+                    item.id,
+                    item.kind
+                );
+            }
+        }
+        assert!(
+            !builtin_plugin_items()
+                .iter()
+                .any(|item| item.id == "com.himind.builtin.smb"),
+            "SMB 空壳条目应已移除"
+        );
+    }
+
+    #[test]
+    fn builtin_plugin_versions_track_their_capability_contracts() {
+        let items = builtin_plugin_items();
+        let development = items
+            .iter()
+            .find(|item| item.id == "com.himind.extension-development-tools")
+            .unwrap();
+        assert_eq!(
+            development.version,
+            crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION
+        );
+        let distribution = items
+            .iter()
+            .find(|item| item.id == "com.himind.software-distribution")
+            .unwrap();
+        assert_eq!(
+            distribution.version,
+            crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION
+        );
+    }
+
+    #[test]
+    fn builtin_identity_wins_over_external_duplicate_regardless_of_order() {
+        let builtin = builtin_plugin_items()
+            .into_iter()
+            .find(|item| item.id == "com.himind.extension-development-tools")
+            .unwrap();
+        let mut external = builtin.clone();
+        external.source = "local".to_string();
+        external.version = "99.0.0".to_string();
+        external.name = "外置同 ID 副本".to_string();
+
+        for items in [
+            vec![builtin.clone(), external.clone()],
+            vec![external, builtin.clone()],
+        ] {
+            let deduped = dedupe_plugins_by_id(items);
+            assert_eq!(deduped.len(), 1, "同一 ID 只能留下一个条目");
+            assert_eq!(deduped[0].source, "builtin");
+            assert_eq!(deduped[0].name, builtin.name);
+        }
+    }
+
+    #[test]
     fn independent_registry_hides_control_plane_builtins() {
         let registry = registry_json_for_control_plane(false).unwrap();
         let items = registry["items"].as_array().unwrap();
@@ -2653,6 +2980,7 @@ mod tests {
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            credentials: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
@@ -2695,6 +3023,7 @@ mod tests {
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            credentials: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions::default(),
         };
@@ -2740,6 +3069,7 @@ mod tests {
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            credentials: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
@@ -2785,6 +3115,7 @@ mod tests {
             capability_namespace: String::new(),
             capabilities: Vec::new(),
             permissions: Vec::new(),
+            credentials: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {

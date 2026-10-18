@@ -64,6 +64,8 @@ cargo build --release
 
 Agent 主窗口已提供“本机插件”页：左侧选择当前设备已安装插件，右侧查看该插件的本机状态、错误、功能页面、权限和已注册能力，并可打开独立插件窗口、创建桌面快捷方式或打开插件目录；页面通过 Tauri 命令直接读取本机注册表和 Gateway，避免主窗口 WebView 再 fetch 自身 `127.0.0.1` 服务。插件和 Skill 可从本地包或固定 GitHub ref 导入，Independent 不依赖组织商城；组织安装策略、审批、分发和审核仍由 Connected 模式的控制面负责。
 
+插件注册表区分 `plugin`（本地能力包）、`connector`（凭据、本机进程等特权集成）和 `provider`（控制面契约适配）。内置插件随 Agent 发布、列表可见但不可卸载；同一个插件 ID 只允许一个身份，外部同 ID 副本不会被加载，安装入口也会拒绝。当前内置插件包括扩展开发工具和软件分发工具。完整约定见 [内置插件架构与升级约定](docs/builtin-plugins.md)。
+
 Agent 主窗口前端采用 React + TypeScript + Vite：`frontend/src/` 按 Shell、通用组件、页面和服务层组织，生产构建输出到 `frontend/dist` 并由 Tauri 打包。界面使用 Lucide 标准图标和适配 `900 × 640` 默认窗口的紧凑桌面控制台布局；低于 `740px` 时侧栏收为图标栏，本机插件页采用列表/详情主从布局，日志在自身容器内滚动。
 
 MCP 接入由统一 Registry、目标适配和真实探测组成。Registry 继续读取 `himind-ai-mcp.json`，但 DSH、Agent MCP、CLI 和 Tauri 都通过同一模型访问；环境变量、请求头和疑似密钥参数不会出现在公开快照中。除 Codex、GitHub Copilot、WorkBuddy 外，面板和 CLI 还可注册 Claude、VS Code、Cursor、Windsurf、Qoder、ZCode、Gemini CLI、OpenCode、Kimi Code、Kiro、Qwen Code、Trae 等客户端。目标配置写入前保留备份，损坏配置必须显式选择重建；需要保留客户端专有配置格式的目标只提供手动配置片段，不参与批量写入。可用命令为 `himind-agent mcp list|targets|inspect|plan|apply|apply-all|remove|remove-all|test`，批量操作默认只处理已检测且支持自动配置的客户端，并逐目标返回成功、失败和跳过明细。

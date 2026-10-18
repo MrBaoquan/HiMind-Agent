@@ -3,6 +3,7 @@ import { Activity, ArrowUpRight, Check, CircleAlert, Download, LogIn, MessageCir
 import type { RefObject } from 'react';
 import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type InstructionPackRef, type WorkspaceInstructionContext } from '../services/agentApi';
 import { errorDetail } from '../types';
+import { AI_CONNECTIONS_TAB_LABELS } from './aiConnectionsTabs';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 import { BusyIndicator } from '../components/BusyIndicator';
 
@@ -341,8 +342,8 @@ export function BuiltinAiPage({
                 {/* 提示里点名了模型服务时，就近给一个入口，别让用户自己找。
                     旧版文案（「设置 → AI 服务」）可能还留在已保存的会话里，一并认出来。 */}
                 {sessionNotice.includes('模型服务') || sessionNotice.includes('设置 → AI 服务') ? (
-                  <button type="button" className="builtin-ai-notice-action" title="管理模型凭据与运行环境" onClick={onOpenAiConnections}>
-                    <Settings size={14} />模型服务
+                  <button type="button" className="builtin-ai-notice-action" title="管理模型来源与运行环境" onClick={onOpenAiConnections}>
+                    <Settings size={14} />{AI_CONNECTIONS_TAB_LABELS.services}
                   </button>
                 ) : null}
                 {/* 这条提示讲的是本机模型凭据，别把「登录工作台」混进来：工作台
@@ -418,7 +419,7 @@ export function BuiltinAiPage({
             actions={<>
               <button type="button" className="btn btn-primary" onClick={() => void connect()}><PlugZap size={15} />重新连接</button>
               {!identity?.authorized && !independentMode ? <button type="button" className="btn" disabled={authorizationBusy} onClick={onStartAuthorization}><LogIn size={15} />登录 HiMind</button> : null}
-              <button type="button" className="btn" onClick={onOpenAiConnections}><Settings size={15} />配置本机模型服务</button>
+              <button type="button" className="btn" onClick={onOpenAiConnections}><Settings size={15} />配置本机模型来源</button>
               <button type="button" className="btn" onClick={() => void openInBrowser()}><ArrowUpRight size={15} />打开网页版</button>
             </>}
           />
@@ -602,16 +603,16 @@ function presentConnectionError(error: unknown): { message: string; detail: stri
     || normalized.includes('dsh 原生')
     || normalized.includes('settings.yaml')
     || (normalized.includes('provider') && normalized.includes('原生服务配置'))) {
-    return present('本机模型服务尚未配置，请在设置中完成配置后重试。');
+    return present('本机模型来源尚未配置，请在设置中完成配置后重试。');
   }
   if (normalized.includes('登录 himind')) return present('当前登录状态已失效，请重新登录。');
   // 本机服务缺字段是最常见的自建服务故障，先于通用的「ai 服务」兜底认出来，
   // 否则会被误导成「账号没有分配服务」去找管理员。
-  if (normalized.includes('模型或 base url')) return present('本机模型服务的模型或 Base URL 不完整，请到「设置 → AI 连接 → 模型服务」补全。');
+  if (normalized.includes('模型或 base url')) return present(`本机模型来源的模型或 Base URL 不完整，请到「设置 → AI 连接 → ${AI_CONNECTIONS_TAB_LABELS.services}」补全。`);
   // 后端同类错误改叫「模型服务」后也该命中这一条兜底，但不能按「模型服务」泛匹配，
   // 否则会把下面的「dsh 不可用」等更具体的本机故障也误判成账号没分配服务。
   if (normalized.includes('ai 服务') || normalized.includes('暂未分配可用模型服务')) {
-    return present('当前账号暂未分配可用的模型服务，请联系管理员。');
+    return present('当前账号暂未分配可用的工作台模型服务，请联系管理员。');
   }
   if (normalized.includes('运行时') && normalized.includes('修复')) return present('HiMind AI 需要修复，请在设置中处理。');
   if ((normalized.includes('运行时') || normalized.includes('组件')) && normalized.includes('安装')) return present('请先安装 HiMind AI，再开始对话。');
@@ -622,7 +623,7 @@ function presentConnectionError(error: unknown): { message: string; detail: stri
   if (normalized.includes('页面认证失败')) return present('HiMind AI 页面认证失败，通常是会话目录或运行时启动异常。');
   if (normalized.includes('启动失败')) return present('HiMind AI 启动失败，请查看下方原始错误。');
   if (normalized.includes('项目工作区') || normalized.includes('workspace')) return present('当前项目目录不可用，请重新选择后再试。');
-  if (normalized.includes('dsh')) return present('本机模型服务暂时不可用，请在设置中检查配置。');
+  if (normalized.includes('dsh')) return present('本机模型来源暂时不可用，请在设置中检查配置。');
   if (normalized.includes('正在启动')) return present('会话仍在准备中，请稍后重新连接。');
   // 兜底也不再吞掉原文：认不出来时原文比一句「服务暂时不可用」有用得多。
   return present(headline || '服务暂时不可用，请稍后重试。');

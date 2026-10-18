@@ -30,6 +30,7 @@ mod approval;
 mod business_integration;
 mod capability;
 mod development_checkpoint;
+mod distribution_native;
 #[allow(dead_code)]
 mod ecc_import;
 mod engineering_project;
@@ -39,6 +40,8 @@ mod extension_authoring;
 mod extension_category;
 mod extension_contracts;
 mod extension_projects;
+mod extension_scaffold;
+mod extension_toolchain;
 mod extension_workspace;
 mod install_layout;
 mod instruction_pack;

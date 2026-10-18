@@ -1556,6 +1556,12 @@ pub(crate) fn install_plugin_bound(
     expected_source_id: Option<&str>,
     expected_sha256: Option<&str>,
 ) -> Result<PluginCatalogItem, Box<dyn Error>> {
+    // 同一 ID 只对应一个插件：内置身份的存在意味着外部副本不允许安装。
+    if crate::capability::plugin::effective_plugin_is_builtin(plugin_id) {
+        return Err(
+            format!("插件 {plugin_id} 已由 Agent 内置提供，不允许安装外部同 ID 副本").into(),
+        );
+    }
     let snapshot = snapshot()?;
     let plugin_versions = snapshot.plugin_versions.clone();
     let selected_source = plugin_versions

@@ -620,6 +620,7 @@ mod tests {
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),
             capabilities: vec!["wechat.miniprogram.preview".to_string()],
+            capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,
             execution_policy: "strict".to_string(),

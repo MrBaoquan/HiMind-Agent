@@ -2242,6 +2242,7 @@ mod tests {
             local_requirements: serde_json::json!({}),
             optional_providers: Vec::new(),
             capabilities: vec!["test.first".to_string(), "test.second".to_string()],
+            capability_alternatives: Default::default(),
             dependencies: Default::default(),
             candidate: None,
             execution_policy: "strict".to_string(),

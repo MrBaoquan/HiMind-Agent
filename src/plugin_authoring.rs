@@ -468,47 +468,17 @@ impl Drop for DevelopmentRegistrySnapshot {
 }
 
 fn run_runtime_contract_test(manifest: &PluginManifest) -> Result<Value, Box<dyn Error>> {
-    let Some(capability) = manifest
-        .capabilities
-        .iter()
-        .find(|capability| capability.risk_level.eq_ignore_ascii_case("read_only"))
-        .or_else(|| manifest.capabilities.first())
-    else {
+    if manifest.capabilities.is_empty() {
         return Ok(json!({ "state": "skipped", "reason": "插件未声明 Capability" }));
-    };
-    if !capability.risk_level.eq_ignore_ascii_case("read_only") {
-        return Ok(json!({
-            "state": "skipped",
-            "capability_id": capability.id,
-            "reason": "候选测试不会自动执行有副作用的 Capability"
-        }));
     }
-    let input = sample_input(&capability.input_schema);
-    match crate::capability::plugin::invoke_plugin_capability_for_plugin(
-        &manifest.id,
-        &capability.id,
-        input.clone(),
-        None,
-    ) {
-        Ok(output) => Ok(json!({
-            "state": "passed",
-            "capability_id": capability.id,
-            "input": input,
-            "output": output
-        })),
+    match crate::capability::plugin::probe_plugin_transport(&manifest.id) {
+        Ok(report) => Ok(report),
         Err(error) if is_runtime_transport_failure(&error.to_string()) => Ok(json!({
             "state": "failed",
-            "capability_id": capability.id,
-            "input": input,
+            "probe": "transport",
             "error": error.to_string()
         })),
-        Err(error) => Ok(json!({
-            "state": "passed",
-            "capability_id": capability.id,
-            "input": input,
-            "outcome": "error_response",
-            "error": error.to_string()
-        })),
+        Err(error) => Err(error),
     }
 }
 
@@ -527,65 +497,6 @@ fn is_runtime_transport_failure(error: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
-}
-
-fn sample_input(schema: &Value) -> Value {
-    let Some(object) = schema.as_object() else {
-        return json!({});
-    };
-    if object.get("type").and_then(Value::as_str) != Some("object") {
-        return json!({});
-    }
-    let properties = object
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let required = object
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let mut input = serde_json::Map::new();
-    for name in required {
-        if let Some(property) = properties.get(name) {
-            input.insert(name.to_string(), sample_value(name, property));
-        }
-    }
-    Value::Object(input)
-}
-
-fn sample_value(name: &str, schema: &Value) -> Value {
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if let Some(value) = values.first() {
-            return value.clone();
-        }
-    }
-    match schema
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("string")
-    {
-        "string" => {
-            if name.ends_with("path") || name.ends_with("_root") {
-                if name.ends_with("path") {
-                    let path =
-                        env::temp_dir().join(format!("himind-plugin-contract-{}.txt", now_stamp()));
-                    let _ = fs::write(&path, "HiMind plugin contract sample\n");
-                    Value::String(path.to_string_lossy().to_string())
-                } else {
-                    Value::String(env::temp_dir().to_string_lossy().to_string())
-                }
-            } else {
-                Value::String("sample".to_string())
-            }
-        }
-        "integer" | "number" => schema.get("minimum").cloned().unwrap_or_else(|| json!(1)),
-        "boolean" => json!(false),
-        "array" => json!([]),
-        "object" => json!({}),
-        _ => Value::Null,
-    }
 }
 
 pub(crate) fn confirm(plugin_id: &str, version: &str) -> Result<PluginDraft, Box<dyn Error>> {

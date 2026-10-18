@@ -16,6 +16,7 @@ pub(crate) mod media_jobs;
 pub(crate) mod media_registry;
 pub mod outbox;
 pub(crate) mod paths;
+pub(crate) mod plugin_credentials;
 pub mod plugin_outbox;
 pub mod types;
 pub(crate) mod workbenches;

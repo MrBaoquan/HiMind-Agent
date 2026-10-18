@@ -3412,7 +3412,9 @@ tr:last-child td { border-bottom: 0; }
 .ai-overview-stats span, .ai-overview-stats strong { display: block; }
 .ai-overview-stats span { color: var(--text-muted); font-size: 12px; }
 .ai-overview-stats strong { margin-top: 2px; font-size: 15px; font-weight: 650; }
-.ai-overview-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+/* 动作固定在最后一列：概览卡可以不要统计块（例如「模型来源」的标题已经报了数），
+   少一个子元素时按钮也不会滑到中间去。 */
+.ai-overview-actions { grid-column: 3; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 .ai-overview-remove { color: var(--danger-strong, #b91c1c); }
 .ai-overview-actions .btn-primary { min-width: 116px; }
 .mcp-test-result { min-height: 48px; display: flex; align-items: center; gap: 9px; margin-bottom: 14px; padding: 8px 11px; border: 1px solid #a7f3d0; border-radius: 7px; color: #065f46; background: #ecfdf5; font-size: 12px; }
@@ -3746,6 +3748,15 @@ tr:last-child td { border-bottom: 0; }
 .ai-service-route-select { min-height: 30px; max-width: 260px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); background: var(--surface); font-size: 12px; }
 .ai-service-route-select:disabled { opacity: .6; cursor: wait; }
 .ai-service-route-hint { min-width: 0; flex: 1 1 200px; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+/* 「默认使用」＝一行对话来源 ＋ 折叠的媒体映射，两者回答同一个问题：哪条来源被谁用。 */
+.ai-service-defaults { display: grid; gap: 10px; margin-bottom: 14px; }
+.ai-service-defaults .ai-service-route { margin-bottom: 0; }
+.ai-service-defaults-head { color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.ai-service-defaults > .ai-service-media { margin-top: 0; }
+.ai-service-media-body { display: grid; gap: 10px; padding: 12px; border-top: 1px solid var(--border); }
+.ai-service-form-group > .ai-service-hint + .ai-service-hint { margin-top: 5px; }
+/* 禁用按钮上的 title 在 Chromium 里弹不出来：不能删的原因要写成看得见的字。 */
+.ai-client-registration-actions > .ai-service-delete-note { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 /* 「分发给 AI 工具」块：先按「工作台 / 本机自定义」标来源，再列服务行，
    让用户一眼看清有多少来自工作台、多少是自己加的。 */
 .ai-service-distribute { display: grid; }
@@ -4752,3 +4763,15 @@ tr:last-child td { border-bottom: 0; }
 .ai-gateway-upstream-client { flex: 0 0 auto; min-width: 84px; font-size: 12px; }
 .ai-gateway-upstreams-list select { flex: 1 1 auto; min-width: 0; max-width: 260px; height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 12px; }
 .ai-gateway-strip-copy span { max-width: min(520px, 48vw); }
+
+/* 插件凭据：声明在插件清单里，值由 Agent 保管，界面只做录入与状态展示。 */
+.plugin-credential-list { display: grid; gap: 10px; }
+.plugin-credential-row { display: grid; gap: 8px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.plugin-credential-head { display: flex; align-items: center; gap: 8px; }
+.plugin-credential-head > div { display: grid; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.plugin-credential-head small { color: var(--text-subtle); font-size: 11px; }
+.plugin-credential-fields { display: grid; gap: 6px; }
+.plugin-credential-fields label { display: grid; gap: 3px; font-size: 11px; color: var(--text-muted); }
+.plugin-credential-fields input { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12px; }
+.plugin-credential-actions { display: flex; align-items: center; gap: 8px; }
+.plugin-credential-docs { margin-left: auto; font-size: 11px; color: var(--text-muted); }

@@ -109,49 +109,21 @@ Agent 把这次传播提前到会话启动前后，在后台线程里付掉（`s
 两条会话并发跑同一条任务，总耗时 15.0 s，界面各自显示「用时 3 秒 / 4 秒」
 （`.tmp-dsh-probe/out/v5-warmup.json`）。
 
-## 创作链路的前置门槛：AI 扩展开发工具版本
+## 创作链路的前置门槛：扩展开发工具已内置
 
-并发本身不依赖任何插件，但**用 AI 写拓展**要先过一道版本门槛：预检会要求
-`com.himind.extension-development-tools` 不低于 `1.4.0`
-（`src/capability/service.rs` 的 `extension_tools_plugin_outdated`）。低于门槛时
-预检返回 `state=blocked`，技能约定是**诚实停止**、不写工程文件，于是会话看起来
-「跑完了但什么都没产出」。
+从 Agent 0.3.75 起，`com.himind.extension-development-tools` 是随 Agent 发布的内置插件，
+不需要安装、升级或对接组织通道。预检仍保留版本与可用性检查，但正常情况下内置条目
+直接满足门槛；外部同 ID 插件不会被加载，安装入口也会拒绝。
 
-这个门槛和并发无关，但很容易被误读成并发不可用，所以：
+如果预检仍报 `extension_tools_plugin_missing`、`extension_tools_plugin_unavailable`
+或 `extension_tool_missing`，优先检查：
 
-- preflight 的 remediation 会带上「本机哪个来源能拿到达标版本」，不再只说版本太低
-  （`authoring_upgrade_hint()`，同样是给模型和用户看的定位线索）；
-- 同一次预检里由老插件派生的阻塞（`extension_tool_missing`、
-  `authoring_skill_contract_mismatch`）会在 remediation 末尾指回这个根因，
-  否则字面上看像是「Skill 装错了」，用户会去重装 Skill 而始终升不上去；
-- 组织通道长期发低版本、而本地/GitHub 来源有高版本时，升级会被**不可变性守卫**
-  拦下（同版本不同内容不允许覆盖），此时只能卸载重装或发布更高版本；
-- 验证脚本把门槛镜像成一个显式断言（`$Script:AuthoringToolsMinimum`），
-  达不到就在 2 秒内抛错，并说明「这是环境门槛，不是并发架构问题」。
+- 当前启动的是不是刚构建的 Agent 二进制（而不是旧安装目录里的版本）；
+- 内置条目是否被插件健康记录标成 blocked；
+- Agent 安装包是否完整，`extension.*` 能力是否已注册。
 
-### 组织通道的闭环实测
-
-「发布 → 组织策略 → Agent 自动安装 → 并发创作」四段一起走过一遍，2026-09-27 在生产
-通道实测：
-
-| 环节 | 证据 |
-| --- | --- |
-| 发布 | 提交 `pluginsub_0d785ba927790f50` 审批通过，release `distrel_9fcaf57c47c231fb` = 1.4.2 published，artifact `distart_816df159170144c3`，sha256 `bf175d10…340` |
-| 组织策略 | 该资产 `desired-state` 变为 `desired_version=1.4.2 / intent=required / management=organization_managed / source=organization` |
-| Agent 安装 | 生产 home 的 `plugins/com.himind.extension-development-tools/current/plugin.json` = 1.4.2，`extension.lock.json` 里的 artifact_id 与 sha256 就是上面这一份，包内 `checksums.sha256` 逐条校验通过 |
-| 真实调用 | 安装后的入口 `extension.environment.preflight` 返回 `ready=true`；`scripts/verify-multisession-dsh.ps1` 以生产 home 跑出 24/24 |
-
-授权（`data/agent-preferences.json` 的 mode）是这条链路上唯一的用户侧开关：
-**取消授权即停止对接**，Agent 不再拉取组织策略，也就不会再自动升级——低版本会
-原地停住，看起来像「组织通道发不出新版本」。反向的坑同样存在：授权按钮要求当前
-处于对接状态，而取消授权会把 mode 打回 independent，于是「取消授权」之后
-再点「授权」必然以 `control_plane_required` 失败。现在 `start_dashboard_authorization`
-会先切回对接状态再发起设备授权（`src/app/commands.rs` 的
-`ensure_dashboard_mode_for_authorization`），两条控制互为反向操作。
-
-多工作台补充（ADR 0008）：设备授权按工作台连接分别保存，`mode` 只决定控制面
-Worker 是否运行。在「设置 → 账号 → HiMind 账号」里对当前连接取消授权会把 `mode`
-打回 independent，但其它连接仍保留自己的授权记录，切回去即可继续对接。
+历史文档里「从组织通道安装 1.4.2 插件」的实测记录只说明旧外部插件时代的升级链路；
+现在同一 ID 只保留内置身份，旧 Release 不再作为运行时依赖。
 
 ## 使用方式
 

@@ -246,6 +246,35 @@ fn resolve_dependency(
     dependency: &SkillCapabilityDependency,
     capability_facts: &[CapabilityFact],
 ) -> SkillDependencyResolution {
+    // 内核已经内建的能力（构建、校验、打包、preflight）不该因为「插件没装」而被
+    // 判成缺失：能力归属内核之后，插件只是执行器。
+    //
+    // 只在调用方没有指定提供方、或指定 agent/builtin 时兜底：显式 pin 了插件
+    // （provider: com.himind.xxx）的声明仍然要求那个插件 —— 那是作者写下的契约，
+    // 内核不替它兜底。
+    let pinned = dependency
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let missing_from_facts = !capability_facts.iter().any(|item| item.id == dependency.id);
+    let kernel_served = missing_from_facts
+        && crate::extension_toolchain::covers(&dependency.id)
+        && pinned
+            .map(|provider| provider_matches(provider, "builtin"))
+            .unwrap_or(true);
+    if kernel_served {
+        return SkillDependencyResolution {
+            id: dependency.id.clone(),
+            required: dependency.required,
+            state: "ready".to_string(),
+            reason: None,
+            // 内核实现随 Agent 版本发布，与插件序号不同序：这里只做展示，
+            // 不参与 min/max_version 比较（拿插件版本去卡内核实现是用了错误的尺子）。
+            capability_version: Some(crate::VERSION.to_string()),
+            provider: Some("kernel".to_string()),
+        };
+    }
     let matching_id = capability_facts
         .iter()
         .find(|item| item.id == dependency.id);
@@ -388,12 +417,20 @@ mod tests {
     }
 
     fn dependency(id: &str, required: bool) -> SkillCapabilityDependency {
+        dependency_with_provider(id, required, Some("agent"))
+    }
+
+    fn dependency_with_provider(
+        id: &str,
+        required: bool,
+        provider: Option<&str>,
+    ) -> SkillCapabilityDependency {
         SkillCapabilityDependency {
             id: id.to_string(),
             required,
             min_version: Some("1.0.0".to_string()),
             max_version: None,
-            provider: Some("agent".to_string()),
+            provider: provider.map(str::to_string),
         }
     }
 
@@ -414,8 +451,10 @@ mod tests {
 
     #[test]
     fn missing_required_capability_blocks_skill_readiness() {
+        // 用一条内核与外置插件都不提供的能力：缺失判定本身要有效。
+        // （extension.plugin.build 已由内核提供，见下面的内核兜底用例。）
         let readiness = SkillReadiness::resolve(
-            &manifest(vec![dependency("extension.plugin.build", true)]),
+            &manifest(vec![dependency("com.example.absent.capability", true)]),
             &[],
             "0.3.32",
             "codex",
@@ -424,9 +463,57 @@ mod tests {
         assert_eq!(readiness.state, "blocked");
         assert_eq!(
             readiness.reasons,
-            vec!["missing required capability: extension.plugin.build"]
+            vec!["missing required capability: com.example.absent.capability"]
         );
         assert_eq!(readiness.dependencies[0].state, "blocked");
+    }
+
+    #[test]
+    fn kernel_served_capabilities_satisfy_unpinned_and_agent_dependencies() {
+        // 内核内建（extension.plugin.build 等）之后，插件只是执行器：
+        // 没声明提供方、或声明 agent/builtin 的能力都应当就绪。
+        for capability in [
+            dependency_with_provider("extension.plugin.build", true, None),
+            dependency_with_provider("extension.plugin.build", true, Some("agent")),
+            dependency_with_provider("extension.skill.package", true, Some("builtin")),
+        ] {
+            let readiness = SkillReadiness::resolve(
+                &manifest(vec![capability.clone()]),
+                &[],
+                "0.3.75",
+                "codex",
+            );
+            assert_eq!(
+                readiness.state, "ready",
+                "{:?} 应当由内核满足: {:?}",
+                capability.id, readiness.reasons
+            );
+            assert_eq!(
+                readiness.dependencies[0].provider.as_deref(),
+                Some("kernel")
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_pinned_capabilities_still_require_that_plugin() {
+        // 作者显式 pin 了插件提供方，就是写下的契约：内核不替它兜底。
+        let readiness = SkillReadiness::resolve(
+            &manifest(vec![dependency_with_provider(
+                "extension.plugin.build",
+                true,
+                Some("com.himind.extension-development-tools"),
+            )]),
+            &[],
+            "0.3.75",
+            "codex",
+        );
+
+        assert_eq!(readiness.state, "blocked");
+        assert_eq!(
+            readiness.reasons,
+            vec!["missing required capability: extension.plugin.build"]
+        );
     }
 
     #[test]

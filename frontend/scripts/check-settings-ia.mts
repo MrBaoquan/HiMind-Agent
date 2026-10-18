@@ -147,4 +147,25 @@ assert.ok(
   '进入设置页必须走 refreshSettingsPageData',
 );
 
-console.log(`settings IA: ${groups.length} 组 / ${totalItems} 条，深链白名单、窄窗折叠与样式约定校验通过`);
+// 13. AI 连接是这套左栏里唯一一个「页签套页签」的面板，三条最容易退化的约定单独锁住：
+//     · 页头说明不能丢（这句话同时是左栏条目的说明，只有这里两处共用）；
+//     · 指路文案里的页签名要取自 aiConnectionsTabs，不能再出现「模型服务」这种早已改名的词；
+//     · 没有可用来源时，「模型」接线要给下一步，不能只剩一个禁用按钮。
+const aiPage = readFrontend(join('src', 'pages', 'AiConnectionsPage.tsx'));
+const aiTabs = readFrontend(join('src', 'pages', 'aiConnectionsTabs.ts'));
+const aiProviders = readFrontend(join('src', 'pages', 'AiProvidersPanel.tsx'));
+const aiTools = readFrontend(join('src', 'pages', 'AiToolsPanel.tsx'));
+const builtinAi = readFrontend(join('src', 'pages', 'BuiltinAiPage.tsx'));
+assert.ok(aiTabs.includes("services: '模型来源'"), 'aiConnectionsTabs 必须声明「模型来源」这个页签标签');
+assert.ok(/<PageHeader title="AI 连接" description=\{AI_CONNECTIONS_DESCRIPTION\}/.test(aiPage), 'AI 连接页头要带说明，与其他设置面板一致');
+assert.ok(/AI_CONNECTIONS_TAB_LABELS\.services/.test(builtinAi), '对话页指路到模型来源页签时要取同一个标签常量，不能自己写死一个词');
+assert.ok(!/media\.[a-z]/.test(aiProviders), '用户可见文案里不能出现 media.* 这类内部能力 ID');
+assert.ok(/hasUsableSource/.test(aiTools) && aiTools.includes('还没有可用的模型来源'), '「模型」接线在一条可用来源都没有时要说明缺什么');
+assert.ok(/onOpenModelSources=\{\(\) => setActiveTab\('services'\)\}/.test(aiPage), '「新增模型来源」要能直接切到模型来源页签');
+assert.ok(/hasAnySource/.test(aiTools), '一条来源都没有时，工具接入页要在列表之前说明并给出入口');
+assert.ok(/ai-service-media/.test(aiProviders), '媒体映射要收进可折叠块，首屏只留一行对话来源');
+assert.ok(!/applyPreset\(group\.items\[0\]\.id\)/.test(aiProviders), '预设分类页签只切换列表，不能顺手替用户选中第一个厂商');
+assert.ok(/ai-service-delete-note/.test(aiProviders), '不能删除的原因要写成看得见的字（禁用按钮的 title 在 Chromium 里弹不出来）');
+assert.ok(/missing === 'Base URL'/.test(aiProviders), '缺字段要由 saveService 点名，按钮不能靠 disabled 把用户关在门外');
+
+console.log(`settings IA: ${groups.length} 组 / ${totalItems} 条，深链白名单、窄窗折叠、AI 连接约定校验通过`);

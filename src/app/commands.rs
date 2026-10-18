@@ -3612,10 +3612,7 @@ pub(crate) fn add_extension_workspace(
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default();
         let _ = crate::app::extension_source::add_local_source(&name, &display, None);
-    } else if ["plugin.json", "skill.json", "workflow.json"]
-        .iter()
-        .any(|manifest| path.join(manifest).is_file())
-    {
+    } else if crate::extension_workspace::is_extension_project_dir(&path) {
         // 目录本身就是一个扩展（单项目工作区）：登记成项目，列表里才会出现它。
         let _ = crate::extension_projects::register(&path);
     }
@@ -3651,6 +3648,10 @@ pub(crate) fn remove_extension_workspace(
             let _ = crate::app::extension_source::remove_source(&source_id);
         }
     }
+    // 工作区下的项目登记也要一起消失：只删工作区会让项目以「未关联本地目录」
+    // 重新出现，目录清单为空时还会被项目目录兜底，看起来像移除没有生效。
+    crate::extension_projects::remove_for_workspace(std::path::Path::new(root.trim()))
+        .map_err(|error| format!("清理工作区项目登记失败: {error}"))?;
     Ok(crate::extension_workspace::workspace_entries())
 }
 
@@ -3714,6 +3715,95 @@ pub(crate) fn create_extension_project(
     };
     crate::extension_projects::create(&parent, input, &identity.user_name)
         .map_err(|error| error.to_string())
+}
+
+/// 扩展开发工具链就绪度：界面据此说明「走插件执行器还是内核内置实现」、
+/// Go 工具链是否可用，以及新建扩展是否仍需要扩展开发工具插件。
+/// 插件声明的凭据 + 当前配置状态。只返回状态（配没配、配了哪些字段、更新时间），
+/// 不返回任何明文：值由 Agent 统一保管，界面与插件都看不到它。
+#[tauri::command]
+pub(crate) fn plugin_credentials(plugin_id: String) -> Result<serde_json::Value, String> {
+    let item = crate::capability::plugin::find_plugin(plugin_id.trim())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("插件未安装: {}", plugin_id.trim()))?;
+    // 内置插件没有磁盘清单；凭据需求由内核清单描述，当前两个内置插件都没有声明。
+    // 返回空集合而不是报错，避免详情页把「系统内置」误显示成读取失败。
+    if item.source == "builtin" {
+        return Ok(serde_json::json!({
+            "plugin_id": plugin_id.trim(),
+            "credentials": [],
+        }));
+    }
+    let directory = {
+        let current = std::path::Path::new(&item.path).join("current");
+        if current.join("plugin.json").is_file() {
+            current
+        } else {
+            std::path::PathBuf::from(&item.path)
+        }
+    };
+    let content = std::fs::read_to_string(directory.join("plugin.json"))
+        .map_err(|error| format!("读取插件清单失败: {error}"))?;
+    let manifest = crate::capability::plugin::parse_plugin_manifest(&content)
+        .map_err(|error| error.to_string())?;
+    let ids: Vec<String> = manifest
+        .credentials
+        .iter()
+        .map(|item| item.id.clone())
+        .collect();
+    let statuses = crate::store::plugin_credentials::statuses(plugin_id.trim(), &ids)
+        .map_err(|error| error.to_string())?;
+    let by_id: std::collections::BTreeMap<_, _> = statuses
+        .into_iter()
+        .map(|status| (status.id.clone(), status))
+        .collect();
+    let items: Vec<serde_json::Value> = manifest
+        .credentials
+        .iter()
+        .map(|request| {
+            let status = by_id.get(&request.id);
+            serde_json::json!({
+                "id": request.id,
+                "label": if request.label.trim().is_empty() { request.id.clone() } else { request.label.clone() },
+                "kind": request.kind,
+                "fields": request.fields,
+                "required": request.required,
+                "description": request.description,
+                "docs_url": request.docs_url,
+                "configured": status.is_some_and(|value| value.configured),
+                "configured_fields": status.map(|value| value.configured_fields.clone()).unwrap_or_default(),
+                "updated_at": status.map(|value| value.updated_at.clone()).unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "plugin_id": plugin_id.trim(), "credentials": items }))
+}
+
+/// 保存（或覆盖）一条插件凭据。明文只在内存里传给凭据库，落盘前就加密。
+#[tauri::command]
+pub(crate) fn save_plugin_credential(
+    plugin_id: String,
+    credential_id: String,
+    fields: std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    crate::store::plugin_credentials::save(plugin_id.trim(), credential_id.trim(), &fields)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 删除一条插件凭据；返回是否真的删掉了东西。
+#[tauri::command]
+pub(crate) fn delete_plugin_credential(
+    plugin_id: String,
+    credential_id: String,
+) -> Result<bool, String> {
+    crate::store::plugin_credentials::remove(plugin_id.trim(), credential_id.trim())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn extension_development_readiness() -> serde_json::Value {
+    crate::extension_toolchain::readiness()
 }
 
 #[tauri::command]

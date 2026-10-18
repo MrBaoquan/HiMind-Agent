@@ -917,7 +917,7 @@ fn create_instruction_skeleton(
     )
 }
 
-fn create_workflow_skeleton(
+pub(crate) fn create_workflow_skeleton(
     parent: &Path,
     slug: &str,
     input: &CreateExtensionProjectInput,
@@ -1140,6 +1140,36 @@ fn git_head(workspace: &Path) -> Option<String> {
     (!commit.is_empty()).then_some(commit)
 }
 
+/// 移除工作区时一并清掉该工作区下的项目登记。目录内容不动，只清「扩展开发」
+/// 列表里的归属关系；否则工作区消失后项目会以「未关联本地目录」重新出现，
+/// 或在没有其它工作区时按项目目录兜底，看起来像移除失败。
+pub(crate) fn remove_for_workspace(root: &Path) -> Result<usize, Box<dyn Error>> {
+    remove_for_workspace_at(&registry_path(), root)
+}
+
+fn remove_for_workspace_at(registry: &Path, root: &Path) -> Result<usize, Box<dyn Error>> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let (removed, _) = with_registry_mut_at(registry, |records| {
+        let before = records.len();
+        records.retain(|record| !path_is_within(&root, &record.workspace_path));
+        Ok((before - records.len(), before != records.len()))
+    })?;
+    Ok(removed)
+}
+
+fn path_is_within(root: &Path, candidate: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        crate::extension_workspace::display_path(&resolved)
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    let root = normalize(root);
+    let candidate = normalize(candidate);
+    candidate == root || candidate.starts_with(&(root.clone() + "/"))
+}
+
 pub(crate) fn remove(project_id: &str) -> Result<(), Box<dyn Error>> {
     with_registry_mut(|records| {
         let before = records.len();
@@ -1160,17 +1190,27 @@ fn find_record(project_id: &str) -> Result<ProjectRecord, Box<dyn Error>> {
 }
 
 fn invoke_development_tool(capability_id: &str, input: Value) -> Result<Value, Box<dyn Error>> {
-    let plugin = crate::capability::plugin::find_plugin(DEVELOPMENT_TOOLS_PLUGIN_ID)?
-        .ok_or("请先安装扩展开发工具")?;
-    if !plugin.enabled || plugin.circuit_open {
-        return Err("扩展开发工具当前不可用".into());
+    // 交给执行器（外置插件或内核）的路径统一成普通形态，见 normalize_tool_paths。
+    let input = normalize_tool_paths(&input);
+    // 扩展开发工具的内置条目是唯一身份（外部同 ID 副本已被注册表忽略）：
+    // 能力直接由内核实现，不再尝试启动插件进程。
+    if crate::capability::plugin::effective_plugin_is_builtin(DEVELOPMENT_TOOLS_PLUGIN_ID) {
+        if crate::extension_toolchain::covers(capability_id) {
+            return crate::extension_toolchain::invoke(capability_id, &input);
+        }
+        // 内置身份只实现 8 条能力；其余（workflow.* 等）没有外置副本可用。
+        // 用与"插件缺少能力"一致的措辞，让 create 的工作流原生兜底生效。
+        return Err(format!("扩展开发工具（内置）缺少能力: {capability_id}").into());
     }
-    if !plugin
-        .capabilities
-        .iter()
-        .any(|capability| capability.id == capability_id)
-    {
-        return Err(format!("扩展开发工具缺少能力: {capability_id}").into());
+    // 装了插件优先用插件：上游工具链可以独立演进（模板、语言矩阵、错误文案）。
+    // 插件没装/不可用/没声明这条能力时回落到内核实现：构建、校验、打包不能再被
+    // 一个可选的市场制品卡住——本轮之前，未装插件的 profile 里每个扩展都会单独
+    // 报一次「请先安装扩展开发工具」。
+    if let Some(reason) = development_plugin_gap(capability_id) {
+        if crate::extension_toolchain::covers(capability_id) {
+            return crate::extension_toolchain::invoke(capability_id, &input);
+        }
+        return Err(reason.into());
     }
     crate::capability::plugin::invoke_plugin_capability_for_plugin(
         DEVELOPMENT_TOOLS_PLUGIN_ID,
@@ -1179,6 +1219,52 @@ fn invoke_development_tool(capability_id: &str, input: Value) -> Result<Value, B
         None,
     )
     .map_err(|error| friendly_tool_error(&error.to_string()).into())
+}
+
+/// 把工具入参里的路径剥掉 Windows 的 verbatim 前缀（\\?\C:\...）。
+///
+/// Rust 的 canonicalize 在 Windows 上返回 verbatim 路径，而 Go 的 go:embed 在
+/// verbatim 工作目录下会找不到文件：同一个插件目录用普通路径构建通过、用前缀构建
+/// 报 pattern runtime-lock.json: no matching files found（media-downloader 长期
+/// 建不出来的原因）。内核实现自己两种形态都能处理，但外置执行器是别人的进程，
+/// 唯一稳妥的做法是在入口处统一成普通路径。
+fn normalize_tool_paths(input: &Value) -> Value {
+    let mut value = input.clone();
+    let Some(fields) = value.as_object_mut() else {
+        return value;
+    };
+    for key in ["workspace_root", "path", "output", "output_dir"] {
+        let normalized = match fields.get(key) {
+            Some(Value::String(text)) if !text.trim().is_empty() => Some(
+                crate::extension_workspace::display_path(std::path::Path::new(text)),
+            ),
+            _ => None,
+        };
+        if let Some(text) = normalized {
+            fields.insert(key.to_string(), Value::String(text));
+        }
+    }
+    value
+}
+
+/// 扩展开发工具插件为什么提供不了这条能力；None 表示插件可用且声明了该能力。
+fn development_plugin_gap(capability_id: &str) -> Option<String> {
+    let plugin = match crate::capability::plugin::find_plugin(DEVELOPMENT_TOOLS_PLUGIN_ID) {
+        Ok(Some(plugin)) => plugin,
+        Ok(None) => return Some("请先安装扩展开发工具".to_string()),
+        Err(error) => return Some(format!("扩展开发工具状态读取失败: {error}")),
+    };
+    if !plugin.enabled || plugin.circuit_open {
+        return Some("扩展开发工具当前不可用".to_string());
+    }
+    if !plugin
+        .capabilities
+        .iter()
+        .any(|capability| capability.id == capability_id)
+    {
+        return Some(format!("扩展开发工具缺少能力: {capability_id}"));
+    }
+    None
 }
 
 fn friendly_tool_error(error: &str) -> String {
@@ -2247,6 +2333,26 @@ mod tests {
     }
 
     #[test]
+    fn external_tool_paths_drop_the_windows_verbatim_prefix() {
+        let input = json!({
+            "workspace_root": r"\\?\C:\work\repo",
+            "path": r"\\?\C:\work\repo\plugins\demo",
+            "output_dir": r"\\?\C:\work\repo",
+            "output": r"\\?\C:\work\repo\out.hmpkg",
+            "name": "demo",
+        });
+
+        let normalized = normalize_tool_paths(&input);
+
+        assert_eq!(normalized["workspace_root"], json!(r"C:\work\repo"));
+        assert_eq!(normalized["path"], json!(r"C:\work\repo\plugins\demo"));
+        assert_eq!(normalized["output_dir"], json!(r"C:\work\repo"));
+        assert_eq!(normalized["output"], json!(r"C:\work\repo\out.hmpkg"));
+        // 非路径字段原样保留，别把清单里的名字也"规范化"了。
+        assert_eq!(normalized["name"], json!("demo"));
+    }
+
+    #[test]
     fn rejects_ambiguous_project_directory() {
         let root = env::temp_dir().join(format!("himind-project-ambiguous-{}", now_stamp()));
         fs::create_dir_all(&root).unwrap();
@@ -2708,5 +2814,53 @@ mod tests {
         // `env::temp_dir()` 在 Windows 上可能是 8.3 短名（ADMINI~1），登记里存的是
         // 规范化之后的长名，比较前先对齐。
         crate::extension_workspace::display_path(&path.canonicalize().unwrap())
+    }
+
+    #[test]
+    fn workspace_removal_drops_projects_under_that_root_only() {
+        let root = env::temp_dir().join(format!("himind-workspace-remove-{}", now_stamp()));
+        let child = root.join("child");
+        let outside = env::temp_dir().join(format!("himind-workspace-keep-{}", now_stamp()));
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let registry = registry_file("workspace-remove");
+        let records = vec![
+            record(
+                ExtensionProjectKind::Plugin,
+                "com.example.root".to_string(),
+                "根项目".to_string(),
+                String::new(),
+                "0.1.0".to_string(),
+                &root,
+                "local_workspace",
+            ),
+            record(
+                ExtensionProjectKind::Plugin,
+                "com.example.child".to_string(),
+                "子项目".to_string(),
+                String::new(),
+                "0.1.0".to_string(),
+                &child,
+                "local_workspace",
+            ),
+            record(
+                ExtensionProjectKind::Plugin,
+                "com.example.outside".to_string(),
+                "外部项目".to_string(),
+                String::new(),
+                "0.1.0".to_string(),
+                &outside,
+                "local_workspace",
+            ),
+        ];
+        write_records(&registry, &records).unwrap();
+        let removed = remove_for_workspace_at(&registry, &root).unwrap();
+        assert_eq!(removed, 2);
+        let remaining = read_records(&registry).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].extension_id, "com.example.outside");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+        let _ = fs::remove_file(registry);
     }
 }

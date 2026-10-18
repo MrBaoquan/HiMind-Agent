@@ -173,17 +173,23 @@ pub(crate) fn trusted_agent_update_key_ids() -> Vec<String> {
 
 pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn Error>> {
     let key_id = key_id.trim();
-    if let Some(trusted_dir) = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR") {
-        let trusted_dir = PathBuf::from(trusted_dir);
-        // 撤销优先于任何其它来源：内嵌公钥和目录里的公钥文件都不能让撤销过的
-        // key ID 重新生效，否则「轮换后旧签名继续可验」就是必然发生的。
-        if signing_key_is_revoked(&trusted_dir, key_id)? {
-            return Err(format!("签名公钥已被撤销：{key_id}").into());
-        }
-        let public_key_path = trusted_dir.join(format!("{key_id}.pem"));
-        if public_key_path.is_file() {
-            return Ok(std::fs::read_to_string(public_key_path)?);
-        }
+    // 查找目录必须与提示目录同源：没显式指定就用 agent_home/trusted-keys。
+    //
+    // 这条曾经只读环境变量，于是本地构建的开发版（没有内嵌生产公钥）永远报
+    // 「未找到受信的签名公钥」，而报错里同时列着提示目录中已经躺好的公钥文件——
+    // 用户照着提示操作仍旧不行，运行时自愈也就一直装不上。安装器写入的这份
+    // 始终是内嵌信任根的覆盖层（见 embedded_signing_public_key 的说明）。
+    let trusted_dir = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::store::paths::agent_home().join("trusted-keys"));
+    // 撤销优先于任何其它来源：目录里的公钥文件与内嵌公钥都不能让撤销过的
+    // key ID 重新生效，否则「轮换后旧签名继续可验」就是必然发生的。
+    if signing_key_is_revoked(&trusted_dir, key_id)? {
+        return Err(format!("签名公钥已被撤销：{key_id}").into());
+    }
+    let public_key_path = trusted_dir.join(format!("{key_id}.pem"));
+    if public_key_path.is_file() {
+        return Ok(std::fs::read_to_string(public_key_path)?);
     }
     if let Some(embedded) = embedded_signing_public_key(key_id) {
         return Ok(embedded.to_string());
@@ -3116,6 +3122,27 @@ mod tests {
         }
         assert!(error.to_string().contains("撤销"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trusted_key_lookup_reads_the_hint_directory_without_an_override() {
+        // 「按提示把公钥放进 trusted-keys」必须真的生效：提示目录与查找目录同源。
+        // 曾经查找只读 HIMIND_TRUSTED_SIGNING_KEYS_DIR，本地构建的开发版因此
+        // 永远报「未找到受信的签名公钥」，运行时自愈一直装不上。
+        let home = PinnedHome::new("trusted-keys-lookup", "development");
+        let trusted = home.root.join("trusted-keys");
+        std::fs::create_dir_all(&trusted).unwrap();
+        let pem = "-----BEGIN PUBLIC KEY-----\nZmFrZS1rZXk=\n-----END PUBLIC KEY-----\n";
+        std::fs::write(trusted.join("himind-production-2026.pem"), pem).unwrap();
+        let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
+        let resolved = trusted_signing_public_key("himind-production-2026");
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
+            None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
+        }
+        assert_eq!(resolved.unwrap(), pem);
+        assert!(trusted_signing_keys_directory_hint().ends_with("trusted-keys"));
     }
 
     #[test]

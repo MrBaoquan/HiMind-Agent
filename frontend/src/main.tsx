@@ -12,6 +12,7 @@ import { lazyNamed } from './utils/lazyNamed';
 import { managedItems } from './utils/managedItems';
 const ApprovalsPage = lazyNamed(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
 const AiConnectionsPage = lazyNamed(() => import('./pages/AiConnectionsPage'), 'AiConnectionsPage');
+import type { AiConnectionsTab } from './pages/aiConnectionsTabs';
 import { clientLabel } from './utils/clientLabels';
 import { BuiltinAiPage } from './pages/BuiltinAiPage';
 const DashboardPage = lazyNamed(() => import('./pages/DashboardPage'), 'DashboardPage');
@@ -38,8 +39,6 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 let nextNotificationId = 1;
-
-type AiConnectionsTab = 'mcp' | 'services' | 'acp';
 
 function workspaceLabel(root: string) {
   return root.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '扩展聚合仓库';
@@ -1539,6 +1538,41 @@ function AgentApp() {
     }
   }
 
+  /// 单个扩展的构建流水线：构建 → 生成候选 → 本机试运行并确认 → 刷新本机能力。
+  /// 单个项目的「构建」与工作区的「一键构建」共用这一条，避免两处语义漂移。
+  /// 批量场景把派生视图（插件/技能/内置 AI 工具上下文）的刷新压到整批结束做一次。
+  async function buildOneProject(
+    projectId: string,
+    onProgress?: (stage: 'building' | 'activating' | 'refreshing') => void,
+    deferCapabilityRefresh = false,
+  ) {
+    onProgress?.('building');
+    const candidate = await agentApi.buildExtensionProject(projectId);
+    onProgress?.('activating');
+    if (candidate.kind === 'plugin') {
+      await agentApi.testPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      await agentApi.confirmPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+    } else if (candidate.kind === 'skill') {
+      await agentApi.testSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      await agentApi.confirmSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+    } else if (candidate.kind === 'workflow') {
+      await agentApi.testWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
+      await agentApi.confirmWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
+    } else if (candidate.kind === 'expert') {
+      await agentApi.testExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
+      await agentApi.confirmExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
+    } else {
+      await agentApi.testInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      await agentApi.confirmInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+    }
+    onProgress?.('refreshing');
+    if (deferCapabilityRefresh) {
+      await refreshDevelopment();
+    } else {
+      await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
+    }
+  }
+
   const availablePlugins = useMemo(() => {
     const merged = new Map(pluginCatalog.map(item => [item.plugin_id, item]));
     for (const item of pluginRegistry?.items || []) {
@@ -2028,10 +2062,10 @@ function AgentApp() {
       onRemoveTarget={removeMcpTarget}
       onOpenDirectory={(path) => run(() => agentApi.openFolder(path))}
       onTest={testMcpConnection}
-      onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', '模型服务已保存'); } catch (error) { notify('error', formatError(error, '保存模型服务失败')); throw error; } }}
+      onSaveAIService={async (input) => { try { await agentApi.saveAIService(input); await refreshAIServices(); notify('success', '模型来源已保存'); } catch (error) { notify('error', formatError(error, '保存模型来源失败')); throw error; } }}
       onSetActiveAIService={(id) => run(async () => { await agentApi.setActiveAIService(id); await refreshAIServices(); }, id ? 'HiMind AI 对话已改用所选服务' : 'HiMind AI 对话已恢复默认服务', '切换 HiMind AI 对话服务失败')}
       onSetImageAIService={(id, capability) => run(async () => { await agentApi.setImageAIService(id, capability); await refreshAIServices(); }, id ? '媒体能力已改用所选服务' : '媒体能力已恢复自动选择', '设置媒体能力服务失败')}
-      onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型服务已删除', '删除模型服务失败')}
+      onRemoveAIService={(id) => run(async () => { await agentApi.removeAIService(id); await refreshAIServices(); }, '模型来源已删除', '删除模型来源失败')}
       onFetchModels={(input) => agentApi.fetchAIServiceModels(input).then((result) => result.models)}
       onFetchSavedModels={(id, baseUrl) => agentApi.fetchSavedAIServiceModels(id, baseUrl).then((result) => result.models)}
       onFetchBalance={(id) => agentApi.fetchSavedAIServiceBalance(id)}
@@ -2458,29 +2492,46 @@ function AgentApp() {
       }}
       onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProjects(); await refreshDevelopment(); }, '已添加到扩展开发', '打开扩展项目失败')}
       onAssociateProject={(project: ExtensionRemoteProject) => runDevelopmentOperation(`associate:${project.product_key}`, async () => { await agentApi.associateExtensionProject(project); await refreshDevelopment(); }, '本地项目已关联', '关联本地项目失败')}
-      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, async () => {
-        onProgress?.('building');
-        const candidate = await agentApi.buildExtensionProject(projectId);
-        onProgress?.('activating');
-        if (candidate.kind === 'plugin') {
-          await agentApi.testPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-          await agentApi.confirmPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-        } else if (candidate.kind === 'skill') {
-          await agentApi.testSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-          await agentApi.confirmSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-        } else if (candidate.kind === 'workflow') {
-          await agentApi.testWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
-          await agentApi.confirmWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
-        } else if (candidate.kind === 'expert') {
-          await agentApi.testExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
-          await agentApi.confirmExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
-        } else {
-          await agentApi.testInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
-          await agentApi.confirmInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, () => buildOneProject(projectId, onProgress), '构建完成，已在本机启用', '构建或启用失败')}
+      // 工作区级「一键构建」：页面按依赖排好序后交过来，这里逐个执行。
+      // 单个失败不打断后面的；被依赖的项没成功就跳过依赖者（跳过不是失败）。
+      // 失败与跳过都以值的形式交回页面，由页面在同一条提示里说明是谁、为什么。
+      onBuildWorkspace={async (projects, onProgress) => {
+        if (developmentOperation) throw new Error('已有扩展操作正在进行，请稍后重试');
+        setDevelopmentOperation('build-workspace');
+        try {
+          const failures: Array<{ name: string; message: string }> = [];
+          const skipped: Array<{ name: string; reason: string }> = [];
+          const succeeded = new Set<string>();
+          for (let index = 0; index < projects.length; index += 1) {
+            const project = projects[index];
+            onProgress?.({ done: index + 1, total: projects.length, name: project.name });
+            const missing = project.dependencies.filter(
+              dependency => projects.some(item => item.extensionId === dependency) && !succeeded.has(dependency),
+            );
+            if (missing.length) {
+              skipped.push({ name: project.name, reason: `依赖 ${missing.join('、')} 未构建成功` });
+              continue;
+            }
+            try {
+              await buildOneProject(project.id, undefined, true);
+              succeeded.add(project.extensionId);
+            } catch (error) {
+              failures.push({ name: project.name, message: formatError(error, '构建失败') });
+            }
+          }
+          // 派生视图整批刷一次：逐项各刷一遍，在 28 项的批次里就是上百次全量刷新。
+          await Promise.all([refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
+          if (failures.length) {
+            notify('error', `一键构建：${succeeded.size}/${projects.length} 成功，${failures.length} 项失败，${skipped.length} 项跳过`);
+          } else {
+            notify('success', `已构建并启用 ${succeeded.size} 个扩展${skipped.length ? `，跳过 ${skipped.length} 项` : ''}`);
+          }
+          return { succeeded: succeeded.size, failures, skipped };
+        } finally {
+          setDevelopmentOperation(null);
         }
-        onProgress?.('refreshing');
-        await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
-      }, '构建完成，已在本机启用', '构建或启用失败')}
+      }}
       onDevelopWithAi={(project) => { void openBuiltinAi(project); }}
       onDevelopWorkspaceWithAi={(root: string) => { void openExtensionWorkspaceAi(root); }}
        onSubmit={(kind: ExtensionProjectKind, extensionId: string, version: string) => runDevelopmentOperation(`submit:${kind}:${extensionId}`, async () => { if (kind === 'plugin') await agentApi.submitPluginDraft(extensionId, version); else if (kind === 'skill') await agentApi.submitSkillDraft(extensionId, version); else if (kind === 'workflow') await agentApi.submitWorkflowDraft(extensionId, version); else if (kind === 'expert') await agentApi.submitExpertDraft(extensionId, version); else throw new Error('项目规则请发布到本机规则库'); await refreshDevelopment(); }, '已提交审核', '提交审核失败')}

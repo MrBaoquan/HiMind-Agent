@@ -1340,7 +1340,7 @@ function RuntimeUninstallConfirmation({ onClose, onConfirm }: { onClose: () => v
   return (
     <div className="modal-backdrop" role="presentation">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="runtime-uninstall-title">
-        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI？</h3><p>HiMind AI 将暂时不可用，个人模型服务、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+        <div className="modal-header"><div><h3 id="runtime-uninstall-title">卸载 HiMind AI？</h3><p>HiMind AI 将暂时不可用，本机模型来源、技能、插件和用户数据会保留。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body"><div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-danger" onClick={onConfirm}><Trash2 size={15} />确认卸载</button></div></div></div>
       </div>
     </div>

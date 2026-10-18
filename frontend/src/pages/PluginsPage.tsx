@@ -4,6 +4,7 @@ import type { CapabilityItem, ExtensionDesiredItem, ExtensionDesiredState, Plugi
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, Pill, Tags } from '../components/Common';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
+import { PluginCredentialsPanel } from '../components/PluginCredentialsPanel';
 import { ExtensionKindMark } from '../components/ExtensionKindMark';
 import { ExtensionBatchUpdateDialog } from '../components/ExtensionBatchUpdateDialog';
 import { OperationPlanCard } from '../components/OperationPlanCard';
@@ -31,9 +32,12 @@ function governanceBadge(item: PluginItem): { label: string; tone: 'warn' | 'dan
  * 计数和列表必须同源，所以这段筛选对外导出给容器页用。
  */
 export function userInstalledPlugins(pluginItems: PluginItem[], desired: ExtensionDesiredState | null, dashboardEnabled: boolean) {
+  // provider 是控制面契约适配（工作台动态提供），不是"本地插件"：
+  // 插件列表只展示 plugin 与 connector，避免出现"装了一个插件却什么都没有"。
+  const local = pluginItems.filter(item => item.kind !== 'provider');
   return dashboardEnabled
-    ? pluginItems.filter(item => !isManagedPlugin(item, desired))
-    : pluginItems.filter(item => item.availability !== 'control_plane');
+    ? local.filter(item => !isManagedPlugin(item, desired))
+    : local.filter(item => item.availability !== 'control_plane');
 }
 
 export function PluginsPage({ loading, registry, catalog, desired, capabilities, dashboardEnabled, catalogEnabled, onLoadVersions, onPlanInstall, onInstall, onUninstall, onRollback, onRepair, onSetEnabled, onOpenView, onCreateShortcut, onImportLocal, onImportGithub, onOpenExtensions, onBatchUpdateFinished }: {
@@ -237,13 +241,13 @@ function PluginDetail({ item, capabilities, catalog, catalogEnabled, onLoadVersi
       <div className="plugin-detail-header">
         <div className="plugin-detail-title">
           <ExtensionKindMark kind="plugin" />
-          <div className="plugin-title-line"><h3>{item.name || item.id}</h3><Pill kind={item.circuit_open ? 'danger' : item.status === 'installed' && item.enabled ? 'success' : item.status === 'failed' ? 'danger' : 'warn'}>{item.circuit_open || item.status === 'failed' ? '运行异常' : item.enabled ? '已安装' : '已停用'}</Pill>{item.development ? <Pill kind="warn">开发中</Pill> : null}{governanceTag ? <Pill kind={governanceTag.tone}>{governanceTag.label}</Pill> : null}</div>
+          <div className="plugin-title-line"><h3>{item.name || item.id}</h3>{item.kind === 'connector' ? <Pill kind="neutral">连接器</Pill> : null}<Pill kind={item.circuit_open ? 'danger' : item.status === 'installed' && item.enabled ? 'success' : item.status === 'failed' ? 'danger' : 'warn'}>{item.circuit_open || item.status === 'failed' ? '运行异常' : item.enabled ? '已安装' : '已停用'}</Pill>{item.development ? <Pill kind="warn">开发中</Pill> : null}{governanceTag ? <Pill kind={governanceTag.tone}>{governanceTag.label}</Pill> : null}</div>
         </div>
         {/* 回滚暂时不暴露入口（后端与 registry 里的 previous 版本都保留），详情级只留更新、启用与卸载。 */}
         <div className="plugin-installed-actions">
           {needsRepair ? <button className="btn btn-primary" type="button" title="清除失败记录并立即重新尝试调用" onClick={() => onRepair(item.id)}><RefreshCw size={15} />修复并重试</button> : null}
           {updatable ? <button className={`btn${needsRepair ? '' : ' btn-primary'}`} type="button" onClick={() => onPlanVersion(latestVersion)}><Download size={15} />更新到 v{latestVersion}</button> : null}
-          {!item.development ? <>
+          {!item.development && item.source !== 'builtin' ? <>
             {/* 类名从 plugin- 前缀改成通用名：工作流详情头部用的是同一个控件，
                 两个页面共用一条规则，改一处两边一起变。 */}
             <label className="enable-control"><span>启用</span><span className="toggle"><input type="checkbox" checked={Boolean(item.enabled)} disabled={item.governance === 'required' || item.governance === 'managed'} onChange={event => event.target.checked ? onSetEnabled(item.id, true) : setPendingAction({ title: '确认停用插件？', description: `停用后，Agent 将不再调用“${item.name || item.id}”提供的能力。`, confirmText: '确认停用', run: () => onSetEnabled(item.id, false) })} /><span className="slider" /></span></label>
@@ -268,12 +272,14 @@ function PluginDetail({ item, capabilities, catalog, catalogEnabled, onLoadVersi
           <div className="plugin-section-heading"><div><h4>功能</h4></div></div>
           <div className="plugin-view-list">
             {item.views?.map(view => <div className="plugin-view-row" key={view.id}><MonitorUp size={17} /><div><strong>{view.title}</strong></div><div className="actions-row"><button className="btn btn-primary" onClick={() => onOpenView(item.id, view.id)}><ExternalLink size={15} />打开</button><button className="btn" onClick={() => onCreateShortcut(item.id, view.id, view.title)}>创建快捷方式</button></div></div>)}
-            {capabilities.length ? <div className="plugin-view-row"><Bot size={17} /><div><strong>AI 工具</strong><small>可供 AI 使用</small></div></div> : null}
+            {capabilities.length ? <div className="plugin-view-row"><Bot size={17} /><div><strong>AI 工具</strong><small>{capabilities.length} 个能力可供 AI 使用</small></div></div> : null}
             {!item.views?.length && !capabilities.length ? <div className="plugin-section-empty">未声明可用功能</div> : null}
           </div>
         </section>
         <section className="plugin-detail-section"><div className="plugin-section-heading"><div><h4>依赖</h4></div></div><div className="plugin-product-dependencies">{(item.plugin_dependencies || []).map(dependency => <div key={dependency.plugin_id}><span className="status-dot success" /><PluginDependencyName pluginId={dependency.plugin_id} catalog={catalog} /><span>{dependency.required ? '必需' : '可选'}</span><strong>{dependency.min_version ? `v${dependency.min_version} 及以上` : '不限版本'}</strong></div>)}{!item.plugin_dependencies?.length ? <div className="plugin-section-empty">无依赖</div> : null}</div></section>
         {friendlyPermissionItems.length ? <section className="plugin-detail-section"><div className="plugin-section-heading"><div><h4>权限</h4></div></div><div className="plugin-permission-list"><Tags items={friendlyPermissionItems} /></div></section> : null}
+        {/* 插件声明了凭据需求才出现：值由 Agent 保管，界面只做录入与状态展示。 */}
+        <PluginCredentialsPanel pluginId={item.id} />
         {!item.development ? <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>插件 ID</span><code>{item.id}</code></div><div><span>作者</span><strong>{item.author_name || catalogItem?.author_name || '未知作者'}</strong></div><div><span>来源</span><strong>{pluginSourceLabel(item.source)}</strong></div><div><span>运行时</span><strong>{item.runtime || '--'}</strong></div><div><span>最低桌面端版本</span><strong>{item.min_agent_version ? `v${item.min_agent_version}` : '--'}</strong></div></div></details> : null}
       </>}
       {pendingAction ? <ConfirmPluginAction action={pendingAction} onClose={() => setPendingAction(null)} /> : null}

@@ -7,6 +7,46 @@ use std::path::{Path, PathBuf};
 const CONFIG_FILE: &str = "extension-workspace.json";
 const BINDING_FILE: &str = "extension-workspace-binding.json";
 const CATALOG_FILE: &str = "extensions.json";
+
+/// 聚合清单（`extensions.json`）认得哪些扩展类型，以及各自的源码清单文件名。
+///
+/// 校验（`read_catalog`）与发现（`discover`）必须共用这一份口径。`expert` 曾经
+/// 只加进了本地来源与项目登记两条链路，这里仍是 plugin/skill/workflow 的白名单，
+/// 于是登记了专家的聚合仓库被判成整体无效 —— 面板报
+/// `extensions.json 包含不支持的扩展类型: expert`，同一份清单在别处却能正常读出
+/// 28 个扩展。新增扩展类型时只改这张表。
+const CATALOG_KINDS: [(&str, &str); 4] = [
+    ("plugin", "plugin.json"),
+    ("skill", "skill.json"),
+    ("workflow", "workflow.json"),
+    ("expert", "expert.json"),
+];
+
+/// 聚合清单里的类型 → 源码清单文件名；`None` 表示该类型不受支持。
+fn catalog_manifest(kind: &str) -> Option<&'static str> {
+    let kind = kind.trim();
+    CATALOG_KINDS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, manifest)| *manifest)
+}
+
+/// 受支持类型的可读列表，用在报错里，免得用户只能靠猜。
+fn catalog_kind_list() -> String {
+    CATALOG_KINDS
+        .iter()
+        .map(|(kind, _)| *kind)
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+/// 目录本身就是一个扩展工程：含受支持类型里的任一源码清单。
+pub(crate) fn is_extension_project_dir(path: &Path) -> bool {
+    CATALOG_KINDS
+        .iter()
+        .any(|(_, manifest)| path.join(manifest).is_file())
+}
+
 /// 绑定文件 v2 结构版本。v1 是单值 `{"root": "..."}`，v2 是集合
 /// `{"version": 2, "roots": [...]}`。两者都能读，写回统一用 v2。
 const BINDING_SCHEMA_VERSION: u32 = 2;
@@ -385,16 +425,14 @@ pub(crate) fn session_root() -> Option<PathBuf> {
 
 pub(crate) fn classify_path(path: &Path) -> &'static str {
     if path.join(CATALOG_FILE).is_file() {
-        "aggregate"
-    } else if path.join("plugin.json").is_file() {
-        "plugin"
-    } else if path.join("skill.json").is_file() {
-        "skill"
-    } else if path.join("workflow.json").is_file() {
-        "workflow"
-    } else {
-        "directory"
+        return "aggregate";
     }
+    for (kind, manifest) in CATALOG_KINDS {
+        if path.join(manifest).is_file() {
+            return kind;
+        }
+    }
+    "directory"
 }
 
 pub(crate) fn is_agent_managed_path(path: &Path) -> bool {
@@ -439,16 +477,8 @@ pub(crate) fn discover() -> Vec<DiscoveredExtension> {
         .extensions
         .into_iter()
         .filter_map(|item| {
-            if !matches!(item.kind.as_str(), "plugin" | "skill" | "workflow") {
-                return None;
-            }
+            let manifest_name = catalog_manifest(&item.kind)?;
             let path = safe_child_path(&root, &item.path).ok()?;
-            let manifest_name = match item.kind.as_str() {
-                "plugin" => "plugin.json",
-                "skill" => "skill.json",
-                "workflow" => "workflow.json",
-                _ => return None,
-            };
             if !path.join(manifest_name).is_file() {
                 return None;
             }
@@ -536,19 +566,18 @@ fn read_catalog(root: &Path) -> Result<Catalog, Box<dyn std::error::Error>> {
         if item.id.trim().is_empty() || item.path.trim().is_empty() {
             return Err("extensions.json 包含空的扩展 ID 或目录".into());
         }
-        if item.kind != "plugin" && item.kind != "skill" && item.kind != "workflow" {
-            return Err(format!("extensions.json 包含不支持的扩展类型: {}", item.kind).into());
-        }
+        let Some(manifest_name) = catalog_manifest(&item.kind) else {
+            return Err(format!(
+                "extensions.json 包含不支持的扩展类型: {}（受支持的类型：{}）",
+                item.kind,
+                catalog_kind_list()
+            )
+            .into());
+        };
         if !ids.insert(format!("{}:{}", item.kind, item.id.trim())) {
             return Err(format!("extensions.json 包含重复扩展 ID: {}", item.id).into());
         }
         let path = safe_child_path(root, &item.path)?;
-        let manifest_name = match item.kind.as_str() {
-            "plugin" => "plugin.json",
-            "skill" => "skill.json",
-            "workflow" => "workflow.json",
-            _ => unreachable!(),
-        };
         if !path.join(manifest_name).is_file() {
             return Err(format!("扩展目录缺少 {manifest_name}: {}", item.path).into());
         }
@@ -870,6 +899,68 @@ mod tests {
         assert_eq!(discovered[0].kind, "workflow");
         assert_eq!(discovered[0].id, "com.test.workflow-discovery");
         assert_eq!(classify_path(&workflow), "workflow");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 登记了专家的聚合清单必须整体有效，专家也要被发现。
+    ///
+    /// 回归用例：这里曾经只认 plugin/skill/workflow，清单里第一条专家就让整个
+    /// 工作区报「不支持的扩展类型: expert」，而同一份清单在本地来源与项目登记
+    /// 两条链路上却能读出全部扩展。
+    #[test]
+    fn aggregate_workspace_accepts_expert_entries() {
+        let _lock = env_lock();
+        let root = unique_root("himind-extension-expert-discovery");
+        let plugin = root.join("plugins/demo");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"id":"com.test.plugin-demo"}"#,
+        )
+        .unwrap();
+        let expert = root.join("experts/demo");
+        fs::create_dir_all(&expert).unwrap();
+        fs::write(
+            expert.join("expert.json"),
+            r#"{"id":"com.test.expert-demo"}"#,
+        )
+        .unwrap();
+        fs::write(expert.join("EXPERT.md"), "# demo\n").unwrap();
+        fs::write(
+            root.join(CATALOG_FILE),
+            r#"{"repository":"https://github.com/example/extensions.git","default_branch":"main","extensions":[{"type":"plugin","id":"com.test.plugin-demo","path":"plugins/demo"},{"type":"expert","id":"com.test.expert-demo","path":"experts/demo"}]}"#,
+        )
+        .unwrap();
+        let _workspace_file = EnvGuard::set(
+            "HIMIND_EXTENSIONS_WORKSPACE_FILE",
+            root.join("profile/extension-workspace.json"),
+        );
+        let _binding_file = EnvGuard::set(
+            "HIMIND_EXTENSIONS_BINDING_FILE",
+            root.join("profile/extension-workspace-binding.json"),
+        );
+        let _root = EnvGuard::set("HIMIND_EXTENSIONS_ROOT", &root);
+
+        let workspace_settings = settings();
+        assert!(
+            workspace_settings.valid,
+            "登记了专家的清单必须判为有效: {}",
+            workspace_settings.error
+        );
+        assert_eq!(workspace_settings.extension_count, 2);
+
+        let discovered = discover();
+        assert_eq!(discovered.len(), 2);
+        let expert_item = discovered
+            .iter()
+            .find(|item| item.kind == "expert")
+            .expect("专家应当被发现");
+        assert_eq!(expert_item.id, "com.test.expert-demo");
+        assert_eq!(expert_item.path, expert.canonicalize().unwrap());
+        assert_eq!(classify_path(&expert), "expert");
+        assert!(is_extension_project_dir(&expert));
+        assert_eq!(classify_path(&root), "aggregate");
 
         let _ = fs::remove_dir_all(root);
     }

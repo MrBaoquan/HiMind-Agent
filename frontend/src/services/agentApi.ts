@@ -1285,6 +1285,8 @@ export type ExtensionUpdateProgress = {
 
 export type PluginItem = {
     id: string;
+    /// 条目语义：plugin（本地能力包）/ connector（特权集成）/ provider（控制面适配）。
+    kind?: 'plugin' | 'connector' | 'provider' | string;
     name?: string;
     description?: string;
     release_notes?: string;
@@ -2172,6 +2174,32 @@ export type BuiltinAiWorkspaceTarget = { kind: 'project'; projectId: string; nam
  * 仍然返回用户才能把它移除。`has_catalog` 区分"目录里还没有聚合清单"与
  * "清单坏了"：前者只是还没有可整体分发的扩展，不是错误。
  */
+/// 插件声明的一条凭据需求 + 当前配置状态（只有状态，没有值）。
+export type PluginCredentialView = {
+  id: string;
+  label: string;
+  kind: string;
+  fields: string[];
+  required: boolean;
+  description: string;
+  docs_url: string;
+  configured: boolean;
+  configured_fields: string[];
+  updated_at: string;
+};
+
+/// 扩展开发工具链就绪度：说明走插件执行器还是内核实现、Go 是否可用。
+export type ExtensionDevelopmentReadiness = {
+  plugin: { installed: boolean; usable: boolean; version: string };
+  kernel: {
+    capabilities: string[];
+    go: { installed: boolean; path: string | null; version: string; error: string | null };
+  };
+  provider: 'plugin' | 'builtin';
+  builtin: { installed: boolean; id: string; version: string };
+  scaffold_requires_plugin: boolean;
+};
+
 export type ExtensionWorkspaceEntry = {
     root: string;
     name: string;
@@ -2941,6 +2969,11 @@ export const agentApi = {
     extensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('get_extension_workspace'),
     setExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceSettings>('set_extension_workspace', { root }),
     extensionWorkspaces: () => invoke<ExtensionWorkspaceEntry[]>('list_extension_workspaces'),
+    extensionDevelopmentReadiness: () => invoke<ExtensionDevelopmentReadiness>('extension_development_readiness'),
+    /// 插件凭据：声明 + 状态，值是单向写入的（保存后界面不再回显）。
+    pluginCredentials: (pluginId: string) => invoke<{ plugin_id: string; credentials: PluginCredentialView[] }>('plugin_credentials', { pluginId }),
+    savePluginCredential: (pluginId: string, credentialId: string, fields: Record<string, string>) => invoke<void>('save_plugin_credential', { pluginId, credentialId, fields }),
+    deletePluginCredential: (pluginId: string, credentialId: string) => invoke<boolean>('delete_plugin_credential', { pluginId, credentialId }),
     pickExtensionWorkspaceDir: () => invoke<string | null>('pick_extension_workspace_dir'),
     addExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceEntry[]>('add_extension_workspace', { root }),
     removeExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceEntry[]>('remove_extension_workspace', { root }),

@@ -124,6 +124,7 @@ enum CapabilityHandler {
     AIServiceImageSet,
     AuthoringIdentity,
     AuthoringPreflight,
+    ExtensionToolchain,
     ExtensionWorkspaceCurrent,
     ExtensionWorkspaceBind,
     ExtensionWorkspaceClear,
@@ -133,6 +134,11 @@ enum CapabilityHandler {
     ExtensionDistributionTargetSet,
     ExtensionDistributionPreview,
     ExtensionDistributionPublish,
+    GithubReleasePublish,
+    DistributionProjectInspect,
+    DistributionArtifactInspect,
+    DistributionChannelResolve,
+    DistributionReleaseResolve,
     ExtensionDistributionStateGet,
     ReleaseInstallPlan,
     ReleaseInstallApply,
@@ -984,6 +990,240 @@ impl CapabilityGateway {
                 }),
                 CapabilityHandler::AuthoringPreflight,
             ),
+            // 扩展开发工具链：12 条能力全部由内核实现，并作为内置插件
+            // com.himind.extension-development-tools 的对外能力暴露给 MCP/UI。
+            registration_versioned(
+                "extension.environment.preflight",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "扩展开发环境预检",
+                "检查扩展工程类型需要的工具链、工作区和内置能力是否就绪。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow"] }
+                    },
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.plugin.scaffold",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "创建插件工程",
+                "在用户指定工作区创建可独立构建的 HiMind 插件工程。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "output_dir": { "type": "string" },
+                        "name": { "type": "string" },
+                        "display_name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "author": { "type": "string" },
+                        "categories": { "type": "array", "items": { "type": "string" } },
+                        "release_notes": { "type": "string" },
+                        "template": { "type": "string", "enum": ["readonly-tool", "job-worker", "ui-tool"] }
+                    },
+                    "required": ["workspace_root", "output_dir", "name", "display_name", "description", "author", "categories", "release_notes"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.plugin.validate",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "校验插件工程",
+                "校验 HiMind 插件工程或 .hmpkg 制品。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.plugin.build",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "构建插件",
+                "在工作区内运行插件测试并构建入口文件。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.plugin.package",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "打包插件",
+                "校验并打包 HiMind .hmpkg 制品。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" },
+                        "output": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path", "output"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.skill.scaffold",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "创建技能工程",
+                "在用户指定工作区创建独立的 HiMind Skill 工程。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "output_dir": { "type": "string" },
+                        "slug": { "type": "string" },
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "version": { "type": "string" },
+                        "min_agent_version": { "type": "string" },
+                        "description": { "type": "string" },
+                        "author": { "type": "string" },
+                        "categories": { "type": "array", "items": { "type": "string" } },
+                        "release_notes": { "type": "string" },
+                        "supported_clients": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["workspace_root", "output_dir", "slug", "name", "description", "author", "categories", "release_notes"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.skill.validate",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "校验技能工程",
+                "校验 HiMind Skill 工程或 .hmskill 制品。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.skill.package",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "打包技能",
+                "校验并打包 HiMind .hmskill 制品。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" },
+                        "output": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path", "output"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.workflow.scaffold",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "创建工作流工程",
+                "在用户指定工作区创建标准目录结构的 HiMind Workflow 工程。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "output_dir": { "type": "string" },
+                        "slug": { "type": "string" },
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "version": { "type": "string" },
+                        "min_agent_version": { "type": "string" },
+                        "description": { "type": "string" },
+                        "author": { "type": "string" },
+                        "categories": { "type": "array", "items": { "type": "string" } },
+                        "release_notes": { "type": "string" },
+                        "template": { "type": "string", "enum": ["strict", "segmented", "flexible", "development-loop", "capability-pipeline"] }
+                    },
+                    "required": ["workspace_root", "output_dir", "slug", "name", "description", "author", "release_notes"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.workflow.validate",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "校验工作流工程",
+                "深度校验 HiMind Workflow 工程或 .hmwf 制品。",
+                "read_only",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.workflow.build",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "构建工作流",
+                "执行 Workflow 工程契约检查并返回构建摘要。",
+                "local_action",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
+            registration_versioned(
+                "extension.workflow.package",
+                crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
+                "打包工作流",
+                "校验并打包确定性 HiMind .hmwf 制品。",
+                "local_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "path": { "type": "string" },
+                        "output": { "type": "string" }
+                    },
+                    "required": ["workspace_root", "path", "output"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::ExtensionToolchain,
+            ),
             registration(
                 "extension.workspace.current",
                 "当前扩展工作区",
@@ -1116,6 +1356,83 @@ impl CapabilityGateway {
                     "additionalProperties": false
                 }),
                 CapabilityHandler::ExtensionDistributionPublish,
+            ),
+            registration_versioned(
+                "distribution.release.publish.github",
+                "1.0.0",
+                "发布制品到 GitHub Release",
+                "把工作区内的制品作为 GitHub Release 资产投递到指定仓库（tag + 资产），使用本机已授权的 GitHub 令牌，且尊重账号绑定的仓库白名单。语义是仓库级发布：不含工作台的组织审核与不可变制品签名，独立模式下也能用。",
+                "network_write",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_root": { "type": "string" },
+                        "artifact_path": { "type": "string" },
+                        "repository": { "type": "string" },
+                        "tag": { "type": "string" },
+                        "asset_name": { "type": "string" },
+                        "release_name": { "type": "string" },
+                        "release_notes": { "type": "string" },
+                        "channel": { "type": "string" },
+                        "prerelease": { "type": "boolean" },
+                        "expected_sha256": { "type": "string" },
+                        "kind": { "type": "string", "enum": ["plugin", "skill", "workflow", "expert", "instruction", "artifact"] },
+                        "id": { "type": "string" },
+                        "version": { "type": "string" },
+                        // 软件发布请求（工作台）同形状：独立模式下同一个步骤输入可以走这里。
+                        "product_id": { "type": "string" },
+                        "product_name": { "type": "string" },
+                        "product_type": { "type": "string" },
+                        "platform": { "type": "string" },
+                        "architecture": { "type": "string" },
+                        "package_type": { "type": "string" },
+                        "mandatory": { "type": "boolean" },
+                        "rollout_percent": { "type": "integer" },
+                        "inspection_receipt": { "type": "string" },
+                        "expected_size": { "type": "integer" },
+                        "confirmed": { "type": "boolean" }
+                    },
+                    "required": ["workspace_root", "artifact_path"],
+                    "additionalProperties": false
+                }),
+                CapabilityHandler::GithubReleasePublish,
+            ),
+            // 软件分发其余 4 条能力：随 Agent 发布的内核实现（同 ID 内置插件身份）。
+            registration_versioned(
+                "distribution.project.inspect",
+                crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION,
+                "检查分发项目",
+                "检查本机项目的分发接入形态（.NET/WPF/Unity），给出推荐包类型与客户端安装状态。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": true }),
+                CapabilityHandler::DistributionProjectInspect,
+            ),
+            registration_versioned(
+                "distribution.artifact.inspect",
+                crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION,
+                "检查分发制品",
+                "校验制品文件（类型/扩展名/结构/大小），返回摘要与发布所需的元信息。",
+                "read_only",
+                json!({ "type": "object", "additionalProperties": true }),
+                CapabilityHandler::DistributionArtifactInspect,
+            ),
+            registration_versioned(
+                "distribution.channel.resolve",
+                crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION,
+                "解析渠道版本",
+                "读取受信任的 GitHub 渠道文档，校验 product_id/渠道/摘要/签名与灰度，返回可更新版本。",
+                "network_read",
+                json!({ "type": "object", "additionalProperties": true }),
+                CapabilityHandler::DistributionChannelResolve,
+            ),
+            registration_versioned(
+                "distribution.release.resolve",
+                crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION,
+                "解析工作台版本",
+                "通过已配置的 AI 工作台解析软件更新，并校验返回清单的可信签名。",
+                "network_read",
+                json!({ "type": "object", "additionalProperties": true }),
+                CapabilityHandler::DistributionReleaseResolve,
             ),
             registration(
                 "extension.distribution.state.get",
@@ -3506,6 +3823,9 @@ impl CapabilityGateway {
             }
             CapabilityHandler::AuthoringIdentity => self.current_authoring_identity(),
             CapabilityHandler::AuthoringPreflight => self.authoring_preflight(input),
+            CapabilityHandler::ExtensionToolchain => {
+                crate::extension_toolchain::invoke(&registration.descriptor.id, &input)
+            }
             CapabilityHandler::ExtensionWorkspaceCurrent => {
                 crate::extension_projects::current_workspace(input.get("workspace_root"))
             }
@@ -3536,6 +3856,21 @@ impl CapabilityGateway {
                     &version,
                 )?;
                 Ok(report)
+            }
+            CapabilityHandler::GithubReleasePublish => {
+                crate::app::github_publisher::publish_artifact_to_github(&input)
+            }
+            CapabilityHandler::DistributionProjectInspect => {
+                crate::distribution_native::invoke("distribution.project.inspect", &input)
+            }
+            CapabilityHandler::DistributionArtifactInspect => {
+                crate::distribution_native::invoke("distribution.artifact.inspect", &input)
+            }
+            CapabilityHandler::DistributionChannelResolve => {
+                crate::distribution_native::invoke("distribution.channel.resolve", &input)
+            }
+            CapabilityHandler::DistributionReleaseResolve => {
+                crate::distribution_native::invoke("distribution.release.resolve", &input)
             }
             CapabilityHandler::ExtensionDistributionStateGet => {
                 let view = crate::app::distribution_state::load()?;
@@ -4781,12 +5116,14 @@ impl CapabilityGateway {
             })
             .collect::<Vec<_>>();
         for required in required_tools {
-            if !visible_ids.contains(required) {
+            // 内核已经内建的能力不算缺失：扩展开发不能因为一个可选的市场制品
+            // 没装就在预检里全线报红。
+            if !visible_ids.contains(required) && !crate::extension_toolchain::covers(required) {
                 blockers.push(crate::extension_authoring::blocker(
                     "extension_tool_missing",
                     "toolchain",
                     format!("三件套未提供必需能力: {required}"),
-                    "启用并重新安装扩展开发工具插件，然后重启 Agent",
+                    "重启 Agent 以加载内置扩展开发工具；若问题仍在，检查 Agent 安装包是否完整",
                     true,
                 ));
             }
@@ -4825,14 +5162,14 @@ impl CapabilityGateway {
                         .map(|value| format!(": {value}"))
                         .unwrap_or_default()
                 ),
-                "在本机启用扩展开发工具插件并重新执行预检",
+                "内置扩展开发工具不应被停用；重启 Agent 并检查插件健康记录",
                 true,
             )),
             Ok(None) => blockers.push(crate::extension_authoring::blocker(
                 "extension_tools_plugin_missing",
                 "toolchain",
-                "未安装扩展开发工具插件",
-                "安装三件套中的扩展开发工具插件后重新执行预检",
+                "当前 Agent 版本没有加载内置扩展开发工具",
+                "升级到包含内置扩展开发工具的 Agent 版本后重新执行预检",
                 true,
             )),
             Err(error) => blockers.push(crate::extension_authoring::blocker(
@@ -6368,20 +6705,9 @@ const EXTENSION_DEVELOPMENT_TOOLS_PLUGIN_ID: &str = "com.himind.extension-develo
 /// allow-list: a future plugin capability must opt into the normal approval
 /// path until its workspace and risk contract are reviewed.
 fn is_extension_tool_capability(capability_id: &str) -> bool {
-    matches!(
-        capability_id,
-        "extension.plugin.scaffold"
-            | "extension.plugin.validate"
-            | "extension.plugin.build"
-            | "extension.plugin.package"
-            | "extension.skill.scaffold"
-            | "extension.skill.validate"
-            | "extension.skill.package"
-            | "extension.workflow.scaffold"
-            | "extension.workflow.validate"
-            | "extension.workflow.build"
-            | "extension.workflow.package"
-    )
+    // 清单只有一份，在 extension_toolchain 里：这批能力是内核/第一方插件的确定性
+    // 本地创作动作，漏登记会让它走普通审批路径（曾经漏过 preflight）。
+    crate::extension_toolchain::is_authoring_capability(capability_id)
 }
 
 fn is_trusted_local_authoring_capability(
@@ -6972,6 +7298,7 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
     match handler {
         CapabilityHandler::AuthoringIdentity
         | CapabilityHandler::AuthoringPreflight
+        | CapabilityHandler::ExtensionToolchain
         | CapabilityHandler::ExtensionWorkspaceCurrent
         | CapabilityHandler::ExtensionWorkspaceBind
         | CapabilityHandler::ExtensionWorkspaceClear
@@ -6981,6 +7308,11 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::ExtensionDistributionTargetSet
         | CapabilityHandler::ExtensionDistributionPreview
         | CapabilityHandler::ExtensionDistributionPublish
+        | CapabilityHandler::GithubReleasePublish
+        | CapabilityHandler::DistributionProjectInspect
+        | CapabilityHandler::DistributionArtifactInspect
+        | CapabilityHandler::DistributionChannelResolve
+        | CapabilityHandler::DistributionReleaseResolve
         | CapabilityHandler::ExtensionDistributionStateGet
         | CapabilityHandler::GithubAccountGet
         | CapabilityHandler::GithubAccountSet
@@ -9651,5 +9983,30 @@ mod tests {
         assert!(!descriptor.approval_required);
         assert_eq!(descriptor.execution_mode, "sync");
         assert_eq!(descriptor.input_schema["required"][0], "prompt");
+    }
+
+    #[test]
+    fn extension_toolchain_capabilities_are_registered_as_builtin() {
+        let mut options = Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let visible = gateway
+            .list_capabilities(&InvocationContext::new(
+                crate::capability::types::InvocationSource::Mcp,
+                "ai-client:test",
+            ))
+            .unwrap();
+        for capability_id in crate::extension_toolchain::BUILTIN_CAPABILITIES {
+            let item = visible
+                .iter()
+                .find(|item| item.id == capability_id)
+                .unwrap_or_else(|| panic!("{capability_id} 未注册到能力网关"));
+            assert_eq!(item.source, "builtin", "{capability_id} 的来源应为内置插件");
+            assert_eq!(
+                item.availability,
+                crate::capability::types::CapabilityAvailability::Local
+            );
+        }
     }
 }

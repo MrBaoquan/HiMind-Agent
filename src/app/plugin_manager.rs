@@ -5,8 +5,8 @@ use crate::api::distribution::{
 use crate::app::extension_lock::TransientPolicy;
 use crate::app::system::verify_extension_artifact_signature;
 use crate::capability::plugin::{
-    is_builtin_plugin, parse_plugin_manifest, plugin_registry_dir, validate_manifest_contributions,
-    PluginManifest,
+    builtin_plugin_entry, effective_plugin_is_builtin, parse_plugin_manifest, plugin_registry_dir,
+    validate_manifest_contributions, PluginManifest,
 };
 use crate::skill::resolver::compare_versions;
 use crate::store::plugin_outbox::{
@@ -65,6 +65,22 @@ pub(crate) struct PluginInstallPlan {
 }
 
 pub(crate) fn local_status(plugin_id: &str) -> LocalPluginStatus {
+    // 内置插件没有可写目录，但对依赖解析和界面而言就是已安装：
+    // 这条分支必须先于磁盘探测，否则 Skill/Workflow 会因为找不到外部副本
+    // 而尝试安装一个明确禁止外置的同 ID 插件。
+    if let Some(item) = builtin_plugin_entry(plugin_id) {
+        return LocalPluginStatus {
+            enabled: item.enabled,
+            status: if item.enabled {
+                "installed"
+            } else {
+                "disabled"
+            }
+            .to_string(),
+            current_version: item.version,
+            previous_version: String::new(),
+        };
+    }
     let Ok(root) = plugin_root(plugin_id) else {
         return LocalPluginStatus::default();
     };
@@ -659,6 +675,14 @@ fn install_catalog_item(
     agent_id: &str,
     item: &PluginCatalogItem,
 ) -> Result<(), Box<dyn Error>> {
+    // 同一 ID 只对应一个插件：内置身份的存在意味着外部副本不允许安装。
+    if effective_plugin_is_builtin(&item.plugin_id) {
+        return Err(format!(
+            "插件 {} 已由 Agent 内置提供，不允许安装外部同 ID 副本",
+            item.plugin_id
+        )
+        .into());
+    }
     if item.governance == "blocked" {
         return Err(format!("插件 {} 已被组织策略禁止安装", item.name).into());
     }
@@ -1004,7 +1028,7 @@ fn ensure_plugin_not_referenced(root: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 pub(crate) fn rollback(plugin_id: &str) -> Result<(), Box<dyn Error>> {
-    if is_builtin_plugin(plugin_id) {
+    if effective_plugin_is_builtin(plugin_id) {
         return Err("内置系统扩展不支持回滚".into());
     }
     rollback_root(&plugin_root(plugin_id)?, plugin_id)
@@ -1055,7 +1079,7 @@ fn rollback_root_with_lock(
 }
 
 pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
-    if is_builtin_plugin(plugin_id) {
+    if effective_plugin_is_builtin(plugin_id) {
         return Err("内置系统扩展不允许卸载".into());
     }
     let root = plugin_root(plugin_id)?;
@@ -1075,7 +1099,7 @@ pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
 }
 
 pub(crate) fn remove_for_policy(plugin_id: &str) -> Result<(), Box<dyn Error>> {
-    if is_builtin_plugin(plugin_id) {
+    if effective_plugin_is_builtin(plugin_id) {
         return Err("内置系统扩展不能由分发策略移除".into());
     }
     let root = plugin_root(plugin_id)?;
@@ -1175,7 +1199,7 @@ fn disable_rejection(
     if enabled {
         return None;
     }
-    if is_builtin_plugin(plugin_id) {
+    if effective_plugin_is_builtin(plugin_id) {
         return Some("内置系统扩展不允许停用");
     }
     if development_ids.iter().any(|id| id == plugin_id) {
@@ -2043,7 +2067,7 @@ mod tests {
     #[test]
     fn builtin_plugins_cannot_be_disabled_or_uninstalled() {
         assert!(set_enabled("com.himind.builtin.svn", false).is_err());
-        assert!(uninstall("com.himind.builtin.smb").is_err());
+        assert!(uninstall("com.himind.software-distribution").is_err());
     }
 
     fn dependency(plugin_id: &str, required: bool, min_version: &str) -> SkillPluginDependency {
@@ -2676,5 +2700,40 @@ mod tests {
         assert!(first.exists());
         assert!(second.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builtin_plugins_report_installed_versions_without_a_disk_copy() {
+        let development = local_status(crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_ID);
+        assert!(development.enabled);
+        assert_eq!(development.status, "installed");
+        assert_eq!(
+            development.current_version,
+            crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION
+        );
+        assert!(development.previous_version.is_empty());
+
+        let distribution = local_status("com.himind.software-distribution");
+        assert!(distribution.enabled);
+        assert_eq!(
+            distribution.current_version,
+            crate::distribution_native::SOFTWARE_DISTRIBUTION_PLUGIN_VERSION
+        );
+    }
+
+    #[test]
+    fn builtin_plugin_ids_reject_external_catalog_installation() {
+        let client = Client::builder().build().unwrap();
+        let options = Options::from_env();
+        for plugin_id in [
+            "com.himind.extension-development-tools",
+            "com.himind.software-distribution",
+        ] {
+            let item = catalog_plugin(plugin_id, "外置同 ID 副本", "9.9.9", vec![]);
+            let error = install_catalog_item(&client, &options, "", &item)
+                .expect_err("内置插件 ID 不允许再安装外部副本")
+                .to_string();
+            assert!(error.contains("内置提供"), "{plugin_id}: {error}");
+        }
     }
 }

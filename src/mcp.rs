@@ -1473,6 +1473,63 @@ mod tests {
     }
 
     #[test]
+    fn extension_toolchain_is_searchable_activatable_and_versioned() {
+        let gateway = test_gateway();
+        let mut session = McpSessionState::default();
+        let search = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "system.capability.search",
+                "arguments": { "query": "extension.plugin.scaffold", "limit": 10 }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(search["isError"], false);
+        assert!(search["structuredContent"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "extension.plugin.scaffold"));
+
+        let described = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "system.capability.describe",
+                "arguments": { "id": "extension.plugin.scaffold" }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(described["isError"], false);
+        assert_eq!(
+            described["structuredContent"]["version"],
+            crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION
+        );
+
+        let activated = handle_request_with_session(
+            &gateway,
+            "tools/call",
+            json!({
+                "name": "system.capability.activate",
+                "arguments": { "ids": ["extension.plugin.scaffold"] }
+            }),
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(activated["isError"], false);
+        let listed =
+            handle_request_with_session(&gateway, "tools/list", json!({}), &mut session).unwrap();
+        assert!(listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "extension.plugin.scaffold"));
+    }
+
+    #[test]
     fn registry_change_invalidates_old_session_activation_before_invoke() {
         let gateway = test_gateway();
         let mut session = McpSessionState::default();

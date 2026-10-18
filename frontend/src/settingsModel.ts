@@ -1,4 +1,5 @@
 import { Cable, Database, KeyRound, PlugZap, Power, ShieldAlert, ShieldCheck, Wrench, type LucideIcon } from 'lucide-react';
+import { AI_CONNECTIONS_DESCRIPTION } from './pages/aiConnectionsTabs';
 
 /** Surfaces inside the dedicated management window. */
 export type SettingsWindowPanel = 'settings' | 'ai';
@@ -37,7 +38,7 @@ export const SETTINGS_RAIL_GROUPS: Array<{ label: string; items: SettingsRailIte
     label: '账号与连接',
     items: [
       { key: 'accounts', label: '账号', description: '管理 HiMind 账号、内网账号与代码仓库凭据。', keywords: ['himind', '内网', 'svn', 'git', 'github', '凭据', '登录', '授权'], icon: KeyRound, panel: 'settings' },
-      { key: 'ai', label: 'AI 连接', description: '接入其他 AI 工具，管理模型服务与运行环境。', keywords: ['ai', 'mcp', '模型', '服务', '运行环境', '客户端', '注册', 'acp'], icon: Cable, panel: 'ai' },
+      { key: 'ai', label: 'AI 连接', description: AI_CONNECTIONS_DESCRIPTION, keywords: ['ai', 'mcp', '模型', '模型来源', '服务', '运行环境', '执行环境', '客户端', '注册', 'acp'], icon: Cable, panel: 'ai' },
       { key: 'services', label: '本机服务', description: '管理本机工作流连接器与远程控制客户端。', keywords: ['连接器', '远程控制', '客户端', '本机服务', 'codex', 'copilot'], icon: PlugZap, panel: 'settings' },
     ],
   },
