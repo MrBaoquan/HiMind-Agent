@@ -2347,6 +2347,8 @@ export type ExtensionProject = {
     distribution_targets_declared?: DistributionTarget[];
     /** 生效目标的来源：`manifest` 清单声明、`project` 显式覆盖、`unit` 分发单元默认、`default` 系统默认。 */
     distribution_targets_source?: 'manifest' | 'project' | 'unit' | 'default' | string;
+    /** 清单声明的同仓插件依赖，首次构建前也能据此排出先后。 */
+    plugin_dependencies?: string[];
     updated_at: string;
     source_unit_key?: string;
 };

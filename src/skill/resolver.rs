@@ -359,10 +359,15 @@ fn resolve_dependency(
 
 fn provider_matches(expected: &str, actual: &str) -> bool {
     let expected = expected.trim();
+    let actual_is_builtin = actual == "builtin" || actual.starts_with("builtin:");
     expected.is_empty()
         || expected == actual
-        || (matches!(expected, "agent" | "builtin")
-            && (actual == "builtin" || actual.starts_with("builtin:")))
+        // 内置插件的实现随内核发布，能力事实的 source 只有 "builtin"。清单里
+        // pin 了内置插件 ID（例如扩展开发工具）时，必须按同一个身份匹配，
+        // 否则能力明明已注册，技能预检仍会报 "missing required capability"。
+        || (actual_is_builtin
+            && (matches!(expected, "agent" | "builtin")
+                || crate::capability::plugin::builtin_plugin_entry(expected).is_some()))
         || actual == format!("plugin:{expected}")
 }
 
@@ -497,12 +502,12 @@ mod tests {
 
     #[test]
     fn plugin_pinned_capabilities_still_require_that_plugin() {
-        // 作者显式 pin 了插件提供方，就是写下的契约：内核不替它兜底。
+        // 显式 pin 了外部插件，就是写下的契约：内核不替它兜底。
         let readiness = SkillReadiness::resolve(
             &manifest(vec![dependency_with_provider(
                 "extension.plugin.build",
                 true,
-                Some("com.himind.extension-development-tools"),
+                Some("com.example.extension-tools"),
             )]),
             &[],
             "0.3.75",
@@ -513,6 +518,28 @@ mod tests {
         assert_eq!(
             readiness.reasons,
             vec!["missing required capability: extension.plugin.build"]
+        );
+    }
+
+    #[test]
+    fn pinned_builtin_plugin_id_resolves_to_the_kernel() {
+        // 扩展开发工具已内置：清单仍按旧契约 pin 了插件 ID，但内置身份
+        // 不会缺席，预检不应把它判成缺少插件。
+        let readiness = SkillReadiness::resolve(
+            &manifest(vec![dependency_with_provider(
+                "extension.plugin.build",
+                true,
+                Some(crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_ID),
+            )]),
+            &[],
+            "0.3.75",
+            "codex",
+        );
+
+        assert_eq!(readiness.state, "ready", "{:?}", readiness.reasons);
+        assert_eq!(
+            readiness.dependencies[0].provider.as_deref(),
+            Some("kernel")
         );
     }
 
@@ -683,6 +710,35 @@ mod tests {
             .dependencies
             .iter()
             .all(|dependency| dependency.state == "degraded"));
+    }
+
+    #[test]
+    fn builtin_plugin_pin_resolves_to_kernel_capabilities() {
+        // 扩展开发工具已内置：清单仍按旧契约 pin 了插件 ID，但能力事实的
+        // source 是 builtin。两者必须视为同一个身份，否则开发助手 Skill
+        // 会在预检里被判成缺少 extension.* 能力。
+        let mut skill = manifest(vec![SkillCapabilityDependency {
+            id: "extension.plugin.build".to_string(),
+            required: true,
+            min_version: None,
+            max_version: None,
+            provider: Some(crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_ID.to_string()),
+        }]);
+        skill.plugin_dependencies = Vec::new();
+
+        let readiness = SkillReadiness::resolve(
+            &skill,
+            &[CapabilityFact {
+                id: "extension.plugin.build".to_string(),
+                version: crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION.to_string(),
+                source: "builtin".to_string(),
+            }],
+            crate::VERSION,
+            "codex",
+        );
+
+        assert_eq!(readiness.state, "ready", "{:?}", readiness.reasons);
+        assert_eq!(readiness.dependencies[0].state, "ready");
     }
 
     #[test]

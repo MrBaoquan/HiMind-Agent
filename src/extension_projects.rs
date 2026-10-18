@@ -110,6 +110,10 @@ pub(crate) struct ExtensionProject {
     /// 生效目标的来源：`project` / `unit` / `manifest` / `default`。
     #[serde(default)]
     pub distribution_targets_source: String,
+    /// 清单声明的同仓插件依赖。列表页不需要先建一次才排出构建顺序：
+    /// 没有草稿的项目只能从这里读到依赖。
+    #[serde(default)]
+    pub plugin_dependencies: Vec<String>,
     pub updated_at: String,
     /// 所属扩展分发单元键，由扩展源实时派生，不落盘。
     #[serde(default)]
@@ -1898,6 +1902,8 @@ impl From<ProjectRecord> for ExtensionProject {
             },
             updated_at: value.updated_at,
             source_unit_key: value.source_unit_key,
+            // 清单依赖需要读盘，由 project_view 补齐。
+            plugin_dependencies: Vec::new(),
         }
     }
 }
@@ -1947,7 +1953,7 @@ fn resolve_distribution_targets(
 ///
 /// 只做 JSON 级读取，不走完整清单校验：扩展正在编辑时清单可能暂时不合法，
 /// 那时仍应沿用作者上一次写下的约束，而不是把约束判断整个丢掉。
-fn read_declared_distribution_targets(record: &ProjectRecord) -> Vec<DistributionTarget> {
+fn read_manifest_value(record: &ProjectRecord) -> Option<Value> {
     let manifest = match record.kind {
         ExtensionProjectKind::Plugin => record.workspace_path.join("plugin.json"),
         ExtensionProjectKind::Skill => record.workspace_path.join("skill.json"),
@@ -1955,13 +1961,52 @@ fn read_declared_distribution_targets(record: &ProjectRecord) -> Vec<Distributio
         ExtensionProjectKind::Expert => record.workspace_path.join("expert.json"),
         ExtensionProjectKind::Instruction => record.workspace_path.join("instruction.json"),
     };
-    let Ok(source) = fs::read_to_string(&manifest) else {
+    let source = fs::read_to_string(&manifest).ok()?;
+    serde_json::from_str::<Value>(&source).ok()
+}
+
+fn read_declared_distribution_targets(record: &ProjectRecord) -> Vec<DistributionTarget> {
+    read_manifest_value(record)
+        .map(|value| declared_distribution_targets(&value))
+        .unwrap_or_default()
+}
+
+/// 读取清单声明的同仓插件依赖，供「一键构建」在首次构建之前排序。
+///
+/// 插件/技能写 `plugin_dependencies: [{plugin_id}]`，工作流写
+/// `dependencies.plugins: [id]`；两种形态都要认，否则工作区的依赖方
+/// 会先于被依赖的插件执行。
+fn read_declared_plugin_dependencies(record: &ProjectRecord) -> Vec<String> {
+    let Some(value) = read_manifest_value(record) else {
         return Vec::new();
     };
-    let Ok(value) = serde_json::from_str::<Value>(&source) else {
-        return Vec::new();
-    };
-    declared_distribution_targets(&value)
+    let mut dependencies = Vec::new();
+    if let Some(items) = value.get("plugin_dependencies").and_then(Value::as_array) {
+        for item in items {
+            let id = item
+                .get("plugin_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if !id.is_empty() {
+                dependencies.push(id.to_string());
+            }
+        }
+    }
+    if let Some(items) = value
+        .get("dependencies")
+        .and_then(|dependencies| dependencies.get("plugins"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            let id = item.as_str().unwrap_or_default().trim();
+            if !id.is_empty() && !dependencies.iter().any(|existing| existing == id) {
+                dependencies.push(id.to_string());
+            }
+        }
+    }
+    dependencies
 }
 
 /// 把记录投影成对外的项目视图，并补齐分发单元与目标字段。
@@ -1990,6 +2035,7 @@ fn project_view_with(
     view.distribution_targets = targets;
     view.distribution_targets_declared = declared.clone();
     view.distribution_targets_source = source.to_string();
+    view.plugin_dependencies = read_declared_plugin_dependencies(record);
     view
 }
 

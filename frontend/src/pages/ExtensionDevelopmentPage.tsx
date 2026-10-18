@@ -1016,8 +1016,13 @@ function submissionStatus(submission: SubmissionRef): { label: string; tone: 'su
 /// 这个项目声明依赖的同仓库插件（技能/插件/工作流都写在 manifest.plugin_dependencies）。
 function declaredPluginDependencies(project: ProjectModel): string[] {
   const draft = project.drafts.find(item => draftVersion(item) === project.local?.version) || project.drafts[0];
-  if (!draft || draft.kind === 'expert' || draft.kind === 'instruction') return [];
-  return (draft.value.manifest.plugin_dependencies || []).map(item => item.plugin_id).filter(Boolean);
+  if (draft && draft.kind !== 'expert' && draft.kind !== 'instruction') {
+    const declared = (draft.value.manifest.plugin_dependencies || []).map(item => item.plugin_id).filter(Boolean);
+    if (declared.length) return declared;
+  }
+  // 还没建过的项目没有草稿，依赖只能从清单投影里取；否则一键构建会把
+  // 依赖方排在插件前面，首批必然报「缺少必需插件」。
+  return project.local?.plugin_dependencies || [];
 }
 
 /// 构建顺序：被依赖的插件先建。
