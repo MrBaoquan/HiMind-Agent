@@ -328,53 +328,73 @@ impl CapabilityGateway {
             context.principal.as_str(),
             context.request_id.as_str(),
         );
-        let catalog_ids = self.business_provider.catalog_snapshot().map(|snapshot| {
-            snapshot
-                .items
-                .into_iter()
-                .map(|item| item.id)
-                .collect::<std::collections::BTreeSet<_>>()
-        });
-        Ok(self
-            .registry()?
-            .into_values()
-            .filter(|registration| {
-                let visible_for_mode = self.options.mode().control_plane_enabled()
-                    || registration
-                        .descriptor
-                        .availability
-                        .available_without_control_plane();
-                if !visible_for_mode {
-                    return false;
-                }
-                if is_svn_admin_capability(&registration.descriptor.id) {
-                    return false;
-                }
-                if is_task_scoped_capability(&registration.descriptor.id)
-                    && context.source != crate::capability::types::InvocationSource::DashboardWorker
-                {
-                    return false;
-                }
-                // Once a fresh catalog is available, catalog-owned business
-                // capabilities absent from it have been removed by Dashboard
-                // and must no longer be projected through MCP. Other
-                // control-plane providers (media, review, distribution) use
-                // their own contracts and are intentionally unaffected.
-                if let Some(ids) = catalog_ids.as_ref() {
-                    if is_business_integration_handler(&registration.handler)
-                        && !ids.contains(&registration.descriptor.id)
+        // The catalog snapshot and the registry are separate locks/state. A
+        // background catalog refresh between reading the snapshot and building
+        // the registry would otherwise let a new capability enter the registry
+        // but be filtered out by the old ID set (or vice versa). Retry until the
+        // catalog generation is stable around the registry read; MCP clients
+        // then never observe a partially applied catalog after a change
+        // notification.
+        for _ in 0..8 {
+            let snapshot = self.business_provider.catalog_snapshot();
+            let generation = snapshot.as_ref().map(|value| value.generation.clone());
+            let catalog_ids = snapshot.map(|snapshot| {
+                snapshot
+                    .items
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            let registry = self.registry()?;
+            let after_generation = self
+                .business_provider
+                .catalog_snapshot()
+                .map(|value| value.generation);
+            if generation != after_generation {
+                continue;
+            }
+            return Ok(registry
+                .into_values()
+                .filter(|registration| {
+                    let visible_for_mode = self.options.mode().control_plane_enabled()
+                        || registration
+                            .descriptor
+                            .availability
+                            .available_without_control_plane();
+                    if !visible_for_mode {
+                        return false;
+                    }
+                    if is_svn_admin_capability(&registration.descriptor.id) {
+                        return false;
+                    }
+                    if is_task_scoped_capability(&registration.descriptor.id)
+                        && context.source
+                            != crate::capability::types::InvocationSource::DashboardWorker
                     {
                         return false;
                     }
-                }
-                true
-            })
-            .map(|registration| {
-                let mut descriptor = registration.descriptor;
-                annotate_business_exhibit_id_contract(&mut descriptor);
-                descriptor
-            })
-            .collect())
+                    // Once a fresh catalog is available, catalog-owned business
+                    // capabilities absent from it have been removed by Dashboard
+                    // and must no longer be projected through MCP. Other
+                    // control-plane providers (media, review, distribution) use
+                    // their own contracts and are intentionally unaffected.
+                    if let Some(ids) = catalog_ids.as_ref() {
+                        if is_business_integration_handler(&registration.handler)
+                            && !ids.contains(&registration.descriptor.id)
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .map(|registration| {
+                    let mut descriptor = registration.descriptor;
+                    annotate_business_exhibit_id_contract(&mut descriptor);
+                    descriptor
+                })
+                .collect());
+        }
+        Err("capability catalog changed repeatedly while reading the registry".into())
     }
 
     pub(crate) fn search_capabilities(
