@@ -1751,8 +1751,10 @@ mod tests {
             }],
         ));
 
+        // 巡检间隔 10ms，但整套用例并行跑满核时一次调度就可能超过 1 秒；
+        // 这里等的是「目录变化最终被观测到」，不是延迟指标，给足余量避免偶发超时。
         let changed_generation = updates
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(10))
             .expect("catalog change must update the MCP registry generation");
         assert_ne!(changed_generation, initial_generation);
         assert_eq!(
