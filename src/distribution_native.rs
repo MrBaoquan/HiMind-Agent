@@ -134,6 +134,9 @@ fn workspace_path(input: &Value) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     } else {
         root.join(&candidate)
     };
+    // 目标已存在时先取真实路径：8.3 短路径与 canonicalize 后的长路径文本不同，
+    // 直接做词法比较会把「确实在 workspace 内」的路径误报成越界。
+    let candidate = candidate.canonicalize().unwrap_or(candidate);
     // 词法判定：即使目标不存在，也要给出确定性的越界诊断。
     let lexical = crate::extension_workspace::display_path(&candidate);
     let lexical_root = crate::extension_workspace::display_path(&root);

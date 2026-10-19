@@ -3126,6 +3126,9 @@ mod tests {
 
     #[test]
     fn trusted_key_lookup_reads_the_hint_directory_without_an_override() {
+        // 本用例会临时移除 HIMIND_TRUSTED_SIGNING_KEYS_DIR；与其它改签名环境变量的
+        // 用例共用一把锁，否则并行运行时会读到别人刚写回的值（本机实测会红）。
+        let _guard = signing_env_lock();
         // 「按提示把公钥放进 trusted-keys」必须真的生效：提示目录与查找目录同源。
         // 曾经查找只读 HIMIND_TRUSTED_SIGNING_KEYS_DIR，本地构建的开发版因此
         // 永远报「未找到受信的签名公钥」，运行时自愈一直装不上。
@@ -3137,12 +3140,16 @@ mod tests {
         let previous = std::env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
         std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR");
         let resolved = trusted_signing_public_key("himind-production-2026");
+        // hint 必须在移除覆盖之后再取：本机若在进程环境里设了
+        // HIMIND_TRUSTED_SIGNING_KEYS_DIR，恢复后 hint 会指向那份覆盖值，
+        // 断言就变成「机器配置不同则结果不同」。
+        let hint = trusted_signing_keys_directory_hint();
         match previous {
             Some(value) => std::env::set_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR", value),
             None => std::env::remove_var("HIMIND_TRUSTED_SIGNING_KEYS_DIR"),
         }
         assert_eq!(resolved.unwrap(), pem);
-        assert!(trusted_signing_keys_directory_hint().ends_with("trusted-keys"));
+        assert!(hint.ends_with("trusted-keys"));
     }
 
     #[test]

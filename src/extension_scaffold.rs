@@ -110,13 +110,37 @@ fn validate_slug(label: &str, value: &str) -> Result<(), Box<dyn Error>> {
 
 fn ensure_inside(workspace: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
     let workspace = comparable_path(&workspace.canonicalize()?);
-    let target = comparable_path(target);
+    // 目标可能已经存在（覆盖检查、追加写入），也可能还不存在（新建目录）。
+    // 存在时取真实路径：Windows 的 8.3 短路径（%TEMP% 常被解析成 ...\ADMINI~1\...）
+    // 与 canonicalize 后的长路径文本不同，只做词法比较会把合法路径误判成越界。
+    let target = comparable_path(&canonical_for_compare(target));
     if target == workspace || target.starts_with(&(workspace.clone() + "\\")) {
         return Ok(());
     }
     Err(format!("输出目录必须位于 workspace_root 内: {target}").into())
 }
 
+/// 尽力归一成真实路径：目标存在时直接 canonicalize；不存在时 canonicalize 最近的
+/// 已存在祖先再把剩余组件拼回去。新目录（如 <workspace>/nested）因此也能与
+/// canonicalize 过的 workspace 比较，而不会被 8.3 短路径或符号链接误判成越界。
+fn canonical_for_compare(path: &Path) -> std::path::PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
+        suffix.push(name.to_os_string());
+        cursor = parent.to_path_buf();
+        if let Ok(mut canonical) = cursor.canonicalize() {
+            for part in suffix.iter().rev() {
+                canonical.push(part);
+            }
+            return canonical;
+        }
+    }
+    path.to_path_buf()
+}
 /// 将路径归一成可比较的文本：统一分隔符、去掉尾部分隔符，并在 Windows 上
 /// 忽略大小写。MCP/AI 客户端经常传正斜杠路径，而 Agent 内部路径来自
 /// canonicalize（反斜杠）；不归一会在「明明在 workspace 内」时误报越界。
