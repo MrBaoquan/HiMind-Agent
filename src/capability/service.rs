@@ -3884,7 +3884,11 @@ impl CapabilityGateway {
                 crate::distribution_native::invoke("distribution.project.inspect", &input)
             }
             CapabilityHandler::DistributionArtifactInspect => {
-                crate::distribution_native::invoke("distribution.artifact.inspect", &input)
+                let output =
+                    crate::distribution_native::invoke("distribution.artifact.inspect", &input)?;
+                // 内核内置分发能力不经过 plugin finalize 钩子，必须在处理器里
+                // 自己签发预检收据，否则发布侧会判定制品不可发布。
+                attach_inspection_receipt(context, &input, output)
             }
             CapabilityHandler::DistributionChannelResolve => {
                 crate::distribution_native::invoke("distribution.channel.resolve", &input)
@@ -9689,6 +9693,61 @@ mod tests {
             validate_mcp_capability_workspace(&mcp, capability, &input).unwrap();
         }
         let _ = std::fs::remove_dir_all(input["workspace_root"].as_str().unwrap());
+    }
+
+    #[test]
+    fn builtin_distribution_artifact_inspect_returns_an_inspection_receipt() {
+        use std::io::Write as _;
+        use zip::write::FileOptions;
+        use zip::ZipWriter;
+
+        let root = std::env::temp_dir().join(format!(
+            "himind-builtin-distribution-inspect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.zip");
+        let file = std::fs::File::create(&artifact).unwrap();
+        let mut archive = ZipWriter::new(file);
+        archive
+            .start_file("app.txt", FileOptions::default())
+            .unwrap();
+        archive.write_all(b"hello").unwrap();
+        archive.finish().unwrap();
+
+        let receipts = root.join("receipts");
+        std::env::set_var("HIMIND_DISTRIBUTION_INSPECTION_DIR", &receipts);
+        let mut options = Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let context = InvocationContext::new(InvocationSource::Mcp, "ai-client:test");
+        let result = gateway
+            .invoke(
+                &context,
+                "distribution.artifact.inspect",
+                json!({
+                    "workspace_root": root.to_string_lossy(),
+                    "artifact_path": artifact.to_string_lossy(),
+                    "product_id": "himind-agent",
+                    "version": "0.3.78",
+                    "channel": "stable",
+                    "platform": "windows",
+                    "architecture": "x64",
+                    "package_type": "directory-zip"
+                }),
+            )
+            .unwrap();
+        std::env::remove_var("HIMIND_DISTRIBUTION_INSPECTION_DIR");
+
+        assert_eq!(result["ready"], true);
+        let receipt = result["inspection_receipt"].as_str().unwrap_or_default();
+        assert!(receipt.starts_with("inspection_"), "{result}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
