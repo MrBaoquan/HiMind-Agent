@@ -1,6 +1,7 @@
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::time::Duration;
 
@@ -214,10 +215,33 @@ where
     Ok(Option::<Vec<AiProviderTemplateModel>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// 客户端注册时使用的模型能力事实。
+///
+/// 它来自供应商的 `/v1/models` 或内置的已知模型兜底，不能由注册器按供应商
+/// 写死。`context_window` 与 `input_modalities` 都会直接影响客户端的上下文
+/// 预算和附件入口；缺失时保持为空，由各客户端自己的缺省策略处理。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AIModelMetadata {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_modalities: Vec<String>,
+}
+
+impl AIModelMetadata {
+    pub fn supports_image(&self) -> bool {
+        self.input_modalities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("image"))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AIClientCredential {
     pub access: AIUserCredential,
     pub api_key: String,
+    /// 以模型 ID 为键；注册器只读取上面声明的模型，不会把端点返回的未授权
+    /// 模型混进客户端选择器。
+    pub model_metadata: BTreeMap<String, AIModelMetadata>,
 }
 
 /// 拉取 Dashboard 用户级 AI 服务模板目录（只读，不含凭据）。
@@ -320,6 +344,7 @@ pub(crate) fn fetch_client_credential(
     Ok(AIClientCredential {
         access: credential,
         api_key: revealed.api_key,
+        model_metadata: BTreeMap::new(),
     })
 }
 

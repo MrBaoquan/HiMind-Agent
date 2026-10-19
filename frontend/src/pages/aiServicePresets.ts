@@ -1,7 +1,7 @@
 // 本文件由 scripts/generate-ai-service-presets.mts 生成，请勿手工编辑。
 //
 // 内容来自工作台 AI 服务目录（GET /api/integrations/ai/personal-connections/catalog，
-// GCMP 供应商目录投影），生成时目录版本 e585f019b184，共 23 条。
+// GCMP 供应商目录投影），生成时目录版本 0.29.0，共 23 条。
 // 它只在独立模式或目录暂不可用时兜底；能连上工作台时以工作台目录为准。
 // 重新生成：保存目录响应后执行 npm run generate:ai-service-presets -- catalog.json。
 import type { AIServiceProtocol } from '../services/agentApi';
@@ -135,8 +135,8 @@ export const fallbackAiServicePresets: AiServicePreset[] = [
     description: 'LongCat Anthropic 兼容 API',
     base_url: 'https://api.longcat.chat/anthropic',
     protocol: 'anthropic',
-    default_model: 'LongCat-2.0',
-    models: ['LongCat-2.0'],
+    default_model: 'LongCat-2.5-Preview',
+    models: ['LongCat-2.5-Preview', 'LongCat-2.0'],
   },
   {
     id: 'zhipu',

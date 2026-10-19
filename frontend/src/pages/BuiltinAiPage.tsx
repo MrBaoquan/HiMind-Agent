@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, Check, CircleAlert, Download, LogIn, MessageCircle, PlugZap, RefreshCw, Settings, X } from 'lucide-react';
 import type { RefObject } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { agentApi, type BuiltinAIRuntimeActivity, type BuiltinAIRuntimeInstallationStatus, type BuiltinAiWorkspaceTarget, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type InstructionPackRef, type WorkspaceInstructionContext } from '../services/agentApi';
 import { errorDetail } from '../types';
 import { AI_CONNECTIONS_TAB_LABELS } from './aiConnectionsTabs';
@@ -279,6 +280,35 @@ export function BuiltinAiPage({
     if (!canStartSession || !runtimeReady || sessionUrl || connecting || connectionError) return;
     void connect();
   }, [canStartSession, connect, connecting, connectionError, runtimeReady, sessionUrl]);
+
+  // Switching the service stops the DSH process in the backend. The AI page is
+  // intentionally kept mounted across navigation, so its iframe would otherwise
+  // stay on the dead session URL and show "reconnecting" forever. Drop the stale
+  // URL and let the normal connect effect create a session with the new service.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void listen<{ reason?: string; service_id?: string }>('himind:ai-service-changed', () => {
+      if (cancelled) return;
+      frameRetry.current = 0;
+      setFrameStalled(false);
+      setFrameLoaded(false);
+      setSessionUrl('');
+      setSessionNotice('');
+      setConnectionError('');
+      setConnectionDetail('');
+      setFrameKey(key => key + 1);
+    })
+      .then(remove => {
+        if (cancelled) remove();
+        else unlisten = remove;
+      })
+      .catch(error => console.error('HiMind AI 服务切换监听失败', error));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   // 加载态兜底：会话页长时间没交出 load 事件时，先自己重挂一次；再不行就把
   // 「重试 / 在浏览器打开」交到用户手上，而不是让一个转圈把整块会话区锁死。

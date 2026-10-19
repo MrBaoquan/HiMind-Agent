@@ -4,7 +4,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -1028,6 +1028,7 @@ pub(crate) fn enable_gateway_binding(
     let client_credential = AIClientCredential {
         access: client_access,
         api_key: token.clone(),
+        model_metadata: credential.model_metadata.clone(),
     };
     let service_source = if service.trim().is_empty() {
         "managed".to_string()
@@ -1378,31 +1379,366 @@ fn resolve_credential(
     if let Some(credential) = gateway_override_for(service) {
         return Ok(credential);
     }
-    if service.is_empty() || service == "managed" {
+    let mut credential = if service.is_empty() || service == "managed" {
         if !options.mode().dashboard_enabled() {
             return Err(
                 "HiMind 分发服务需要先对接 AI 工作台；未对接时请从本机自定义模型服务导入".into(),
             );
         }
-        return fetch_client_credential(options, expected_user_id, client_id);
-    }
-    let custom_id = service
-        .strip_prefix("custom:")
-        .ok_or_else(|| format!("不支持的服务源：{service}，应为 managed 或 custom:<id>"))?;
-    let (custom, api_key) = crate::store::ai_services::load_secret(custom_id)?;
-    let access = crate::api::ai::AIUserCredential {
-        active_entitlement_id: String::new(),
-        active_personal_connection_id: String::new(),
-        status: "active".to_string(),
-        created_at: custom.created_at,
-        updated_at: custom.updated_at,
-        rotated_at: String::new(),
-        base_url: custom.base_url,
-        model: custom.model,
-        models: custom.models,
-        protocol: custom.protocol.as_str().to_string(),
+        fetch_client_credential(options, expected_user_id, client_id)?
+    } else {
+        let custom_id = service
+            .strip_prefix("custom:")
+            .ok_or_else(|| format!("不支持的服务源：{service}，应为 managed 或 custom:<id>"))?;
+        let (custom, api_key) = crate::store::ai_services::load_secret(custom_id)?;
+        let access = crate::api::ai::AIUserCredential {
+            active_entitlement_id: String::new(),
+            active_personal_connection_id: String::new(),
+            status: "active".to_string(),
+            created_at: custom.created_at,
+            updated_at: custom.updated_at,
+            rotated_at: String::new(),
+            base_url: custom.base_url,
+            model: custom.model,
+            models: custom.models,
+            protocol: custom.protocol.as_str().to_string(),
+        };
+        AIClientCredential {
+            access,
+            api_key,
+            model_metadata: BTreeMap::new(),
+        }
     };
-    Ok(AIClientCredential { access, api_key })
+    attach_model_metadata(&mut credential);
+    Ok(credential)
+}
+
+/// 注册不同客户端时共用的模型能力事实。
+///
+/// 模型的上下文窗口和输入模态属于模型本身，不属于某个客户端。注册器一旦按
+/// 供应商写死（例如所有模型都写 1,048,576、只允许文本），客户端就会把可用的
+/// 图片入口和真实的上下文预算一起丢掉。这里优先读供应商 `/v1/models`，读不到
+/// 时只对明确已知的 HiMind 模型做保守兜底；未知模型不伪造窗口，交给客户端缺省。
+fn attach_model_metadata(credential: &mut AIClientCredential) {
+    let mut metadata = fetch_provider_model_metadata(credential);
+    let mut declared = credential.access.models.clone();
+    let default_model = credential.access.model.trim();
+    if !default_model.is_empty() {
+        declared.push(default_model.to_string());
+    }
+    for model in declared {
+        let model = model.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let entry = metadata.entry(model.to_string()).or_default();
+        merge_known_model_metadata(model, entry);
+    }
+    credential.model_metadata = metadata;
+}
+
+fn credential_model_metadata<'a>(
+    credential: &'a AIClientCredential,
+    model: &str,
+) -> Option<&'a crate::api::ai::AIModelMetadata> {
+    credential.model_metadata.get(model).or_else(|| {
+        credential
+            .model_metadata
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(model))
+            .map(|(_, value)| value)
+    })
+}
+
+fn model_metadata_or_known(
+    credential: &AIClientCredential,
+    model: &str,
+) -> crate::api::ai::AIModelMetadata {
+    let mut metadata = credential_model_metadata(credential, model)
+        .cloned()
+        .unwrap_or_default();
+    merge_known_model_metadata(model, &mut metadata);
+    metadata
+}
+
+#[cfg(not(test))]
+fn fetch_provider_model_metadata(
+    credential: &AIClientCredential,
+) -> BTreeMap<String, crate::api::ai::AIModelMetadata> {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    else {
+        return BTreeMap::new();
+    };
+    let anthropic = credential.access.protocol.trim() == "anthropic";
+    let Ok(url) = (|| -> Result<String, Box<dyn Error>> {
+        if anthropic {
+            let root = anthropic_base_url(&credential.access.base_url)?;
+            Ok(format!("{root}/v1/models"))
+        } else {
+            let base = normalized_base_url(&credential.access.base_url)?;
+            Ok(format!("{base}/models"))
+        }
+    })() else {
+        return BTreeMap::new();
+    };
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json");
+    request = if anthropic {
+        request
+            .header("x-api-key", credential.api_key.as_str())
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(credential.api_key.as_str())
+    };
+    let Ok(response) = request.send() else {
+        return BTreeMap::new();
+    };
+    if !response.status().is_success() {
+        return BTreeMap::new();
+    }
+    let Ok(payload) = response.json::<Value>() else {
+        return BTreeMap::new();
+    };
+    parse_provider_model_metadata(&payload)
+}
+
+#[cfg(test)]
+fn fetch_provider_model_metadata(
+    _credential: &AIClientCredential,
+) -> BTreeMap<String, crate::api::ai::AIModelMetadata> {
+    BTreeMap::new()
+}
+
+fn parse_provider_model_metadata(
+    payload: &Value,
+) -> BTreeMap<String, crate::api::ai::AIModelMetadata> {
+    let items = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("models").and_then(Value::as_array))
+        .or_else(|| payload.as_array());
+    let mut result = BTreeMap::new();
+    let Some(items) = items else {
+        return result;
+    };
+    for item in items {
+        let Some(id) = ["id", "model", "slug", "model_name"]
+            .iter()
+            .find_map(|key| item.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let metadata = crate::api::ai::AIModelMetadata {
+            context_window: parse_model_context_window(item),
+            max_output_tokens: parse_model_output_tokens(item),
+            input_modalities: parse_model_input_modalities(item),
+        };
+        result.insert(id.to_string(), metadata);
+    }
+    result
+}
+
+fn model_number(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(number) = value.as_u64() {
+        return (number > 0).then_some(number);
+    }
+    if let Some(number) = value.as_i64() {
+        return (number > 0).then_some(number as u64);
+    }
+    if let Some(number) = value.as_f64() {
+        return (number.is_finite() && number > 0.0).then_some(number as u64);
+    }
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|number| *number > 0)
+}
+
+fn first_model_number(item: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| model_number(item.get(*key)))
+}
+
+fn parse_model_context_window(item: &Value) -> Option<u64> {
+    if let Some(value) = first_model_number(
+        item,
+        &[
+            "context_window",
+            "max_context_window",
+            "context_length",
+            "max_input_tokens",
+            "input_token_limit",
+            "contextWindow",
+        ],
+    ) {
+        return Some(value);
+    }
+    if let Some(limit) = item.get("limit") {
+        if let Some(value) = model_number(limit.get("context")) {
+            return Some(value);
+        }
+    }
+    if let Some(metadata) = item.get("metadata") {
+        if let Some(value) = first_model_number(
+            metadata,
+            &["context_window", "max_context_window", "max_input_tokens"],
+        ) {
+            return Some(value);
+        }
+    }
+    if let Some(sizes) = item.get("contextSize").and_then(Value::as_array) {
+        if let Some(max) = sizes
+            .iter()
+            .filter_map(|value| model_number(Some(value)))
+            .max()
+        {
+            return Some(max);
+        }
+    }
+    if item.get("supports_1m").and_then(Value::as_bool) == Some(true) {
+        return Some(1_000_000);
+    }
+    None
+}
+
+fn parse_model_output_tokens(item: &Value) -> Option<u64> {
+    first_model_number(
+        item,
+        &[
+            "max_output_tokens",
+            "max_completion_tokens",
+            "output_token_limit",
+        ],
+    )
+    .or_else(|| {
+        item.get("limit")
+            .and_then(|limit| model_number(limit.get("output")))
+    })
+}
+
+fn parse_model_input_modalities(item: &Value) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    for path in [
+        &["input_modalities"][..],
+        &["architecture", "input_modalities"][..],
+        &["modalities", "input"][..],
+    ] {
+        let mut current = item;
+        let mut found = true;
+        for segment in path {
+            let Some(next) = current.get(*segment) else {
+                found = false;
+                break;
+            };
+            current = next;
+        }
+        if found {
+            if let Some(array) = current.as_array() {
+                for value in array {
+                    if let Some(value) = value.as_str() {
+                        values.push(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(capabilities) = item.get("capabilities") {
+        match capabilities {
+            Value::Array(items) => {
+                for value in items {
+                    if let Some(value) = value.as_str() {
+                        values.push(value.to_string());
+                    }
+                }
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if value.as_bool() == Some(true)
+                        && matches!(
+                            key.to_ascii_lowercase().as_str(),
+                            "imageinput" | "image_input" | "vision" | "supports_vision"
+                        )
+                    {
+                        values.push("image".to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for key in [
+        "supports_vision",
+        "supports_image_input",
+        "image_input",
+        "vision",
+    ] {
+        if item.get(key).and_then(Value::as_bool) == Some(true) {
+            values.push("image".to_string());
+        }
+    }
+    normalize_input_modalities(&values)
+}
+
+fn normalize_input_modalities(values: &[String]) -> Vec<String> {
+    let mut text = false;
+    let mut image = false;
+    let mut audio = false;
+    for value in values {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" => text = true,
+            "image" | "vision" | "image_input" | "image.input" | "supports_vision" => image = true,
+            "audio" => audio = true,
+            _ => {}
+        }
+    }
+    if image || audio || text {
+        let mut result = vec!["text".to_string()];
+        if image {
+            result.push("image".to_string());
+        }
+        if audio {
+            result.push("audio".to_string());
+        }
+        result
+    } else {
+        Vec::new()
+    }
+}
+
+/// 仅在供应商没有返回能力元数据时使用的保守兜底。窗口只收录各目录一致的
+/// 值；MiniMax 等存在 512K/1M 两种上游窗口的模型不写死窗口，避免把预算放大。
+fn merge_known_model_metadata(model: &str, metadata: &mut crate::api::ai::AIModelMetadata) {
+    let key = model.to_ascii_lowercase();
+    let (context_window, image) = if key.contains("deepseek-v4.1-flash") {
+        (Some(1_000_000), true)
+    } else if key.contains("deepseek-v4-flash") || key.contains("deepseek-v4-pro") {
+        (Some(1_000_000), false)
+    } else if key.contains("qwen3.8-max") {
+        (Some(1_000_000), true)
+    } else if key.contains("kimi-k3") {
+        (Some(1_000_000), true)
+    } else if key.contains("glm-5.3") {
+        (Some(1_000_000), false)
+    } else if key.contains("minimax-m3") {
+        (None, true)
+    } else {
+        (None, false)
+    };
+    if metadata.context_window.is_none() {
+        metadata.context_window = context_window;
+    }
+    if metadata.input_modalities.is_empty() {
+        metadata.input_modalities = if image {
+            vec!["text".to_string(), "image".to_string()]
+        } else {
+            vec!["text".to_string()]
+        };
+    }
 }
 
 /// ADR 0118：解析服务源当前的修订号，供工作台判断客户端持有的凭据是否已过期。
@@ -1658,7 +1994,10 @@ fn import_codex(
     let catalog = if catalog_models.is_empty() {
         None
     } else {
-        Some(build_codex_models_json(&catalog_models)?)
+        Some(build_codex_models_json(
+            &catalog_models,
+            &credential.model_metadata,
+        )?)
     };
     // 写了目录就整体替换，默认模型必须落在目录内。
     let default_model =
@@ -1723,7 +2062,10 @@ fn import_codex(
 //  * 原生网关可能拒收 Codex 的 freeform `apply_patch`（type=="custom"）工具，故不声明
 //    `apply_patch_tool_type` / `web_search_tool_type` / `model_messages`，编辑改由
 //    `shell_type="shell_command"` 承担。这些结论与 cc-switch 完全一致。
-fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> {
+fn build_codex_models_json(
+    models: &[String],
+    metadata: &BTreeMap<String, crate::api::ai::AIModelMetadata>,
+) -> Result<String, Box<dyn Error>> {
     let mut catalog = Vec::new();
     for (index, model) in models.iter().enumerate() {
         let display = model
@@ -1731,7 +2073,19 @@ fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> 
             .map(capitalize)
             .collect::<Vec<_>>()
             .join(" ");
-        catalog.push(json!({
+        let model_metadata = metadata.get(model).or_else(|| {
+            metadata
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(model))
+                .map(|(_, value)| value)
+        });
+        let image_input = model_metadata.is_some_and(|value| value.supports_image());
+        let input_modalities = if image_input {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        };
+        let mut entry = json!({
             "slug": model,
             "display_name": display,
             "description": "HiMind 网关模型",
@@ -1751,15 +2105,20 @@ fn build_codex_models_json(models: &[String]) -> Result<String, Box<dyn Error>> 
             "support_verbosity": false,
             "truncation_policy": {"mode": "bytes", "limit": 10000},
             "supports_parallel_tool_calls": false,
-            "supports_image_detail_original": false,
-            "context_window": 1048576,
-            "max_context_window": 1048576,
+            "supports_image_detail_original": image_input,
             "effective_context_window_percent": 95,
             // Codex 0.150 的目录解析器要求该字段存在（空数组即可）。
             "experimental_supported_tools": [],
-            "input_modalities": ["text"],
+            "input_modalities": input_modalities,
             "supports_search_tool": false
-        }));
+        });
+        // 上下文窗口是可选字段。供应商没有声明时宁可不写，让 Codex 使用自己的
+        // 保守缺省，也不要像旧实现那样把所有模型统一伪装成 1,048,576。
+        if let Some(context_window) = model_metadata.and_then(|value| value.context_window) {
+            entry["context_window"] = json!(context_window);
+            entry["max_context_window"] = json!(context_window);
+        }
+        catalog.push(entry);
     }
     Ok(serde_json::to_string_pretty(&json!({ "models": catalog }))?)
 }
@@ -2468,7 +2827,9 @@ fn build_kimi_code_config(
             .ok_or("既有 config.toml 的 models 条目不是表")?;
         entry["provider"] = value(KIMI_CODE_PROVIDER_ID);
         entry["model"] = value(model.as_str());
-        entry["max_context_size"] = value(KIMI_CODE_DEFAULT_CONTEXT as i64);
+        let metadata = model_metadata_or_known(credential, model);
+        entry["max_context_size"] =
+            value(metadata.context_window.unwrap_or(KIMI_CODE_DEFAULT_CONTEXT) as i64);
         let mut capabilities = toml_edit::Array::new();
         capabilities.push("tool_use");
         entry["capabilities"] = toml_edit::Item::Value(toml_edit::Value::Array(capabilities));
@@ -4106,7 +4467,24 @@ fn build_opencode_config(
     };
     let catalog = models
         .iter()
-        .map(|model| (model.clone(), json!({ "name": model })))
+        .map(|model| {
+            let metadata = model_metadata_or_known(credential, model);
+            let mut entry = json!({ "name": model });
+            if let Some(context) = metadata.context_window {
+                let mut limit = json!({ "context": context });
+                if let Some(output) = metadata.max_output_tokens {
+                    limit["output"] = json!(output);
+                }
+                entry["limit"] = limit;
+            }
+            if !metadata.input_modalities.is_empty() {
+                entry["capabilities"] = json!({
+                    "input": metadata.input_modalities,
+                    "output": ["text"],
+                });
+            }
+            (model.clone(), entry)
+        })
         .collect::<serde_json::Map<String, Value>>();
     providers.insert(
         OPENCODE_PROVIDER_ID.to_string(),
@@ -4848,11 +5226,16 @@ fn build_crush_config(
     let entries = models
         .iter()
         .map(|model| {
+            let metadata = model_metadata_or_known(credential, model);
             json!({
                 "id": model,
                 "name": model,
-                "context_window": DECLARATIVE_MODEL_CONTEXT_WINDOW,
-                "default_max_tokens": CRUSH_DEFAULT_MAX_TOKENS,
+                "context_window": metadata
+                    .context_window
+                    .unwrap_or(DECLARATIVE_MODEL_CONTEXT_WINDOW),
+                "default_max_tokens": metadata
+                    .max_output_tokens
+                    .unwrap_or(CRUSH_DEFAULT_MAX_TOKENS),
             })
         })
         .collect::<Vec<_>>();
@@ -4943,12 +5326,22 @@ fn build_zcode_config(
     let enabled = zcode_provider_enabled(&root, DECLARATIVE_PROVIDER_ID).unwrap_or(true);
     let mut entries = serde_json::Map::new();
     for model in models {
+        let metadata = model_metadata_or_known(credential, model);
+        let input = if metadata.input_modalities.is_empty() {
+            vec!["text".to_string()]
+        } else {
+            metadata.input_modalities
+        };
         entries.insert(
             model.clone(),
             json!({
                 "name": model,
-                "limit": { "context": DECLARATIVE_MODEL_CONTEXT_WINDOW },
-                "modalities": { "input": ["text"], "output": ["text"] },
+                "limit": {
+                    "context": metadata
+                        .context_window
+                        .unwrap_or(DECLARATIVE_MODEL_CONTEXT_WINDOW)
+                },
+                "modalities": { "input": input, "output": ["text"] },
             }),
         );
     }
@@ -5012,13 +5405,16 @@ fn build_zcode_provider_rules(
     let entries = models
         .iter()
         .map(|model| {
+            let metadata = model_metadata_or_known(credential, model);
             json!({
                 "providerId": DECLARATIVE_PROVIDER_ID,
                 "modelId": model,
                 "config": {
                     "properties": {
-                        "contextWindow": DECLARATIVE_MODEL_CONTEXT_WINDOW,
-                        "inputFormat": { "supportsImage": false },
+                        "contextWindow": metadata
+                            .context_window
+                            .unwrap_or(DECLARATIVE_MODEL_CONTEXT_WINDOW),
+                        "inputFormat": { "supportsImage": metadata.supports_image() },
                     },
                 },
             })
@@ -7402,7 +7798,7 @@ mod tests {
         ProbeVerdict, ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION,
         PROVIDER_TARGETS, VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
     };
-    use crate::api::ai::AIUserCredential;
+    use crate::api::ai::{AIModelMetadata, AIUserCredential};
     use semver::Version;
     use serde_json::{json, Value};
     use std::cmp::Ordering;
@@ -7609,6 +8005,7 @@ mod tests {
                 protocol: "openai-responses".to_string(),
             },
             api_key: "test-secret-key".to_string(),
+            model_metadata: std::collections::BTreeMap::new(),
         }
     }
 
@@ -7900,24 +8297,70 @@ mod tests {
     }
 
     #[test]
-    fn builds_codex_models_catalog_with_himind_models() {
-        let catalog = build_codex_models_json(&[
-            "deepseek-v4-flash".to_string(),
+    fn builds_codex_models_catalog_with_per_model_context_and_modalities() {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "deepseek-v4.1-flash".to_string(),
+            AIModelMetadata {
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(64_000),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+            },
+        );
+        metadata.insert(
             "deepseek-v4-pro".to_string(),
-        ])
+            AIModelMetadata {
+                context_window: Some(1_000_000),
+                max_output_tokens: None,
+                input_modalities: vec!["text".to_string()],
+            },
+        );
+        let catalog = build_codex_models_json(
+            &[
+                "deepseek-v4.1-flash".to_string(),
+                "deepseek-v4-pro".to_string(),
+            ],
+            &metadata,
+        )
         .unwrap();
         let root: Value = serde_json::from_str(&catalog).unwrap();
         let models = root.get("models").and_then(Value::as_array).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(
             models[0].get("slug").and_then(Value::as_str),
-            Some("deepseek-v4-flash")
+            Some("deepseek-v4.1-flash")
         );
         assert_eq!(models[0].get("priority").and_then(Value::as_i64), Some(1));
         assert_eq!(models[1].get("priority").and_then(Value::as_i64), Some(2));
         assert_eq!(
             models[0].get("context_window").and_then(Value::as_i64),
-            Some(1048576)
+            Some(1_000_000)
+        );
+        assert_eq!(
+            models[0]
+                .get("input_modalities")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["text", "image"])
+        );
+        assert_eq!(
+            models[0]
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            models[1]
+                .get("input_modalities")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["text"])
+        );
+        assert_eq!(
+            models[1]
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool),
+            Some(false)
         );
         assert_eq!(
             models[0].get("visibility").and_then(Value::as_str),
@@ -8274,6 +8717,79 @@ command = "uvx.exe"
         assert!(error
             .to_string()
             .contains("CC Switch 既有 config.toml 格式无效"));
+    }
+
+    #[test]
+    fn propagates_model_metadata_to_opencode_and_zcode() {
+        let mut credential = credential(&["deepseek-v4.1-flash"]);
+        credential.model_metadata.insert(
+            "deepseek-v4.1-flash".to_string(),
+            AIModelMetadata {
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(64_000),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+            },
+        );
+        let opencode =
+            build_opencode_config("", &credential, &["deepseek-v4.1-flash".to_string()]).unwrap();
+        let opencode: Value = serde_json::from_str(&opencode).unwrap();
+        let model = &opencode["provider"]["himind"]["models"]["deepseek-v4.1-flash"];
+        assert_eq!(model["limit"]["context"], 1_000_000);
+        assert_eq!(model["limit"]["output"], 64_000);
+        assert_eq!(model["capabilities"]["input"], json!(["text", "image"]));
+
+        let rules = build_zcode_provider_rules(
+            "",
+            ProviderConfigFormat::Json,
+            &credential,
+            &["deepseek-v4.1-flash".to_string()],
+        )
+        .unwrap();
+        let rules: Value = serde_json::from_str(&rules).unwrap();
+        let rule =
+            &rules["config"]["modelConfigRules"]["providerModelRules"][0]["config"]["properties"];
+        assert_eq!(rule["contextWindow"], 1_000_000);
+        assert_eq!(rule["inputFormat"]["supportsImage"], true);
+    }
+
+    #[test]
+    fn parses_provider_model_metadata_without_guessing_context() {
+        let parsed = super::parse_provider_model_metadata(&json!({
+            "data": [
+                {
+                    "id": "deepseek-v4.1-flash",
+                    "max_input_tokens": 1_000_000,
+                    "input_modalities": ["text", "image"]
+                },
+                {
+                    "id": "text-only",
+                    "context_window": "131072",
+                    "capabilities": {"toolCalling": true, "imageInput": false}
+                },
+                {
+                    "id": "unknown"
+                }
+            ]
+        }));
+        let multimodal = parsed.get("deepseek-v4.1-flash").unwrap();
+        assert_eq!(multimodal.context_window, Some(1_000_000));
+        assert!(multimodal.supports_image());
+        let text_only = parsed.get("text-only").unwrap();
+        assert_eq!(text_only.context_window, Some(131_072));
+        assert!(!text_only.supports_image());
+        assert_eq!(parsed.get("unknown").unwrap().context_window, None);
+    }
+
+    #[test]
+    fn known_model_metadata_fills_multimodal_fallback_but_not_unknown_windows() {
+        let mut metadata = AIModelMetadata::default();
+        super::merge_known_model_metadata("deepseek-v4.1-flash", &mut metadata);
+        assert_eq!(metadata.context_window, Some(1_000_000));
+        assert!(metadata.supports_image());
+        let mut unknown = AIModelMetadata::default();
+        super::merge_known_model_metadata("custom-model", &mut unknown);
+        assert_eq!(unknown.context_window, None);
+        assert_eq!(unknown.input_modalities, vec!["text"]);
     }
 
     #[test]

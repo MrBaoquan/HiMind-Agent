@@ -2906,6 +2906,7 @@ pub(crate) fn remove_acp_runtime_profile(
 
 #[tauri::command]
 pub(crate) fn save_ai_service(
+    app: AppHandle,
     state: State<'_, AgentState>,
     id: String,
     display_name: String,
@@ -2979,6 +2980,13 @@ pub(crate) fn save_ai_service(
         == Some(service.id.as_str())
     {
         crate::app::ui::stop_builtin_ai_process();
+        let _ = app.emit(
+            "himind:ai-service-changed",
+            json!({
+                "reason": "active_service_edited",
+                "service_id": service.id.clone(),
+            }),
+        );
     }
     state.approval_manager.add_log(
         "info",
@@ -2988,12 +2996,23 @@ pub(crate) fn save_ai_service(
 }
 
 #[tauri::command]
-pub(crate) fn remove_ai_service(state: State<'_, AgentState>, id: String) -> Result<bool, String> {
+pub(crate) fn remove_ai_service(
+    app: AppHandle,
+    state: State<'_, AgentState>,
+    id: String,
+) -> Result<bool, String> {
     crate::app::ai_provider_import::ensure_service_not_in_use(&state.options, &id)
         .map_err(|error| error.to_string())?;
     let removed = crate::store::ai_services::remove(&id).map_err(|e| e.to_string())?;
     if removed {
         crate::app::ui::stop_builtin_ai_process();
+        let _ = app.emit(
+            "himind:ai-service-changed",
+            json!({
+                "reason": "active_service_removed",
+                "service_id": id.clone(),
+            }),
+        );
         state
             .approval_manager
             .add_log("info", &format!("已删除自定义 AI 服务: {id}"));
@@ -3003,11 +3022,16 @@ pub(crate) fn remove_ai_service(state: State<'_, AgentState>, id: String) -> Res
 
 #[tauri::command]
 pub(crate) fn set_active_ai_service(
+    app: AppHandle,
     state: State<'_, AgentState>,
     id: String,
 ) -> Result<serde_json::Value, String> {
     let selected = crate::store::ai_services::set_active(&id).map_err(|e| e.to_string())?;
     crate::app::ui::stop_builtin_ai_process();
+    let service_id = selected
+        .as_ref()
+        .map(|service| service.id.clone())
+        .unwrap_or_default();
     if let Some(service) = selected.as_ref() {
         state.approval_manager.add_log(
             "info",
@@ -3021,8 +3045,19 @@ pub(crate) fn set_active_ai_service(
             .approval_manager
             .add_log("info", "已取消 HiMind AI 本机默认服务，恢复 DSH 原生设置");
     }
+    // The main window keeps the AI iframe mounted across navigation. Stopping DSH
+    // leaves that iframe pointed at a dead proxy URL, and its own rail can only
+    // say "reconnecting" forever. Tell every window to drop the stale session and
+    // start a fresh one with the newly selected service.
+    let _ = app.emit(
+        "himind:ai-service-changed",
+        json!({
+            "reason": "active_service_changed",
+            "service_id": service_id.clone(),
+        }),
+    );
     Ok(json!({
-        "active_service_id": selected.map(|service| service.id).unwrap_or_default(),
+        "active_service_id": service_id,
     }))
 }
 
