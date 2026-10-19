@@ -1428,6 +1428,9 @@ pub(crate) fn open_plugin_view(
         if window.is_visible().unwrap_or(false) {
             let _ = window.show();
             let _ = window.set_focus();
+            // 插件源码可能在窗口保持打开期间被重新构建；再次打开同一视图时
+            // 必须重新加载，否则开发者和用户会继续看到旧页面。
+            let _ = window.reload();
             return Ok(());
         }
         let _ = window.destroy();
@@ -1976,6 +1979,9 @@ fn plugin_ui_response(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
             .header("Content-Type", content_type)
             .header("Content-Security-Policy", "default-src 'self' data: blob: https: http:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline' https: http:; style-src 'self' 'unsafe-inline' https: http:; connect-src *; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:")
             .header("X-Content-Type-Options", "nosniff")
+            // 插件视图直接从源码或已安装目录读取。WebView2 默认可能缓存
+            // 自定义协议响应，源码更新后页面仍显示旧 HTML/CSS/JS。
+            .header("Cache-Control", "no-store")
             .body(body)?)
     })();
     result.unwrap_or_else(|error| {
