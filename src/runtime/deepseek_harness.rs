@@ -3109,6 +3109,15 @@ fn local_media_tool_timeout_ms() -> u64 {
     seconds.saturating_add(60).saturating_mul(1000)
 }
 
+fn managed_model_capacity(model: &str) -> Option<(u64, u64)> {
+    match model.trim() {
+        "deepseek-v4-flash" | "deepseek-v4.1-flash" | "deepseek-v4-pro" => {
+            Some((1_000_000, 64_000))
+        }
+        _ => None,
+    }
+}
+
 fn append_managed_model_profile(
     patch: &mut String,
     home: &Path,
@@ -3158,10 +3167,16 @@ fn append_managed_model_profile(
     patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(base_url)));
     patch.push_str("        models:\n");
     for model in catalog {
+        let capacity = managed_model_capacity(&model);
         let model = yaml_scalar(&model);
         patch.push_str(&format!(
             "          - id: {model}\n            name: {model}\n"
         ));
+        if let Some((context_window, max_tokens)) = capacity {
+            patch.push_str(&format!(
+                "            contextWindow: {context_window}\n            maxTokens: {max_tokens}\n"
+            ));
+        }
     }
     Ok(())
 }
@@ -3225,10 +3240,16 @@ fn append_independent_service_profile(
     patch.push_str(&format!("        baseURL: {}\n", yaml_scalar(&base_url)));
     patch.push_str("        models:\n");
     for model in catalog {
+        let capacity = managed_model_capacity(&model);
         let model = yaml_scalar(&model);
         patch.push_str(&format!(
             "          - id: {model}\n            name: {model}\n"
         ));
+        if let Some((context_window, max_tokens)) = capacity {
+            patch.push_str(&format!(
+                "            contextWindow: {context_window}\n            maxTokens: {max_tokens}\n"
+            ));
+        }
     }
     Ok(())
 }
@@ -5671,6 +5692,37 @@ mod tests {
         assert!(connected_arguments
             .iter()
             .any(|argument| argument == "--api"));
+    }
+
+    #[test]
+    fn managed_profile_declares_deepseek_context_window() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-profile-deepseek-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut options = crate::Options::from_env();
+        options.set_api_base("https://dashboard.example");
+        options.state_path = root.join("agent-state.json");
+        options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+
+        let profile = render_himind_profile_patch(
+            &root,
+            &options,
+            ModelRouteSource::Managed,
+            "deepseek-v4.1-flash",
+            "https://gateway.example/v1",
+            &["deepseek-v4.1-flash".to_string()],
+        )
+        .unwrap();
+
+        assert!(profile.contains("contextWindow: 1000000"));
+        assert!(profile.contains("maxTokens: 64000"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
