@@ -8351,7 +8351,7 @@ mod tests {
                 .get("input_modalities")
                 .and_then(Value::as_array)
                 .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
-            Some(vec!["text"])
+            Some(vec!["text", "image"])
         );
         assert_eq!(
             models[1]
