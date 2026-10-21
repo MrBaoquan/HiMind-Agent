@@ -49,6 +49,19 @@ fn local_app_data_base() -> PathBuf {
         .unwrap_or_else(env::temp_dir)
 }
 
+/// Agent 工作临时目录。
+///
+/// 优先落在 `<agent_home>/tmp`：受限令牌/沙箱只允许写 workspace 与 agent_home，
+/// 系统 `%TEMP%` 可能返回 Access Denied（os error 5）。只有 agent_home 不可写时
+/// 才回退到系统临时目录。
+pub(crate) fn agent_temp_dir() -> PathBuf {
+    let root = agent_home().join("tmp");
+    if std::fs::create_dir_all(&root).is_ok() {
+        return root;
+    }
+    env::temp_dir()
+}
+
 /// WebView2 的用户数据目录。
 ///
 /// WebView2 的用户数据目录是**进程级独占**的：同一台机器上第二个 Agent
@@ -252,7 +265,8 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_safe_profile_name, resolve_profile, test_env_lock, webview_user_data_dir, ProfileSource,
+        agent_temp_dir, is_safe_profile_name, resolve_profile, test_env_lock,
+        webview_user_data_dir, ProfileSource,
     };
     use std::env;
     use std::fs;
@@ -299,6 +313,24 @@ mod tests {
         restore("HIMIND_AGENT_PROFILE", previous_profile);
         restore("HIMIND_AGENT_HOME", previous_home);
         restore("HIMIND_AGENT_ALLOW_PARALLEL_INSTANCE", previous_parallel);
+    }
+
+    /// 安装/解包暂存必须优先落在 agent_home 内：受限令牌下系统 %TEMP% 可能
+    /// 返回 Access Denied，导致 workflow/skill 安装直接失败。
+    #[test]
+    fn agent_temp_dir_prefers_agent_home() {
+        let _guard = test_env_lock();
+        let previous_home = env::var_os("HIMIND_AGENT_HOME");
+        let root = env::current_dir()
+            .expect("current dir")
+            .join("target")
+            .join(format!("agent-temp-dir-test-{}", std::process::id()));
+        env::set_var("HIMIND_AGENT_HOME", &root);
+        let directory = agent_temp_dir();
+        assert_eq!(directory, root.join("tmp"));
+        assert!(directory.is_dir(), "agent_temp_dir should create its root");
+        let _ = fs::remove_dir_all(&root);
+        restore("HIMIND_AGENT_HOME", previous_home);
     }
 
     fn restore(key: &str, value: Option<std::ffi::OsString>) {

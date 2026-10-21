@@ -86,14 +86,37 @@ pub(crate) fn save(input: PluginDraftInput) -> Result<PluginDraft, Box<dyn Error
         .as_ref()
         .map(|draft| draft.candidate_sha256 == candidate_sha256)
         .unwrap_or(false);
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&root).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("创建插件候选目录失败 {}: {error}", root.display()),
+        )
+    })?;
     let candidate_path = root.join(format!("{}-{}.hmpkg", manifest.id, manifest.version));
-    fs::copy(&source, &candidate_path)?;
+    fs::copy(&source, &candidate_path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "复制插件候选包失败 {} -> {}: {error}",
+                source.display(),
+                candidate_path.display()
+            ),
+        )
+    })?;
     let package_root = root.join("package");
     if package_root.exists() {
-        fs::remove_dir_all(&package_root)?;
+        fs::remove_dir_all(&package_root).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("清理插件候选目录失败 {}: {error}", package_root.display()),
+            )
+        })?;
     }
-    extract_and_validate(&candidate_path, &package_root, &manifest)?;
+    extract_and_validate(&candidate_path, &package_root, &manifest).map_err(
+        |error| -> Box<dyn Error> {
+            format!("解包并校验插件候选失败 {}: {error}", package_root.display()).into()
+        },
+    )?;
     crate::capability::plugin::register_development_plugin(&package_root)?;
     let draft = PluginDraft {
         manifest,

@@ -431,7 +431,7 @@ fn tasks_url(base_url: &str) -> Result<String, Box<dyn Error>> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("AI 服务 base_url 仅支持 http/https".into());
     }
-    let root = if base.ends_with("/api/v3") {
+    let root = if base.ends_with("/api/plan/v3") || base.ends_with("/api/v3") {
         base.to_string()
     } else {
         format!("{base}/api/v3")
@@ -727,5 +727,17 @@ mod tests {
         assert!(text.contains("一只柯基在雪地里奔跑"), "{text}");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn ark_plan_video_url_keeps_plan_prefix() {
+        assert_eq!(
+            tasks_url("https://ark.cn-beijing.volces.com/api/plan/v3").unwrap(),
+            "https://ark.cn-beijing.volces.com/api/plan/v3/contents/generations/tasks"
+        );
+        assert_eq!(
+            tasks_url("https://ark.cn-beijing.volces.com").unwrap(),
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+        );
     }
 }

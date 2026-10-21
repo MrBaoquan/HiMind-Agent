@@ -32,3 +32,6 @@
 /agent-user-authorization.lock
 /agent-update-state.json
 /agent-state.distribution.json
+
+# Top-level release/workflow staging output
+/dist/

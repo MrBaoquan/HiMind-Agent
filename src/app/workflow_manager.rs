@@ -49,7 +49,8 @@ pub(crate) fn install_public_catalog_item(
     // 这里的 require_signature 约束的是发布清单签名，已在上一步完成；解包后不再
     // 要求包内 manifest.sig，见 REMOTE_REQUIRE_PACKAGE_SIGNATURE。
     let archive = download_public(&client, item, require_signature)?;
-    let staging = std::env::temp_dir().join(format!("himind-public-workflow-{}", unique_suffix()));
+    let staging = crate::store::paths::agent_temp_dir()
+        .join(format!("himind-public-workflow-{}", unique_suffix()));
     let result = (|| {
         extract_archive(&archive, &staging)?;
         let root = package_root(&staging)?;
@@ -74,8 +75,8 @@ pub(crate) fn install_dashboard_catalog_item(
         .user_agent("HiMind-Agent")
         .build()?;
     let archive = download_dashboard(&client, item, options, agent_id)?;
-    let staging =
-        std::env::temp_dir().join(format!("himind-dashboard-workflow-{}", unique_suffix()));
+    let staging = crate::store::paths::agent_temp_dir()
+        .join(format!("himind-dashboard-workflow-{}", unique_suffix()));
     let result = (|| {
         extract_archive(&archive, &staging)?;
         let root = package_root(&staging)?;
@@ -229,8 +230,8 @@ pub(crate) fn install_local_archive(
         return Err("Workflow 制品为空或超过 256 MiB 限制".into());
     }
     let artifact_sha256 = sha256_file(&archive_path)?;
-    let staging =
-        std::env::temp_dir().join(format!("himind-local-workflow-archive-{}", unique_suffix()));
+    let staging = crate::store::paths::agent_temp_dir()
+        .join(format!("himind-local-workflow-archive-{}", unique_suffix()));
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
     }
@@ -333,8 +334,8 @@ fn download_public(
     {
         return Err("Workflow 制品响应大小超过发布记录".into());
     }
-    let path =
-        std::env::temp_dir().join(format!("himind-public-workflow-{}.hmwf", unique_suffix()));
+    let path = crate::store::paths::agent_temp_dir()
+        .join(format!("himind-public-workflow-{}.hmwf", unique_suffix()));
     let mut file = File::create(&path)?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
@@ -400,7 +401,7 @@ fn download_dashboard(
         )
         .send()?
         .error_for_status()?;
-    let path = std::env::temp_dir().join(format!(
+    let path = crate::store::paths::agent_temp_dir().join(format!(
         "himind-dashboard-workflow-{}.hmwf",
         unique_suffix()
     ));

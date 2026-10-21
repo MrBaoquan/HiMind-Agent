@@ -6173,24 +6173,31 @@ pub(crate) async fn invoke_plugin_view_capability(
     let label = window.label().to_string();
     let gateway = state.capability_gateway.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let plugin = crate::capability::plugin::scan_plugins()
+        let (plugin, view) = crate::capability::plugin::scan_plugins()
             .map_err(|error| error.to_string())?
             .into_iter()
-            .find(|plugin| {
-                plugin.enabled
-                    && plugin.views.iter().any(|view| {
-                        super::ui::plugin_view_window_label(&plugin.id, &view.id) == label
-                    })
+            .find_map(|plugin| {
+                if !plugin.enabled {
+                    return None;
+                }
+                plugin
+                    .views
+                    .iter()
+                    .find(|view| super::ui::plugin_view_window_label(&plugin.id, &view.id) == label)
+                    .cloned()
+                    .map(|view| (plugin, view))
             })
             .ok_or_else(|| "plugin view identity is unavailable".to_string())?;
-        if !plugin
+        let owns_capability = plugin
             .capabilities
             .iter()
-            .any(|capability| capability.id == capability_id)
-        {
+            .any(|capability| capability.id == capability_id);
+        let external_capability =
+            crate::capability::plugin::view_can_invoke_external(&view, &capability_id);
+        if !owns_capability && !external_capability {
             return Err(format!(
-                "capability is not declared by plugin {}: {}",
-                plugin.id, capability_id
+                "capability is not declared by plugin view {}/{}: {}",
+                plugin.id, view.id, capability_id
             ));
         }
         gateway

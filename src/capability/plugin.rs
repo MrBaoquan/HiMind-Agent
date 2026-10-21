@@ -253,6 +253,10 @@ pub(crate) struct PluginViewContribution {
     #[serde(default = "default_view_location")]
     pub location: String,
     pub entry: String,
+    /// Capabilities from other plugins this view may invoke through the host bridge.
+    /// Exact IDs or trailing `.*` namespace patterns; management namespaces are rejected.
+    #[serde(default)]
+    pub external_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2070,6 +2074,15 @@ pub(crate) fn validate_manifest_contributions(
             return Err(format!("plugin view entry must be an HTML file: {}", view.entry).into());
         }
     }
+    for view in &manifest.contributes.views {
+        let mut external = std::collections::HashSet::new();
+        for pattern in &view.external_capabilities {
+            validate_external_capability_pattern(pattern)?;
+            if !external.insert(pattern.as_str()) {
+                return Err(format!("duplicate external capability pattern: {pattern}").into());
+            }
+        }
+    }
     let mut command_ids = std::collections::HashSet::new();
     for command in &manifest.contributes.commands {
         if command.id.trim().is_empty() || command.title.trim().is_empty() {
@@ -2992,6 +3005,7 @@ mod tests {
                     order: 0,
                     location: "plugin_navigation".to_string(),
                     entry: "ui/index.html".to_string(),
+                    external_capabilities: Vec::new(),
                 }],
                 commands: Vec::new(),
             },
@@ -3081,6 +3095,7 @@ mod tests {
                     order: 0,
                     location: "plugin_navigation".to_string(),
                     entry: "ui/index.js".to_string(),
+                    external_capabilities: Vec::new(),
                 }],
                 commands: Vec::new(),
             },
@@ -3127,6 +3142,7 @@ mod tests {
                     order: 0,
                     location: "plugin_navigation".to_string(),
                     entry: format!("../{}", outside.file_name().unwrap().to_string_lossy()),
+                    external_capabilities: Vec::new(),
                 }],
                 commands: Vec::new(),
             },
@@ -3363,5 +3379,161 @@ mod tests {
         assert!(items[0].overrides_installed_version.is_none());
 
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+const VIEW_EXTERNAL_CAPABILITY_PREFIXES: &[&str] =
+    &["media.", "audio.", "visual.", "asset.", "render."];
+
+fn valid_capability_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+}
+
+fn validate_external_capability_pattern(pattern: &str) -> Result<(), Box<dyn Error>> {
+    let value = pattern.trim();
+    if value.is_empty() {
+        return Err("external capability pattern is empty".into());
+    }
+    if value.contains(char::is_whitespace) {
+        return Err(format!("external capability pattern contains whitespace: {value}").into());
+    }
+    let wildcard = value.ends_with(".*");
+    if value.contains('*') && !wildcard {
+        return Err(format!("external capability wildcard must be a trailing .*: {value}").into());
+    }
+    if !VIEW_EXTERNAL_CAPABILITY_PREFIXES
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(format!(
+            "external capability namespace is not allowed for plugin views: {value}"
+        )
+        .into());
+    }
+    let prefix = if wildcard {
+        &value[..value.len() - 2]
+    } else {
+        value
+    };
+    if prefix.is_empty() || !prefix.split('.').all(valid_capability_segment) {
+        return Err(format!("external capability pattern is invalid: {value}").into());
+    }
+    Ok(())
+}
+
+pub(crate) fn external_capability_matches(pattern: &str, capability_id: &str) -> bool {
+    let value = pattern.trim();
+    if let Some(prefix) = value.strip_suffix(".*") {
+        capability_id.starts_with(prefix)
+            && capability_id
+                .as_bytes()
+                .get(prefix.len())
+                .is_some_and(|byte| *byte == b'.')
+    } else {
+        value == capability_id
+    }
+}
+
+pub(crate) fn view_can_invoke_external(view: &PluginViewContribution, capability_id: &str) -> bool {
+    view.external_capabilities
+        .iter()
+        .any(|pattern| external_capability_matches(pattern, capability_id))
+}
+
+#[cfg(test)]
+mod view_external_capability_tests {
+    use super::*;
+
+    fn view(patterns: &[&str]) -> PluginViewContribution {
+        PluginViewContribution {
+            id: "demo.view.main".to_string(),
+            title: "Demo".to_string(),
+            short_title: String::new(),
+            icon: default_view_icon(),
+            quick_access: true,
+            order: 0,
+            location: "plugin_navigation".to_string(),
+            entry: "ui/index.html".to_string(),
+            external_capabilities: patterns.iter().map(|item| item.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn external_capability_matches_exact_and_namespace() {
+        assert!(external_capability_matches(
+            "audio.*",
+            "audio.speech.synthesize"
+        ));
+        assert!(external_capability_matches(
+            "media.visual.*",
+            "media.visual.upscale"
+        ));
+        assert!(external_capability_matches(
+            "media.image.generate",
+            "media.image.generate"
+        ));
+        assert!(!external_capability_matches(
+            "audio.*",
+            "audioprocess.speech"
+        ));
+        assert!(!external_capability_matches(
+            "audio.speech.*",
+            "audio.speech"
+        ));
+        assert!(!external_capability_matches(
+            "media.image.generate",
+            "media.image.edit"
+        ));
+    }
+
+    #[test]
+    fn external_capability_patterns_reject_management_namespaces() {
+        for pattern in [
+            "system.health",
+            "system.*",
+            "extension.plugin.package",
+            "plugin.invoke",
+            "workflow.run.start",
+            "skill.run",
+            "market.install",
+            "*",
+            "audio.*.speech",
+            "audio speech",
+        ] {
+            assert!(
+                validate_external_capability_pattern(pattern).is_err(),
+                "pattern should be rejected: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_capability_patterns_accept_media_namespaces() {
+        for pattern in [
+            "audio.*",
+            "audio.speech.synthesize",
+            "media.image.generate",
+            "media.visual.*",
+            "asset.*",
+            "render.*",
+            "visual.*",
+        ] {
+            assert!(
+                validate_external_capability_pattern(pattern).is_ok(),
+                "pattern should be accepted: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_can_invoke_only_declared_external_capability() {
+        let item = view(&["audio.*", "media.image.generate"]);
+        assert!(view_can_invoke_external(&item, "audio.mix.render"));
+        assert!(view_can_invoke_external(&item, "media.image.generate"));
+        assert!(!view_can_invoke_external(&item, "media.video.generate"));
+        assert!(!view_can_invoke_external(&item, "system.health"));
     }
 }

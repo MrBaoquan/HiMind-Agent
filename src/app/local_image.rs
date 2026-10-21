@@ -660,7 +660,7 @@ fn images_url_for(adapter: &str, base_url: &str) -> Result<String, Box<dyn Error
     }
     let root = match adapter {
         ADAPTER_ARK_IMAGES => {
-            if base.ends_with("/api/v3") {
+            if base.ends_with("/api/plan/v3") || base.ends_with("/api/v3") {
                 base.to_string()
             } else {
                 format!("{base}/api/v3")
@@ -982,6 +982,22 @@ mod tests {
             }
         });
         format!("http://{address}/v1")
+    }
+
+    #[test]
+    fn ark_plan_image_url_keeps_plan_prefix() {
+        assert_eq!(
+            images_url_for(
+                ADAPTER_ARK_IMAGES,
+                "https://ark.cn-beijing.volces.com/api/plan/v3"
+            )
+            .unwrap(),
+            "https://ark.cn-beijing.volces.com/api/plan/v3/images/generations"
+        );
+        assert_eq!(
+            images_url_for(ADAPTER_ARK_IMAGES, "https://ark.cn-beijing.volces.com").unwrap(),
+            "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+        );
     }
 
     #[test]

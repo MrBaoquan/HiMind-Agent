@@ -2080,11 +2080,6 @@ fn build_codex_models_json(
                 .map(|(_, value)| value)
         });
         let image_input = model_metadata.is_some_and(|value| value.supports_image());
-        let input_modalities = if image_input {
-            json!(["text", "image"])
-        } else {
-            json!(["text"])
-        };
         let mut entry = json!({
             "slug": model,
             "display_name": display,
@@ -2109,7 +2104,9 @@ fn build_codex_models_json(
             "effective_context_window_percent": 95,
             // Codex 0.150 的目录解析器要求该字段存在（空数组即可）。
             "experimental_supported_tools": [],
-            "input_modalities": input_modalities,
+            // Codex 按 input_modalities 决定能否附加图片：只有 "text" 时输入框
+            // 会直接拒绝图片，网关模型普遍支持识图，故声明 text+image。
+            "input_modalities": ["text", "image"],
             "supports_search_tool": false
         });
         // 上下文窗口是可选字段。供应商没有声明时宁可不写，让 Codex 使用自己的

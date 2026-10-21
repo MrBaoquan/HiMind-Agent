@@ -163,20 +163,11 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
         }
     });
     let mut stdout = io::stdout().lock();
-    let mut initialized = false;
-    let mut last_generation = None::<String>;
-    let mut registry_updates = None::<Receiver<String>>;
-    let mut session = McpSessionState {
-        default_activated: default_activation_ids(&gateway),
-        device_id,
-        ..McpSessionState::default()
-    };
+    let mut server = McpServer::new(gateway, device_id);
 
     loop {
-        if initialized {
-            if let Some(updates) = registry_updates.as_ref() {
-                emit_registry_notifications(updates, &mut stdout, &mut last_generation)?;
-            }
+        for notification in server.poll_registry_notifications()? {
+            write_message(&mut stdout, &notification)?;
         }
         let line = match line_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(line)) => line,
@@ -194,138 +185,208 @@ pub(crate) fn run(options: Options) -> Result<(), Box<dyn Error>> {
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        if line.trim().is_empty() {
-            continue;
+        match server.process_line(&line)? {
+            McpServerAction::None => {}
+            McpServerAction::Respond {
+                response,
+                notifications,
+            } => {
+                write_message(&mut stdout, &response)?;
+                for notification in notifications {
+                    write_message(&mut stdout, &notification)?;
+                }
+            }
+            McpServerAction::Exit => break,
         }
-        let request: Value = match serde_json::from_str(&line) {
+    }
+    Ok(())
+}
+
+/// Transport-independent MCP protocol engine.
+///
+/// This type owns one MCP session and the gateway reference, but performs no
+/// stdio I/O. The stdio companion above and the future local daemon can both
+/// feed it JSON-RPC frames and write the returned frames to their own transport.
+pub(crate) struct McpServer {
+    gateway: CapabilityGateway,
+    session: McpSessionState,
+    initialized: bool,
+    last_generation: Option<String>,
+    registry_updates: Option<Receiver<String>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum McpServerAction {
+    None,
+    Respond {
+        response: Value,
+        notifications: Vec<Value>,
+    },
+    Exit,
+}
+
+impl McpServer {
+    pub(crate) fn new(gateway: CapabilityGateway, device_id: String) -> Self {
+        Self::new_with_registry_updates(gateway, device_id, None)
+    }
+
+    pub(crate) fn new_with_registry_updates(
+        gateway: CapabilityGateway,
+        device_id: String,
+        registry_updates: Option<Receiver<String>>,
+    ) -> Self {
+        let default_activated = default_activation_ids(&gateway);
+        Self {
+            gateway,
+            session: McpSessionState {
+                default_activated,
+                device_id,
+                ..McpSessionState::default()
+            },
+            initialized: false,
+            last_generation: None,
+            registry_updates,
+        }
+    }
+
+    pub(crate) fn process_line(&mut self, line: &str) -> Result<McpServerAction, Box<dyn Error>> {
+        if line.trim().is_empty() {
+            return Ok(McpServerAction::None);
+        }
+        let request: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(error) => {
-                write_message(
-                    &mut stdout,
-                    &json!({
+                return Ok(McpServerAction::Respond {
+                    response: json!({
                         "jsonrpc": "2.0",
                         "id": null,
                         "error": { "code": -32700, "message": error.to_string() }
                     }),
-                )?;
-                continue;
+                    notifications: Vec::new(),
+                })
             }
         };
         // MCP lifecycle uses a shutdown request followed by an `exit`
-        // notification.  The notification has no response, but it must end
-        // the stdio process so clients can cleanly restart or upgrade it.
+        // notification. The notification has no response, but it must end the
+        // transport loop so clients can cleanly restart or upgrade it.
         if request.get("method").and_then(Value::as_str) == Some("exit")
             && request.get("id").is_none()
         {
-            break;
+            return Ok(McpServerAction::Exit);
         }
         let request_id = request.get("id").cloned();
         if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             if let Some(id) = request_id {
-                write_message(
-                    &mut stdout,
-                    &json!({
+                return Ok(McpServerAction::Respond {
+                    response: json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "error": { "code": -32600, "message": "invalid JSON-RPC request" }
                     }),
-                )?;
+                    notifications: Vec::new(),
+                });
             }
-            continue;
+            return Ok(McpServerAction::None);
         }
         if request_id.is_none() {
             if request.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
-                initialized = true;
-                if registry_updates.is_none() {
-                    registry_updates = Some(spawn_registry_watcher(gateway.clone()));
+                self.initialized = true;
+                if self.registry_updates.is_none() {
+                    self.registry_updates = Some(spawn_registry_watcher(self.gateway.clone()));
                 }
             }
-            continue;
+            return Ok(McpServerAction::None);
         }
         let Some(id) = request_id else {
-            continue;
+            return Ok(McpServerAction::None);
         };
         let Some(method) = request.get("method").and_then(Value::as_str) else {
-            write_message(
-                &mut stdout,
-                &json!({
+            return Ok(McpServerAction::Respond {
+                response: json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "error": { "code": -32600, "message": "MCP method is required" }
                 }),
-            )?;
-            continue;
+                notifications: Vec::new(),
+            });
         };
         let params = request
             .get("params")
             .filter(|value| !value.is_null())
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let response = match handle_request_with_session(&gateway, method, params, &mut session) {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(error) => {
-                let message = error.to_string();
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": mcp_error_code(method, &message),
-                        "message": message
-                    }
-                })
-            }
-        };
-        write_message(&mut stdout, &response)?;
-        if session.take_projection_changed() {
-            write_notification(
-                &mut stdout,
-                "notifications/tools/list_changed",
-                json!({ "registryGeneration": mcp_registry_generation(&gateway)? }),
-            )?;
+        let response =
+            match handle_request_with_session(&self.gateway, method, params, &mut self.session) {
+                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Err(error) => {
+                    let message = error.to_string();
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": mcp_error_code(method, &message),
+                            "message": message
+                        }
+                    })
+                }
+            };
+        let mut notifications = Vec::new();
+        if self.session.take_projection_changed() {
+            notifications.push(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": { "registryGeneration": mcp_registry_generation(&self.gateway)? }
+            }));
         }
         if method == "initialize" && response.get("error").is_none() {
-            last_generation = response
+            self.last_generation = response
                 .pointer("/result/_meta/himind/registryGeneration")
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
+        Ok(McpServerAction::Respond {
+            response,
+            notifications,
+        })
     }
-    Ok(())
+
+    pub(crate) fn poll_registry_notifications(&mut self) -> Result<Vec<Value>, Box<dyn Error>> {
+        if !self.initialized {
+            return Ok(Vec::new());
+        }
+        let Some(updates) = self.registry_updates.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut generation = None;
+        while let Ok(next) = updates.try_recv() {
+            generation = Some(next);
+        }
+        let Some(generation) = generation else {
+            return Ok(Vec::new());
+        };
+        if self.last_generation.as_deref() == Some(generation.as_str()) {
+            return Ok(Vec::new());
+        }
+        let notifications = [
+            "notifications/tools/list_changed",
+            "notifications/prompts/list_changed",
+            "notifications/resources/list_changed",
+        ]
+        .into_iter()
+        .map(|method| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": { "registryGeneration": generation }
+            })
+        })
+        .collect();
+        self.last_generation = Some(generation);
+        Ok(notifications)
+    }
 }
 
-/// MCP listChanged notifications are emitted from the same writer loop as
-/// request responses, so a client never receives interleaved JSON lines. The
-/// registry watcher computes generations off the request loop and only sends
-/// changes through this channel. The generation intentionally covers tools,
-/// prompts and resources together; sending all three notifications keeps the
-/// contract correct when a Skill or plugin changes more than one projection.
-fn emit_registry_notifications(
-    updates: &Receiver<String>,
-    stdout: &mut impl Write,
-    last_generation: &mut Option<String>,
-) -> Result<(), Box<dyn Error>> {
-    let mut generation = None;
-    while let Ok(next) = updates.try_recv() {
-        generation = Some(next);
-    }
-    let Some(generation) = generation else {
-        return Ok(());
-    };
-    if last_generation.as_deref() == Some(generation.as_str()) {
-        return Ok(());
-    }
-    for method in [
-        "notifications/tools/list_changed",
-        "notifications/prompts/list_changed",
-        "notifications/resources/list_changed",
-    ] {
-        write_notification(stdout, method, json!({ "registryGeneration": generation }))?;
-    }
-    *last_generation = Some(generation);
-    Ok(())
-}
-
-fn spawn_registry_watcher(gateway: CapabilityGateway) -> Receiver<String> {
+pub(crate) fn spawn_registry_watcher(gateway: CapabilityGateway) -> Receiver<String> {
     spawn_registry_watcher_with_interval(gateway, REGISTRY_POLL_INTERVAL)
 }
 
@@ -375,7 +436,8 @@ fn handle_request(
     // The real stdio loop uses a session-scoped projection below.
     let mut session = McpSessionState {
         activated_capabilities: gateway
-            .list_capabilities(&mcp_invocation_context())?
+            .list_capabilities(&mcp_invocation_context())
+            .map_err(|error| format!("list MCP capabilities for legacy session: {error}"))?
             .into_iter()
             .map(|capability| capability.id)
             .collect(),
@@ -858,7 +920,10 @@ fn mcp_tool_call_result(result: Value) -> Result<Value, Box<dyn Error>> {
     }))
 }
 
-fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Option<String>> {
+pub(crate) fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> io::Result<Option<String>> {
     let mut bytes = Vec::with_capacity(8192.min(limit));
     loop {
         let buffer = reader.fill_buf()?;
@@ -923,7 +988,9 @@ fn mcp_capability_facts(
 
 fn mcp_registry_generation(gateway: &CapabilityGateway) -> Result<String, Box<dyn Error>> {
     let context = mcp_invocation_context();
-    let capabilities = gateway.list_capabilities(&context)?;
+    let capabilities = gateway
+        .list_capabilities(&context)
+        .map_err(|error| format!("list capabilities for MCP registry generation: {error}"))?;
     let mut hasher = Sha256::new();
     for capability in &capabilities {
         // Hash the contract fields individually. This preserves changes to
@@ -976,11 +1043,15 @@ fn mcp_registry_generation(gateway: &CapabilityGateway) -> Result<String, Box<dy
             source: descriptor.source.clone(),
         })
         .collect::<Vec<_>>();
-    let prompts = crate::skill::mcp_prompts_json(VERSION, &facts)?;
-    let resources = crate::skill::mcp_resources_json(VERSION, &facts)?;
+    let prompts = crate::skill::mcp_prompts_json(VERSION, &facts)
+        .map_err(|error| format!("build MCP prompt catalog: {error}"))?;
+    let resources = crate::skill::mcp_resources_json(VERSION, &facts)
+        .map_err(|error| format!("build MCP resource catalog: {error}"))?;
     hasher.update(serde_json::to_vec(&prompts)?);
     hasher.update(serde_json::to_vec(&resources)?);
-    hasher.update(serde_json::to_vec(&crate::expert::mcp_prompts_json()?)?);
+    let expert_prompts = crate::expert::mcp_prompts_json()
+        .map_err(|error| format!("build MCP expert prompt catalog: {error}"))?;
+    hasher.update(serde_json::to_vec(&expert_prompts)?);
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
@@ -1154,26 +1225,14 @@ fn write_message(writer: &mut impl Write, value: &Value) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn write_notification(
-    writer: &mut impl Write,
-    method: &str,
-    params: Value,
-) -> Result<(), Box<dyn Error>> {
-    write_message(
-        writer,
-        &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_registry_notifications, handle_request, handle_request_with_session,
-        mcp_client_id_from_client_info, mcp_error_code, mcp_invocation_context_for_session,
-        mcp_registry_generation, mcp_tool_call_error, mcp_tool_call_result,
-        negotiate_protocol_version, parse_default_activation_ids, parse_tool_cursor,
-        spawn_registry_watcher_with_interval, McpSessionState, MCP_INSTRUCTIONS,
-        MCP_MARKET_INSTRUCTIONS,
+        handle_request, handle_request_with_session, mcp_client_id_from_client_info,
+        mcp_error_code, mcp_invocation_context_for_session, mcp_registry_generation,
+        mcp_tool_call_error, mcp_tool_call_result, negotiate_protocol_version,
+        parse_default_activation_ids, parse_tool_cursor, spawn_registry_watcher_with_interval,
+        McpServer, McpServerAction, McpSessionState, MCP_INSTRUCTIONS, MCP_MARKET_INSTRUCTIONS,
     };
     use crate::api::oauth::AgentAccessToken;
     use crate::business_integration::{BusinessCapabilityContract, BusinessCatalogSnapshot};
@@ -1680,14 +1739,49 @@ mod tests {
     fn registry_notifications_are_emitted_once_per_generation() {
         let (tx, rx) = mpsc::channel();
         tx.send("sha256:generation-1".to_string()).unwrap();
-        let mut output = Vec::new();
-        let mut last_generation = None;
-        emit_registry_notifications(&rx, &mut output, &mut last_generation).unwrap();
-        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 3);
+        let mut server = McpServer::new(test_gateway(), String::new());
+        server.initialized = true;
+        server.registry_updates = Some(rx);
+        assert_eq!(server.poll_registry_notifications().unwrap().len(), 3);
+        assert!(server.poll_registry_notifications().unwrap().is_empty());
+    }
 
-        output.clear();
-        emit_registry_notifications(&rx, &mut output, &mut last_generation).unwrap();
-        assert!(output.is_empty());
+    #[test]
+    fn transport_server_processes_json_without_stdio() {
+        let mut server = McpServer::new(test_gateway(), String::new());
+        let initialized = server
+            .process_line(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"transport-test","version":"1"}}}"#,
+            )
+            .unwrap();
+        match initialized {
+            McpServerAction::Respond {
+                response,
+                notifications,
+            } => {
+                assert_eq!(response["id"], 1);
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(response["result"]["serverInfo"]["name"], "himind-agent");
+                assert!(notifications.is_empty());
+            }
+            action => panic!("initialize must return a response, got {action:?}"),
+        }
+        assert!(matches!(
+            server
+                .process_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .unwrap(),
+            McpServerAction::None
+        ));
+        let listed = server
+            .process_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+            .unwrap();
+        match listed {
+            McpServerAction::Respond { response, .. } => {
+                assert_eq!(response["id"], 2);
+                assert!(response["result"]["tools"].is_array());
+            }
+            action => panic!("tools/list must return a response, got {action:?}"),
+        }
     }
 
     #[test]
@@ -1823,12 +1917,20 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         tx.send(changed_generation.clone()).unwrap();
-        let mut output = Vec::new();
-        let mut last_generation = Some(initial_generation);
-        emit_registry_notifications(&rx, &mut output, &mut last_generation).unwrap();
-        let notifications = String::from_utf8(output).unwrap();
-        assert!(notifications.contains("notifications/tools/list_changed"));
-        assert!(notifications.contains(&changed_generation));
+        let mut server = McpServer::new(gateway.clone(), String::new());
+        server.initialized = true;
+        server.last_generation = Some(initial_generation);
+        server.registry_updates = Some(rx);
+        let notifications = server.poll_registry_notifications().unwrap();
+        assert_eq!(notifications.len(), 3);
+        assert_eq!(
+            notifications[0]["method"],
+            "notifications/tools/list_changed"
+        );
+        assert_eq!(
+            notifications[0]["params"]["registryGeneration"],
+            changed_generation
+        );
     }
 
     #[test]

@@ -622,10 +622,13 @@ fn json_target_state(
 ) -> Option<bool> {
     let target_id = definition.id;
     let server_id = super::mcp_registry::agent_server_id();
+    let legacy_server_id = "himind-agent";
     if definition.layout == JsonTargetLayout::OpenCode {
-        let Some(server) =
-            server_collection(root, definition).and_then(|servers| servers.get(&server_id))
-        else {
+        let Some(server) = server_collection(root, definition).and_then(|servers| {
+            servers
+                .get(&server_id)
+                .or_else(|| servers.get(legacy_server_id))
+        }) else {
             return None;
         };
         let Some(command_line) = server.get("command").and_then(Value::as_array) else {
@@ -643,9 +646,11 @@ fn json_target_state(
         let enabled_matches = server.get("enabled").and_then(Value::as_bool) != Some(false);
         return Some(command_matches && type_matches && enabled_matches);
     }
-    let Some(server) =
-        server_collection(root, definition).and_then(|servers| servers.get(&server_id))
-    else {
+    let Some(server) = server_collection(root, definition).and_then(|servers| {
+        servers
+            .get(&server_id)
+            .or_else(|| servers.get(legacy_server_id))
+    }) else {
         return None;
     };
     let command_matches = server
@@ -1224,7 +1229,8 @@ mod tests {
             &[],
         ))
         .unwrap();
-        assert!(snippet.pointer("/mcp/servers/himind-agent").is_some());
+        let server_id = crate::app::mcp_registry::agent_server_id();
+        assert!(snippet["mcp"]["servers"][&server_id].is_object());
     }
 
     /// Layer 1: the manual snippet a non-production Agent shows must name its

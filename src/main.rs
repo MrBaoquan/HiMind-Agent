@@ -51,6 +51,12 @@ mod instruction_projection;
 mod instruction_targets;
 mod local_activity;
 mod mcp;
+#[cfg(windows)]
+mod mcp_bridge;
+mod mcp_ipc;
+#[cfg(windows)]
+mod mcp_pipe;
+mod mcp_service;
 mod path_guard;
 mod plugin_authoring;
 mod remote;
@@ -156,18 +162,25 @@ fn main() {
     configure_process_stacks();
     let arguments = env::args().collect::<Vec<_>>();
     let mcp_mode = should_run_mcp(env!("CARGO_BIN_NAME"), &arguments);
+    let mcp_bridge_mode = arguments.iter().any(|argument| argument == "--mcp-bridge");
+    let mcp_service_mode = arguments.iter().any(|argument| argument == "--mcp-service");
+    let direct_mcp = env::var("HIMIND_MCP_TRANSPORT").as_deref() == Ok("direct");
     let acp_mode = should_run_acp(&arguments);
     // Must run before `Options::from_env()`: that is where the state path — and
     // with it every other path of this process — is derived from the profile.
     apply_startup_profile(
         &arguments,
-        !mcp_mode && !acp_mode && cli_subcommand(&arguments).is_none(),
+        !mcp_mode
+            && !mcp_bridge_mode
+            && !mcp_service_mode
+            && !acp_mode
+            && cli_subcommand(&arguments).is_none(),
     );
     let options = Options::from_env();
     if let Err(error) = app::extension_lock::recover() {
         eprintln!("extension transaction recovery failed: {error}");
     }
-    if !mcp_mode && !acp_mode {
+    if !mcp_mode && !mcp_bridge_mode && !mcp_service_mode && !acp_mode {
         if let Err(error) = svn::service::bootstrap_svn_credentials() {
             eprintln!("SVN credential initialization failed: {error}");
             std::process::exit(1);
@@ -269,9 +282,24 @@ fn main() {
             eprintln!("mcp command failed: {error}");
             std::process::exit(1);
         }
+    } else if mcp_service_mode {
+        if let Err(error) = run_mcp_service_mode(options) {
+            eprintln!("agent mcp service failed: {error}");
+            std::process::exit(1);
+        }
+    } else if mcp_bridge_mode {
+        if let Err(error) = run_mcp_bridge_mode(options) {
+            eprintln!("agent mcp bridge failed: {error}");
+            std::process::exit(1);
+        }
     } else if mcp_mode {
-        if let Err(error) = mcp::run(options) {
-            eprintln!("agent mcp failed: {error}");
+        if direct_mcp {
+            if let Err(error) = mcp::run(options) {
+                eprintln!("agent mcp direct failed: {error}");
+                std::process::exit(1);
+            }
+        } else if let Err(error) = run_mcp_bridge_mode(options) {
+            eprintln!("agent mcp bridge failed: {error}");
             std::process::exit(1);
         }
     } else if options.local_app {
@@ -290,6 +318,43 @@ fn main() {
     } else if let Err(error) = worker::run_loop(options, None, None) {
         eprintln!("agent failed: {error}");
         std::process::exit(1);
+    }
+}
+
+fn run_mcp_service_mode(options: Options) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        mcp_service::run(options)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = options;
+        Err("MCP singleton service is currently implemented on Windows only".into())
+    }
+}
+
+fn run_mcp_bridge_mode(options: Options) -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        let service_executable = env::current_exe()?;
+        mcp_ipc::ensure_service_running(
+            &crate::store::paths::profile_name(),
+            &options.state_path,
+            &crate::store::paths::agent_home(),
+            &service_executable,
+            Some(options.mode().as_str()),
+            Some(&options.api_base()),
+        )?;
+        mcp_bridge::run(
+            &crate::store::paths::profile_name(),
+            &options.state_path,
+            &crate::store::paths::agent_home(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = options;
+        Err("MCP bridge is currently implemented on Windows only".into())
     }
 }
 

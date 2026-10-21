@@ -662,7 +662,7 @@ fn collect_payload_files(
 fn plugin_skips_directory(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        ".git" | ".github" | "node_modules" | "dist" | "target" | "test-output"
+        ".git" | ".github" | "node_modules" | "dist" | "target" | "test-output" | ".cache"
     )
 }
 
@@ -868,6 +868,7 @@ mod tests {
         write(&root.join("go.mod"), "module fixture");
         write(&root.join("checksums.sha256"), "stale");
         write(&root.join("dist/bundle.js"), "generated");
+        write(&root.join(".cache/webpack/0.pack"), "cached");
         write(&root.join("ui/node_modules/react/index.js"), "dependency");
     }
 
