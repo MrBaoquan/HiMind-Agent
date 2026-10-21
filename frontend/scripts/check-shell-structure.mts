@@ -22,6 +22,15 @@ function countOccurrences(haystack: string, needle: string): number {
 assert.equal(countOccurrences(shell, '<AppMenuBar'), 1, 'Shell 只能渲染一个 AppMenuBar，多了就是双重标题栏');
 assert.equal(countOccurrences(shell, 'className="app-menu-bar"'), 1, 'app-menu-bar 只能出现一次');
 
+// 自绘标题栏必须阻止 WebView2 的默认鼠标手势，否则 startDragging 会晚于
+// 浏览器焦点/选择动作，用户按住空白处时窗口不动。拖拽区也必须显式标注。
+const dragHandler = shell.match(/const handleTitleBarMouseDown[\s\S]*?\n    \};/);
+assert.ok(dragHandler, '标题栏必须有 mousedown 拖拽处理器');
+assert.match(dragHandler[0], /event\.preventDefault\(\)/, '标题栏拖拽处理必须先 preventDefault');
+assert.match(dragHandler[0], /getCurrentWindow\(\)\.startDragging\(\)/, '标题栏拖拽必须使用 Tauri Window API');
+assert.match(shell, /className="app-menu-brand"[^>]*data-tauri-drag-region/, '标题栏品牌区必须声明 drag region');
+assert.match(shell, /className="app-menu-drag-space"[^>]*data-tauri-drag-region/, '标题栏空白区必须声明 drag region');
+
 // 徽标安全网必须保留：列表里 `button > span { display: grid }` 这类规则会把
 // 「圆点 + 文字」的胶囊拆成两行，必须由后面的 !important 规则兜住。
 const badgeSafetyNet = styles.match(/:where\([^{]*\.pill[^{]*\{[^}]*display: inline-flex !important;[^}]*\}/);

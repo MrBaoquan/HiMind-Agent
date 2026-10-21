@@ -9734,7 +9734,7 @@ mod tests {
                     "workspace_root": root.to_string_lossy(),
                     "artifact_path": artifact.to_string_lossy(),
                     "product_id": "himind-agent",
-                    "version": "0.3.79",
+                    "version": "0.3.80",
                     "channel": "stable",
                     "platform": "windows",
                     "architecture": "x64",

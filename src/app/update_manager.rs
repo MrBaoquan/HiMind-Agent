@@ -189,12 +189,14 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
         status.channel = default_channel();
         changed = true;
     }
-    if status.available_version == crate::VERSION
-        && !status.available_version.is_empty()
+    if !status.available_version.trim().is_empty()
         && status.status != "idle"
+        && crate::skill::resolver::compare_versions(status.available_version.trim(), crate::VERSION)
+            != std::cmp::Ordering::Greater
     {
-        // The update may have completed before the previous status write. Do
-        // not keep showing the just-installed version as an available update.
+        // Update status survives upgrades. Never present an equal or older
+        // target as pending: a manual install or a completed updater can leave
+        // a valid staged package behind while the running Agent is already newer.
         clear_release(&mut status);
         status.status = "idle".to_string();
         status.last_error.clear();
@@ -1014,6 +1016,51 @@ mod tests {
 
         assert_eq!(loaded.status, "idle");
         assert!(loaded.available_version.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_clears_a_ready_state_for_an_older_version_even_with_staged_payload() {
+        let root = temporary_test_root("obsolete-ready");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let state_path = root.join("agent-state.json");
+        let mut status = AgentUpdateStatus::default();
+        status.status = "ready".to_string();
+        status.available_version = "0.0.1".to_string();
+        status.release_id = "old-release".to_string();
+        status.package_type = "directory-zip".to_string();
+        let staged_package = staging.join("himind-agent-0.0.1.zip");
+        fs::write(&staged_package, b"zip").unwrap();
+        status.staged_package_path = staged_package.to_string_lossy().to_string();
+        for (file, slot) in [
+            ("himind-agent.exe", "agent"),
+            ("himind-agent-mcp.exe", "mcp"),
+            ("himind-agent-updater.exe", "updater"),
+            ("himind-agent-launcher.exe", "launcher"),
+        ] {
+            let path = staging.join(file);
+            fs::write(&path, b"binary").unwrap();
+            let value = path.to_string_lossy().to_string();
+            match slot {
+                "agent" => status.staged_agent_path = value,
+                "mcp" => status.staged_mcp_path = value,
+                "updater" => status.staged_updater_path = value,
+                _ => status.staged_launcher_path = value,
+            }
+        }
+        save(&state_path, &status).unwrap();
+
+        let loaded = load(&state_path).unwrap();
+        let persisted = serde_json::from_slice::<AgentUpdateStatus>(
+            &fs::read(status_path(&state_path)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.status, "idle");
+        assert!(loaded.available_version.is_empty());
+        assert!(loaded.staged_package_path.is_empty());
+        assert_eq!(persisted.status, "idle");
         let _ = fs::remove_dir_all(root);
     }
 

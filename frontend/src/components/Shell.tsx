@@ -11,6 +11,7 @@ import type { CurrentTaskStatus, DashboardIdentityStatus, PluginQuickAccessView 
 import { shortRunId, taskElapsedSeconds, taskTypeLabel } from '../pages/taskView';
 import { formatElapsedCn } from '../pages/workflowRunView';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 /**
  * 常驻运行条的数据：只取「第一条在跑的运行」做代表，数量用来提示后面还有。
@@ -146,12 +147,22 @@ function AppMenuBar({ currentPage, inboxCount, agentVersion, updateBusy, dashboa
     setOpenMenu(null);
     action();
   };
-  const handleTitleBarMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    const target = event.target;
-    if (target instanceof Element && target.closest('button, a, input, select, [role="menu"]')) return;
-    void invoke('window_start_dragging').catch(error => console.error('窗口拖拽失败', error));
-  };
+  useEffect(() => {
+    const menuBar = menuBarRef.current;
+    if (!menuBar) return;
+    const handleTitleBarMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('button, a, input, select, [role="menu"]')) return;
+      // Capture before Tauri's drag-region handler and WebView2's focus handoff.
+      // Use Tauri's official Window API so dragging follows the same native path
+      // as the framework drag-region implementation.
+      event.preventDefault();
+      void getCurrentWindow().startDragging().catch(error => console.error('窗口拖拽失败', error));
+    };
+    menuBar.addEventListener('mousedown', handleTitleBarMouseDown, { capture: true });
+    return () => menuBar.removeEventListener('mousedown', handleTitleBarMouseDown, { capture: true });
+  }, []);
   const handleTitleBarDoubleClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     const target = event.target;
     if (target instanceof Element && target.closest('button, a, input, select, [role="menu"]')) return;
@@ -170,7 +181,7 @@ function AppMenuBar({ currentPage, inboxCount, agentVersion, updateBusy, dashboa
   const visibleSections = visibleNavigationSections({ dashboardEnabled });
   return (
     <>
-      <div className="app-menu-bar" ref={menuBarRef} aria-label="应用菜单" data-tauri-drag-region onMouseDown={handleTitleBarMouseDown} onDoubleClick={handleTitleBarDoubleClick}>
+      <div className="app-menu-bar" ref={menuBarRef} aria-label="应用菜单" data-tauri-drag-region onDoubleClick={handleTitleBarDoubleClick}>
         <button
           type="button"
           className="app-sidebar-toggle"
@@ -181,7 +192,7 @@ function AppMenuBar({ currentPage, inboxCount, agentVersion, updateBusy, dashboa
         >
           {sidebarCollapsed ? <PanelLeftOpen size={16} aria-hidden="true" /> : <PanelLeftClose size={16} aria-hidden="true" />}
         </button>
-        <div className="app-menu-brand" aria-label="HiMind Agent">
+        <div className="app-menu-brand" aria-label="HiMind Agent" data-tauri-drag-region>
           <span className="app-menu-brand-mark"><span /></span>
           <strong>HiMind Agent</strong>
         </div>
@@ -229,7 +240,7 @@ function AppMenuBar({ currentPage, inboxCount, agentVersion, updateBusy, dashboa
             </div>
           ) : null}
         </div>
-        <div className="app-menu-drag-space" aria-hidden="true" />
+        <div className="app-menu-drag-space" aria-hidden="true" data-tauri-drag-region />
         <button
           type="button"
           className={`app-status-chip${busyLabel ? ' running' : ''}${currentPage === 'tasks' ? ' active' : ''}`}
