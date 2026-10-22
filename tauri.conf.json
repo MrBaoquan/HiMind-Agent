@@ -1,6 +1,6 @@
 {
   "productName": "HiMind Agent",
-  "version": "0.3.81",
+  "version": "0.3.82",
   "identifier": "com.himind.agent",
   "build": {
     "frontendDist": "frontend/dist"

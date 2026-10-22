@@ -5,15 +5,23 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn freeze_candidate(input: &Value) -> Result<Value, Box<dyn Error>> {
-    let workspace = input
-        .get("project_root")
-        .or_else(|| input.get("repository_root"))
-        .or_else(|| input.get("workspace_root"))
-        .or_else(|| input.get("source_root"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or("candidate freeze requires project_root, repository_root, workspace_root or source_root")?;
+    let workspace = [
+        "project_root",
+        "repository_root",
+        "workspace_root",
+        "source_root",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        input
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+    .ok_or(
+        "candidate freeze requires project_root, repository_root, workspace_root or source_root",
+    )?;
     let candidate_artifact_id = input
         .get("candidate_artifact_id")
         .and_then(Value::as_str)
@@ -253,7 +261,9 @@ mod tests {
         git(&root, &["commit", "--quiet", "-m", "initial"]);
 
         let result = freeze_candidate(&json!({
-            "project_root": root,
+            "project_root": "",
+            "workspace_root": root,
+            "source_root": "",
             "candidate_artifact_id": "candidate",
             "allow_dirty": false
         }))
