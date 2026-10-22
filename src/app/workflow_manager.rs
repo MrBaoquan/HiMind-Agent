@@ -279,6 +279,57 @@ pub(crate) fn install_local_archive(
     result
 }
 
+/// 把已确认的开发候选安装到独立开发槽位，不创建发布记录或提审记录。
+pub(crate) fn install_development_archive(
+    archive_path: &Path,
+    source_root: &Path,
+    extension_lock: Option<ExtensionLock>,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    let store = crate::workflow::WorkflowStore::open_default()?;
+    install_development_archive_into(&store, archive_path, source_root, extension_lock)
+}
+
+fn install_development_archive_into(
+    store: &crate::workflow::WorkflowStore,
+    archive_path: &Path,
+    source_root: &Path,
+    extension_lock: Option<ExtensionLock>,
+) -> Result<crate::workflow::InstalledWorkflow, Box<dyn Error>> {
+    let archive_path = archive_path.canonicalize()?;
+    let extension = archive_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "hmwf" | "zip") {
+        return Err("Workflow 制品必须使用 .hmwf 或 .zip 扩展名".into());
+    }
+    let metadata = fs::metadata(&archive_path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_WORKFLOW_ARCHIVE_BYTES {
+        return Err("Workflow 制品为空或超过 256 MiB 限制".into());
+    }
+    let artifact_sha256 = sha256_file(&archive_path)?;
+    let staging = crate::store::paths::agent_temp_dir()
+        .join(format!("himind-development-workflow-{}", unique_suffix()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    let result = (|| {
+        extract_archive(&archive_path, &staging)?;
+        let root = package_root(&staging)?;
+        let package = crate::workflow::load_from_directory(&root)?;
+        ensure_agent_version_supported(&package.min_agent_version)?;
+        store.install_development_from_directory(
+            &root,
+            source_root,
+            &artifact_sha256,
+            extension_lock,
+        )
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
 fn load_local_archive_lock(
     archive_path: &Path,
     package: &crate::workflow::WorkflowPackage,
@@ -707,6 +758,35 @@ mod tests {
             "unexpected error: {error}"
         );
 
+        let _ = fs::remove_dir_all(staging);
+    }
+
+    #[test]
+    fn development_archive_installs_without_a_release_record() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let staging = std::env::temp_dir().join(format!(
+            "himind-development-archive-test-{}",
+            unique_suffix()
+        ));
+        let package_root = staging.join("package");
+        copy_dir(&fixture, &package_root);
+        write_checksums(&package_root);
+        let archive_path = staging.join("candidate.hmwf");
+        crate::app::local_package::archive_directory(&package_root, &archive_path).unwrap();
+        let store = crate::workflow::WorkflowStore::new(staging.join("store"));
+
+        let installed =
+            install_development_archive_into(&store, &archive_path, &package_root, None).unwrap();
+        assert!(installed.development);
+        assert!(installed.stable_version.is_empty());
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        assert!(store
+            .remove_development(&installed.package.id)
+            .unwrap()
+            .is_none());
+        assert!(store.list().unwrap().is_empty());
         let _ = fs::remove_dir_all(staging);
     }
 

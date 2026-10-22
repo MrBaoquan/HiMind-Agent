@@ -463,6 +463,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_workflow_enabled,
             super::commands::rollback_workflow,
             super::commands::remove_workflow,
+            super::commands::remove_workflow_development,
             super::commands::get_extension_sources,
             super::commands::add_extension_source,
             super::commands::add_local_extension_source,

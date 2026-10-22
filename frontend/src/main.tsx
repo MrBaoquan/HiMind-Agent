@@ -1569,7 +1569,13 @@ function AgentApp() {
     if (deferCapabilityRefresh) {
       await refreshDevelopment();
     } else {
-      await Promise.all([refreshDevelopment(), refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
+      await Promise.all([
+        refreshDevelopment(),
+        refreshPlugins(),
+        refreshSkills(),
+        refreshWorkflowCenter(false, true),
+        refreshBuiltinAiToolContext(),
+      ]);
     }
   }
 
@@ -2203,6 +2209,11 @@ function AgentApp() {
       onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(false, true); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
       onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(false, true); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
       onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(false, true); }, '工作流已移除', '移除工作流失败')}
+      onRemoveDevelopment={(packageId) => run(async () => {
+        const restored = await agentApi.removeWorkflowDevelopment(packageId);
+        await refreshWorkflowCenter(false, true);
+        notify('success', restored ? '已恢复正式版' : '本地开发版已移除');
+      }, undefined, '恢复正式版失败')}
       onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
       onOpenExtensions={() => setPage('extensions')}
       onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
@@ -2439,6 +2450,11 @@ function AgentApp() {
         onInstallLocal={async () => { try { const picked = await agentApi.pickWorkflowArchive(); if (!picked.path) return; await agentApi.installLocalWorkflowArchive(picked.path); await refreshWorkflowCenter(false, true); notify('success', '本地工作流已安装'); } catch (error) { notify('error', formatError(error, '安装本地工作流失败')); } }}
         onSetEnabled={(packageId, enabled) => run(async () => { await agentApi.setWorkflowEnabled(packageId, enabled); await refreshWorkflowCenter(false, true); }, enabled ? '工作流已启用' : '工作流已停用', '更新工作流状态失败')}
         onRemove={(packageId) => run(async () => { await agentApi.removeWorkflow(packageId); await refreshWorkflowCenter(false, true); }, '工作流已移除', '移除工作流失败')}
+        onRemoveDevelopment={(packageId) => run(async () => {
+          const restored = await agentApi.removeWorkflowDevelopment(packageId);
+          await refreshWorkflowCenter(false, true);
+          notify('success', restored ? '已恢复正式版' : '本地开发版已移除');
+        }, undefined, '恢复正式版失败')}
         onPickDirectory={async () => { const result = await agentApi.pickWorkspaceDirectory(); return result.path || null; }}
         onOpenExtensions={() => setPage('extensions')}
         onScheduleWorkflow={(workflowId) => { setSchedulePresetTarget(workflowId); setPage('schedules'); }}
@@ -2521,7 +2537,12 @@ function AgentApp() {
             }
           }
           // 派生视图整批刷一次：逐项各刷一遍，在 28 项的批次里就是上百次全量刷新。
-          await Promise.all([refreshPlugins(), refreshSkills(), refreshBuiltinAiToolContext()]);
+          await Promise.all([
+            refreshPlugins(),
+            refreshSkills(),
+            refreshWorkflowCenter(false, true),
+            refreshBuiltinAiToolContext(),
+          ]);
           if (failures.length) {
             notify('error', `一键构建：${succeeded.size}/${projects.length} 成功，${failures.length} 项失败，${skipped.length} 项跳过`);
           } else {

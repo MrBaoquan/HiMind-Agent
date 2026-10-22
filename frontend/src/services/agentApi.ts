@@ -370,6 +370,8 @@ export type WorkflowCenterItem = {
     previous_version: string;
     package_digest: string;
     source: string;
+    development: boolean;
+    stable_version: string;
     installed_at: string;
     updated_at: string;
     view: WorkflowView | null;
@@ -2934,6 +2936,7 @@ export const agentApi = {
     setWorkflowEnabled: (packageId: string, enabled: boolean) => invoke<Record<string, unknown>>('set_workflow_enabled', { packageId, enabled }),
     rollbackWorkflow: (packageId: string) => invoke<Record<string, unknown>>('rollback_workflow', { packageId }),
     removeWorkflow: (packageId: string) => invoke<boolean>('remove_workflow', { packageId }),
+    removeWorkflowDevelopment: (packageId: string) => invoke<Record<string, unknown> | null>('remove_workflow_development', { packageId }),
     workflowRun: (runId: string) => invoke<WorkflowRunSnapshot>('get_workflow_run', { runId }),
     verifyWorkflowRun: (runId: string) => invoke<WorkflowRunVerification>('verify_workflow_run', { runId }),
     revealWorkflowArtifact: (runId: string, artifactId: string) => invoke<void>('reveal_workflow_artifact', { runId, artifactId }),

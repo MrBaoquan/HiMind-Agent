@@ -4352,12 +4352,19 @@ pub(crate) fn confirm_workflow_draft(
         .capability_gateway
         .list_capabilities(&InvocationContext::tauri())
         .map_err(|error| error.to_string())?;
-    crate::workflow::confirm_authoring_candidate_with_capabilities(
+    let draft = crate::workflow::confirm_authoring_candidate_with_capabilities(
         &workflow_id,
         &version,
         &capabilities,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    crate::app::workflow_manager::install_development_archive(
+        &draft.candidate_path,
+        &draft.source_root,
+        draft.lock.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(draft)
 }
 
 #[tauri::command]
@@ -6845,6 +6852,20 @@ pub(crate) async fn remove_workflow(package_id: String) -> Result<bool, String> 
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+pub(crate) async fn remove_workflow_development(
+    package_id: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let restored = crate::workflow::WorkflowStore::open_default()
+            .and_then(|store| store.remove_development(&package_id))
+            .map_err(|error| error.to_string())?;
+        serde_json::to_value(restored).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn decide_workflow_step(
     run_id: &str,
     step_id: &str,
@@ -7209,6 +7230,8 @@ fn workflow_center_snapshot(
                 "previous_version": item.previous_version,
                 "package_digest": item.package_digest,
                 "source": item.source,
+                "development": item.development,
+                "stable_version": item.stable_version,
                 "installed_at": item.installed_at,
                 "updated_at": item.updated_at,
                 "view": view,

@@ -13,6 +13,8 @@ use crate::extension_contracts::{ExtensionAssetKind, ExtensionLock};
 use crate::store::atomic_file;
 
 const INSTALLATION_FILE: &str = "installation.json";
+const DEVELOPMENT_DIR: &str = "development";
+const DEVELOPMENT_PACKAGE_DIR: &str = "package";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +33,10 @@ struct WorkflowInstallation {
     extension_lock: Option<ExtensionLock>,
     #[serde(default)]
     lock_required: bool,
+    /// 本地开发构建的活动副本。正式安装仍保存在 `versions/` 下；开发版只改变
+    /// 读取优先级，因此恢复正式版不需要重新下载。
+    #[serde(default)]
+    development: Option<WorkflowDevelopmentInstallation>,
     #[serde(default)]
     versions: BTreeMap<String, WorkflowVersionMetadata>,
     installed_at: String,
@@ -46,6 +52,21 @@ struct WorkflowVersionMetadata {
     extension_lock: Option<ExtensionLock>,
     #[serde(default)]
     lock_required: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct WorkflowDevelopmentInstallation {
+    version: String,
+    #[serde(default)]
+    previous_version: String,
+    package_digest: String,
+    source: String,
+    artifact_sha256: String,
+    #[serde(default)]
+    extension_lock: Option<ExtensionLock>,
+    installed_at: String,
+    updated_at: String,
 }
 
 impl WorkflowInstallation {
@@ -74,6 +95,10 @@ pub(crate) struct InstalledWorkflow {
     pub artifact_sha256: String,
     pub extension_lock: Option<ExtensionLock>,
     pub lock_required: bool,
+    /// 当前条目是否来自本地开发构建。
+    pub development: bool,
+    /// 同时保留的正式版本；开发版激活时用于展示“恢复正式版”。
+    pub stable_version: String,
     pub installed_at: String,
     pub updated_at: String,
 }
@@ -280,6 +305,7 @@ impl WorkflowStore {
             artifact_sha256,
             extension_lock,
             lock_required,
+            development: previous.as_ref().and_then(|item| item.development.clone()),
             versions,
             installed_at: previous
                 .as_ref()
@@ -288,6 +314,120 @@ impl WorkflowStore {
             updated_at: now,
         };
         self.save_installation(&installation)?;
+        self.installed_from(&installation)
+    }
+
+    /// 原子安装或更新本地开发构建。
+    ///
+    /// 开发版与正式版共享稳定 ID，但字节放在独立的 `development/package` 槽位。
+    /// 每次构建先完整复制并校验，再一次性切换目录和 installation.json；失败时恢复
+    /// 上一个开发版，正式版本目录不会被触碰。
+    pub(crate) fn install_development_from_directory(
+        &self,
+        source: &Path,
+        recorded_source: &Path,
+        artifact_sha256: &str,
+        extension_lock: Option<ExtensionLock>,
+    ) -> Result<InstalledWorkflow, Box<dyn Error>> {
+        let source = source.canonicalize()?;
+        validate_package_integrity(&source, false)?;
+        let package = load_from_directory(&source)?;
+        let digest = package_digest(&source)?;
+        let metadata = WorkflowVersionMetadata {
+            artifact_sha256: artifact_sha256.trim().to_string(),
+            extension_lock: extension_lock.clone(),
+            lock_required: extension_lock.is_some(),
+        };
+        validate_workflow_extension_lock(&package, &metadata)?;
+
+        let product_root = self.product_root(&package.id)?;
+        let development_root = product_root.join(DEVELOPMENT_DIR);
+        fs::create_dir_all(&development_root)?;
+        let _lock = atomic_file::lock(&product_root.join(INSTALLATION_FILE))?;
+        let current = development_root.join(DEVELOPMENT_PACKAGE_DIR);
+        let suffix = format!("{}-{}", std::process::id(), unique_suffix());
+        let staging = development_root.join(format!(".staging-{suffix}"));
+        let retired = development_root.join(format!(".retired-{suffix}"));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        copy_package(&source, &staging)?;
+        if let Err(error) = validate_package_integrity(&staging, false) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        let staged_digest = match package_digest(&staging) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
+        if staged_digest != digest {
+            let _ = fs::remove_dir_all(&staging);
+            return Err("workflow development package changed while it was being installed".into());
+        }
+
+        let had_current = current.exists();
+        if had_current {
+            fs::rename(&current, &retired)?;
+        }
+        if let Err(error) = fs::rename(&staging, &current) {
+            if had_current {
+                let _ = fs::rename(&retired, &current);
+            }
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error.into());
+        }
+
+        let now = timestamp();
+        let mut installation = match self.load_installation(&package.id)? {
+            Some(value) => value,
+            None => WorkflowInstallation {
+                package_id: package.id.clone(),
+                current_version: String::new(),
+                previous_version: String::new(),
+                enabled: true,
+                package_digest: String::new(),
+                source: String::new(),
+                artifact_sha256: String::new(),
+                extension_lock: None,
+                lock_required: false,
+                development: None,
+                versions: BTreeMap::new(),
+                installed_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        };
+        let previous_development = installation.development.clone();
+        let installed_at = previous_development
+            .as_ref()
+            .map(|value| value.installed_at.clone())
+            .unwrap_or_else(|| now.clone());
+        installation.development = Some(WorkflowDevelopmentInstallation {
+            version: package.version.clone(),
+            previous_version: previous_development
+                .as_ref()
+                .map(|value| value.version.clone())
+                .unwrap_or_default(),
+            package_digest: digest,
+            source: recorded_source.to_string_lossy().to_string(),
+            artifact_sha256: artifact_sha256.trim().to_string(),
+            extension_lock,
+            installed_at,
+            updated_at: now.clone(),
+        });
+        installation.updated_at = now;
+        if let Err(error) = self.save_installation(&installation) {
+            let _ = fs::remove_dir_all(&current);
+            if had_current {
+                let _ = fs::rename(&retired, &current);
+            }
+            return Err(error);
+        }
+        if had_current {
+            let _ = fs::remove_dir_all(&retired);
+        }
         self.installed_from(&installation)
     }
 
@@ -325,7 +465,11 @@ impl WorkflowStore {
                 Ok(item) => items.push(item),
                 Err(error) => issues.push(WorkflowLoadIssue {
                     package_id: installation.package_id.clone(),
-                    version: installation.current_version.clone(),
+                    version: installation
+                        .development
+                        .as_ref()
+                        .map(|development| development.version.clone())
+                        .unwrap_or_else(|| installation.current_version.clone()),
                     message: error.to_string(),
                 }),
             }
@@ -382,17 +526,11 @@ impl WorkflowStore {
         &self,
         package_id: &str,
     ) -> Result<InstalledWorkflow, Box<dyn Error>> {
-        let package = self
+        Ok(self
             .list()?
             .into_iter()
             .find(|item| item.package.id == package_id && item.enabled)
-            .ok_or_else(|| self.missing_package_error(package_id))?;
-        let installation = self
-            .load_installation(package_id)?
-            .ok_or("workflow package installation metadata is missing")?;
-        let metadata = installation.metadata_for_version(&package.package.version);
-        validate_workflow_extension_lock(&package.package, &metadata)?;
-        Ok(self.installed_from(&installation)?)
+            .ok_or_else(|| self.missing_package_error(package_id))?)
     }
 
     pub(crate) fn load_for_run_interaction(
@@ -416,14 +554,46 @@ impl WorkflowStore {
             .get("package_digest")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let package = if !version.trim().is_empty() {
-            self.load_version(package_id, version)?
+        let product_root = self.product_root(package_id)?;
+        let installation = self
+            .load_installation(package_id)?
+            .ok_or("workflow package installation metadata is missing")?;
+        let development_matches = installation
+            .development
+            .as_ref()
+            .is_some_and(|development| {
+                expected_digest.trim().is_empty()
+                    || expected_digest.eq_ignore_ascii_case(&development.package_digest)
+            });
+        let (package, metadata) = if development_matches {
+            let development = installation
+                .development
+                .as_ref()
+                .ok_or("workflow development metadata is missing")?;
+            let version_root = product_root
+                .join(DEVELOPMENT_DIR)
+                .join(DEVELOPMENT_PACKAGE_DIR);
+            validate_package_integrity(&version_root, false)?;
+            (
+                load_from_directory(&version_root)?,
+                WorkflowVersionMetadata {
+                    artifact_sha256: development.artifact_sha256.clone(),
+                    extension_lock: development.extension_lock.clone(),
+                    lock_required: development.extension_lock.is_some(),
+                },
+            )
         } else {
-            self.list()?
-                .into_iter()
-                .find(|item| item.package.id == package_id && item.enabled)
-                .map(|item| item.package)
-                .ok_or_else(|| self.missing_package_error(package_id))?
+            let package = if !version.trim().is_empty() {
+                self.load_version(package_id, version)?
+            } else {
+                self.list()?
+                    .into_iter()
+                    .find(|item| item.package.id == package_id && item.enabled)
+                    .map(|item| item.package)
+                    .ok_or_else(|| self.missing_package_error(package_id))?
+            };
+            let metadata = installation.metadata_for_version(&package.version);
+            (package, metadata)
         };
         if !expected_digest.trim().is_empty() {
             let actual_digest = package_digest(&package.source_root)?;
@@ -434,10 +604,6 @@ impl WorkflowStore {
                 .into());
             }
         }
-        let installation = self
-            .load_installation(package_id)?
-            .ok_or("workflow package installation metadata is missing")?;
-        let metadata = installation.metadata_for_version(&package.version);
         validate_workflow_extension_lock(&package, &metadata)?;
         Ok(package)
     }
@@ -449,11 +615,22 @@ impl WorkflowStore {
         if package.ui.entry.trim().is_empty() {
             return Ok(None);
         }
-        let path = self
-            .product_root(&package.id)?
-            .join("versions")
-            .join(safe_segment(&package.version)?)
-            .join(&package.ui.entry);
+        let product_root = self.product_root(&package.id)?;
+        let development_active = self
+            .load_installation(&package.id)?
+            .and_then(|installation| installation.development)
+            .is_some_and(|development| development.version == package.version);
+        let path = if development_active {
+            product_root
+                .join(DEVELOPMENT_DIR)
+                .join(DEVELOPMENT_PACKAGE_DIR)
+                .join(&package.ui.entry)
+        } else {
+            product_root
+                .join("versions")
+                .join(safe_segment(&package.version)?)
+                .join(&package.ui.entry)
+        };
         if !path.is_file() {
             return Ok(None);
         }
@@ -476,6 +653,41 @@ impl WorkflowStore {
         installation.updated_at = timestamp();
         self.save_installation(&installation)?;
         self.installed_from(&installation)
+    }
+
+    /// 移除当前开发版并恢复正式版；若没有正式版则卸载整个工作流。
+    pub(crate) fn remove_development(
+        &self,
+        package_id: &str,
+    ) -> Result<Option<InstalledWorkflow>, Box<dyn Error>> {
+        let root = self.product_root(package_id)?;
+        if !root.exists() {
+            return Ok(None);
+        }
+        let lock = atomic_file::lock(&root.join(INSTALLATION_FILE))?;
+        let mut installation = self
+            .load_installation(package_id)?
+            .ok_or("workflow package is not installed")?;
+        if installation.development.is_none() {
+            return self.installed_from(&installation).map(Some);
+        }
+        installation.development = None;
+        installation.updated_at = timestamp();
+        if installation.current_version.trim().is_empty() {
+            drop(lock);
+            fs::remove_dir_all(&root)?;
+            crate::app::extension_source::remove_provenance_at(
+                &self.extension_state_root,
+                "workflow",
+                package_id,
+            );
+            return Ok(None);
+        }
+        self.save_installation(&installation)?;
+        let restored = self.installed_from(&installation)?;
+        let _ = fs::remove_dir_all(root.join(DEVELOPMENT_DIR));
+        drop(lock);
+        Ok(Some(restored))
     }
 
     pub(crate) fn rollback(&self, package_id: &str) -> Result<InstalledWorkflow, Box<dyn Error>> {
@@ -517,8 +729,44 @@ impl WorkflowStore {
         &self,
         installation: &WorkflowInstallation,
     ) -> Result<InstalledWorkflow, Box<dyn Error>> {
-        let version_root = self
-            .product_root(&installation.package_id)?
+        let product_root = self.product_root(&installation.package_id)?;
+        if let Some(development) = installation.development.as_ref() {
+            if development.version.trim().is_empty() {
+                return Err("workflow development version is required".into());
+            }
+            let version_root = product_root
+                .join(DEVELOPMENT_DIR)
+                .join(DEVELOPMENT_PACKAGE_DIR);
+            validate_package_integrity(&version_root, false)?;
+            let package = load_from_directory(&version_root)?;
+            if package.id != installation.package_id || package.version != development.version {
+                return Err(
+                    "workflow development package identity does not match installation metadata"
+                        .into(),
+                );
+            }
+            let metadata = WorkflowVersionMetadata {
+                artifact_sha256: development.artifact_sha256.clone(),
+                extension_lock: development.extension_lock.clone(),
+                lock_required: development.extension_lock.is_some(),
+            };
+            validate_workflow_extension_lock(&package, &metadata)?;
+            return Ok(InstalledWorkflow {
+                package,
+                enabled: installation.enabled,
+                previous_version: development.previous_version.clone(),
+                package_digest: development.package_digest.clone(),
+                source: development.source.clone(),
+                artifact_sha256: metadata.artifact_sha256,
+                extension_lock: metadata.extension_lock,
+                lock_required: metadata.lock_required,
+                development: true,
+                stable_version: installation.current_version.clone(),
+                installed_at: development.installed_at.clone(),
+                updated_at: development.updated_at.clone(),
+            });
+        }
+        let version_root = product_root
             .join("versions")
             .join(safe_segment(&installation.current_version)?);
         validate_package_integrity(&version_root, false)?;
@@ -533,6 +781,8 @@ impl WorkflowStore {
             artifact_sha256: metadata.artifact_sha256,
             extension_lock: metadata.extension_lock,
             lock_required: metadata.lock_required,
+            development: false,
+            stable_version: installation.current_version.clone(),
             installed_at: installation.installed_at.clone(),
             updated_at: installation.updated_at.clone(),
         })
@@ -1055,6 +1305,72 @@ mod tests {
         assert!(!disabled.enabled);
         assert!(store.remove(&installed.package.id).unwrap());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn development_install_overrides_then_restores_the_release() {
+        let store = store();
+        let official = store.install_from_directory(&source_package()).unwrap();
+        let development_source = package_copy();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(development_source.join("workflow.json")).unwrap())
+                .unwrap();
+        manifest["name"] = serde_json::json!("本地开发版");
+        fs::write(
+            development_source.join("workflow.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let development = store
+            .install_development_from_directory(
+                &development_source,
+                &development_source,
+                &"d".repeat(64),
+                None,
+            )
+            .unwrap();
+        assert!(development.development);
+        assert_eq!(development.stable_version, official.package.version);
+        assert_eq!(development.package.name, "本地开发版");
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let restored = store
+            .remove_development(&official.package.id)
+            .unwrap()
+            .unwrap();
+        assert!(!restored.development);
+        assert_eq!(restored.package.version, official.package.version);
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(development_source);
+        let _ = fs::remove_dir_all(store.root);
+    }
+
+    #[test]
+    fn development_only_install_is_removed_without_a_release() {
+        let store = store();
+        let development_source = package_copy();
+        let development = store
+            .install_development_from_directory(
+                &development_source,
+                &development_source,
+                &"e".repeat(64),
+                None,
+            )
+            .unwrap();
+        assert!(development.development);
+        assert!(development.stable_version.is_empty());
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        assert!(store
+            .remove_development(&development.package.id)
+            .unwrap()
+            .is_none());
+        assert!(store.list().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(development_source);
+        let _ = fs::remove_dir_all(store.root);
     }
 
     fn lock_entry(id: &str) -> crate::app::extension_lock::ExtensionLockEntry {

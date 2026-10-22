@@ -70,6 +70,7 @@ type WorkflowsPageProps = {
   onInstallLocal: () => Promise<void>;
   onSetEnabled: (packageId: string, enabled: boolean) => Promise<void>;
   onRemove: (packageId: string) => Promise<void>;
+  onRemoveDevelopment: (packageId: string) => Promise<void>;
   onPickDirectory: () => Promise<string | null>;
   onOpenExtensions: () => void;
   /** 跳到平台级「定时计划」页，并预选该工作流作为定时目标。 */
@@ -510,7 +511,7 @@ function draftFromPreset(preset: WorkflowRunPreset | null, fields: WorkflowStart
   };
 }
 
-export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onPickDirectory, onOpenExtensions, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
+export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun, initialRunId = '', loading, error, onRefresh, onLoadRun, onVerify, onRevealArtifact, onApprove, onReject, onResume, onCancel, onStart, onPreflight, onSaveCredentialFile, onSaveCredentialSecret, onInstallLocal, onSetEnabled, onRemove, onRemoveDevelopment, onPickDirectory, onOpenExtensions, onScheduleWorkflow, onLoadPresets, onSavePreset, onDeletePreset }: WorkflowsPageProps) {
   // 工作流页把「有哪些能力」和「跑成什么样」拆成两个页签：进来先看到能跑的工作流，
   // 而不是一张运行记录表；有活动运行时才在列表上方补一条运行态。
   const [pageTab, setPageTab] = useState<'library' | 'runs'>(() => (mode === 'library' ? 'library' : initialRunId ? 'runs' : 'library'));
@@ -1597,7 +1598,10 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                   >
                     <span className="workflow-list-mark"><Workflow size={16} /></span>
                     <span>
-                      <strong>{item.package.name}</strong>
+                      <strong className="workflow-list-name">
+                        <span>{item.package.name}</span>
+                        {item.development ? <span className="workflow-dev-badge">开发</span> : null}
+                      </strong>
                       <small>v{item.package.version} · {item.package.steps.length} 步</small>
                       {live ? (
                         <small className="workflow-list-live" title={live.label ? `${live.label} · ${live.runId}` : live.runId}>
@@ -1817,6 +1821,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                     {/* 状态跟着标题走：与技能、插件详情同一个位置。 */}
                     <div className="workflow-title-line">
                       <h2>{selectedWorkflow.package.name}</h2>
+                      {selectedWorkflow.development ? <span className="workflow-dev-badge">开发</span> : null}
                       <Pill kind={selectedWorkflow.enabled ? 'success' : 'neutral'}>{selectedWorkflow.enabled ? '已启用' : '已停用'}</Pill>
                     </div>
                     <p>{selectedWorkflow.package.description}</p>
@@ -1846,6 +1851,20 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                   >
                     <Play size={14} />运行
                   </button>
+                  {selectedWorkflow.development && selectedWorkflow.stable_version ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      title={`停用本地开发版并恢复正式版 v${selectedWorkflow.stable_version}`}
+                      disabled={Boolean(packageBusy)}
+                      onClick={() => void performPackageAction(
+                        'remove-development',
+                        () => onRemoveDevelopment(selectedWorkflow.package.id),
+                      )}
+                    >
+                      <Repeat2 size={14} />恢复正式版
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="btn"
@@ -1880,6 +1899,9 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                 {/* 详情页只报当前版本：换版本是「市场」里的心智（在市场详情里看历史版本、选一个装上），
                     所以这里不提供回滚入口，避免同一个动作在两个地方各有一套说法。 */}
                 <div><span>版本</span><strong>v{selectedWorkflow.package.version}</strong></div>
+                {selectedWorkflow.development && selectedWorkflow.stable_version ? (
+                  <div><span>正式版</span><strong>v{selectedWorkflow.stable_version}</strong></div>
+                ) : null}
                 <div><span>步骤</span><strong>{selectedWorkflow.package.steps.length}</strong></div>
                 <div><span>支持环境</span><strong>{selectedWorkflow.package.supported_runtimes.length}</strong></div>
                 <div><span>输出文件</span><strong>{selectedWorkflow.package.artifacts.length}</strong></div>

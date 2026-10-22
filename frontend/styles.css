@@ -4448,6 +4448,21 @@ tr:last-child td { border-bottom: 0; }
 .workflow-title-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .workflow-title-line h2 { margin: 0; }
 
+/* 开发版本只用一个两字徽标，完整来源与正式版本放在详情里。 */
+.workflow-list-name { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.workflow-list-name > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-dev-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border: 1px solid #fde68a;
+  border-radius: 4px;
+  color: #b45309;
+  background: #fffbeb;
+  font-size: 10px;
+  line-height: 16px;
+  font-weight: 600;
+}
+
 /* 25. 停用态说清「为什么不能跑、去哪里开」。
    症状：详情头原来挂着「启用 + 开关」，和列表行尾那枚开关是同一个布尔值的两个控件，
    同屏左右并存（已删掉详情那一枚）。删掉之后，停用态的动作区只剩一枚灰掉的「运行」，
