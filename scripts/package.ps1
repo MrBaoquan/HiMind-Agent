@@ -149,7 +149,9 @@ Compress-Archive -Path (Join-Path $ReleaseDirectory "*") -DestinationPath $Archi
 # package: every entry is a file at the archive root so the updater can
 # validate and atomically replace only runtime files.
 $UpdateArchivePath = Join-Path $OutputRoot "himind-agent-update.zip"
-if (Test-Path -LiteralPath $UpdateArchivePath) { throw "Self-update archive already exists: $UpdateArchivePath" }
+# This archive is transient packaging output copied into the versioned release
+# directory. A previous failed/interrupted release must not block the next one.
+if (Test-Path -LiteralPath $UpdateArchivePath) { Remove-Item -LiteralPath $UpdateArchivePath -Force }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $UpdateArchive = [System.IO.Compression.ZipFile]::Open($UpdateArchivePath, [System.IO.Compression.ZipArchiveMode]::Create)
