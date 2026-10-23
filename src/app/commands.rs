@@ -1513,6 +1513,14 @@ pub(crate) fn open_dashboard_page(state: State<'_, AgentState>) -> Result<(), St
     open_url(&state.options.api_base()).map_err(|e| e.to_string())
 }
 
+/// Open an HTTP(S) link from the embedded DSH surface in the system browser.
+/// The iframe cannot call Tauri IPC directly, so the proxy bridge forwards only
+/// the narrow `himind:open-external` message and this command validates it again.
+#[tauri::command]
+pub(crate) fn open_external_url(url: String) -> Result<(), String> {
+    crate::app::system::open_external_url_once(&url)
+}
+
 #[tauri::command]
 pub(crate) async fn start_builtin_ai_session(
     state: State<'_, AgentState>,

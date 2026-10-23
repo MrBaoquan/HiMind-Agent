@@ -42,9 +42,9 @@ const badgeColumn = 'grid-template-columns: 30px minmax(0, 1fr) auto;';
 assert.ok(new RegExp(`\\.workflow-list > button \\{[^}]*${badgeColumn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(styles), '工作流列表的徽标列要保持 auto');
 assert.ok(new RegExp(`\\.schedule-list-item > button:first-child \\{[^}]*${badgeColumn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(styles), '定时计划列表的徽标列要保持 auto');
 
-// 「标签值」格子只能有一套排法：数值和单位被拆成上下两行时，读起来像断行而不是指标。
-assert.ok(/className="workflow-meta-grid workflow-graph-summary"/.test(workflowsPage), '执行结构必须复用 workflow-meta-grid 的排版');
-assert.ok(!/\.workflow-graph-summary strong \{[^}]*display: block/.test(styles), '执行结构不能再自己定义「数值独占一行」');
+// 执行结构只保留一条统一过程轨道；图摘要和步骤摘要都不能再另起一套列表。
+assert.ok(/<WorkflowProcessRail nodes=\{selectedWorkflowGraph\?\.nodes \|\| \[\]\} mode="definition"/.test(workflowsPage), '执行结构必须走统一过程轨道');
+assert.ok(!/workflow-graph-summary/.test(workflowsPage), '定义页不能再回到重复的图摘要');
 
 // 默认启用是常态：插件行不能再为每一行多渲染一行「已启用」。
 assert.ok(!/已启用' : '已停用/.test(pluginsPage), '插件列表行不能重复渲染默认的「已启用」文案');

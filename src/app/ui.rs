@@ -402,6 +402,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::save_local_login,
             super::commands::logout_local_login,
             super::commands::open_dashboard_page,
+            super::commands::open_external_url,
             super::workbench_connections::open_workbench_agent_binding_page,
             super::commands::open_inner_admin_page,
             super::commands::open_agent_directory,
@@ -766,6 +767,16 @@ fn create_main_window(
         .resizable(true)
         .center()
         .data_directory(data_directory.to_path_buf())
+        // DSH renders links with target="_blank" inside its iframe. The injected
+        // bridge and this native hook can both observe the same click, so both
+        // go through one short-lived deduplicator before handing the URL to the
+        // system browser. Embedded popups are always denied.
+        .on_new_window(|url, _features| {
+            if matches!(url.scheme(), "http" | "https") {
+                let _ = crate::app::system::open_external_url_once(url.as_str());
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
         .build()
 }
 

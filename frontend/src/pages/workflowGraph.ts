@@ -9,6 +9,8 @@ export type WorkflowGraphNode = {
   stepId: string;
   title: string;
   kind: string;
+  capabilityId: string;
+  executionMode: string;
   approvalRequired: boolean;
   onFailure: string;
   depth: number;
@@ -62,6 +64,8 @@ export function buildWorkflowGraph(pkg: WorkflowPackage): WorkflowGraph {
         stepId: step.id,
         title: step.title || step.id,
         kind: step.kind || 'provider_defined',
+        capabilityId: step.capability_id || '',
+        executionMode: step.execution_mode || '',
         approvalRequired: Boolean(step.approval_required),
         onFailure: step.on_failure || 'fail',
         depth,

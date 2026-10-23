@@ -3,6 +3,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { ArrowDown, ArrowLeft, Boxes, CalendarClock, CheckCircle2, ChevronRight, CircleAlert, Clock3, FileText, FolderOpen, GitBranch, KeyRound, MessageCircle, Pin, Play, Plus, RefreshCw, Repeat2, Search, ShieldCheck, Store, Trash2, Upload, Workflow, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { ExtensionKindMark } from '../components/ExtensionKindMark';
+import { WorkflowProcessRail } from '../components/WorkflowProcessRail';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
 import type { AcpRuntimeProfile, WorkflowCenterSnapshot, WorkflowLocalRun, WorkflowPreflight, WorkflowRunPreset, WorkflowRunPresetInput, WorkflowRunSnapshot, WorkflowRunVerification, WorkflowStep } from '../services/agentApi';
 import { formatStamp } from '../timeFormat';
@@ -27,7 +28,6 @@ import {
   formatElapsedCn,
   formatIdleCn,
   toEpochSeconds,
-  type RunStepState,
 } from './workflowRunView';
 import { buildWorkflowGraph } from './workflowGraph';
 import { shortRunId } from './taskView';
@@ -107,6 +107,17 @@ function statusLabel(status: string) {
   } as Record<string, string>)[status] || status;
 }
 
+/** 顶部摘要只回答“现在处于什么状态”；当前步骤由过程轨道高亮，不在页头重复一次标题。 */
+function runStatusSummary(status: string, idleSeconds: number) {
+  if (status === 'queued') return '已排队，等待可用运行环境';
+  if (status === 'running') return idleSeconds >= 45 ? '运行中 · 最近一次事件已等待较久' : '运行中';
+  if (status === 'waiting') return '等待处理，完成后会继续运行';
+  if (status === 'succeeded') return '全部步骤已完成';
+  if (status === 'failed') return '运行失败，后续步骤已停止';
+  if (status === 'canceled') return '运行已取消';
+  return statusLabel(status);
+}
+
 function formatDuration(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '--';
   if (seconds < 60) return `${Math.round(seconds)} 秒`;
@@ -149,41 +160,8 @@ function executionPolicyLabel(policy?: string) {
   return ({ strict: '严格执行', segmented: '分段执行', flexible: '灵活执行' } as Record<string, string>)[policy || 'strict'] || '自定义策略';
 }
 
-function stepKindLabel(kind?: string) {
-  return ({ capability: '自动步骤', runtime: 'AI 步骤', manual: '人工步骤', loop: '循环步骤', provider_defined: '扩展步骤' } as Record<string, string>)[kind || ''] || '工作流步骤';
-}
-
 function riskLevelLabel(risk?: string) {
   return ({ R1: '低', R2: '中', R3: '高', R4: '最高' } as Record<string, string>)[risk || 'R3'] || '高';
-}
-
-// 时间线用的是归一化后的步骤状态，标签与配色都从这里出，避免各处各写一份。
-function runStepStateLabel(state: RunStepState) {
-  return ({
-    done: '已完成',
-    active: '进行中',
-    waiting: '等待处理',
-    failed: '失败',
-    canceled: '已取消',
-    skipped: '已跳过',
-    pending: '待执行',
-  } as Record<RunStepState, string>)[state] || state;
-}
-
-function runStepStateKind(state: RunStepState): 'success' | 'warn' | 'danger' | 'neutral' {
-  if (state === 'done') return 'success';
-  if (state === 'failed' || state === 'canceled') return 'danger';
-  if (state === 'active' || state === 'waiting') return 'warn';
-  return 'neutral';
-}
-
-function runElapsedSeconds(run: WorkflowLocalRun) {
-  const created = Number(run.created_at);
-  const updated = Number(run.updated_at);
-  if (Number.isFinite(created) && Number.isFinite(updated) && updated >= created) return updated - created;
-  const start = new Date(run.created_at).getTime();
-  const end = new Date(run.updated_at).getTime();
-  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? (end - start) / 1000 : 0;
 }
 
 function currentFeedbackQuestion(snapshot: WorkflowRunSnapshot) {
@@ -1659,7 +1637,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                   <div>
                     <span>{runDetail.workflow?.package.id || runDetail.run.run_id}</span>
                     <h2>{runDetail.workflow?.package.name || '工作流运行'}</h2>
-                    <p>{timeline?.headline || statusLabel(runDetail.run.status)}</p>
+                    <p>{runStatusSummary(runDetail.run.status, timeline?.idleSeconds || 0)}</p>
                   </div>
                   <div className="workflow-run-hero-side">
                     {/* 状态点只留一套：状态胶囊自带圆点，这里不再另加跳动圆点——
@@ -1690,9 +1668,6 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                         </strong>
                       </div>
                       <div><span>运行号</span><strong>{shortRunId(runDetail.run.run_id)}</strong></div>
-                    </div>
-                    <div className={`workflow-run-progress${!timeline.active && timeline.percent === 100 ? ' is-done' : ''}`} role="progressbar" aria-valuenow={timeline.percent} aria-valuemin={0} aria-valuemax={100} aria-label="步骤完成度">
-                      <i style={{ width: `${timeline.percent}%` }} />
                     </div>
                     {timeline.active && timeline.idleSeconds >= 45 ? (
                       <p className="workflow-run-live-note idle" role="status">
@@ -1726,13 +1701,11 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                   </section>
                 ) : waitingForExternal || waitingForOtherInteraction ? (
                   <section className="workflow-action-card external-wait">
-                    <div><Clock3 size={18} /><div><strong>{waitingRequest?.title || '等待外部状态或人工操作'}</strong><span>{waitingRequest?.description || '这里暂时没有可执行操作，请查看任务动态和外部系统状态。'}</span><small>{waitingRequest?.required_action ? interactionActionLabel(waitingRequest.required_action) : '检查运行状态'}</small>{waitingRequest?.schema ? <details className="workflow-interaction-schema"><summary>查看提交格式</summary><pre>{JSON.stringify(waitingRequest.schema, null, 2)}</pre></details> : null}</div></div>
+                    <div><Clock3 size={18} /><div><strong>{waitingRequest?.title || '等待外部状态或人工操作'}</strong><span>{waitingRequest?.description || '这里暂时没有可执行操作，请查看对应步骤事件或外部系统状态。'}</span><small>{waitingRequest?.required_action ? interactionActionLabel(waitingRequest.required_action) : '检查运行状态'}</small>{waitingRequest?.schema ? <details className="workflow-interaction-schema"><summary>查看提交格式</summary><pre>{JSON.stringify(waitingRequest.schema, null, 2)}</pre></details> : null}</div></div>
                     <div className="workflow-run-actions"><button type="button" className="btn" onClick={() => void openRun(runDetail.run.run_id)}><RefreshCw size={14} />查看最新状态</button></div>
                   </section>
                 ) : null}
                 <div className="workflow-run-context">
-                  <div><span>工作流</span><strong>{runDetail.workflow?.package.name || selectedWorkflow?.package.name || '未记录'}</strong></div>
-                  <div><span>当前步骤</span><strong>{currentStepDefinition?.title || runDetail.run.current_step_id || '已完成'}</strong></div>
                   <div><span>运行环境</span><strong>{runtimeProviderLabel(runDetail.run.runtime_provider, runtimeProfiles)}</strong></div>
                   <div>
                     <span>AI 模型</span>
@@ -1744,46 +1717,12 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                           : '该运行未调用 AI'}
                     </strong>
                   </div>
-                  <div><span>耗时</span><strong>{formatElapsedCn(timeline?.elapsedSeconds ?? runElapsedSeconds(runDetail.run))}</strong></div>
+                  <div><span>工作区</span><strong title={runDetail.run.workspace_ref || ''}>{runDetail.run.workspace_ref || '本机默认工作区'}</strong></div>
                 </div>
                 {runDetail.run.error ? <div className="workflow-inline-error">{runDetail.run.error}</div> : null}
-                <section className="workflow-section">
-                  <div className="workflow-section-title"><strong>执行步骤</strong><span>{timeline ? `${timeline.completed}/${timeline.total} 完成` : `${runDetail.run.steps.length} 步`}</span></div>
-                  <div className="workflow-run-step-timeline">
-                    {(timeline?.steps || []).map(step => (
-                      <div key={step.id} className={`${step.state}${step.state === 'active' ? ' is-running' : ''}`}>
-                        <i />
-                        <span>
-                          <strong>{step.title}</strong>
-                          <small>
-                            {[stepKindLabel(step.kind || step.executionMode), step.durationSeconds ? `耗时 ${formatElapsedCn(step.durationSeconds)}` : '', step.attempt > 1 ? `第 ${step.attempt} 次尝试` : ''].filter(Boolean).join(' · ')}
-                          </small>
-                          {step.error ? <small className="workflow-run-step-error">{step.error}</small> : null}
-                          {step.artifacts.length ? (
-                            <span className="workflow-run-step-artifacts">
-                              {step.artifacts.map(artifact => <b key={artifact.id}>{artifact.name}</b>)}
-                            </span>
-                          ) : null}
-                        </span>
-                        <Pill kind={runStepStateKind(step.state)}>{step.running ? (step.state === 'waiting' ? '等待处理' : `进行中 ${formatElapsedCn(step.durationSeconds)}`) : runStepStateLabel(step.state)}</Pill>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-                <section className="workflow-section">
-                  <div className="workflow-section-title"><strong>任务动态</strong><span>{activity.length ? `${activity.length} 条` : '等待事件'}</span></div>
-                  <div className="workflow-run-activity">
-                    {activity.map(item => (
-                      <div key={item.key} className={item.kind}>
-                        <time>{item.clock}</time>
-                        <span>
-                          <strong>{item.text}</strong>
-                          {item.detail ? <small>{item.detail}</small> : null}
-                        </span>
-                      </div>
-                    ))}
-                    {!activity.length ? <div className="workflow-start-empty">还没有事件。</div> : null}
-                  </div>
+                <section className="workflow-section workflow-process-section">
+                  <div className="workflow-section-title"><strong>执行过程</strong><span>事件可按步骤展开</span></div>
+                  <WorkflowProcessRail nodes={timeline?.steps || []} mode="run" activities={activity} />
                 </section>
                 <section className="workflow-section">
                   <div className="workflow-section-title"><strong>输出文件</strong><span>{runDetail.run.artifacts.length}</span></div>
@@ -1978,55 +1917,18 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                   </div>
                 )}
               </div>
-              <div className="workflow-section workflow-graph-section">
+              <div className="workflow-section workflow-process-section">
                 <div className="workflow-section-title">
-                  <strong><GitBranch size={15} />执行结构</strong>
-                  <span>{selectedWorkflowGraph?.nodes.length || 0} 个步骤 · {executionPolicyLabel(selectedWorkflow.package.execution_policy)}</span>
+                  <strong>执行过程</strong>
+                  <span>{selectedWorkflowGraph?.nodes.length || 0} 步 · {executionPolicyLabel(selectedWorkflow.package.execution_policy)}</span>
                 </div>
-                {/* 与上面的「运行指标」用同一套格子：标签在上、数值在下，数值和单位不会被拆成两行。 */}
-                <div className="workflow-meta-grid workflow-graph-summary">
-                  <div><span>入口</span><strong>{selectedWorkflowGraph?.entrypoints.length || 0}</strong></div>
-                  <div><span>出口</span><strong>{selectedWorkflowGraph?.exits.length || 0}</strong></div>
-                  <div><span>循环</span><strong>{selectedWorkflowGraph?.nodes.filter(node => node.loop).length || 0}</strong></div>
-                  <div><span>输出文件</span><strong>{selectedWorkflow.package.artifacts.length}</strong></div>
-                </div>
-                <div className="workflow-graph-list">
-                  {(selectedWorkflowGraph?.nodes || []).map((node, index) => (
-                    <div key={node.id} className="workflow-graph-node" style={{ marginLeft: `${Math.min(node.depth, 3) * 18}px` }}>
-                      <span className="workflow-graph-node-index">{String(index + 1).padStart(2, '0')}</span>
-                      <span className="workflow-graph-node-main">
-                        <strong>{node.title}</strong>
-                        <small>{stepKindLabel(node.kind)}{node.dependsOn.length ? ` · 前置：${node.dependsOn.map(id => id.split('/').pop()).join('、')}` : ' · 起始步骤'}{node.downstream.length ? ` · 后续 ${node.downstream.length}` : ''}{node.onFailure === 'continue' ? ' · 失败后继续' : ''}</small>
-                        <span className="workflow-graph-tags">
-                          {node.loop ? <b><Repeat2 size={11} />最多 {node.loop.maxIterations} 轮{node.loop.pauseForFeedback ? ' · 每轮可反馈' : ''}</b> : null}
-                          {node.condition ? <b><GitBranch size={11} />条件：{node.condition}</b> : null}
-                          {node.failureCondition ? <b><CircleAlert size={11} />失败条件：{node.failureCondition}</b> : null}
-                          {node.inputArtifacts.length ? <b><Boxes size={11} />读取：{node.inputArtifacts.join('、')}</b> : null}
-                          {node.producedArtifacts.length ? <b><ArrowDown size={11} />产出：{node.producedArtifacts.join('、')}</b> : null}
-                        </span>
-                      </span>
-                      {node.approvalRequired ? <ShieldCheck size={14} aria-label="需要审批" /> : null}
-                    </div>
-                  ))}
-                </div>
+                <WorkflowProcessRail nodes={selectedWorkflowGraph?.nodes || []} mode="definition" />
                 {(selectedWorkflowGraph?.entrypoints.length || selectedWorkflowGraph?.exits.length) ? (
                   <div className="workflow-graph-endpoints">
                     {(selectedWorkflowGraph?.entrypoints || []).map(endpoint => <span key={`entry:${endpoint.id}`}><strong>入口</strong>{endpoint.label} · {endpoint.atStep}</span>)}
                     {(selectedWorkflowGraph?.exits || []).map(endpoint => <span key={`exit:${endpoint.id}`}><strong>出口</strong>{endpoint.label} · {endpoint.atStep}</span>)}
                   </div>
                 ) : null}
-              </div>
-              <div className="workflow-section">
-                <div className="workflow-section-title"><strong>步骤摘要</strong><span>{selectedWorkflow.package.steps.length} 步</span></div>
-                <div className="workflow-step-list">
-                  {selectedWorkflow.package.steps.map((step, index) => (
-                    <div key={step.id}>
-                      <span className="workflow-step-index">{String(index + 1).padStart(2, '0')}</span>
-                    <span><strong>{step.title}</strong><small>{stepKindLabel(step.kind)}</small></span>
-                      {step.approval_required ? <ShieldCheck size={15} aria-label="需要审批" /> : null}
-                    </div>
-                  ))}
-                </div>
               </div>
               <div className="workflow-section">
                 <div className="workflow-section-title"><strong>输出文件</strong><span>{selectedWorkflow.package.artifacts.length} 类</span></div>

@@ -33,6 +33,71 @@ const BROWSER_HOST: &str = "localhost";
 const BROWSER_PORT_BASE: u16 = 21_600;
 const BROWSER_PORT_SPAN: u16 = 1_200;
 const RUNTIME_REFERRER_POLICY: &str = r#"<meta name="referrer" content="same-origin">"#;
+// WebView2 131 parses `dsh-resource://file/...` as an opaque URL whose
+// hostname is empty. DSH then cannot map the address to its `file` resource
+// provider, so file links and the document preview report "文件资源服务不可用".
+// Restore the hostname/host semantics the DSH client expects without changing
+// URL behavior for normal HTTP(S) addresses.
+const RUNTIME_RESOURCE_URL_COMPAT: &str = r#"<script data-himind-resource-url-compat>
+(() => {
+  if (window.__himindDshResourceUrlCompat) return;
+  const hostname = Object.getOwnPropertyDescriptor(URL.prototype, 'hostname');
+  const host = Object.getOwnPropertyDescriptor(URL.prototype, 'host');
+  const resourceHost = (url) => {
+    if (url.protocol !== 'dsh-resource:') return '';
+    const match = /^dsh-resource:\/\/([^/?#]+)/i.exec(String(url.href));
+    return match ? match[1].toLowerCase() : '';
+  };
+  try {
+    if (hostname && hostname.get) {
+      Object.defineProperty(URL.prototype, 'hostname', {
+        configurable: true,
+        enumerable: hostname.enumerable,
+        get() {
+          return hostname.get.call(this) || resourceHost(this);
+        },
+      });
+    }
+    if (host && host.get) {
+      Object.defineProperty(URL.prototype, 'host', {
+        configurable: true,
+        enumerable: host.enumerable,
+        get() {
+          return host.get.call(this) || resourceHost(this);
+        },
+      });
+    }
+    window.__himindDshResourceUrlCompat = 'dsh-resource-host-v1';
+  } catch (error) {
+    console.warn('HiMind AI resource URL compatibility was not installed', error);
+  }
+})();
+</script>"#;
+// DSH renders chat links with target="_blank". WebView2 does not surface those
+// requests reliably from inside the embedded DSH iframe, so ask the Agent shell
+// to open HTTP(S) links through the system browser. Browser mode is untouched:
+// when DSH is the top-level document, parent === self and the bridge exits.
+const RUNTIME_EXTERNAL_LINK_BRIDGE: &str = r#"<script data-himind-external-link-bridge>
+(() => {
+  if (window.parent === window || window.__himindExternalLinkBridge) return;
+  window.__himindExternalLinkBridge = 'post-message-v1';
+  document.addEventListener('click', (event) => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+    if (!anchor || anchor.hasAttribute('download')) return;
+    let url;
+    try {
+      url = new URL(anchor.href, location.href);
+    } catch {
+      return;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+    if (anchor.target !== '_blank' && url.origin === location.origin) return;
+    event.preventDefault();
+    window.parent.postMessage({ type: 'himind:open-external', url: url.href }, '*');
+  }, true);
+})();
+</script>"#;
 // DSH's model selector prefers the optional display name over the provider
 // and model id. Keep the user-facing label tied to the real catalog id so a
 // managed HiMind provider cannot turn `deepseek-v4-flash` into `HiMind-v4`.
@@ -1510,6 +1575,12 @@ fn customize_runtime_html(html: &str, rail_view_preset: Option<&str>) -> String 
             inject_head_snippet(&mut html, preset);
         }
     }
+    if !html.contains("data-himind-resource-url-compat") {
+        inject_head_snippet(&mut html, RUNTIME_RESOURCE_URL_COMPAT);
+    }
+    if !html.contains("data-himind-external-link-bridge") {
+        inject_head_snippet(&mut html, RUNTIME_EXTERNAL_LINK_BRIDGE);
+    }
     if !html.contains("data-himind-runtime-auth") {
         let bridge = format!("{RUNTIME_REFERRER_POLICY}{RUNTIME_AUTH_BRIDGE}");
         inject_head_snippet(&mut html, &bridge);
@@ -2116,6 +2187,41 @@ mod tests {
         );
         assert!(customized.contains("X-HiMind-Session"));
         assert!(customized.contains("NativeWebSocket"));
+    }
+
+    #[test]
+    fn runtime_resource_url_compat_is_injected_before_runtime_scripts() {
+        let html =
+            "<html><head><script>window.__ModuleLoader__={}</script></head><body></body></html>";
+        let customized = customize_runtime_html(html, None);
+
+        assert!(customized.contains("data-himind-resource-url-compat"));
+        assert!(customized.contains("__himindDshResourceUrlCompat"));
+        assert!(customized.contains("dsh-resource-host-v1"));
+        assert!(
+            customized.find("data-himind-resource-url-compat").unwrap()
+                < customized.find("window.__ModuleLoader__").unwrap(),
+            "the resource URL compatibility bridge must run before DSH module code"
+        );
+        // Normal HTTP(S) URLs keep their native hostname/host behavior.
+        assert!(customized.contains("hostname.get.call(this) || resourceHost(this)"));
+        assert!(customized.contains("host.get.call(this) || resourceHost(this)"));
+    }
+
+    #[test]
+    fn runtime_external_link_bridge_only_runs_inside_the_embedded_iframe() {
+        let html =
+            "<html><head><script>window.__ModuleLoader__={}</script></head><body></body></html>";
+        let customized = customize_runtime_html(html, None);
+
+        assert!(customized.contains("data-himind-external-link-bridge"));
+        assert!(customized.contains("window.parent === window"));
+        assert!(customized.contains("himind:open-external"));
+        assert!(
+            customized.find("data-himind-external-link-bridge").unwrap()
+                < customized.find("window.__ModuleLoader__").unwrap(),
+            "the external-link bridge must run before DSH module code"
+        );
     }
 
     #[test]

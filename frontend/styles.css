@@ -424,6 +424,76 @@
 .workflow-run-activity > div.question, .workflow-run-activity > div.approval { border-color: var(--warning-border); background: #fffbeb; }
 .workflow-run-activity > div.interaction { border-color: var(--border); background: var(--surface-muted, #f8fafc); }
 
+/* 过程轨道：定义态和运行态共用一套节点，运行态只叠加状态与事件。 */
+.workflow-process-rail { position: relative; display: grid; gap: 6px; min-width: 0; }
+.workflow-process-node { position: relative; min-width: 0; margin-left: calc(var(--process-depth, 0) * 18px); }
+.workflow-process-node:not(:last-child)::before {
+  position: absolute;
+  left: 19px;
+  top: 38px;
+  bottom: -6px;
+  width: 1px;
+  content: "";
+  background: var(--border);
+}
+.workflow-process-node-card {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) max-content;
+  align-items: start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+}
+.workflow-process-node.is-active .workflow-process-node-card { border-color: var(--primary-border); background: var(--primary-soft); }
+.workflow-process-node.is-waiting .workflow-process-node-card { border-color: var(--warning-border); background: #fffbeb; }
+.workflow-process-node.is-failed .workflow-process-node-card { border-color: var(--danger-border); background: #fef2f2; }
+.workflow-process-node-state { width: 20px; height: 20px; display: grid; place-items: center; color: var(--text-muted); }
+.workflow-process-node-state.is-done { color: var(--success); }
+.workflow-process-node-state.is-active { color: var(--primary); }
+.workflow-process-node-state.is-waiting { color: var(--warning); }
+.workflow-process-node-state.is-failed, .workflow-process-node-state.is-canceled { color: var(--danger); }
+.workflow-process-node-state.is-spinning svg { animation: spin 1s linear infinite; }
+.workflow-process-node-main { min-width: 0; display: grid; gap: 3px; }
+.workflow-process-node-title { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.workflow-process-node-title strong { min-width: 0; overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-process-node-title svg { flex: 0 0 auto; color: var(--warning); }
+.workflow-process-node-index { flex: 0 0 auto; color: var(--text-muted); font-family: Consolas, monospace; font-size: 10px; font-weight: 500; }
+.workflow-process-node-meta, .workflow-process-node-error, .workflow-process-latest-event { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.workflow-process-node-error { color: #b91c1c; }
+.workflow-process-node-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.workflow-process-node-tags b {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: #4b5563;
+  background: #f9fafb;
+  font-size: 10px;
+  font-weight: 500;
+}
+.workflow-process-latest-event { display: flex; align-items: flex-start; gap: 7px; min-width: 0; }
+.workflow-process-latest-event time { flex: 0 0 auto; font-family: Consolas, monospace; font-size: 10px; }
+.workflow-process-latest-event span { min-width: 0; overflow-wrap: anywhere; }
+.workflow-process-events { margin: 5px 0 0 29px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-muted, #f8fafc); }
+.workflow-process-events summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; color: var(--text-muted); font-size: 11px; cursor: pointer; list-style: none; }
+.workflow-process-events summary::-webkit-details-marker { display: none; }
+.workflow-process-events summary svg { transition: transform 160ms ease; }
+.workflow-process-events[open] summary svg { transform: rotate(180deg); }
+.workflow-process-event-list { display: grid; gap: 4px; max-height: 240px; padding: 0 8px 8px; overflow-y: auto; overscroll-behavior: contain; }
+.workflow-process-event-list > div { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px; padding: 6px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
+.workflow-process-event-list time { color: var(--text-muted); font-family: Consolas, monospace; font-size: 10px; }
+.workflow-process-event-list span { min-width: 0; display: grid; gap: 2px; }
+.workflow-process-event-list strong { font-size: 11px; font-weight: 600; }
+.workflow-process-event-list small { color: var(--text-muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.workflow-process-event-list > div.error { border-color: var(--danger-border); background: #fef2f2; }
+.workflow-process-event-list > div.error strong, .workflow-process-event-list > div.error small { color: #b91c1c; }
+
 /* 启动回执：点下启动运行后弹窗先给出受理结果，再交接给实时视图。 */
 .workflow-start-receipt { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; padding: 11px; border: 1px solid var(--success-border); border-radius: 7px; background: var(--success-soft); }
 .workflow-start-receipt { animation: receipt-in 220ms ease-out; }
@@ -795,6 +865,10 @@
   .workflow-run-context { grid-template-columns: 1fr; }
   .workflow-run-context > div { border-right: 0; border-bottom: 1px solid var(--border); }
   .workflow-run-context > div:last-child { border-bottom: 0; }
+  .workflow-process-node { margin-left: calc(var(--process-depth, 0) * 10px); }
+  .workflow-process-node-card { grid-template-columns: 20px minmax(0, 1fr); }
+  .workflow-process-node-card > .pill { grid-column: 2; justify-self: start; }
+  .workflow-process-events { margin-left: 10px; }
   .workflow-preflight-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .workflow-preflight-credential { grid-template-columns: minmax(0, 1fr); }
   .workflow-preflight-secret input { width: auto; flex: 1; }

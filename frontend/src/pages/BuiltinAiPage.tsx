@@ -53,6 +53,7 @@ export function BuiltinAiPage({
   const [frameKey, setFrameKey] = useState(0);
   const [frameStalled, setFrameStalled] = useState(false);
   const frameRetry = useRef(0);
+  const sessionFrameRef = useRef<HTMLIFrameElement | null>(null);
   const [connectionError, setConnectionError] = useState('');
   // 结论之外的原始错误。之前这一层被「服务暂时不可用」盖掉，恰恰是
   // 「会话没有启动」最难排查的地方，所以单独留一个字段给用户展开。
@@ -85,6 +86,26 @@ export function BuiltinAiPage({
     normalizeWorkspacePath(instructionContext.workspace_root) === normalizeWorkspacePath(instructionRoot)
     ? instructionContext.selected.length
     : null;
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== sessionFrameRef.current?.contentWindow) return;
+      const data = event.data as { type?: unknown; url?: unknown } | null;
+      if (!data || data.type !== 'himind:open-external' || typeof data.url !== 'string') return;
+      let target: URL;
+      try {
+        target = new URL(data.url);
+      } catch {
+        return;
+      }
+      if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
+      void agentApi.openExternalUrl(target.toString()).catch(error => {
+        setSessionNotice(`无法打开链接：${errorDetail(error)}`);
+      });
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   useEffect(() => {
     if (!instructionRoot) {
@@ -404,6 +425,7 @@ export function BuiltinAiPage({
               ) : null}
               <iframe
                 key={frameKey}
+                ref={sessionFrameRef}
                 className={frameLoaded ? 'loaded' : ''}
                 title="HiMind AI 会话"
                 src={sessionUrl}

@@ -2888,6 +2888,7 @@ export const agentApi = {
     listBuiltinAiSessions: () => invoke<BuiltinAiSessionSnapshot[]>('list_builtin_ai_sessions'),
     stopBuiltinAiSession: (workspaceRoot: string) => invoke<boolean>('stop_builtin_ai_session', { workspaceRoot }),
     openBuiltinAiWeb: (target?: { projectId?: string; workspaceRoot?: string }) => invoke<string>('open_builtin_ai_web', target || {}),
+    openExternalUrl: (url: string) => invoke<void>('open_external_url', { url }),
     syncBuiltinAiModels: () => invoke<BuiltinAiModelSyncResult>('sync_builtin_ai_models'),
     login: () => invoke<LoginState>('get_local_login_status'),
     logs: () => invoke<LogItem[]>('get_agent_logs'),

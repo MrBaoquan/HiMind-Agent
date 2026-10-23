@@ -740,9 +740,48 @@ fn powershell_failure(prefix: &str, output: &std::process::Output) -> String {
     }
 }
 
+/// Both the iframe bridge (Tauri IPC) and WebView2's native new-window hook can
+/// observe one click. Keep their delivery races from opening the same target
+/// twice while still allowing a deliberate repeat after the short guard.
+const EXTERNAL_URL_OPEN_DEDUP_WINDOW: Duration = Duration::from_millis(1500);
+
+fn claim_external_url_open(url: &str, now: Instant) -> bool {
+    static LAST_OPEN: std::sync::OnceLock<std::sync::Mutex<Option<(String, Instant)>>> =
+        std::sync::OnceLock::new();
+    let mut last = LAST_OPEN
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.as_ref().is_some_and(|(previous, opened_at)| {
+        previous == url
+            && now.saturating_duration_since(*opened_at) < EXTERNAL_URL_OPEN_DEDUP_WINDOW
+    }) {
+        return false;
+    }
+    *last = Some((url.to_string(), now));
+    true
+}
+
+/// Validate and open one HTTP(S) link once, regardless of which embedded
+/// surface reported it first.
+pub(crate) fn open_external_url_once(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url.trim()).map_err(|_| "链接格式无效".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("只允许打开 HTTP 或 HTTPS 链接".to_string());
+    }
+    let normalized = parsed.to_string();
+    if !claim_external_url_open(&normalized, Instant::now()) {
+        return Ok(());
+    }
+    open_url(&normalized).map_err(|error| error.to_string())
+}
+
 pub(crate) fn open_url(url: &str) -> Result<(), Box<dyn Error>> {
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+    // Do not route web links through `cmd /C start`: URLs from chat content can
+    // contain `&`, `^`, or other cmd metacharacters. Passing the URL as a single
+    // argument to the protocol handler avoids shell interpretation.
+    std::process::Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
@@ -982,14 +1021,98 @@ pub(crate) fn launch_project_workspace(
         .as_str()
         .ok_or("project file is missing")?;
     let engine = status["engine_type"].as_str().unwrap_or_default();
+    if engine == "unity" {
+        match focus_existing_unity_project(project) {
+            Some(true) => {
+                return Ok(json!({
+                    "ok": true,
+                    "engine_type": engine,
+                    "editor_path": editor,
+                    "project_file": project,
+                    "reused": true,
+                }));
+            }
+            Some(false) => {
+                return Err("工程已在 Unity 中打开，但无法激活 Unity 窗口".into());
+            }
+            None => {}
+        }
+    }
     let mut command = Command::new(editor);
     if engine == "unity" {
         command.arg("-projectPath").arg(project);
     } else {
         command.arg(project);
     }
-    command.spawn()?;
-    Ok(json!({ "ok": true, "engine_type": engine, "editor_path": editor, "project_file": project }))
+    let child = command.spawn()?;
+    Ok(json!({
+        "ok": true,
+        "engine_type": engine,
+        "editor_path": editor,
+        "project_file": project,
+        "reused": false,
+        "pid": child.id(),
+    }))
+}
+
+fn focus_existing_unity_project(project_path: &str) -> Option<bool> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$target = [System.IO.Path]::GetFullPath($env:HIMIND_PROJECT_PATH)
+$processes = @(Get-CimInstance Win32_Process -Filter "Name='Unity.exe'" | Where-Object {
+    $commandLine = [string]$_.CommandLine
+    $commandLine.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $commandLine -match '(?i)-projectPath'
+})
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+public static class HimindUnityWindow {
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    public static bool Focus(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero) return false;
+        ShowWindowAsync(hWnd, 9);
+        BringWindowToTop(hWnd);
+        for (var attempt = 0; attempt < 5; attempt++) {
+            SetForegroundWindow(hWnd);
+            Thread.Sleep(120);
+            if (GetForegroundWindow() == hWnd) return true;
+        }
+        return false;
+    }
+}
+'@
+foreach ($item in $processes) {
+    $process = Get-Process -Id $item.ProcessId
+    if ($process -and $process.MainWindowHandle -ne 0 -and $process.MainWindowTitle -and $process.MainWindowTitle -ne 'Error!') {
+        if ([HimindUnityWindow]::Focus($process.MainWindowHandle)) { exit 0 }
+        exit 3
+    }
+}
+exit 2
+"#;
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            script,
+        ])
+        .env("HIMIND_PROJECT_PATH", project_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(3) => Some(false),
+        _ => None,
+    }
 }
 
 pub(crate) fn launch_workspace_build(
@@ -3408,6 +3531,27 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn external_link_open_deduplicates_dual_webview_delivery() {
+        let url = format!(
+            "https://example.com/himind-open-once-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let opened_at = Instant::now();
+        assert!(claim_external_url_open(&url, opened_at));
+        assert!(!claim_external_url_open(
+            &url,
+            opened_at + Duration::from_millis(250)
+        ));
+        assert!(claim_external_url_open(
+            &url,
+            opened_at + EXTERNAL_URL_OPEN_DEDUP_WINDOW + Duration::from_millis(1)
+        ));
+    }
     #[test]
     fn rejects_incomplete_unity_project_layout() {
         let root = std::env::temp_dir().join(format!(

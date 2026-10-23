@@ -3,15 +3,23 @@
 //   1. 可以脱离 UI 直接验证（真实事件的 payload 极其庞大，容错必须能测）；
 //   2. 动态流只允许输出小字段摘要，绝不把 Step 输出原样贴进界面。
 import type { WorkflowInteractionRequest, WorkflowRunSnapshot } from '../services/agentApi';
+import { buildWorkflowGraph, type WorkflowGraphNode } from './workflowGraph.ts';
 
 export type RunStepState = 'done' | 'active' | 'waiting' | 'failed' | 'canceled' | 'skipped' | 'pending';
 
 export type RunTimelineStep = {
   id: string;
+  stepId: string;
   title: string;
   kind: string;
   capabilityId: string;
   executionMode: string;
+  depth: number;
+  approvalRequired: boolean;
+  condition: string;
+  failureCondition: string;
+  onFailure: string;
+  loop: WorkflowGraphNode['loop'];
   state: RunStepState;
   /** 已完成取实际耗时，运行中取「至今」，其余为 0。 */
   durationSeconds: number;
@@ -26,6 +34,7 @@ export type RunActivityItem = {
   key: string;
   at: number;
   clock: string;
+  stepId: string;
   stepTitle: string;
   kind: 'started' | 'completed' | 'progress' | 'error' | 'question' | 'approval' | 'interaction' | 'info';
   text: string;
@@ -148,6 +157,7 @@ function interactionActivity(snapshot: WorkflowRunSnapshot): RunActivityItem | n
     key: `interaction:${request.id}`,
     at,
     clock: formatClock(at),
+    stepId: request.step_id || '',
     stepTitle: request.title || request.step_id || '运行',
     kind,
     text: request.title || '运行需要你的处理',
@@ -174,6 +184,59 @@ function artifactsByStep(snapshot: WorkflowRunSnapshot): Map<string, Array<{ id:
   return result;
 }
 
+type RuntimeStep = WorkflowRunSnapshot['run']['steps'][number];
+
+function fallbackGraphNode(step: RuntimeStep, index: number): WorkflowGraphNode {
+  const id = step.step_id || ('runtime-' + index);
+  return {
+    id,
+    stepId: id,
+    title: step.title || step.step_id || '运行步骤',
+    kind: step.capability_id ? 'capability' : 'runtime',
+    capabilityId: step.capability_id || '',
+    executionMode: '',
+    approvalRequired: false,
+    onFailure: 'fail',
+    depth: 0,
+    dependsOn: [],
+    downstream: [],
+    inputArtifacts: [],
+    producedArtifacts: [],
+    condition: '',
+    failureCondition: '',
+    loop: null,
+  };
+}
+
+function graphNodesForRun(snapshot: WorkflowRunSnapshot): WorkflowGraphNode[] {
+  if (snapshot.workflow?.package) return buildWorkflowGraph(snapshot.workflow.package).nodes;
+  return snapshot.run.steps.map(fallbackGraphNode);
+}
+
+/** 运行步骤优先按精确节点路径匹配，其次按声明的 step_id 顺序消费；匹配不上的运行步骤保留为额外节点。 */
+function runtimeStepsByNode(snapshot: WorkflowRunSnapshot, nodes: WorkflowGraphNode[]) {
+  const exact = new Map<string, RuntimeStep>();
+  const byStepId = new Map<string, RuntimeStep[]>();
+  for (const step of snapshot.run.steps) {
+    if (!exact.has(step.step_id)) exact.set(step.step_id, step);
+    const bucket = byStepId.get(step.step_id) || [];
+    bucket.push(step);
+    byStepId.set(step.step_id, bucket);
+  }
+  const used = new Set<RuntimeStep>();
+  const matched = new Map<string, RuntimeStep>();
+  for (const node of nodes) {
+    const exactMatch = exact.get(node.id) || exact.get(node.stepId);
+    const candidate = exactMatch && !used.has(exactMatch)
+      ? exactMatch
+      : (byStepId.get(node.stepId) || []).find(step => !used.has(step));
+    if (!candidate) continue;
+    used.add(candidate);
+    matched.set(node.id, candidate);
+  }
+  return { matched, used };
+}
+
 export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): RunTimeline {
   const now = Math.floor(nowMs / 1000);
   const run = snapshot.run;
@@ -181,10 +244,10 @@ export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): 
   const startedAt = toEpochSeconds(run.created_at);
   const finishedAt = toEpochSeconds(run.updated_at);
   const artifacts = artifactsByStep(snapshot);
-  const packageSteps = snapshot.workflow?.package.steps || [];
+  const graphNodes = graphNodesForRun(snapshot);
+  const { matched, used } = runtimeStepsByNode(snapshot, graphNodes);
 
-  const steps: RunTimelineStep[] = packageSteps.map(definition => {
-    const runtimeStep = run.steps.find(item => item.step_id === definition.id);
+  const toTimelineStep = (node: WorkflowGraphNode, runtimeStep: RuntimeStep | undefined): RunTimelineStep => {
     const rawStatus = runtimeStep?.status || (run.status === 'succeeded' ? 'succeeded' : 'pending');
     const state = stepState(rawStatus, run.status);
     const started = toEpochSeconds(runtimeStep?.started_at);
@@ -195,26 +258,43 @@ export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): 
       : running && started
         ? Math.max(0, now - started)
         : 0;
+    const artifactBucket = runtimeStep
+      ? artifacts.get(runtimeStep.step_id) || artifacts.get(node.stepId) || artifacts.get(node.id)
+      : artifacts.get(node.stepId) || artifacts.get(node.id);
     return {
-      id: definition.id,
-      title: definition.title || definition.id,
-      kind: definition.kind || '',
-      capabilityId: definition.capability_id || '',
-      executionMode: definition.execution_mode || '',
+      id: node.id,
+      stepId: node.stepId,
+      title: node.title || runtimeStep?.title || node.stepId,
+      kind: node.kind || '',
+      capabilityId: node.capabilityId || '',
+      executionMode: node.executionMode || '',
+      depth: node.depth,
+      approvalRequired: node.approvalRequired,
+      condition: node.condition,
+      failureCondition: node.failureCondition,
+      onFailure: node.onFailure,
+      loop: node.loop,
       state,
       durationSeconds: duration,
       running,
       error: runtimeStep?.error || '',
-      artifacts: artifacts.get(definition.id) || [],
+      artifacts: artifactBucket || [],
       startedAt: started,
       attempt: runtimeStep?.attempt || 0,
     };
-  });
+  };
+
+  const steps: RunTimelineStep[] = graphNodes.map(node => toTimelineStep(node, matched.get(node.id)));
+  for (const runtimeStep of run.steps) {
+    if (used.has(runtimeStep)) continue;
+    const node = fallbackGraphNode(runtimeStep, steps.length);
+    steps.push(toTimelineStep(node, runtimeStep));
+  }
 
   const total = steps.length;
   const completed = steps.filter(step => step.state === 'done' || step.state === 'skipped').length;
   const current = steps.find(step => step.state === 'active' || step.state === 'waiting')
-    || steps.find(step => step.id === run.current_step_id)
+    || steps.find(step => step.id === run.current_step_id || step.stepId === run.current_step_id)
     || null;
   const lastEvent = snapshot.events.reduce((latest, event) => Math.max(latest, toEpochSeconds(event.occurred_at)), 0);
   const lastActivity = Math.max(lastEvent, finishedAt, startedAt);
@@ -227,11 +307,11 @@ export function buildRunTimeline(snapshot: WorkflowRunSnapshot, nowMs: number): 
   const failedStep = steps.find(step => step.state === 'failed');
 
   let headline: string;
-  if (failedStep) headline = `${failedStep.title} 失败`;
-  else if (run.status === 'succeeded') headline = `${total} 步全部完成`;
+  if (failedStep) headline = failedStep.title + ' 失败';
+  else if (run.status === 'succeeded') headline = total + ' 步全部完成';
   else if (run.status === 'canceled') headline = '运行已取消';
-  else if (current?.state === 'waiting') headline = `等待处理：${current.title}`;
-  else if (current) headline = `正在执行：${current.title}`;
+  else if (current?.state === 'waiting') headline = '等待处理：' + current.title;
+  else if (current) headline = '正在执行：' + current.title;
   else if (run.status === 'queued') headline = '已排队，等待开始执行';
   else headline = '准备中';
 
@@ -269,6 +349,7 @@ export function buildRunActivity(snapshot: WorkflowRunSnapshot): RunActivityItem
     ) continue;
     const payload = asObject(event.payload);
     const output = asObject(payload.output);
+    const stepId = event.step_id || '';
     const stepTitle = titleById.get(event.step_id) || event.step_id || '运行';
     const at = toEpochSeconds(event.occurred_at);
     const key = event.event_id || `${event.step_id}:${event.sequence}:${event.event_type}`;
@@ -277,7 +358,7 @@ export function buildRunActivity(snapshot: WorkflowRunSnapshot): RunActivityItem
     switch (event.event_type) {
       case 'tool_started':
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'started',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'started',
           text: `${stepTitle} 开始执行`,
           detail: '',
         });
@@ -292,7 +373,7 @@ export function buildRunActivity(snapshot: WorkflowRunSnapshot): RunActivityItem
         if (output.degraded === true) parts.push('已降级');
         const summary = asText(output.summary);
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'completed',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'completed',
           text: `${stepTitle} 完成`,
           detail: parts.length ? parts.join(' · ') : truncate(summary, 90),
         });
@@ -300,7 +381,7 @@ export function buildRunActivity(snapshot: WorkflowRunSnapshot): RunActivityItem
       }
       case 'progress': {
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'progress',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'progress',
           text: `${stepTitle} 进度更新`,
           detail: truncate(asText(payload.message), 90),
         });
@@ -308,14 +389,14 @@ export function buildRunActivity(snapshot: WorkflowRunSnapshot): RunActivityItem
       }
       case 'error':
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'error',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'error',
           text: `${stepTitle} 失败`,
           detail: truncate(asText(payload.error) || asText(payload.message), 160),
         });
         break;
       case 'question_requested':
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'question',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'question',
           text: `${stepTitle} 请求你的反馈`,
           detail: truncate(asText(payload.question) || asText(payload.message) || asText(payload.reason), 120),
         });
@@ -323,14 +404,14 @@ export function buildRunActivity(snapshot: WorkflowRunSnapshot): RunActivityItem
       case 'approval_requested':
       case 'approval_decided':
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'approval',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'approval',
           text: event.event_type === 'approval_requested' ? `${stepTitle} 等待审批` : `${stepTitle} 审批已处理`,
           detail: '',
         });
         break;
       default:
         items.push({
-          key, at, clock: formatClock(at), stepTitle, kind: 'info',
+          key, at, clock: formatClock(at), stepId, stepTitle, kind: 'info',
           text: `${stepTitle} 状态已更新`,
           detail: '',
         });

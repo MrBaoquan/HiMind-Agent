@@ -4,6 +4,7 @@
 //   2. 动态流只输出小字段摘要，绝不把 Step 输出贴进界面。
 import { strict as assert } from 'node:assert';
 import { buildRunActivity, buildRunTimeline } from '../src/pages/workflowRunView.ts';
+import { buildWorkflowGraph } from '../src/pages/workflowGraph.ts';
 
 const packageSteps = [
   { id: 'TR-COLLECT', title: '采集与筛选公开热点', kind: 'capability', capability_id: 'tech-radar.collect', execution_mode: 'long_running', risk_level: 'read_only', approval_required: false, depends_on: [] },
@@ -160,5 +161,47 @@ const waitingActivity = buildRunActivity(waiting as never);
 assert.equal(waitingActivity[0].kind, 'interaction');
 assert.equal(waitingActivity[0].detail.includes('外部系统完成确认'), true);
 assert.equal(waitingActivity.filter(item => item.key === 'wait-1').length, 0);
+
+// 6) 定义图和运行轨道必须使用同一递归步骤顺序，循环内子步骤不能只出现在其中一侧。
+const loopPackage = {
+  schema_version: 'workflow_package.v1',
+  id: 'fixture.loop',
+  version: '1.0.0',
+  name: 'loop fixture',
+  description: '',
+  min_agent_version: '0.1.0',
+  capabilities: [],
+  dependencies: { skills: [], plugins: [], connectors: [], runtimes: [] },
+  steps: [
+    { id: 'prepare', title: '准备', kind: 'capability', capability_id: 'fs.read', execution_mode: 'sync', risk_level: '', approval_required: false, depends_on: [] },
+    { id: 'loop', title: '迭代', kind: 'loop', capability_id: '', execution_mode: 'sync', risk_level: '', approval_required: false, depends_on: ['prepare'], loop: { max_iterations: 3, pause_for_feedback: true, steps: [{ id: 'body', title: '执行', kind: 'runtime', capability_id: '', execution_mode: 'sync', risk_level: '', approval_required: false, depends_on: [] }] } },
+  ],
+  artifacts: [],
+  ui: { mode: 'standard', entry: '', surfaces: [] },
+  entrypoints: [],
+  exits: [],
+  supported_runtimes: [],
+};
+const loopSnapshot = {
+  ...snapshot,
+  workflow: { package: loopPackage, enabled: true, view: null },
+  run: {
+    ...baseRun,
+    status: 'succeeded',
+    current_step_id: '',
+    steps: [
+      { ...baseRun.steps[0], step_id: 'prepare', title: '准备' },
+      { ...baseRun.steps[1], step_id: 'loop', title: '迭代' },
+    ],
+  },
+  events: [],
+};
+const loopGraph = buildWorkflowGraph(loopPackage as never);
+const loopTimeline = buildRunTimeline(loopSnapshot as never, 1789888000_000);
+assert.deepEqual(loopTimeline.steps.map(step => step.id), loopGraph.nodes.map(node => node.id));
+assert.deepEqual(loopTimeline.steps.map(step => step.depth), loopGraph.nodes.map(node => node.depth));
+assert.equal(loopTimeline.total, 3);
+assert.equal(loopTimeline.steps[2].stepId, 'body');
+assert.equal(loopTimeline.steps[2].state, 'done');
 
 console.log('run view checks passed');
