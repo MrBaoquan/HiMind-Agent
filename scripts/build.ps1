@@ -58,7 +58,8 @@ $CargoCheckArguments = @("check", "--locked")
 if ($Configuration -eq "release") { $CargoCheckArguments += "--release" }
 Invoke-Checked "Rust compile check" { & cargo @CargoCheckArguments }
 if (-not $SkipTests) {
-    Invoke-Checked "Rust tests" { & cargo test --locked }
+    # These tests exercise process-wide Agent state, environment variables and temporary homes. Run them serially so a parallel test cannot remove another test's directory or proxy configuration mid-flight.
+    Invoke-Checked "Rust tests" { & cargo test --locked -- --test-threads=1 }
 }
 
 $AgentBuildArguments = @(
