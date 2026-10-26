@@ -267,14 +267,23 @@ $releaseManifest = [ordered]@{
 }
 $releaseManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $ReleaseDirectory "himind-agent-update.json") -Encoding UTF8
 
-Remove-Item -LiteralPath (Join-Path $ReleaseDirectory "manifest.json"), (Join-Path $ReleaseDirectory "checksums.sha256") -Force -ErrorAction SilentlyContinue
-$commit = (& git rev-parse HEAD).Trim()
-& (Join-Path (Split-Path -Parent $Root) "scripts\release\generate-manifest.ps1") `
-    -ReleaseDirectory $ReleaseDirectory -Version $Version -GitCommit $commit -SourceDirty ((& git status --porcelain).Count -gt 0)
-if ($LASTEXITCODE -ne 0) { throw "Release manifest generation failed." }
+$manifestPath = Join-Path $ReleaseDirectory "manifest.json"
+$checksumsPath = Join-Path $ReleaseDirectory "checksums.sha256"
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $checksumsPath -PathType Leaf)) {
+    throw "Release payload manifest or checksums are missing from the packaged directory."
+}
 
-$pairVerifier = Join-Path (Split-Path -Parent $Root) "scripts\release\verify-agent-release-pair.ps1"
-& $pairVerifier -ReleaseDirectory $ReleaseDirectory -RequireSignature:$hasSigning
+$verifyArgs = @{
+    ReleaseDirectory = $ReleaseDirectory
+    Version = $Version
+    RequireSignature = $hasSigning
+}
+if ($hasSigning) { $verifyArgs.PublicKeyPath = $PublicKeyPath }
+if ($WindowsCodeSigningCertificateThumbprint) {
+    $verifyArgs.WindowsCodeSigningCertificateThumbprint = $WindowsCodeSigningCertificateThumbprint
+}
+& (Join-Path $PSScriptRoot "verify-agent-release-pair.ps1") @verifyArgs | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "Agent release pair verification failed." }
 
 $checksums = Get-ChildItem -LiteralPath $ReleaseDirectory -File -Recurse | Sort-Object FullName | ForEach-Object {
