@@ -29,6 +29,18 @@
         "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
       }
     },
+    "icon": {
+      "description": "可选扩展品牌图标 sidecar。与制品同一次 Release 发布，消费侧必须按摘要复核。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_name", "size_bytes", "sha256", "content_type"],
+      "properties": {
+        "file_name": { "type": "string", "minLength": 1, "pattern": "\\.(png|webp)$" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 262144 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "content_type": { "enum": ["image/png", "image/webp"] }
+      }
+    },
     "signature": {
       "description": "制品分离签名。可选：缺失表示未签名，是否允许安装由分发策略决定；一旦出现就必须验签通过。",
       "type": "object",

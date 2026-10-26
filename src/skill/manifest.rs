@@ -48,6 +48,9 @@ pub(crate) fn parse_skill_manifest(content: &str) -> Result<SkillManifest, Box<d
 }
 
 pub(crate) fn validate_skill_manifest(manifest: &SkillManifest) -> Result<(), Box<dyn Error>> {
+    if !manifest.icon.trim().is_empty() {
+        crate::app::extension_icons::validate_icon_reference(&manifest.icon)?;
+    }
     validate_skill_id(&manifest.id)?;
     validate_skill_version(&manifest.version)?;
     if manifest.name.trim().is_empty() {
@@ -247,6 +250,16 @@ fn load_standard_skill_manifest(root: &Path) -> Result<SkillManifest, Box<dyn Er
     contents.push(".himind/manifest.json".to_string());
     contents.sort();
     contents.dedup();
+    let icon = [
+        "assets/icon.png",
+        "assets/icon.webp",
+        "icon.png",
+        "icon.webp",
+    ]
+    .iter()
+    .find(|path| root.join(path).is_file())
+    .map(|path| path.to_string())
+    .unwrap_or_default();
     let manifest = SkillManifest {
         id: name.clone(),
         name,
@@ -255,6 +268,7 @@ fn load_standard_skill_manifest(root: &Path) -> Result<SkillManifest, Box<dyn Er
         version,
         scope: SkillScope::User,
         description,
+        icon,
         release_notes: String::new(),
         min_agent_version: String::new(),
         supported_clients: vec![crate::skill::clients::PORTABLE_PROFILE_ID.to_string()],
@@ -495,6 +509,7 @@ mod tests {
         let root = std::env::temp_dir().join("himind-skill-manifest-test");
         let _ = fs::remove_dir_all(&root);
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.environment-doctor".to_string(),
             name: "环境诊断".to_string(),
             author: String::new(),
@@ -533,6 +548,7 @@ mod tests {
     #[test]
     fn accepts_standard_script_files_as_resources() {
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.environment-doctor".to_string(),
             name: "环境诊断".to_string(),
             author: String::new(),
@@ -605,5 +621,20 @@ mod tests {
         .unwrap();
         assert!(manifest.capabilities.is_empty());
         assert!(manifest.plugin_dependencies.is_empty());
+    }
+
+    #[test]
+    fn skill_icon_is_optional_and_package_local() {
+        let valid = parse_skill_manifest(
+            r#"{"id":"com.himind.skill.icon","name":"Icon skill","version":"1.0.0","scope":"organization","supported_clients":["codex"],"contents":["SKILL.md"],"icon":"assets/icon.png"}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.icon, "assets/icon.png");
+        for invalid in ["../icon.png", "C:/icon.png", "assets/icon.svg"] {
+            let content = format!(
+                r#"{{"id":"com.himind.skill.icon","name":"Icon skill","version":"1.0.0","scope":"organization","supported_clients":["codex"],"contents":["SKILL.md"],"icon":"{invalid}"}}"#
+            );
+            assert!(parse_skill_manifest(&content).is_err(), "{invalid}");
+        }
     }
 }

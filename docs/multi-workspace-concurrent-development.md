@@ -21,17 +21,30 @@ HiMind AI（DSH）会话可以同时打开多个工作目录，每个目录各�
 ### rail 的登记与会话内容跨目录共享
 
 `storages/`（rail 的工作区分组与会话索引）与 `sessions/`（会话内容）在各目录的
-home 之间不是各自一份，而是**目录联接指向共享目录**
+home 之间不是各自一份：Agent 生成的 DSH overlay 把 `storage-json` 与
+`session-persistence-jsonl` 的后端根直接指向共享目录
 （`homes/interactive/storages`、`homes/interactive/sessions`）。这样打开任一目录的
 会话，rail 里都能同时看到所有目录及其会话，不必回扩展开发页切来切去——对齐主流
-客户端的会话列表。首次运行会把各 home 已有的登记**取并集**合并、会话内容搬进共享
-目录，幂等且按 home 打标记；`share_rail_state()` 负责这件事。
+客户端的会话列表。
+
+不要再把工作区 home 下的 `storages`/`sessions` 做成 Windows 目录联接：旧版 Agent
+数据根可能残留 DSH sandbox ACL，在这种情况下 Node 的 `open(..., "wx")` 会错误返回
+`EEXIST`，导致 `dsh-workspace` 在插件树装配阶段启动失败。首次运行会把旧 home 里
+已有的登记**取并集**合并、会话内容搬进共享目录，然后只删除本地旧目录/联接，
+`share_rail_state()` 不会再重建链接。
 
 隔离的边界仍在：`AGENTS.md`（该目录选中的项目规则）、`profiles`、凭据都还按目录
 各自一份，所以并发目录之间不会互相覆盖项目规则；origin 也仍按 home 派生，上面那条
 「一个 origin 一个 localStorage」不受影响。
 
 代价：多个 Host 进程会同时读写同一份 rail 登记与会话目录。
+
+### 冷启动加速
+
+交互会话直接执行 Runtime 自带的 `node.exe`，不再经过 `cmd.exe` 的额外进程。Agent
+同时启用按 Runtime 版本分区的 `NODE_COMPILE_CACHE`，让 Node 22 复用 V8 字节码；
+控制面能力探测和模型目录同步都移到 iframe 首屏之后，不再阻塞会话返回。首次冷启动
+仍受 Runtime 插件树和磁盘缓存影响，但第二次及之后的同一 Runtime 启动会明显更快。
 
 ## 并发开发到底卡在哪里
 

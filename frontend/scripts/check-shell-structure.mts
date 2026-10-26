@@ -112,9 +112,8 @@ const taskCenter = readFileSync(join(here, '..', 'src', 'pages', 'TaskCenterPage
 assert.ok(/className=\{`task-center-state-icon/.test(taskCenter), '任务中心行首必须是状态图形');
 assert.ok(!/task-center-status-dot/.test(taskCenter), '任务中心不能再回退到状态小圆点');
 assert.ok(/function stateIcon\(status: string\)/.test(taskCenter), '任务中心的状态图形必须由状态推导');
-// 这个选择器只能有一处，而且必须是「转」：拿到进度的运行行没有转圈就只剩颜色一个维度，
-// 停住的转圈则和卡死长得一样。动效不再跟随系统开关（整套 reduce 分支已移除），
-// 所以这里也不该再出现明暗呼吸那类降级实现。
+// 这个选择器只能有一处，而且基础状态必须是「转」：拿到进度的运行行没有转圈就只剩颜色一个维度。
+// 系统开启「减少动态效果」时由全局 reduce 分支统一降级，状态仍由文字和进度值表达。
 const stateIconRules = styles.match(/\.task-center-state-icon\.is-spinning svg[^{}]*\{[^}]*\}/g) ?? [];
 assert.ok(stateIconRules.some((rule) => /animation: spin/.test(rule)), '拿不到进度的运行行必须转圈，否则看不出「还活着」');
 assert.ok(
@@ -122,4 +121,17 @@ assert.ok(
   '状态图形不能被降级成呼吸或静止：运行态必须始终在转',
 );
 
+// 快捷工具必须能承载大量插件入口：顶部只保留有限槽位，完整入口进入可搜索、
+// 可收藏、可学习常用项的对话框，而不是无限横向堆叠或跳回插件管理页。
+assert.match(shell, /QUICK_ACCESS_VISIBLE_LIMIT = 4/, '顶部快捷工具必须明确限制可见槽位');
+assert.match(shell, /himind\.quick-access\.favorites/, '快捷工具收藏必须持久化');
+assert.match(shell, /himind\.quick-access\.usage/, '快捷工具常用频次必须持久化');
+assert.match(shell, /useModalFocus\(dialogRef, true, onClose, searchRef, returnFocusRef\)/, '工具面板必须支持焦点接管与关闭回焦');
+assert.match(shell, /aria-labelledby="quick-access-dialog-title"/, '工具面板必须有可访问名称');
+assert.match(shell, /搜索工具、插件或视图/, '工具面板必须提供搜索入口');
+assert.ok(!/打开更多插件工具/.test(shell), '超出槽位不能只跳回插件管理页，必须进入完整工具面板');
+const quickDialogListRule = styles.match(/\.quick-access-dialog-list \{[^}]*\}/);
+assert.ok(quickDialogListRule && /overflow-y: auto/.test(quickDialogListRule[0]), '大量工具必须由面板内部滚动，不能撑破窗口');
+const quickFavoriteRule = styles.match(/\.quick-access-favorite-button \{[^}]*\}/);
+assert.ok(quickFavoriteRule && /width: 36px; height: 36px/.test(quickFavoriteRule[0]), '收藏按钮命中区必须至少 36×36');
 console.log('shell structure checks passed');

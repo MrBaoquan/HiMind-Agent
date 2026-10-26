@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::api::distribution::{
     resolve_runtime_component as resolve_dashboard_runtime_component, RuntimeComponentUpdate,
 };
+use crate::app::control_plane_provider;
 use crate::app::system::validate_signature_metadata;
 use crate::Options;
 
@@ -140,7 +141,7 @@ fn configured_source(options: &Options) -> Result<RuntimeDistributionSource, Box
         "" | "auto" => {
             if env::var_os(LOCAL_MANIFEST_ENV).is_some_and(|value| !value.is_empty()) {
                 Ok(RuntimeDistributionSource::Local)
-            } else if options.mode().dashboard_enabled() {
+            } else if control_plane_provider::available(options) {
                 Ok(RuntimeDistributionSource::Dashboard)
             } else {
                 Ok(RuntimeDistributionSource::Github)

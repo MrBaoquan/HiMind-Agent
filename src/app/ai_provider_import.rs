@@ -1380,7 +1380,7 @@ fn resolve_credential(
         return Ok(credential);
     }
     let mut credential = if service.is_empty() || service == "managed" {
-        if !options.mode().dashboard_enabled() {
+        if !crate::app::control_plane_provider::available(options) {
             return Err(
                 "HiMind 分发服务需要先对接 AI 工作台；未对接时请从本机自定义模型服务导入".into(),
             );

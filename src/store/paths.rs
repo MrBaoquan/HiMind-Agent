@@ -41,6 +41,15 @@ pub(crate) fn agent_home() -> PathBuf {
         _ => base,
     }
 }
+/// Machine-wide Agent installation root.
+///
+/// Runtime binaries are products installed by the Agent, not user-profile
+/// data. Keeping them under this root means every profile sees the same pinned
+/// Runtime version. `HIMIND_AGENT_HOME` remains a complete explicit root so
+/// parallel and isolated test instances stay self-contained.
+pub(crate) fn shared_agent_root() -> PathBuf {
+    explicit_agent_home().unwrap_or_else(|| local_app_data_base().join(DEFAULT_AGENT_DIRECTORY))
+}
 
 fn local_app_data_base() -> PathBuf {
     env::var_os("LOCALAPPDATA")
@@ -265,7 +274,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_temp_dir, is_safe_profile_name, resolve_profile, test_env_lock,
+        agent_temp_dir, is_safe_profile_name, resolve_profile, shared_agent_root, test_env_lock,
         webview_user_data_dir, ProfileSource,
     };
     use std::env;
@@ -284,6 +293,27 @@ mod tests {
     /// WebView2 只允许一个进程独占用户数据目录，同一台机器上的第二个 Agent
     /// 进程如果和别的 profile 共用一个目录，就会静默建不出主窗口。这条用例
     /// 把「目录跟着 profile 走」钉住，避免以后又退回到共享目录。
+    #[test]
+    fn shared_runtime_root_does_not_follow_profile() {
+        let _guard = test_env_lock();
+        let previous_profile = env::var_os("HIMIND_AGENT_PROFILE");
+        let previous_home = env::var_os("HIMIND_AGENT_HOME");
+        env::remove_var("HIMIND_AGENT_HOME");
+
+        env::set_var("HIMIND_AGENT_PROFILE", "production");
+        let production = shared_agent_root();
+        env::set_var("HIMIND_AGENT_PROFILE", "development");
+        assert_eq!(shared_agent_root(), production);
+        assert!(production.ends_with("HiMindAgent"));
+
+        let explicit = std::env::temp_dir().join("himind-explicit-shared-root");
+        env::set_var("HIMIND_AGENT_HOME", &explicit);
+        assert_eq!(shared_agent_root(), explicit);
+
+        restore("HIMIND_AGENT_PROFILE", previous_profile);
+        restore("HIMIND_AGENT_HOME", previous_home);
+    }
+
     #[test]
     fn webview_data_directory_follows_profile() {
         let _guard = test_env_lock();

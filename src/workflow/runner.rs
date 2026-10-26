@@ -2231,6 +2231,7 @@ mod tests {
 
     fn package() -> WorkflowPackage {
         WorkflowPackage {
+            icon: String::new(),
             schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.runner-test".to_string(),
             version: "1.0.0".to_string(),

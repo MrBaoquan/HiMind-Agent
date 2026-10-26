@@ -117,6 +117,8 @@ pub(crate) enum AgentOpenTarget {
     Main,
     /// 唤起并把设置窗口开到「AI 连接」面板，供用户在本机完成注册。
     SettingsAi,
+    /// Open Settings → 账号与凭据.
+    SettingsAccounts,
 }
 
 impl AgentOpenTarget {
@@ -124,6 +126,7 @@ impl AgentOpenTarget {
     fn from_query(value: &str) -> Option<Self> {
         match value {
             "ai" => Some(AgentOpenTarget::SettingsAi),
+            "accounts" => Some(AgentOpenTarget::SettingsAccounts),
             _ => None,
         }
     }
@@ -3170,7 +3173,7 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
         Some("list") => println!(
             "{}",
             capability::plugin::registry_json_for_control_plane(
-                options.mode().control_plane_enabled(),
+                app::control_plane_provider::available(options),
             )?
         ),
         Some("import-local") if arguments.len() == 2 => {
@@ -3178,7 +3181,7 @@ fn run_plugin_cli(options: &Options, arguments: &[String]) -> Result<(), Box<dyn
             println!(
                 "{}",
                 capability::plugin::registry_json_for_control_plane(
-                    options.mode().control_plane_enabled(),
+                    app::control_plane_provider::available(options),
                 )?
             );
         }
@@ -3277,6 +3280,8 @@ pub(crate) struct Options {
     identity_generation: Arc<AtomicU64>,
     platform_access: Arc<RwLock<Option<api::oauth::AgentAccessToken>>>,
     task_execution: Arc<RwLock<Option<(String, String, String, String)>>>,
+    #[cfg(test)]
+    provider_availability_override: Arc<AtomicU8>,
 }
 
 /// 后台启动标记：登录自启（Run 项）用 `--hidden`，桌面快捷方式与协议唤起不带它。
@@ -3332,6 +3337,38 @@ impl Options {
     pub(crate) fn set_mode(&self, mode: app::runtime_mode::AgentMode) {
         self.workbench_mode
             .store(mode.as_code(), std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.provider_availability_override.store(
+            if mode.dashboard_enabled() { 2 } else { 1 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Test-only shortcut for legacy unit fixtures that intentionally model a
+    /// connected capability surface without materialising a real workbench
+    /// identity. Production always derives availability from provider state.
+    #[cfg(test)]
+    pub(crate) fn set_provider_availability_override(&self, value: Option<bool>) {
+        self.provider_availability_override.store(
+            match value {
+                Some(true) => 2,
+                Some(false) => 1,
+                None => 0,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_availability_override(&self) -> Option<bool> {
+        match self
+            .provider_availability_override
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            2 => Some(true),
+            1 => Some(false),
+            _ => None,
+        }
     }
 
     /// 持久化值已经与运行时同步，保留该入口只为兼容既有调用点。
@@ -3467,6 +3504,8 @@ impl Options {
             identity_generation: Arc::new(AtomicU64::new(0)),
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            provider_availability_override: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -3863,6 +3902,16 @@ mod tests {
         assert_eq!(
             parse_protocol_open(&open_ai),
             Some(AgentOpenTarget::SettingsAi)
+        );
+
+        let open_accounts = vec![
+            "agent.exe".to_string(),
+            "--protocol-url".to_string(),
+            "himind-agent://open?open=accounts".to_string(),
+        ];
+        assert_eq!(
+            parse_protocol_open(&open_accounts),
+            Some(AgentOpenTarget::SettingsAccounts)
         );
 
         for value in [

@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
-import { Activity, AppWindow, Blocks, BookOpen, Cable, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, Clapperboard, Clock3, Database, ExternalLink, FileCode2, FileText, FolderOpen, Info, LayoutDashboard, LayoutGrid, LogOut, MessageCircle, Minus, MonitorPlay, Music, Package, PanelLeftClose, PanelLeftOpen, Puzzle, RefreshCw, Settings, Sparkles, Square, Terminal, Video, Workflow, Wrench, X, type LucideIcon } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
+import { Activity, AppWindow, Blocks, BookOpen, Cable, CalendarDays, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, Clapperboard, Clock3, Database, Download, ExternalLink, FileCode2, FileText, FolderOpen, Info, LayoutDashboard, LayoutGrid, LogOut, MessageCircle, Minus, MonitorPlay, Music, Package, PanelLeftClose, PanelLeftOpen, Puzzle, Radar, RefreshCw, Search, Settings, Sparkles, Square, Star, Terminal, Video, Workflow, Wrench, X, type LucideIcon } from 'lucide-react';
 // 形变吃的是图标数据，静态图标仍走 lucide-react 组件；两边的图标集版本必须一致，
 // 否则同一个图标在「形变端点」和「静态渲染」下长得不一样（由 check:icon-version 守住）。
 import { Activity as activityIconData, LoaderCircle as loaderCircleIconData } from 'lucide';
 import { BusyIndicator } from './BusyIndicator';
 import { MorphIcon } from './MorphIcon';
+import { useModalFocus } from './useModalFocus';
 import type { NavigationTarget, PageKey } from '../types';
 import { pageLabel, visibleNavigationSections, type NavigationItem } from '../navigation';
 import type { CurrentTaskStatus, DashboardIdentityStatus, PluginQuickAccessView } from '../services/agentApi';
@@ -75,8 +76,11 @@ const quickViewIconMap: Record<string, LucideIcon> = {
   book: BookOpen,
   'book-open': BookOpen,
   cable: Cable,
+  calendar: CalendarDays,
+  'calendar-days': CalendarDays,
   clapperboard: Clapperboard,
   code: FileCode2,
+  download: Download,
   database: Database,
   file: FileText,
   'file-code': FileCode2,
@@ -97,6 +101,7 @@ const quickViewIconMap: Record<string, LucideIcon> = {
   'monitor-play': MonitorPlay,
   package: Package,
   puzzle: Puzzle,
+  radar: Radar,
   settings: Settings,
   sparkles: Sparkles,
   terminal: Terminal,
@@ -117,6 +122,188 @@ function quickViewLabel(view: PluginQuickAccessView) {
   return label || '工具';
 }
 
+type QuickAccessUsage = Record<string, { count: number; lastUsed: number }>;
+type QuickAccessFilter = 'all' | 'favorites' | 'frequent';
+
+const QUICK_ACCESS_FAVORITES_KEY = 'himind.quick-access.favorites';
+const QUICK_ACCESS_USAGE_KEY = 'himind.quick-access.usage';
+const QUICK_ACCESS_VISIBLE_LIMIT = 4;
+
+function quickAccessKey(view: PluginQuickAccessView) {
+  return `${view.plugin_id}:${view.view_id}`;
+}
+
+function compareQuickViews(left: PluginQuickAccessView, right: PluginQuickAccessView) {
+  return left.order - right.order
+    || left.short_title.localeCompare(right.short_title, 'zh-CN')
+    || left.plugin_name.localeCompare(right.plugin_name, 'zh-CN')
+    || left.view_id.localeCompare(right.view_id);
+}
+
+function readQuickAccessFavorites(): string[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(QUICK_ACCESS_FAVORITES_KEY) || '[]');
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function readQuickAccessUsage(): QuickAccessUsage {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(QUICK_ACCESS_USAGE_KEY) || '{}');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const usage: QuickAccessUsage = {};
+    for (const [key, raw] of Object.entries(value)) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const item = raw as { count?: unknown; lastUsed?: unknown };
+      const count = Number(item.count);
+      const lastUsed = Number(item.lastUsed);
+      if (!Number.isFinite(count) || count <= 0) continue;
+      usage[key] = { count: Math.min(Math.floor(count), 9999), lastUsed: Number.isFinite(lastUsed) ? lastUsed : 0 };
+    }
+    return usage;
+  } catch {
+    return {};
+  }
+}
+
+function quickViewSearchText(view: PluginQuickAccessView) {
+  return [view.short_title, view.title, view.plugin_name, view.plugin_id, view.view_id].join('\n').toLocaleLowerCase('zh-CN');
+}
+
+type QuickAccessDialogProps = {
+  views: PluginQuickAccessView[];
+  favorites: Set<string>;
+  usage: QuickAccessUsage;
+  onToggleFavorite: (view: PluginQuickAccessView) => void;
+  onOpen: (view: PluginQuickAccessView) => void;
+  onClose: () => void;
+  returnFocusRef: RefObject<HTMLButtonElement | null>;
+};
+
+function QuickAccessDialog({ views, favorites, usage, onToggleFavorite, onOpen, onClose, returnFocusRef }: QuickAccessDialogProps) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<QuickAccessFilter>('all');
+  useModalFocus(dialogRef, true, onClose, searchRef, returnFocusRef);
+
+  const favoriteViews = useMemo(
+    () => views.filter(view => favorites.has(quickAccessKey(view))).sort(compareQuickViews),
+    [favorites, views],
+  );
+  const frequentViews = useMemo(
+    () => views
+      .filter(view => usage[quickAccessKey(view)]?.count > 0)
+      .sort((left, right) => {
+        const leftUsage = usage[quickAccessKey(left)];
+        const rightUsage = usage[quickAccessKey(right)];
+        return rightUsage.count - leftUsage.count
+          || rightUsage.lastUsed - leftUsage.lastUsed
+          || compareQuickViews(left, right);
+      }),
+    [usage, views],
+  );
+  const sourceViews = filter === 'favorites' ? favoriteViews : filter === 'frequent' ? frequentViews : [...views].sort(compareQuickViews);
+  const normalizedQuery = query.trim().toLocaleLowerCase('zh-CN');
+  const visibleViews = normalizedQuery
+    ? sourceViews.filter(view => quickViewSearchText(view).includes(normalizedQuery))
+    : sourceViews;
+
+  return (
+    <div className="quick-access-dialog-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
+      <section ref={dialogRef} className="quick-access-dialog" role="dialog" aria-modal="true" aria-labelledby="quick-access-dialog-title" tabIndex={-1}>
+        <header className="quick-access-dialog-head">
+          <div>
+            <h2 id="quick-access-dialog-title">全部工具</h2>
+            <p>搜索插件入口，收藏常用的工具。</p>
+          </div>
+          <button type="button" className="btn btn-icon" aria-label="关闭工具面板" title="关闭" onClick={onClose}><X size={16} /></button>
+        </header>
+        <div className="quick-access-dialog-search" role="search">
+          <Search size={16} aria-hidden="true" />
+          <input
+            ref={searchRef}
+            type="search"
+            value={query}
+            onChange={event => setQuery(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && visibleViews[0]) {
+                event.preventDefault();
+                onOpen(visibleViews[0]);
+              } else if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                dialogRef.current?.querySelector<HTMLButtonElement>('[data-quick-row-main]')?.focus();
+              }
+            }}
+            placeholder="搜索工具、插件或视图"
+            aria-label="搜索快捷工具"
+          />
+          {query ? <button type="button" className="quick-access-dialog-search-clear" title="清空搜索" aria-label="清空搜索" onClick={() => { setQuery(''); searchRef.current?.focus(); }}><X size={14} /></button> : null}
+        </div>
+        <div className="quick-access-dialog-filters" aria-label="快捷工具筛选">
+          {([
+            ['all', '全部', views.length],
+            ['favorites', '收藏', favoriteViews.length],
+            ['frequent', '常用', frequentViews.length],
+          ] as const).map(([value, label, count]) => (
+            <button
+              key={value}
+              type="button"
+              className={filter === value ? 'active' : ''}
+              aria-pressed={filter === value}
+              onClick={() => setFilter(value)}
+            >
+              {label}<span>{count}</span>
+            </button>
+          ))}
+        </div>
+        <div className="quick-access-dialog-list" role="list" aria-label="插件工具">
+          {visibleViews.map(view => {
+            const key = quickAccessKey(view);
+            const Icon = quickViewIcon(view.icon);
+            const favorite = favorites.has(key);
+            const viewUsage = usage[key];
+            return (
+              <div className="quick-access-dialog-row" role="listitem" key={key} data-quick-access-key={key}>
+                <button type="button" className="quick-access-dialog-row-main" data-quick-row-main onClick={() => onOpen(view)}>
+                  <span className="quick-access-dialog-row-icon"><Icon size={18} strokeWidth={1.8} aria-hidden="true" /></span>
+                  <span className="quick-access-dialog-row-copy"><strong>{quickViewLabel(view)}</strong><small>{view.plugin_name} · {view.title}</small></span>
+                </button>
+                <span className="quick-access-dialog-row-meta">
+                  {favorite ? <span className="quick-access-dialog-tag favorite"><Star size={11} fill="currentColor" aria-hidden="true" />收藏</span> : null}
+                  {viewUsage?.count ? <span className="quick-access-dialog-tag">使用 {viewUsage.count} 次</span> : null}
+                </span>
+                <button
+                  type="button"
+                  className={`quick-access-favorite-button${favorite ? ' active' : ''}`}
+                  aria-label={favorite ? `取消收藏 ${quickViewLabel(view)}` : `收藏 ${quickViewLabel(view)}`}
+                  aria-pressed={favorite}
+                  title={favorite ? '取消收藏' : '收藏'}
+                  onClick={() => onToggleFavorite(view)}
+                >
+                  <Star size={16} fill={favorite ? 'currentColor' : 'none'} aria-hidden="true" />
+                </button>
+              </div>
+            );
+          })}
+          {!visibleViews.length ? (
+            <div className="quick-access-dialog-empty">
+              {filter === 'favorites' ? <Star size={24} aria-hidden="true" /> : filter === 'frequent' ? <Clock3 size={24} aria-hidden="true" /> : <Search size={24} aria-hidden="true" />}
+              <strong>{query ? '没有匹配的工具' : filter === 'favorites' ? '还没有收藏' : filter === 'frequent' ? '还没有常用记录' : '没有可用工具'}</strong>
+              <span>{query ? '换个关键词，或清空搜索查看全部入口。' : filter === 'favorites' ? '点击工具右侧的星标即可固定到顶部。' : '打开工具后会自动记录使用频次。'}</span>
+            </div>
+          ) : null}
+        </div>
+        <footer className="quick-access-dialog-foot">
+          <span>{visibleViews.length} / {views.length} 个入口</span>
+          <span>Enter 打开首个结果 · Esc 关闭</span>
+        </footer>
+      </section>
+    </div>
+  );
+}
 type MenuKey = 'agent' | 'view' | 'help';
 
 function AppMenuBar({ currentPage, inboxCount, agentVersion, updateBusy, dashboardEnabled, currentTask, activeRunCount, sidebarCollapsed, onToggleSidebar, onNavigate, onOpenDashboard, onOpenBuiltinAi, onCheckUpdate, onOpenAgentDirectory, onQuit }: Pick<ShellProps, 'currentPage' | 'agentVersion' | 'updateBusy' | 'dashboardEnabled' | 'currentTask' | 'activeRunCount' | 'onNavigate' | 'onOpenDashboard' | 'onOpenBuiltinAi' | 'onCheckUpdate' | 'onOpenAgentDirectory' | 'onQuit'> & { inboxCount: number; sidebarCollapsed: boolean; onToggleSidebar: () => void }) {
@@ -285,10 +472,37 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
     }
   });
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [quickAccessOpen, setQuickAccessOpen] = useState(false);
+  const [favoriteQuickAccessKeys, setFavoriteQuickAccessKeys] = useState<string[]>(readQuickAccessFavorites);
+  const [quickAccessUsage, setQuickAccessUsage] = useState<QuickAccessUsage>(readQuickAccessUsage);
   const sidebarNavRef = useRef<HTMLElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
-  const visibleQuickPluginViews = quickPluginViews.slice(0, 4);
-  const hasMoreQuickPluginViews = quickPluginViews.length > visibleQuickPluginViews.length;
+  const quickAccessTriggerRef = useRef<HTMLButtonElement>(null);
+  const favoriteQuickAccessSet = useMemo(() => new Set(favoriteQuickAccessKeys), [favoriteQuickAccessKeys]);
+  const visibleQuickPluginViews = useMemo(() => {
+    const selected: PluginQuickAccessView[] = [];
+    const seen = new Set<string>();
+    const add = (view: PluginQuickAccessView) => {
+      const key = quickAccessKey(view);
+      if (seen.has(key) || selected.length >= QUICK_ACCESS_VISIBLE_LIMIT) return;
+      seen.add(key);
+      selected.push(view);
+    };
+    quickPluginViews.filter(view => favoriteQuickAccessSet.has(quickAccessKey(view))).forEach(add);
+    quickPluginViews
+      .filter(view => (quickAccessUsage[quickAccessKey(view)]?.count || 0) > 0)
+      .sort((left, right) => {
+        const leftUsage = quickAccessUsage[quickAccessKey(left)];
+        const rightUsage = quickAccessUsage[quickAccessKey(right)];
+        return rightUsage.count - leftUsage.count
+          || rightUsage.lastUsed - leftUsage.lastUsed
+          || compareQuickViews(left, right);
+      })
+      .forEach(add);
+    [...quickPluginViews].sort(compareQuickViews).forEach(add);
+    return selected;
+  }, [favoriteQuickAccessSet, quickAccessUsage, quickPluginViews]);
+  const quickAccessCountLabel = quickPluginViews.length > 99 ? '99+' : String(quickPluginViews.length);
   // 常驻运行条优先跟随工作台任务；没有工作台任务时跟随本机在跑的第一个运行，
   // 这样未连接工作台（独立模式）时也能看到「有东西正在执行」和已运行时长。
   const localRun = dashboardEnabled && currentTask ? null : activeRun;
@@ -305,6 +519,20 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
       // Local storage may be unavailable in restricted webview profiles.
     }
   }, [sidebarCollapsed]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(QUICK_ACCESS_FAVORITES_KEY, JSON.stringify(favoriteQuickAccessKeys));
+    } catch {
+      // Favorites remain usable in memory if the webview blocks storage.
+    }
+  }, [favoriteQuickAccessKeys]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(QUICK_ACCESS_USAGE_KEY, JSON.stringify(quickAccessUsage));
+    } catch {
+      // Usage ordering remains usable in memory if the webview blocks storage.
+    }
+  }, [quickAccessUsage]);
   useEffect(() => {
     const closeOnPointerDown = (event: PointerEvent) => {
       if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false);
@@ -336,13 +564,35 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
     setAccountMenuOpen(false);
     action();
   };
+  const recordQuickAccessUse = (view: PluginQuickAccessView) => {
+    const key = quickAccessKey(view);
+    setQuickAccessUsage(current => {
+      const previous = current[key];
+      return {
+        ...current,
+        [key]: {
+          count: Math.min((previous?.count || 0) + 1, 9999),
+          lastUsed: Date.now(),
+        },
+      };
+    });
+  };
+  const openQuickAccessView = (view: PluginQuickAccessView) => {
+    recordQuickAccessUse(view);
+    setQuickAccessOpen(false);
+    onOpenPluginView(view.plugin_id, view.view_id);
+  };
+  const toggleQuickAccessFavorite = (view: PluginQuickAccessView) => {
+    const key = quickAccessKey(view);
+    setFavoriteQuickAccessKeys(current => current.includes(key) ? current.filter(item => item !== key) : [...current, key]);
+  };
   const openDashboardAccount = () => {
     onNavigate('dashboard');
     window.setTimeout(() => document.getElementById('account-authorization')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
   };
   // The rail is narrow, so the account row keeps a short name and a one-word
   // state while the wider account popover carries the fuller wording.
-  const accountName = dashboardEnabled ? (identity?.authorized ? identity.user_name || 'HiMind 账号' : 'HiMind 账号') : '独立运行';
+  const accountName = dashboardEnabled ? (identity?.authorized ? identity.user_name || 'HiMind 账号' : 'HiMind 账号') : '本机运行';
   const accountStatus = dashboardEnabled ? (identity?.authorized ? '已连接' : '未连接') : '服务就绪';
   const accountDetail = dashboardEnabled ? (identity?.authorized ? '当前工作台账号' : '尚未连接工作台账号') : '本机服务已就绪';
   const accountHealthy = !dashboardEnabled || Boolean(identity?.authorized);
@@ -399,7 +649,7 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
               <div className="sidebar-account-menu-separator" role="separator" />
               {dashboardEnabled ? <button type="button" role="menuitem" onClick={() => runAccountAction(openDashboardAccount)}>
                 <CircleUserRound size={17} aria-hidden="true" />
-                <span><strong>账号与工作台</strong><small>管理账号连接和工作区</small></span>
+                <span><strong>账号与凭据</strong><small>管理工作台、插件和服务凭据</small></span>
               </button> : null}
               <button type="button" role="menuitem" className={currentPage === 'settings' || currentPage === 'ai' || currentPage === 'logs' ? 'active' : ''} onClick={() => runAccountAction(onOpenSettings)}>
                 <Settings size={17} aria-hidden="true" />
@@ -417,24 +667,52 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
                 {visibleQuickPluginViews.map(view => {
                   const Icon = quickViewIcon(view.icon);
                   const label = quickViewLabel(view);
+                  const key = quickAccessKey(view);
+                  const favorite = favoriteQuickAccessSet.has(key);
                   const accessibleLabel = `${view.plugin_name} · ${view.title}`;
                   return (
                     <button
                       type="button"
-                      key={`${view.plugin_id}:${view.view_id}`}
-                      className="quick-access-button"
-                      onClick={() => onOpenPluginView(view.plugin_id, view.view_id)}
+                      key={key}
+                      className={`quick-access-button${favorite ? ' is-favorite' : ''}`}
+                      data-quick-access-key={key}
+                      onClick={() => openQuickAccessView(view)}
                       aria-label={accessibleLabel}
-                      title={accessibleLabel}
+                      title={favorite ? `已收藏 · ${accessibleLabel}` : accessibleLabel}
                     >
                       <Icon size={17} strokeWidth={1.8} aria-hidden="true" />
                       <span className="quick-access-button-label">{label}</span>
+                      {favorite ? <Star className="quick-access-favorite-mark" size={10} fill="currentColor" aria-hidden="true" /> : null}
                     </button>
                   );
                 })}
-                {hasMoreQuickPluginViews ? <button type="button" className="quick-access-button" onClick={() => onNavigate({ page: 'installed', kind: 'plugin' })} aria-label="打开更多插件工具" title="打开更多插件工具"><LayoutGrid size={17} strokeWidth={1.8} aria-hidden="true" /><span className="quick-access-button-label">更多工具</span></button> : null}
               </div>
+              <button
+                ref={quickAccessTriggerRef}
+                type="button"
+                className="quick-access-button quick-access-all-button"
+                onClick={() => setQuickAccessOpen(true)}
+                aria-label="打开全部工具并搜索"
+                aria-haspopup="dialog"
+                aria-expanded={quickAccessOpen}
+                title="搜索、收藏和管理全部插件工具"
+              >
+                <Search size={17} strokeWidth={1.8} aria-hidden="true" />
+                <span className="quick-access-button-label">全部工具</span>
+                <span className="quick-access-count" aria-hidden="true">{quickAccessCountLabel}</span>
+              </button>
             </div>
+          ) : null}
+          {quickAccessOpen ? (
+            <QuickAccessDialog
+              views={quickPluginViews}
+              favorites={favoriteQuickAccessSet}
+              usage={quickAccessUsage}
+              onToggleFavorite={toggleQuickAccessFavorite}
+              onOpen={openQuickAccessView}
+              onClose={() => setQuickAccessOpen(false)}
+              returnFocusRef={quickAccessTriggerRef}
+            />
           ) : null}
           <div className="main-content">
             {currentPage === 'builtin-ai' ? null : dashboardEnabled && currentTask ? (

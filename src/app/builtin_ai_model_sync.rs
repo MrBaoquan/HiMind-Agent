@@ -80,7 +80,7 @@ impl BuiltinAiModelSync {
 }
 
 fn require_dashboard_model_sync(options: &Options) -> Result<(), String> {
-    if options.mode().dashboard_enabled() {
+    if crate::app::control_plane_provider::available(options) {
         Ok(())
     } else {
         Err(crate::app::runtime_mode::control_plane_required_error())

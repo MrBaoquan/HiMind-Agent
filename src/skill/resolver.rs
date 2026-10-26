@@ -404,6 +404,7 @@ mod tests {
 
     fn manifest(capabilities: Vec<SkillCapabilityDependency>) -> SkillManifest {
         SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.test".to_string(),
             name: "测试技能".to_string(),
             author: "测试作者".to_string(),

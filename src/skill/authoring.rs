@@ -152,6 +152,7 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
         version: input.version.trim().to_string(),
         scope: SkillScope::Organization,
         description: input.description.trim().to_string(),
+        icon: String::new(),
         release_notes: input.release_notes.trim().to_string(),
         min_agent_version: input.min_agent_version.trim().to_string(),
         supported_clients: input.supported_clients,

@@ -1,18 +1,16 @@
-import { useEffect, useState } from 'react';
-import { ArrowUpRight, Cloud, KeyRound, MoreHorizontal, PencilLine, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { ArrowUpRight, Cloud, KeyRound, MoreHorizontal, PencilLine, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2, Unplug, X } from 'lucide-react';
 import type { DashboardAuthorizationProgress, DashboardIdentityStatus, WorkbenchConnection, WorkbenchConnectionsSnapshot, WorkbenchProbe } from '../services/agentApi';
 import { ActionMenu, ActionMenuItem } from './ActionMenu';
 import { BusyIndicator } from './BusyIndicator';
 import { IconButton, Pill } from './Common';
+import { useModalFocus } from './useModalFocus';
 
 export type WorkbenchConnectionDraft = {
   displayName: string;
   apiBase: string;
-  purpose: string;
   enrollmentToken: string;
 };
-
-const PURPOSE_PRESETS = ['生产环境', '开发环境'];
 
 /** 连接状态只说事实：本机有没有这台工作台的 Agent 身份、有没有登录账号。 */
 function connectionState(connection: WorkbenchConnection): { label: string; kind: 'success' | 'warn' | 'neutral' } {
@@ -37,7 +35,7 @@ type WorkbenchConnectionsPanelProps = {
   busyId: string;
   onRefresh: () => void;
   onAdd: (draft: WorkbenchConnectionDraft) => Promise<void>;
-  onRename: (id: string, displayName: string, purpose: string) => Promise<void>;
+  onRename: (id: string, displayName: string) => Promise<void>;
   onRemove: (connection: WorkbenchConnection) => void;
   onSwitch: (connection: WorkbenchConnection) => void;
   onEnroll: (id: string, enrollmentToken: string) => Promise<void>;
@@ -97,16 +95,12 @@ export function WorkbenchConnectionsPanel({
       : { label: snapshot ? '未连接' : '读取中', kind: 'neutral' as const };
 
   return (
-    <section className="card settings-section workbench-connections" id="workbench-connections">
+    <section className="card settings-section workbench-connections" id="workbench-connections" aria-labelledby="workbench-account-title">
       <div className="card-header">
-        <span>HiMind 账号</span>
+        <h2 id="workbench-account-title">工作台账号</h2>
         <Pill kind={headerState.kind}>{headerState.label}</Pill>
       </div>
       <div className="credential-section">
-        <div className="credential-heading">
-          <span>工作台连接</span>
-          <span className="credential-heading-note">本机能力只有一份，账号按工作台各存一份</span>
-        </div>
         {error ? (
           // 读不出来时给出可执行的下一步，而不是让「读取中」一直转下去。
           <div className="blocker account-blocker" role="alert">
@@ -149,7 +143,7 @@ export function WorkbenchConnectionsPanel({
         )}
         <div className="security-note compact">
           <ShieldCheck size={16} />
-          <span>连接后接收该工作台派发的任务并同步运行记录；切换不影响本机能力与凭据。</span>
+          <span>连接后可接收工作台任务并同步运行记录；切换不会影响本机 AI、技能和插件。</span>
         </div>
       </div>
       {addOpen ? <AddConnectionDialog onClose={() => setAddOpen(false)} onProbe={onProbe} onSubmit={onAdd} /> : null}
@@ -198,7 +192,6 @@ function ConnectionRow({
         <div className="workbench-connection-title">
           <strong>{connection.display_name || connection.api_base}</strong>
           {connection.active ? <span className="workbench-connection-active">当前</span> : null}
-          {connection.purpose ? <span className="workbench-connection-purpose">{connection.purpose}</span> : null}
         </div>
         <small title={detail}>{detail}</small>
       </div>
@@ -207,7 +200,10 @@ function ConnectionRow({
         {connection.active ? (
           connection.authorized
             ? <button type="button" className="btn btn-danger-quiet" disabled={disabled || flowActive} onClick={onRevoke}>{rowBusy || flowActive ? <BusyIndicator size={15} /> : null}取消授权</button>
-            : <button type="button" className="btn btn-primary" disabled={disabled || flowActive || (connection.registered && authorizeDisabled)} onClick={() => connection.registered ? onAuthorize(connection) : onOpenBindingPage(connection.id)}>{rowBusy ? <BusyIndicator size={15} /> : null}授权</button>
+            : <>
+                <button type="button" className="btn btn-danger-quiet" title="停止对接 AI 工作台，保留本机能力" disabled={disabled || flowActive} onClick={onRevoke}><Unplug size={15} />停止对接</button>
+                <button type="button" className="btn btn-primary" disabled={disabled || flowActive || (connection.registered && authorizeDisabled)} onClick={() => connection.registered ? onAuthorize(connection) : onOpenBindingPage(connection.id)}>{rowBusy ? <BusyIndicator size={15} /> : null}授权</button>
+              </>
         ) : connection.registered ? (
           <button type="button" className="btn" disabled={disabled} onClick={() => onSwitch(connection)}>{rowBusy ? <BusyIndicator size={15} /> : null}切换</button>
         ) : (
@@ -220,10 +216,8 @@ function ConnectionRow({
               <ActionMenuItem icon={<KeyRound size={15} />} label="手填授权码" onClick={() => { close(); onEnroll(); }} />
               <ActionMenuItem
                 icon={<Trash2 size={15} />}
-                label="移除"
+                label={connection.active ? '移除当前连接' : '移除'}
                 danger
-                disabled={connection.active}
-                title={connection.active ? '当前使用中的工作台不能移除' : undefined}
                 onClick={() => { close(); onRemove(); }}
               />
             </>
@@ -245,16 +239,16 @@ function AddConnectionDialog({
 }) {
   const [apiBase, setApiBase] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [purpose, setPurpose] = useState(PURPOSE_PRESETS[0]);
-  const [customPurpose, setCustomPurpose] = useState('');
   const [enrollmentToken, setEnrollmentToken] = useState('');
   const [probe, setProbe] = useState<WorkbenchProbe | null>(null);
   const [probing, setProbing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const firstInputRef = useRef<HTMLInputElement>(null);
+  useModalFocus(dialogRef, true, onClose, firstInputRef);
 
   const address = apiBase.trim();
-  const resolvedPurpose = purpose === '自定义' ? customPurpose.trim() : purpose;
 
   const test = async () => {
     if (!address) return;
@@ -271,14 +265,13 @@ function AddConnectionDialog({
   };
 
   const submit = async () => {
-    if (!address || !displayName.trim()) return;
+    if (!address) return;
     setSubmitting(true);
     setError('');
     try {
       await onSubmit({
         apiBase: address,
         displayName: displayName.trim(),
-        purpose: resolvedPurpose,
         enrollmentToken: enrollmentToken.trim(),
       });
       onClose();
@@ -291,7 +284,7 @@ function AddConnectionDialog({
 
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal workbench-connection-modal" role="dialog" aria-modal="true" aria-labelledby="workbench-add-title" onClick={event => event.stopPropagation()}>
+      <div ref={dialogRef} className="modal workbench-connection-modal" role="dialog" aria-modal="true" tabIndex={-1} aria-labelledby="workbench-add-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header">
           <div><h3 id="workbench-add-title">连接工作台</h3><p>填地址连接，之后在工作台点一下完成授权。</p></div>
           <IconButton icon={X} label="关闭" onClick={onClose} />
@@ -299,7 +292,7 @@ function AddConnectionDialog({
         <div className="modal-body">
           <div className="field-group">
             <label className="field-label" htmlFor="workbench-api-base">工作台地址</label>
-            <input id="workbench-api-base" autoComplete="off" placeholder="http://localhost:8080" value={apiBase} disabled={submitting} onChange={event => { setApiBase(event.target.value); setProbe(null); }} />
+            <input ref={firstInputRef} id="workbench-api-base" autoComplete="off" placeholder="http://localhost:8080" value={apiBase} disabled={submitting} onChange={event => { setApiBase(event.target.value); setProbe(null); }} />
             <p className="field-hint">工作台首页地址即可，不要带路径。</p>
             <div className="actions-row" style={{ marginTop: 8 }}>
               <button type="button" className="btn" disabled={!address || probing || submitting} onClick={() => void test()}>{probing ? <BusyIndicator size={15} /> : null}测试连接</button>
@@ -307,29 +300,20 @@ function AddConnectionDialog({
             </div>
           </div>
           <div className="field-group">
-            <label className="field-label" htmlFor="workbench-display-name">名称</label>
-            <input id="workbench-display-name" autoComplete="off" placeholder="例如：公司工作台" value={displayName} disabled={submitting} onChange={event => setDisplayName(event.target.value)} />
+            <label className="field-label" htmlFor="workbench-display-name">名称（可选）</label>
+            <input id="workbench-display-name" autoComplete="off" placeholder="留空时使用工作台地址" value={displayName} disabled={submitting} onChange={event => setDisplayName(event.target.value)} />
           </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor="workbench-purpose">用途</label>
-            <div className="segmented-control" role="group" aria-label="工作台用途">
-              {[...PURPOSE_PRESETS, '自定义'].map(option => (
-                <button key={option} type="button" className={purpose === option ? 'active' : ''} disabled={submitting} onClick={() => setPurpose(option)}>{option}</button>
-              ))}
-            </div>
-            {purpose === '自定义' ? <input style={{ marginTop: 8 }} autoComplete="off" placeholder="例如：测试环境" value={customPurpose} disabled={submitting} onChange={event => setCustomPurpose(event.target.value)} /> : null}
-          </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor="workbench-enrollment-token">授权码（可选）</label>
+          <details className="field-group">
+            <summary className="field-hint">有工作台提供的授权码</summary>
             <input id="workbench-enrollment-token" autoComplete="off" placeholder="由工作台或管理员签发" value={enrollmentToken} disabled={submitting} onChange={event => setEnrollmentToken(event.target.value)} />
             <p className="field-hint">留空即可，连接后在工作台点一下即可授权。</p>
-          </div>
+          </details>
           {error ? <div className="inline-feedback visible workbench-connection-error" role="alert">{error}</div> : null}
           <div className="modal-actions">
             <span />
             <div className="actions-row">
               <button type="button" className="btn" disabled={submitting} onClick={onClose}>取消</button>
-              <button type="button" className="btn btn-primary" disabled={!address || !displayName.trim() || submitting} onClick={() => void submit()}>{submitting ? <BusyIndicator size={15} /> : null}连接</button>
+              <button type="button" className="btn btn-primary" disabled={!address || submitting} onClick={() => void submit()}>{submitting ? <BusyIndicator size={15} /> : null}连接</button>
             </div>
           </div>
         </div>
@@ -345,19 +329,21 @@ function RenameConnectionDialog({
 }: {
   connection: WorkbenchConnection;
   onClose: () => void;
-  onSubmit: (id: string, displayName: string, purpose: string) => Promise<void>;
+  onSubmit: (id: string, displayName: string) => Promise<void>;
 }) {
   const [displayName, setDisplayName] = useState(connection.display_name);
-  const [purpose, setPurpose] = useState(connection.purpose);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const firstInputRef = useRef<HTMLInputElement>(null);
+  useModalFocus(dialogRef, true, onClose, firstInputRef);
 
   const submit = async () => {
     if (!displayName.trim()) return;
     setSubmitting(true);
     setError('');
     try {
-      await onSubmit(connection.id, displayName.trim(), purpose.trim());
+      await onSubmit(connection.id, displayName.trim());
       onClose();
     } catch (cause) {
       setError(failureText(cause, '保存失败'));
@@ -368,7 +354,7 @@ function RenameConnectionDialog({
 
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal workbench-connection-modal" role="dialog" aria-modal="true" aria-labelledby="workbench-rename-title" onClick={event => event.stopPropagation()}>
+      <div ref={dialogRef} className="modal workbench-connection-modal" role="dialog" aria-modal="true" tabIndex={-1} aria-labelledby="workbench-rename-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header">
           <div><h3 id="workbench-rename-title">重命名工作台</h3><p>{connection.api_base}</p></div>
           <IconButton icon={PencilLine} label="关闭" onClick={onClose} />
@@ -376,11 +362,7 @@ function RenameConnectionDialog({
         <div className="modal-body">
           <div className="field-group">
             <label className="field-label" htmlFor="workbench-rename-name">名称</label>
-            <input id="workbench-rename-name" autoComplete="off" value={displayName} disabled={submitting} onChange={event => setDisplayName(event.target.value)} />
-          </div>
-          <div className="field-group">
-            <label className="field-label" htmlFor="workbench-rename-purpose">用途</label>
-            <input id="workbench-rename-purpose" autoComplete="off" placeholder="例如：生产环境" value={purpose} disabled={submitting} onChange={event => setPurpose(event.target.value)} />
+            <input ref={firstInputRef} id="workbench-rename-name" autoComplete="off" value={displayName} disabled={submitting} onChange={event => setDisplayName(event.target.value)} />
           </div>
           {error ? <div className="inline-feedback visible workbench-connection-error" role="alert">{error}</div> : null}
           <div className="modal-actions">
@@ -412,6 +394,9 @@ function EnrollConnectionDialog({
   const [token, setToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const primaryActionRef = useRef<HTMLButtonElement>(null);
+  useModalFocus(dialogRef, true, onClose, primaryActionRef);
 
   // 绑定是在工作台页面里完成的，本机收不到本地事件 —— 弹窗打开期间定期刷新连接状态，
   // 用户在工作台点完就能看到这里翻成「已登记」。
@@ -436,7 +421,7 @@ function EnrollConnectionDialog({
 
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal workbench-connection-modal" role="dialog" aria-modal="true" aria-labelledby="workbench-enroll-title" onClick={event => event.stopPropagation()}>
+      <div ref={dialogRef} className="modal workbench-connection-modal" role="dialog" aria-modal="true" tabIndex={-1} aria-labelledby="workbench-enroll-title" onClick={event => event.stopPropagation()}>
         <div className="modal-header">
           <div><h3 id="workbench-enroll-title">授权到工作台</h3><p>{connection.api_base}</p></div>
           <IconButton icon={Cloud} label="关闭" onClick={onClose} />
@@ -446,7 +431,7 @@ function EnrollConnectionDialog({
             <p className="field-hint">在工作台点一下即可，授权码会自动回到本机。</p>
             <p className="field-hint">绑定完成后这里会自动更新，无需刷新。</p>
             <div className="actions-row">
-              <button type="button" className="btn btn-primary" disabled={submitting} onClick={() => onOpenBindingPage(connection.id)}><ArrowUpRight size={15} />打开工作台绑定本机</button>
+              <button ref={primaryActionRef} type="button" className="btn btn-primary" disabled={submitting} onClick={() => onOpenBindingPage(connection.id)}><ArrowUpRight size={15} />打开工作台绑定本机</button>
             </div>
           </div>
           <details className="field-group">

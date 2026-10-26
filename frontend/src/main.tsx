@@ -34,6 +34,8 @@ const TaskCenterPage = lazyNamed(() => import('./pages/TaskCenterPage'), 'TaskCe
 const WorkflowsPage = lazyNamed(() => import('./pages/WorkflowsPage'), 'WorkflowsPage');
 const SchedulesPage = lazyNamed(() => import('./pages/SchedulesPage'), 'SchedulesPage');
 import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
+
+import { hydrateWorkflowOptionSources } from './pages/workflowOptionSources';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -118,7 +120,7 @@ function settingsWindowQuery(): { panel: SettingsWindowPanel; section: SettingsS
       panel: route.panel,
       section: route.section,
       tab: route.tab,
-      aiTab: aiTab === 'services' || aiTab === 'acp' ? aiTab : 'mcp',
+      aiTab: aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp' ? aiTab : 'mcp',
     };
   } catch {
     return null;
@@ -339,7 +341,12 @@ function AgentApp() {
   function dashboardEnabled() {
     const current = statusRef.current || status;
     if (!current) return false;
-    return current.mode !== 'independent' && current.dashboard_enabled !== false;
+    return current.provider?.available ?? (current.mode !== 'independent' && current.dashboard_enabled !== false);
+  }
+  function workbenchEnabled() {
+    const current = statusRef.current || status;
+    if (!current) return false;
+    return current.provider?.enabled_by_user ?? (current.mode !== 'independent' && current.dashboard_enabled !== false);
   }
   function extensionMarketEnabled() {
     return dashboardEnabled() || extensionSources.sources.some(source => source.enabled);
@@ -557,7 +564,7 @@ function AgentApp() {
     return singleFlight('settings-page', async () => {
       setSettingsLoading(true);
       setSettingsLoadError('');
-      const independent = statusRef.current?.mode === 'independent' || statusRef.current?.dashboard_enabled === false;
+      const independent = !dashboardEnabled();
       // 账号设置页的主数据是连接清单，和审批设置并行拉，谁先到谁先渲染。
       void refreshWorkbenchConnections();
       // 更新状态也要在这里取：主窗口的 refreshInitialPage 和 60 秒更新轮询都对设置
@@ -724,7 +731,8 @@ function AgentApp() {
     return singleFlight('workflow-center', async () => {
       setWorkflowLoading(true);
       try {
-        const next = await withTimeout(agentApi.workflowCenter(light), '工作流中心');
+        const snapshot = await withTimeout(agentApi.workflowCenter(light), '工作流中心');
+        const next = light ? snapshot : await hydrateWorkflowOptionSources(snapshot, agentApi.resolveWorkflowOptionSource);
         workflowCenterFailures.current = 0;
         setWorkflowError('');
         // 轻量快照不包含目录、工作流定义或投影明细。保留完整快照，
@@ -1146,7 +1154,7 @@ function AgentApp() {
       const route = settingsRoute(event.payload);
       setSettingsSection(route.section);
       setSettingsTab(route.tab);
-      if (aiTab === 'mcp' || aiTab === 'services' || aiTab === 'acp') setAiConnectionsTab(aiTab);
+      if (aiTab === 'mcp' || aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp') setAiConnectionsTab(aiTab);
       setPage(route.panel);
     }).then(remove => { unlisten = remove; }).catch(error => console.error('设置窗口导航监听失败', error));
     return () => unlisten?.();
@@ -1329,7 +1337,10 @@ function AgentApp() {
   }, [pluginSubmissions, skillSubmissions]);
 
   useEffect(() => {
-    if (!dashboardEnabled() || (dashboardAuthorization?.state !== 'starting' && dashboardAuthorization?.state !== 'pending')) return;
+    // Authorization may be started while the Agent is still independent. The
+    // backend switches modes only after success, so polling must follow the
+    // flow itself rather than the current Agent mode.
+    if (dashboardAuthorization?.state !== 'starting' && dashboardAuthorization?.state !== 'pending') return;
     let stopped = false;
     const timer = window.setInterval(async () => {
       if (stopped) return;
@@ -1339,7 +1350,7 @@ function AgentApp() {
         if (progress.state === 'authorized') {
           stopped = true;
           window.clearInterval(timer);
-          await Promise.all([refreshDashboardIdentity(), refreshWorkbenchConnections()]);
+          await Promise.all([refreshStatus(), refreshDashboardIdentity(), refreshWorkbenchConnections()]);
           notify('success', progress.user_name ? `已登录工作台账号：${progress.user_name}` : '工作台账号授权成功');
         } else if (['denied', 'expired', 'failed', 'canceled'].includes(progress.state)) {
           stopped = true;
@@ -1366,7 +1377,7 @@ function AgentApp() {
   // React 状态，互不可见。只在"发起授权的那个窗口"轮询的话，另一个窗口会一直停在
   // 「授权」不刷新 —— 用户看到的就是"授权完了还显示授权"。
   useEffect(() => {
-    if (!dashboardEnabled()) return;
+    if (!workbenchEnabled()) return;
     let stopped = false;
     const timer = window.setInterval(() => {
       if (stopped) return;
@@ -1660,17 +1671,21 @@ function AgentApp() {
 
   async function revokeDashboardAuthorization() {
     if (aiOperation) return;
+    const authorized = Boolean(dashboardIdentity?.authorized);
     if (!await confirm({
-      title: '取消 HiMind 账号授权？',
-        description: '取消后不再接收工作台任务与运行记录；本机能力不受影响，设备注册需在组织侧解除。',
-      confirmText: '取消授权',
+      title: authorized ? '取消 HiMind 账号授权？' : '停止工作台对接？',
+      description: authorized
+        ? '取消后不再接收工作台任务与运行记录；本机能力不受影响，设备注册需在组织侧解除。'
+        : '停止后不再接收工作台任务或同步运行记录。',
+      confirmText: authorized ? '取消授权' : '停止对接',
     })) return;
     setAiOperation('identity');
     try {
-      await agentApi.revokeDashboardAuthorization();
+      const result = await agentApi.revokeDashboardAuthorization();
       setDashboardAuthorization(null);
-      await Promise.all([refreshDashboardIdentity(), refreshWorkbenchConnections()]);
-      notify('success', '已取消工作台账号授权');
+      await Promise.allSettled([refreshStatus(), refreshDashboardIdentity(), refreshWorkbenchConnections()]);
+      if (result.warning) notify('info', result.warning);
+      else notify('success', authorized ? '已取消工作台账号授权' : '已停止工作台对接');
     } catch (error) {
       notify('error', friendlyConnectionError(error, '暂时无法取消工作台账号授权，请稍后重试。'));
     } finally {
@@ -1733,7 +1748,7 @@ function AgentApp() {
   async function addWorkbenchConnection(draft: WorkbenchConnectionDraft) {
     setWorkbenchBusyId('add');
     try {
-      const next = await agentApi.addWorkbenchConnection(draft.apiBase, draft.displayName, draft.purpose);
+      const next = await agentApi.addWorkbenchConnection(draft.apiBase, draft.displayName);
       setWorkbenchConnections(next);
       const token = draft.enrollmentToken.trim();
       if (!token) {
@@ -1774,10 +1789,10 @@ function AgentApp() {
     }
   }
 
-  async function renameWorkbenchConnection(id: string, displayName: string, purpose: string) {
+  async function renameWorkbenchConnection(id: string, displayName: string) {
     setWorkbenchBusyId(`rename:${id}`);
     try {
-      setWorkbenchConnections(await agentApi.renameWorkbenchConnection(id, displayName, purpose));
+      setWorkbenchConnections(await agentApi.renameWorkbenchConnection(id, displayName));
     } catch (error) {
       throw new Error(formatError(error, '保存工作台名称失败'));
     } finally {
@@ -1789,12 +1804,29 @@ function AgentApp() {
     if (workbenchBusyId) return;
     if (!await confirm({
       title: `移除工作台「${connection.display_name || connection.api_base}」？`,
-      description: '只删除这台电脑上的连接记录，工作台侧不受影响。',
-      confirmText: '移除',
+      description: connection.active
+        ? '会清除这条连接在本机的账号凭据；如果还有其它连接，将自动切换过去。工作台侧不受影响。'
+        : '只删除这台电脑上的连接记录，工作台侧不受影响。',
+      confirmText: connection.active ? '移除当前连接' : '移除',
     })) return;
     setWorkbenchBusyId(`remove:${connection.id}`);
     try {
-      setWorkbenchConnections(await agentApi.removeWorkbenchConnection(connection.id));
+      let next: WorkbenchConnectionsSnapshot;
+      try {
+        next = await agentApi.removeWorkbenchConnection(connection.id);
+      } catch (error) {
+        const detail = errorDetail(error);
+        if (!connection.active || !detail.startsWith('WORKBENCH_BUSY')) throw error;
+        const reason = detail.replace(/^WORKBENCH_BUSY:\s*/, '');
+        if (!await confirm({
+          title: '仍要移除当前工作台？',
+          description: `${reason}。移除会中断这个任务。`,
+          confirmText: '仍然移除',
+        })) return;
+        next = await agentApi.removeWorkbenchConnection(connection.id, true);
+      }
+      setWorkbenchConnections(next);
+      if (connection.active) await refreshAfterWorkbenchChange();
       notify('success', '已移除工作台连接');
     } catch (error) {
       notify('error', formatError(error, '移除工作台失败'));
@@ -1921,7 +1953,7 @@ function AgentApp() {
   // the iframe on every navigation loses the runtime's browser state and
   // forces a full session reload when the user comes back.
   const builtinAiContent = <BuiltinAiPage
-      independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false}
+      independentMode={!dashboardEnabled()}
       identity={dashboardIdentity}
       authorization={dashboardAuthorization}
       authorizationBusy={aiOperation === 'identity'}
@@ -2020,12 +2052,14 @@ function AgentApp() {
       localUsageBusy={localUsageBusy}
       inferenceGateway={inferenceGateway}
       identity={dashboardIdentity}
+      providerStatus={status?.provider ?? null}
       authorization={dashboardAuthorization}
       identityBusy={aiOperation === 'identity'}
       updateStatus={updateStatus}
       updateBusy={updateBusy}
       projectionRequeueBusy={projectionRequeueBusy}
       onOpenDashboard={() => run(agentApi.openDashboard)}
+      onOpenWorkbenchSettings={() => openSettingsWindow('settings', 'accounts')}
       onRequeueProjectionDeadLetters={requeueProjectionDeadLetters}
       onStartAuthorization={startDashboardAuthorization}
       onStartEnrollment={() => run(() => agentApi.openWorkbenchAgentBindingPage())}
@@ -2105,7 +2139,7 @@ function AgentApp() {
       onOpenWorkflowRun={(runId) => navigate({ page: 'workflows', runId })}
       onOpenApprovalHistory={() => navigate('approvals')}
     />;
-    if (page === 'approvals') return <ApprovalsPage independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} approvals={approvals} history={approvalHistory} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} onOpenSettings={() => openSettingsWindow('settings', 'approval')} />;
+    if (page === 'approvals') return <ApprovalsPage independentMode={!dashboardEnabled()} approvals={approvals} history={approvalHistory} onRefresh={() => run(refreshApprovals)} onRespond={(id, approved) => run(async () => { await agentApi.respondApproval(id, approved); await refreshApprovals(); await refreshStatus(); }, undefined, '审批处理失败')} onOpenSettings={() => openSettingsWindow('settings', 'approval')} />;
     if (page === 'tasks') return <TaskCenterPage
       dashboardEnabled={dashboardEnabled()}
       currentTask={status?.current_task || null}
@@ -2593,7 +2627,7 @@ function AgentApp() {
     if (page === 'settings' && (!settings || !remoteExecutionSettings || !loginState)) {
       return <SettingsLoadState loading={settingsLoading} error={settingsLoadError} onRetry={refreshSettingsPageData} />;
     }
-      if (page === 'settings') return <SettingsPage section={settingsSection} tab={settingsTab} onTabChange={setSettingsTab} logs={logs} onExportDiagnostics={exportDiagnostics} identity={dashboardIdentity} onRevokeAuthorization={revokeDashboardAuthorization} workbenchConnections={workbenchConnections} workbenchConnectionsError={workbenchConnectionsError} workbenchBusyId={workbenchBusyId} workbenchAuthorization={dashboardAuthorization} onRefreshWorkbenchConnections={refreshWorkbenchConnections} onAddWorkbenchConnection={addWorkbenchConnection} onRenameWorkbenchConnection={renameWorkbenchConnection} onRemoveWorkbenchConnection={removeWorkbenchConnection} onSwitchWorkbenchConnection={switchWorkbenchConnection} onEnrollWorkbenchConnection={enrollWorkbenchConnection} onProbeWorkbenchConnection={probeWorkbenchConnection} onAuthorizeWorkbenchConnection={authorizeWorkbenchConnection} independentMode={status?.mode === 'independent' || status?.dashboard_enabled === false} settings={settings} remoteExecutionSettings={remoteExecutionSettings} remoteClients={remoteClients} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除内网账号', '清除内网账号失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRemoteExecutionChange={(next, confirmed) => run(async () => { await agentApi.saveRemoteExecutionSettings(next, confirmed); await refreshRemoteExecutionSettings(); await refreshLogs(); }, next.enabled ? '远程任务设置已更新' : '已关闭远程任务', '远程任务设置更新失败')} onRemoteClientsChange={setRemoteClients} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onApprovalProfileChange={(profile, confirmed, durationSeconds) => run(async () => { await agentApi.setApprovalProfile(profile, confirmed ?? false, durationSeconds); await refreshSettings(); await refreshLogs(); }, '审批档位已更新', '审批档位更新失败')} onApprovalNotificationModeChange={mode => run(async () => { await agentApi.setApprovalNotificationMode(mode); await refreshSettings(); }, '审批提醒方式已更新', '审批提醒方式更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} onUnityEditorSettingsChange={editors => setSettings(current => current ? { ...current, editors } : current)} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={testSvnConnection} svnTesting={svnTesting} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} updateStatus={updateStatus} updateBusy={updateBusy} onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')} onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)} onCancelUpdateDownload={cancelUpdateDownload} onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)} onUpdatePreferences={(autoCheck, autoDownload) => runUpdateOperation(() => agentApi.setUpdatePreferences(autoCheck, autoDownload))} />;
+      if (page === 'settings') return <SettingsPage section={settingsSection} tab={settingsTab} onTabChange={setSettingsTab} logs={logs} onExportDiagnostics={exportDiagnostics} identity={dashboardIdentity} onRevokeAuthorization={revokeDashboardAuthorization} workbenchConnections={workbenchConnections} workbenchConnectionsError={workbenchConnectionsError} workbenchBusyId={workbenchBusyId} workbenchAuthorization={dashboardAuthorization} onRefreshWorkbenchConnections={refreshWorkbenchConnections} onAddWorkbenchConnection={addWorkbenchConnection} onRenameWorkbenchConnection={renameWorkbenchConnection} onRemoveWorkbenchConnection={removeWorkbenchConnection} onSwitchWorkbenchConnection={switchWorkbenchConnection} onEnrollWorkbenchConnection={enrollWorkbenchConnection} onProbeWorkbenchConnection={probeWorkbenchConnection} onAuthorizeWorkbenchConnection={authorizeWorkbenchConnection} onOpenAiServices={() => { setPage('ai'); setAiConnectionsTab('services'); setSettingsSection('services'); setSettingsTab(null); }} independentMode={!dashboardEnabled()} settings={settings} remoteExecutionSettings={remoteExecutionSettings} remoteClients={remoteClients} loginState={loginState} loginModalOpen={loginModalOpen} loginUsername={loginUsername} loginPassword={loginPassword} onOpenLoginModal={openLoginModal} onCloseLoginModal={() => setLoginModalOpen(false)} onUsernameChange={setLoginUsername} onPasswordChange={setLoginPassword} onSaveLogin={() => run(async () => { await agentApi.saveLogin(loginUsername, loginPassword); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '内网账号已保存', '保存内网账号失败')} onLogoutLogin={() => run(async () => { await agentApi.logoutLogin(); setLoginPassword(''); setLoginModalOpen(false); await refreshStatus(); await refreshLogin(); await refreshLogs(); }, '已清除内网账号', '清除内网账号失败')} onOpenInnerAdmin={() => run(agentApi.openInnerAdmin)} onRemoteExecutionChange={(next, confirmed) => run(async () => { await agentApi.saveRemoteExecutionSettings(next, confirmed); await refreshRemoteExecutionSettings(); await refreshLogs(); }, next.enabled ? '远程任务设置已更新' : '已关闭远程任务', '远程任务设置更新失败')} onRemoteClientsChange={setRemoteClients} onRuleChange={(requestType, mode) => run(async () => { await agentApi.setRule(requestType, mode); await refreshSettings(); }, '审批规则已更新', '审批规则更新失败')} onApprovalProfileChange={(profile, confirmed, durationSeconds) => run(async () => { await agentApi.setApprovalProfile(profile, confirmed ?? false, durationSeconds); await refreshSettings(); await refreshLogs(); }, '审批档位已更新', '审批档位更新失败')} onApprovalNotificationModeChange={mode => run(async () => { await agentApi.setApprovalNotificationMode(mode); await refreshSettings(); }, '审批提醒方式已更新', '审批提醒方式更新失败')} onTimeoutChange={seconds => run(async () => { await agentApi.setTimeout(seconds); await refreshSettings(); }, '审批超时已更新', '审批超时更新失败')} onAutoStartChange={enabled => run(async () => { const result = await agentApi.setAutoStart(enabled); await refreshSettings(); await refreshLogs(); notify('success', result.auto_start ? '已启用开机自启' : '已关闭开机自启'); }, undefined, '开机自启更新失败')} onUnityEditorSettingsChange={editors => setSettings(current => current ? { ...current, editors } : current)} svnConnections={svnConnections} svnModalOpen={svnModalOpen} svnDraft={svnDraft} onOpenSvnModal={() => setSvnModalOpen(true)} onCloseSvnModal={() => setSvnModalOpen(false)} onSvnDraftChange={setSvnDraft} onSaveSvnConnection={() => run(async () => { await agentApi.saveSvnConnection(svnDraft); setSvnModalOpen(false); await refreshSvnConnections(); }, 'SVN 账号已保存', '保存 SVN 账号失败')} onTestSvnConnection={testSvnConnection} svnTesting={svnTesting} onRemoveSvnConnection={() => run(async () => { await agentApi.removeSvnConnection(); await refreshSvnConnections(); }, 'SVN 账号已删除', '删除 SVN 账号失败')} updateStatus={updateStatus} updateBusy={updateBusy} onCheckUpdate={() => runUpdateOperation(agentApi.checkUpdate, result => result.available_version ? `发现新版本 v${result.available_version}` : '当前已是最新版本')} onDownloadUpdate={() => runUpdateOperation(agentApi.downloadUpdate, result => `v${result.available_version} 更新已下载`)} onCancelUpdateDownload={cancelUpdateDownload} onInstallUpdate={() => runUpdateOperation(agentApi.installUpdate)} onUpdatePreferences={(autoCheck, autoDownload) => runUpdateOperation(() => agentApi.setUpdatePreferences(autoCheck, autoDownload))} />;
     // 到这里 page 只剩设置窗口的面板：设置、AI 连接。运行日志已经是页签，不再有独立页面。
     return null;
   })();

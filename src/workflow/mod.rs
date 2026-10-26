@@ -96,6 +96,9 @@ pub(crate) struct WorkflowPackage {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Optional package-local PNG/WebP path used as the extension brand icon.
+    #[serde(default)]
+    pub icon: String,
     /// 本版本更新说明，用于市场与更新日志展示。
     ///
     /// 与 `distribution_targets` 一样属于发布元数据，运行期不参与执行：Agent 在
@@ -451,6 +454,8 @@ enum WorkflowViewOption {
         value: String,
         #[serde(default)]
         label: String,
+        #[serde(default)]
+        topics: Vec<String>,
     },
 }
 
@@ -461,6 +466,27 @@ impl WorkflowViewOption {
             WorkflowViewOption::Labeled { value, .. } => value.as_str(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkflowViewOptionSource {
+    #[serde(default)]
+    pub(crate) kind: String,
+    pub(crate) capability_id: String,
+    #[serde(default)]
+    pub(crate) input: Value,
+    #[serde(default)]
+    pub(crate) items_path: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowViewBudget {
+    #[serde(default)]
+    max_queries: Option<u64>,
+    #[serde(default)]
+    interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -478,6 +504,10 @@ struct WorkflowViewFieldDefinition {
     #[serde(default)]
     options: Vec<WorkflowViewOption>,
     #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    option_source: Option<WorkflowViewOptionSource>,
+    #[serde(default)]
     placeholder: String,
     #[serde(default)]
     target: String,
@@ -488,6 +518,9 @@ struct WorkflowViewFieldDefinition {
     // hint 是字段级说明，用来解释默认值的行为；缺省值不写就不占版面。
     #[serde(default)]
     hint: String,
+    // 主题字段可声明查询预算；前端据此在保存前给出预估并阻止超限组合。
+    #[serde(default)]
+    budget: WorkflowViewBudget,
     // span 控制栅格占位：full 表示整行，其它值按单列处理。
     #[serde(default)]
     span: String,
@@ -495,6 +528,9 @@ struct WorkflowViewFieldDefinition {
 
 impl WorkflowPackage {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if !self.icon.trim().is_empty() {
+            crate::app::extension_icons::validate_icon_reference(&self.icon)?;
+        }
         if self.schema_version != WORKFLOW_PACKAGE_SCHEMA_VERSION {
             return Err("workflow package schema_version is invalid".to_string());
         }
@@ -698,6 +734,29 @@ pub(crate) fn launch_form_fields(package: &WorkflowPackage) -> Vec<WorkflowLaunc
 /// 启动表单的默认值此前只服务于界面预填：从定时计划、命令行走同一条工作流时，
 /// 用户不填就会退回能力自身的兜底，容易在运行中途才暴露缺参。
 /// 这里统一在运行入口补齐缺失字段，让「不填也能按默认值跑」成为所有入口的一致行为。
+/// 从已安装工作流的声明式视图中取字段的动态选项来源。
+/// 动态来源必须由包自己声明，不能由前端临时传入任意 capability。
+pub(crate) fn view_option_source(
+    package: &WorkflowPackage,
+    field_id: &str,
+) -> Result<Option<WorkflowViewOptionSource>, Box<dyn std::error::Error>> {
+    let entry = package.ui.entry.trim();
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    let bytes = fs::read(package.source_root.join(entry))?;
+    let view: WorkflowViewManifest = serde_json::from_slice(&bytes)?;
+    for section in view.sections {
+        for field in section.fields {
+            if let WorkflowViewField::Definition(definition) = field {
+                if definition.id == field_id {
+                    return Ok(definition.option_source);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
 /// 只填补缺失或显式 `null` 的键，用户主动填的空串（例如「版本号留空按日期生成」）不会被覆盖。
 pub(crate) fn with_launch_defaults(package: &WorkflowPackage, input: &Value) -> Value {
     let mut merged = match input {
@@ -961,6 +1020,9 @@ fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>
                     | "boolean"
                     | "select"
                     | "list"
+                    | "theme-list"
+                    | "tag-list"
+                    | "topic-groups"
                     | "json"
                     | "credential"
             ) {
@@ -968,12 +1030,57 @@ fn validate_workflow_view(root: &Path, entry: &str) -> Result<(), Box<dyn Error>
                     format!("workflow view field {} type is invalid", definition.id).into(),
                 );
             }
-            if definition.field_type == "select" && definition.options.is_empty() {
+            if definition.field_type == "select"
+                && definition.options.is_empty()
+                && definition.option_source.is_none()
+            {
                 return Err(format!(
-                    "workflow view select field {} requires options",
+                    "workflow view select field {} requires options or option_source",
                     definition.id
                 )
                 .into());
+            }
+            if matches!(
+                definition.field_type.as_str(),
+                "theme-list" | "topic-groups"
+            ) && definition.options.is_empty()
+                && definition.option_source.is_none()
+            {
+                return Err(format!(
+                    "workflow view theme-list field {} requires options or option_source",
+                    definition.id
+                )
+                .into());
+            }
+            let mut alias_values = HashSet::new();
+            for alias in &definition.aliases {
+                validate_workflow_id(alias).map_err(std::io::Error::other)?;
+                if alias == &definition.id || !alias_values.insert(alias.as_str()) {
+                    return Err(format!(
+                        "workflow view field {} has an invalid or duplicate alias: {}",
+                        definition.id, alias
+                    )
+                    .into());
+                }
+            }
+            if let Some(source) = definition.option_source.as_ref() {
+                if !matches!(
+                    source.kind.as_str(),
+                    "" | "plugin_capability" | "capability"
+                ) {
+                    return Err(format!(
+                        "workflow view field {} option_source kind is invalid",
+                        definition.id
+                    )
+                    .into());
+                }
+                if source.capability_id.trim().is_empty() {
+                    return Err(format!(
+                        "workflow view field {} option_source capability_id is required",
+                        definition.id
+                    )
+                    .into());
+                }
             }
             // 选项值重复或为空会让下拉出现两个「看起来一样、提交后不一样」的项，
             // 属于包写错了，直接在安装校验里挡掉。
@@ -1463,6 +1570,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workflow_view_accepts_theme_metadata_and_query_budget() {
+        let view: WorkflowViewManifest = serde_json::from_str(
+            r#"{
+                "schema_version": "workflow_view.v1",
+                "title": "开源热榜日报",
+                "sections": [{
+                    "id": "scope",
+                    "title": "关注范围",
+                    "fields": [{
+                        "id": "domains",
+                        "label": "关注主题",
+                        "type": "theme-list",
+                        "default": ["ai-video"],
+                        "options": [{
+                            "value": "ai-video",
+                            "label": "AI 视频生成",
+                            "topics": ["text-to-video", "video-generation"]
+                        }],
+                        "budget": {"max_queries": 24, "interval_ms": 7000}
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let WorkflowViewField::Definition(field) = &view.sections[0].fields[0] else {
+            panic!("expected structured field");
+        };
+        assert_eq!(field.field_type, "theme-list");
+        assert_eq!(field.budget.max_queries, Some(24));
+        assert_eq!(field.budget.interval_ms, Some(7000));
+        match &field.options[0] {
+            WorkflowViewOption::Labeled { topics, .. } => {
+                assert_eq!(topics, &["text-to-video", "video-generation"]);
+            }
+            WorkflowViewOption::Value(_) => panic!("expected labeled theme option"),
+        }
+    }
+
+    #[test]
     fn loads_wechat_experience_upload_package() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("workflows")
@@ -1561,6 +1707,18 @@ mod tests {
         assert_eq!(package.steps[0].kind, "provider_defined");
         assert_eq!(package.steps[0].execution_mode, "provider_defined");
         assert_eq!(package.ui.mode, "standard");
+    }
+
+    #[test]
+    fn workflow_icon_is_optional_and_package_local() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("wechat-experience-upload");
+        let mut package = load_from_directory(&root).unwrap();
+        package.icon = "assets/icon.webp".to_string();
+        assert!(package.validate().is_ok());
+        package.icon = "../icon.webp".to_string();
+        assert!(package.validate().is_err());
     }
 
     #[test]

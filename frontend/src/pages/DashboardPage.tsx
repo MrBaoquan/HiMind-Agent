@@ -3,7 +3,7 @@ import { LocalUsagePanel } from '../components/LocalUsagePanel';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { PageHeader, Pill } from '../components/Common';
 import { DashboardIdentityPanel } from '../components/DashboardIdentityPanel';
-import type { AgentStatus, AgentUpdateStatus, AiUsageRange, ApprovalItem, DashboardAuthorizationProgress, DashboardIdentityStatus, InferenceGatewayStatus, LocalUsageOverview, McpTargetDescriptor, ProjectionSyncStatus, RemoteExecutionSettings } from '../services/agentApi';
+import type { AgentStatus, AgentUpdateStatus, AiUsageRange, ApprovalItem, ControlPlaneProviderStatus, DashboardAuthorizationProgress, DashboardIdentityStatus, InferenceGatewayStatus, LocalUsageOverview, McpTargetDescriptor, ProjectionSyncStatus, RemoteExecutionSettings } from '../services/agentApi';
 
 type DashboardPageProps = {
   status: AgentStatus | null;
@@ -16,12 +16,14 @@ type DashboardPageProps = {
   localUsageBusy: boolean;
   inferenceGateway: InferenceGatewayStatus | null;
   identity: DashboardIdentityStatus | null;
+  providerStatus: ControlPlaneProviderStatus | null;
   authorization: DashboardAuthorizationProgress | null;
   identityBusy: boolean;
   updateStatus: AgentUpdateStatus | null;
   updateBusy: boolean;
   projectionRequeueBusy: boolean;
   onOpenDashboard: () => void;
+  onOpenWorkbenchSettings: () => void;
   onRequeueProjectionDeadLetters: () => void;
   onStartAuthorization: () => void;
   onStartEnrollment: () => void;
@@ -49,12 +51,14 @@ export function DashboardPage({
   localUsageBusy,
   inferenceGateway,
   identity,
+  providerStatus,
   authorization,
   identityBusy,
   updateStatus,
   updateBusy,
   projectionRequeueBusy,
   onOpenDashboard,
+  onOpenWorkbenchSettings,
   onRequeueProjectionDeadLetters,
   onStartAuthorization,
   onStartEnrollment,
@@ -74,49 +78,11 @@ export function DashboardPage({
     return <div className="page-loading"><BusyIndicator size={15} />正在读取应用状态</div>;
   }
 
-  const independentMode = status.mode === 'independent' || status.dashboard_enabled === false;
-  const workerExpected = status.dashboard_worker_expected ?? status.dashboard_enabled !== false;
+  const provider = providerStatus ?? status.provider ?? null;
+  const providerEnabled = provider?.enabled_by_user ?? (status.mode !== 'independent' && status.dashboard_enabled !== false);
+  const providerAvailable = provider?.available ?? providerEnabled;
+  const workerExpected = providerAvailable;
   const workerOnline = !workerExpected || status.dashboard_worker_online;
-  if (independentMode) {
-    return (
-      <div className="dashboard-page">
-        <PageHeader title="首页" />
-        {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
-        <ProjectionStatusPanel status={projectionSyncStatus} requeueBusy={projectionRequeueBusy} onRequeue={onRequeueProjectionDeadLetters} />
-        <section className="workspace-status-panel ready independent-status-panel">
-          <div className="workspace-status-body">
-            <div className="workspace-status-icon ready" aria-hidden="true"><Sparkles size={25} /></div>
-            <div className="workspace-status-copy">
-              <div className="workspace-status-kicker"><span>HiMind Agent</span><span className="workspace-status-pill ready"><i />独立运行</span></div>
-              <strong>HiMind Agent 已就绪</strong>
-              <span>HiMind AI、技能、插件和已连接工具均可使用。</span>
-            </div>
-          </div>
-          <div className="workspace-status-metrics" aria-label="本机运行状态">
-            <div><span>待审批</span><strong>{approvals.length}</strong></div>
-            <div><span>本机服务</span><strong>已就绪</strong></div>
-            <div><span>AI 工具</span><strong>{mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected && target.state === 'configured').length} 已连接</strong></div>
-          </div>
-        </section>
-        <LocalUsagePanel
-          overview={localUsage}
-          gateway={inferenceGateway}
-          range={localUsageRange}
-          busy={localUsageBusy}
-          onRangeChange={onLocalUsageRangeChange}
-          onRefresh={onRefreshLocalUsage}
-          onBindGateway={onBindCodexToGateway}
-          bindBusy={bindingModeBusy}
-        />
-        <section className="overview-facts" aria-label="运行信息">
-          <div><span>版本</span><strong>v{status.version}</strong></div>
-          <div><span>AI 工作台</span><strong>未连接</strong></div>
-          <div><span>本机服务</span><strong>运行中</strong></div>
-          <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
-        </section>
-      </div>
-    );
-  }
   const workerIssue = describeWorkerIssue(status.dashboard_worker_error, status.dashboard_worker_reason_code);
   const aiReadyCount = mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected && target.state === 'configured').length;
   const aiInstalledCount = mcpTargets.filter(target => target.id !== 'himind-ai' && target.detected).length;
@@ -125,30 +91,46 @@ export function DashboardPage({
       <PageHeader
         title="首页"
         description="从这里开始使用 AI 对话、自动化工作流和能力拓展。"
-        actions={<button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>}
+        actions={providerAvailable
+          ? <button className="btn btn-primary" onClick={onOpenDashboard}><ArrowUpRight size={16} />打开工作台</button>
+          : <button className="btn btn-primary" onClick={onOpenWorkbenchSettings}><ArrowUpRight size={16} />连接工作台</button>}
       />
       {updateStatus && updateStatus.status !== 'idle' ? <AgentUpdateBanner status={updateStatus} busy={updateBusy} onCheck={onCheckUpdate} onDownload={onDownloadUpdate} onInstall={onInstallUpdate} /> : null}
       <ProjectionStatusPanel status={projectionSyncStatus} requeueBusy={projectionRequeueBusy} onRequeue={onRequeueProjectionDeadLetters} />
-      <DashboardIdentityPanel
-        identity={identity}
-        authorization={authorization}
-        workerOnline={workerOnline}
-        dashboardEnabled={status.dashboard_enabled !== false}
-        workerAttention={workerIssue.attention}
-        workerIssueTitle={workerIssue.title}
-        workerHealthDescription={workerIssue.healthDescription}
-        pendingApprovals={approvals.length}
-        remoteExecutionEnabled={Boolean(remoteExecutionSettings?.enabled)}
-        aiToolSummary={aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已连接` : '未安装'}
-        busy={identityBusy}
-        onStartAuthorization={onStartAuthorization}
-        onStartEnrollment={onStartEnrollment}
-        onCancelAuthorization={onCancelAuthorization}
-        onOpenAuthorization={onOpenAuthorization}
-        onRefresh={onRefreshIdentity}
-        onRevoke={onRevokeAuthorization}
-        authorizationDisabledReason={workerIssue.requiresEnrollment ? workerIssue.description : undefined}
-      />
+      {providerEnabled ? <DashboardIdentityPanel
+          identity={identity}
+          authorization={authorization}
+          workerOnline={workerOnline}
+          dashboardEnabled={providerEnabled}
+          workerAttention={workerIssue.attention}
+          workerIssueTitle={workerIssue.title}
+          workerHealthDescription={workerIssue.healthDescription}
+          pendingApprovals={approvals.length}
+          remoteExecutionEnabled={Boolean(remoteExecutionSettings?.enabled)}
+          aiToolSummary={aiInstalledCount ? `${aiReadyCount}/${aiInstalledCount} 已连接` : '未安装'}
+          busy={identityBusy}
+          onStartAuthorization={onStartAuthorization}
+          onStartEnrollment={onStartEnrollment}
+          onCancelAuthorization={onCancelAuthorization}
+          onOpenAuthorization={onOpenAuthorization}
+          onRefresh={onRefreshIdentity}
+          onRevoke={onRevokeAuthorization}
+          authorizationDisabledReason={workerIssue.requiresEnrollment ? workerIssue.description : undefined}
+        /> : <section className="workspace-status-panel ready independent-status-panel">
+          <div className="workspace-status-body">
+            <div className="workspace-status-icon ready" aria-hidden="true"><Sparkles size={25} /></div>
+            <div className="workspace-status-copy">
+              <div className="workspace-status-kicker"><span>AI 工作台</span><span className="workspace-status-pill neutral"><i />未连接</span></div>
+              <strong>HiMind Agent 本机运行中</strong>
+              <span>{provider?.message || '未连接工作台，本机 AI、技能、插件和工作流照常可用。'}</span>
+            </div>
+          </div>
+          <div className="workspace-status-metrics" aria-label="本机运行状态">
+            <div><span>待审批</span><strong>{approvals.length}</strong></div>
+            <div><span>本机服务</span><strong>已就绪</strong></div>
+            <div><span>AI 工具</span><strong>{aiReadyCount}/{aiInstalledCount} 已连接</strong></div>
+          </div>
+        </section>}
       <LocalUsagePanel
         overview={localUsage}
         gateway={inferenceGateway}
@@ -163,7 +145,7 @@ export function DashboardPage({
         <div><span>版本</span><strong>v{status.version}</strong></div>
         {/* 这一格只回答「账号现在能不能用工作台」：写死「已对接」会和上面
             同时出现的「需要登录」自相矛盾。 */}
-        <div><span>AI 工作台</span><strong>{identity?.authorized ? '已授权' : '未连接'}</strong></div>
+        <div><span>AI 工作台</span><strong>{providerAvailable ? '已连接' : provider?.message || '未连接'}</strong></div>
         <div><span>本机服务</span><strong>运行中</strong></div>
         <div><span>当前任务</span><strong>{status.current_task ? '执行中' : '无任务'}</strong></div>
       </section>

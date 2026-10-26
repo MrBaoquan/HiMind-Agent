@@ -1,12 +1,14 @@
 use crate::Options;
 use std::error::Error;
 
+use crate::app::control_plane_provider;
+
 pub(crate) fn reconcile(
     options: &Options,
     agent_id: &str,
     dashboard_generation: &mut String,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    if options.mode().dashboard_enabled() {
+    if control_plane_provider::available(options) {
         crate::app::extension_reconciler::reconcile(options, agent_id, dashboard_generation)?;
     } else {
         crate::app::extension_reconciler::release_control_plane_policies()?;

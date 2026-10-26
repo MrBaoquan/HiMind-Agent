@@ -1,6 +1,6 @@
 //! 本机推理网关（ADR 0113）。
 //!
-//! 一个环回监听，服务多个绑定：客户端配置里只有 `http://127.0.0.1:<port>`
+//! 一个环回监听，服务多个绑定：客户端配置里只有 `http://localhost:<port>`
 //! 与一枚本机令牌，真实凭据留在 Agent。网关按上游协议直通转发，并在响应里
 //! 提取用量写入本机台账（`store::local_usage`）。
 //!
@@ -19,7 +19,11 @@ use std::time::Duration;
 use crate::store::local_usage::{self, LocalUsageRecord};
 
 const HEADER_LIMIT: usize = 64 * 1024;
-const BODY_LIMIT: usize = 32 * 1024 * 1024;
+/// 本机是受信任的规格化边界：入口允许容纳客户端已经生成的大历史，
+/// 但出站请求会在媒体外置后严格压到远端网关限制以下。
+const INBOUND_BODY_LIMIT: usize = 96 * 1024 * 1024;
+const OUTBOUND_BODY_LIMIT: usize = 24 * 1024 * 1024;
+const RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -380,7 +384,9 @@ impl InferenceGateway {
             })
             .map_err(|error| format!("无法创建本机推理网关线程：{error}"))?;
         let gateway = Self {
-            url: format!("http://127.0.0.1:{port}"),
+            // 客户端侧统一使用 localhost：Windows 系统代理通常会绕过本地主机名，
+            // 但对裸 127.0.0.1 不保证绕过，可能把本机请求送进代理后得到 502。
+            url: format!("http://localhost:{port}"),
             port,
             notice,
             shutdown,
@@ -417,6 +423,12 @@ struct RequestHead {
     headers: HashMap<String, String>,
 }
 
+enum RequestRead {
+    Request(RequestHead, Vec<u8>),
+    Empty,
+    TooLarge { actual: usize, limit: usize },
+}
+
 fn handle_connection(stream: TcpStream, resolver: &BindingResolver) -> std::io::Result<()> {
     let mut stream = stream;
     // Windows 上 accept 出来的套接字会继承 listener 的非阻塞标志；本模块的
@@ -425,8 +437,22 @@ fn handle_connection(stream: TcpStream, resolver: &BindingResolver) -> std::io::
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
-    let Some((head, body)) = read_request(&mut stream)? else {
-        return Ok(());
+    let (head, body) = match read_request(&mut stream)? {
+        RequestRead::Empty => return Ok(()),
+        RequestRead::TooLarge { actual, limit } => {
+            let message = format!(
+                "请求体约 {:.1} MiB，超过本机网关 {} MiB 入站上限。请新建会话或减少图片/附件后重试。",
+                actual as f64 / (1024.0 * 1024.0),
+                limit / (1024 * 1024),
+            );
+            return write_json_error(
+                &mut stream,
+                413,
+                "himind_gateway_request_too_large",
+                &message,
+            );
+        }
+        RequestRead::Request(head, body) => (head, body),
     };
     match route(&mut stream, resolver, &head, &body) {
         Ok(()) => Ok(()),
@@ -447,7 +473,7 @@ fn handle_connection(stream: TcpStream, resolver: &BindingResolver) -> std::io::
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(RequestHead, Vec<u8>)>> {
+fn read_request(stream: &mut TcpStream) -> std::io::Result<RequestRead> {
     let mut buffer = Vec::<u8>::with_capacity(8192);
     let mut chunk = [0_u8; 8192];
     let head_end = loop {
@@ -455,17 +481,29 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(RequestHead, 
             break position;
         }
         if buffer.len() > HEADER_LIMIT {
-            return Ok(None);
+            return Ok(RequestRead::Empty);
         }
         let read = stream.read(&mut chunk)?;
         if read == 0 {
-            return Ok(None);
+            return Ok(RequestRead::Empty);
         }
         buffer.extend_from_slice(&chunk[..read]);
     };
     let head_text = String::from_utf8_lossy(&buffer[..head_end]).to_string();
     let head =
         parse_head(&head_text).ok_or_else(|| std::io::Error::other("malformed request head"))?;
+    let content_length = head
+        .headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    // 超限请求在发送 100 Continue 之前直接拒绝，避免客户端继续上传几十 MiB。
+    if content_length > INBOUND_BODY_LIMIT {
+        return Ok(RequestRead::TooLarge {
+            actual: content_length,
+            limit: INBOUND_BODY_LIMIT,
+        });
+    }
     // .NET 系客户端（HttpClient 默认）会先发 `Expect: 100-continue` 再等应答；
     // 不回 100 就会被判定为连接错误，请求根本到不了转发逻辑。
     if head
@@ -476,14 +514,6 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(RequestHead, 
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         stream.flush()?;
     }
-    let content_length = head
-        .headers
-        .get("content-length")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_length > BODY_LIMIT {
-        return Ok(None);
-    }
     let mut body = buffer[head_end + 4..].to_vec();
     while body.len() < content_length {
         let read = stream.read(&mut chunk)?;
@@ -493,9 +523,8 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<(RequestHead, 
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(content_length);
-    Ok(Some((head, body)))
+    Ok(RequestRead::Request(head, body))
 }
-
 fn find_head_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -614,6 +643,51 @@ fn join_upstream(base_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+fn summarize_responses_request(body: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return "invalid-json".to_string();
+    };
+    let model = value.get("model").and_then(Value::as_str).unwrap_or("");
+    let stream = value
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let input_count = value
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let tool_types = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let previous = value.get("previous_response_id").is_some();
+    let store = value.get("store").and_then(Value::as_bool);
+    format!(
+        "model={model} stream={stream} input_items={input_count} tools={tool_types} previous_response_id={previous} store={store:?} bytes={}",
+        body.len()
+    )
+}
+fn upstream_client(base_url: &str) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT);
+    let loopback = url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"));
+    if loopback {
+        builder = builder.no_proxy();
+    }
+    builder.build()
+}
 /// OpenAI Chat 的流式响应默认不带用量，必须显式要求上游在末尾补一个 usage 块。
 fn inject_stream_usage_flag(body: &[u8]) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
@@ -781,21 +855,60 @@ fn forward(
     if kind == "anthropic" && binding.protocol == "openai-chat" {
         return forward_translated(stream, binding, body);
     }
+    let request_summary = if kind == "openai-responses" {
+        summarize_responses_request(body)
+    } else {
+        String::new()
+    };
+    let normalized_responses = if kind == "openai-responses" {
+        let request: Value = serde_json::from_slice(body)
+            .map_err(|_| translate_error(stream, "Responses 请求体不是合法 JSON"))?;
+        let normalized = crate::app::responses_media::normalize_request(request)
+            .map_err(|error| media_normalize_error(stream, &error))?;
+        if normalized.stats.images_total > 0 {
+            let message = format!(
+                "本机网关媒体规格化：images={} offloaded={} referenced={} inline={}->{} bytes request={}->{} bytes",
+                normalized.stats.images_total,
+                normalized.stats.images_offloaded,
+                normalized.stats.images_replaced_with_reference,
+                normalized.stats.inline_bytes_before,
+                normalized.stats.inline_bytes_after,
+                normalized.stats.request_bytes_before,
+                normalized.stats.request_bytes_after,
+            );
+            crate::approval::manager::append_event_log("info", &message);
+        }
+        for warning in normalized.warnings {
+            crate::approval::manager::append_event_log(
+                "warn",
+                &format!("本机网关媒体规格化警告：{warning}"),
+            );
+        }
+        Some(normalized.request)
+    } else {
+        None
+    };
     // Codex 只讲 Responses，同样落在 Chat 上游上。
     if kind == "openai-responses" && binding.protocol == "openai-chat" {
-        return forward_responses_translated(stream, binding, body);
+        return forward_responses_translated(
+            stream,
+            binding,
+            normalized_responses
+                .as_ref()
+                .expect("Responses request was normalized above"),
+        );
     }
-    let outgoing_body = if kind == "openai-chat" {
-        inject_stream_usage_flag(body)
-    } else {
-        body.to_vec()
+    let outgoing_body = match normalized_responses {
+        Some(request) => serde_json::to_vec(&request)
+            .map_err(|error| media_normalize_error(stream, &error.to_string()))?,
+        None if kind == "openai-chat" => inject_stream_usage_flag(body),
+        None => body.to_vec(),
     };
+    if kind != "models" {
+        enforce_outbound_body_limit(stream, outgoing_body.len())?;
+    }
     let upstream_url = join_upstream(&binding.base_url, &head.path);
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|_| GatewayError::Answered)?;
+    let client = upstream_client(&upstream_url).map_err(|_| GatewayError::Answered)?;
     let method =
         reqwest::Method::from_bytes(head.method.as_bytes()).unwrap_or(reqwest::Method::POST);
     let mut request = client
@@ -833,6 +946,47 @@ fn forward(
     let streaming = content_type.contains("text/event-stream");
     let model = model_from_body(body).unwrap_or_default();
 
+    // 上游失败时先完整收下错误体：既便于本机诊断，也避免把空 502
+    // 当成正常的流式响应交给客户端，导致真正原因被吞掉。
+    if !status.is_success() {
+        let mut raw = Vec::new();
+        let _ = response.read_to_end(&mut raw);
+        let excerpt = String::from_utf8_lossy(&raw[..raw.len().min(1200)]).replace('\n', " ");
+        let header_names = head.headers.keys().cloned().collect::<Vec<_>>().join(",");
+        crate::approval::manager::append_event_log(
+            "warn",
+            &format!(
+                "本机网关上游返回失败：status={} path={} bytes={} headers={} request={} body={excerpt}",
+                status.as_u16(),
+                head.path,
+                raw.len(),
+                header_names,
+                request_summary,
+            ),
+        );
+        write_buffered_head(
+            stream,
+            status.as_u16(),
+            &content_type,
+            &binding.id,
+            raw.len(),
+        )
+        .map_err(|_| GatewayError::Answered)?;
+        let _ = stream.write_all(&raw);
+        let _ = stream.flush();
+        if kind != "models" {
+            record_usage(
+                binding,
+                &model,
+                streaming,
+                status.as_u16(),
+                Usage::default(),
+                true,
+            );
+        }
+        return Ok(());
+    }
+
     // 流式：长度不可知，用 `Connection: close` 结束，客户端按 EOF 收尾。
     if streaming {
         write_stream_head(stream, status.as_u16(), &content_type, &binding.id)
@@ -869,8 +1023,8 @@ fn forward(
     // 非流式：先收完再写，才能给出准确的 content-length。
     let mut raw = Vec::new();
     let _ = response.read_to_end(&mut raw);
-    if raw.len() > BODY_LIMIT {
-        raw.truncate(BODY_LIMIT);
+    if raw.len() > RESPONSE_BODY_LIMIT {
+        raw.truncate(RESPONSE_BODY_LIMIT);
     }
     write_buffered_head(
         stream,
@@ -926,17 +1080,15 @@ fn forward_translated(
             Ok(openai_body) => openai_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|_| GatewayError::Answered)?;
+    let openai_payload = openai_body.to_string();
+    enforce_outbound_body_limit(stream, openai_payload.len())?;
+    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
     let mut response = match client
         .post(join_upstream(&binding.base_url, "/v1/chat/completions"))
         .header("authorization", format!("Bearer {}", binding.api_key))
         .header("content-type", "application/json")
         .header("accept-encoding", "identity")
-        .body(openai_body.to_string())
+        .body(openai_payload)
         .send()
     {
         Ok(response) => response,
@@ -1052,12 +1204,8 @@ fn forward_translated(
 fn forward_responses_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
-    body: &[u8],
+    request: &Value,
 ) -> Result<(), GatewayError> {
-    let request: Value = match serde_json::from_slice(body) {
-        Ok(request) => request,
-        Err(_) => return Err(translate_error(stream, "Responses 请求体不是合法 JSON")),
-    };
     let streaming = request
         .get("stream")
         .and_then(Value::as_bool)
@@ -1070,21 +1218,19 @@ fn forward_responses_translated(
         .unwrap_or(binding.default_model.as_str())
         .to_string();
     let chat_body =
-        match crate::app::responses_chat::request_to_chat(&request, &binding.default_model) {
+        match crate::app::responses_chat::request_to_chat(request, &binding.default_model) {
             Ok(chat_body) => chat_body,
             Err(error) => return Err(translate_error(stream, &error)),
         };
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|_| GatewayError::Answered)?;
+    let chat_payload = chat_body.to_string();
+    enforce_outbound_body_limit(stream, chat_payload.len())?;
+    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
     let mut response = match client
         .post(join_upstream(&binding.base_url, "/chat/completions"))
         .header("authorization", format!("Bearer {}", binding.api_key))
         .header("content-type", "application/json")
         .header("accept-encoding", "identity")
-        .body(chat_body.to_string())
+        .body(chat_payload)
         .send()
     {
         Ok(response) => response,
@@ -1189,6 +1335,34 @@ fn translate_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
     GatewayError::Answered
 }
 
+fn media_normalize_error(stream: &mut TcpStream, detail: &str) -> GatewayError {
+    let _ = write_json_error(
+        stream,
+        400,
+        "himind_gateway_media_normalize_failed",
+        &format!("媒体请求规格化失败：{detail}"),
+    );
+    GatewayError::Answered
+}
+
+fn enforce_outbound_body_limit(stream: &mut TcpStream, actual: usize) -> Result<(), GatewayError> {
+    if actual <= OUTBOUND_BODY_LIMIT {
+        return Ok(());
+    }
+    let message = format!(
+        "媒体外置后请求体仍为 {:.1} MiB，超过本机网关 {} MiB 出站预算。请新建会话或减少历史工具输出后重试。",
+        actual as f64 / (1024.0 * 1024.0),
+        OUTBOUND_BODY_LIMIT / (1024 * 1024),
+    );
+    let _ = write_json_error(
+        stream,
+        413,
+        "himind_gateway_request_budget_exceeded",
+        &message,
+    );
+    Err(GatewayError::Answered)
+}
+
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -1198,6 +1372,7 @@ fn reason_phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -1255,6 +1430,7 @@ fn is_forwarded_request_header(name: &str) -> bool {
 }
 
 fn write_upstream_failure(stream: &mut TcpStream, detail: &str) -> GatewayError {
+    crate::approval::manager::append_event_log("warn", &format!("本机网关上游请求失败：{detail}"));
     let _ = write_json_error(
         stream,
         502,
@@ -1577,6 +1753,167 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oversized_declared_body_returns_structured_413() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let resolver: BindingResolver = Arc::new(Vec::new);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, &resolver).unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            INBOUND_BODY_LIMIT + 1
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("himind_gateway_request_too_large"));
+        assert!(response.contains("96 MiB"));
+    }
+    #[test]
+    fn outbound_budget_exceeded_returns_structured_413() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let error =
+                enforce_outbound_body_limit(&mut stream, OUTBOUND_BODY_LIMIT + 1).unwrap_err();
+            assert_eq!(error, GatewayError::Answered);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("himind_gateway_request_budget_exceeded"));
+        assert!(response.contains("24 MiB"));
+    }
+    #[test]
+    fn responses_request_through_gateway_offloads_large_images_before_upstream() {
+        use base64::Engine as _;
+        use image::{ImageBuffer, Rgb};
+
+        let _guard = crate::store::paths::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-gateway-media-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (head, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("mock upstream expected a request"),
+            };
+            assert_eq!(head.path, "/v1/responses");
+            let response = br#"{"id":"resp_test","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            let response_head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(response_head.as_bytes()).unwrap();
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+            body
+        });
+
+        let token = "local-test-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "codex:test".to_string(),
+                client: "codex".to_string(),
+                service: "test".to_string(),
+                models: vec!["test-model".to_string()],
+                default_model: "test-model".to_string(),
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(512, 512, |x, y| {
+            let value = (x.wrapping_mul(31) ^ y.wrapping_mul(17)) as u8;
+            Rgb([value, value.wrapping_add(41), value.wrapping_add(83)])
+        });
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        let request = json!({
+            "model": "test-model",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": data_url,
+                    "detail": "original"
+                }]
+            }],
+            "stream": false
+        });
+        let request_body = serde_json::to_vec(&request).unwrap();
+        let input_size = request_body.len();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let request_head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(request_head.as_bytes()).unwrap();
+        client.write_all(&request_body).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "gateway response={response}"
+        );
+        let forwarded = upstream_thread.join().unwrap();
+        let forwarded_json: Value = serde_json::from_slice(&forwarded).unwrap();
+        let forwarded_url = forwarded_json["input"][0]["content"][0]["image_url"]
+            .as_str()
+            .unwrap();
+        assert!(forwarded_url.starts_with("data:image/jpeg;base64,"));
+        assert!(forwarded.len() < input_size * 3 / 4);
+        assert!(forwarded_json["input"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["type"] == "input_text"
+                && part["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("media_id=")));
+
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
     /// 已有客户端走网关时，优先端口被占用必须失败：换端口会让那些客户端
     /// 配置里的地址立刻失效，而且界面上看不出来。
     #[test]
@@ -1598,6 +1935,10 @@ mod tests {
         let port = occupied.local_addr().unwrap().port();
         let gateway = InferenceGateway::start(Some(port), Box::new(Vec::new), false).unwrap();
         assert_ne!(gateway.port(), port);
+        assert!(
+            gateway.url().starts_with("http://localhost:"),
+            "客户端侧地址必须使用 localhost，避免 Windows 系统代理拦截裸 127.0.0.1"
+        );
         assert!(!gateway.notice.is_empty(), "换端口必须留下提示");
     }
 

@@ -265,7 +265,7 @@ impl DashboardCatalogProvider {
     /// Returns the last validated Connected-mode catalog. Independent mode is
     /// a first-class topology and never reads or refreshes Dashboard state.
     pub(crate) fn snapshot(&self) -> Option<DashboardCatalogSnapshot> {
-        if !self.options.mode().control_plane_enabled() {
+        if !crate::app::control_plane_provider::available(&self.options) {
             return None;
         }
         let should_refresh = self
@@ -413,7 +413,11 @@ enum FetchResult {
 fn fetch_catalog(options: &Options, etag: &str) -> Result<FetchResult, Box<dyn Error>> {
     let access = platform_access_token(options, BUSINESS_CONTEXT_READ_SCOPE)?;
     let url = catalog_url(&options.api_base())?;
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let mut client_builder = Client::builder().timeout(Duration::from_secs(10));
+    if is_loopback_api_base(options) {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build()?;
     let mut request = client
         .get(url)
         .bearer_auth(&access.token)

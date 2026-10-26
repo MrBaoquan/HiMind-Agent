@@ -267,6 +267,8 @@ pub struct PluginCatalogItem {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub view_count: usize,
+    #[serde(default)]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
     #[serde(default, deserialize_with = "deserialize_nullable_vec")]
     pub plugin_dependencies: Vec<SkillPluginDependency>,
 }
@@ -316,6 +318,8 @@ pub struct SkillCatalogItem {
     pub allow_disable: bool,
     #[serde(default = "default_true")]
     pub allow_uninstall: bool,
+    #[serde(default)]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -365,6 +369,8 @@ pub struct WorkflowCatalogItem {
     pub allow_uninstall: bool,
     #[serde(default)]
     pub extension_lock: Option<serde_json::Value>,
+    #[serde(default)]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -418,6 +424,8 @@ pub struct InstructionPackCatalogItem {
     pub allow_disable: bool,
     #[serde(default = "default_true")]
     pub allow_uninstall: bool,
+    #[serde(default)]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -465,6 +473,8 @@ pub struct ExpertCatalogItem {
     pub allow_disable: bool,
     #[serde(default = "default_true")]
     pub allow_uninstall: bool,
+    #[serde(default)]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
 }
 
 fn default_marketplace_source() -> String {
@@ -2312,6 +2322,7 @@ mod tests {
             confirmed: true,
         };
         let client = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
@@ -2384,6 +2395,7 @@ mod tests {
             confirmed: true,
         };
         let client = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();

@@ -51,6 +51,9 @@ pub(crate) struct MediaJob {
     /// Provider 侧任务 ID（提交后才有）。
     #[serde(default)]
     pub provider_job_id: String,
+    /// Provider request id from the submit response, when one is returned.
+    #[serde(default)]
+    pub provider_request_id: String,
     pub status: String,
     #[serde(default)]
     pub progress: u8,
@@ -80,6 +83,9 @@ impl MediaJob {
             "capability": self.capability,
             "service_id": self.service_id,
             "provider": self.provider,
+            "adapter": self.adapter,
+            "provider_job_id": self.provider_job_id,
+            "provider_request_id": self.provider_request_id,
             "model": self.model,
             "status": self.status,
             "progress": self.progress,
@@ -154,6 +160,7 @@ pub(crate) fn create(
         adapter: adapter.to_string(),
         model: model.to_string(),
         provider_job_id: String::new(),
+        provider_request_id: String::new(),
         status: STATUS_QUEUED.to_string(),
         progress: 0,
         prompt: prompt.to_string(),

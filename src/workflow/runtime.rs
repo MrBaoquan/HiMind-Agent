@@ -66,13 +66,14 @@ pub(crate) fn execute_runtime_step(
         }
         "himind.fixture" => fixture_runtime_output(&step.id, &workspace, input)?,
         "himind.builtin" => {
-            let outcome = crate::runtime::deepseek_harness::execute_workflow(
+            let outcome = crate::runtime::deepseek_harness::execute_workflow_in_run_home(
                 options
                     .ok_or("himind.builtin runtime step is unavailable without Agent options")?,
                 &workspace,
                 &prompt,
                 timeout_seconds,
                 disable_tools,
+                run_id,
                 is_canceled,
             )?;
             // 把“实际用了哪个模型/哪类服务”写进步骤输出，随运行事实一起留痕。

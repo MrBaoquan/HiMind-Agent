@@ -80,7 +80,8 @@ pub(crate) struct WorkbenchConnection {
     pub id: String,
     #[serde(default)]
     pub display_name: String,
-    /// Free-form label from the user ("本地开发", "生产", "A 团队").
+    /// Legacy free-form label. Kept only so existing stores still deserialize;
+    /// it no longer affects the product and is not exposed by the UI.
     #[serde(default)]
     pub purpose: String,
     pub api_base: String,
@@ -103,7 +104,6 @@ impl WorkbenchConnection {
 pub(crate) struct WorkbenchConnectionView {
     pub id: String,
     pub display_name: String,
-    pub purpose: String,
     pub api_base: String,
     pub active: bool,
     pub registered: bool,
@@ -125,8 +125,7 @@ impl WorkbenchConnectionView {
         let registered = connection.registered();
         Self {
             id: connection.id.clone(),
-            display_name: connection.display_name.clone(),
-            purpose: connection.purpose.clone(),
+            display_name: display_name_of(connection),
             api_base: connection.api_base.clone(),
             active: connection.id == active_id,
             registered,
@@ -447,17 +446,15 @@ pub(crate) fn add(
     state_path: &Path,
     api_base: &str,
     display_name: &str,
-    purpose: &str,
 ) -> Result<WorkbenchConnection, Box<dyn Error>> {
     let _lock = lock(state_path)?;
-    add_locked(state_path, api_base, display_name, purpose)
+    add_locked(state_path, api_base, display_name)
 }
 
 fn add_locked(
     state_path: &Path,
     api_base: &str,
     display_name: &str,
-    purpose: &str,
 ) -> Result<WorkbenchConnection, Box<dyn Error>> {
     let mut store = require_store(state_path)?;
     let api_base = normalize_api_base(api_base);
@@ -480,13 +477,18 @@ fn add_locked(
         } else {
             display_name.to_string()
         },
-        purpose: purpose.trim().to_string(),
+        purpose: String::new(),
         api_base,
         added_at: now,
         last_used_at: 0,
         identity: ConnectionIdentity::default(),
     };
+    let becomes_active = store.active_connection_id.trim().is_empty();
     store.connections.push(connection.clone());
+    if becomes_active {
+        store.active_connection_id = connection.id.clone();
+        store.pending_materialize = true;
+    }
     save(state_path, &store)?;
     Ok(connection)
 }
@@ -495,17 +497,15 @@ pub(crate) fn rename(
     state_path: &Path,
     id: &str,
     display_name: &str,
-    purpose: &str,
 ) -> Result<WorkbenchConnection, Box<dyn Error>> {
     let _lock = lock(state_path)?;
-    rename_locked(state_path, id, display_name, purpose)
+    rename_locked(state_path, id, display_name)
 }
 
 fn rename_locked(
     state_path: &Path,
     id: &str,
     display_name: &str,
-    purpose: &str,
 ) -> Result<WorkbenchConnection, Box<dyn Error>> {
     let mut store = require_store(state_path)?;
     let Some(target) = store
@@ -519,29 +519,52 @@ fn rename_locked(
     if !display_name.is_empty() {
         target.display_name = display_name.to_string();
     }
-    target.purpose = purpose.trim().to_string();
     let updated = target.clone();
     save(state_path, &store)?;
     Ok(updated)
 }
 
-pub(crate) fn remove(state_path: &Path, id: &str) -> Result<(), Box<dyn Error>> {
+/// Remove a local connection.
+///
+/// Removing the active connection is allowed. If another connection remains,
+/// it becomes active; otherwise the Agent enters the unconnected state and the
+/// materialised identity is cleared. The returned id is the replacement active
+/// connection, when there is one.
+pub(crate) fn remove(state_path: &Path, id: &str) -> Result<Option<String>, Box<dyn Error>> {
     let _lock = lock(state_path)?;
     remove_locked(state_path, id)
 }
 
-fn remove_locked(state_path: &Path, id: &str) -> Result<(), Box<dyn Error>> {
+fn remove_locked(state_path: &Path, id: &str) -> Result<Option<String>, Box<dyn Error>> {
     let mut store = require_store(state_path)?;
-    if store.active_connection_id == id {
-        return Err("正在使用的工作台不能删除，请先切换到其它工作台".into());
-    }
     let before = store.connections.len();
     store.connections.retain(|connection| connection.id != id);
     if store.connections.len() == before {
         return Err(format!("未知的工作台连接: {id}").into());
     }
+    if store.active_connection_id != id {
+        save(state_path, &store)?;
+        return Ok(None);
+    }
+
+    store.active_connection_id = store
+        .connections
+        .first()
+        .map(|connection| connection.id.clone())
+        .unwrap_or_default();
+    store.pending_materialize = !store.active_connection_id.is_empty();
     save(state_path, &store)?;
-    Ok(())
+
+    let Some(target) = store.active_connection().cloned() else {
+        clear_identity_files(state_path)?;
+        store.pending_materialize = false;
+        save(state_path, &store)?;
+        return Ok(None);
+    };
+    materialize(state_path, &target)?;
+    store.pending_materialize = false;
+    save(state_path, &store)?;
+    Ok(Some(target.id))
 }
 
 /// Make `id` the active connection and materialise its identity on disk.
@@ -664,7 +687,7 @@ pub(crate) fn activate_for(
     match existing {
         Some(id) => switch_locked(state_path, &id),
         None => {
-            let created = add_locked(state_path, &api_base, "", "")?;
+            let created = add_locked(state_path, &api_base, "")?;
             switch_locked(state_path, &created.id)
         }
     }
@@ -805,10 +828,24 @@ fn normalize_api_base(api_base: &str) -> String {
 }
 
 fn display_name_of(connection: &WorkbenchConnection) -> String {
-    if connection.display_name.trim().is_empty() {
-        default_display_name(&connection.api_base)
-    } else {
-        connection.display_name.clone()
+    let current = connection.display_name.trim();
+    if !current.is_empty() {
+        let old_derived = default_host_label(&connection.api_base);
+        if !(is_loopback_api_base(&connection.api_base) && current == old_derived) {
+            return current.to_string();
+        }
+    }
+    default_display_name(&connection.api_base)
+}
+
+fn default_host_label(api_base: &str) -> String {
+    let trimmed = api_base.trim().trim_end_matches('/');
+    match url::Url::parse(trimmed) {
+        Ok(parsed) => match parsed.port() {
+            Some(port) => format!("{}:{}", parsed.host_str().unwrap_or(trimmed), port),
+            None => parsed.host_str().unwrap_or(trimmed).to_string(),
+        },
+        Err(_) => trimmed.to_string(),
     }
 }
 
@@ -819,6 +856,9 @@ fn default_display_name(api_base: &str) -> String {
     if trimmed.is_empty() {
         return "工作台".to_string();
     }
+    if is_loopback_api_base(trimmed) {
+        return "本机工作台".to_string();
+    }
     match url::Url::parse(trimmed) {
         Ok(parsed) => match parsed.port() {
             Some(port) => format!("{}:{}", parsed.host_str().unwrap_or(trimmed), port),
@@ -826,6 +866,15 @@ fn default_display_name(api_base: &str) -> String {
         },
         Err(_) => trimmed.to_string(),
     }
+}
+
+fn is_loopback_api_base(api_base: &str) -> bool {
+    url::Url::parse(api_base)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            host == "localhost" || host == "::1" || host == "[::1]" || host.starts_with("127.")
+        })
 }
 
 fn new_connection_id(store: &WorkbenchStore) -> String {
@@ -965,7 +1014,7 @@ mod tests {
         assert!(!legacy.exists(), "legacy file must be moved, not copied");
         assert!(canonical.is_file());
 
-        let b = add(&state_path, "http://b.example", "B 工作台", "").unwrap();
+        let b = add(&state_path, "http://b.example", "B 工作台").unwrap();
         switch(&state_path, &b.id).unwrap();
         assert!(
             !canonical.exists(),
@@ -980,7 +1029,7 @@ mod tests {
         write_identity(&state_path, "agent-a", "sealed-a", "user-a");
         ensure(&state_path, "http://a.example").unwrap();
 
-        let b = add(&state_path, "http://b.example", "B 工作台", "生产").unwrap();
+        let b = add(&state_path, "http://b.example", "B 工作台").unwrap();
         switch(&state_path, &b.id).unwrap();
 
         // B never enrolled: the legacy view must be empty, including backups,
@@ -1029,7 +1078,7 @@ mod tests {
 
         // B is added and switched to before it is enrolled; then the enrollment
         // (performed by the existing /enroll path) lands on disk.
-        let b = add(&state_path, "http://b.example", "B 工作台", "").unwrap();
+        let b = add(&state_path, "http://b.example", "B 工作台").unwrap();
         switch(&state_path, &b.id).unwrap();
         write_identity(&state_path, "agent-b", "sealed-b", "user-b");
 
@@ -1061,7 +1110,7 @@ mod tests {
         ensure(&state_path, "http://a.example").unwrap();
 
         // B enrolls, so from here on `agent-b` belongs to B.
-        let b = add(&state_path, "http://b.example", "B 工作台", "").unwrap();
+        let b = add(&state_path, "http://b.example", "B 工作台").unwrap();
         switch(&state_path, &b.id).unwrap();
         write_identity(&state_path, "agent-b", "sealed-b", "user-b");
         assert!(capture_active(&state_path).unwrap());
@@ -1122,7 +1171,7 @@ mod tests {
 
         // A switch that crashed between "save" and "materialise" leaves the
         // pending flag behind; the store then wins.
-        let b = add(&state_path, "http://b.example", "B", "").unwrap();
+        let b = add(&state_path, "http://b.example", "B").unwrap();
         let mut raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path_for(&state_path)).unwrap()).unwrap();
         raw["active_connection_id"] = json!(b.id);
@@ -1142,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_and_renaming_update_the_store_without_touching_the_agent() {
+    fn removing_and_renaming_update_the_store_and_clear_active_identity() {
         let home = TempHome::new("crud");
         let state_path = home.state_path();
         write_identity(&state_path, "agent-a", "sealed-a", "user-a");
@@ -1153,20 +1202,57 @@ mod tests {
             .active_connection_id()
             .to_string();
 
-        let b = add(&state_path, "http://b.example", "", "").unwrap();
+        let b = add(&state_path, "http://b.example", "").unwrap();
         assert_eq!(b.display_name, "b.example");
+        assert!(b.purpose.is_empty());
 
-        let renamed = rename(&state_path, &b.id, "测试工作台", "本地开发").unwrap();
+        let renamed = rename(&state_path, &b.id, "测试工作台").unwrap();
         assert_eq!(renamed.display_name, "测试工作台");
-        assert_eq!(renamed.purpose, "本地开发");
 
-        // The active connection is never removable, and a duplicate address is
-        // rejected instead of silently creating a second record.
-        assert!(remove(&state_path, &active_id).is_err());
-        assert!(add(&state_path, "http://b.example", "重复", "").is_err());
+        // A duplicate address is rejected instead of silently creating a
+        // second record.
+        assert!(add(&state_path, "http://b.example", "重复").is_err());
 
-        remove(&state_path, &b.id).unwrap();
-        assert_eq!(load(&state_path).unwrap().unwrap().connections().len(), 1);
+        // Removing the active connection promotes the remaining record and
+        // clears the old materialised identity instead of stranding the user.
+        assert_eq!(remove(&state_path, &active_id).unwrap(), Some(b.id.clone()));
+        let store = load(&state_path).unwrap().unwrap();
+        assert_eq!(store.connections().len(), 1);
+        assert_eq!(store.active_connection_id(), b.id);
+        assert!(!state_path.exists());
+        assert!(!state_path.with_extension("device-id").exists());
+        assert!(!state_path
+            .with_file_name("agent-user-authorization.json")
+            .exists());
+
+        // Removing the last connection enters a real unconnected state. A
+        // later ensure call must not silently recreate localhost.
+        assert_eq!(remove(&state_path, &b.id).unwrap(), None);
+        let empty = load(&state_path).unwrap().unwrap();
+        assert!(empty.connections().is_empty());
+        assert!(empty.active_connection_id().is_empty());
+        let after_ensure = ensure(&state_path, "http://localhost:8080").unwrap();
+        assert!(after_ensure.connections().is_empty());
+        assert!(after_ensure.active_connection_id().is_empty());
+    }
+
+    #[test]
+    fn loopback_connections_have_a_readable_label() {
+        let home = TempHome::new("loopback-label");
+        let state_path = home.state_path();
+        ensure(&state_path, "http://localhost:8080").unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path_for(&state_path)).unwrap()).unwrap();
+        raw["connections"][0]["display_name"] = json!("localhost:8080");
+        fs::write(
+            path_for(&state_path),
+            serde_json::to_vec_pretty(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let views = load(&state_path).unwrap().unwrap().views();
+        assert_eq!(views[0].display_name, "本机工作台");
+        assert_eq!(views[0].api_base, "http://localhost:8080");
     }
 
     #[test]

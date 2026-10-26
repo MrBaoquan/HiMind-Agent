@@ -2,10 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { ArrowDown, ArrowLeft, Boxes, CalendarClock, CheckCircle2, ChevronRight, CircleAlert, Clock3, FileText, FolderOpen, GitBranch, KeyRound, MessageCircle, Pin, Play, Plus, RefreshCw, Repeat2, Search, ShieldCheck, Store, Trash2, Upload, Workflow, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
-import { ExtensionKindMark } from '../components/ExtensionKindMark';
+import { CredentialFieldsEditor } from '../components/CredentialFieldsEditor';
+import { ExtensionIcon } from '../components/ExtensionIcon';
 import { WorkflowProcessRail } from '../components/WorkflowProcessRail';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
-import type { AcpRuntimeProfile, WorkflowCenterSnapshot, WorkflowLocalRun, WorkflowPreflight, WorkflowRunPreset, WorkflowRunPresetInput, WorkflowRunSnapshot, WorkflowRunVerification, WorkflowStep } from '../services/agentApi';
+import { ThemeBudgetPreview, ThemeMultiSelect, TopicTagsInput } from '../components/WorkflowThemeInputs';
+import { TopicGroupsBudgetPreview, TopicGroupsEditor } from '../components/WorkflowTopicGroups';
+import { agentApi, type AcpRuntimeProfile, type WorkflowCenterSnapshot, type WorkflowLocalRun, type WorkflowPreflight, type WorkflowRunPreset, type WorkflowRunPresetInput, type WorkflowRunSnapshot, type WorkflowRunVerification, type WorkflowStep } from '../services/agentApi';
 import { formatStamp } from '../timeFormat';
 import {
   WorkflowStartFieldError,
@@ -16,6 +19,7 @@ import {
   invalidOptionValue,
   jsonToFormValues,
   normalizeStartField,
+  themeBudgetError,
   usesFullRow,
   type WorkflowStartField,
 } from './workflowStartForm';
@@ -262,7 +266,7 @@ function PreflightPanel({
       <span>连接 {report.connectors.filter(item => item.available && item.health_status === 'passed').length}/{report.connectors.length}</span>
     </div>
     {missingCredentials.length ? <div className="workflow-preflight-credentials">
-      <div className="workflow-preflight-credentials-head"><KeyRound size={15} /><span><strong>需要配置凭据</strong><small>保存后会自动重新检查，不需要重新打开此窗口。</small></span></div>
+      <div className="workflow-preflight-credentials-head"><KeyRound size={15} /><span><strong>需要配置凭据</strong><small>保存后会自动重新检查，不需要重新打开此窗口。</small></span><button type="button" className="btn btn-quiet" onClick={() => void agentApi.openCredentialCenter()}>账号与凭据中心</button></div>
       {missingCredentials.map(credential => (
         <div key={credential.handle} className="workflow-preflight-credential">
           <span>
@@ -276,12 +280,21 @@ function PreflightPanel({
             </button>
           ) : (
             <div className="workflow-preflight-secret">
-              <input
-                type="password"
-                value={secretDrafts[credential.handle] || ''}
-                placeholder="输入 Secret"
-                autoComplete="new-password"
-                onChange={event => setSecretDrafts(current => ({ ...current, [credential.handle]: event.target.value }))}
+              <CredentialFieldsEditor
+                fields={[{
+                  key: credential.target,
+                  label: '密钥',
+                  type: 'password',
+                  secret: true,
+                  required: credential.required,
+                  configured: credential.configured,
+                  value: '',
+                  placeholder: '输入 Secret',
+                  help: '',
+                }]}
+                drafts={{ [credential.target]: secretDrafts[credential.handle] || '' }}
+                disabled={busy || Boolean(credentialBusy)}
+                onChange={(_key, value) => setSecretDrafts(current => ({ ...current, [credential.handle]: value }))}
               />
               <button type="button" className="btn" disabled={busy || Boolean(credentialBusy) || !(secretDrafts[credential.handle] || '').trim()} onClick={() => void configureSecret(credential.connectorId, credential.handle)}>
                 {credentialBusy === `secret:${credential.handle}` ? <BusyIndicator size={13} /> : <CheckCircle2 size={13} />}
@@ -352,6 +365,33 @@ function StartFields({ sections, values, errors, onChange, onPickDirectory, cont
                   </label>
                 );
               }
+              if (field.type === 'theme-list') {
+                return (
+                  <div key={field.id} data-field-id={field.id} className={fieldClass}>
+                    {label}
+                    <ThemeMultiSelect field={field} value={value} onChange={next => onChange(field.id, next)} />
+                    {footer}
+                  </div>
+                );
+              }
+              if (field.type === 'tag-list') {
+                return (
+                  <div key={field.id} data-field-id={field.id} className={fieldClass}>
+                    {label}
+                    <TopicTagsInput field={field} value={value} onChange={next => onChange(field.id, next)} />
+                    {footer}
+                  </div>
+                );
+              }
+              if (field.type === 'topic-groups') {
+                return (
+                  <div key={field.id} data-field-id={field.id} className={fieldClass}>
+                    {label}
+                    <TopicGroupsEditor field={field} value={value} onChange={next => onChange(field.id, next)} />
+                    {footer}
+                  </div>
+                );
+              }
               if (field.type === 'textarea' || field.type === 'list' || field.type === 'json') {
                 return (
                   <label key={field.id} data-field-id={field.id} className={fieldClass}>
@@ -402,6 +442,7 @@ function StartFields({ sections, values, errors, onChange, onPickDirectory, cont
           </div>
         </section>
       ))}
+      {sections.flatMap(section => section.fields).some(field => field.type === 'topic-groups') ? <TopicGroupsBudgetPreview fields={sections.flatMap(section => section.fields)} values={values} /> : <ThemeBudgetPreview fields={sections.flatMap(section => section.fields)} values={values} />}
       {!sections.some(section => section.fields.length) ? (
         <div className="workflow-start-empty">该工作流未声明表单输入，可切换到 JSON 模式。</div>
       ) : null}
@@ -980,6 +1021,11 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
           invalid.field,
           `${invalid.field.label}不支持「${invalid.invalidValue}」，可选：${invalid.field.optionEntries.map(option => option.label).join('、')}`,
         );
+      }
+      const budgetError = themeBudgetError(fields, startForm);
+      if (budgetError) {
+        const themeField = fields.find(field => field.type === 'theme-list') || fields[0];
+        throw new WorkflowStartFieldError(themeField, budgetError);
       }
       // 预设里可能有视图没声明的键（例如自定义产物目录），它们要跟着这一跑继续传递。
       return { ...startBaseInput, ...fieldsToInput(fields, startForm) };
@@ -1754,7 +1800,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
             <>
               <div className="workflow-detail-head">
                 <div className="workflow-detail-title">
-                  <ExtensionKindMark kind="workflow" />
+                  <ExtensionIcon kind="workflow" name={selectedWorkflow.package.name} icon={selectedWorkflow.icon} size={48} />
                   <div>
                     <span>工作流</span>
                     {/* 状态跟着标题走：与技能、插件详情同一个位置。 */}

@@ -91,9 +91,12 @@ export function DashboardIdentityPanel({
           <button className="btn btn-icon" title="刷新账号状态" aria-label="刷新账号状态" disabled={busy} onClick={onRefresh}><RefreshCw size={15} /></button>
           {dashboardEnabled ? (identity?.authorized
             ? <button className="btn btn-danger-quiet" disabled={busy || flowActive} onClick={onRevoke}><LogOut size={15} />取消授权</button>
-            : identity?.state === 'not_enrolled'
-              ? <button className="btn btn-primary" disabled={busy || flowActive} onClick={onStartEnrollment}><ArrowUpRight size={15} />授权</button>
-              : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />授权</button>) : null}
+            : <>
+                <button className="btn btn-danger-quiet" title="停止对接 AI 工作台，保留本机能力" disabled={busy || flowActive} onClick={onRevoke}><Unplug size={15} />停止对接</button>
+                {identity?.state === 'not_enrolled'
+                  ? <button className="btn btn-primary" disabled={busy || flowActive} onClick={onStartEnrollment}><ArrowUpRight size={15} />授权</button>
+                  : <button className="btn btn-primary" title={authorizationDisabledReason} disabled={busy || flowActive || Boolean(authorizationDisabledReason)} onClick={onStartAuthorization}><LogIn size={15} />授权</button>}
+              </>) : null}
         </div>
       </div>
       <div className="workspace-status-metrics" aria-label="桌面端运行状态">

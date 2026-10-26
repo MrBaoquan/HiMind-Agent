@@ -7,6 +7,7 @@ import { errorDetail } from '../types';
 import { AI_CONNECTIONS_TAB_LABELS } from './aiConnectionsTabs';
 import { BuiltinAiExtensionsDialog } from '../components/BuiltinAiExtensionsDialog';
 import { BusyIndicator } from '../components/BusyIndicator';
+import { copyText } from '../lib/clipboard';
 
 type BuiltinAiPageProps = {
   independentMode: boolean;
@@ -284,12 +285,18 @@ export function BuiltinAiPage({
     if (probedWorkspaceTarget.current === workspaceTargetKey) return;
     probedWorkspaceTarget.current = workspaceTargetKey;
     const root = builtinAiWorkspaceRoot(workspaceTarget);
-    if (!root) return;
-    const normalized = normalizeWorkspacePath(root);
+    const normalized = root ? normalizeWorkspacePath(root) : '';
     let cancelled = false;
     void agentApi.listBuiltinAiSessions().then((sessions) => {
       if (cancelled) return;
-      const existing = sessions.find((item) => normalizeWorkspacePath(item.workspace_root) === normalized);
+      // Warm re-entry must not wait for another runtime-status round trip. With a
+      // concrete project/workspace, find its session; the plain AI entry can
+      // safely reuse the only running session because there is no ambiguity.
+      const existing = root
+        ? sessions.find((item) => normalizeWorkspacePath(item.workspace_root) === normalized)
+        : sessions.length === 1
+          ? sessions[0]
+          : undefined;
       if (!existing) return;
       setSessionUrl(existing.url);
       setSessionNotice(existing.notice || '');
@@ -596,7 +603,17 @@ function formatActivityTime(value: string) {
 }
 
 function WorkspaceStatus({ icon, title, description, detail, actions, tone = 'default' }: { icon: ReactNode; title: string; description: string; detail?: string; actions?: ReactNode; tone?: 'default' | 'error' }) {
-  return <div className={`builtin-ai-state ${tone}`} role={tone === 'error' ? 'alert' : 'status'}><span className="builtin-ai-state-icon">{icon}</span><h3>{title}</h3><p>{description}</p>{detail ? <details className="builtin-ai-state-detail"><summary>查看原始错误</summary><pre>{detail}</pre></details> : null}{actions ? <div className="builtin-ai-state-actions">{actions}</div> : null}</div>;
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const copyDiagnostic = async () => {
+    if (!detail) return;
+    try {
+      setCopyState(await copyText(detail) ? 'copied' : 'failed');
+    } catch {
+      setCopyState('failed');
+    }
+    window.setTimeout(() => setCopyState('idle'), 1800);
+  };
+  return <div className={`builtin-ai-state ${tone}`} role={tone === 'error' ? 'alert' : 'status'}><span className="builtin-ai-state-icon">{icon}</span><h3>{title}</h3><p>{description}</p>{detail ? <details className="builtin-ai-state-detail"><summary>查看技术详情</summary><pre>{detail}</pre><div className="builtin-ai-state-detail-actions"><button type="button" className="text-action" aria-live="polite" onClick={() => void copyDiagnostic()}>{copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败，请手动选择' : '复制诊断信息'}</button></div></details> : null}{actions ? <div className="builtin-ai-state-actions">{actions}</div> : null}</div>;
 }
 
 function RuntimeInstallationStatus({ installation }: { installation: BuiltinAIRuntimeInstallationStatus }) {
@@ -658,6 +675,16 @@ function presentConnectionError(error: unknown): { message: string; detail: stri
     return present('本机模型来源尚未配置，请在设置中完成配置后重试。');
   }
   if (normalized.includes('登录 himind')) return present('当前登录状态已失效，请重新登录。');
+  const searchable = `${headline}\n${detail}`.toLowerCase();
+  if (searchable.includes("syscall: 'open'") && searchable.includes('.tmp')) {
+    return present('无法创建临时文件。请重新连接，必要时修复运行环境。');
+  }
+  if (searchable.includes('loader entry')) {
+    return present('组件加载失败。请修复运行环境，或先用网页版继续。');
+  }
+  if (searchable.includes('access is denied') || searchable.includes('拒绝访问')) {
+    return present('HiMind AI 启动时被系统拒绝访问文件。请关闭占用运行目录的程序后重试，或修复运行环境。');
+  }
   // 本机服务缺字段是最常见的自建服务故障，先于通用的「ai 服务」兜底认出来，
   // 否则会被误导成「账号没有分配服务」去找管理员。
   if (normalized.includes('模型或 base url')) return present(`本机模型来源的模型或 Base URL 不完整，请到「设置 → AI 连接 → ${AI_CONNECTIONS_TAB_LABELS.services}」补全。`);

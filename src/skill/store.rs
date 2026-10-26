@@ -296,6 +296,7 @@ impl SkillStore {
         }
         // 来源记录跟着资产走：留着会让自动更新把已经卸掉的技能当成待更新项。
         crate::app::extension_source::remove_provenance("skill", skill_id);
+        crate::app::extension_icons::clear_user_override_after_uninstall("skill", skill_id);
         Ok(existed)
     }
 
@@ -304,6 +305,7 @@ impl SkillStore {
         let development = crate::skill::development::is_development_skill(skill_id);
         if development {
             crate::skill::development::unregister_skill(skill_id)?;
+            crate::app::extension_icons::clear_user_override_after_uninstall("skill", skill_id);
         }
         let Some(record) = self.installed_record(skill_id)? else {
             return Ok(development);
@@ -323,6 +325,7 @@ impl SkillStore {
         );
         // 来源记录跟着资产走：留着会让自动更新把已经卸掉的技能当成待更新项。
         crate::app::extension_source::remove_provenance("skill", skill_id);
+        crate::app::extension_icons::clear_user_override_after_uninstall("skill", skill_id);
         Ok(true)
     }
 
@@ -549,11 +552,20 @@ impl SkillStore {
             return Ok(None);
         }
         let manifest = load_skill_manifest(&version_root)?;
+        let icon = crate::app::extension_icons::resolve_effective_icon(
+            "skill",
+            &manifest.id,
+            &version_root,
+            Some(&manifest.icon),
+        )
+        .ok()
+        .flatten();
         let previous_version = previous_pointer.map(|pointer| pointer.version);
         Ok(Some(SkillRecord {
             manifest,
             root: skill_root.to_path_buf(),
             version_root,
+            icon,
             current: current_pointer.is_some(),
             previous_version,
         }))
@@ -829,6 +841,7 @@ mod tests {
         let current_version = "2.0.0";
         let previous_version = "1.0.0";
         let current_manifest = SkillManifest {
+            icon: String::new(),
             id: "demo.skill".to_string(),
             name: "Demo".to_string(),
             author: String::new(),
@@ -882,6 +895,7 @@ mod tests {
         let store = SkillStore::with_root(root.clone());
         let package = root.join("package");
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.immutable-test".to_string(),
             name: "Immutable Test".to_string(),
             author: String::new(),
@@ -917,6 +931,7 @@ mod tests {
         let store = SkillStore::with_root(root.clone());
         let package = root.join("package");
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.repackaged-test".to_string(),
             name: "Repackaged Test".to_string(),
             author: String::new(),
@@ -955,6 +970,7 @@ mod tests {
         let store = SkillStore::with_root(root.clone());
         let package = root.join("package");
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.remove-test".to_string(),
             name: "卸载测试".to_string(),
             author: String::new(),

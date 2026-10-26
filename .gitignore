@@ -19,6 +19,9 @@
 *.tmp
 # 本地 e2e 截图、日志和临时验收产物，不作为源码提交。
 .acceptance/
+/artifacts-runtime-test*/
+/artifacts-signed*/
+/artifacts-codesigned*/
 *.exe
 *.pdb
 
@@ -35,3 +38,5 @@
 
 # Top-level release/workflow staging output
 /dist/
+/resources/runtime/*.zip
+/resources/runtime/*.signature.json

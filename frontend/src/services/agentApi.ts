@@ -1,6 +1,34 @@
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import type { CatalogView } from '../pages/mcpCatalogView';
 
+export type ExtensionIconInfo = {
+  url: string;
+  sha256: string;
+  source: 'author' | 'user' | string;
+};
+
+export type ControlPlaneProviderStatus = {
+    provider_id: string;
+    plugin_id: string;
+    name: string;
+    state: 'disabled' | 'unconfigured' | 'unregistered' | 'unauthorized' | 'invalid_authorization' | 'authorization_mismatch' | 'expired' | 'available' | string;
+    enabled_by_user: boolean;
+    configured: boolean;
+    registered: boolean;
+    authorized: boolean;
+    available: boolean;
+    worker_enabled: boolean;
+    reason: string;
+    message: string;
+    connection_id: string;
+    display_name: string;
+    api_base: string;
+    agent_id: string;
+    user_id: string;
+    user_name: string;
+    refresh_expires_at: number;
+};
+
 export type AgentStatus = {
     version: string;
     dashboard_base?: string;
@@ -18,6 +46,7 @@ export type AgentStatus = {
     pending_mode?: string;
     requires_restart?: boolean;
     dashboard_enabled?: boolean;
+    provider?: ControlPlaneProviderStatus;
     control_plane?: {
         kind: 'none' | 'dashboard' | string;
         enabled: boolean;
@@ -38,6 +67,14 @@ export type AgentModeSettings = {
     pending_mode: 'connected' | 'independent' | string;
     dashboard_enabled: boolean;
     requires_restart: boolean;
+};
+
+export type DashboardRevocationResult = {
+    mode: 'independent' | string;
+    mode_persisted: boolean;
+    remote_revoked: boolean;
+    local_cleared: boolean;
+    warning: string;
 };
 
 export type ProjectionSyncStatus = {
@@ -293,6 +330,7 @@ export type WorkflowPackage = {
     version: string;
     name: string;
     description: string;
+    icon?: string;
     min_agent_version: string;
     execution_policy?: 'strict' | 'segmented' | 'flexible' | string;
     capabilities: string[];
@@ -329,15 +367,38 @@ export type WorkflowViewField = string | {
      * 允许取值。只写字符串时值与显示文本相同；写成 `{ value, label }`
      * 时提交 `value`、显示 `label`（例如展馆 szkjg / 随州科技馆）。
      */
-    options?: Array<string | { value: string; label?: string }>;
+    options?: Array<string | { value: string; label?: string; topics?: string[]; source?: string; description?: string; query_count?: number }>;
+    /** 旧计划字段名；表单转换时作为主字段缺失后的兼容读取来源。 */
+    aliases?: string[];
+    /** 由已安装工作流声明、Agent 校验后执行的动态选项来源。 */
+    option_source?: { kind?: string; capability_id: string; input?: unknown; items_path?: string };
+    /** 最近目录读取失败时，由前端注入的降级说明。 */
+    option_source_warning?: string;
+    option_source_cached?: boolean;
     placeholder?: string;
     target?: string;
     /** 声明输入控件类型，当前支持 directory（带目录选择按钮）。 */
     picker?: string;
     /** 字段级说明，用来解释默认值行为。 */
     hint?: string;
+    /** 主题字段的查询预算；目前由科技雷达使用。 */
+    budget?: { max_queries?: number; interval_ms?: number };
     /** 栅格占位，full 表示整行。 */
     span?: string;
+};
+
+export type WorkflowOptionItem = {
+    value: string;
+    label: string;
+    topics: string[];
+    source?: string;
+    description?: string;
+    query_count?: number;
+};
+
+export type WorkflowOptionSourceResult = {
+    capability_id: string;
+    options: WorkflowOptionItem[];
 };
 
 export type WorkflowLocalRun = {
@@ -366,6 +427,7 @@ export type WorkflowLocalRun = {
 
 export type WorkflowCenterItem = {
     package: WorkflowPackage;
+    icon?: ExtensionIconInfo | null;
     enabled: boolean;
     previous_version: string;
     package_digest: string;
@@ -406,6 +468,7 @@ export type ScheduleExecution = {
 
 export type Schedule = {
     id: string;
+    name?: string;
     kind: string;
     target_id: string;
     /** Workflow 启动预设来源；input 是保存时的不可变快照。 */
@@ -510,6 +573,7 @@ export type WorkflowInteractionRequest = {
 
 export type ScheduleInput = {
     id?: string;
+    name?: string;
     kind?: string;
     target_id: string;
     preset_id?: string;
@@ -1053,6 +1117,7 @@ export type ExtensionFeaturePack = {
 
 export type WorkflowCatalogItem = {
     workflow_id: string;
+    icon?: ExtensionIconInfo | null;
     name: string;
     description: string;
     author_name: string;
@@ -1085,6 +1150,7 @@ export type WorkflowCatalogItem = {
 };
 
 export type InstructionPackCatalogItem = {
+  icon?: ExtensionIconInfo | null;
   instruction_pack_id: string;
   name: string;
   description: string;
@@ -1118,6 +1184,7 @@ export type InstructionPackCatalogItem = {
 };
 
 export type ExpertSummary = {
+  icon?: ExtensionIconInfo | null;
   id: string;
   name: string;
   version: string;
@@ -1134,6 +1201,7 @@ export type ExpertSummary = {
 };
 
 export type ExpertCatalogItem = {
+  icon?: ExtensionIconInfo | null;
   expert_id: string;
   name: string;
   description: string;
@@ -1287,6 +1355,7 @@ export type ExtensionUpdateProgress = {
 
 export type PluginItem = {
     id: string;
+    icon?: ExtensionIconInfo | null;
     /// 条目语义：plugin（本地能力包）/ connector（特权集成）/ provider（控制面适配）。
     kind?: 'plugin' | 'connector' | 'provider' | string;
     name?: string;
@@ -1347,6 +1416,7 @@ export type DevelopmentInvocationResult = {
 
 export type PluginCatalogItem = {
     plugin_id: string;
+    icon?: ExtensionIconInfo | null;
     name: string;
     description: string;
     author_name?: string;
@@ -1409,7 +1479,6 @@ export type DashboardAuthorizationProgress = {
 export type WorkbenchConnection = {
     id: string;
     display_name: string;
-    purpose: string;
     api_base: string;
     active: boolean;
     registered: boolean;
@@ -1598,6 +1667,7 @@ export type EccInspection = {
 };
 
 export type InstructionPackDraft = {
+    icon?: ExtensionIconInfo | null;
     manifest: {
         schema_version: string;
         id: string;
@@ -1606,6 +1676,7 @@ export type InstructionPackDraft = {
         categories: string[];
         version: string;
         description: string;
+        icon?: string;
         release_notes: string;
         min_agent_version: string;
         supported_clients: string[];
@@ -1730,6 +1801,7 @@ export type SkillCapabilityDependency = {
 
 export type SkillManifest = {
     id: string;
+    icon?: string;
     name: string;
     author?: string;
     categories?: string[];
@@ -1746,6 +1818,7 @@ export type SkillManifest = {
 };
 
 export type SkillRecord = {
+    icon?: ExtensionIconInfo | null;
     manifest: SkillManifest;
     root: string;
     version_root: string;
@@ -1810,6 +1883,7 @@ export type SkillPluginDependency = {
 };
 
 export type OrganizationSkillCatalogItem = {
+    icon?: ExtensionIconInfo | null;
     skill_id: string;
     name: string;
     description: string;
@@ -2139,6 +2213,7 @@ export type ExpertAuthoringDraft = {
 };
 
 export type ExpertDefinitionSnapshot = {
+  icon?: string;
   schema_version: string;
   id: string;
   name: string;
@@ -2176,18 +2251,73 @@ export type BuiltinAiWorkspaceTarget = { kind: 'project'; projectId: string; nam
  * 仍然返回用户才能把它移除。`has_catalog` 区分"目录里还没有聚合清单"与
  * "清单坏了"：前者只是还没有可整体分发的扩展，不是错误。
  */
-/// 插件声明的一条凭据需求 + 当前配置状态（只有状态，没有值）。
+export type CredentialFieldView = {
+  key: string;
+  label: string;
+  type: 'text' | 'password' | 'url' | 'file' | 'cookie' | string;
+  secret: boolean;
+  required: boolean;
+  configured: boolean;
+  value: string;
+  placeholder: string;
+  help: string;
+};
+
+/// 插件声明的一条凭据需求 + 当前配置状态（秘密值永远为空）。
 export type PluginCredentialView = {
   id: string;
   label: string;
   kind: string;
-  fields: string[];
+  fields: CredentialFieldView[];
   required: boolean;
   description: string;
   docs_url: string;
+  verify_capability: string;
   configured: boolean;
   configured_fields: string[];
+  public_fields: Record<string, string>;
+  descriptor_current: boolean;
   updated_at: string;
+};
+
+export type CredentialCatalogItem = {
+  id: string;
+  owner_kind: 'core' | 'builtin' | 'plugin' | 'workflow' | string;
+  owner_id: string;
+  owner_name: string;
+  label: string;
+  kind: string;
+  required: boolean;
+  configured: boolean;
+  status: 'valid' | 'unverified' | 'missing' | 'invalid' | 'unavailable' | 'needs_review' | 'optional' | 'disabled' | string;
+  description: string;
+  docs_url: string;
+  manage_action: string;
+  deep_link: string;
+  editable: boolean;
+  fields: CredentialFieldView[];
+  configured_fields: string[];
+  public_fields: Record<string, string>;
+  descriptor_current: boolean;
+  verify_capability: string;
+  updated_at: string;
+  last_used_at: string;
+};
+
+export type CredentialCatalogSnapshot = {
+  items: CredentialCatalogItem[];
+  warnings: string[];
+  generated_at: string;
+};
+
+export type CredentialAuditEntry = {
+  at: string;
+  owner_kind: string;
+  owner_id: string;
+  credential_id: string;
+  capability: string;
+  result: 'allowed' | 'denied' | string;
+  reason: string;
 };
 
 /// 扩展开发工具链就绪度：说明走插件执行器还是内核实现、Go 是否可用。
@@ -2338,6 +2468,7 @@ export type ExtensionProject = {
     version: string;
     workspace_path: string;
     workspace_available: boolean;
+    icon?: ExtensionIconInfo | null;
     source: string;
     source_repository: string;
     source_default_branch: string;
@@ -2623,6 +2754,8 @@ export type AIServiceTemplateListResult = {
     items: AIServiceTemplate[];
 };
 
+export type MediaExecutionMode = 'sync' | 'stream' | 'async';
+
 export type CustomAIService = {
     id: string;
     display_name: string;
@@ -2634,8 +2767,8 @@ export type CustomAIService = {
     image_model: string;
     /** 生图适配器：空/openai-images = OpenAI Images；ark-images = 火山方舟（豆包）。 */
     image_adapter: string;
-    /** 媒体能力槽位：`image.generate` / `image.edit` / `video.generate` → 适配器 + 模型。 */
-    media?: Record<string, { adapter: string; model: string }>;
+    /** 媒体能力槽位：图像、视频、TTS、转写 → 适配器 + 模型 + 执行模式。 */
+    media?: Record<string, { adapter: string; model: string; execution_mode?: MediaExecutionMode | null }>;
     balance_profile_id?: string | null;
     balance_user_id?: string | null;
     suggested_balance_profile_id?: string | null;
@@ -2695,9 +2828,108 @@ export type AIServiceListResult = {
         active_service_id?: string;
         image_service_id?: string;
         media_services?: Record<string, string>;
+        capability_fallbacks?: Record<string, string[]>;
     };
     managed: ManagedAIServiceSummary;
     clients: AIProviderImportOverview;
+};
+
+export type MediaProviderHealth = {
+    state: 'ready' | 'unconfigured' | 'degraded' | 'unavailable';
+    reason?: string;
+};
+
+export type MediaProviderCatalogAdapter = {
+    id: string;
+    capabilities: string[];
+    execution_modes: MediaExecutionMode[];
+    features: string[];
+    limits: Record<string, unknown>;
+    pricing: Record<string, unknown>;
+    usage: Record<string, unknown>;
+};
+
+export type MediaProviderCatalogCapability = {
+    id: string;
+    default_execution_mode: MediaExecutionMode;
+    execution_modes: MediaExecutionMode[];
+    adapter_count: number;
+    configured_by: string[];
+    configured: boolean;
+};
+
+export type MediaProviderCatalogProvider = {
+    id: string;
+    display_name: string;
+    base_url: string;
+    protocol: AIServiceProtocol;
+    has_api_key: boolean;
+    health: MediaProviderHealth;
+    models: string[];
+    media_capabilities: Array<{
+        capability: string;
+        adapter: string;
+        model: string;
+        execution_mode: MediaExecutionMode;
+        features: string[];
+        limits: Record<string, unknown>;
+        health: MediaProviderHealth;
+        pricing: Record<string, unknown>;
+        usage: Record<string, unknown>;
+    }>;
+};
+
+export type CapabilityRouteCandidate = {
+    service_id: string;
+    display_name: string;
+    eligible: boolean;
+    eligibility: 'selected' | 'fallback' | 'candidate' | string;
+    reason: string;
+    adapter: string;
+    model: string;
+    execution_mode: MediaExecutionMode | 'sync' | string;
+    credential_present: boolean;
+};
+
+export type CapabilityRoutePlan = {
+    schema_version: 'himind.ai-capability-route.v1';
+    capability: string;
+    state: 'resolved' | 'ambiguous' | 'missing' | string;
+    reason: string;
+    selected: null | {
+        service_id: string;
+        display_name: string;
+        adapter: string | null;
+        model: string | null;
+        execution_mode: string | null;
+    };
+    fallbacks: Array<{ service_id: string; display_name: string }>;
+    attempts: Array<{ service_id: string; display_name: string; role: 'primary' | 'fallback' | string }>;
+    candidates: CapabilityRouteCandidate[];
+    requires_cost_confirmation: boolean;
+    fallback_policy: 'same_capability_only' | string;
+};
+
+export type MediaProviderCatalogResult = {
+    schema_version: 'himind.media-provider-catalog.v1' | 'himind.media-provider-catalog.v2' | string;
+    adapters: MediaProviderCatalogAdapter[];
+    providers: MediaProviderCatalogProvider[];
+    capabilities: MediaProviderCatalogCapability[];
+    routes?: CapabilityRoutePlan[];
+    defaults: Record<string, string>;
+    fallbacks?: Record<string, string[]>;
+    image_service_id: string;
+};
+
+export type AICapabilityTestResult = {
+    state: 'healthy' | 'accepted' | 'confirmation_required' | 'needs_input' | string;
+    capability?: string;
+    service_id?: string;
+    message?: string;
+    models?: string[];
+    preflight?: Record<string, unknown>;
+    result?: Record<string, unknown>;
+    route?: CapabilityRoutePlan;
 };
 
 export type AIServiceModelListResult = {
@@ -2794,14 +3026,14 @@ export const agentApi = {
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
     openDashboardAuthorizationPage: () => invoke('open_dashboard_authorization_page'),
     openWorkbenchAgentBindingPage: (id = '') => invoke('open_workbench_agent_binding_page', { id }),
-    revokeDashboardAuthorization: () => invoke('revoke_dashboard_authorization'),
+    revokeDashboardAuthorization: () => invoke<DashboardRevocationResult>('revoke_dashboard_authorization'),
     workbenchConnections: () => invoke<WorkbenchConnectionsSnapshot>('list_workbench_connections'),
-    addWorkbenchConnection: (apiBase: string, displayName: string, purpose: string) =>
-        invoke<WorkbenchConnectionsSnapshot>('add_workbench_connection', { apiBase, displayName, purpose }),
-    renameWorkbenchConnection: (id: string, displayName: string, purpose: string) =>
-        invoke<WorkbenchConnectionsSnapshot>('rename_workbench_connection', { id, displayName, purpose }),
-    removeWorkbenchConnection: (id: string) =>
-        invoke<WorkbenchConnectionsSnapshot>('remove_workbench_connection', { id }),
+    addWorkbenchConnection: (apiBase: string, displayName: string) =>
+        invoke<WorkbenchConnectionsSnapshot>('add_workbench_connection', { apiBase, displayName }),
+    renameWorkbenchConnection: (id: string, displayName: string) =>
+        invoke<WorkbenchConnectionsSnapshot>('rename_workbench_connection', { id, displayName }),
+    removeWorkbenchConnection: (id: string, force = false) =>
+        invoke<WorkbenchConnectionsSnapshot>('remove_workbench_connection', { id, force }),
     probeWorkbenchConnection: (apiBase: string) =>
         invoke<WorkbenchProbe>('probe_workbench_connection', { apiBase }),
     switchWorkbenchConnection: (id: string, force = false) =>
@@ -2817,6 +3049,9 @@ export const agentApi = {
     confirmExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('confirm_expert_draft', { expertId, version }),
     submitExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('submit_expert_draft', { expertId, version }),
     expertCatalog: () => invoke<ExpertCatalogItem[]>('get_expert_catalog'),
+    pickExtensionIconFile: () => invoke<string | null>('pick_extension_icon_file'),
+    setExtensionIconOverride: (kind: string, id: string, path: string) => invoke<ExtensionIconInfo>('set_extension_icon_override', { kind, id, path }),
+    clearExtensionIconOverride: (kind: string, id: string) => invoke<boolean>('clear_extension_icon_override', { kind, id }),
     activeExpert: (workspaceRoot?: string) => invoke<ExpertActivation | null>('active_expert', { workspaceRoot: workspaceRoot ?? null }),
     activateExpert: (expertId: string, version?: string, workspaceRoot?: string) => invoke<ExpertActivation>('activate_expert', { expertId, version: version ?? null, workspaceRoot: workspaceRoot ?? null }),
     saveExpert: (input: Record<string, unknown>) => invoke<ExpertSummary>('save_expert', { input }),
@@ -2909,6 +3144,7 @@ export const agentApi = {
      * 轮询必须走轻量快照，完整快照留给打开发工作流页面和手动刷新。
      */
     workflowCenter: (light = false) => invoke<WorkflowCenterSnapshot>('get_workflow_center', { light }),
+    resolveWorkflowOptionSource: (workflowId: string, fieldId: string) => invoke<WorkflowOptionSourceResult>('resolve_workflow_option_source', { workflowId, fieldId }),
     schedules: () => invoke<ScheduleList>('list_schedules'),
     workflowPresets: (workflowId?: string) => invoke<{ store_path: string; total: number; presets: WorkflowRunPreset[] }>('list_workflow_presets', { workflowId: workflowId ?? null }),
     setWorkflowPreset: (input: WorkflowRunPresetInput) => invoke<{ saved: boolean; preset: WorkflowRunPreset }>('set_workflow_preset', { input }),
@@ -2978,8 +3214,14 @@ export const agentApi = {
     extensionDevelopmentReadiness: () => invoke<ExtensionDevelopmentReadiness>('extension_development_readiness'),
     /// 插件凭据：声明 + 状态，值是单向写入的（保存后界面不再回显）。
     pluginCredentials: (pluginId: string) => invoke<{ plugin_id: string; credentials: PluginCredentialView[] }>('plugin_credentials', { pluginId }),
-    savePluginCredential: (pluginId: string, credentialId: string, fields: Record<string, string>) => invoke<void>('save_plugin_credential', { pluginId, credentialId, fields }),
+    savePluginCredentialProfile: (pluginId: string, credentialId: string, publicFields: Record<string, string>, secretFields: Record<string, string>) =>
+        invoke<void>('save_plugin_credential_profile', { pluginId, credentialId, publicFields, secretFields }),
+    savePluginCredential: (pluginId: string, credentialId: string, fields: Record<string, string>) =>
+        invoke<void>('save_plugin_credential', { pluginId, credentialId, fields }),
     deletePluginCredential: (pluginId: string, credentialId: string) => invoke<boolean>('delete_plugin_credential', { pluginId, credentialId }),
+    credentialCatalog: () => invoke<CredentialCatalogSnapshot>('get_credential_catalog'),
+    openCredentialCenter: () => invoke<void>('open_credential_center'),
+    credentialAudit: (limit = 100) => invoke<CredentialAuditEntry[]>('get_credential_audit', { limit }),
     pickExtensionWorkspaceDir: () => invoke<string | null>('pick_extension_workspace_dir'),
     addExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceEntry[]>('add_extension_workspace', { root }),
     removeExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceEntry[]>('remove_extension_workspace', { root }),
@@ -3091,7 +3333,7 @@ export const agentApi = {
     openFolder: (path: string) => invoke('open_folder', { path }),
     /// 设置窗口的定位由「面板 + 条目 + 页签」三段组成：条目不适用时传空，
     /// 旧键位（remote / skills / logs……）后端原样透传，由前端统一映射。
-    openSettingsWindow: (panel: 'settings' | 'ai' | 'logs' = 'settings', section?: string, tab?: string, aiTab?: 'mcp' | 'services' | 'acp') => invoke('open_settings_window', { panel, section, tab, aiTab }),
+    openSettingsWindow: (panel: 'settings' | 'ai' | 'logs' = 'settings', section?: string, tab?: string, aiTab?: 'mcp' | 'services' | 'routes' | 'acp') => invoke('open_settings_window', { panel, section, tab, aiTab }),
     pickWorkspaceDirectory: () => invoke<{ path?: string }>('pick_workspace_directory'),
     installPlugin: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke('install_plugin', { pluginId, version, source, artifactId, sha256 }),
     uninstallPlugin: (pluginId: string) => invoke('uninstall_plugin', { pluginId }),
@@ -3103,12 +3345,16 @@ export const agentApi = {
     fetchSavedAIServiceModels: (id: string, baseUrl: string) => invoke<AIServiceModelListResult>('fetch_saved_ai_service_models', { id, baseUrl }),
     fetchSavedAIServiceBalance: (id: string) => invoke<AIServiceBalanceSnapshot>('fetch_saved_ai_service_balance', { id }),
     listAIServices: () => invoke<AIServiceListResult>('list_ai_services'),
+    getMediaProviderCatalog: () => invoke<MediaProviderCatalogResult>('get_media_provider_catalog'),
+    planAICapabilityRoute: (input: Record<string, unknown>) => invoke<CapabilityRoutePlan>('plan_ai_capability_route', { input }),
+    testAICapability: (input: Record<string, unknown>) => invoke<AICapabilityTestResult>('test_ai_capability', { input }),
+    setAICapabilityFallbacks: (capability: string, serviceIds: string[]) => invoke<MediaProviderCatalogResult>('set_ai_capability_fallbacks', { capability, serviceIds }),
     listAIServiceTemplates: () => invoke<AIServiceTemplateListResult>('list_ai_service_templates'),
     acpRuntimeProfiles: () => invoke<AcpRuntimeProfileSnapshot>('list_acp_runtime_profiles'),
     saveAcpRuntimeProfile: (input: AcpRuntimeProfileInput) => invoke<AcpRuntimeProfile>('save_acp_runtime_profile', input),
     setAcpRuntimeProfileEnabled: (providerId: string, enabled: boolean) => invoke<AcpRuntimeProfile>('set_acp_runtime_profile_enabled', { providerId, enabled }),
     removeAcpRuntimeProfile: (providerId: string) => invoke<{ provider_id: string; removed: boolean }>('remove_acp_runtime_profile', { providerId }),
-    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
+    saveAIService: (input: { id: string; display_name: string; base_url: string; protocol: AIServiceProtocol; model: string; models: string[]; image_model: string; image_adapter: string; image_edit_model: string; image_edit_adapter: string; video_model: string; video_adapter: string; speech_model: string; speech_adapter: string; transcribe_model: string; transcribe_adapter: string; balance_profile_id: string; balance_access_token: string; balance_user_id: string; api_key: string }) =>
         invoke<CustomAIService>('save_ai_service', {
             id: input.id,
             displayName: input.display_name,
@@ -3122,6 +3368,10 @@ export const agentApi = {
             imageEditAdapter: input.image_edit_adapter,
             videoModel: input.video_model,
             videoAdapter: input.video_adapter,
+            speechModel: input.speech_model,
+            speechAdapter: input.speech_adapter,
+            transcribeModel: input.transcribe_model,
+            transcribeAdapter: input.transcribe_adapter,
             balanceProfileId: input.balance_profile_id,
             balanceAccessToken: input.balance_access_token,
             balanceUserId: input.balance_user_id,

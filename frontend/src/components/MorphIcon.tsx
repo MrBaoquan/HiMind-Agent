@@ -18,9 +18,8 @@ type MorphIconProps = {
  * 只解决一件事：**同一个图标位从一个含义变成另一个含义**（等待 → 运行 → 完成）。
  * 持续运行态交给 BusyIndicator —— 形变转完就停，它表达不了「还在跑」。
  *
- * 两个默认值是有意收口的：`reducedMotion="never"` 明确让形变始终播放 ——
- * 形变是「状态变了」这件事本身的表达，系统的「减少动态效果」一旦介入，
- * 同一套界面在不同机器上就有两种形态（详见 styles.css 末尾的取舍说明）；
+ * 形变遵循系统的「减少动态效果」偏好：开启后直接落到终态，避免动画成为
+ * 前庭敏感用户必须承受的干扰；状态含义仍由图标终态、颜色和文字共同表达。
  * `strokeWidth` 与项目里 lucide-react 的用法对齐，免得同一行里形变图标和静态图标粗细不一致。
  *
  * 形变的是同一个 `<path>` 的 `d`，所以旋转（BusyIndicator）和形变互不干扰。
@@ -34,7 +33,7 @@ export function MorphIcon({ icon, size = 16, strokeWidth = 1.8, className, color
       className={className}
       color={color}
       label={label}
-      reducedMotion="never"
+      reducedMotion="user"
     />
   );
 }

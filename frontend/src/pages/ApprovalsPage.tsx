@@ -132,7 +132,7 @@ export function ApprovalsPage({ approvals, history, independentMode = false, onR
   return (
     <>
       <PageHeader title="审批" description="处理需要确认的敏感操作。" actions={<div className="page-header-actions"><button type="button" className="btn" onClick={onOpenSettings}><Settings2 size={15} />审批策略</button></div>} />
-        {independentMode ? <div className="security-note compact approval-independent-note"><ShieldAlert size={16} /><span>未对接 AI 工作台时，审批记录只保存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
+        {independentMode ? <div className="security-note compact approval-independent-note"><ShieldAlert size={16} /><span>未连接 AI 工作台时，审批记录只保存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
       <div className="card approval-workspace">
         <div className="approval-workspace-header">
           <ApprovalTabs activeTab={activeTab} pendingCount={approvals.length} historyCount={history.length} onChange={setActiveTab} />

@@ -2,6 +2,7 @@ use crate::api::distribution::{
     plugin_catalog, plugin_versions, report_plugin_status, PluginCatalogItem, PluginStatusReport,
     SkillPluginDependency,
 };
+use crate::app::control_plane_provider;
 use crate::app::extension_lock::TransientPolicy;
 use crate::app::system::verify_extension_artifact_signature;
 use crate::capability::plugin::{
@@ -109,7 +110,7 @@ pub(crate) fn report_status(
     from_version: &str,
     error: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if !options.mode().dashboard_enabled() {
+    if !control_plane_provider::available(options) {
         return Ok(());
     }
     flush_status_outbox(options, agent_id);
@@ -141,7 +142,7 @@ fn send_status(
     options: &Options,
     record: &PluginStatusRecord,
 ) -> Result<(), crate::api::distribution::PluginStatusDeliveryError> {
-    if !options.mode().dashboard_enabled() {
+    if !control_plane_provider::available(options) {
         return Ok(());
     }
     let credential = options.agent_credential();
@@ -376,6 +377,18 @@ pub(crate) fn install_local_package_from_source(
     let result = (|| -> Result<(), Box<dyn Error>> {
         let manifest = read_plugin_manifest_from_archive(archive_path)?;
         ensure_agent_version_supported(&manifest.min_agent_version)?;
+        let icon = if source.is_dir() {
+            crate::app::extension_icons::resolve_effective_icon(
+                "plugin",
+                &manifest.id,
+                &source,
+                Some(&manifest.icon),
+            )
+            .ok()
+            .flatten()
+        } else {
+            crate::app::extension_icons::resolve_user_override("plugin", &manifest.id)
+        };
         let item = PluginCatalogItem {
             plugin_id: manifest.id.clone(),
             name: manifest.name.clone(),
@@ -416,6 +429,7 @@ pub(crate) fn install_local_package_from_source(
                 .collect(),
             permissions: manifest.permissions.clone(),
             view_count: manifest.contributes.views.len(),
+            icon,
             plugin_dependencies: manifest
                 .plugin_dependencies
                 .iter()
@@ -1092,6 +1106,7 @@ pub(crate) fn uninstall(plugin_id: &str) -> Result<(), Box<dyn Error>> {
     remove_owner_references(&format!("plugin:{plugin_id}"));
     let _ = crate::app::extension_lock::remove("plugin", plugin_id);
     crate::app::extension_source::remove_provenance("plugin", plugin_id);
+    crate::app::extension_icons::clear_user_override_after_uninstall("plugin", plugin_id);
     if existed {
         crate::capability::service::invalidate_capability_discovery();
     }
@@ -1108,6 +1123,7 @@ pub(crate) fn remove_for_policy(plugin_id: &str) -> Result<(), Box<dyn Error>> {
     remove_owner_references(&format!("plugin:{plugin_id}"));
     let _ = crate::app::extension_lock::remove("plugin", plugin_id);
     crate::app::extension_source::remove_provenance("plugin", plugin_id);
+    crate::app::extension_icons::clear_user_override_after_uninstall("plugin", plugin_id);
     if existed {
         crate::capability::service::invalidate_capability_discovery();
     }
@@ -2085,6 +2101,7 @@ mod tests {
         dependencies: Vec<SkillPluginDependency>,
     ) -> PluginCatalogItem {
         PluginCatalogItem {
+            icon: None,
             plugin_id: plugin_id.to_string(),
             name: name.to_string(),
             description: format!("{name} description"),
@@ -2475,6 +2492,7 @@ mod tests {
             identity_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
+            provider_availability_override: Arc::new(std::sync::atomic::AtomicU8::new(2)),
         }
     }
 
@@ -2580,6 +2598,7 @@ mod tests {
             identity_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
+            provider_availability_override: Arc::new(std::sync::atomic::AtomicU8::new(2)),
         };
 
         assert!(report_status(

@@ -495,6 +495,7 @@ mod tests {
 
     fn manifest(clients: &[&str]) -> SkillManifest {
         SkillManifest {
+            icon: String::new(),
             id: "com.himind.skill.portable".to_string(),
             name: "Portable".to_string(),
             author: String::new(),

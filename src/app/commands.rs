@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::api::distribution::ExtensionDesiredState;
 use crate::api::types::AgentTaskHistoryItem;
+use crate::app::control_plane_provider;
 use crate::app::extension_lock::ADHOC_SOURCE;
 use crate::app::remote_clients;
 use crate::app::status::local_worker_snapshot;
@@ -295,10 +296,10 @@ fn dashboard_agent_user_client(
 }
 
 fn require_dashboard(state: &AgentState) -> Result<(), String> {
-    if state.options.mode().dashboard_enabled() {
+    if control_plane_provider::available(&state.options) {
         Ok(())
     } else {
-        Err(crate::app::runtime_mode::control_plane_required_error())
+        Err(control_plane_provider::unavailable_error(&state.options))
     }
 }
 
@@ -306,7 +307,7 @@ fn require_dashboard(state: &AgentState) -> Result<(), String> {
 pub(crate) async fn get_dashboard_identity_status(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardIdentityStatus, String> {
-    if !state.options.mode().dashboard_enabled() {
+    if !control_plane_provider::status(&state.options).enabled_by_user {
         // Independent mode has no Dashboard identity of its own. Clear only a
         // leftover Dashboard binding (e.g. after switching from connected
         // mode); a locally confirmed, unbounded full_access approval posture
@@ -367,7 +368,23 @@ pub(crate) fn get_builtin_ai_activity(
 pub(crate) fn start_dashboard_authorization(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
-    ensure_dashboard_mode_for_authorization(&state)?;
+    // Explicitly choosing authorization is the user action that enables the
+    // workbench provider preference. Availability remains false until the
+    // binding is registered and authorization completes.
+    if !state.options.mode().dashboard_enabled() {
+        crate::app::runtime_mode::save(
+            &state.state_path,
+            crate::app::runtime_mode::AgentMode::Connected,
+        )
+        .map_err(|error| error.to_string())?;
+        state
+            .options
+            .set_mode(crate::app::runtime_mode::AgentMode::Connected);
+        crate::app::ui::stop_builtin_ai_process();
+        state
+            .approval_manager
+            .add_log("info", "已启用 AI 工作台对接，等待账号授权");
+    }
     crate::app::identity::start_authorization(
         state.options.clone(),
         Arc::clone(&state.dashboard_authorization),
@@ -375,35 +392,10 @@ pub(crate) fn start_dashboard_authorization(
     )
 }
 
-/// 授权即对接：账号授权是用户侧唯一的开关。
-///
-/// 独立模式下点「授权」先切回对接状态再发起设备授权；否则用户「取消授权」后
-/// 就一直停在独立模式，授权按钮每次都按 `control_plane_required` 失败，形成死路。
-fn ensure_dashboard_mode_for_authorization(state: &AgentState) -> Result<(), String> {
-    if state.options.mode().dashboard_enabled() {
-        return Ok(());
-    }
-    crate::app::runtime_mode::save(
-        &state.state_path,
-        crate::app::runtime_mode::AgentMode::Connected,
-    )
-    .map_err(|error| error.to_string())?;
-    state
-        .options
-        .set_mode(crate::app::runtime_mode::AgentMode::Connected);
-    // 独立模式下启动的会话沿用本机配置，切换对接状态后收掉，避免它继续用旧身份。
-    crate::app::ui::stop_builtin_ai_process();
-    state
-        .approval_manager
-        .add_log("info", "已开启 AI 工作台对接");
-    Ok(())
-}
-
 #[tauri::command]
 pub(crate) fn get_dashboard_authorization_progress(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
-    require_dashboard(&state)?;
     Ok(crate::app::identity::authorization_progress(
         &state.dashboard_authorization,
     ))
@@ -413,7 +405,6 @@ pub(crate) fn get_dashboard_authorization_progress(
 pub(crate) fn cancel_dashboard_authorization(
     state: State<'_, AgentState>,
 ) -> Result<crate::app::identity::DashboardAuthorizationProgress, String> {
-    require_dashboard(&state)?;
     crate::app::identity::cancel_authorization(&state.dashboard_authorization)
 }
 
@@ -421,7 +412,6 @@ pub(crate) fn cancel_dashboard_authorization(
 pub(crate) fn open_dashboard_authorization_page(
     state: State<'_, AgentState>,
 ) -> Result<(), String> {
-    require_dashboard(&state)?;
     let progress = crate::app::identity::authorization_progress(&state.dashboard_authorization);
     if progress.verification_uri_complete.trim().is_empty() {
         return Err("当前没有可打开的 Dashboard 授权页面".to_string());
@@ -429,34 +419,108 @@ pub(crate) fn open_dashboard_authorization_page(
     open_url(&progress.verification_uri_complete).map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DashboardRevocationResult {
+    pub mode: String,
+    pub mode_persisted: bool,
+    pub remote_revoked: bool,
+    pub local_cleared: bool,
+    pub warning: String,
+}
+
 #[tauri::command]
 pub(crate) async fn revoke_dashboard_authorization(
     state: State<'_, AgentState>,
-) -> Result<(), String> {
-    require_dashboard(&state)?;
-    let options = state.options.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::api::oauth::revoke_authorization(&options).map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    state
-        .approval_manager
-        .add_log("info", "已退出 Dashboard 账号授权");
-    state.approval_manager.clear_identity()?;
-    // 取消授权即终止对接：授权是唯一的用户侧控制，取消后立即停止任务接收
-    // 与运行记录同步，重启后也不会自动恢复。
-    let _ = crate::app::runtime_mode::save(
+) -> Result<DashboardRevocationResult, String> {
+    // Leaving Dashboard mode is a local decision. Persist it before any
+    // network work so an unavailable or already-expired Dashboard can never
+    // trap the Agent in connected mode.
+    let mut warning = String::new();
+    let mode_persisted = match crate::app::runtime_mode::save(
         &state.state_path,
         crate::app::runtime_mode::AgentMode::Independent,
-    );
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            state
+                .approval_manager
+                .add_log("error", &format!("停止工作台对接时无法保存偏好: {error}"));
+            warning.push_str(
+                "当前进程已停止工作台对接，但偏好无法写入本机；重启前请修复数据目录权限或完整性。",
+            );
+            false
+        }
+    };
     state
         .options
         .set_mode(crate::app::runtime_mode::AgentMode::Independent);
-    state
-        .approval_manager
-        .add_log("info", "已取消 AI 工作台授权，停止对接");
-    Ok(())
+    crate::app::ui::stop_builtin_ai_process();
+    let _ = crate::app::identity::cancel_authorization(&state.dashboard_authorization);
+
+    let mut local_cleared = true;
+    if let Err(error) = state.approval_manager.clear_identity() {
+        local_cleared = false;
+        state.approval_manager.add_log(
+            "warn",
+            &format!("停止工作台对接时清理审批身份失败: {error}"),
+        );
+    }
+
+    let options = state.options.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        crate::api::oauth::revoke_authorization_best_effort(&options)
+    })
+    .await
+    .unwrap_or_else(|error| crate::api::oauth::AuthorizationRevocationOutcome {
+        remote_revoked: false,
+        local_cleared: false,
+        remote_error: error.to_string(),
+        local_error: String::new(),
+    });
+    local_cleared &= outcome.local_cleared;
+
+    if !outcome.remote_revoked {
+        state.approval_manager.add_log(
+            "warn",
+            &format!(
+                "已停止工作台对接，但远端撤销授权失败: {}",
+                outcome.remote_error
+            ),
+        );
+        if !warning.is_empty() {
+            warning.push(' ');
+        }
+        warning.push_str("暂时无法通知工作台撤销远端授权，设备注册可能仍需在组织侧解除。");
+    } else {
+        state
+            .approval_manager
+            .add_log("info", "已退出 Dashboard 账号授权");
+    }
+    if !local_cleared {
+        if !outcome.local_error.is_empty() {
+            state.approval_manager.add_log(
+                "warn",
+                &format!("停止工作台对接时清理本地授权失败: {}", outcome.local_error),
+            );
+        }
+        if !warning.is_empty() {
+            warning.push(' ');
+        }
+        warning.push_str("本机授权记录未能完全清理，但重启后仍不会自动恢复工作台对接。");
+    } else {
+        state
+            .approval_manager
+            .add_log("info", "已取消 AI 工作台授权，停止对接");
+    }
+    Ok(DashboardRevocationResult {
+        mode: crate::app::runtime_mode::AgentMode::Independent
+            .as_str()
+            .to_string(),
+        mode_persisted,
+        remote_revoked: outcome.remote_revoked,
+        local_cleared,
+        warning,
+    })
 }
 
 #[tauri::command]
@@ -730,6 +794,7 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
     let executable = local_agent_executable_metadata();
     let pending = state.approval_manager.list_pending();
     let login = local_login_status_json();
+    let provider = control_plane_provider::status(&state.options);
     let current_task =
         state
             .options
@@ -751,11 +816,12 @@ pub(crate) fn get_agent_status(state: State<'_, AgentState>) -> Result<serde_jso
         "effective_mode": state.options.mode().as_str(),
         "pending_mode": state.options.pending_mode().as_str(),
         "requires_restart": state.options.mode() != state.options.pending_mode(),
-        "dashboard_enabled": state.options.mode().dashboard_enabled(),
+        "dashboard_enabled": provider.enabled_by_user,
+        "provider": provider.clone(),
         "control_plane": {
             "kind": state.options.mode().control_plane(),
-            "enabled": state.options.mode().control_plane_enabled(),
-            "available": state.options.mode().control_plane_enabled(),
+            "enabled": provider.enabled_by_user,
+            "available": provider.available,
             "worker_state": worker["dashboard_worker_state"],
             "worker_expected": worker["dashboard_worker_expected"],
             "worker_reason_code": worker["dashboard_worker_reason_code"],
@@ -2200,7 +2266,7 @@ pub(crate) fn test_svn_connection(
 pub(crate) async fn get_plugin_registry(
     state: State<'_, AgentState>,
 ) -> Result<serde_json::Value, String> {
-    let control_plane_enabled = state.options.mode().control_plane_enabled();
+    let control_plane_enabled = control_plane_provider::available(&state.options);
     tauri::async_runtime::spawn_blocking(move || {
         registry_json_for_control_plane(control_plane_enabled).map_err(|e| e.to_string())
     })
@@ -2446,7 +2512,7 @@ pub(crate) fn import_local_plugin(
     };
     crate::app::plugin_manager::install_local_package_from_source(&path, ADHOC_SOURCE)
         .map_err(|error| error.to_string())?;
-    registry_json_for_control_plane(state.options.mode().control_plane_enabled())
+    registry_json_for_control_plane(control_plane_provider::available(&state.options))
         .map_err(|error| error.to_string())
 }
 
@@ -2753,13 +2819,18 @@ pub(crate) async fn list_ai_services(
     tauri::async_runtime::spawn_blocking(move || {
         let custom = crate::store::ai_services::public_snapshot().map_err(|e| e.to_string())?;
         let clients = crate::app::ai_provider_import::status(&options);
-        let managed = if options.mode().dashboard_enabled() {
+        let provider = control_plane_provider::status(&options);
+        let managed = if provider.available {
             // This summary may require OAuth refresh and network I/O. It runs
             // off the desktop event loop and degrades to an unavailable state.
             let user_id = crate::app::identity::identity_status(&options).user_id;
             crate::api::ai::managed_ai_service_summary(&options, &user_id)
         } else {
-            serde_json::json!({ "available": false, "reason": "independent" })
+            serde_json::json!({
+                "available": false,
+                "reason": provider.reason,
+                "message": provider.message,
+            })
         };
         Ok(json!({
             "custom": custom,
@@ -2769,6 +2840,39 @@ pub(crate) async fn list_ai_services(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn get_media_provider_catalog() -> Result<serde_json::Value, String> {
+    crate::store::ai_services::media_provider_catalog().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn plan_ai_capability_route(
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    crate::app::ai_capability_bus::route_plan(&input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn test_ai_capability(
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::ai_capability_bus::test(&input).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn set_ai_capability_fallbacks(
+    capability: String,
+    service_ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    crate::store::ai_services::set_capability_fallbacks(&capability, service_ids)
+        .map_err(|error| error.to_string())?;
+    crate::store::ai_services::media_provider_catalog().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2928,13 +3032,17 @@ pub(crate) fn save_ai_service(
     image_edit_adapter: Option<String>,
     video_model: Option<String>,
     video_adapter: Option<String>,
+    speech_model: Option<String>,
+    speech_adapter: Option<String>,
+    transcribe_model: Option<String>,
+    transcribe_adapter: Option<String>,
     balance_profile_id: Option<String>,
     balance_access_token: Option<String>,
     balance_user_id: Option<String>,
     api_key: String,
 ) -> Result<serde_json::Value, String> {
     let protocol = crate::store::ai_services::AIServiceProtocol::parse(&protocol)?;
-    // 媒体能力槽位：表单里的「生图 / 改图」两行各自映射到一个槽位。
+    // 媒体能力槽位：表单里的每一行映射到一个稳定的媒体原语。
     let mut media = std::collections::BTreeMap::new();
     let image_model = image_model.unwrap_or_default();
     let image_adapter = image_adapter.unwrap_or_default();
@@ -2942,12 +3050,37 @@ pub(crate) fn save_ai_service(
     let image_edit_adapter = image_edit_adapter.unwrap_or_default();
     let video_model = video_model.unwrap_or_default();
     let video_adapter = video_adapter.unwrap_or_default();
+    let speech_model = speech_model.unwrap_or_default();
+    let speech_adapter = speech_adapter.unwrap_or_default();
+    let transcribe_model = transcribe_model.unwrap_or_default();
+    let transcribe_adapter = transcribe_adapter.unwrap_or_default();
+    if !speech_model.trim().is_empty() {
+        media.insert(
+            crate::store::ai_services::CAP_AUDIO_SPEECH.to_string(),
+            crate::store::ai_services::MediaModelBinding {
+                adapter: speech_adapter.trim().to_string(),
+                model: speech_model.trim().to_string(),
+                execution_mode: None,
+            },
+        );
+    }
+    if !transcribe_model.trim().is_empty() {
+        media.insert(
+            crate::store::ai_services::CAP_AUDIO_TRANSCRIBE.to_string(),
+            crate::store::ai_services::MediaModelBinding {
+                adapter: transcribe_adapter.trim().to_string(),
+                model: transcribe_model.trim().to_string(),
+                execution_mode: None,
+            },
+        );
+    }
     if !video_model.trim().is_empty() {
         media.insert(
             crate::store::ai_services::CAP_VIDEO_GENERATE.to_string(),
             crate::store::ai_services::MediaModelBinding {
                 adapter: video_adapter.trim().to_string(),
                 model: video_model.trim().to_string(),
+                execution_mode: None,
             },
         );
     }
@@ -2957,6 +3090,7 @@ pub(crate) fn save_ai_service(
             crate::store::ai_services::MediaModelBinding {
                 adapter: image_edit_adapter.trim().to_string(),
                 model: image_edit_model.trim().to_string(),
+                execution_mode: None,
             },
         );
     }
@@ -3620,6 +3754,28 @@ pub(crate) fn pick_extension_workspace_dir() -> Option<String> {
 }
 
 #[tauri::command]
+pub(crate) fn pick_extension_icon_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("扩展图标", &["png", "webp"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub(crate) fn set_extension_icon_override(
+    kind: String,
+    id: String,
+    path: String,
+) -> Result<crate::app::extension_icons::ExtensionIconInfo, String> {
+    crate::app::extension_icons::set_user_override(&kind, &id, std::path::Path::new(path.trim()))
+}
+
+#[tauri::command]
+pub(crate) fn clear_extension_icon_override(kind: String, id: String) -> Result<bool, String> {
+    crate::app::extension_icons::clear_user_override(&kind, &id)
+}
+
+#[tauri::command]
 pub(crate) fn pick_instruction_file() -> Option<String> {
     rfd::FileDialog::new()
         .set_title("选择 AGENTS.md 或 CLAUDE.md")
@@ -3762,59 +3918,83 @@ pub(crate) fn create_extension_project(
 
 /// 扩展开发工具链就绪度：界面据此说明「走插件执行器还是内核内置实现」、
 /// Go 工具链是否可用，以及新建扩展是否仍需要扩展开发工具插件。
-/// 插件声明的凭据 + 当前配置状态。只返回状态（配没配、配了哪些字段、更新时间），
-/// 不返回任何明文：值由 Agent 统一保管，界面与插件都看不到它。
+/// 插件声明的凭据 + 当前配置状态。只返回状态和公开账号元数据，不返回任何秘密值。
 #[tauri::command]
 pub(crate) fn plugin_credentials(plugin_id: String) -> Result<serde_json::Value, String> {
     let item = crate::capability::plugin::find_plugin(plugin_id.trim())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("插件未安装: {}", plugin_id.trim()))?;
-    // 内置插件没有磁盘清单；凭据需求由内核清单描述，当前两个内置插件都没有声明。
-    // 返回空集合而不是报错，避免详情页把「系统内置」误显示成读取失败。
     if item.source == "builtin" {
         return Ok(serde_json::json!({
             "plugin_id": plugin_id.trim(),
             "credentials": [],
         }));
     }
-    let directory = {
-        let current = std::path::Path::new(&item.path).join("current");
-        if current.join("plugin.json").is_file() {
-            current
-        } else {
-            std::path::PathBuf::from(&item.path)
-        }
-    };
-    let content = std::fs::read_to_string(directory.join("plugin.json"))
-        .map_err(|error| format!("读取插件清单失败: {error}"))?;
-    let manifest = crate::capability::plugin::parse_plugin_manifest(&content)
-        .map_err(|error| error.to_string())?;
-    let ids: Vec<String> = manifest
+    let fingerprint =
+        crate::capability::plugin::credential_declaration_fingerprint(&item.credentials);
+    let status_input = item
         .credentials
         .iter()
-        .map(|item| item.id.clone())
-        .collect();
-    let statuses = crate::store::plugin_credentials::statuses(plugin_id.trim(), &ids)
-        .map_err(|error| error.to_string())?;
+        .map(|request| (request.id.clone(), fingerprint.clone()))
+        .collect::<Vec<_>>();
+    let statuses = crate::store::plugin_credentials::statuses_with_fingerprints(
+        plugin_id.trim(),
+        &status_input,
+    )
+    .map_err(|error| error.to_string())?;
     let by_id: std::collections::BTreeMap<_, _> = statuses
         .into_iter()
         .map(|status| (status.id.clone(), status))
         .collect();
-    let items: Vec<serde_json::Value> = manifest
+    let items: Vec<serde_json::Value> = item
         .credentials
         .iter()
         .map(|request| {
             let status = by_id.get(&request.id);
+            let fields: Vec<serde_json::Value> = request
+                .fields
+                .iter()
+                .map(|field| {
+                    let configured = status.is_some_and(|value| {
+                        if field.secret {
+                            value.configured_fields.iter().any(|name| name == &field.key)
+                        } else {
+                            value.public_fields.contains_key(&field.key)
+                        }
+                    });
+                    serde_json::json!({
+                        "key": field.key,
+                        "label": field.display_label(),
+                        "type": field.field_type,
+                        "secret": field.secret,
+                        "required": field.required,
+                        "placeholder": field.placeholder,
+                        "help": field.help,
+                        "configured": configured,
+                        "value": if field.secret {
+                            String::new()
+                        } else {
+                            status
+                                .and_then(|value| value.public_fields.get(&field.key))
+                                .cloned()
+                                .unwrap_or_default()
+                        },
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "id": request.id,
                 "label": if request.label.trim().is_empty() { request.id.clone() } else { request.label.clone() },
                 "kind": request.kind,
-                "fields": request.fields,
+                "fields": fields,
                 "required": request.required,
                 "description": request.description,
                 "docs_url": request.docs_url,
+                "verify_capability": request.verify_capability,
                 "configured": status.is_some_and(|value| value.configured),
                 "configured_fields": status.map(|value| value.configured_fields.clone()).unwrap_or_default(),
+                "public_fields": status.map(|value| value.public_fields.clone()).unwrap_or_default(),
+                "descriptor_current": status.map(|value| value.descriptor_current).unwrap_or(true),
                 "updated_at": status.map(|value| value.updated_at.clone()).unwrap_or_default(),
             })
         })
@@ -3822,15 +4002,140 @@ pub(crate) fn plugin_credentials(plugin_id: String) -> Result<serde_json::Value,
     Ok(serde_json::json!({ "plugin_id": plugin_id.trim(), "credentials": items }))
 }
 
-/// 保存（或覆盖）一条插件凭据。明文只在内存里传给凭据库，落盘前就加密。
+fn plugin_credential_request(
+    plugin_id: &str,
+    credential_id: &str,
+) -> Result<
+    (
+        crate::capability::plugin::PluginRegistryItem,
+        crate::capability::plugin::PluginCredentialRequest,
+        String,
+    ),
+    String,
+> {
+    let item = crate::capability::plugin::find_plugin(plugin_id.trim())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("插件未安装: {}", plugin_id.trim()))?;
+    if item.source == "builtin" {
+        return Err("内置集成的凭据由 Agent 适配器管理".to_string());
+    }
+    let request = item
+        .credentials
+        .iter()
+        .find(|request| request.id == credential_id.trim())
+        .cloned()
+        .ok_or_else(|| format!("插件未声明凭据: {plugin_id}/{credential_id}"))?;
+    let fingerprint =
+        crate::capability::plugin::credential_declaration_fingerprint(&item.credentials);
+    Ok((item, request, fingerprint))
+}
+
+fn validate_credential_fields(
+    request: &crate::capability::plugin::PluginCredentialRequest,
+    public_fields: &std::collections::BTreeMap<String, String>,
+    secret_fields: &std::collections::BTreeMap<String, String>,
+    existing: &crate::store::plugin_credentials::PluginCredentialStatus,
+) -> Result<(), String> {
+    for key in public_fields.keys() {
+        if !request
+            .fields
+            .iter()
+            .any(|field| field.key == *key && !field.secret)
+        {
+            return Err(format!("字段 {key} 未在插件清单中声明为公开字段"));
+        }
+    }
+    for key in secret_fields.keys() {
+        if !request
+            .fields
+            .iter()
+            .any(|field| field.key == *key && field.secret)
+        {
+            return Err(format!("字段 {key} 未在插件清单中声明为秘密字段"));
+        }
+    }
+    for field in request.fields.iter().filter(|field| field.required) {
+        let supplied = if field.secret {
+            secret_fields
+                .get(&field.key)
+                .is_some_and(|value| !value.trim().is_empty())
+                || existing
+                    .configured_fields
+                    .iter()
+                    .any(|key| key == &field.key)
+        } else {
+            public_fields
+                .get(&field.key)
+                .is_some_and(|value| !value.trim().is_empty())
+                || existing.public_fields.contains_key(&field.key)
+        };
+        if !supplied {
+            return Err(format!("字段 {} 为必填项", field.display_label()));
+        }
+    }
+    Ok(())
+}
+
+/// 保存插件凭据。公开字段用于账号元数据展示，秘密字段在落盘前由 DPAPI 封装。
+#[tauri::command]
+pub(crate) fn save_plugin_credential_profile(
+    plugin_id: String,
+    credential_id: String,
+    public_fields: std::collections::BTreeMap<String, String>,
+    secret_fields: std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let (_item, request, fingerprint) = plugin_credential_request(&plugin_id, &credential_id)?;
+    let existing = crate::store::plugin_credentials::statuses_with_fingerprints(
+        plugin_id.trim(),
+        &[(credential_id.trim().to_string(), fingerprint.clone())],
+    )
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .next()
+    .ok_or_else(|| "无法读取凭据状态".to_string())?;
+    validate_credential_fields(&request, &public_fields, &secret_fields, &existing)?;
+    crate::store::plugin_credentials::save_profile(
+        plugin_id.trim(),
+        credential_id.trim(),
+        &public_fields,
+        &secret_fields,
+        &fingerprint,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Legacy command: every supplied field is treated as secret. Kept so older
+/// frontends cannot bypass manifest validation.
 #[tauri::command]
 pub(crate) fn save_plugin_credential(
     plugin_id: String,
     credential_id: String,
     fields: std::collections::BTreeMap<String, String>,
 ) -> Result<(), String> {
-    crate::store::plugin_credentials::save(plugin_id.trim(), credential_id.trim(), &fields)
-        .map_err(|error| error.to_string())?;
+    let (_item, request, fingerprint) = plugin_credential_request(&plugin_id, &credential_id)?;
+    let existing = crate::store::plugin_credentials::statuses_with_fingerprints(
+        plugin_id.trim(),
+        &[(credential_id.trim().to_string(), fingerprint.clone())],
+    )
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .next()
+    .ok_or_else(|| "无法读取凭据状态".to_string())?;
+    validate_credential_fields(
+        &request,
+        &std::collections::BTreeMap::new(),
+        &fields,
+        &existing,
+    )?;
+    crate::store::plugin_credentials::save_profile(
+        plugin_id.trim(),
+        credential_id.trim(),
+        &std::collections::BTreeMap::new(),
+        &fields,
+        &fingerprint,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -3840,6 +4145,7 @@ pub(crate) fn delete_plugin_credential(
     plugin_id: String,
     credential_id: String,
 ) -> Result<bool, String> {
+    let (_item, _request, _fingerprint) = plugin_credential_request(&plugin_id, &credential_id)?;
     crate::store::plugin_credentials::remove(plugin_id.trim(), credential_id.trim())
         .map_err(|error| error.to_string())
 }
@@ -5442,7 +5748,7 @@ pub(crate) fn merged_plugin_catalog_for(
             Vec::new()
         }
     };
-    if options.mode().dashboard_enabled() {
+    if control_plane_provider::available(options) {
         let credential = options.agent_credential();
         if !agent_id.trim().is_empty() && !credential.trim().is_empty() {
             let dashboard = reqwest::blocking::Client::builder()
@@ -5523,7 +5829,7 @@ pub(crate) fn merged_skill_catalog_for(
             Vec::new()
         }
     };
-    if options.mode().dashboard_enabled() {
+    if control_plane_provider::available(options) {
         let credential = options.agent_credential();
         if !agent_id.trim().is_empty() && !credential.trim().is_empty() {
             match crate::app::skill_manager::catalog(options, agent_id) {
@@ -5614,7 +5920,7 @@ pub(crate) fn merged_workflow_catalog(
         Ok(snapshot) => catalog.extend(snapshot.workflows),
         Err(error) => errors.push(error.to_string()),
     }
-    if options.mode().dashboard_enabled() {
+    if control_plane_provider::available(options) {
         match crate::api::client::load_agent_state(&options.state_path) {
             Ok(state) => match reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -6051,15 +6357,12 @@ pub(crate) fn invoke_development_plugin(
         capability.availability.trim().to_ascii_lowercase().as_str(),
         "control_plane" | "dashboard"
     );
-    if control_plane_capability && !state.options.mode().control_plane_enabled() {
-        return Err(crate::app::runtime_mode::control_plane_required_error());
+    let control_plane_available = control_plane_provider::available(&state.options);
+    if control_plane_capability && !control_plane_available {
+        return Err(control_plane_provider::unavailable_error(&state.options));
     }
     let api_base = state.options.api_base();
-    let trusted_dashboard_url = state
-        .options
-        .mode()
-        .control_plane_enabled()
-        .then_some(api_base.as_str());
+    let trusted_dashboard_url = control_plane_available.then_some(api_base.as_str());
     let result = crate::capability::plugin::invoke_plugin_capability_for_plugin(
         &plugin_id,
         &capability_id,
@@ -6143,6 +6446,45 @@ pub(crate) fn pick_workspace_directory() -> Result<serde_json::Value, String> {
         .pick_folder()
         .map(|value| value.to_string_lossy().to_string());
     Ok(json!({ "path": path }))
+}
+
+/// Plugin views need deletion guards for their own saved references, but must
+/// not receive the full local schedule list. Return only category-id counts.
+#[tauri::command]
+pub(crate) fn get_plugin_view_schedule_reference_counts(
+    window: WebviewWindow,
+) -> Result<serde_json::Value, String> {
+    if !window.label().starts_with("plugin-view-") {
+        return Err("only plugin windows can use this command".to_string());
+    }
+    let result =
+        crate::scheduler::list(crate::scheduler::now_epoch()).map_err(|error| error.to_string())?;
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for schedule in result
+        .get("schedules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let input = schedule.get("input").and_then(Value::as_object);
+        let ids = input
+            .and_then(|value| value.get("category_ids"))
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .or_else(|| {
+                input
+                    .and_then(|value| value.get("domains"))
+                    .and_then(Value::as_array)
+            });
+        for id in ids.into_iter().flatten().filter_map(Value::as_str) {
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            *counts.entry(id.to_string()).or_default() += 1;
+        }
+    }
+    Ok(serde_json::to_value(counts).map_err(|error| error.to_string())?)
 }
 
 #[tauri::command]
@@ -6308,6 +6650,121 @@ pub(crate) fn get_workflow_center(
 }
 
 #[tauri::command]
+pub(crate) fn resolve_workflow_option_source(
+    state: State<'_, AgentState>,
+    workflow_id: String,
+    field_id: String,
+) -> Result<serde_json::Value, String> {
+    let store =
+        crate::workflow::WorkflowStore::open_default().map_err(|error| error.to_string())?;
+    let installed = store
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.package.id == workflow_id && item.enabled)
+        .ok_or_else(|| format!("workflow package not found or disabled: {workflow_id}"))?;
+    let source = crate::workflow::view_option_source(&installed.package, &field_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow field has no option_source: {workflow_id}/{field_id}"))?;
+    if !matches!(
+        source.kind.as_str(),
+        "" | "plugin_capability" | "capability"
+    ) {
+        return Err(format!(
+            "unsupported workflow option_source kind: {}",
+            source.kind
+        ));
+    }
+    let input = if source.input.is_null() {
+        json!({})
+    } else {
+        source.input
+    };
+    let context = InvocationContext::new(
+        crate::capability::types::InvocationSource::Tauri,
+        format!("workflow-option-source:{workflow_id}:{field_id}"),
+    );
+    let result = state
+        .capability_gateway
+        .invoke(&context, &source.capability_id, input)
+        .map_err(|error| error.to_string())?;
+    let options = normalize_workflow_option_items(result, &source.items_path)?;
+    Ok(json!({
+        "capability_id": source.capability_id,
+        "options": options,
+    }))
+}
+
+fn normalize_workflow_option_items(value: Value, items_path: &str) -> Result<Vec<Value>, String> {
+    let items = if let Some(items) = value.as_array() {
+        items.clone()
+    } else if !items_path.trim().is_empty() {
+        value
+            .get(items_path.trim())
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "option_source result does not contain {}",
+                    items_path.trim()
+                )
+            })?
+    } else {
+        value
+            .get("themes")
+            .and_then(Value::as_array)
+            .cloned()
+            .or_else(|| value.get("options").and_then(Value::as_array).cloned())
+            .ok_or_else(|| {
+                "option_source result must be an array or contain themes/options".to_string()
+            })?
+    };
+    let mut options = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let option_value = object
+            .get("value")
+            .or_else(|| object.get("id"))
+            .or_else(|| object.get("slug"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(option_value) = option_value else {
+            continue;
+        };
+        let label = object
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(option_value);
+        let topics = object
+            .get("topics")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        options.push(json!({
+            "value": option_value,
+            "label": label,
+            "topics": topics,
+            "source": object.get("source").and_then(Value::as_str).unwrap_or("system"),
+            "description": object.get("description").and_then(Value::as_str).unwrap_or(""),
+            "query_count": object.get("query_count").cloned().unwrap_or_else(|| json!(topics.len() * 2)),
+        }));
+    }
+    Ok(options)
+}
+#[tauri::command]
 pub(crate) async fn query_workflow_catalog(
     q: String,
     category: String,
@@ -6355,7 +6812,7 @@ pub(crate) fn get_workflow_versions(
             Err(error) => errors.push(error.to_string()),
         }
     }
-    if state.options.mode().dashboard_enabled()
+    if control_plane_provider::available(&state.options)
         && source
             .as_deref()
             .is_none_or(|value| !value.starts_with("local:") && !value.starts_with("github:"))
@@ -7231,9 +7688,18 @@ fn workflow_center_snapshot(
         let (installed, issues) = store.list_with_issues()?;
         for item in installed {
             let view = store.view_json(&item.package)?;
+            let icon = crate::app::extension_icons::resolve_effective_icon(
+                "workflow",
+                &item.package.id,
+                &item.package.source_root,
+                Some(&item.package.icon),
+            )
+            .ok()
+            .flatten();
             workflow_names.insert(item.package.id.clone(), item.package.name.clone());
             workflows.push(json!({
                 "package": item.package,
+                "icon": icon,
                 "enabled": item.enabled,
                 "previous_version": item.previous_version,
                 "package_digest": item.package_digest,
@@ -7558,7 +8024,9 @@ fn workflow_run_verification(
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_workflow_catalog, present_builtin_ai_start_error};
+    use super::{
+        dedupe_workflow_catalog, present_builtin_ai_start_error, validate_credential_fields,
+    };
     use crate::api::distribution::WorkflowCatalogItem;
 
     fn catalog_item(
@@ -7570,6 +8038,7 @@ mod tests {
         capability_ids: &[&str],
     ) -> WorkflowCatalogItem {
         WorkflowCatalogItem {
+            icon: None,
             workflow_id: workflow_id.to_string(),
             name: name.to_string(),
             description: description.to_string(),
@@ -7767,5 +8236,60 @@ mod tests {
         assert_eq!(attached["targets"][0]["strategy"], "release");
         assert_eq!(attached["targets"][1]["strategy"], "submit");
         assert_eq!(attached["ready"], serde_json::Value::Bool(true));
+    }
+    #[test]
+    fn plugin_credential_save_rejects_fields_not_declared_by_manifest() {
+        use crate::capability::plugin::{PluginCredentialField, PluginCredentialRequest};
+        use std::collections::BTreeMap;
+        let request = PluginCredentialRequest {
+            id: "demo.account".to_string(),
+            label: "Demo".to_string(),
+            kind: "userpass".to_string(),
+            fields: vec![
+                PluginCredentialField {
+                    key: "username".to_string(),
+                    label: "账号".to_string(),
+                    field_type: "text".to_string(),
+                    secret: false,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                },
+                PluginCredentialField {
+                    key: "password".to_string(),
+                    label: "密码".to_string(),
+                    field_type: "password".to_string(),
+                    secret: true,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                },
+            ],
+            required: true,
+            description: String::new(),
+            docs_url: String::new(),
+            verify_capability: String::new(),
+        };
+        let existing = crate::store::plugin_credentials::PluginCredentialStatus {
+            id: request.id.clone(),
+            configured: false,
+            configured_fields: Vec::new(),
+            public_fields: BTreeMap::new(),
+            descriptor_current: true,
+            updated_at: String::new(),
+        };
+        let mut public = BTreeMap::new();
+        public.insert("username".to_string(), "alice".to_string());
+        let mut secret = BTreeMap::new();
+        secret.insert("password".to_string(), "secret".to_string());
+        assert!(validate_credential_fields(&request, &public, &secret, &existing).is_ok());
+
+        let mut undeclared = secret.clone();
+        undeclared.insert("other".to_string(), "value".to_string());
+        assert!(validate_credential_fields(&request, &public, &undeclared, &existing).is_err());
+
+        let mut missing = public.clone();
+        missing.remove("username");
+        assert!(validate_credential_fields(&request, &missing, &secret, &existing).is_err());
     }
 }

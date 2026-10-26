@@ -5,7 +5,6 @@
 //! 大段 base64。登记表只保存本机元数据，不含凭据。
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -92,7 +91,21 @@ fn prompt_digest(value: &str) -> String {
     digest
 }
 
+/// 按内容哈希查已登记媒体。空哈希不参与匹配。
+pub(crate) fn find_by_sha256(sha256: &str) -> Result<Option<MediaRecord>, Box<dyn Error>> {
+    let sha256 = sha256.trim();
+    if sha256.is_empty() {
+        return Ok(None);
+    }
+    Ok(load_all()?
+        .into_iter()
+        .find(|item| item.sha256.eq_ignore_ascii_case(sha256)))
+}
+
 /// 登记一条本机生成的媒体，返回带 `media_id` 的记录。
+///
+/// 有 SHA-256 时按内容去重：同一张原图被多个工具或会话重复带入时，
+/// 只保留一条登记和一份原文件，避免媒体历史继续放大。
 pub(crate) fn register(item: NewMedia<'_>) -> Result<MediaRecord, Box<dyn Error>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -120,6 +133,17 @@ pub(crate) fn register(item: NewMedia<'_>) -> Result<MediaRecord, Box<dyn Error>
         created_at: now.to_string(),
     };
     let mut records = load_all()?;
+    if !record.sha256.is_empty() {
+        if let Some(existing) = records
+            .iter()
+            .find(|item| item.sha256.eq_ignore_ascii_case(&record.sha256))
+            .cloned()
+        {
+            if std::path::Path::new(&existing.path).is_file() {
+                return Ok(existing);
+            }
+        }
+    }
     records.push(record.clone());
     if records.len() > MAX_ENTRIES {
         let drop = records.len() - MAX_ENTRIES;
@@ -186,6 +210,43 @@ mod tests {
         result
     }
 
+    #[test]
+    fn registration_deduplicates_existing_content_hash() {
+        with_isolated_home(|| {
+            let root = crate::store::paths::agent_home();
+            let path = root.join("same.png");
+            std::fs::write(&path, b"same").unwrap();
+            let first = register(NewMedia {
+                path: &path.to_string_lossy(),
+                kind: "image",
+                mime_type: "image/png",
+                size_bytes: 4,
+                sha256: "same-hash",
+                width: 1,
+                height: 1,
+                duration_seconds: 0.0,
+                capability: "image.generate",
+                service_id: "test",
+                prompt: "",
+            })
+            .unwrap();
+            let second = register(NewMedia {
+                path: &path.to_string_lossy(),
+                kind: "image",
+                mime_type: "image/png",
+                size_bytes: 4,
+                sha256: "same-hash",
+                width: 1,
+                height: 1,
+                duration_seconds: 0.0,
+                capability: "image.generate",
+                service_id: "test",
+                prompt: "",
+            })
+            .unwrap();
+            assert_eq!(first.id, second.id);
+        });
+    }
     #[test]
     fn registered_media_can_be_resolved_by_reference() {
         with_isolated_home(|| {

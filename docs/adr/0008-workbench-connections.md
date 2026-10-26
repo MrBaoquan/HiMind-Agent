@@ -37,7 +37,7 @@ Agent                     one instance, one local dataset
   已装能力 / AI 服务 / 审批档位 / 工作区 / 备份 / 本地会话
 
 Connection (工作台连接)    N records, each with its own identity
-  id / 显示名 / 用途标签 / api_base
+  id / 显示名 / api_base
   agent_id / credential / device_id
   user_id / scope / refresh token / 授权时间
   active_connection_id      exactly one connection is active
@@ -88,6 +88,19 @@ So "添加工作台" is one flow with three steps, in order:
 
 A connection created by step 1 but not step 3 is legitimate and must render as
 "已登记 · 未授权", not as an error.
+
+### Connections are user-owned, including the current one
+
+The connection list is a local convenience list, not a protected registry. An
+active connection can be removed directly. If another connection exists it
+becomes active; if none exists the Agent enters an explicit unconnected state
+and clears the materialised identity. An empty `workbenches.json` must stay
+empty on later reads and must never be re-seeded with localhost.
+
+The old free-form `purpose` field remains deserializable for compatibility, but
+it has no product behavior and is no longer shown or edited. Display name and
+address are sufficient; development/production is an implementation detail,
+not a user classification.
 
 ### Switching while work is in flight
 

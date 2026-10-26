@@ -90,7 +90,7 @@ pub(crate) fn independent_status(options: &Options) -> DashboardIdentityStatus {
 /// Dashboard identity enriches connected submissions but is not required for
 /// local extension scaffolding, validation, packaging, or candidate tests.
 pub(crate) fn authoring_identity(options: &Options) -> AuthoringIdentity {
-    if options.mode().dashboard_enabled() {
+    if crate::app::control_plane_provider::available(options) {
         let dashboard = identity_status(options);
         if dashboard.authorized && !dashboard.user_name.trim().is_empty() {
             return AuthoringIdentity {
@@ -328,13 +328,9 @@ pub(crate) fn start_authorization(
                     );
                 }
                 logs.add_log("info", "Dashboard 账号授权成功");
-                // 授权即参与：拿到账号授权后立刻开始对接工作台，不再需要单独的
-                // 启用开关，也不用重启 Agent。
-                let _ = crate::app::runtime_mode::save(
-                    &options.state_path,
-                    crate::app::runtime_mode::AgentMode::Connected,
-                );
-                options.set_mode(crate::app::runtime_mode::AgentMode::Connected);
+                // 独立模式下启动的会话沿用本机配置；授权成功后收掉它，避免会话
+                // 继续持有与新的工作台身份不一致的配置。
+                crate::app::ui::stop_builtin_ai_process();
                 // The company SVN account is picked by the user on this machine;
                 // it is no longer derived from the Dashboard account name.
             }

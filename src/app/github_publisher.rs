@@ -280,6 +280,7 @@ pub(crate) fn build_release_manifest(
     plan: &GithubPublishPlan,
     tag: &str,
     artifact: &GithubArtifact,
+    icon: Option<&GithubArtifact>,
     dependencies: &Value,
     min_agent_version: &str,
 ) -> Value {
@@ -302,6 +303,19 @@ pub(crate) fn build_release_manifest(
     });
     // 签名只在配置了私钥时出现：消费侧看到该字段就必须校验通过，看不到则按未签名
     // 制品处理。这样「有没有签名」在清单里是显式事实，而不是靠某个开关推断。
+    if let Some(icon) = icon {
+        if let Some(object) = manifest.as_object_mut() {
+            object.insert(
+                "icon".to_string(),
+                json!({
+                    "file_name": icon.name,
+                    "size_bytes": icon.size_bytes,
+                    "sha256": icon.sha256,
+                    "content_type": icon.content_type,
+                }),
+            );
+        }
+    }
     if let Some(signature) = plan.signature.clone() {
         if let Some(object) = manifest.as_object_mut() {
             object.insert("signature".to_string(), signature);
@@ -1458,6 +1472,7 @@ mod tests {
             &plan,
             "plugin/com.himind.x@1.0.0",
             &artifact,
+            None,
             &json!([]),
             "0.3.30",
         );
@@ -1504,10 +1519,55 @@ mod tests {
             &plan,
             "plugin/com.himind.x@1.0.0",
             &artifact,
+            None,
             &json!([]),
             "0.3.30",
         );
         assert_eq!(manifest["signature"], signature);
+    }
+
+    #[test]
+    fn manifest_records_icon_sidecar_facts() {
+        let artifact = GithubArtifact {
+            name: "com.himind.x-1.0.0.hmpkg".to_string(),
+            path: PathBuf::from("F:/tmp/package.hmpkg"),
+            sha256: "b".repeat(64),
+            size_bytes: 2048,
+            content_type: "application/octet-stream".to_string(),
+        };
+        let icon = GithubArtifact {
+            name: "com.himind.x-1.0.0-icon.png".to_string(),
+            path: PathBuf::from("F:/tmp/icon.png"),
+            sha256: "c".repeat(64),
+            size_bytes: 512,
+            content_type: "image/png".to_string(),
+        };
+        let plan = GithubPublishPlan {
+            kind: "plugin".to_string(),
+            id: "com.himind.x".to_string(),
+            version: "1.0.0".to_string(),
+            repository: "owner/repo".to_string(),
+            commit: "deadbeef".to_string(),
+            branch: "main".to_string(),
+            release_name: "示例插件 v1.0.0".to_string(),
+            release_notes: "首个版本".to_string(),
+            channel: "stable".to_string(),
+            prerelease: false,
+            artifacts: vec![artifact.clone(), icon.clone()],
+            signature: None,
+        };
+        let manifest = build_release_manifest(
+            &plan,
+            "plugin/com.himind.x@1.0.0",
+            &artifact,
+            Some(&icon),
+            &json!([]),
+            "0.3.30",
+        );
+        assert_eq!(manifest["icon"]["file_name"], icon.name);
+        assert_eq!(manifest["icon"]["size_bytes"], icon.size_bytes);
+        assert_eq!(manifest["icon"]["sha256"], icon.sha256);
+        assert_eq!(manifest["icon"]["content_type"], "image/png");
     }
 
     /// 发布清单是一份跨边界的契约：发布侧写、消费侧读。这里让真实产物对 schema
@@ -1571,6 +1631,7 @@ mod tests {
                 &plan,
                 "plugin/com.himind.x@1.0.0",
                 &artifact,
+                None,
                 &dependencies,
                 "0.3.30",
             );

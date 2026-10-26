@@ -149,6 +149,33 @@ struct OAuthErrorResponse {
     error_description: String,
 }
 
+fn oauth_client(options: &Options) -> Result<Client, Box<dyn Error>> {
+    let mut builder = Client::builder().timeout(Duration::from_secs(20));
+    if options.api_base().is_loopback_http_url() {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
+}
+
+trait LoopbackEndpoint {
+    fn is_loopback_http_url(&self) -> bool;
+}
+
+impl LoopbackEndpoint for str {
+    fn is_loopback_http_url(&self) -> bool {
+        let Ok(url) = url::Url::parse(self) else {
+            return false;
+        };
+        match url.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Domain(host)) => {
+                host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+            }
+            None => false,
+        }
+    }
+}
 pub(crate) fn platform_access_token(
     options: &Options,
     required_scope: &str,
@@ -196,7 +223,7 @@ pub(crate) fn platform_access_token(
     }
     let refresh_token = unprotect_secret_for_current_user(&stored.refresh_token_protected)?;
     let next_refresh_token = prepare_refresh_attempt(&options.state_path, &stored)?;
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let client = oauth_client(options)?;
     let response = client
         .post(format!("{}/oauth/token", options.api_base()))
         .form(&[
@@ -352,6 +379,22 @@ pub(crate) fn clear_authorization(state_path: &Path) -> Result<(), Box<dyn Error
     clear_authorization_unlocked(state_path)
 }
 
+/// Remove every local trace of the delegated Dashboard authorization.
+///
+/// This is intentionally separate from the remote revocation call: users must
+/// be able to leave Dashboard mode while the Dashboard is unreachable or the
+/// locally stored authorization is already invalid.
+pub(crate) fn forget_authorization(options: &Options) -> Result<(), Box<dyn Error>> {
+    if let Ok(mut cache) = options.platform_access.write() {
+        *cache = None;
+    } else {
+        return Err("Agent OAuth access-token cache is unavailable".into());
+    }
+    clear_authorization(&options.state_path)?;
+    crate::svn::service::remove_connection()?;
+    Ok(())
+}
+
 fn clear_authorization_unlocked(state_path: &Path) -> Result<(), Box<dyn Error>> {
     let path = authorization_path(state_path);
     for candidate in [&path, &atomic_file::backup_path(&path)] {
@@ -369,20 +412,23 @@ fn clear_authorization_unlocked(state_path: &Path) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-pub(crate) fn revoke_authorization(options: &Options) -> Result<(), Box<dyn Error>> {
-    let mut cache = options
-        .platform_access
-        .write()
-        .map_err(|_| "Agent OAuth access-token cache is unavailable")?;
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizationRevocationOutcome {
+    pub remote_revoked: bool,
+    pub local_cleared: bool,
+    pub remote_error: String,
+    pub local_error: String,
+}
+
+fn revoke_remote_authorization(options: &Options) -> Result<(), Box<dyn Error>> {
     let _refresh_lock = lock_authorization_file(&options.state_path)?;
     let path = authorization_path(&options.state_path);
     if !path.exists() {
-        *cache = None;
         return Ok(());
     }
     let stored: StoredAgentAuthorization = serde_json::from_slice(&fs::read(&path)?)?;
     let refresh_token = unprotect_secret_for_current_user(&stored.refresh_token_protected)?;
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let client = oauth_client(options)?;
     client
         .post(format!("{}/oauth/revoke", options.api_base()))
         .form(&[
@@ -392,17 +438,55 @@ pub(crate) fn revoke_authorization(options: &Options) -> Result<(), Box<dyn Erro
         ])
         .send()?
         .error_for_status()?;
-    clear_authorization_unlocked(&options.state_path)?;
-    crate::svn::service::remove_connection()?;
-    *cache = None;
     Ok(())
+}
+
+pub(crate) fn revoke_authorization(options: &Options) -> Result<(), Box<dyn Error>> {
+    revoke_remote_authorization(options)?;
+    forget_authorization(options)
+}
+
+fn revoke_authorization_best_effort_with<F>(
+    options: &Options,
+    forget: F,
+) -> AuthorizationRevocationOutcome
+where
+    F: FnOnce(&Options) -> Result<(), Box<dyn Error>>,
+{
+    let remote_result = revoke_remote_authorization(options);
+    let remote_revoked = remote_result.is_ok();
+    let remote_error = remote_result
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    let local_result = forget(options);
+    AuthorizationRevocationOutcome {
+        remote_revoked,
+        local_cleared: local_result.is_ok(),
+        remote_error,
+        local_error: local_result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// Best-effort remote revocation for the UI's "leave Dashboard mode" action.
+///
+/// The local authorization is always removed, even when the remote request
+/// fails. Keeping the local token after the user has chosen independent mode
+/// would leave a credential behind that can accidentally be reused later.
+pub(crate) fn revoke_authorization_best_effort(
+    options: &Options,
+) -> AuthorizationRevocationOutcome {
+    revoke_authorization_best_effort_with(options, forget_authorization)
 }
 
 pub(crate) fn begin_device_authorization(
     options: &Options,
 ) -> Result<DeviceAuthorizationResponse, Box<dyn Error>> {
     let state = load_agent_state(&options.state_path)?;
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let client = oauth_client(options)?;
     let response = client
         .post(format!("{}/oauth/device_authorization", options.api_base()))
         .header(
@@ -518,7 +602,7 @@ pub(crate) fn wait_for_device_authorization_with_cancel<F>(
 where
     F: FnMut() -> bool,
 {
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let client = oauth_client(options)?;
     // 客户端不要在服务端的有效期上「卡点」放弃：本机时钟偏差、休眠唤醒、或者用户
     // 恰好在最后一秒点确认，都会让一次已经生效的确认白做。多给一个轮询周期以上
     // 的余量继续问，服务端仍然是唯一的裁判——真过期了它会回 expired_token。
@@ -595,7 +679,7 @@ pub(crate) fn authorization_snapshot(
 
 pub(crate) fn fetch_user_info(options: &Options) -> Result<AgentUserInfo, Box<dyn Error>> {
     let access = platform_access_token(options, PROFILE_SCOPE)?;
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let client = oauth_client(options)?;
     let response = client
         .get(format!("{}/api/agent/oauth/userinfo", options.api_base()))
         .bearer_auth(&access.token)
@@ -1168,6 +1252,51 @@ mod tests {
 
         fs::remove_file(&canonical).expect("remove canonical authorization");
         assert_eq!(authorization_path(&state_path), legacy);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn best_effort_revocation_clears_local_authorization_when_remote_is_unreachable() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-agent-oauth-offline-revoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create OAuth offline revocation test directory");
+        let state_path = root.join("agent-state.json");
+        let response = OAuthTokenResponse {
+            access_token: "access-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 600,
+            refresh_token: "refresh-token".to_string(),
+            refresh_token_expires_in: 3600,
+            scope: "agent.profile".to_string(),
+            user_id: "usr-test".to_string(),
+            agent_id: "agt-test".to_string(),
+        };
+        save_authorization_response(&state_path, &response).expect("save authorization");
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve local port");
+        let api_base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("read local address").port()
+        );
+        drop(listener);
+
+        let mut options = crate::Options::from_env();
+        options.state_path = state_path.clone();
+        options.set_api_base(&api_base);
+        let outcome = super::revoke_authorization_best_effort_with(&options, |options| {
+            clear_authorization(&options.state_path)
+        });
+
+        assert!(!outcome.remote_revoked);
+        assert!(outcome.local_cleared);
+        assert!(!outcome.remote_error.is_empty());
+        assert!(!authorization_path(&state_path).exists());
         fs::remove_dir_all(root).ok();
     }
 }

@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::app::local_image::{data_url, resolve_input_image};
-use crate::store::ai_services::{CAP_VIDEO_GENERATE, DEFAULT_MEDIA_ADAPTER};
+use crate::store::ai_services::CAP_VIDEO_GENERATE;
 use crate::store::media_jobs::{self, MediaJob, MediaJobOutput};
 
 pub(crate) const ADAPTER_ARK_VIDEO: &str = "ark-video";
+pub(crate) const ADAPTER_WAN_VIDEO: &str = "wan-video";
 const MAX_VIDEO_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 900;
@@ -44,8 +45,11 @@ pub(crate) fn generate(input: &Value) -> Result<Value, Box<dyn Error>> {
             .into())
         }
     };
-    if adapter != ADAPTER_ARK_VIDEO && adapter != DEFAULT_MEDIA_ADAPTER {
-        return Err(format!("适配器 {adapter} 暂不支持生视频").into());
+    if adapter != ADAPTER_ARK_VIDEO && adapter != ADAPTER_WAN_VIDEO {
+        return Err(format!(
+            "适配器 {adapter} 暂不支持生视频；可选 {ADAPTER_ARK_VIDEO}、{ADAPTER_WAN_VIDEO}"
+        )
+        .into());
     }
     if api_key.trim().is_empty() {
         return Err("所选本机 AI 服务没有可用的 API Key".into());
@@ -56,15 +60,23 @@ pub(crate) fn generate(input: &Value) -> Result<Value, Box<dyn Error>> {
         CAP_VIDEO_GENERATE,
         &service.id,
         &provider_label(&service.base_url),
-        ADAPTER_ARK_VIDEO,
+        &adapter,
         &model,
         &prompt,
         &output_dir.to_string_lossy(),
     )?;
 
-    match submit_task(&service.base_url, &api_key, &model, input, &prompt) {
-        Ok(provider_job_id) => {
-            job.provider_job_id = provider_job_id;
+    match submit_task(
+        &service.base_url,
+        &api_key,
+        &adapter,
+        &model,
+        input,
+        &prompt,
+    ) {
+        Ok(submitted) => {
+            job.provider_job_id = submitted.provider_job_id;
+            job.provider_request_id = submitted.provider_request_id;
             job.status = media_jobs::STATUS_QUEUED.to_string();
             job.progress = 5;
             job.updated_at = now();
@@ -125,7 +137,12 @@ pub(crate) fn job_cancel(input: &Value) -> Result<Value, Box<dyn Error>> {
     }
     let (service, api_key) = crate::store::ai_services::load_secret(&job.service_id)?;
     if !job.provider_job_id.trim().is_empty() {
-        cancel_task(&service.base_url, &api_key, &job.provider_job_id)?;
+        cancel_task(
+            &service.base_url,
+            &api_key,
+            &job.adapter,
+            &job.provider_job_id,
+        )?;
     }
     job.status = media_jobs::STATUS_CANCELED.to_string();
     job.updated_at = now();
@@ -139,7 +156,12 @@ fn refresh(mut job: MediaJob) -> Result<MediaJob, Box<dyn Error>> {
         return Ok(job);
     }
     let (service, api_key) = crate::store::ai_services::load_secret(&job.service_id)?;
-    let status = fetch_status(&service.base_url, &api_key, &job.provider_job_id)?;
+    let status = fetch_status(
+        &service.base_url,
+        &api_key,
+        &job.adapter,
+        &job.provider_job_id,
+    )?;
     job.updated_at = now();
     match status.state.as_str() {
         "queued" => {
@@ -187,13 +209,32 @@ struct ProviderStatus {
     error: Option<String>,
 }
 
+struct SubmittedTask {
+    provider_job_id: String,
+    provider_request_id: String,
+}
+
 fn submit_task(
+    base_url: &str,
+    api_key: &str,
+    adapter: &str,
+    model: &str,
+    input: &Value,
+    prompt: &str,
+) -> Result<SubmittedTask, Box<dyn Error>> {
+    match adapter {
+        ADAPTER_WAN_VIDEO => submit_wan_task(base_url, api_key, model, input, prompt),
+        _ => submit_ark_task(base_url, api_key, model, input, prompt),
+    }
+}
+
+fn submit_ark_task(
     base_url: &str,
     api_key: &str,
     model: &str,
     input: &Value,
     prompt: &str,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<SubmittedTask, Box<dyn Error>> {
     let mut body = input
         .get("parameters")
         .and_then(Value::as_object)
@@ -227,7 +268,7 @@ fn submit_task(
     body.entry("watermark".to_string())
         .or_insert_with(|| json!(false));
 
-    let client = client(request_timeout())?;
+    let client = client_for(base_url, request_timeout())?;
     let response = client
         .post(tasks_url(base_url)?)
         .bearer_auth(api_key.trim())
@@ -239,7 +280,7 @@ fn submit_task(
     if !status.is_success() {
         return Err(format!("生视频接口返回 {status}：{}", describe_error(&payload)).into());
     }
-    payload
+    let provider_job_id = payload
         .get("id")
         .or_else(|| payload.get("job_id"))
         .or_else(|| payload.get("task_id"))
@@ -247,15 +288,122 @@ fn submit_task(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "生视频响应缺少任务 ID".into())
+        .ok_or("生视频响应缺少任务 ID")?;
+    Ok(SubmittedTask {
+        provider_job_id,
+        provider_request_id: payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn submit_wan_task(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    input: &Value,
+    prompt: &str,
+) -> Result<SubmittedTask, Box<dyn Error>> {
+    let images = input
+        .get("input_images")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if images.len() > 1 {
+        return Err("万相生视频当前只接受 1 张首帧参考图".into());
+    }
+    let lower_model = model.to_ascii_lowercase();
+    if images.is_empty() && lower_model.contains("i2v") {
+        return Err("所选万相图生视频模型需要 1 张 input_images 首帧图".into());
+    }
+    if !images.is_empty() && lower_model.contains("t2v") {
+        return Err("所选万相文生视频模型不接受 input_images；请改用 i2v 模型".into());
+    }
+    let mut input_body = json!({"prompt": prompt});
+    if let Some(negative) = string_field(input, "negative_prompt") {
+        input_body["negative_prompt"] = json!(negative);
+    }
+    if let Some(reference) = images.first().and_then(Value::as_str) {
+        let image = resolve_input_image(reference)?;
+        input_body["img_url"] = json!(data_url(&image));
+    }
+    let mut parameters = input
+        .get("parameters")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, slot) in [
+        ("duration", "duration_seconds"),
+        ("ratio", "ratio"),
+        ("resolution", "resolution"),
+        ("prompt_extend", "prompt_extend"),
+    ] {
+        if parameters.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = input.get(slot) {
+            parameters.insert(key.to_string(), value.clone());
+        }
+    }
+    parameters
+        .entry("watermark".to_string())
+        .or_insert_with(|| json!(false));
+    let body = json!({
+        "model": model,
+        "input": input_body,
+        "parameters": parameters,
+    });
+    let client = client_for(base_url, request_timeout())?;
+    let response = client
+        .post(wan_synthesis_url(base_url)?)
+        .bearer_auth(api_key.trim())
+        .header("X-DashScope-Async", "enable")
+        .json(&body)
+        .send()
+        .map_err(|error| format!("提交万相视频任务失败：{error}"))?;
+    let status = response.status();
+    let payload = read_json(response)?;
+    if !status.is_success() {
+        return Err(format!("万相视频接口返回 {status}：{}", describe_error(&payload)).into());
+    }
+    let provider_job_id = payload
+        .get("output")
+        .and_then(|output| output.get("task_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or("万相视频响应缺少 output.task_id")?;
+    Ok(SubmittedTask {
+        provider_job_id,
+        provider_request_id: payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 fn fetch_status(
     base_url: &str,
     api_key: &str,
+    adapter: &str,
     provider_job_id: &str,
 ) -> Result<ProviderStatus, Box<dyn Error>> {
-    let client = client(request_timeout())?;
+    match adapter {
+        ADAPTER_WAN_VIDEO => fetch_wan_status(base_url, api_key, provider_job_id),
+        _ => fetch_ark_status(base_url, api_key, provider_job_id),
+    }
+}
+
+fn fetch_ark_status(
+    base_url: &str,
+    api_key: &str,
+    provider_job_id: &str,
+) -> Result<ProviderStatus, Box<dyn Error>> {
+    let client = client_for(base_url, request_timeout())?;
     let url = format!("{}/{}", tasks_url(base_url)?, provider_job_id);
     let response = client
         .get(&url)
@@ -267,9 +415,38 @@ fn fetch_status(
     if !status.is_success() {
         return Err(format!("查询生视频任务返回 {status}：{}", describe_error(&payload)).into());
     }
-    let raw_state = payload
-        .get("status")
-        .or_else(|| payload.get("state"))
+    Ok(parse_provider_status(&payload))
+}
+
+fn fetch_wan_status(
+    base_url: &str,
+    api_key: &str,
+    provider_job_id: &str,
+) -> Result<ProviderStatus, Box<dyn Error>> {
+    let client = client_for(base_url, request_timeout())?;
+    let response = client
+        .get(wan_task_url(base_url, provider_job_id)?)
+        .bearer_auth(api_key.trim())
+        .send()
+        .map_err(|error| format!("查询万相视频任务失败：{error}"))?;
+    let status = response.status();
+    let payload = read_json(response)?;
+    if !status.is_success() {
+        return Err(format!(
+            "查询万相视频任务返回 {status}：{}",
+            describe_error(&payload)
+        )
+        .into());
+    }
+    Ok(parse_provider_status(&payload))
+}
+
+fn parse_provider_status(payload: &Value) -> ProviderStatus {
+    let output = payload.get("output").unwrap_or(payload);
+    let raw_state = output
+        .get("task_status")
+        .or_else(|| output.get("status"))
+        .or_else(|| output.get("state"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -282,42 +459,100 @@ fn fetch_status(
         other => other,
     }
     .to_string();
-    Ok(ProviderStatus {
+    ProviderStatus {
         state,
-        progress: payload
+        progress: output
             .get("progress")
+            .or_else(|| payload.get("progress"))
             .and_then(Value::as_u64)
             .map(|value| value.min(100) as u8),
-        video_url: find_video_url(&payload),
-        error: payload
-            .get("error")
-            .and_then(|error| {
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .or_else(|| error.as_str())
+        video_url: find_video_url(payload),
+        error: output
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| output.get("code").and_then(Value::as_str))
+            .or_else(|| {
+                payload.get("error").and_then(|error| {
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| error.as_str())
+                })
             })
             .map(str::to_string),
-    })
+    }
 }
 
-fn cancel_task(base_url: &str, api_key: &str, provider_job_id: &str) -> Result<(), Box<dyn Error>> {
-    let client = client(request_timeout())?;
-    let url = format!("{}/{}", tasks_url(base_url)?, provider_job_id);
-    let response = client
-        .delete(&url)
-        .bearer_auth(api_key.trim())
-        .send()
-        .map_err(|error| format!("取消生视频任务失败：{error}"))?;
+fn cancel_task(
+    base_url: &str,
+    api_key: &str,
+    adapter: &str,
+    provider_job_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let client = client_for(base_url, request_timeout())?;
+    let response = if adapter == ADAPTER_WAN_VIDEO {
+        client
+            .post(wan_cancel_url(base_url, provider_job_id)?)
+            .bearer_auth(api_key.trim())
+            .send()
+            .map_err(|error| format!("取消万相视频任务失败：{error}"))?
+    } else {
+        let url = format!("{}/{}", tasks_url(base_url)?, provider_job_id);
+        client
+            .delete(&url)
+            .bearer_auth(api_key.trim())
+            .send()
+            .map_err(|error| format!("取消生视频任务失败：{error}"))?
+    };
     if !response.status().is_success() {
-        return Err(format!("取消生视频任务返回 HTTP {}", response.status()).into());
+        let status = response.status();
+        let payload = read_json(response).unwrap_or(Value::Null);
+        return Err(format!("取消生视频任务返回 {status}：{}", describe_error(&payload)).into());
     }
     Ok(())
+}
+
+fn wan_api_root(base_url: &str) -> Result<String, Box<dyn Error>> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("AI 服务 base_url 为空".into());
+    }
+    let parsed = url::Url::parse(base).map_err(|_| "AI 服务 base_url 不是合法 URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("AI 服务 base_url 仅支持 http/https".into());
+    }
+    let root = base
+        .strip_suffix("/compatible-mode/v1")
+        .or_else(|| base.strip_suffix("/api/v1"))
+        .unwrap_or(base);
+    Ok(root.trim_end_matches('/').to_string())
+}
+
+fn wan_synthesis_url(base_url: &str) -> Result<String, Box<dyn Error>> {
+    Ok(format!(
+        "{}/api/v1/services/aigc/video-generation/video-synthesis",
+        wan_api_root(base_url)?
+    ))
+}
+
+fn wan_task_url(base_url: &str, task_id: &str) -> Result<String, Box<dyn Error>> {
+    Ok(format!(
+        "{}/api/v1/tasks/{}",
+        wan_api_root(base_url)?,
+        task_id.trim()
+    ))
+}
+
+fn wan_cancel_url(base_url: &str, task_id: &str) -> Result<String, Box<dyn Error>> {
+    Ok(format!("{}/cancel", wan_task_url(base_url, task_id)?))
 }
 
 /// 从 provider 返回里尽力找出视频地址（不同厂商字段名不一）。
 fn find_video_url(payload: &Value) -> Option<String> {
     let candidates = [
+        payload
+            .get("output")
+            .and_then(|value| value.get("video_url")),
         payload
             .get("content")
             .and_then(|value| value.get("video_url")),
@@ -350,7 +585,7 @@ fn download_video(url: &str, job: &MediaJob) -> Result<MediaJobOutput, Box<dyn E
     {
         return Err("视频地址必须使用 HTTPS（环回地址除外）".into());
     }
-    let client = client(Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECONDS))?;
+    let client = client_for(url, Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECONDS))?;
     let response = client
         .get(parsed)
         .send()
@@ -461,8 +696,16 @@ fn resolve_output_dir(explicit: Option<String>) -> Result<PathBuf, Box<dyn Error
     Ok(base)
 }
 
-fn client(timeout: Duration) -> Result<Client, Box<dyn Error>> {
-    Ok(Client::builder().timeout(timeout).build()?)
+fn client_for(url: &str, timeout: Duration) -> Result<Client, Box<dyn Error>> {
+    let mut builder = Client::builder().timeout(timeout);
+    if url::Url::parse(url.trim())
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+    {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
 }
 
 fn request_timeout() -> Duration {
@@ -579,6 +822,7 @@ fn output_dir_of(job: &MediaJob) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -639,6 +883,61 @@ mod tests {
         (format!("http://{address}"), captured)
     }
 
+    fn fake_wan_video() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let port = address.port();
+        thread::spawn(move || {
+            for index in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                let mut buffer = [0u8; 16384];
+                let mut text = String::new();
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => text.push_str(&String::from_utf8_lossy(&buffer[..read])),
+                        Err(_) => break,
+                    }
+                }
+                if index == 0 {
+                    *sink.lock().unwrap() = text.clone();
+                    let body = "{\"request_id\":\"req-wan-1\",\"output\":{\"task_id\":\"wan-task-1\",\"task_status\":\"PENDING\"}}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                } else if index == 1 {
+                    let body = format!(
+                        "{{\"request_id\":\"req-wan-2\",\"output\":{{\"task_id\":\"wan-task-1\",\"task_status\":\"SUCCEEDED\",\"video_url\":\"http://127.0.0.1:{port}/video.mp4\",\"usage\":{{\"duration\":5}}}}}}"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                } else {
+                    let video: &[u8] = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        video.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(video);
+                }
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), captured)
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "himind-local-video-{name}-{}-{}",
@@ -671,6 +970,7 @@ mod tests {
                 crate::store::ai_services::MediaModelBinding {
                     adapter: ADAPTER_ARK_VIDEO.to_string(),
                     model: "doubao-seedance-test".to_string(),
+                    execution_mode: None,
                 },
             );
             crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
@@ -725,6 +1025,90 @@ mod tests {
         );
         assert!(text.contains("\"content\""), "{text}");
         assert!(text.contains("一只柯基在雪地里奔跑"), "{text}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn wan_image_to_video_runs_submit_status_download() {
+        let (base_url, captured) = fake_wan_video();
+        let _guard = crate::store::paths::test_env_lock();
+        let home = temp_dir("wan-home");
+        let workspace = temp_dir("wan-ws");
+        let out_dir = workspace.join("media-out");
+        let image_path = workspace.join("first-frame.png");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=")
+            .unwrap();
+        std::fs::write(&image_path, png).unwrap();
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        let previous_ws = std::env::var_os("HIMIND_AI_WORKSPACE");
+        std::env::set_var("HIMIND_AGENT_HOME", &home);
+        std::env::set_var("HIMIND_AI_WORKSPACE", &workspace);
+
+        let result = (|| -> Result<(Value, Value), Box<dyn Error>> {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_VIDEO_GENERATE.to_string(),
+                crate::store::ai_services::MediaModelBinding {
+                    adapter: ADAPTER_WAN_VIDEO.to_string(),
+                    model: "wan2.6-i2v-flash".to_string(),
+                    execution_mode: None,
+                },
+            );
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "wan-video".to_string(),
+                display_name: "万相视频".to_string(),
+                base_url: base_url.clone(),
+                protocol: crate::store::ai_services::AIServiceProtocol::OpenaiChat,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-wan".to_string(),
+            })?;
+            crate::store::ai_services::set_media_service(CAP_VIDEO_GENERATE, "wan-video")?;
+            let submitted = generate(&json!({
+                "prompt": "镜头缓慢推进",
+                "input_images": [image_path.to_string_lossy()],
+                "duration_seconds": 5,
+                "resolution": "720P",
+                "output_dir": out_dir.to_string_lossy(),
+            }))?;
+            let job_id = submitted["job_id"].as_str().unwrap().to_string();
+            let finished = job_get(&json!({ "job_id": job_id }))?;
+            Ok((submitted, finished))
+        })();
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        match previous_ws {
+            Some(value) => std::env::set_var("HIMIND_AI_WORKSPACE", value),
+            None => std::env::remove_var("HIMIND_AI_WORKSPACE"),
+        }
+        let (submitted, finished) = result.expect("Wan video pipeline");
+        assert_eq!(submitted["provider_request_id"], "req-wan-1");
+        assert_eq!(finished["provider_request_id"], "req-wan-1");
+        assert_eq!(finished["status"], "succeeded");
+        assert!(finished["provider_job_id"]
+            .as_str()
+            .unwrap()
+            .contains("wan-task-1"));
+        let text = captured.lock().unwrap().clone();
+        assert!(
+            text.contains("POST /api/v1/services/aigc/video-generation/video-synthesis"),
+            "{text}"
+        );
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("x-dashscope-async: enable"),
+            "{text}"
+        );
+        assert!(text.contains("\"img_url\""), "{text}");
+        assert!(text.contains("wan2.6-i2v-flash"), "{text}");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&workspace);
     }

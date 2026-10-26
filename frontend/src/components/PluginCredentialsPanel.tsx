@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { KeyRound, Trash2 } from 'lucide-react';
 import { agentApi, type PluginCredentialView } from '../services/agentApi';
 import { BusyIndicator } from './BusyIndicator';
+import { CredentialFieldsEditor } from './CredentialFieldsEditor';
 import { Pill } from './Common';
 
 /**
@@ -44,23 +45,24 @@ export function PluginCredentialsPanel({ pluginId }: { pluginId: string }) {
   // 没有声明就不占位置：凭据是插件自己提的需求，不是所有插件都需要。
   if (!items.length && !error) return null;
 
-  const fieldsOf = (item: PluginCredentialView) => (item.fields.length ? item.fields : ['value']);
-
   const save = async (item: PluginCredentialView) => {
     const values = drafts[item.id] || {};
-    const filled: Record<string, string> = {};
-    for (const field of fieldsOf(item)) {
-      const value = (values[field] || '').trim();
-      if (value) filled[field] = value;
+    const publicFields: Record<string, string> = {};
+    const secretFields: Record<string, string> = {};
+    for (const field of item.fields) {
+      const value = (values[field.key] ?? (field.secret ? '' : field.value)).trim();
+      if (!value) continue;
+      if (field.secret) secretFields[field.key] = value;
+      else publicFields[field.key] = value;
     }
-    if (!Object.keys(filled).length) {
+    if (!Object.keys(publicFields).length && !Object.keys(secretFields).length) {
       setError('请先填写要保存的字段');
       return;
     }
     setBusy(item.id);
     setError('');
     try {
-      await agentApi.savePluginCredential(pluginId, item.id, filled);
+      await agentApi.savePluginCredentialProfile(pluginId, item.id, publicFields, secretFields);
       setDrafts(current => ({ ...current, [item.id]: {} }));
       await load();
     } catch (reason) {
@@ -84,28 +86,23 @@ export function PluginCredentialsPanel({ pluginId }: { pluginId: string }) {
   };
 
   return <section className="plugin-detail-section">
-    <div className="plugin-section-heading"><div><h4>凭据</h4><small>由 Agent 保管：按插件隔离、加密落盘，插件读不到明文</small></div></div>
+    <div className="plugin-section-heading"><div><h4>凭据</h4><small>由 Agent 保管：按插件隔离、加密落盘，插件读不到明文</small></div><button type="button" className="btn btn-quiet" onClick={() => void agentApi.openCredentialCenter()}>账号与凭据中心</button></div>
     {error ? <div className="plugin-local-error">{error}</div> : null}
     <div className="plugin-credential-list">
       {items.map(item => <article className="plugin-credential-row" key={item.id}>
         <div className="plugin-credential-head">
           <KeyRound size={16} />
-          <div><strong>{item.label}</strong><small>{item.kind || 'api_key'}{item.required ? ' · 必需' : ' · 可选'}</small></div>
+          <div><strong>{item.label}</strong><small>{item.kind || 'api_key'}{item.required ? ' · 必需' : ' · 可选'}{item.verify_capability ? ` · ${item.verify_capability}` : ''}</small></div>
           <Pill kind={item.configured ? 'success' : item.required ? 'warn' : 'neutral'}>{item.configured ? '已配置' : '未配置'}</Pill>
         </div>
         {item.description ? <p className="muted">{item.description}</p> : null}
-        <div className="plugin-credential-fields">
-          {fieldsOf(item).map(field => <label key={field}>
-            <span>{field}</span>
-            <input
-              type="password"
-              autoComplete="off"
-              placeholder={item.configured && item.configured_fields.includes(field) ? '已保存（留空则不修改）' : '待填写'}
-              value={(drafts[item.id] || {})[field] || ''}
-              onChange={event => setDrafts(current => ({ ...current, [item.id]: { ...(current[item.id] || {}), [field]: event.target.value } }))}
-            />
-          </label>)}
-        </div>
+        {!item.descriptor_current ? <div className="inline-feedback visible" role="alert">插件更新了凭据声明，请核对字段后重新保存。</div> : null}
+        <CredentialFieldsEditor
+          fields={item.fields}
+          drafts={drafts[item.id] || {}}
+          disabled={Boolean(busy)}
+          onChange={(key, value) => setDrafts(current => ({ ...current, [item.id]: { ...(current[item.id] || {}), [key]: value } }))}
+        />
         <div className="plugin-credential-actions">
           <button className="btn btn-primary" disabled={Boolean(busy)} onClick={() => void save(item)}>{busy === item.id ? <BusyIndicator size={14} /> : null}保存</button>
           {item.configured ? <button className="btn btn-danger-quiet" disabled={Boolean(busy)} onClick={() => void remove(item)}><Trash2 size={14} />删除</button> : null}

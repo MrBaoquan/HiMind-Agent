@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 use crate::api::distribution::{self, DistributionState, UpdateCheckResponse};
+use crate::app::control_plane_provider;
 use crate::Options;
 
 const BACKGROUND_CHECK_MIN_SECONDS: u64 = 30 * 60;
@@ -19,18 +20,27 @@ const BACKGROUND_CHECK_JITTER_SECONDS: u64 = 30 * 60;
 // The MCP companion is part of the Agent runtime contract. VSIX remains
 // optional, but every directory package must carry the console companion so a
 // release cannot silently regress stdio MCP clients.
-const DIRECTORY_PACKAGE_FILES: [&str; 5] = [
+const RUNTIME_BUNDLE_MANIFEST: &str = "himind-runtime-manifest.json";
+const RUNTIME_BUNDLE_PACKAGE: &str = "himind-runtime-package.zip";
+const RUNTIME_BUNDLE_SIGNATURE: &str = "himind-runtime-package.signature.json";
+const DIRECTORY_PACKAGE_FILES: [&str; 8] = [
     "himind-agent.exe",
     "himind-agent-mcp.exe",
     "himind-agent-updater.exe",
     "himind-agent-launcher.exe",
     "himind-ai.vsix",
+    RUNTIME_BUNDLE_MANIFEST,
+    RUNTIME_BUNDLE_PACKAGE,
+    RUNTIME_BUNDLE_SIGNATURE,
 ];
-const REQUIRED_DIRECTORY_PACKAGE_FILES: [&str; 4] = [
+const REQUIRED_DIRECTORY_PACKAGE_FILES: [&str; 7] = [
     "himind-agent.exe",
     "himind-agent-mcp.exe",
     "himind-agent-updater.exe",
     "himind-agent-launcher.exe",
+    RUNTIME_BUNDLE_MANIFEST,
+    RUNTIME_BUNDLE_PACKAGE,
+    RUNTIME_BUNDLE_SIGNATURE,
 ];
 const MAX_EXTRACTED_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -91,6 +101,12 @@ pub(crate) struct AgentUpdateStatus {
     #[serde(default)]
     pub staged_vscode_extension_path: String,
     #[serde(default)]
+    pub staged_runtime_manifest_path: String,
+    #[serde(default)]
+    pub staged_runtime_package_path: String,
+    #[serde(default)]
+    pub staged_runtime_signature_path: String,
+    #[serde(default)]
     pub last_checked_at: u64,
     #[serde(default)]
     pub last_error: String,
@@ -128,6 +144,9 @@ impl Default for AgentUpdateStatus {
             staged_updater_path: String::new(),
             staged_launcher_path: String::new(),
             staged_vscode_extension_path: String::new(),
+            staged_runtime_manifest_path: String::new(),
+            staged_runtime_package_path: String::new(),
+            staged_runtime_signature_path: String::new(),
             last_checked_at: 0,
             last_error: String::new(),
             auto_check: true,
@@ -149,7 +168,7 @@ fn default_update_source() -> String {
 }
 
 fn update_source_for_mode(options: &Options) -> &'static str {
-    if options.mode().dashboard_enabled() {
+    if control_plane_provider::available(options) {
         "dashboard"
     } else {
         "github"
@@ -287,7 +306,7 @@ pub(crate) fn check_now(options: &Options) -> Result<AgentUpdateStatus, Box<dyn 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let distribution_state = if options.mode().dashboard_enabled() {
+    let distribution_state = if control_plane_provider::available(options) {
         Some(
             distribution::load_state(&distribution::distribution_state_path(&options.state_path))?
                 .ok_or("软件更新服务尚未完成设备注册")?,
@@ -437,7 +456,7 @@ fn apply_update_check(
 
 pub(crate) fn download(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Error>> {
     let _guard = operation_lock()?;
-    let distribution_state = if options.mode().dashboard_enabled() {
+    let distribution_state = if control_plane_provider::available(options) {
         Some(
             distribution::load_state(&distribution::distribution_state_path(&options.state_path))?
                 .ok_or("软件更新服务尚未完成设备注册")?,
@@ -649,6 +668,18 @@ fn prepare_staged_payload(
     } else {
         String::new()
     };
+    status.staged_runtime_manifest_path = package_dir
+        .join(RUNTIME_BUNDLE_MANIFEST)
+        .to_string_lossy()
+        .to_string();
+    status.staged_runtime_package_path = package_dir
+        .join(RUNTIME_BUNDLE_PACKAGE)
+        .to_string_lossy()
+        .to_string();
+    status.staged_runtime_signature_path = package_dir
+        .join(RUNTIME_BUNDLE_SIGNATURE)
+        .to_string_lossy()
+        .to_string();
     Ok(())
 }
 
@@ -762,6 +793,9 @@ fn staged_payload_available(status: &AgentUpdateStatus) -> bool {
         && Path::new(&status.staged_launcher_path).is_file()
         && (status.staged_vscode_extension_path.is_empty()
             || Path::new(&status.staged_vscode_extension_path).is_file())
+        && Path::new(&status.staged_runtime_manifest_path).is_file()
+        && Path::new(&status.staged_runtime_package_path).is_file()
+        && Path::new(&status.staged_runtime_signature_path).is_file()
 }
 
 fn clear_staged_paths(status: &mut AgentUpdateStatus) {
@@ -771,6 +805,9 @@ fn clear_staged_paths(status: &mut AgentUpdateStatus) {
     status.staged_updater_path.clear();
     status.staged_launcher_path.clear();
     status.staged_vscode_extension_path.clear();
+    status.staged_runtime_manifest_path.clear();
+    status.staged_runtime_package_path.clear();
+    status.staged_runtime_signature_path.clear();
 }
 
 pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Error>> {
@@ -806,6 +843,9 @@ pub(crate) fn install(options: &Options) -> Result<AgentUpdateStatus, Box<dyn Er
         Path::new(&status.staged_launcher_path),
         (!status.staged_vscode_extension_path.is_empty())
             .then(|| Path::new(&status.staged_vscode_extension_path)),
+        Path::new(&status.staged_runtime_manifest_path),
+        Path::new(&status.staged_runtime_package_path),
+        Path::new(&status.staged_runtime_signature_path),
         &current_executable,
         options,
         &status.available_version,
@@ -930,7 +970,8 @@ fn unix_now() -> u64 {
 mod tests {
     use super::{
         apply_update_check, extract_directory_package, load, safe_version_segment, save,
-        status_path, AgentUpdateStatus, DIRECTORY_PACKAGE_FILES,
+        status_path, AgentUpdateStatus, DIRECTORY_PACKAGE_FILES, RUNTIME_BUNDLE_MANIFEST,
+        RUNTIME_BUNDLE_PACKAGE, RUNTIME_BUNDLE_SIGNATURE,
     };
     use crate::api::distribution::UpdateCheckResponse;
     use std::fs::{self, File};
@@ -1049,6 +1090,25 @@ mod tests {
                 _ => status.staged_launcher_path = value,
             }
         }
+        for name in [
+            RUNTIME_BUNDLE_MANIFEST,
+            RUNTIME_BUNDLE_PACKAGE,
+            RUNTIME_BUNDLE_SIGNATURE,
+        ] {
+            fs::write(staging.join(name), b"runtime").unwrap();
+        }
+        status.staged_runtime_manifest_path = staging
+            .join(RUNTIME_BUNDLE_MANIFEST)
+            .to_string_lossy()
+            .to_string();
+        status.staged_runtime_package_path = staging
+            .join(RUNTIME_BUNDLE_PACKAGE)
+            .to_string_lossy()
+            .to_string();
+        status.staged_runtime_signature_path = staging
+            .join(RUNTIME_BUNDLE_SIGNATURE)
+            .to_string_lossy()
+            .to_string();
         save(&state_path, &status).unwrap();
 
         let loaded = load(&state_path).unwrap();
@@ -1095,6 +1155,25 @@ mod tests {
                 _ => status.staged_launcher_path = value,
             }
         }
+        for name in [
+            RUNTIME_BUNDLE_MANIFEST,
+            RUNTIME_BUNDLE_PACKAGE,
+            RUNTIME_BUNDLE_SIGNATURE,
+        ] {
+            fs::write(staging.join(name), b"runtime").unwrap();
+        }
+        status.staged_runtime_manifest_path = staging
+            .join(RUNTIME_BUNDLE_MANIFEST)
+            .to_string_lossy()
+            .to_string();
+        status.staged_runtime_package_path = staging
+            .join(RUNTIME_BUNDLE_PACKAGE)
+            .to_string_lossy()
+            .to_string();
+        status.staged_runtime_signature_path = staging
+            .join(RUNTIME_BUNDLE_SIGNATURE)
+            .to_string_lossy()
+            .to_string();
         save(&state_path, &status).unwrap();
 
         let loaded = load(&state_path).unwrap();

@@ -2,10 +2,13 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { agentApi, type AgentBackupExportReport, type AgentBackupInspectReport, type AgentBackupRestoreReport, type AgentBackupScope, type AgentUpdateStatus, type ApprovalSettings, type BuiltinAIRuntimeInstallationStatus, type BuiltinAIRuntimeStatus, type ConnectorStateItem, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type EngineInstallation, type GithubAccountStatus, type GithubAppAuthorization, type GithubAppInstallation, type LogItem, type LoginState, type RemoteClientOverview, type RemoteClientStatus, type RemoteClientVendor, type RemoteExecutionSettings, type SvnConnection, type SvnConnectionInput, type UnityEditorSettings, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe } from '../services/agentApi';
 import { Bell, BellOff, Bot, Check, CheckCircle2, ChevronDown, Clock3, Database, Download, ExternalLink, FolderOpen, Github, Globe2, Inbox, KeyRound, Link2, LockKeyhole, LogIn, Monitor, MoreHorizontal, PencilLine, PlugZap, Power, RefreshCw, RotateCcw, ScanSearch, Search, ShieldAlert, ShieldCheck, ShieldX, Trash2, UnlockKeyhole, Wrench, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
+import { copyText } from '../lib/clipboard';
 import { useConfirm } from '../components/ConfirmDialog';
 import { IconButton, PageHeader, Pill } from '../components/Common';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
+import { useModalFocus } from '../components/useModalFocus';
 import { WorkbenchConnectionsPanel, type WorkbenchConnectionDraft } from '../components/WorkbenchConnectionsPanel';
+import { CredentialCenterPanel } from '../components/CredentialCenterPanel';
 import { LogsPage } from './LogsPage';
 import { localRuntimeMeta } from './runtimeProviderView';
 import { settingsSectionMeta, settingsSectionTabFor, settingsSectionTabs, type SettingsSection, type SettingsTab } from '../settingsModel';
@@ -82,6 +85,7 @@ export function SettingsPage({
   onEnrollWorkbenchConnection,
   onProbeWorkbenchConnection,
   onAuthorizeWorkbenchConnection,
+  onOpenAiServices,
   onRemoteExecutionChange,
   onRemoteClientsChange,
   onRuleChange,
@@ -137,12 +141,13 @@ export function SettingsPage({
   workbenchAuthorization: DashboardAuthorizationProgress | null;
   onRefreshWorkbenchConnections: () => void;
   onAddWorkbenchConnection: (draft: WorkbenchConnectionDraft) => Promise<void>;
-  onRenameWorkbenchConnection: (id: string, displayName: string, purpose: string) => Promise<void>;
+  onRenameWorkbenchConnection: (id: string, displayName: string) => Promise<void>;
   onRemoveWorkbenchConnection: (connection: WorkbenchConnection) => void;
   onSwitchWorkbenchConnection: (connection: WorkbenchConnection) => void;
   onEnrollWorkbenchConnection: (id: string, enrollmentToken: string) => Promise<void>;
   onProbeWorkbenchConnection: (apiBase: string) => Promise<WorkbenchProbe>;
   onAuthorizeWorkbenchConnection: (connection: WorkbenchConnection) => void;
+  onOpenAiServices: () => void;
   onRemoteExecutionChange: (settings: RemoteExecutionSettings, fullAccessConfirmed?: boolean) => void;
   onRemoteClientsChange: (overview: RemoteClientOverview) => void;
   onRuleChange: (requestType: string, mode: string) => void;
@@ -830,9 +835,9 @@ export function SettingsPage({
               <div className="approval-settings-body">
                 <div className="approval-identity-row">
                   <div><strong>授权归属</strong><span>{independentMode ? '审批设置只保存在本机' : settings.owner_user_id ? '审批设置与当前工作台账号和这台电脑绑定' : '当前审批设置仅保存在本机'}</span></div>
-                  <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '未对接工作台' : settings.owner_user_id ? '已绑定账号' : '本机模式'}</Pill>
+                  <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '工作台未连接' : settings.owner_user_id ? '已绑定账号' : '仅本机'}</Pill>
                 </div>
-                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>未对接 AI 工作台时，记录与提醒只存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
+                {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>未连接 AI 工作台时，记录与提醒只存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
               <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>受控操作不再询问，工作流确认步骤也跳过；工作台侧授权与远程目录限制不受影响。</span></div>
 
                 <div className="approval-settings-group">
@@ -916,28 +921,18 @@ export function SettingsPage({
             onAuthorize={onAuthorizeWorkbenchConnection}
             onRevoke={onRevokeAuthorization}
           />
-          <section className="card settings-section settings-credentials">
-            <div className="card-header">账号</div>
+          <CredentialCenterPanel
+            onOpenAiServices={onOpenAiServices}
+            onOpenInnerAccount={onOpenLoginModal}
+            onOpenSvnAccount={onOpenSvnModal}
+            onTestSvn={onTestSvnConnection}
+            onRemoveSvn={onRemoveSvnConnection}
+            svnBusy={svnTesting}
+          />
+          <details className="card settings-section settings-credentials settings-credentials-details" id="github-account-card">
+            <summary className="card-header settings-credentials-summary"><span role="heading" aria-level={2}>GitHub 发布账号</span><span className="settings-summary-hint"><span className="when-closed">展开管理</span><span className="when-open">收起</span></span></summary>
             <div className="credential-section">
-              <div className="credential-heading"><span>内网账号</span><Pill kind={configured ? 'success' : 'warn'}>{configured ? '已配置' : '待配置'}</Pill></div>
-              <div className="account-row">
-                <div className="account-icon"><KeyRound size={18} /></div>
-                <div><span>当前账号</span><strong>{loginState.account || '未保存账号'}</strong></div>
-                <button className="btn" onClick={onOpenLoginModal}>{configured ? '更新账号' : '配置账号'}</button>
-              </div>
-              <div className="security-note compact"><ShieldCheck size={16} /><span>账号信息加密保存在本机，不会写入工作台或日志。</span></div>
-            </div>
-            <div className="credential-section">
-              <div className="credential-heading"><span>SVN 账号</span><Pill kind={svnConnections[0]?.status === 'ready' ? 'success' : 'warn'}>{!svnConnections.length ? '待配置' : svnConnections[0]?.status === 'ready' ? '已验证' : svnConnections[0]?.status === 'invalid' ? '凭据失效' : svnConnections[0]?.status === 'unreachable' ? '服务不可达' : '待验证'}</Pill></div>
-              {svnConnections[0] ? <div className="svn-connection-row">
-                <div className="account-icon"><Database size={17} /></div>
-                <div className="svn-connection-main"><strong>{svnConnections[0].username}</strong><span>{svnConnections[0].base_url}</span><small>{svnConnections[0].status === 'invalid' ? '请更新账号并重新测试' : svnConnections[0].status === 'unreachable' ? '请检查 SVN 服务和本机客户端' : '项目仓库地址由项目自动生成'}</small></div>
-                <div className="actions-row svn-connection-actions"><button className="btn" disabled={svnTesting} onClick={onTestSvnConnection}>{svnTesting ? <><BusyIndicator size={14} />测试中</> : '测试'}</button><button className="btn" disabled={svnTesting} onClick={onOpenSvnModal}>更新账号</button><button className="btn btn-danger-quiet" disabled={svnTesting} onClick={onRemoveSvnConnection}>清除</button></div>
-              </div> : <div className="account-row"><div className="account-icon"><Database size={17} /></div><div><span>公司 SVN</span><strong>尚未配置个人账号</strong></div><button className="btn btn-primary" onClick={onOpenSvnModal}>配置账号</button></div>}
-              <div className="security-note compact"><ShieldCheck size={16} /><span>密码只保存在当前 Windows 用户的本地加密存储中。</span></div>
-            </div>
-            <div className="credential-section">
-              <div className="credential-heading"><span>GitHub 账号</span><Pill kind={githubAccount?.authorized ? 'success' : 'neutral'}>{githubAccount?.authorized ? '已授权' : '未授权'}</Pill></div>
+              <div className="credential-heading"><span>授权方式</span><Pill kind={githubAccount?.authorized ? 'success' : 'neutral'}>{githubAccount?.authorized ? '已授权' : '未授权'}</Pill></div>
               {githubAccount?.authorized ? <div className="account-row">
                 <div className="account-icon"><Github size={17} /></div>
                 <div>
@@ -1017,10 +1012,10 @@ export function SettingsPage({
                   </div>
                 ))}
               </div> : null}
-              <div className="security-note compact"><ShieldCheck size={16} /><span>凭据经 DPAPI 加密保存在本机，只用于创建 tag 与 Release，不写入日志或控制面。</span></div>
+              <div className="security-note compact"><ShieldCheck size={16} /><span>凭据加密保存在本机，只用于创建 tag 与 Release。</span></div>
               {githubFeedback ? <div className="inline-feedback visible" role="status">{githubFeedback}</div> : null}
             </div>
-          </section>
+          </details>
           </> : null}
 
           {section === 'services' && activeTab === 'connectors' ? <section className="card settings-section">
@@ -1206,6 +1201,7 @@ export function SettingsPage({
                 <div>
                   <strong>{describeUpdateState(updateStatus)}</strong>
                   <span>{describeUpdateMessage(updateStatus)}</span>
+                  <UpdateDiagnostic message={updateStatus?.last_error || ''} />
                   {updateStatus?.status === 'downloading' ? <div className="agent-update-progress"><span style={{ width: `${updateStatus.progress_percent}%` }} /></div> : null}
                 </div>
                 <div className="actions-row">
@@ -1284,12 +1280,21 @@ function describeUpdateMessage(status: AgentUpdateStatus | null) {
   const reason = (status.last_error || '').trim();
   if (status.status === 'rolled_back') {
     return reason
-      ? `更新没有完成，仍在使用上一版本。原因：${reason}`
-      : '更新没有完成，仍在使用上一版本。';
+      ? '更新失败，已恢复上一版本。可重试或查看技术详情。'
+      : '更新没有完成，已恢复上一版本。请稍后重试。';
   }
   if (status.status === 'failed') {
-    return reason ? `更新未完成：${reason}` : '暂时无法完成更新，请稍后重试。';
+    if (!reason) return '暂时无法完成更新，请稍后重试。';
+    const lowerReason = reason.toLowerCase();
+    if (lowerReason.includes('error sending request') || lowerReason.includes('network') || lowerReason.includes('timed out')) {
+      return '无法连接到更新服务，请检查网络或代理后重试。';
+    }
+    if (lowerReason.includes('404') || lowerReason.includes('not found')) {
+      return '更新包暂时不可用，请稍后重试或检查更新来源。';
+    }
+    return '更新没有完成。可重试；若仍失败，请查看技术详情。';
   }
+
   if (status.status === 'ready') {
     return reason ? `${reason}。重启 HiMind Agent 后完成安装。` : '重启 HiMind Agent 后完成安装。';
   }
@@ -1303,6 +1308,24 @@ function BackupDetails({ summary, items }: { summary: string; items: string[] })
       <ul>{items.map(item => <li key={item}>{item}</li>)}</ul>
     </details>
   );
+}
+
+function UpdateDiagnostic({ message }: { message: string }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  if (!message.trim()) return null;
+  const copy = async () => {
+    try {
+      setCopyState(await copyText(message) ? 'copied' : 'failed');
+    } catch {
+      setCopyState('failed');
+    }
+    window.setTimeout(() => setCopyState('idle'), 1800);
+  };
+  return <details className="update-diagnostic">
+    <summary>技术详情</summary>
+    <pre>{message}</pre>
+    <button type="button" className="text-action" aria-live="polite" onClick={() => void copy()}>{copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败，请手动选择' : '复制诊断信息'}</button>
+  </details>;
 }
 
 function formatBackupBytes(bytes: number): string {
@@ -1416,12 +1439,15 @@ function ApprovalTrustConfirmation({ profile, onClose, onConfirm }: { profile: '
 
 function SvnConnectionModal({ draft, exists, onClose, onChange, onSave }: { draft: SvnConnectionInput; exists: boolean; onClose: () => void; onChange: (draft: SvnConnectionInput) => void; onSave: () => void }) {
   const update = (field: keyof SvnConnectionInput, value: string) => onChange({ ...draft, [field]: value });
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const initialFocusRef = useRef<HTMLInputElement>(null);
+  useModalFocus(dialogRef, true, onClose, initialFocusRef);
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="svn-modal-title" onClick={event => event.stopPropagation()}>
+      <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="svn-modal-title" tabIndex={-1} onClick={event => event.stopPropagation()}>
         <div className="modal-header"><div><h3 id="svn-modal-title">{exists ? '更新 SVN 账号' : '配置 SVN 账号'}</h3><p>用于访问公司 SVN 中当前账号有权限的项目仓库。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="field-group"><label className="field-label" htmlFor="svn-username">账号</label><input id="svn-username" autoComplete="username" value={draft.username} onChange={event => update('username', event.target.value)} /></div>
+          <div className="field-group"><label className="field-label" htmlFor="svn-username">账号</label><input ref={initialFocusRef} id="svn-username" autoComplete="username" value={draft.username} onChange={event => update('username', event.target.value)} /></div>
           <div className="field-group"><label className="field-label" htmlFor="svn-password">密码</label><input id="svn-password" autoComplete="current-password" type="password" value={draft.password} onChange={event => update('password', event.target.value)} placeholder={exists ? '留空以保留当前密码' : '输入 SVN 密码'} /></div>
           <div className="modal-actions"><span /><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" onClick={onSave} disabled={!draft.username.trim() || (!exists && !draft.password)}>保存账号</button></div></div>
         </div>
@@ -1576,12 +1602,15 @@ function RemoteClientCard({ option, status, path, busy, feedback, onPathChange, 
 }
 
 function LoginModal({ configured, username, password, onClose, onUsernameChange, onPasswordChange, onSave, onLogout, onOpenInnerAdmin }: { configured: boolean; username: string; password: string; onClose: () => void; onUsernameChange: (value: string) => void; onPasswordChange: (value: string) => void; onSave: () => void; onLogout: () => void; onOpenInnerAdmin: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const initialFocusRef = useRef<HTMLInputElement>(null);
+  useModalFocus(dialogRef, true, onClose, initialFocusRef);
   return (
     <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="login-modal-title" onClick={event => event.stopPropagation()}>
+      <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="login-modal-title" tabIndex={-1} onClick={event => event.stopPropagation()}>
         <div className="modal-header"><div><h3 id="login-modal-title">配置内网账号</h3><p>凭据仅保存在这台电脑。</p></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
         <div className="modal-body">
-          <div className="field-group"><label className="field-label" htmlFor="login-username">内网账号</label><input id="login-username" autoComplete="username" value={username} onChange={event => onUsernameChange(event.target.value)} placeholder="输入内网平台用户名" /></div>
+          <div className="field-group"><label className="field-label" htmlFor="login-username">内网账号</label><input ref={initialFocusRef} id="login-username" autoComplete="username" value={username} onChange={event => onUsernameChange(event.target.value)} placeholder="输入内网平台用户名" /></div>
           <div className="field-group"><label className="field-label" htmlFor="login-password">内网密码</label><input id="login-password" autoComplete="current-password" type="password" value={password} onChange={event => onPasswordChange(event.target.value)} placeholder={configured ? '输入新密码以更新凭据' : '输入内网平台密码'} /></div>
           <button className="text-action" onClick={onOpenInnerAdmin}><ExternalLink size={14} />打开内网平台</button>
           <div className="modal-actions"><div>{configured ? <button className="btn btn-danger-quiet" onClick={onLogout}>清除凭据</button> : null}</div><div className="actions-row"><button className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" onClick={onSave} disabled={!username.trim() || !password}>保存凭据</button></div></div>

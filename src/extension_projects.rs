@@ -96,6 +96,8 @@ pub(crate) struct ExtensionProject {
     /// registry as PathBuf so filesystem operations remain lossless.
     pub workspace_path: String,
     pub workspace_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
     pub source: String,
     pub source_repository: String,
     pub source_default_branch: String,
@@ -750,7 +752,24 @@ pub(crate) fn create(
         .get("root")
         .and_then(Value::as_str)
         .ok_or("扩展开发工具未返回项目目录")?;
+    append_icon_guidance(Path::new(root))?;
     register(Path::new(root))
+}
+
+fn append_icon_guidance(root: &Path) -> Result<(), Box<dyn Error>> {
+    let readme = root.join("README.md");
+    let mut content = fs::read_to_string(&readme).unwrap_or_default();
+    if content.contains("## 品牌图标") {
+        return Ok(());
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(
+        "\n## 品牌图标（可选）\n\n在清单顶层设置 `\"icon\": \"assets/icon.png\"`。图标必须是项目内的 PNG/WebP，尺寸 64–1024px、不超过 256 KB；缺失或损坏时回退到扩展类型图标。\n",
+    );
+    fs::write(readme, content)?;
+    Ok(())
 }
 
 fn create_expert_skeleton(
@@ -775,6 +794,7 @@ fn create_expert_skeleton(
         "author": author.trim(),
         "categories": [if input.category.trim().is_empty() { "software-engineering" } else { input.category.trim() }],
         "version": "0.1.0",
+        "icon": "",
         "release_notes": "创建初始版本。",
         "min_agent_version": crate::VERSION,
         "description": input.description.trim(),
@@ -891,6 +911,7 @@ fn create_instruction_skeleton(
         "author": author.trim(),
         "categories": [if input.category.trim().is_empty() { "software-engineering" } else { input.category.trim() }],
         "version": "0.1.0",
+        "icon": "",
         "description": input.description.trim(),
         "release_notes": "创建初始版本。",
         "min_agent_version": crate::VERSION,
@@ -941,6 +962,7 @@ pub(crate) fn create_workflow_skeleton(
         "version": "0.1.0",
         "name": input.name.trim(),
         "description": input.description.trim(),
+        "icon": "",
         "release_notes": "创建初始版本。",
         "min_agent_version": crate::VERSION,
         "local_requirements": {},
@@ -1869,6 +1891,7 @@ impl From<ProjectRecord> for ExtensionProject {
     fn from(value: ProjectRecord) -> Self {
         Self {
             workspace_available: value.workspace_path.is_dir(),
+            icon: None,
             id: value.id,
             kind: value.kind,
             extension_id: value.extension_id,
@@ -2035,8 +2058,54 @@ fn project_view_with(
     view.distribution_targets = targets;
     view.distribution_targets_declared = declared.clone();
     view.distribution_targets_source = source.to_string();
+    view.icon = read_project_icon(record);
     view.plugin_dependencies = read_declared_plugin_dependencies(record);
     view
+}
+
+fn read_project_icon(
+    record: &ProjectRecord,
+) -> Option<crate::app::extension_icons::ExtensionIconInfo> {
+    let root = &record.workspace_path;
+    if !root.is_dir() {
+        return crate::app::extension_icons::resolve_user_override(
+            record.kind.as_str(),
+            &record.extension_id,
+        );
+    }
+    let declared = match record.kind {
+        ExtensionProjectKind::Plugin => std::fs::read_to_string(root.join("plugin.json"))
+            .ok()
+            .and_then(|content| crate::capability::plugin::parse_plugin_manifest(&content).ok())
+            .map(|manifest| manifest.icon),
+        ExtensionProjectKind::Skill => crate::skill::manifest::load_skill_manifest(root)
+            .ok()
+            .map(|manifest| manifest.icon),
+        ExtensionProjectKind::Workflow => crate::workflow::load_from_directory(root)
+            .ok()
+            .map(|package| package.icon),
+        ExtensionProjectKind::Expert => std::fs::read(root.join("expert.json"))
+            .ok()
+            .and_then(|content| {
+                serde_json::from_slice::<crate::expert::ExpertDefinition>(&content).ok()
+            })
+            .map(|definition| definition.icon),
+        ExtensionProjectKind::Instruction => std::fs::read(root.join("instruction.json"))
+            .ok()
+            .and_then(|content| {
+                serde_json::from_slice::<crate::instruction_pack::InstructionPackManifest>(&content)
+                    .ok()
+            })
+            .map(|manifest| manifest.icon),
+    };
+    crate::app::extension_icons::resolve_effective_icon(
+        record.kind.as_str(),
+        &record.extension_id,
+        root,
+        declared.as_deref(),
+    )
+    .ok()
+    .flatten()
 }
 
 /// 由本地目录源工作区反查分发单元键；查不到时返回空字符串。

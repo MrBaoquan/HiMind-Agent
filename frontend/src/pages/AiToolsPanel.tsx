@@ -5,6 +5,7 @@ import { BusyIndicator } from '../components/BusyIndicator';
 import { useConfirm } from '../components/ConfirmDialog';
 import { acpPresets, acpProfileStatus, presetCommand, presetVersion, splitCommandLine, type AcpPreset } from './acpProfileView';
 import { buildToolConnections, modelSourceLabel, type ToolConnection } from './aiToolConnections';
+import { serviceSupportsCapability } from './aiServiceCapabilities';
 import type {
   AcpRuntimeProfileInput,
   AcpRuntimeProfileSnapshot,
@@ -93,7 +94,7 @@ export function AiToolsPanel({
   const [sourceDraft, setSourceDraft] = useState<Record<string, string>>({});
 
   const clients = aiServices?.clients?.targets ?? [];
-  const customServices = aiServices?.custom?.services ?? [];
+  const customServices = (aiServices?.custom?.services ?? []).filter((service) => serviceSupportsCapability(service, 'chat'));
   const managed: ManagedAIServiceSummary = aiServices?.managed ?? { available: false };
   const activeServiceId = aiServices?.custom?.active_service_id ?? '';
   const managedLabel = managed.available ? '工作台模型服务' : '工作台模型服务（未就绪）';
@@ -193,7 +194,7 @@ export function AiToolsPanel({
 
       {dashboardEnabled && !identity?.authorized ? <div className="blocker account-blocker"><CircleAlert size={18} /><div><strong>工作台账号未连接</strong><span>不影响本机工具接入；需要工作台数据时再连接账号。</span></div><button className="btn" onClick={onOpenAccount}>连接账号</button></div> : null}
 
-      {!hasAnySource ? <div className="blocker"><CircleAlert size={18} /><div><strong>还没有模型来源</strong><span>接入工具后要给它一份模型配置，先添加一条来源。</span></div><button className="btn" onClick={onOpenModelSources}>新增模型来源</button></div> : null}
+      {!hasAnySource ? <div className="blocker"><CircleAlert size={18} /><div><strong>还没有可用的 AI 服务</strong><span>先在「AI 服务」中添加一个支持对话的服务。</span></div><button className="btn" onClick={onOpenModelSources}>新增 AI 服务</button></div> : null}
 
       <details className={`ai-advanced ai-gateway-advanced${gatewayStatus?.running ? ' is-running' : ''}`}>
         <summary>
@@ -477,7 +478,7 @@ function ToolRow(props: {
               <span className="ai-tool-wire-state">
                 {!hasUsableSource ? <>
                   <span className="status-dot" />
-                  <span className="muted">还没有可用的模型来源</span>
+                  <span className="muted">还没有可用的 AI 服务</span>
                 </> : modelImported ? <>
                   <span className={`status-dot ${gatewayMode ? 'warn' : 'success'}`} />
                   <select className="ai-service-route-select ai-tool-source-select" aria-label={`${item.name} 的模型来源`} title={sourceOptions.some((option) => option.value === (item.model?.service ?? '')) ? undefined : '当前绑定的来源没有记录，可在这里重新选择'} value={item.model?.service ?? ''} disabled={rowBusy} onChange={(event) => void changeSource(event.target.value)}>
@@ -495,7 +496,7 @@ function ToolRow(props: {
               </span>
               <span className="ai-tool-wire-actions">
                 {!hasUsableSource ? (
-                  <button type="button" className="btn btn-primary ai-service-tool-btn" onClick={onOpenModelSources}><PlugZap size={14} />新增模型来源</button>
+                  <button type="button" className="btn btn-primary ai-service-tool-btn" onClick={onOpenModelSources}><PlugZap size={14} />新增 AI 服务</button>
                 ) : modelImported ? <>
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} title={gatewayMode ? '切回直连：把真实地址与密钥写回该工具' : '切到网关：密钥留在 Agent'} onClick={() => void onRunRow(item.key, () => onSetBindingMode(item.key, gatewayMode ? 'direct' : 'gateway'))}>{rowBusy ? <BusyIndicator size={11} /> : null}{gatewayMode ? '切回直连' : '切到网关'}</button>
                   <button type="button" className="btn ai-service-tool-btn" disabled={rowBusy} onClick={() => { void confirm({ title: `取消分发到 ${item.name}？`, description: '取消后该工具恢复自己的模型配置，服务仍可再分发。', confirmText: '取消分发' }).then((accepted) => { if (accepted) void onRunRow(item.key, () => onRemoveAIClient(item.key)); }); }}>{rowBusy ? <BusyIndicator size={11} /> : null}取消分发</button>

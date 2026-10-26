@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::api::client::load_agent_state;
 use crate::api::oauth::platform_access_token;
+use crate::app::control_plane_provider;
 use crate::approval::policy;
 use crate::store::approval_outbox::{self, ApprovalDecisionRecord};
 use crate::Options;
@@ -111,7 +112,7 @@ pub(crate) fn active_grant(
     args_digest: &str,
     input: &Value,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    if !options.mode().dashboard_enabled() {
+    if !control_plane_provider::available(options) {
         return Ok(None);
     }
     let access = platform_access_token(options, "")?;

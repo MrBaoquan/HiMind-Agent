@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { ChevronDown, CircleAlert, Download, FolderOpen, GitBranch, Info, MessageCircle, MoreHorizontal, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
 import { agentApi, type DistributionStateEntry, type ExtensionDistributionUnit, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceNotice, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
 import { compareVersions, countUnitUpdates, friendlySourceName, sourceBaseName, type UnitUpdateAsset } from '../pages/marketCatalog';
 import { ActionMenu, ActionMenuItem } from './ActionMenu';
 import { BusyIndicator } from './BusyIndicator';
+import { useModalFocus } from './useModalFocus';
 
 type Props = {
   open: boolean;
@@ -17,6 +18,7 @@ type Props = {
   loading: boolean;
   error: string;
   onClose: () => void;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   onDevelopWorkspace: (root: string) => void;
   onRefresh: () => Promise<void>;
   onAdd: (name: string, repository: string, reference: string, catalogPath: string, verification: ExtensionSourceConfig['verification']) => Promise<void>;
@@ -55,7 +57,7 @@ type UnitDowngrade = { assetKind: string; assetId: string; from: string; to: str
 /// 一次单元安装的入参：装哪一侧、装谁的版本、会不会退版本。
 type UnitInstallRequest = { unitKey: string; sourceId: string; side: ExtensionSourceAcquisition; downgrades: UnitDowngrade[] };
 
-export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, unitUpdateTargets, loading, error, onClose, onDevelopWorkspace, onRefresh, onAdd, onUpdate, onRemove, onSetAcquisition, onInstallUnit }: Props) {
+export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, unitUpdateTargets, loading, error, onClose, returnFocusRef, onDevelopWorkspace, onRefresh, onAdd, onUpdate, onRemove, onSetAcquisition, onInstallUnit }: Props) {
   // 已发布的 GitHub Release 来自分发台账：源码目录源（仓库树）与 Release 制品是两条
   // 不同的消费路径，不在这里显示的话，用户会以为"发了 Release 但来源里看不到"。
   const [published, setPublished] = useState<DistributionStateEntry[]>([]);
@@ -68,6 +70,10 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, un
   const [localError, setLocalError] = useState('');
   /// 待确认的降级安装：确认后按原样再走一次安装，取消则什么都不做。
   const [pendingInstall, setPendingInstall] = useState<UnitInstallRequest | null>(null);
+  const sourceDialogRef = useRef<HTMLDivElement | null>(null);
+  const sourceCloseRef = useRef<HTMLButtonElement | null>(null);
+  const installConfirmRef = useRef<HTMLElement | null>(null);
+  const installCancelRef = useRef<HTMLButtonElement | null>(null);
   const statuses = useMemo(() => new Map((snapshot?.sources || []).map(item => [item.source.id, item])), [snapshot]);
   // Do not render the persisted sources as independent rows while the first
   // snapshot is still loading.  The snapshot is what proves that a local
@@ -76,6 +82,9 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, un
   const units = useMemo(() => snapshot ? buildUnitGroups(snapshot, settings) : [], [snapshot, settings]);
   const activeRoot = workspace.valid ? normalizePath(workspace.root) : '';
   const officialAdded = settings.sources.some(source => source.kind !== 'local' && normalizePath(source.repository) === 'mrbaoquan/himind-extensions');
+
+  useModalFocus(sourceDialogRef, open && !pendingInstall, onClose, sourceCloseRef, returnFocusRef);
+  useModalFocus(installConfirmRef, Boolean(open && pendingInstall), () => setPendingInstall(null), installCancelRef);
 
   useEffect(() => {
     if (!open) return;
@@ -197,7 +206,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, un
 
   return <>
   <div className="modal-backdrop extension-source-backdrop" role="presentation">
-    <div className="modal extension-source-dialog" role="dialog" aria-modal="true" aria-labelledby="extension-source-title">
+    <div ref={sourceDialogRef} tabIndex={-1} className="modal extension-source-dialog" role="dialog" aria-modal="true" aria-labelledby="extension-source-title">
       <div className="modal-header extension-source-header">
         <h3 id="extension-source-title">来源管理</h3>
         <div className="actions-row">
@@ -209,7 +218,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, un
             </>}
           </ActionMenu>
           <button className="btn btn-icon" title="刷新来源" aria-label="刷新来源" disabled={loading} onClick={() => void onRefresh().catch(reason => setLocalError(messageOf(reason)))}>{loading ? <BusyIndicator size={15} /> : <RefreshCw size={15} />}</button>
-          <button className="btn btn-icon" title="关闭" aria-label="关闭" onClick={onClose}><X size={15} /></button>
+          <button ref={sourceCloseRef} className="btn btn-icon" title="关闭" aria-label="关闭" onClick={onClose}><X size={15} /></button>
         </div>
       </div>
       <div className="modal-body extension-source-body">
@@ -241,7 +250,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, un
     </div>
   </div>
   {pendingInstall ? <div className="modal-backdrop is-confirm" role="presentation">
-    <section className="modal extension-source-confirm" role="dialog" aria-modal="true" aria-labelledby="extension-source-confirm-title">
+    <section ref={installConfirmRef} tabIndex={-1} className="modal extension-source-confirm" role="dialog" aria-modal="true" aria-labelledby="extension-source-confirm-title">
       <div className="modal-header">
         <div>
           <h3 id="extension-source-confirm-title">安装会把 {pendingInstall.downgrades.length} 项退到更低版本</h3>
@@ -255,7 +264,7 @@ export function ExtensionSourcesDialog({ open, workspace, settings, snapshot, un
         </ul>
         {pendingInstall.downgrades.length > 8 ? <p className="field-hint">另有 {pendingInstall.downgrades.length - 8} 项同样会退版本。</p> : null}
         <div className="modal-actions">
-          <button type="button" className="btn" onClick={() => setPendingInstall(null)}>取消</button>
+          <button ref={installCancelRef} type="button" className="btn" onClick={() => setPendingInstall(null)}>取消</button>
           <button type="button" className="btn btn-danger" onClick={() => { const action = pendingInstall; setPendingInstall(null); void runInstallUnit(action.unitKey, action.sourceId); }}>仍要安装</button>
         </div>
       </div>

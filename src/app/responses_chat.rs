@@ -99,7 +99,10 @@ fn translate_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), String
                 other => other,
             }
             .to_string();
-            out.push(json!({ "role": role, "content": content_text(item.get("content"))? }));
+            out.push(json!({
+                "role": role,
+                "content": message_content(item.get("content"), &role)?,
+            }));
             Ok(())
         }
         Some("function_call") => {
@@ -125,12 +128,23 @@ fn translate_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), String
                 .get("call_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let output = match item.get("output") {
-                Some(Value::String(text)) => text.clone(),
-                Some(value) => value.to_string(),
-                None => String::new(),
-            };
-            out.push(json!({ "role": "tool", "tool_call_id": call_id, "content": output }));
+            let (mut output, images) = function_output_parts(item.get("output"))?;
+            if output.trim().is_empty() && !images.is_empty() {
+                output = "工具返回了图片；预览见下一条消息。".to_string();
+            }
+            out.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": output,
+            }));
+            if !images.is_empty() {
+                let mut parts = vec![json!({
+                    "type": "text",
+                    "text": "工具返回的图片预览；完整原图已由 HiMind 本机媒体登记表保存。",
+                })];
+                parts.extend(images);
+                out.push(json!({ "role": "user", "content": parts }));
+            }
             Ok(())
         }
         // reasoning / 其它 Responses 专有项在 Chat 里没有对应概念。
@@ -138,20 +152,98 @@ fn translate_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), String
     }
 }
 
-fn content_text(content: Option<&Value>) -> Result<String, String> {
-    Ok(match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => {
-            let mut out = Vec::new();
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    out.push(text.to_string());
+fn message_content(content: Option<&Value>, role: &str) -> Result<Value, String> {
+    let Some(content) = content else {
+        return Ok(Value::String(String::new()));
+    };
+    if let Value::String(text) = content {
+        return Ok(Value::String(text.clone()));
+    }
+    let Some(parts) = content.as_array() else {
+        return Ok(Value::String(String::new()));
+    };
+    let mut text = String::new();
+    let mut chat_parts = Vec::<Value>::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => {
+                if let Some(value) = part.get("text").and_then(Value::as_str) {
+                    text.push_str(value);
+                    chat_parts.push(json!({ "type": "text", "text": value }));
                 }
             }
-            out.join("")
+            Some("input_image") if role == "user" => {
+                if let Some(image) = chat_image_part(part) {
+                    chat_parts.push(image);
+                }
+            }
+            Some("input_file") if role == "user" => {
+                let label = part
+                    .get("file_id")
+                    .or_else(|| part.get("filename"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("附件");
+                let note = format!("[附件：{label}]");
+                text.push_str(&note);
+                chat_parts.push(json!({ "type": "text", "text": note }));
+            }
+            _ => {}
         }
-        _ => String::new(),
-    })
+    }
+    if role != "user" || chat_parts.iter().all(|part| part["type"] == "text") {
+        return Ok(Value::String(text));
+    }
+    Ok(Value::Array(chat_parts))
+}
+
+fn function_output_parts(output: Option<&Value>) -> Result<(String, Vec<Value>), String> {
+    let Some(output) = output else {
+        return Ok((String::new(), Vec::new()));
+    };
+    if let Value::String(text) = output {
+        return Ok((text.clone(), Vec::new()));
+    }
+    let Some(parts) = output.as_array() else {
+        return Ok((output.to_string(), Vec::new()));
+    };
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "text") => {
+                if let Some(value) = part.get("text").and_then(Value::as_str) {
+                    text.push_str(value);
+                }
+            }
+            Some("input_image") => {
+                if let Some(image) = chat_image_part(part) {
+                    images.push(image);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((text, images))
+}
+
+fn chat_image_part(part: &Value) -> Option<Value> {
+    let (url, detail) = match part.get("image_url") {
+        Some(Value::String(url)) => (url.as_str(), part.get("detail").and_then(Value::as_str)),
+        Some(Value::Object(image)) => (
+            image.get("url").and_then(Value::as_str)?,
+            image
+                .get("detail")
+                .and_then(Value::as_str)
+                .or_else(|| part.get("detail").and_then(Value::as_str)),
+        ),
+        _ => return None,
+    };
+    let mut image = Map::new();
+    image.insert("url".to_string(), json!(url));
+    if let Some(detail) = detail {
+        image.insert("detail".to_string(), json!(detail));
+    }
+    Some(json!({ "type": "image_url", "image_url": Value::Object(image) }))
 }
 
 fn translate_tool_choice(value: Option<&Value>) -> Option<Value> {
@@ -580,6 +672,55 @@ mod tests {
         assert_eq!(chat["messages"][1]["role"], "user");
     }
 
+    #[test]
+    fn user_image_becomes_chat_vision_content() {
+        let request = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "看这张图" },
+                    { "type": "input_image", "image_url": "data:image/jpeg;base64,AAAA", "detail": "low" }
+                ]
+            }]
+        });
+        let chat = request_to_chat(&request, "m").unwrap();
+        assert_eq!(chat["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(chat["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            chat["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,AAAA"
+        );
+        assert_eq!(
+            chat["messages"][0]["content"][1]["image_url"]["detail"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn function_image_output_keeps_tool_text_and_adds_vision_message() {
+        let request = json!({
+            "input": [
+                { "type": "function_call", "call_id": "call_1", "name": "view_image", "arguments": "{}" },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        { "type": "input_image", "image_url": "data:image/jpeg;base64,AAAA", "detail": "low" },
+                        { "type": "input_text", "text": "[HiMind media] media_id=media_1" }
+                    ]
+                }
+            ]
+        });
+        let chat = request_to_chat(&request, "m").unwrap();
+        assert_eq!(chat["messages"][1]["role"], "tool");
+        assert!(chat["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("media_id=media_1"));
+        assert_eq!(chat["messages"][2]["role"], "user");
+        assert_eq!(chat["messages"][2]["content"][1]["type"], "image_url");
+    }
     #[test]
     fn non_stream_response_maps_text_and_usage() {
         let chat = json!({

@@ -10,12 +10,14 @@ param(
     [switch]$RequireAuthenticode,
     [switch]$SkipBuild,
     [switch]$SkipDependencyInstall,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$RuntimeReleaseDirectory
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+. (Join-Path $PSScriptRoot "runtime-bundle.ps1")
 
 $CargoText = [IO.File]::ReadAllText((Join-Path $Root "Cargo.toml"))
 $PackageVersion = [regex]::Match($CargoText, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -28,7 +30,7 @@ if ($PackageVersion -ne $Version) {
 }
 
 if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot "build.ps1") -Configuration $Configuration -SkipDependencyInstall:$SkipDependencyInstall -SkipTests:$SkipTests
+    & (Join-Path $PSScriptRoot "build.ps1") -Configuration $Configuration -RuntimeReleaseDirectory $RuntimeReleaseDirectory -SkipDependencyInstall:$SkipDependencyInstall -SkipTests:$SkipTests
     if ($LASTEXITCODE -ne 0) { throw "Agent build failed." }
 }
 
@@ -117,6 +119,12 @@ $VSCodeArtifact = Join-Path $ReleaseDirectory "resources\vscode\himind-ai.vsix"
 & (Join-Path $PSScriptRoot "build-vscode-extension.ps1") -OutputPath $VSCodeArtifact -SkipDependencyInstall:$SkipDependencyInstall | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "VS Code integration package build failed." }
 
+$BundledRuntime = Join-Path $Root "target\$Configuration\resources\runtime"
+if (-not (Test-Path -LiteralPath (Join-Path $BundledRuntime "himind-runtime-release.json") -PathType Leaf)) {
+    throw "Bundled Runtime is missing from target\$Configuration\resources\runtime. Run build.ps1 with a signed Runtime release or pass -RuntimeReleaseDirectory."
+}
+Copy-RuntimeBundle -RuntimeReleaseDirectory $BundledRuntime -DestinationDirectory (Join-Path $ReleaseDirectory "resources\runtime") | Out-Null
+
 $TrackedStatus = @(& git status --porcelain=v1 --untracked-files=normal)
 $Commit = (& git rev-parse HEAD).Trim()
 $Files = @(Get-ChildItem -LiteralPath $ReleaseDirectory -File -Recurse | Sort-Object FullName | ForEach-Object {
@@ -156,11 +164,18 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $UpdateArchive = [System.IO.Compression.ZipFile]::Open($UpdateArchivePath, [System.IO.Compression.ZipArchiveMode]::Create)
 try {
+    $RuntimeManifestPath = Join-Path $ReleaseDirectory "resources\runtime\himind-runtime-release.json"
+    $RuntimeManifest = Get-Content -LiteralPath $RuntimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $RuntimePackageName = [string]$RuntimeManifest.file_name
+    if ($RuntimePackageName -notmatch '^[A-Za-z0-9._-]+\.zip$') { throw "Bundled Runtime package file name is unsafe." }
     $UpdateFiles = @(
         @{ Source = (Join-Path $ReleaseDirectory "himind-agent.exe"); Entry = "himind-agent.exe" },
         @{ Source = (Join-Path $ReleaseDirectory "himind-agent-mcp.exe"); Entry = "himind-agent-mcp.exe" },
         @{ Source = (Join-Path $ReleaseDirectory "himind-agent-updater.exe"); Entry = "himind-agent-updater.exe" },
-        @{ Source = (Join-Path $ReleaseDirectory "himind-agent-launcher.exe"); Entry = "himind-agent-launcher.exe" }
+        @{ Source = (Join-Path $ReleaseDirectory "himind-agent-launcher.exe"); Entry = "himind-agent-launcher.exe" },
+        @{ Source = $RuntimeManifestPath; Entry = "himind-runtime-manifest.json" },
+        @{ Source = (Join-Path $ReleaseDirectory "resources\runtime\$RuntimePackageName"); Entry = "himind-runtime-package.zip" },
+        @{ Source = (Join-Path $ReleaseDirectory "resources\runtime\$RuntimePackageName.signature.json"); Entry = "himind-runtime-package.signature.json" }
     )
     $VSCodeSource = Join-Path $ReleaseDirectory "resources\vscode\himind-ai.vsix"
     if (Test-Path -LiteralPath $VSCodeSource -PathType Leaf) {

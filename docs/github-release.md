@@ -25,6 +25,18 @@ Release 还必须发布 `himind-agent-update.json`，其 `product` 为 `himind-a
 
 ## Runtime 安装
 
+Runtime 是 Agent 发行制品的一部分，不再作为安装后的可选下载项。仓库内的
+`resources/runtime/himind-runtime-release.json` 固定精确版本和 SHA-256；构建、
+便携包和安装器都必须携带同一份签名 Runtime ZIP。当前固定为
+`0.2.1-rc.2`（`cf10a0b39e10…`）。
+
+Runtime 二进制安装在机器级
+`%LOCALAPPDATA%\HiMindAgent\runtimes\deepseek-harness`，所有 profile 共用同一版本；
+profile 只隔离 `homes/`、会话、设置快照和工作区数据。Agent 启动时不仅检查
+`status=ready`，还要求实际版本等于内置清单；不匹配时从随包签名归档重新安装。
+Agent 自更新会保留旧 Runtime 归档直到新版本通过启动健康检查；若更新回滚，
+旧 Agent 与旧 Runtime 归档一起恢复。
+
 HiMind AI Runtime 与 Agent Release 解耦，使用独立标签和制品：
 
 | 制品 | 文件 | 用途 |
@@ -133,9 +145,14 @@ $env:HIMIND_EXTENSION_SIGNING_KEY_ID = "himind-extension-production-2026"
 | Tag | `<kind>/<id>@<version>`，如 `plugin/com.himind.x@1.0.0` |
 | 主制品 | `<id>-<version>.<hmpkg\|hmskill\|hmwf>` |
 | 发布清单 | `<id>@<version>.json` |
+| 品牌图标（可选） | `<id>-<version>-icon.<png\|webp>` |
 | 签名 | 内嵌在发布清单的 `signature` 字段，不作为独立资产上传 |
 
-一次发布只有两个资产：制品和发布清单（Workflow 多一个扩展锁 `<id>-<version>.extension-lock.json`）。签名放在发布清单里，安装侧读到的签名与它校验的制品是同一份事实，不会出现「清单和签名资产各说各话」。
+一次发布至少包含制品和发布清单；Workflow 多一个扩展锁，扩展声明了
+`icon` 时再多一个品牌图标 sidecar。发布清单的 `icon` 记录文件名、大小、
+SHA-256 与 MIME，市场和安装侧只接受同源且摘要一致的图标。签名放在发布清单
+里，安装侧读到的签名与它校验的制品是同一份事实，不会出现「清单和签名资产
+各说各话」。
 
 发布命令（UI 在扩展开发工作区，同一实现）：
 

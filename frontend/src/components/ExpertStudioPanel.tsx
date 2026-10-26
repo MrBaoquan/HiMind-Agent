@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Code2, Download, FileUp, FolderPlus, Github, GraduationCap, MoreHorizontal, Plus, Send, X } from 'lucide-react';
 import { EmptyState, Pill } from './Common';
+import { ExtensionIcon } from './ExtensionIcon';
 import { ActionMenu, ActionMenuItem } from './ActionMenu';
 import { agentApi, type ExpertCatalogItem, type ExpertSummary } from '../services/agentApi';
 
@@ -165,7 +166,7 @@ export function ExpertStudioPanel({ experts, expertCatalog = [], activeExpert, c
       // 专家没有"启用/停用"这种持久状态：用不用由会话里的 AI 客户端按任务决定，
       // 所以卡片只描述这个专家是什么，以及能同步到哪些客户端。
       return <article className="expert-studio-item" key={`${expert.id}@${expert.version}`}>
-        <div className="expert-studio-copy"><div><strong title={expert.name}>{expert.name}</strong><Pill kind="neutral">v{expert.version}</Pill></div><p title={expert.description || undefined}>{expert.description || '可复用的专家工作标准。'}</p><small>{expertMeta(expert)}</small></div>
+        <div className="expert-studio-copy"><div><ExtensionIcon kind="expert" name={expert.name} icon={expert.icon} size={36} /><strong title={expert.name}>{expert.name}</strong><Pill kind="neutral">v{expert.version}</Pill></div><p title={expert.description || undefined}>{expert.description || '可复用的专家工作标准。'}</p><small>{expertMeta(expert)}</small></div>
         <div className="expert-studio-item-actions">
           {showProjection ? <ActionMenu label="同步到客户端" icon={<Send size={14} />} title={`同步${expert.name}到客户端`} disabled={Boolean(busy)}>
             {close => <>

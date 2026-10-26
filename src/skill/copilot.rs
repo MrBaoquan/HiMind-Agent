@@ -808,7 +808,9 @@ mod tests {
         .unwrap();
         fs::write(version_root.join("skill.json"), "{}").unwrap();
         SkillRecord {
+            icon: None,
             manifest: SkillManifest {
+                icon: String::new(),
                 id: "com.himind.skill.copilot-test".to_string(),
                 name: "Copilot 测试".to_string(),
                 author: String::new(),

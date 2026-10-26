@@ -2,19 +2,20 @@
 //!
 //! 为什么不让插件自己存：凭据的**轮换、审计、卸载清理**都需要一个统一持有者。
 //! 散落在各插件目录里的配置文件做不到其中任何一条，而且插件一升级就可能把用户
-//! 填过的 key 覆盖掉。这里只做 S1（声明 + 保管 + 状态查询）：
+//! 填过的 key 覆盖掉。本模块负责声明后的保管、状态、声明指纹和取用审计：
 //!
 //! - 值以 DPAPI 按当前 Windows 用户加密后落盘（与 AI 服务密钥、GitHub 令牌同一套保护）；
 //! - 按插件 ID 隔离：A 插件授权不等于 B 插件可用；
 //! - 界面与插件都只能看到「配没配 / 配了哪些字段 / 什么时候更新的」，没有明文；
 //! - 明文只在进程内存里短暂存在，不写日志、不进错误信息。
 //!
-//! 未来的 broker 通道（S2）才把值按需交给插件，且应当以短期令牌或一次性注入的
-//! 形式给出，而不是让插件读到长期密钥。
+//! 外部插件的运行时取值由本模块之上的 per-invocation broker 完成；Agent 只在一个
+//! 短生命周期进程内按声明和授权下发，不让插件直接持有长期密钥。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::store::atomic_file;
@@ -58,19 +59,28 @@ struct PluginCredentials {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CredentialEntry {
+    /// Public account metadata such as username, endpoint or tenant.
+    #[serde(default)]
+    public_fields: BTreeMap<String, String>,
     /// 字段名 → DPAPI 保护后的值。字段名本身不是秘密，值才是。
     #[serde(default)]
     protected_fields: BTreeMap<String, String>,
+    /// Fingerprint of the declaration used when this profile was saved.
+    #[serde(default)]
+    descriptor_fingerprint: String,
     #[serde(default)]
     updated_at: String,
 }
 
-/// 给界面（以及未来的插件状态查询）看的凭据状态：只有「配没配」，没有值。
+/// 给界面和插件状态查询看的凭据状态：只有公开元数据与配置状态，没有秘密值。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PluginCredentialStatus {
     pub id: String,
     pub configured: bool,
     pub configured_fields: Vec<String>,
+    pub public_fields: BTreeMap<String, String>,
+    /// False when the plugin changed the declaration after this profile was saved.
+    pub descriptor_current: bool,
     pub updated_at: String,
 }
 
@@ -84,7 +94,8 @@ fn read_store() -> Result<StoreFile, Box<dyn Error>> {
         return Ok(StoreFile::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&content).unwrap_or_default())
+    serde_json::from_str(&content)
+        .map_err(|error| format!("插件凭据存储损坏，已拒绝覆盖：{error}").into())
 }
 
 fn write_store(store: &StoreFile) -> Result<(), Box<dyn Error>> {
@@ -125,6 +136,15 @@ pub(crate) fn status_of(
     plugin_id: &str,
     credential_id: &str,
 ) -> PluginCredentialStatus {
+    status_of_with_fingerprint(store, plugin_id, credential_id, "")
+}
+
+fn status_of_with_fingerprint(
+    store: &BTreeMap<String, PluginCredentials>,
+    plugin_id: &str,
+    credential_id: &str,
+    expected_fingerprint: &str,
+) -> PluginCredentialStatus {
     let entry = store
         .get(plugin_id)
         .and_then(|plugin| plugin.entries.get(credential_id));
@@ -134,6 +154,14 @@ pub(crate) fn status_of(
         configured_fields: entry
             .map(|entry| entry.protected_fields.keys().cloned().collect())
             .unwrap_or_default(),
+        public_fields: entry
+            .map(|entry| entry.public_fields.clone())
+            .unwrap_or_default(),
+        descriptor_current: entry.is_some_and(|entry| {
+            expected_fingerprint.trim().is_empty()
+                || entry.descriptor_fingerprint.trim().is_empty()
+                || entry.descriptor_fingerprint == expected_fingerprint
+        }),
         updated_at: entry
             .map(|entry| entry.updated_at.clone())
             .unwrap_or_default(),
@@ -145,11 +173,25 @@ pub(crate) fn statuses(
     plugin_id: &str,
     credential_ids: &[String],
 ) -> Result<Vec<PluginCredentialStatus>, Box<dyn Error>> {
+    statuses_with_fingerprints(
+        plugin_id,
+        &credential_ids
+            .iter()
+            .map(|id| (id.clone(), String::new()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub(crate) fn statuses_with_fingerprints(
+    plugin_id: &str,
+    credentials: &[(String, String)],
+) -> Result<Vec<PluginCredentialStatus>, Box<dyn Error>> {
     let store = read_store()?;
-    let plugins = &store.plugins;
-    Ok(credential_ids
+    Ok(credentials
         .iter()
-        .map(|id| status_of(plugins, plugin_id, id))
+        .map(|(id, fingerprint)| {
+            status_of_with_fingerprint(&store.plugins, plugin_id, id, fingerprint)
+        })
         .collect())
 }
 
@@ -159,16 +201,34 @@ pub(crate) fn save(
     credential_id: &str,
     fields: &BTreeMap<String, String>,
 ) -> Result<PluginCredentialStatus, Box<dyn Error>> {
+    save_profile(plugin_id, credential_id, &BTreeMap::new(), fields, "")
+}
+
+pub(crate) fn save_profile(
+    plugin_id: &str,
+    credential_id: &str,
+    public_fields: &BTreeMap<String, String>,
+    secret_fields: &BTreeMap<String, String>,
+    descriptor_fingerprint: &str,
+) -> Result<PluginCredentialStatus, Box<dyn Error>> {
     let plugin_id = validate_segment("插件 ID", plugin_id)?;
     let credential_id = validate_segment("凭据 ID", credential_id)?;
-    if fields.is_empty() {
+    if public_fields.is_empty() && secret_fields.is_empty() {
         return Err("凭据至少要有一个字段".into());
     }
-    if fields.len() > MAX_FIELDS {
+    if public_fields.len() + secret_fields.len() > MAX_FIELDS {
         return Err(format!("凭据字段最多 {MAX_FIELDS} 个").into());
     }
+    let mut normalized_public = BTreeMap::new();
+    for (name, value) in public_fields {
+        let name = validate_segment("字段名", name)?;
+        if value.len() > MAX_VALUE_BYTES {
+            return Err(format!("字段 {name} 的值超过 {MAX_VALUE_BYTES} 字节").into());
+        }
+        normalized_public.insert(name, value.trim().to_string());
+    }
     let mut protected_fields = BTreeMap::new();
-    for (name, value) in fields {
+    for (name, value) in secret_fields {
         let name = validate_segment("字段名", name)?;
         if value.trim().is_empty() {
             return Err(format!("字段 {name} 的值不能为空").into());
@@ -179,6 +239,16 @@ pub(crate) fn save(
         protected_fields.insert(name, protect_secret_for_current_user(value)?);
     }
     let mut store = read_store()?;
+    let existing = store
+        .plugins
+        .get(&plugin_id)
+        .and_then(|plugin| plugin.entries.get(&credential_id))
+        .cloned()
+        .unwrap_or_default();
+    let mut merged_public = existing.public_fields;
+    merged_public.extend(normalized_public);
+    let mut merged_secret = existing.protected_fields;
+    merged_secret.extend(protected_fields);
     store
         .plugins
         .entry(plugin_id.clone())
@@ -187,12 +257,19 @@ pub(crate) fn save(
         .insert(
             credential_id.clone(),
             CredentialEntry {
-                protected_fields,
+                public_fields: merged_public,
+                protected_fields: merged_secret,
+                descriptor_fingerprint: descriptor_fingerprint.trim().to_string(),
                 updated_at: now_stamp(),
             },
         );
     write_store(&store)?;
-    Ok(status_of(&store.plugins, &plugin_id, &credential_id))
+    Ok(status_of_with_fingerprint(
+        &store.plugins,
+        &plugin_id,
+        &credential_id,
+        descriptor_fingerprint,
+    ))
 }
 
 /// 删除一条凭据；返回是否真的删掉了东西（用于界面提示）。
@@ -229,7 +306,7 @@ pub(crate) fn remove_all_for_plugin(plugin_id: &str) -> Result<bool, Box<dyn Err
     Ok(removed)
 }
 
-/// 取值。**只给内核用**（未来的 broker 通道）；插件进程不直接调用这条路径。
+/// 读取秘密字段。仅供内核和 broker 使用；插件进程必须通过 broker 获取。
 pub(crate) fn secret_fields(
     plugin_id: &str,
     credential_id: &str,
@@ -247,6 +324,100 @@ pub(crate) fn secret_fields(
         fields.insert(name.clone(), unprotect_secret_for_current_user(value)?);
     }
     Ok(fields)
+}
+
+/// Resolve the public and secret values of one profile for a brokered consumer.
+pub(crate) fn broker_fields(
+    plugin_id: &str,
+    credential_id: &str,
+    expected_fingerprint: &str,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let plugin_id = validate_segment("插件 ID", plugin_id)?;
+    let credential_id = validate_segment("凭据 ID", credential_id)?;
+    let store = read_store()?;
+    let status = status_of_with_fingerprint(
+        &store.plugins,
+        &plugin_id,
+        &credential_id,
+        expected_fingerprint,
+    );
+    if !status.configured {
+        return Err(format!("凭据未配置: {plugin_id}/{credential_id}").into());
+    }
+    if !status.descriptor_current {
+        return Err("插件更新了凭据声明，请先在账号与凭据中心确认".into());
+    }
+    let entry = store
+        .plugins
+        .get(&plugin_id)
+        .and_then(|plugin| plugin.entries.get(&credential_id))
+        .ok_or_else(|| format!("凭据未配置: {plugin_id}/{credential_id}"))?;
+    let mut fields = entry.public_fields.clone();
+    for (name, value) in &entry.protected_fields {
+        fields.insert(name.clone(), unprotect_secret_for_current_user(value)?);
+    }
+    Ok(fields)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CredentialAuditEvent {
+    pub at: String,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub credential_id: String,
+    pub capability: String,
+    pub result: String,
+    pub reason: String,
+}
+
+fn audit_path() -> PathBuf {
+    crate::store::paths::agent_home().join("credential-audit.jsonl")
+}
+
+pub(crate) fn record_audit(
+    owner_kind: &str,
+    owner_id: &str,
+    credential_id: &str,
+    capability: &str,
+    result: &str,
+    reason: &str,
+) -> Result<(), Box<dyn Error>> {
+    let path = audit_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = atomic_file::lock(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let event = CredentialAuditEvent {
+        at: now_stamp(),
+        owner_kind: owner_kind.trim().to_string(),
+        owner_id: owner_id.trim().to_string(),
+        credential_id: credential_id.trim().to_string(),
+        capability: capability.trim().to_string(),
+        result: result.trim().to_string(),
+        reason: reason.trim().to_string(),
+    };
+    writeln!(file, "{}", serde_json::to_string(&event)?)?;
+    Ok(())
+}
+
+pub(crate) fn audit_events(limit: usize) -> Result<Vec<CredentialAuditEvent>, Box<dyn Error>> {
+    let path = audit_path();
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)?;
+    let mut events = content
+        .lines()
+        .rev()
+        .take(limit.clamp(1, 500))
+        .filter_map(|line| serde_json::from_str::<CredentialAuditEvent>(line).ok())
+        .collect::<Vec<_>>();
+    events.reverse();
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -309,7 +480,7 @@ mod tests {
         let listed = statuses("com.test.plugin", &["demo.api".to_string()]).unwrap();
         assert!(listed[0].configured);
 
-        // 内核侧取值仍然拿得到原值（未来的 broker 通道会用它）。
+        // 内核侧取值仍然拿得到原值（broker 通过这条路径解析）。
         let secrets = secret_fields("com.test.plugin", "demo.api").unwrap();
         assert_eq!(
             secrets.get("api_key").map(String::as_str),
@@ -348,5 +519,55 @@ mod tests {
         assert!(remove_all_for_plugin("com.test.a").unwrap());
         assert!(!statuses("com.test.a", &["one".to_string()]).unwrap()[0].configured);
         assert!(!statuses("com.test.a", &["two".to_string()]).unwrap()[0].configured);
+    }
+    #[test]
+    fn public_fields_and_declaration_fingerprint_are_status_only() {
+        let _home = PinnedHome::new("metadata");
+        let mut public_fields = BTreeMap::new();
+        public_fields.insert("username".to_string(), "alice".to_string());
+        let mut secret_fields = BTreeMap::new();
+        secret_fields.insert("password".to_string(), "super-secret".to_string());
+        let status = save_profile(
+            "com.test.plugin",
+            "demo.account",
+            &public_fields,
+            &secret_fields,
+            "fingerprint-a",
+        )
+        .unwrap();
+        assert!(status.configured);
+        assert_eq!(
+            status.public_fields.get("username").map(String::as_str),
+            Some("alice")
+        );
+        assert!(status.descriptor_current);
+
+        let changed = statuses_with_fingerprints(
+            "com.test.plugin",
+            &[("demo.account".to_string(), "fingerprint-b".to_string())],
+        )
+        .unwrap();
+        assert!(!changed[0].descriptor_current);
+        let raw = std::fs::read_to_string(store_path()).unwrap();
+        assert!(!raw.contains("super-secret"));
+    }
+
+    #[test]
+    fn audit_events_never_leak_values() {
+        let _home = PinnedHome::new("audit");
+        record_audit(
+            "plugin",
+            "com.test.plugin",
+            "demo.api",
+            "demo.run",
+            "allowed",
+            "",
+        )
+        .unwrap();
+        let events = audit_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].result, "allowed");
+        let raw = std::fs::read_to_string(audit_path()).unwrap();
+        assert!(!raw.contains("super-secret"));
     }
 }

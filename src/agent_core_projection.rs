@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::api::client::load_agent_state;
 use crate::api::oauth::{platform_access_token, AI_CONVERSATION_SCOPE};
+use crate::app::control_plane_provider;
 use crate::store::local_runs::{LocalRunLedger, ProjectionDeadLetterGroup, ProjectionOutboxRecord};
 use crate::Options;
 
@@ -63,7 +64,7 @@ pub(crate) fn projection_sync_status(
 ) -> Result<ProjectionSyncStatus, Box<dyn Error>> {
     let ledger = LocalRunLedger::open_default()?;
     let summary = ledger.projection_outbox_summary()?;
-    let dashboard_enabled = options.mode().dashboard_enabled();
+    let dashboard_enabled = control_plane_provider::available(options);
     let state = if !dashboard_enabled {
         "local_only"
     } else if summary.dead_letter > 0 {
@@ -117,7 +118,7 @@ pub(crate) fn drain_pending_projections(
     options: &Options,
     max_batches: usize,
 ) -> Result<ProjectionDrainReport, Box<dyn Error>> {
-    if !options.mode().dashboard_enabled() {
+    if !control_plane_provider::available(options) {
         return Err("AI 工作台未启用，本地运行记录会保留到重新对接后再同步".into());
     }
     let mut report = ProjectionDrainReport::default();
@@ -147,7 +148,7 @@ pub(crate) fn drain_pending_projections(
 pub(crate) fn flush_pending_projections(
     options: &Options,
 ) -> Result<ProjectionFlushReport, Box<dyn Error>> {
-    if !options.mode().dashboard_enabled() {
+    if !control_plane_provider::available(options) {
         return Ok(ProjectionFlushReport::default());
     }
     let ledger = LocalRunLedger::open_default()?;

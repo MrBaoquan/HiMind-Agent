@@ -327,7 +327,20 @@ fn rail_view_preset_script(workspace_ids: &[String], session_id: Option<&str>) -
 /// The rail groups by Workspace membership, so these are exactly the group
 /// keys the browser must open for recorded Sessions to be visible.
 fn rail_workspace_ids(home: &Path) -> Vec<String> {
-    let path = home.join("storages").join("workspace.json");
+    // The current layouts point DSH at the real shared storage directory; the
+    // local candidate keeps legacy homes and tests readable during migration.
+    let local = home.join("storages").join("workspace.json");
+    let shared = home
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("storages").join("workspace.json"));
+    let path = if local.is_file() {
+        local
+    } else if let Some(shared) = shared.filter(|path| path.is_file()) {
+        shared
+    } else {
+        return Vec::new();
+    };
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -580,9 +593,15 @@ impl BuiltinAiProxyControl {
         workspace: &Path,
         adopt_session: bool,
     ) -> Result<Vec<String>, String> {
-        let registered = match adopt_session {
-            true => self.register_workspace(workspace).map(Some),
-            false => Ok(None),
+        // A plain AI entry normally leaves the rail alone. On a fresh/reset
+        // storage there is no group to select, though, so the embedded surface
+        // would stop at "选择一个工作区". Bootstrap one group + Session only for
+        // that empty state.
+        let needs_bootstrap = !adopt_session && rail_workspace_ids(home).is_empty();
+        let registered = if adopt_session || needs_bootstrap {
+            self.register_workspace(workspace).map(Some)
+        } else {
+            Ok(None)
         };
         let mut opened = Vec::new();
         if let Ok(Some(workspace_id)) = &registered {
@@ -2368,6 +2387,15 @@ mod tests {
 
         std::fs::write(storages.join("workspace.json"), "not json").unwrap();
         assert!(rail_workspace_ids(&home).is_empty());
+
+        let workspace_home = home.join("workspaces").join("alpha");
+        std::fs::create_dir_all(&workspace_home).unwrap();
+        std::fs::write(
+            storages.join("workspace.json"),
+            r#"{"global":{"workspaceIds":["shared-alpha"]},"tables":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(rail_workspace_ids(&workspace_home), vec!["shared-alpha"]);
         std::fs::remove_dir_all(&home).unwrap();
     }
 

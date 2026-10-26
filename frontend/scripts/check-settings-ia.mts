@@ -67,6 +67,8 @@ assert.ok(/type="search"/.test(rail), '设置左栏必须有搜索框');
 assert.ok(/settingsRailItemMatches/.test(rail) && /keywords/.test(model), '左栏检索要走 keywords 别名');
 // 只命中别名的条目没有 <mark> 可画，必须回一行来源说明，否则用户看不出为什么命中。
 assert.ok(/settingsRailItemMatch\(item, filter\)/.test(rail), '别名命中要在条目标题下回一行来源说明');
+assert.ok(/searchRef/.test(rail) && /clearSearch/.test(rail), '设置搜索清除后必须把焦点送回输入框');
+assert.ok(/\.settings-rail-search-clear\s*\{[^}]*width:\s*24px; height:\s*24px/.test(styles), '设置搜索清除按钮命中区必须 ≥24×24');
 assert.ok(/\.settings-rail-alias \{/.test(styles), 'styles.css 必须有 .settings-rail-alias 样式');
 
 // 7. 页头下沿只有一套间距（16px），页签视觉与 AI 连接的 .ai-tabs 对齐。
@@ -156,16 +158,29 @@ const aiTabs = readFrontend(join('src', 'pages', 'aiConnectionsTabs.ts'));
 const aiProviders = readFrontend(join('src', 'pages', 'AiProvidersPanel.tsx'));
 const aiTools = readFrontend(join('src', 'pages', 'AiToolsPanel.tsx'));
 const builtinAi = readFrontend(join('src', 'pages', 'BuiltinAiPage.tsx'));
-assert.ok(aiTabs.includes("services: '模型来源'"), 'aiConnectionsTabs 必须声明「模型来源」这个页签标签');
+assert.ok(aiTabs.includes("services: 'AI 服务'"), 'aiConnectionsTabs 必须声明「AI 服务」这个页签标签');
+assert.ok(aiTabs.includes("routes: '能力路由'"), 'aiConnectionsTabs 必须声明「能力路由」这个页签标签');
 assert.ok(/<PageHeader title="AI 连接" description=\{AI_CONNECTIONS_DESCRIPTION\}/.test(aiPage), 'AI 连接页头要带说明，与其他设置面板一致');
-assert.ok(/AI_CONNECTIONS_TAB_LABELS\.services/.test(builtinAi), '对话页指路到模型来源页签时要取同一个标签常量，不能自己写死一个词');
+assert.ok(/AI_CONNECTIONS_TAB_LABELS\.services/.test(builtinAi), '对话页指路到 AI 服务页签时要取同一个标签常量，不能自己写死一个词');
 assert.ok(!/media\.[a-z]/.test(aiProviders), '用户可见文案里不能出现 media.* 这类内部能力 ID');
-assert.ok(/hasUsableSource/.test(aiTools) && aiTools.includes('还没有可用的模型来源'), '「模型」接线在一条可用来源都没有时要说明缺什么');
+assert.ok(/hasUsableSource/.test(aiTools) && aiTools.includes('还没有可用的 AI 服务'), '「模型」接线在一条可用来源都没有时要说明缺什么');
 assert.ok(/onOpenModelSources=\{\(\) => setActiveTab\('services'\)\}/.test(aiPage), '「新增模型来源」要能直接切到模型来源页签');
 assert.ok(/hasAnySource/.test(aiTools), '一条来源都没有时，工具接入页要在列表之前说明并给出入口');
-assert.ok(/ai-service-media/.test(aiProviders), '媒体映射要收进可折叠块，首屏只留一行对话来源');
+assert.ok(/AiServiceRoutesPanel/.test(aiPage), '能力路由必须从 AI 服务页独立出来');
+assert.ok(/ai-capability-picker/.test(aiProviders), '能力选择必须与连接信息分开');
+assert.ok(/ai-service-toolbar/.test(aiProviders), '服务列表必须提供搜索与能力筛选');
 assert.ok(!/applyPreset\(group\.items\[0\]\.id\)/.test(aiProviders), '预设分类页签只切换列表，不能顺手替用户选中第一个厂商');
 assert.ok(/ai-service-delete-note/.test(aiProviders), '不能删除的原因要写成看得见的字（禁用按钮的 title 在 Chromium 里弹不出来）');
-assert.ok(/missing === 'Base URL'/.test(aiProviders), '缺字段要由 saveService 点名，按钮不能靠 disabled 把用户关在门外');
+assert.ok(/connectionStepError/.test(aiProviders) && /capabilityStepError/.test(aiProviders), '分步表单必须由步骤校验点名缺什么');
+
+// 14. 账号与凭据中心：术语一致、敏感字段说明准确，技术错误默认折叠且可复制。
+const credentialPanel = readFrontend(join('src', 'components', 'CredentialCenterPanel.tsx'));
+assert.ok(credentialPanel.includes('账号与凭据'), '账号中心标题必须统一使用「凭据」');
+assert.ok(!credentialPanel.includes('账号与密钥'), '账号中心不能再混用「密钥」指代全部凭据');
+assert.ok(credentialPanel.includes('搜索账号、服务、插件或工作流'), '账号搜索占位必须覆盖工作流类别');
+assert.ok(credentialPanel.includes('敏感凭据仅加密保存在本机，密码、令牌和密钥不会显示原文。'), '安全说明必须区分可显示账号与敏感凭据');
+assert.ok(/credential-load-error/.test(credentialPanel) && /DiagnosticDetails/.test(credentialPanel) && /copyText/.test(credentialPanel), '读取失败要使用摘要 + 可折叠技术详情 + 复制诊断');
+assert.ok(/warningSummary/.test(credentialPanel) && /credential-warning-details/.test(credentialPanel), '来源读取失败默认只展示摘要，技术详情按需展开');
+assert.ok(/\.credential-center-body\s*\{[^}]*padding:\s*12px 14px 14px/.test(styles), '账号与凭据卡片内容必须与标题共用 14px 横向内边距');
 
 console.log(`settings IA: ${groups.length} 组 / ${totalItems} 条，深链白名单、窄窗折叠、AI 连接约定校验通过`);

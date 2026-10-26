@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "product_id": "com.himind.runtime.deepseek-harness",
+  "version": "0.2.1-rc.2",
+  "channel": "stable",
+  "platform": "windows",
+  "architecture": "x64",
+  "package_type": "directory-zip",
+  "file_name": "deepseek-harness-runtime-0.2.1-rc.2-windows-x64.zip",
+  "size": 172037966,
+  "sha256": "cf10a0b39e10c128773b4093e9fb52bdd0d60f433ef156df70fb2977a649fb7b",
+  "signature": "T2kZ0Kd+Md1qsDlKREJ6wDjgKTfLRaCjwgkWx74i6ZgKfu55cQ8pV2fyXAJIwD2sUVAfoukXheBAuvaSV22Z0jGRkW17RwO9yxmBc/SwXJl3XFL6QLsTWJCpQ4WbOCVWixN4O2JCIfcUBUPoJw6CiyjjZDRKT0BVcYU5WT01VGC8Tq3OFmyHYRtrZ/5v4gYVU87Pp93Kp2YkOiDhSp+wtVdD/CuyPngHWEpkFL6J8DTXxCqfcXc/n2vunQokubpqRENPn7z6kOCvM10bpy5dbBnM4gfPgsiYkfv7jSXhXXL7pcVN9RkUbOvX+jNB0umklD5Wr78urP1LRJQMSyJiK/aFTU1xJNF6XJZzvQ98DgVMap7NnCjAH0eAnpNTczdcjEvYaDfqXBXx4PCcFVClU5FrZvYt3J3xj/pNyQ4ju0BSB0JRwAmZSsvdipb9Ta5xmXybeRiqLB2MhdnzO1NvBpfJ2xrXOi8HtPWHqNir6r1bEzvn8M3HBB6u7HovKsn6",
+  "signature_key_id": "himind-production-2026",
+  "signature_algorithm": "rsa-pss-sha256",
+  "min_agent_version": "0.3.82",
+  "max_agent_version": "",
+  "engine_version": "0.2.1-rc.2",
+  "capabilities": [
+    "interactive",
+    "headless",
+    "workflow",
+    "office"
+  ],
+  "mandatory": false,
+  "release_notes": "DSH 0.2.1-rc.2: DeepSeek-V4.1-Flash-1017 and Search/Fetch API support; bundled with HiMind Agent 0.3.83."
+}

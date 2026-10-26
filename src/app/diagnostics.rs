@@ -1824,6 +1824,7 @@ mod tests {
             identity_generation: Arc::new(AtomicU64::new(0)),
             platform_access: Arc::new(RwLock::new(None)),
             task_execution: Arc::new(RwLock::new(None)),
+            provider_availability_override: Arc::new(std::sync::atomic::AtomicU8::new(2)),
         };
         let destination = root.join("diagnostics.zip");
         export_bundle_from(&destination, &options, &LocalWorkerStatus::default(), "cli").unwrap();

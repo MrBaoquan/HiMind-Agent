@@ -87,7 +87,7 @@ impl AgentMode {
 pub(crate) fn control_plane_required_error() -> String {
     serde_json::json!({
         "code": "control_plane_required",
-        "message": "此功能需要对接 AI 工作台；请在设置中开启「AI 工作台」后重试"
+        "message": "此功能需要已连接的 AI 工作台；请先完成工作台连接后重试"
     })
     .to_string()
 }
@@ -132,8 +132,26 @@ pub(crate) fn save(state_path: &Path, mode: AgentMode) -> Result<(), Box<dyn std
         fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_vec_pretty(&AgentPreferences { mode })?;
-    atomic_file::atomic_write(&path, &content)?;
-    Ok(())
+    match atomic_file::atomic_write(&path, &content) {
+        Ok(()) => Ok(()),
+        Err(atomic_error) => {
+            // Some legacy profile directories deny replacing an existing child
+            // even though the current user can write files inside them. The
+            // mode preference is deliberately fail-open to independent, so a
+            // direct truncating write is safer than trapping the user in
+            // connected mode. A crash mid-write loads as independent.
+            fs::write(&path, &content).map_err(|direct_error| {
+                std::io::Error::new(
+                    direct_error.kind(),
+                    format!(
+                        "无法保存 Agent 模式到 {}（原子写入失败：{atomic_error}；直接写入失败：{direct_error}）",
+                        path.display()
+                    ),
+                )
+            })?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +170,10 @@ mod tests {
                 .as_nanos()
         ));
         let state_path = root.join("data/agent-state.json");
+        assert_eq!(load(&state_path), AgentMode::Independent);
+        save(&state_path, AgentMode::Connected).unwrap();
+        assert_eq!(load(&state_path), AgentMode::Connected);
+        save(&state_path, AgentMode::Independent).unwrap();
         assert_eq!(load(&state_path), AgentMode::Independent);
         save(&state_path, AgentMode::Connected).unwrap();
         assert_eq!(load(&state_path), AgentMode::Connected);

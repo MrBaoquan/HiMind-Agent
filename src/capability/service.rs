@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::app::control_plane_provider;
 use crate::app::status::local_worker_snapshot;
 use crate::app::system::{
     cancel_workspace_build, inspect_project_workspace, launch_project_workspace,
@@ -246,6 +247,8 @@ enum CapabilityHandler {
     MediaImageGenerateLocal,
     MediaImageEditLocal,
     MediaVideoGenerateLocal,
+    MediaAudioSpeechLocal,
+    MediaAudioTranscribeLocal,
     MediaJobGetLocal,
     MediaJobWaitLocal,
     MediaJobCancelLocal,
@@ -346,6 +349,7 @@ impl CapabilityGateway {
                     .collect::<std::collections::BTreeSet<_>>()
             });
             let registry = self.registry()?;
+            let control_plane_available = control_plane_provider::available(&self.options);
             let after_generation = self
                 .business_provider
                 .catalog_snapshot()
@@ -356,7 +360,7 @@ impl CapabilityGateway {
             return Ok(registry
                 .into_values()
                 .filter(|registration| {
-                    let visible_for_mode = self.options.mode().control_plane_enabled()
+                    let visible_for_mode = control_plane_available
                         || registration
                             .descriptor
                             .availability
@@ -1381,7 +1385,7 @@ impl CapabilityGateway {
                 "distribution.release.publish.github",
                 "1.0.0",
                 "发布制品到 GitHub Release",
-                "把工作区内的制品作为 GitHub Release 资产投递到指定仓库（tag + 资产），使用本机已授权的 GitHub 令牌，且尊重账号绑定的仓库白名单。语义是仓库级发布：不含工作台的组织审核与不可变制品签名，独立模式下也能用。",
+                "把工作区内的制品作为 GitHub Release 资产投递到指定仓库（tag + 资产），使用本机已授权的 GitHub 令牌，且尊重账号绑定的仓库白名单。语义是仓库级发布：不含工作台的组织审核与不可变制品签名，不连接工作台也能用。",
                 "network_write",
                 json!({
                     "type": "object",
@@ -1879,6 +1883,7 @@ impl CapabilityGateway {
                     "type": "object",
                     "properties": {
                         "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                        "name": { "type": "string", "maxLength": 80 },
                         "kind": { "type": "string", "minLength": 1 },
                         "target_id": { "type": "string", "minLength": 1 },
                         "cron": { "type": "string", "minLength": 1 },
@@ -3067,9 +3072,11 @@ impl CapabilityGateway {
             ),
             // 命名规则：`media.*` 属于 Agent 本机能力（用户自己的服务与 Key），
             // 工作台提供的媒体通道统一放在 `workbench.media.*` 下。
-            local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，独立模式同样可用。", "local_write", media_image_generate_local_schema(), CapabilityHandler::MediaImageGenerateLocal),
+            local_media_registration("media.image.generate", "生成图片（本机）", "使用本机配置的 OpenAI 兼容 AI 服务直接生图：图片保存到本机并返回文件路径，可选地内联返回图片；不依赖 AI 工作台，未连接时同样可用。", "local_write", media_image_generate_local_schema(), CapabilityHandler::MediaImageGenerateLocal),
             local_media_registration("media.image.edit", "编辑图片（本机）", "用本机配置的图片模型按参考图改图（图生图）：参考图可以是工作区内的图片路径或上一轮生成结果的 media:<id>；结果落盘并登记 media_id，便于继续多轮修改。不依赖 AI 工作台。", "local_write", media_image_edit_local_schema(), CapabilityHandler::MediaImageEditLocal),
             local_media_registration("media.video.generate", "生成视频（本机）", "用本机配置的生视频模型提交文生视频 / 图生视频任务（可选参考图，来源同改图）；视频为异步任务，立即返回 job_id，用 media.job.get / media.job.wait 查询、media.job.cancel 取消。不依赖 AI 工作台。", "local_write", media_video_generate_local_schema(), CapabilityHandler::MediaVideoGenerateLocal),
+            local_media_registration("media.audio.speech", "生成语音（本机）", "用本机配置的 OpenAI 兼容语音服务完成一次同步语音合成，返回本地音频路径、MIME 和 SHA；逐 beat 配音、许可证、混音与 QA 仍由音频制作拓展负责。", "local_write", media_audio_speech_local_schema(), CapabilityHandler::MediaAudioSpeechLocal),
+            local_media_registration("media.audio.transcribe", "语音转写（本机）", "用本机配置的 OpenAI 兼容语音服务转写一个音频文件，返回文本与 Provider 元数据；断句、字幕对齐和业务 QA 由音频智能或 Workflow 负责。", "local_write", media_audio_transcribe_local_schema(), CapabilityHandler::MediaAudioTranscribeLocal),
             local_media_registration("media.job.get", "查看本机媒体任务", "查询本机媒体任务（生视频等）的状态、进度与产物。", "read_only", media_job_local_schema(), CapabilityHandler::MediaJobGetLocal),
             local_media_registration("media.job.wait", "等待本机媒体任务", "轮询等待本机媒体任务到达终态或超时；适合在对话里等待短视频生成。", "read_only", media_job_wait_local_schema(), CapabilityHandler::MediaJobWaitLocal),
             local_media_registration("media.job.cancel", "取消本机媒体任务", "取消仍在排队或执行中的本机媒体任务。", "local_write", media_job_local_schema(), CapabilityHandler::MediaJobCancelLocal),
@@ -3296,9 +3303,22 @@ impl CapabilityGateway {
     ) -> Result<Value, Box<dyn Error>> {
         // 工作台媒体能力已从 `media.*` 迁移到 `workbench.media.*`；旧 ID 只在调用
         // 侧解析，不再进入能力目录，避免把废弃命名继续当成公开契约。
-        let capability_id: &str = match capability_id_aliases(capability_id) {
-            Some(target) => target,
-            None => capability_id,
+        let original_capability_id = capability_id.trim();
+        let local_audio_capability = original_capability_id.strip_prefix("media.");
+        let local_audio_configured = matches!(
+            local_audio_capability,
+            Some("audio.speech") | Some("audio.transcribe")
+        ) && self.registry()?.contains_key(original_capability_id)
+            && local_audio_capability.is_some_and(|capability| {
+                crate::store::ai_services::media_capability_configured(capability).unwrap_or(false)
+            });
+        let capability_id: &str = if local_audio_configured {
+            original_capability_id
+        } else {
+            match capability_id_aliases(original_capability_id) {
+                Some(target) => target,
+                None => original_capability_id,
+            }
         };
         if is_svn_admin_capability(capability_id) {
             return Err("集中 SVN 管理能力仅由 Edge Worker 执行".into());
@@ -3327,15 +3347,9 @@ impl CapabilityGateway {
         if matches!(
             registration.descriptor.availability,
             CapabilityAvailability::ControlPlane
-        ) && !self.options.mode().control_plane_enabled()
+        ) && !control_plane_provider::available(&self.options)
         {
-            return Err(serde_json::json!({
-                "code": "control_plane_required",
-                "capability_id": capability_id,
-                "message": "此能力由 AI 工作台提供；请在设置中开启「AI 工作台」后重试"
-            })
-            .to_string()
-            .into());
+            return Err(control_plane_provider::unavailable_error(&self.options).into());
         }
         validate_capability_input_schema(&registration.descriptor.input_schema, &input)?;
         // The pid/display-number rule belongs to Dashboard business
@@ -4211,7 +4225,7 @@ impl CapabilityGateway {
                 >(input)?)
             }
             CapabilityHandler::PluginList => {
-                registry_json_for_control_plane(self.options.mode().control_plane_enabled())
+                registry_json_for_control_plane(control_plane_provider::available(&self.options))
             }
             CapabilityHandler::PluginManifest => self.plugin_manifest(input),
             CapabilityHandler::PluginInvoke => self.plugin_invoke(context, input),
@@ -4480,9 +4494,34 @@ impl CapabilityGateway {
             }
             CapabilityHandler::MediaJobGet => crate::api::media::get(&self.options, input),
             CapabilityHandler::MediaJobCancel => crate::api::media::cancel(&self.options, input),
-            CapabilityHandler::MediaImageGenerateLocal => crate::app::local_image::generate(&input),
-            CapabilityHandler::MediaImageEditLocal => crate::app::local_image::edit(&input),
-            CapabilityHandler::MediaVideoGenerateLocal => crate::app::local_video::generate(&input),
+            CapabilityHandler::MediaImageGenerateLocal => {
+                crate::app::ai_capability_bus::execute_media(
+                    crate::store::ai_services::CAP_IMAGE_GENERATE,
+                    &input,
+                )
+            }
+            CapabilityHandler::MediaImageEditLocal => crate::app::ai_capability_bus::execute_media(
+                crate::store::ai_services::CAP_IMAGE_EDIT,
+                &input,
+            ),
+            CapabilityHandler::MediaVideoGenerateLocal => {
+                crate::app::ai_capability_bus::execute_media(
+                    crate::store::ai_services::CAP_VIDEO_GENERATE,
+                    &input,
+                )
+            }
+            CapabilityHandler::MediaAudioSpeechLocal => {
+                crate::app::ai_capability_bus::execute_media(
+                    crate::store::ai_services::CAP_AUDIO_SPEECH,
+                    &input,
+                )
+            }
+            CapabilityHandler::MediaAudioTranscribeLocal => {
+                crate::app::ai_capability_bus::execute_media(
+                    crate::store::ai_services::CAP_AUDIO_TRANSCRIBE,
+                    &input,
+                )
+            }
             CapabilityHandler::MediaJobGetLocal => crate::app::local_video::job_get(&input),
             CapabilityHandler::MediaJobWaitLocal => crate::app::local_video::job_wait(&input),
             CapabilityHandler::MediaJobCancelLocal => crate::app::local_video::job_cancel(&input),
@@ -4677,6 +4716,7 @@ impl CapabilityGateway {
                 .as_str()
                 .unwrap_or(InvocationTransport::LocalHttp.as_str())
         };
+        let provider = control_plane_provider::status(&self.options);
         let worker_error = if mcp_stdio || worker_state == "not_applicable" {
             Value::Null
         } else {
@@ -4685,8 +4725,8 @@ impl CapabilityGateway {
         let local_service_expected = !mcp_stdio;
         let worker_reason_code = if mcp_stdio {
             "stdio_companion_gateway_only"
-        } else if worker_state == "not_applicable" && !self.options.mode().control_plane_enabled() {
-            "independent_mode_no_control_plane"
+        } else if worker_state == "not_applicable" && !provider.available {
+            provider.reason.as_str()
         } else {
             worker["dashboard_worker_reason_code"]
                 .as_str()
@@ -4705,21 +4745,22 @@ impl CapabilityGateway {
             "dashboard_worker_online_semantics": "legacy_boolean_use_expected_state",
             "version": VERSION,
             "mode": self.options.mode().as_str(),
-            "dashboard_enabled": self.options.mode().dashboard_enabled(),
+            "dashboard_enabled": provider.enabled_by_user,
+            "provider": provider.clone(),
             "control_plane": json!({
                 "kind": self.options.mode().control_plane(),
-                "enabled": self.options.mode().control_plane_enabled(),
+                "enabled": provider.enabled_by_user,
                 "worker_online": worker["dashboard_worker_online"],
                 "worker_state": worker_state,
                 "worker_expected": worker_expected,
                 "worker_reason_code": worker_reason_code,
-                "available": self.options.mode().control_plane_enabled(),
+                "available": provider.available,
             }),
             "business_integration": json!({
                 "provider_id": self.business_provider.provider_id(),
                 "protocol": self.business_provider.protocol_id(),
                 "protocol_version": self.business_provider.protocol_version(),
-                "enabled": self.options.mode().control_plane_enabled(),
+                "enabled": provider.available,
             }),
             "native_folder_picker": true,
             "tree_api": true,
@@ -4762,19 +4803,21 @@ impl CapabilityGateway {
     /// structured so clients can branch on mode/control-plane availability
     /// without making a second health call or parsing prose.
     pub(crate) fn mcp_runtime_metadata(&self) -> Value {
+        let provider = control_plane_provider::status(&self.options);
         json!({
             "schemaVersion": 1,
             "transport": InvocationTransport::Stdio.as_str(),
             "mode": self.options.mode().as_str(),
-            "dashboardEnabled": self.options.mode().dashboard_enabled(),
+            "dashboardEnabled": provider.available,
+            "provider": provider.clone(),
             "dashboardWorkerState": "not_applicable",
             "dashboardWorkerExpected": false,
             "dashboardWorkerReasonCode": "stdio_companion_gateway_only",
             "localServiceExpected": false,
             "controlPlane": {
                 "kind": self.options.mode().control_plane(),
-                "enabled": self.options.mode().control_plane_enabled(),
-                "available": self.options.mode().control_plane_enabled(),
+                "enabled": provider.enabled_by_user,
+                "available": provider.available,
             }
         })
     }
@@ -5308,9 +5351,13 @@ impl CapabilityGateway {
         }
 
         let mut warnings = Vec::new();
-        if !self.options.mode().dashboard_enabled() {
+        let provider = control_plane_provider::status(&self.options);
+        if !provider.available {
             warnings.push(crate::extension_authoring::warning(
-                "本机可以完成本地创作、候选测试和客户端注册；提审与分发需要在对接 AI 工作台后执行。",
+                &format!(
+                    "本机可以完成本地创作、候选测试和客户端注册；提审与分发需要已连接的 AI 工作台（当前：{}）。",
+                    provider.message
+                ),
             ));
         } else if crate::api::client::load_agent_state(&self.options.state_path)
             .ok()
@@ -5348,7 +5395,7 @@ impl CapabilityGateway {
                     })).unwrap_or_else(|| json!({"available": false, "bound": false})),
                     "mode": self.options.mode().as_str(),
                     "toolchain": "ready",
-                    "submission": if self.options.mode().dashboard_enabled() { "available" } else { "connected_mode_required" },
+                    "submission": if provider.available { "available" } else { "provider_unavailable" },
                     "warnings": warnings,
                     "next_steps": next_steps,
                 }),
@@ -5692,7 +5739,7 @@ impl CapabilityGateway {
         }
         match find_plugin(plugin_id)? {
             Some(item)
-                if self.options.mode().control_plane_enabled()
+                if control_plane_provider::available(&self.options)
                     || item.availability != "control_plane" =>
             {
                 Ok(json!({ "plugin": item }))
@@ -5738,15 +5785,9 @@ impl CapabilityGateway {
         if matches!(
             plugin_capability_availability(&plugin, capability),
             CapabilityAvailability::ControlPlane
-        ) && !self.options.mode().control_plane_enabled()
+        ) && !control_plane_provider::available(&self.options)
         {
-            return Err(serde_json::json!({
-                "code": "control_plane_required",
-                "capability_id": capability_id,
-                "message": "此能力由 AI 工作台提供；请在设置中开启「AI 工作台」后重试"
-            })
-            .to_string()
-            .into());
+            return Err(control_plane_provider::unavailable_error(&self.options).into());
         }
         let params = input.get("input").cloned().unwrap_or_else(|| json!({}));
         validate_mcp_capability_workspace(context, capability_id, &params)?;
@@ -8290,6 +8331,106 @@ fn media_video_generate_local_schema() -> Value {
     })
 }
 
+fn media_audio_speech_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "要合成的文本"
+            },
+            "service": {
+                "type": "string",
+                "maxLength": 80,
+                "description": "服务源：custom:<id>；留空按语音默认服务、激活服务或唯一支持语音的服务解析"
+            },
+            "model": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "语音模型；留空使用服务上的 audio.speech 槽位"
+            },
+            "voice": {
+                "type": "string",
+                "maxLength": 120,
+                "description": "Provider 音色 ID；默认 alloy"
+            },
+            "format": {
+                "type": "string",
+                "enum": ["mp3", "opus", "aac", "flac", "wav", "pcm"],
+                "description": "输出音频格式，默认 mp3"
+            },
+            "speed": {
+                "type": "number",
+                "minimum": 0.25,
+                "maximum": 4.0
+            },
+            "output_dir": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "保存目录（绝对路径）；留空保存到会话/Agent 媒体目录"
+            },
+            "filename": {
+                "type": "string",
+                "maxLength": 120
+            },
+            "provider_options": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Provider 专属参数；不能覆盖 model/input/voice/response_format/speed"
+            }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+    })
+}
+
+fn media_audio_transcribe_local_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "file": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "待转写音频的绝对路径"
+            },
+            "service": {
+                "type": "string",
+                "maxLength": 80,
+                "description": "服务源：custom:<id>；留空自动解析"
+            },
+            "model": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "转写模型；留空使用服务上的 audio.transcribe 槽位"
+            },
+            "language": {
+                "type": "string",
+                "maxLength": 32,
+                "description": "可选语言提示，如 zh / en"
+            },
+            "prompt": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "可选转写提示"
+            },
+            "format": {
+                "type": "string",
+                "enum": ["json", "text", "verbose_json", "srt", "vtt"],
+                "description": "返回格式，默认 json"
+            },
+            "provider_options": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Provider 专属字段；不能覆盖 file/model/response_format/language/prompt"
+            }
+        },
+        "required": ["file"],
+        "additionalProperties": false
+    })
+}
+
 fn media_job_local_schema() -> Value {
     json!({
         "type": "object",
@@ -10062,6 +10203,132 @@ mod tests {
         assert!(!descriptor.approval_required);
         assert_eq!(descriptor.execution_mode, "sync");
         assert_eq!(descriptor.input_schema["required"][0], "prompt");
+    }
+
+    #[test]
+    fn local_audio_speech_is_invokable_through_stable_capability() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&received);
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                let mut buffer = [0u8; 8192];
+                let mut request = String::new();
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => request.push_str(&String::from_utf8_lossy(&buffer[..read])),
+                        Err(_) => break,
+                    }
+                }
+                *sink.lock().unwrap() = request;
+                let audio: &[u8] = b"ID3-capability-fixture";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    audio.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(audio);
+                let _ = stream.flush();
+            }
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "himind-audio-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+
+        let result = (|| -> Result<serde_json::Value, Box<dyn Error>> {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                crate::store::ai_services::CAP_AUDIO_SPEECH.to_string(),
+                crate::store::ai_services::MediaModelBinding {
+                    adapter: "openai-speech".to_string(),
+                    model: "tts-fixture".to_string(),
+                    execution_mode: Some(crate::store::ai_services::MediaExecutionMode::Sync),
+                },
+            );
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: "speech-fixture".to_string(),
+                display_name: "语音夹具".to_string(),
+                base_url: format!("http://{address}/v1"),
+                protocol: crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-speech-fixture".to_string(),
+            })
+            .unwrap();
+            crate::store::ai_services::set_active("speech-fixture").unwrap();
+
+            let mut options = crate::Options::from_env();
+            options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+            let gateway =
+                CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+            gateway.invoke(
+                &InvocationContext::new(
+                    crate::capability::types::InvocationSource::LocalHttp,
+                    "plugin-fixture",
+                ),
+                "media.audio.speech",
+                json!({
+                    "text": "稳定能力夹具",
+                    "output_dir": root.join("audio").to_string_lossy(),
+                    "voice": "alloy"
+                }),
+            )
+        })();
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+
+        let value =
+            result.expect("media.audio.speech should execute through the capability gateway");
+        assert_eq!(value["capability"], "audio.speech");
+        assert_eq!(value["adapter"], "openai-speech");
+        assert!(std::path::Path::new(value["path"].as_str().unwrap()).is_file());
+        assert!(received.lock().unwrap().contains("/v1/audio/speech"));
+        assert!(!value.to_string().contains("sk-speech-fixture"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_audio_speech_stays_available_without_the_control_plane() {
+        let mut options = crate::Options::from_env();
+        options.set_mode(crate::app::runtime_mode::AgentMode::Independent);
+        let gateway =
+            CapabilityGateway::new(options, Arc::new(Mutex::new(LocalWorkerStatus::default())));
+        let descriptor = gateway
+            .list_capabilities(&InvocationContext::new(
+                crate::capability::types::InvocationSource::Mcp,
+                "ai-client:himind-ai",
+            ))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == "media.audio.speech")
+            .expect("本机语音合成能力必须在独立模式下保持可见");
+
+        assert_eq!(descriptor.risk_level, "local_write");
+        assert_eq!(descriptor.availability, CapabilityAvailability::Local);
+        assert!(descriptor.required_scope.is_none());
+        assert!(!descriptor.approval_required);
+        assert_eq!(descriptor.execution_mode, "sync");
+        assert_eq!(descriptor.input_schema["required"][0], "text");
     }
 
     #[test]

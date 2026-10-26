@@ -1,17 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import {
   ArrowLeft,
   CircleAlert,
   Download,
   FileText,
   GitBranch,
+  ImageUp,
+  RotateCcw,
   Search,
   ShieldCheck,
   Store,
   X,
 } from 'lucide-react';
 import { EmptyState, PageHeader, Pill, Tags } from '../components/Common';
-import { ExtensionKindMark, capabilityKindIcons } from '../components/ExtensionKindMark';
+import { ExtensionIcon } from '../components/ExtensionIcon';
+import { capabilityKindIcons } from '../components/ExtensionKindMark';
 import { ExtensionBatchUpdateDialog } from '../components/ExtensionBatchUpdateDialog';
 import { ExtensionSourcesDialog } from '../components/ExtensionSourcesDialog';
 import { McpCatalogPanel } from '../components/McpCatalogPanel';
@@ -40,8 +43,10 @@ import {
   type MarketProduct,
   type MarketSourceGroup,
 } from './marketCatalog';
+import { agentApi } from '../services/agentApi';
 import type {
   CodexSkillStatusItem,
+  ExtensionIconInfo,
   ExtensionDistributionUnit,
   ExtensionSourceAcquisition,
   ExtensionSourceConfig,
@@ -84,6 +89,7 @@ type MarketEntry = MarketProduct & {
   workflow?: WorkflowCatalogItem;
   expert?: ExpertCatalogItem;
   instruction?: InstructionPackCatalogItem;
+  icon?: ExtensionIconInfo | null;
 };
 
 type MarketVersion = MarketCandidate;
@@ -238,6 +244,7 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       source: item.source || '',
       artifactId: item.artifact_id || '',
       sha256: item.sha256 || '',
+      icon: item.icon || installed?.icon || null,
       plugin: item,
     };
   });
@@ -281,6 +288,7 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       source: item.source || '',
       artifactId: item.artifact_id || '',
       sha256: item.sha256 || '',
+      icon: item.icon || installed?.record.icon || null,
       skill: item,
     };
   });
@@ -323,6 +331,7 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       source: item.source || '',
       artifactId: item.artifact_id || '',
       sha256: item.sha256 || '',
+      icon: item.icon || installed?.icon || null,
       workflow: item,
     };
   });
@@ -340,7 +349,7 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       sourceLabel: source.label, sourceId: source.id, sourceName, policyLabel: policy, policyKind: assignmentKind(policy),
       blocked: item.assignment === 'blocked', managed: Boolean(item.managed), installedVersion: installed?.version || '',
       updateVersion: installed ? newerVersion(item.version, installed.version) : '', risk: '会话工作方法',
-      support: item.supported_clients || [], minAgentVersion: '', source: item.source || '', artifactId: item.artifact_id || '', sha256: item.sha256 || '', expert: item,
+      support: item.supported_clients || [], minAgentVersion: '', source: item.source || '', artifactId: item.artifact_id || '', sha256: item.sha256 || '', icon: item.icon || installed?.icon || null, expert: item,
     };
   });
   const instructionEntries = instructionPacks.map<MarketEntry>(item => {
@@ -354,7 +363,7 @@ function buildEntries({ plugins, skills, workflows, installedPlugins, installedS
       categories: item.categories || [], capabilityIds: [], dependencies: [], sourceGroup: source.group,
       sourceLabel: source.label, sourceId: source.id, sourceName, policyLabel: policy, policyKind: assignmentKind(policy),
       blocked: item.assignment === 'blocked', managed: Boolean(item.managed), installedVersion: '', updateVersion: '',
-      risk: '项目上下文', support: item.supported_clients || [], minAgentVersion: item.min_agent_version || '', source: item.source || '', artifactId: item.artifact_id || '', sha256: item.sha256 || '', instruction: item,
+      risk: '项目上下文', support: item.supported_clients || [], minAgentVersion: item.min_agent_version || '', source: item.source || '', artifactId: item.artifact_id || '', sha256: item.sha256 || '', icon: item.icon || null, instruction: item,
     };
   });
   return mergeMarketEntries([...pluginEntries, ...skillEntries, ...workflowEntries, ...expertEntries, ...instructionEntries]);
@@ -504,6 +513,23 @@ export function ExtensionsPage({
   const [planBusy, setPlanBusy] = useState(false);
   const [installing, setInstalling] = useState('');
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  const sourcesTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const marketTabKinds: Array<'all' | MarketKind> = ['all', ...marketKinds];
+  const selectMarketKind = (kind: 'all' | MarketKind, focus = false) => {
+    setKindFilter(kind);
+    setDetailOpen(false);
+    if (focus) requestAnimationFrame(() => document.getElementById(`market-tab-${kind}`)?.focus());
+  };
+  const onMarketTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    let next = index;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % marketTabKinds.length;
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + marketTabKinds.length) % marketTabKinds.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = marketTabKinds.length - 1;
+    else return;
+    event.preventDefault();
+    selectMarketKind(marketTabKinds[next], true);
+  };
   const [batchOpen, setBatchOpen] = useState(false);
   const catalogAttempts = useRef(0);
   // `onRefresh` is a fresh closure on every parent render; keeping it in a ref
@@ -677,7 +703,7 @@ export function ExtensionsPage({
     <div className="plugin-page market-page">
       <PageHeader
         title="市场"
-        actions={<button className="btn" title="管理来源" onClick={() => setSourcesOpen(true)}><GitBranch size={14} />来源管理</button>}
+        actions={<button ref={sourcesTriggerRef} className="btn" title="管理来源" onClick={() => setSourcesOpen(true)}><GitBranch size={14} />来源管理</button>}
       />
       {errors.length ? <div className="blocker market-load-errors"><CircleAlert size={18} /><div><strong>{errors.length === 1 ? `${errors[0].module}目录读取失败` : `部分目录数据读取失败（${errors.map(item => item.module).join('、')}）`}</strong>{errors.map(item => <span key={item.module}>{item.module}：{item.message}</span>)}</div></div> : null}
         {/* MCP 工具页签没有列表可铺，主从两栏会空掉半屏，所以整页切成单栏（mcp-mode）。 */}
@@ -685,17 +711,17 @@ export function ExtensionsPage({
           {/* 类型页签横跨两栏：它管的是整个市场的范围，不是左列表的筛选条件。
               挤在 43% 的左列里，五类能力就会折行，右半边还空着。 */}
           <div className="market-kind-bar">
-            <div className="plugin-tabs market-kind-tabs" role="tablist" aria-label="扩展类型">
-              <button role="tab" aria-selected={kindFilter === 'all'} className={kindFilter === 'all' ? 'active' : ''} onClick={() => { setKindFilter('all'); setDetailOpen(false); }}>全部 <span>{entries.length}</span></button>
-              {marketKinds.map(kind => {
+            <div className="plugin-tabs market-kind-tabs" role="tablist" aria-label="扩展类型" aria-orientation="horizontal">
+              <button id="market-tab-all" role="tab" aria-selected={kindFilter === 'all'} aria-controls="market-panel" tabIndex={kindFilter === 'all' ? 0 : -1} className={kindFilter === 'all' ? 'active' : ''} onKeyDown={event => onMarketTabKeyDown(event, 0)} onClick={() => selectMarketKind('all')}>全部 <span>{entries.length}</span></button>
+              {marketKinds.map((kind, index) => {
                 const KindIcon = kind === 'instruction' ? FileText : capabilityKindIcons[kind];
                 // 市场页签上的数字是「目录里有多少可获得的」，不是「已经装了几条」。
                 const count = kind === 'mcp' ? mcp.catalog.entries.length : kindCounts[kind as keyof typeof kindCounts] || 0;
-                return <button role="tab" key={kind} aria-selected={kindFilter === kind} className={kindFilter === kind ? 'active' : ''} onClick={() => { setKindFilter(kind); setDetailOpen(false); }}><KindIcon size={14} />{kind === 'mcp' ? capabilityKindLabels[kind] : marketKindLabels[kind]} <span>{count}</span></button>;
+                return <button id={`market-tab-${kind}`} role="tab" key={kind} aria-selected={kindFilter === kind} aria-controls="market-panel" tabIndex={kindFilter === kind ? 0 : -1} className={kindFilter === kind ? 'active' : ''} onKeyDown={event => onMarketTabKeyDown(event, index + 1)} onClick={() => selectMarketKind(kind)}><KindIcon size={14} />{kind === 'mcp' ? capabilityKindLabels[kind] : marketKindLabels[kind]} <span>{count}</span></button>;
               })}
             </div>
           </div>
-          <aside className="market-browser">
+          <aside className="market-browser" id="market-panel" role="tabpanel" aria-labelledby={`market-tab-${kindFilter}`}>
             <div className="market-tools">
               {/* MCP 页签搜的是工具，不是「能力」：同一句占位文案跨页签复用会让人以为这里能搜到插件和技能。 */}
               <label className="plugin-search"><Search size={15} /><span className="sr-only">{kindFilter === 'mcp' ? '搜索 MCP 工具' : '搜索扩展'}</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder={kindFilter === 'mcp' ? '搜索 MCP 工具名称或用途' : '搜索名称、用途或能力'} /></label>
@@ -736,7 +762,7 @@ export function ExtensionsPage({
                 return (
                   <button key={key} type="button" className={`market-item${selected ? ' selected' : ''}`} onClick={() => { setSelectedKey(key); setDetailOpen(true); }}>
                     {/* 列表行的类型只靠这一格认：图标 + 颜色，文案交给页签和详情头部。 */}
-                    {entry.kind === 'instruction' ? <span className="extension-kind-mark instruction" role="img" aria-label="项目规则" title="项目规则"><FileText size={19} strokeWidth={1.8} /></span> : <ExtensionKindMark kind={entry.kind} label={marketKindLabels[entry.kind]} />}
+                    <ExtensionIcon kind={entry.kind} name={entry.name} icon={entry.icon} label={marketKindLabels[entry.kind]} />
                   <span className="market-item-copy">
                     <strong title={entry.name}>{entry.name}</strong>
                     <small title={entry.description || `${entry.sourceName} · ${entry.author}`}>{entry.description || `${entry.sourceName} · ${entry.author}`}</small>
@@ -796,6 +822,7 @@ export function ExtensionsPage({
         unitUpdateTargets={unitUpdateTargets}
         loading={extensionSourcesLoading}
         error={extensionSourcesError}
+        returnFocusRef={sourcesTriggerRef}
         onClose={() => setSourcesOpen(false)}
         onDevelopWorkspace={onDevelopWorkspace}
         onRefresh={onRefreshSources}
@@ -838,6 +865,43 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
   const [versions, setVersions] = useState<MarketVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsError, setVersionsError] = useState('');
+  const [displayIcon, setDisplayIcon] = useState<ExtensionIconInfo | null | undefined>(entry.icon);
+  const [iconFeedback, setIconFeedback] = useState('');
+  const [iconBusy, setIconBusy] = useState(false);
+
+  useEffect(() => { setDisplayIcon(entry.icon); setIconFeedback(''); }, [entry.key, entry.icon]);
+
+  const changeIcon = async () => {
+    setIconBusy(true);
+    setIconFeedback('');
+    try {
+      const path = await agentApi.pickExtensionIconFile();
+      if (!path) return;
+      const next = await agentApi.setExtensionIconOverride(entry.kind, entry.id, path);
+      setDisplayIcon(next);
+      setIconFeedback('图标已保存到本机。');
+    } catch (error) {
+      setIconFeedback(error instanceof Error ? error.message : '图标更新失败');
+    } finally {
+      setIconBusy(false);
+    }
+  };
+
+  const resetIcon = async () => {
+    setIconBusy(true);
+    setIconFeedback('');
+    try {
+      await agentApi.clearExtensionIconOverride(entry.kind, entry.id);
+      // entry.icon may be the effective user override returned by the catalog;
+      // showing it again would make "恢复默认" look like a no-op.
+      setDisplayIcon(entry.icon?.source === 'user' ? null : entry.icon ?? null);
+      setIconFeedback('已恢复默认图标。');
+    } catch (error) {
+      setIconFeedback(error instanceof Error ? error.message : '恢复图标失败');
+    } finally {
+      setIconBusy(false);
+    }
+  };
   // 顶部按钮装的是「这个产品当下最该装的版本」：有可更新版本时就是那个新版本，
   // 否则才退回目录主来源的版本。同一产品有多个来源时主来源可能比本机已装的还旧，
   // 直接取主来源版本会出现「列表写着可更新至 v1.0.2，按钮却写着降级到 v1.0.1」。
@@ -887,7 +951,7 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
     <>
       <header className="plugin-product-header">
         <div className="plugin-product-title">
-          {entry.kind === 'instruction' ? <span className="extension-kind-mark instruction" aria-hidden="true"><FileText size={19} strokeWidth={1.8} /></span> : <ExtensionKindMark kind={entry.kind} />}
+          <ExtensionIcon kind={entry.kind} name={entry.name} icon={displayIcon} size={52} />
           <div>
             <div><h3>{entry.name}</h3>{entry.policyLabel ? <Pill kind={entry.policyKind}>{entry.policyLabel}</Pill> : null}</div>
             {/* 类型在详情头部走文字，形状交给左边那一格，两个彩色小块并排会互相打架。 */}
@@ -895,6 +959,8 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
           </div>
         </div>
         <div className="actions-row">
+          <button type="button" className="btn" disabled={iconBusy} title="选择本机 PNG/WebP（64–1024px，不超过 256 KB）" onClick={() => void changeIcon()}><ImageUp size={15} />{iconBusy ? '处理中' : '更换图标'}</button>
+          {displayIcon?.source === 'user' ? <button type="button" className="btn" disabled={iconBusy} title="移除本机覆盖，恢复作者图标或类型默认图标" onClick={() => void resetIcon()}><RotateCcw size={15} />恢复默认</button> : null}
           {/* 「管理」单独出现时看不出管的是什么；这个按钮实际跳去「我的能力」的对应页签。 */}
           {installed ? <button type="button" className="btn" title="在「我的能力」里管理" onClick={onManage}>管理已安装</button> : null}
           {upToDate && !lockingLabel ? <Pill kind="success">已是最新</Pill> : null}
@@ -902,6 +968,7 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
         </div>
       </header>
       {entry.description ? <p className="plugin-product-description">{entry.description}</p> : null}
+      {iconFeedback ? <div className="inline-feedback visible" role="status">{iconFeedback}</div> : null}
       {installed ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>已安装 v{installed}{updatableVersion(entry) ? ` · 可更新至 v${entry.updateVersion}` : entry.managed ? ' · 版本由组织推进' : ''}</strong><span>{entry.kind === 'plugin' ? '可在插件页面启用或停用。' : entry.kind === 'skill' ? '可在技能页面同步、更新或卸载。' : entry.kind === 'workflow' ? '可在工作流页面启用、停用或运行。' : entry.kind === 'expert' ? '可在“我的能力 → 专家”中选择和切换。' : '已导入规则库，可在项目中选择。'}</span></div></div> : null}
       <section className="plugin-product-section">
         <div className="plugin-section-heading"><div><h4>版本</h4></div><span className="market-section-note">{versionsLoading ? '读取中' : `${sortedVersions.length} 个可安装版本`}</span></div>

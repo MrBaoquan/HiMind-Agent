@@ -942,6 +942,7 @@ mod tests {
         let skill_root = store.skill_root_for_scope(&SkillScope::Builtin, "demo.skill");
         let version_root = skill_root.join("versions").join("1.0.0");
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "demo.skill".to_string(),
             name: "Demo".to_string(),
             author: String::new(),
@@ -971,6 +972,7 @@ mod tests {
         )
         .unwrap();
         let record = SkillRecord {
+            icon: None,
             manifest,
             root: skill_root.clone(),
             version_root: version_root.clone(),
@@ -994,6 +996,7 @@ mod tests {
         let skill_root = store.skill_root_for_scope(&SkillScope::Builtin, "demo.skill");
         let version_root = skill_root.join("versions").join("1.0.0");
         let manifest = SkillManifest {
+            icon: String::new(),
             id: "demo.skill".to_string(),
             name: "Demo".to_string(),
             author: String::new(),
@@ -1011,6 +1014,7 @@ mod tests {
         };
         crate::skill::manifest::write_skill_package(&version_root, &manifest, "# Demo").unwrap();
         let record = SkillRecord {
+            icon: None,
             manifest,
             root: skill_root,
             version_root,

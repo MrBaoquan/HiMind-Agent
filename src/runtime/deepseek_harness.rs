@@ -36,6 +36,11 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
 const OUTPUT_CAPTURE_LIMIT: usize = 256 * 1024;
 const DSH_HOME_ENV: &str = "DSH_HOME";
 const DSH_HOME_ROOT_ENV: &str = "HIMIND_DSH_HOME_ROOT";
+/// The Runtime release embedded into the Agent build. The archive itself is
+/// carried by the installer; this manifest is the compile-time expected version
+/// and content hash, so a healthy-but-old installation is not treated as ready.
+const BUNDLED_RUNTIME_MANIFEST: &str =
+    include_str!("../../resources/runtime/himind-runtime-release.json");
 const RUNTIME_MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const INSTALL_TIMEOUT_SECONDS: u64 = 30 * 60;
 const UPDATE_CHECK_TIMEOUT_SECONDS: u64 = 30;
@@ -56,6 +61,21 @@ const HIMIND_AGENT_OVERLAY_DIR: &str = ".himind";
 const HIMIND_AGENT_OVERLAY_FILE: &str = "agent.patch.yml";
 const HIMIND_AGENT_PATCH_MARKER: &str =
     "# Agent-owned context. This layer is regenerated for each new HiMind AI session.";
+/// Rail state is shared by pointing DSH's storage backends at two real
+/// directories. Do not recreate the old `storages`/`sessions` junctions under
+/// the Agent home: a Windows reparse point below a legacy sandbox ACL can make
+/// Node's exclusive-create (`open(..., "wx")`) fail with a misleading `EEXIST`
+/// before the DSH plugin tree can boot.
+const DSH_SHARED_RAIL_PATCH: &str = r#"
+
+# Keep the cross-workspace rail while avoiding Windows directory reparse points.
+- id: storage-json
+  config:
+    root: !!js "(() => { const path = process.getBuiltinModule('node:path'); return path.resolve(process.env.DSH_HOME, '..', '..', 'storages'); })()"
+- id: session-persistence-jsonl
+  config:
+    root: !!js "(() => { const path = process.getBuiltinModule('node:path'); return path.resolve(process.env.DSH_HOME, '..', '..', 'sessions'); })()"
+"#;
 const INDEPENDENT_ACTIVE_PROVIDER_ID: &str = "himind-local-ai";
 const INDEPENDENT_ACTIVE_API_KEY_ENV: &str = "HIMIND_LOCAL_AI_API_KEY";
 /// Agent 为托管会话写入的 provider id 与它引用的凭据名。两者一起构成 Agent
@@ -605,7 +625,24 @@ fn bundled_runtime_manifest() -> Option<PathBuf> {
     bundled_runtime_manifest_from(&std::env::current_exe().ok()?)
 }
 
+#[derive(serde::Deserialize)]
+struct ExpectedRuntimeManifest {
+    version: String,
+    sha256: String,
+}
+
+fn expected_runtime_manifest() -> Result<ExpectedRuntimeManifest, Box<dyn Error>> {
+    serde_json::from_str(BUNDLED_RUNTIME_MANIFEST)
+        .map_err(|error| format!("内置 Runtime 发布清单无效: {error}").into())
+}
+
 fn bundled_runtime_manifest_from(executable: &Path) -> Option<PathBuf> {
+    if let Some(explicit) = env::var_os("HIMIND_RUNTIME_RELEASE_MANIFEST")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(explicit);
+    }
     let mut directory = executable.parent()?;
     for _ in 0..3 {
         let candidate = directory
@@ -617,31 +654,94 @@ fn bundled_runtime_manifest_from(executable: &Path) -> Option<PathBuf> {
         }
         directory = directory.parent()?;
     }
-    None
+    let installed = crate::store::paths::shared_agent_root()
+        .join("resources")
+        .join("runtime")
+        .join("himind-runtime-release.json");
+    installed.is_file().then_some(installed)
 }
 
-/// Reinstall the Runtime when first launch finds it missing or unusable.
+fn runtime_alignment_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn bundled_manifest_matches_expected(
+    path: &Path,
+    expected: &ExpectedRuntimeManifest,
+) -> Result<bool, Box<dyn Error>> {
+    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    Ok(
+        value.get("version").and_then(Value::as_str) == Some(expected.version.as_str())
+            && value.get("sha256").and_then(Value::as_str) == Some(expected.sha256.as_str()),
+    )
+}
+
+/// Check the exact installed Runtime identity without paying for the full
+/// capability preflight. `--version` is intentionally used here instead of
+/// `status()`: status runs `--profile headless --help`, which currently costs
+/// several seconds and belongs in diagnostics, not every AI session launch.
+fn installed_runtime_identity(expected: &ExpectedRuntimeManifest) -> (String, bool) {
+    let state = match load_runtime_state() {
+        Ok(Some(state)) => state,
+        _ => return (String::new(), false),
+    };
+    let executable = PathBuf::from(&state.executable_path);
+    let actual_version = process::verify_command(executable.as_os_str(), &["--version"])
+        .ok()
+        .and_then(|value| parse_runtime_version(&value));
+    let version_matches = state.version == expected.version
+        && managed_executable_path(&executable)
+        && actual_version.as_deref() == Some(expected.version.as_str());
+    (state.version, version_matches)
+}
+
+/// Ensure the installed Runtime is exactly the release embedded into this Agent.
 ///
-/// Installing is preflight-gated but no longer preflight-blocked (see
-/// `verify_staged_runtime`), so a machine that could not run the staged CLI
-/// during setup still ends up with a Runtime on disk. The remaining failure
-/// modes are the ones that happen *after* setup - antivirus quarantining a
-/// file, a half-copied version directory, a state.json that no longer points at
-/// a real executable - and those all look the same from here: the Runtime is
-/// not `ready`. Repairing them from the bundled package costs nothing when the
-/// Runtime is healthy, which is the common case, so this is safe to call on
-/// every launch.
-///
-/// Returns a reason when the Runtime is still not usable, for the caller to log.
-pub(crate) fn ensure_installed_runtime_healthy(options: &Options) -> Option<String> {
-    let current = status();
-    if current.status == "ready" {
+/// `status=ready` only proves the installed Runtime is runnable and compatible;
+/// it does not prove it is the version this Agent was built and tested against.
+/// A healthy-but-old Runtime therefore goes through the bundled signed package
+/// as well. The whole operation is serialized because startup self-heal and the
+/// first AI session can request it concurrently.
+pub(crate) fn ensure_installed_runtime_matches(options: &Options) -> Option<String> {
+    let _guard = runtime_alignment_lock().lock().ok()?;
+    let expected = match expected_runtime_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let reason = format!("内置 Runtime 版本信息不可用：{error}");
+            crate::app::crash::record_event("warn", &reason);
+            return Some(reason);
+        }
+    };
+    let (current_version, current_matches) = installed_runtime_identity(&expected);
+    if current_matches {
         return None;
     }
-    // Prefer the package that shipped with this Agent: it is local, signed, and
-    // works with no Dashboard and no network. The guard restores the previous
-    // distribution source when it drops, so this does not leak into other work.
+
+    // Prefer the signed package that shipped with this Agent. The fallback to
+    // the configured source keeps an unhealthy development build recoverable,
+    // but the post-install check still requires the embedded version.
     let bundled = bundled_runtime_manifest();
+    if let Some(path) = bundled.as_deref() {
+        match bundled_manifest_matches_expected(path, &expected) {
+            Ok(true) => {}
+            Ok(false) => {
+                let reason = format!(
+                    "内置 Runtime 清单与 Agent 固定版本不一致：期望 {} ({})，实际 {}",
+                    expected.version,
+                    expected.sha256,
+                    path.display()
+                );
+                crate::app::crash::record_event("warn", &reason);
+                return Some(reason);
+            }
+            Err(error) => {
+                let reason = format!("读取内置 Runtime 清单失败：{error}");
+                crate::app::crash::record_event("warn", &reason);
+                return Some(reason);
+            }
+        }
+    }
     let _override = bundled
         .as_ref()
         .and_then(|path| use_local_manifest_scoped(&path.to_string_lossy()).ok());
@@ -657,6 +757,14 @@ pub(crate) fn ensure_installed_runtime_healthy(options: &Options) -> Option<Stri
     let mut ignore_progress = |_: &str, _: u8, _: &str| {};
     match install_with_report(options, &client_instance_id, &mut ignore_progress) {
         Ok((repaired, degraded)) => {
+            if repaired.version != expected.version {
+                let reason = format!(
+                    "Runtime 对齐失败：期望 {}，安装结果为 {}（{source}）",
+                    expected.version, repaired.version
+                );
+                crate::app::crash::record_event("warn", &reason);
+                return Some(reason);
+            }
             let detail = if degraded.is_empty() {
                 String::new()
             } else {
@@ -672,23 +780,22 @@ pub(crate) fn ensure_installed_runtime_healthy(options: &Options) -> Option<Stri
             crate::app::crash::record_event(
                 "info",
                 &format!(
-                    "运行时自愈完成（{source}）：{} -> {}{detail}",
-                    current.status, repaired.version
+                    "Runtime 对齐完成（{source}）：{} -> {}{detail}",
+                    current_version, repaired.version
                 ),
             );
             None
         }
         Err(error) => {
             let reason = format!(
-                "运行时自愈失败（{source}，当前状态 {}）：{error}",
-                current.status
+                "Runtime 对齐失败（{source}，当前版本 {}，期望 {}）：{error}",
+                current_version, expected.version
             );
             crate::app::crash::record_event("warn", &reason);
             Some(reason)
         }
     }
 }
-
 pub(crate) fn status() -> DeepSeekHarnessRuntimeStatus {
     let executable = resolve_executable().ok();
     let version = executable
@@ -906,7 +1013,12 @@ pub(crate) fn prepare_interactive_launch(
     options: &Options,
     workspace: Option<&Path>,
 ) -> Result<InteractiveLaunch, String> {
-    prepare_interactive_launch_with(options, workspace, ControlPlaneFallback::Fail)
+    prepare_interactive_launch_with(
+        options,
+        workspace,
+        ControlPlaneFallback::Fail,
+        LaunchHome::Interactive,
+    )
 }
 
 /// 交互入口专用的启动准备。
@@ -919,7 +1031,12 @@ pub(crate) fn prepare_interactive_launch_allow_degraded(
     options: &Options,
     workspace: Option<&Path>,
 ) -> Result<InteractiveLaunch, String> {
-    prepare_interactive_launch_with(options, workspace, ControlPlaneFallback::Degrade)
+    prepare_interactive_launch_with(
+        options,
+        workspace,
+        ControlPlaneFallback::Degrade,
+        LaunchHome::Interactive,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -930,15 +1047,40 @@ enum ControlPlaneFallback {
     Degrade,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchHome<'a> {
+    Interactive,
+    Run(&'a str),
+}
+
+/// Resolve the DSH home used by one launch.
+///
+/// Interactive sessions keep the per-workspace home and rail-sharing rules.
+/// Headless workflow steps execute in a run-scoped home: they do not need the
+/// interactive rail, and avoiding cross-workspace junctions is also what lets
+/// current DSH versions create their own session/module directories on Windows.
+fn launch_home(version: &str, workspace: &Path, mode: LaunchHome<'_>) -> Result<PathBuf, String> {
+    match mode {
+        LaunchHome::Interactive => workspace_dsh_home(version, workspace),
+        LaunchHome::Run(run_id) => {
+            if run_id.trim().is_empty() {
+                return Err("workflow runtime run id is missing".to_string());
+            }
+            dsh_run_home(version, run_id)
+        }
+    }
+}
+
 fn prepare_interactive_launch_with(
     options: &Options,
     workspace: Option<&Path>,
     fallback: ControlPlaneFallback,
+    home_mode: LaunchHome<'_>,
 ) -> Result<InteractiveLaunch, String> {
     let executable = resolve_executable().map_err(|error| error.to_string())?;
     let version = resolve_runtime_version(&executable).map_err(|error| error.to_string())?;
     let workspace = interactive_workspace(workspace)?;
-    if options.mode().dashboard_enabled()
+    if crate::app::control_plane_provider::available(options)
         && crate::store::ai_services::active_service()
             .map_err(|error| error.to_string())?
             .is_some()
@@ -948,14 +1090,16 @@ fn prepare_interactive_launch_with(
             executable.to_string_lossy().to_string(),
             version,
             workspace,
+            home_mode,
         );
     }
-    if !options.mode().dashboard_enabled() {
+    if !crate::app::control_plane_provider::available(options) {
         return prepare_independent_interactive_launch(
             options,
             executable.to_string_lossy().to_string(),
             version,
             workspace,
+            home_mode,
         );
     }
     // The Dashboard is an optional control plane. A live OAuth token is not
@@ -972,7 +1116,7 @@ fn prepare_interactive_launch_with(
         let credential =
             crate::api::ai::fetch_client_credential(options, &delegated.user_id, "himind-agent")
                 .map_err(|error| error.to_string())?;
-        let home = workspace_dsh_home(&version, &workspace)?;
+        let home = launch_home(&version, &workspace, home_mode)?;
         let models = managed_model_catalog(&credential.access)?;
         let model = credential.access.model.trim().to_string();
         let sync_snapshot =
@@ -1019,6 +1163,7 @@ fn prepare_interactive_launch_with(
                 executable.to_string_lossy().to_string(),
                 version,
                 workspace,
+                home_mode,
             )?;
             launch.control_plane_notice = degraded_notice(&error, &launch);
             eprintln!("{}", launch.control_plane_notice);
@@ -1057,6 +1202,29 @@ pub(crate) fn execute_workflow(
         disable_tools,
         is_canceled,
         ControlPlaneFallback::Fail,
+        LaunchHome::Interactive,
+    )
+}
+
+/// Execute one workflow Runtime step in its own run-scoped DSH home.
+pub(crate) fn execute_workflow_in_run_home(
+    options: &Options,
+    workspace: &str,
+    prompt: &str,
+    timeout_seconds: u64,
+    disable_tools: bool,
+    run_id: &str,
+    is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
+) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
+    execute_workflow_with(
+        options,
+        workspace,
+        prompt,
+        timeout_seconds,
+        disable_tools,
+        is_canceled,
+        ControlPlaneFallback::Fail,
+        LaunchHome::Run(run_id),
     )
 }
 
@@ -1079,6 +1247,7 @@ pub(crate) fn execute_workflow_allow_degraded(
         false,
         is_canceled,
         ControlPlaneFallback::Degrade,
+        LaunchHome::Interactive,
     )
 }
 
@@ -1090,13 +1259,14 @@ fn execute_workflow_with(
     disable_tools: bool,
     is_canceled: &dyn Fn() -> Result<bool, Box<dyn Error>>,
     fallback: ControlPlaneFallback,
+    home_mode: LaunchHome<'_>,
 ) -> Result<WorkflowRuntimeOutcome, Box<dyn Error>> {
     let workspace = process::canonical_workspace(workspace)?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err("DSH workflow prompt is empty".into());
     }
-    let launch = prepare_interactive_launch_with(options, Some(&workspace), fallback)
+    let launch = prepare_interactive_launch_with(options, Some(&workspace), fallback, home_mode)
         .map_err(std::io::Error::other)?;
     // `tool_policy=none` 的步骤用一份把工具行全部禁用的 overlay：模型看不到任何
     // 工具 schema，也就不可能“去工作区找文件”。这和 prompt 里的约定不同，是
@@ -1184,9 +1354,10 @@ fn prepare_independent_interactive_launch(
     executable: String,
     version: String,
     workspace: PathBuf,
+    home_mode: LaunchHome<'_>,
 ) -> Result<InteractiveLaunch, String> {
     let shared_home = native_dsh_home(&version)?;
-    let home = workspace_dsh_home(&version, &workspace)?;
+    let home = launch_home(&version, &workspace, home_mode)?;
     let (provider_config, api_key, service_source, route_source) =
         match active_independent_provider_config().map_err(|error| error.to_string())? {
             Some(projection) => (
@@ -2161,6 +2332,13 @@ fn spawn(invocation: &Invocation) -> Result<Child, Box<dyn Error>> {
     Ok(command.spawn()?)
 }
 
+/// Build the command used by an interactive DSH session.
+///
+/// Reuse the same direct-node launcher as managed runs. On Windows this avoids
+/// an otherwise redundant `cmd.exe` hop for every browser session.
+pub(crate) fn interactive_command(executable: &Path) -> Command {
+    dsh_command(executable.as_os_str())
+}
 fn dsh_command(executable: &std::ffi::OsStr) -> Command {
     let executable_path = PathBuf::from(executable);
     let mut command = {
@@ -2193,7 +2371,21 @@ pub(crate) fn configure_runtime_environment(command: &mut Command, executable: &
         "HIMIND_DSH_NODE",
         runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
     );
+    command.env("NODE_PATH", runtime_root.join("node_modules"));
     command.env("NO_PROXY", loopback_no_proxy());
+    command.env("NODE_ENV", "production");
+    // Node 22 can persist V8 compile cache across host starts. Keep it outside
+    // the immutable Runtime and partition it by runtime version. A cache that
+    // cannot be written is non-fatal for Node, so sandboxed child processes may
+    // inherit the variable without turning a denied cache write into a tool
+    // failure.
+    if let Some(version) = runtime_root.file_name().and_then(|name| name.to_str()) {
+        let cache = crate::store::paths::agent_home()
+            .join("cache")
+            .join("dsh-node-compile")
+            .join(version);
+        command.env("NODE_COMPILE_CACHE", cache);
+    }
 }
 
 /// 环回地址永不走代理。
@@ -2280,7 +2472,15 @@ fn ensure_himind_profile(
         include_str!("../../runtime-profiles/himind/cordis.patch.yml"),
     )?;
     // 专家库随会话刷新，失败不阻断会话：DSH 侧仍能用自带预设启动。
-    if let Err(error) = sync_expert_presets(&home.join("profiles").join(HIMIND_PROFILE)) {
+    // DSH 0.2.x 才提供单数形式的 `dsh-agent-preset`。旧版 Runtime 若直接加载
+    // 0.2.x 的专家声明，会在插件树装配阶段因缺包退出；此时改为空声明，保留旧
+    // Runtime 的普通对话能力。
+    let supports_agent_preset_v2 =
+        runtime_supports_agent_preset_v2(Path::new(invocation.executable.as_os_str()));
+    if let Err(error) = sync_expert_presets(
+        &home.join("profiles").join(HIMIND_PROFILE),
+        supports_agent_preset_v2,
+    ) {
         eprintln!("同步 DSH 专家预设失败：{error}");
     }
     Ok(())
@@ -2291,12 +2491,31 @@ fn ensure_himind_profile(
 /// DSH 0.2.x 起，用户预设是 profile 里的 `@deepseek-ai/dsh-agent-preset` 声明行，
 /// 旧的 `$DSH_HOME/.agent-presets/` 目录不再被读取。声明写在独立文件里、由
 /// `cordis:include` 引入：每次会话启动整体刷新，同时不动用户手写的 patch 行。
-fn sync_expert_presets(profile: &Path) -> Result<(), Box<dyn Error>> {
-    let document = crate::expert::dsh_preset_document()?;
-    crate::store::atomic_file::atomic_write(
-        &profile.join(crate::expert::DSH_EXPERT_PRESETS_FILE),
-        document.as_bytes(),
-    )?;
+fn runtime_supports_agent_preset_v2(executable: &Path) -> bool {
+    executable
+        .parent()
+        .and_then(Path::parent)
+        .map(|runtime_root| {
+            runtime_root
+                .join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh-agent-preset")
+                .join("package.json")
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
+fn sync_expert_presets(profile: &Path, supported: bool) -> Result<(), Box<dyn Error>> {
+    let document = if supported {
+        crate::expert::dsh_preset_document()?
+    } else {
+        "[]\n".to_string()
+    };
+    let target = profile.join(crate::expert::DSH_EXPERT_PRESETS_FILE);
+    if fs::read(&target).ok().as_deref() != Some(document.as_bytes()) {
+        crate::store::atomic_file::atomic_write(&target, document.as_bytes())?;
+    }
     ensure_expert_presets_include(&profile.join("cordis.patch.yml"))
 }
 
@@ -2743,6 +2962,19 @@ fn no_tools_overlay_text(base: &str) -> String {
     overlay
 }
 
+fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<bool> {
+    if fs::read(path).ok().as_deref() == Some(content) {
+        return Ok(false);
+    }
+    fs::write(path, content)?;
+    Ok(true)
+}
+
+fn copy_if_changed(source: &Path, destination: &Path) -> std::io::Result<bool> {
+    let content = fs::read(source)?;
+    write_if_changed(destination, &content)
+}
+
 fn ensure_agent_overlay(
     home: &Path,
     options: &Options,
@@ -2761,10 +2993,13 @@ fn ensure_agent_overlay(
         &invocation.workspace,
     )?;
     // home 级基线：无工具 overlay 从它派生，外部工具也按这个固定路径阅读。
-    fs::write(directory.join(HIMIND_AGENT_OVERLAY_FILE), &overlay)?;
+    write_if_changed(
+        &directory.join(HIMIND_AGENT_OVERLAY_FILE),
+        overlay.as_bytes(),
+    )?;
     // 会话级副本：并发会话各读自己那份，见 `interactive_overlay_path`。
     let path = interactive_overlay_path(home, &invocation.workspace);
-    fs::write(&path, &overlay)?;
+    write_if_changed(&path, overlay.as_bytes())?;
     Ok(path)
 }
 
@@ -2874,7 +3109,10 @@ fn merge_profile_package(path: &Path, defaults: &str) -> Result<(), Box<dyn Erro
         }
     }
     profile.insert("bundles".to_string(), Value::Array(bundles));
-    fs::write(path, serde_json::to_vec_pretty(&document)?)?;
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    if fs::read(path).ok().as_deref() != Some(bytes.as_slice()) {
+        fs::write(path, bytes)?;
+    }
     Ok(())
 }
 
@@ -2917,6 +3155,7 @@ fn render_himind_agent_overlay(
         "",
         Some(workspace),
     )?;
+    patch.push_str(DSH_SHARED_RAIL_PATCH);
     patch.push_str(
         "\n\n# The interactive DSH surface is embedded by HiMind Agent and must never hand off to the default browser.\n- id: web-runtime\n  config:\n    openBrowser: false\n",
     );
@@ -3415,7 +3654,7 @@ fn migrate_legacy_managed_settings(home: &Path) -> Result<(), Box<dyn Error>> {
 
 fn himind_mcp_arguments(options: &Options) -> Vec<String> {
     let mut arguments = vec!["--mcp".to_string()];
-    if options.mode().dashboard_enabled() {
+    if crate::app::control_plane_provider::available(options) {
         arguments.extend(["--api".to_string(), options.api_base().clone()]);
     }
     arguments.extend([
@@ -3757,7 +3996,18 @@ fn parse_runtime_version(value: &str) -> Option<String> {
     })
 }
 
+/// Machine-wide Runtime binaries. Every profile shares this installation so a
+/// newly built Agent cannot silently fall back to a healthy but stale Runtime
+/// left behind in a profile directory.
 fn runtime_root() -> PathBuf {
+    crate::store::paths::shared_agent_root()
+        .join("runtimes")
+        .join("deepseek-harness")
+}
+
+/// Per-profile DSH mutable data (homes, settings snapshots, sessions). Runtime
+/// binaries are shared, but user state must remain isolated per profile.
+fn runtime_data_root() -> PathBuf {
     crate::store::paths::agent_home()
         .join("runtimes")
         .join("deepseek-harness")
@@ -3797,7 +4047,7 @@ fn dsh_home(version: &str) -> Result<PathBuf, String> {
     let root = env::var_os(DSH_HOME_ROOT_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| runtime_root().join("homes"));
+        .unwrap_or_else(|| runtime_data_root().join("homes"));
     ensure_interactive_home(&root, version)?;
     Ok(root.join(INTERACTIVE_HOME_DIRECTORY))
 }
@@ -3846,7 +4096,7 @@ fn workspace_dsh_home(version: &str, workspace: &Path) -> Result<PathBuf, String
         let source = shared.join(name);
         let destination = target.join(name);
         if source.is_file() {
-            fs::copy(&source, &destination)
+            copy_if_changed(&source, &destination)
                 .map_err(|error| format!("复制 DSH 配置失败: {error}"))?;
         }
     }
@@ -3875,42 +4125,33 @@ fn ensure_workspace_profiles(shared: &Path, target: &Path, managed: &Path) -> Re
     fs::create_dir_all(&destination)
         .map_err(|error| format!("创建工作区 DSH Profile 目录失败: {error}"))?;
     let node_modules = destination.join("node_modules");
-    if !node_modules.exists() {
-        #[cfg(windows)]
-        {
-            // 目录联接只能靠 mklink /J 落地，而 cmd.exe 是控制台程序：
-            // Agent 是 GUI 子系统、没有控制台，看不见的父进程派生控制台子进程时
-            // Windows 会给子进程新开一个窗口。每条会话启动都会走到这里，所以
-            // 漏掉隐藏就是一个肉眼可见的黑窗口。hidden_command 是唯一的入口。
-            let status = crate::runtime::process::hidden_command("cmd.exe")
-                .args(["/D", "/C", "mklink", "/J"])
-                .arg(&node_modules)
-                .arg(&source)
-                .status()
-                .map_err(|error| format!("创建 DSH Profile 隔离目录失败: {error}"))?;
-            if !status.success() {
-                return Err("无法创建工作区 DSH Profile 目录联接，请检查本机文件权限".to_string());
-            }
+    if path_present(&node_modules) && !directory_link_is_traversable(&node_modules, &source) {
+        // An interrupted older migration left a real empty `node_modules` here.
+        // DSH then reports every base/plugin package as missing. Replace only an
+        // empty managed directory; never delete a user-populated dependency tree.
+        let empty = fs::read_dir(&node_modules)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if empty || is_reparse_point(&node_modules) {
+            remove_link_or_dir(&node_modules)?;
         }
-        #[cfg(not(windows))]
-        std::os::unix::fs::symlink(&source, &node_modules)
-            .map_err(|error| format!("创建 DSH Profile 隔离目录失败: {error}"))?;
+    }
+    if !path_present(&node_modules) {
+        link_directory(&node_modules, &source)?;
         fs::write(&marker, source.to_string_lossy().as_bytes())
             .map_err(|error| format!("写入 DSH Profile 隔离记录失败: {error}"))?;
     }
     Ok(())
 }
 
-/// DSH 的 rail 把「工作区分组 + 组内会话」记在 `$DSH_HOME/storages/workspace.json`，
-/// 会话内容落在 `$DSH_HOME/sessions/`。
+/// DSH 的 rail 把「工作区分组 + 组内会话」记在共享 `storages/workspace.json`，
+/// 会话内容落在共享 `sessions/`。DSH 通过 overlay 把这两个后端直接指向共享目录，
+/// 不再在工作区 home 下建立目录联接。
 ///
-/// 会话按工作区各占一个 home（见 `workspace_dsh_home`），于是每个 home 只看得到自己
-/// 那一个工作区，界面上表现为「会话彼此隔离」：在 A 工作区开的会话，B 工作区里看不见。
-/// 把这两处共享出去（目录联接），各组共用一份登记与会话内容，rail 就能一次列出所有
-/// 工作区。home 里的 `AGENTS.md`、profiles 仍按工作区隔离，指令不会互相覆盖。
-///
-/// 首次运行会把各工作区 home 里已有的登记与会话并进共享目录，再换成联接；迁移是
-/// 幂等的，已联接的 home 直接跳过。
+/// 旧版本会用 reparse point 共享这两处。Windows 上，位于遗留 sandbox ACL 下的
+/// reparse point 会让 Node 的 `open(..., "wx")` 返回错误的 `EEXIST`，导致
+/// `dsh-workspace` 在会话启动阶段失败。这里保留一次性迁移：把旧 home 里的数据
+/// 并进共享目录，然后只删除本地旧目录/联接，绝不再重建链接。
 const DSH_RAIL_SHARED_ENTRIES: &[&str] = &["storages", "sessions"];
 const DSH_WORKSPACE_REGISTRY: &str = "workspace.json";
 
@@ -3919,34 +4160,16 @@ fn share_rail_state(shared: &Path, target: &Path, managed: &Path) -> Result<(), 
         let source = shared.join(entry);
         fs::create_dir_all(&source)
             .map_err(|error| format!("创建共享 DSH 目录 {entry} 失败: {error}"))?;
-        // 目录联接除了「指向对的目标」，还必须真的能走进去：Windows 会把某些
-        // 联接判成不受信挂载点，`canonicalize` 仍能解析出目标，但枚举目录会返回
-        // 「The path cannot be traversed because it contains an untrusted mount
-        // point」。DSH 的会话持久化插件正好要枚举这两个目录，激活失败后整个 Web
-        // 入口回 502，界面只报「HiMind AI 会话启动失败 / 页面认证失败」——
-        // 2026-10-16 现场就是这一条。判据取「能不能列目录」，不成立就重建联接：
-        // 重建是目前唯一验证过能恢复的做法。
         let destination = target.join(entry);
-        if linked_to(&destination, &source) && link_is_traversable(&destination) {
-            continue;
-        }
         migrate_rail_entry(entry, &destination, &source)?;
         remove_link_or_dir(&destination)?;
-        link_directory(&destination, &source)?;
-        let _ = fs::write(
-            managed.join(format!("{entry}-link")),
-            source.to_string_lossy().as_bytes(),
-        );
+        let marker = managed.join(format!("{entry}-link"));
+        if marker.is_file() {
+            fs::remove_file(&marker)
+                .map_err(|error| format!("清理旧 DSH 共享链接记录失败: {error}"))?;
+        }
     }
     Ok(())
-}
-
-/// 目录联接也走 `canonicalize`，联接目标一致即视为已共享。
-fn linked_to(destination: &Path, source: &Path) -> bool {
-    match (destination.canonicalize(), source.canonicalize()) {
-        (Ok(current), Ok(expected)) => current == expected,
-        _ => false,
-    }
 }
 
 /// `exists()` 对断掉的联接返回 false，这里用 `symlink_metadata` 判存在。
@@ -3954,8 +4177,40 @@ fn path_present(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-fn link_is_traversable(path: &Path) -> bool {
-    fs::read_dir(path).is_ok()
+fn directory_link_is_traversable(destination: &Path, source: &Path) -> bool {
+    destination
+        .canonicalize()
+        .ok()
+        .zip(source.canonicalize().ok())
+        .is_some_and(|(current, expected)| current == expected)
+        && fs::read_dir(destination).is_ok()
+}
+
+/// Read-only module fallback links are safe under the Agent home. The failure
+/// fixed for rail state was DSH's exclusive temporary-file create through a
+/// writable reparse point, not module resolution.
+fn link_directory(destination: &Path, source: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let status = crate::runtime::process::hidden_command("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(destination)
+            .arg(source)
+            .status()
+            .map_err(|error| format!("创建 DSH Profile 依赖联接失败: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "无法创建 DSH Profile 依赖联接：{}",
+                destination.display()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(source, destination)
+            .map_err(|error| format!("创建 DSH Profile 依赖链接失败: {error}"))
+    }
 }
 
 fn is_reparse_point(path: &Path) -> bool {
@@ -3991,6 +4246,12 @@ fn remove_link_or_dir(path: &Path) -> Result<(), String> {
             path.display(),
             path.display()
         ));
+    }
+    #[cfg(not(windows))]
+    if is_reparse_point(path) {
+        fs::remove_file(path)
+            .map_err(|error| format!("删除 DSH 目录链接失败 {}: {error}", path.display()))?;
+        return Ok(());
     }
     fs::remove_dir_all(path)
         .map_err(|error| format!("清理旧 DSH 目录失败 {}: {error}", path.display()))
@@ -4100,31 +4361,6 @@ fn union_string_array(target: Option<&mut Value>, source: Option<&Value>) {
     }
 }
 
-fn link_directory(destination: &Path, source: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        // 同上：cmd.exe 必须隐藏启动，否则每建一条目录联接就闪一个黑窗口。
-        let status = crate::runtime::process::hidden_command("cmd.exe")
-            .args(["/D", "/C", "mklink", "/J"])
-            .arg(destination)
-            .arg(source)
-            .status()
-            .map_err(|error| format!("创建 DSH 共享目录联接失败: {error}"))?;
-        if !status.success() {
-            return Err(format!(
-                "无法创建 DSH 共享目录联接：{}",
-                destination.display()
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        std::os::unix::fs::symlink(source, destination)
-            .map_err(|error| format!("创建 DSH 共享目录链接失败: {error}"))
-    }
-}
-
 fn native_dsh_home(version: &str) -> Result<PathBuf, String> {
     if let Some(value) = env::var_os(DSH_HOME_ENV).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
@@ -4188,15 +4424,30 @@ fn recent_workspace_in(home: &Path) -> Option<PathBuf> {
     latest.map(|(_, path)| path)
 }
 
+fn safe_run_segment(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Runtime run id 不能为空。".to_string());
+    }
+    // Preserve already-safe ids so a run home keeps its stable path across
+    // resumes. Scheduler ids contain ":"; hash only the ids that cannot be a
+    // Windows directory name, keeping distinct ids collision-resistant.
+    if safe_segment(value).is_ok() {
+        return Ok(value.to_string());
+    }
+    let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
+    Ok(format!("run-{}", &digest[..16]))
+}
+
 fn dsh_run_home(version: &str, run_id: &str) -> Result<PathBuf, String> {
     let root = env::var_os(DSH_HOME_ROOT_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| runtime_root().join("homes"));
+        .unwrap_or_else(|| runtime_data_root().join("homes"));
     Ok(root
         .join("runs")
         .join(safe_segment(version)?)
-        .join(safe_segment(run_id)?))
+        .join(safe_run_segment(run_id)?))
 }
 
 fn versioned_home(root: &Path, version: &str) -> Result<PathBuf, String> {
@@ -4378,13 +4629,13 @@ mod tests {
         agent_owned_route_is_viable_with, append_independent_service_profile,
         configure_runtime_environment, degraded_notice, dsh_run_home, dsh_skill_name,
         effective_runtime_capabilities, ensure_interactive_home, ensure_managed_capability_rows,
-        ensure_profile_patch, first_line, himind_mcp_arguments, link_is_traversable,
-        loopback_no_proxy, managed_model_catalog, merge_profile_package,
-        migrate_legacy_managed_settings, native_dsh_provider_config, no_tools_overlay_text,
-        parse_native_dsh_provider_config, parse_runtime_version, recent_workspace_in,
-        release_agent_owned_model_route, remove_managed_runtime, render_himind_agent_overlay,
-        render_himind_profile_patch, render_himind_profile_patch_from_base, safe_relative_path,
-        safe_segment, skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
+        ensure_profile_patch, first_line, himind_mcp_arguments, loopback_no_proxy,
+        managed_model_catalog, merge_profile_package, migrate_legacy_managed_settings,
+        native_dsh_provider_config, no_tools_overlay_text, parse_native_dsh_provider_config,
+        parse_runtime_version, recent_workspace_in, release_agent_owned_model_route,
+        remove_managed_runtime, render_himind_agent_overlay, render_himind_profile_patch,
+        render_himind_profile_patch_from_base, safe_relative_path, safe_segment,
+        skill_manifest_ready_for_himind_ai, strip_yaml_frontmatter,
         validate_runtime_agent_compatibility, verify_staged_runtime, versioned_home,
         InteractiveEventProjector, InteractiveLaunch, ModelRouteSource, HIMIND_HEADLESS_PROFILE,
     };
@@ -4930,32 +5181,51 @@ mod tests {
             .unwrap();
         assert!(ids.iter().any(|item| item == "w1") && ids.iter().any(|item| item == "w2"));
 
-        // 会话内容搬进共享目录，两个目录都变成指向共享侧的联接。
+        // 会话内容搬进共享目录；工作区 home 不再保留本地目录或目录联接。
         assert!(shared.join("sessions").join("--a--").join("log").is_file());
-        assert!(super::linked_to(
-            &target.join("storages"),
-            &shared.join("storages")
-        ));
-        assert!(super::linked_to(
-            &target.join("sessions"),
-            &shared.join("sessions")
-        ));
+        assert!(!target.join("storages").exists());
+        assert!(!target.join("sessions").exists());
+        assert!(!managed.join("storages-link").exists());
+        assert!(!managed.join("sessions-link").exists());
 
         // 幂等：再跑一次不报错，也不重复迁移。
         super::share_rail_state(&shared, &target, &managed).unwrap();
-        assert!(super::linked_to(
-            &target.join("storages"),
-            &shared.join("storages")
-        ));
+        assert!(!target.join("storages").exists());
+        assert!(!target.join("sessions").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
+    fn workflow_launch_uses_a_run_scoped_home() {
+        let home = super::launch_home(
+            "0.1.0",
+            std::path::Path::new("C:/workspace/project"),
+            super::LaunchHome::Run("run-123"),
+        )
+        .unwrap();
+        let normalized = home.to_string_lossy().replace('\\', "/");
+        assert!(normalized.contains("runs/0.1.0/run-"));
+        assert!(!normalized.contains("workspaces"));
+        assert!(super::launch_home(
+            "0.1.0",
+            std::path::Path::new("C:/workspace/project"),
+            super::LaunchHome::Run("  "),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn managed_run_home_is_isolated_from_interactive_settings() {
-        let home = dsh_run_home("0.1.0-rc.6", "run-123").unwrap();
-        assert!(home.ends_with("runs/0.1.0-rc.6/run-123"));
-        assert!(dsh_run_home("0.1.0-rc.6", "../interactive").is_err());
+        let home = dsh_run_home("0.1.0-rc.6", "run:123").unwrap();
+        let leaf = home.file_name().unwrap().to_string_lossy();
+        let normalized = home.to_string_lossy().replace('\\', "/");
+        assert!(normalized.contains("runs/0.1.0-rc.6/"));
+        assert!(leaf.starts_with("run-"));
+        let traversal = dsh_run_home("0.1.0-rc.6", "../interactive").unwrap();
+        let traversal = traversal.to_string_lossy().replace('\\', "/");
+        assert!(traversal.contains("runs/0.1.0-rc.6/run-"));
+        assert!(!traversal.contains("workspaces"));
     }
 
     #[test]
@@ -5979,6 +6249,7 @@ mod tests {
     #[test]
     fn himind_skill_adapter_accepts_portable_ready_skills() {
         let mut manifest = crate::skill::types::SkillManifest {
+            icon: String::new(),
             id: "com.example.skill".to_string(),
             name: "Example".to_string(),
             author: String::new(),
@@ -6452,21 +6723,96 @@ mod tests {
     }
 
     #[test]
-    fn rail_link_must_be_traversable_to_count_as_shared() {
-        // 判据是「能不能列目录」，不是「指向对不对」：不受信挂载点仍能解析出
-        // 目标，但枚举失败，DSH 的会话持久化插件就会起不来、Web 入口回 502。
+    fn interactive_overlay_uses_real_shared_rail_roots() {
+        assert!(super::DSH_SHARED_RAIL_PATCH.contains("- id: storage-json"));
+        assert!(super::DSH_SHARED_RAIL_PATCH.contains("- id: session-persistence-jsonl"));
+        assert!(super::DSH_SHARED_RAIL_PATCH.contains("'..', '..', 'storages'"));
+        assert!(super::DSH_SHARED_RAIL_PATCH.contains("'..', '..', 'sessions'"));
+        assert!(!super::DSH_SHARED_RAIL_PATCH.contains("mklink"));
+    }
+
+    #[test]
+    fn legacy_runtime_gets_empty_v2_expert_presets() {
         let root = std::env::temp_dir().join(format!(
-            "himind-rail-link-{}-{}",
+            "himind-legacy-expert-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let target = root.join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        assert!(link_is_traversable(&target));
-        assert!(!link_is_traversable(&root.join("missing")));
+        let profile = root.join("profiles").join("himind");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("cordis.patch.yml"), b"[]\n").unwrap();
+        super::sync_expert_presets(&profile, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(profile.join(crate::expert::DSH_EXPERT_PRESETS_FILE)).unwrap(),
+            "[]\n"
+        );
+        let fake_executable = root
+            .join("versions")
+            .join("legacy")
+            .join("bin")
+            .join("dsh.cmd");
+        assert!(!super::runtime_supports_agent_preset_v2(&fake_executable));
+        let package = root
+            .join("versions")
+            .join("current")
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh-agent-preset");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), b"{}").unwrap();
+        assert!(super::runtime_supports_agent_preset_v2(
+            &root
+                .join("versions")
+                .join("current")
+                .join("bin")
+                .join("dsh.cmd")
+        ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embedded_runtime_manifest_pins_an_exact_release() {
+        let manifest = super::expected_runtime_manifest().unwrap();
+        assert_eq!(manifest.version, "0.2.1-rc.2");
+        assert_eq!(manifest.sha256.len(), 64);
+        assert!(manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn runtime_environment_enables_node_compile_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-node-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let version = root.join("versions").join("0.1.5-test");
+        let executable = version.join("bin").join("dsh.cmd");
+        let mut command = std::process::Command::new("dsh");
+        configure_runtime_environment(&mut command, &executable);
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            envs.get("NODE_ENV").and_then(Option::as_deref),
+            Some("production")
+        );
+        let cache = envs
+            .get("NODE_COMPILE_CACHE")
+            .and_then(Option::as_deref)
+            .expect("NODE_COMPILE_CACHE should be set");
+        assert!(cache.contains("dsh-node-compile"));
+        assert!(cache.ends_with("0.1.5-test"));
     }
 }

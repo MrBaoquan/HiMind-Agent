@@ -4,6 +4,7 @@ import { AI_CONNECTIONS_DESCRIPTION, AI_CONNECTIONS_TAB_LABELS, AI_CONNECTIONS_T
 import { AcpProfilesPanel } from './AcpProfilesPanel';
 import { AiToolsPanel } from './AiToolsPanel';
 import { AiProvidersPanel } from './AiProvidersPanel';
+import { AiServiceRoutesPanel } from './AiServiceRoutesPanel';
 import type {
   AIServiceProtocol,
   AIServiceBalanceSnapshot,
@@ -54,6 +55,10 @@ type AiConnectionsPageProps = {
     image_edit_adapter: string;
     video_model: string;
     video_adapter: string;
+    speech_model: string;
+    speech_adapter: string;
+    transcribe_model: string;
+    transcribe_adapter: string;
     balance_profile_id: string;
     balance_access_token: string;
     balance_user_id: string;
@@ -178,13 +183,20 @@ export function AiConnectionsPage({
             templates={aiServiceTemplates}
             onRefresh={onRefresh}
             onSaveAIService={onSaveAIService}
-            onSetActiveAIService={onSetActiveAIService}
-            onSetImageAIService={onSetImageAIService}
             onRemoveAIService={onRemoveAIService}
             onOpenAccount={onOpenAccount}
             onFetchModels={onFetchModels}
             onFetchSavedModels={onFetchSavedModels}
             onFetchBalance={onFetchBalance}
+          />
+        </div>
+      ) : activeTab === 'routes' ? (
+        <div id="ai-panel-routes" role="tabpanel" aria-labelledby="ai-tab-routes">
+          <AiServiceRoutesPanel
+            aiServices={aiServices}
+            onOpenServices={() => setActiveTab('services')}
+            onSetActiveAIService={onSetActiveAIService}
+            onSetMediaAIService={onSetImageAIService}
           />
         </div>
       ) : (

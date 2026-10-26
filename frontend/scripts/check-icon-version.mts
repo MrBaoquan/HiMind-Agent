@@ -66,15 +66,15 @@ assert.deepEqual(
 
 const busyIndicator = readFileSync(join(root, 'src', 'components', 'BusyIndicator.tsx'), 'utf8');
 assert.ok(/from 'lucide-react'/.test(busyIndicator), 'BusyIndicator 是静态图标，只能从 lucide-react 取');
-assert.ok(/reducedMotion="never"/.test(readFileSync(join(root, 'src', 'components', 'MorphIcon.tsx'), 'utf8')), '形变必须始终播放，不能跟随系统的「减少动态效果」开关');
+assert.ok(/reducedMotion="user"/.test(readFileSync(join(root, 'src', 'components', 'MorphIcon.tsx'), 'utf8')), '形变必须遵循系统的「减少动态效果」偏好');
 
-// 动效按设计速度常开：整套 reduce 分支已按产品取舍移除（同一套界面不该在不同机器上
-// 呈现两种形态），状态反馈的持续感全部靠这些常开的动效承载。
+// 基础动效保持设计速度；系统开启「减少动态效果」时由 CSS 媒体查询降级，
+// 状态含义仍由终态图标、文字和进度值承载。
 const styles = readFileSync(join(root, 'styles.css'), 'utf8');
 assert.ok(/\.busy-indicator \{[^}]*animation: spin/.test(styles), 'BusyIndicator 必须转，否则「正在处理」没有持续反馈');
 assert.ok(
-  !/prefers-reduced-motion/.test(styles),
-  'styles.css 里不该再有 reduce 分支：动效不再跟随系统开关，出现即说明有人把它加回来了',
+  /@media\s*\(prefers-reduced-motion:\s*reduce\)/.test(styles),
+  'styles.css 必须提供 prefers-reduced-motion: reduce 降级',
 );
 // 流光条纹曾叠在进度条上：背景位移动画上不了合成线程，实测是本套 UI 里最贵的一段，
 // 信息量却近乎为零（宽度本身已经在表达进度）。谁要加回来，先看性能数据。
@@ -93,6 +93,9 @@ assert.ok(
 );
 const markSource = readFileSync(join(root, 'src', 'components', 'ExtensionKindMark.tsx'), 'utf8');
 assert.ok(!/from 'lucide'/.test(markSource), 'ExtensionKindMark 是静态图标位，只能从 lucide-react 取图标');
+const extensionIconSource = readFileSync(join(root, 'src', 'components', 'ExtensionIcon.tsx'), 'utf8');
+assert.ok(/extension-icon-type-badge/.test(extensionIconSource), '品牌图标必须带右上角类型徽标，不能只显示品牌图');
+assert.ok(/extensionKindIcons\[kind\]/.test(extensionIconSource), '品牌图标和类型徽标必须共用同一套类型形状');
 for (const kind of kinds) {
   assert.ok(
     new RegExp(`^\\s*${kind}: \\w+,`, 'm').test(markSource),
@@ -101,6 +104,10 @@ for (const kind of kinds) {
   assert.ok(
     new RegExp(`\\.extension-kind-mark\\.${kind} \\{`).test(styles),
     `styles.css 缺少 .extension-kind-mark.${kind} 的配色，图标位会退成灰底`,
+  );
+  assert.ok(
+    new RegExp(`\\.extension-icon-type-badge\\.${kind} \\{`).test(styles),
+    `styles.css 缺少 .extension-icon-type-badge.${kind} 的配色，品牌图标上的类型徽标无法区分`,
   );
 }
 // 类型只能靠这一套图标指认：字母占位（P/S/W）和纯文字类型徽标都已下线，谁加回来谁负责解释。

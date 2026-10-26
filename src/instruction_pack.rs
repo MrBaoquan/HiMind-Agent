@@ -72,6 +72,9 @@ pub(crate) struct InstructionPackManifest {
     pub categories: Vec<String>,
     pub version: String,
     pub description: String,
+    /// Optional package-local PNG/WebP path used as the extension brand icon.
+    #[serde(default)]
+    pub icon: String,
     pub release_notes: String,
     pub min_agent_version: String,
     pub supported_clients: Vec<String>,
@@ -88,6 +91,9 @@ pub(crate) struct InstructionPackManifest {
 
 impl InstructionPackManifest {
     pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if !self.icon.trim().is_empty() {
+            crate::app::extension_icons::validate_icon_reference(&self.icon)?;
+        }
         if self.schema_version != INSTRUCTION_PACK_SCHEMA_VERSION {
             return Err(format!(
                 "unsupported instruction pack schema: {}",
@@ -205,6 +211,8 @@ pub(crate) struct InstructionPackDraft {
     pub published_digest: Option<String>,
     #[serde(default)]
     pub test_report: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
     pub updated_at: String,
 }
 
@@ -397,6 +405,7 @@ pub(crate) fn save(
         categories: input.categories,
         version: input.version.trim().to_string(),
         description: input.description.trim().to_string(),
+        icon: String::new(),
         release_notes: input.release_notes.trim().to_string(),
         min_agent_version: input.min_agent_version.trim().to_string(),
         supported_clients: normalize_clients(input.supported_clients),
@@ -452,8 +461,17 @@ pub(crate) fn save(
     let unchanged = previous
         .as_ref()
         .is_some_and(|draft| draft.candidate_sha256 == candidate_sha256);
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "instruction",
+        &manifest.id,
+        &package_root,
+        Some(&manifest.icon),
+    )
+    .ok()
+    .flatten();
     let draft = InstructionPackDraft {
         manifest,
+        icon,
         instructions: input.instructions,
         files: input.files,
         candidate_path,
@@ -647,6 +665,7 @@ pub(crate) fn import_package(
         ));
         fs::copy(&source, &candidate_path)?;
         let draft = InstructionPackDraft {
+            icon: crate::app::extension_icons::resolve_user_override("instruction", &manifest.id),
             manifest,
             instructions,
             files,
@@ -1275,6 +1294,24 @@ mod tests {
         fs::write(&path, "# Changed\n").unwrap();
         let confirmed = confirm(&draft.manifest.id, &draft.manifest.version);
         assert!(confirmed.is_err());
+        env::remove_var("HIMIND_INSTRUCTION_PACK_DRAFTS_DIR");
+        env::remove_var("HIMIND_INSTRUCTION_PACK_STORE_DIR");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn instruction_pack_icon_is_optional_and_package_local() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("himind-instruction-icon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        env::set_var("HIMIND_INSTRUCTION_PACK_DRAFTS_DIR", root.join("drafts"));
+        env::set_var("HIMIND_INSTRUCTION_PACK_STORE_DIR", root.join("store"));
+        let draft = save(input("# Rules\n- verify output\n")).unwrap();
+        let mut manifest = draft.manifest;
+        manifest.icon = "assets/icon.png".to_string();
+        assert!(manifest.validate().is_ok());
+        manifest.icon = "../icon.png".to_string();
+        assert!(manifest.validate().is_err());
         env::remove_var("HIMIND_INSTRUCTION_PACK_DRAFTS_DIR");
         env::remove_var("HIMIND_INSTRUCTION_PACK_STORE_DIR");
         let _ = fs::remove_dir_all(root);

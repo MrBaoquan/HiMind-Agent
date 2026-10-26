@@ -17,6 +17,14 @@ decision, the alternatives that were rejected, and what the decision costs.
 | [0009](0009-local-multi-instance-topology.md) | The profile owns the data root, and a build output never opens the installed one | accepted | 2026-09-30 |
 | [0010](0010-user-visible-copy-states-consequences.md) | User-visible copy states consequences, and a label is not a manual | accepted | 2026-10-01 |
 | [0011](0011-mcp-registration-key-follows-the-profile.md) | The MCP registration key follows the profile | accepted | 2026-10-09 |
+| [0012](0012-media-provider-plane.md) | Media providers are an Agent capability plane | accepted | 2026-10-23 |
+| [0013](0013-control-plane-provider-plugin.md) | The workbench is a built-in control-plane provider plugin | accepted | 2026-10-24 |
+| [0014](0014-ai-capability-provider-landing.md) | AI capabilities have explicit ownership and provider landing zones | accepted | 2026-10-24 |
+| [0015](0015-ai-service-model-routing-ia.md) | AI services and capability routes are separate settings surfaces | accepted | 2026-10-25 |
+| [0016](0016-ai-capability-execution-contract.md) | AI capability execution is one explainable contract | accepted | 2026-10-25 |
+| [0017](0017-agent-credential-center.md) | Agent credentials have one catalog and a brokered runtime boundary | accepted | 2026-10-25 |
+| [0018](0018-agent-bundled-pinned-runtime.md) | Runtime binaries are pinned and bundled with the Agent | accepted | 2026-10-26 |
+| [0019](0019-extension-brand-icons.md) | Extension brand icons are package assets with local overrides | accepted | 2026-10-26 |
 
 ## How these relate
 
@@ -41,6 +49,10 @@ port and the WebView2 directory but left the MCP registration key shared; 0011
 makes that key follow the profile too, so the two Agents can be registered into
 one client at once and a development run can no longer overwrite — or be
 mistaken for — the installed Agent's registration.
+
+0013 builds on 0008 and the capability boundary in 0001: 0008 owns the
+per-workbench identity records, while 0013 makes workbench services and
+control-plane capabilities a provider lifecycle instead of a global Agent mode.
 
 0010 is about the words on the screen and touches only the frontend. It has no
 dependency on the MCP catalog series: it leaves 0007's market discovery and the

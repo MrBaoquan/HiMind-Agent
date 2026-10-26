@@ -73,22 +73,54 @@ impl AIServiceProtocol {
     }
 }
 
-/// 本机媒体能力槽位名（与 `media.*` 能力一一对应，不带 `media.` 前缀）。
+/// Stable AI capability IDs used by the capability bus and settings UI.
+pub(crate) const CAP_CHAT: &str = "chat";
 pub(crate) const CAP_IMAGE_GENERATE: &str = "image.generate";
 pub(crate) const CAP_IMAGE_EDIT: &str = "image.edit";
 pub(crate) const CAP_VIDEO_GENERATE: &str = "video.generate";
-pub(crate) const SUPPORTED_MEDIA_CAPABILITIES: &[&str] =
-    &[CAP_IMAGE_GENERATE, CAP_IMAGE_EDIT, CAP_VIDEO_GENERATE];
+pub(crate) const CAP_AUDIO_SPEECH: &str = "audio.speech";
+pub(crate) const CAP_AUDIO_TRANSCRIBE: &str = "audio.transcribe";
+pub(crate) const SUPPORTED_MEDIA_CAPABILITIES: &[&str] = &[
+    CAP_IMAGE_GENERATE,
+    CAP_IMAGE_EDIT,
+    CAP_VIDEO_GENERATE,
+    CAP_AUDIO_SPEECH,
+    CAP_AUDIO_TRANSCRIBE,
+];
+pub(crate) const SUPPORTED_AI_CAPABILITIES: &[&str] = &[
+    CAP_CHAT,
+    CAP_IMAGE_GENERATE,
+    CAP_IMAGE_EDIT,
+    CAP_VIDEO_GENERATE,
+    CAP_AUDIO_SPEECH,
+    CAP_AUDIO_TRANSCRIBE,
+];
 /// 未显式声明适配器时的默认值（OpenAI Images 兼容协议）。
 pub(crate) const DEFAULT_MEDIA_ADAPTER: &str = "openai-images";
 
 /// 一个服务在某个媒体能力上使用的适配器与模型。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct MediaModelBinding {
-    #[serde(default)]
     pub adapter: String,
-    #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub execution_mode: Option<MediaExecutionMode>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MediaExecutionMode {
+    Sync,
+    Stream,
+    Async,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedMediaBinding {
+    pub adapter: String,
+    pub model: String,
+    pub execution_mode: MediaExecutionMode,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -103,7 +135,7 @@ pub(crate) struct CustomAIService {
     pub image_model: String,
     /// 生图适配器：`openai-images`（默认）或 `ark-images`（火山方舟/豆包）。
     pub image_adapter: String,
-    /// 媒体能力槽位：`image.generate` / `image.edit` / `video.generate` → 适配器 + 模型。
+    /// 媒体能力槽位：`image.generate` / `image.edit` / `video.generate` / `audio.speech` / `audio.transcribe` → 适配器 + 模型。
     /// `image_model` / `image_adapter` 是 `image.generate` 槽位的旧投影，二者保持一致。
     #[serde(default)]
     pub media: std::collections::BTreeMap<String, MediaModelBinding>,
@@ -157,6 +189,10 @@ struct PersistedAIServiceSelection {
     /// 各媒体能力的默认服务：`image.generate` / `image.edit` / `video.generate`。
     #[serde(default)]
     media_services: std::collections::BTreeMap<String, String>,
+    /// Explicit same-capability fallback order. No other capability can be
+    /// substituted because doing so would change the meaning of the request.
+    #[serde(default)]
+    capability_fallbacks: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl From<PersistedCustomAIService> for CustomAIService {
@@ -276,6 +312,7 @@ fn load_all() -> Result<BTreeMap<String, CustomAIService>, Box<dyn Error>> {
                     MediaModelBinding {
                         adapter,
                         model: service.image_model.trim().to_string(),
+                        execution_mode: None,
                     },
                 );
             }
@@ -333,9 +370,235 @@ pub(crate) fn public_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
         "active_service_id": active_id()?.unwrap_or_default(),
         "image_service_id": image_service_id()?.unwrap_or_default(),
         "media_services": load_selection()?.media_services,
+        "capability_fallbacks": load_selection()?.capability_fallbacks,
     }))
 }
 
+/// Built-in adapter metadata. Implementations remain in their domain modules;
+/// this registry is the shared discovery surface for capability routing and UI.
+pub(crate) fn builtin_media_adapters() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "id": "openai-images",
+            "capabilities": [CAP_IMAGE_GENERATE],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["text_to_image", "b64_response", "url_response"],
+            "limits": {"prompt_chars": 8000, "n": [1, 4], "input_images": 0},
+            "pricing": {"status": "unknown", "source": "provider_catalog"},
+            "usage": {"status": "unknown", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "openai-images-edit",
+            "capabilities": [CAP_IMAGE_EDIT],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["image_edit", "single_reference", "mask"],
+            "limits": {"prompt_chars": 8000, "n": [1, 4], "input_images": 1},
+            "pricing": {"status": "unknown", "source": "provider_catalog"},
+            "usage": {"status": "unknown", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "ark-images",
+            "capabilities": [CAP_IMAGE_GENERATE, CAP_IMAGE_EDIT],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["text_to_image", "image_edit", "multi_reference", "watermark_control"],
+            "limits": {"prompt_chars": 8000, "n": [1, 4], "input_images": 4},
+            "pricing": {"status": "unknown", "source": "provider_catalog"},
+            "usage": {"status": "unknown", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "ark-video",
+            "capabilities": [CAP_VIDEO_GENERATE],
+            "execution_modes": [MediaExecutionMode::Async],
+            "features": ["text_to_video", "image_to_video", "first_last_frame", "async_job", "cancel"],
+            "limits": {"prompt_chars": 8000, "input_images": 2, "duration_seconds": [1, 60]},
+            "pricing": {"status": "unknown", "source": "provider_catalog"},
+            "usage": {"status": "unknown", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "wan-video",
+            "capabilities": [CAP_VIDEO_GENERATE],
+            "execution_modes": [MediaExecutionMode::Async],
+            "features": ["text_to_video", "image_to_video", "first_frame", "async_job", "cancel", "prompt_extend"],
+            "limits": {"prompt_chars": 5000, "input_images": 1, "duration_seconds": [2, 15]},
+            "pricing": {"status": "provider_catalog", "source": "provider_catalog"},
+            "usage": {"status": "provider_reported", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "openai-speech",
+            "capabilities": [CAP_AUDIO_SPEECH],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["text_to_speech", "voice", "speed"],
+            "limits": {"text_chars": 4096, "speed": [0.25, 4.0]},
+            "pricing": {"status": "unknown", "source": "provider_catalog"},
+            "usage": {"status": "unknown", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "fish-audio-tts",
+            "capabilities": [CAP_AUDIO_SPEECH],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["text_to_speech", "voice_reference", "voice_clone_reference", "emotion_tags", "multiple_formats"],
+            "limits": {"text_chars": 4096, "speed": [0.5, 2.0], "formats": ["mp3", "wav", "pcm", "opus"]},
+            "pricing": {"status": "published", "source": "provider_catalog", "unit": "utf8_bytes"},
+            "usage": {"status": "reported_in_dashboard", "source": "provider_dashboard"},
+        }),
+        serde_json::json!({
+            "id": "openai-audio",
+            "capabilities": [CAP_AUDIO_TRANSCRIBE],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["transcription", "language_hint", "timestamps"],
+            "limits": {"prompt_chars": 2000},
+            "pricing": {"status": "unknown", "source": "provider_catalog"},
+            "usage": {"status": "unknown", "source": "provider_response"},
+        }),
+        serde_json::json!({
+            "id": "fish-audio-asr",
+            "capabilities": [CAP_AUDIO_TRANSCRIBE],
+            "execution_modes": [MediaExecutionMode::Sync],
+            "features": ["transcription", "language_hint", "timestamps", "speaker_turns", "emotion_events", "long_audio"],
+            "limits": {"duration_seconds": 3600, "audio_files": 1},
+            "pricing": {"status": "published", "source": "provider_catalog", "unit": "audio_hour"},
+            "usage": {"status": "reported_in_dashboard", "source": "provider_dashboard"},
+        }),
+    ]
+}
+
+fn adapter_for<'a>(adapters: &'a [serde_json::Value], id: &str) -> Option<&'a serde_json::Value> {
+    adapters.iter().find(|adapter| adapter["id"] == id)
+}
+
+fn adapter_field(
+    adapter: Option<&serde_json::Value>,
+    field: &str,
+    fallback: serde_json::Value,
+) -> serde_json::Value {
+    adapter
+        .and_then(|value| value.get(field))
+        .cloned()
+        .unwrap_or(fallback)
+}
+
+fn adapter_execution_modes(
+    adapters: &[serde_json::Value],
+    capability: &str,
+) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    for adapter in adapters {
+        let supports = adapter["capabilities"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == capability));
+        if !supports {
+            continue;
+        }
+        if let Some(modes) = adapter["execution_modes"].as_array() {
+            for mode in modes {
+                if let Some(value) = mode.as_str() {
+                    seen.insert(value.to_string());
+                }
+            }
+        }
+    }
+    if seen.is_empty() {
+        let fallback = match default_execution_mode(capability) {
+            MediaExecutionMode::Sync => "sync",
+            MediaExecutionMode::Stream => "stream",
+            MediaExecutionMode::Async => "async",
+        };
+        seen.insert(fallback.to_string());
+    }
+    seen.into_iter().map(serde_json::Value::String).collect()
+}
+
+/// A machine-readable snapshot of configured media providers. It never includes
+/// API keys or provider-specific request payloads.
+pub(crate) fn media_provider_catalog() -> Result<serde_json::Value, Box<dyn Error>> {
+    let services = list()?;
+    let selection = load_selection()?;
+    let adapters = builtin_media_adapters();
+    let providers = services
+        .iter()
+        .map(|service| {
+            let has_api_key = !service.encrypted_api_key.trim().is_empty();
+            let health = if has_api_key {
+                serde_json::json!({"state": "ready", "reason": "credential_present"})
+            } else {
+                serde_json::json!({"state": "unconfigured", "reason": "missing_credential"})
+            };
+            let media_capabilities = SUPPORTED_MEDIA_CAPABILITIES
+                .iter()
+                .filter_map(|capability| {
+                    binding_details_for(service, capability).map(|binding| {
+                        let adapter = adapter_for(&adapters, &binding.adapter);
+                        serde_json::json!({
+                            "capability": capability,
+                            "adapter": binding.adapter,
+                            "model": binding.model,
+                            "execution_mode": binding.execution_mode,
+                            "features": adapter_field(adapter, "features", serde_json::json!([])),
+                            "limits": adapter_field(adapter, "limits", serde_json::json!({})),
+                            "health": health,
+                            "pricing": adapter_field(adapter, "pricing", serde_json::json!({"status": "unknown", "source": "provider_catalog"})),
+                            "usage": adapter_field(adapter, "usage", serde_json::json!({"status": "unknown", "source": "provider_response"})),
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": service.id,
+                "display_name": service.display_name,
+                "base_url": service.base_url,
+                "protocol": service.protocol.as_str(),
+                "has_api_key": has_api_key,
+                "health": health,
+                "models": service.models,
+                "media_capabilities": media_capabilities,
+            })
+        })
+        .collect::<Vec<_>>();
+    let capabilities = SUPPORTED_MEDIA_CAPABILITIES
+        .iter()
+        .map(|capability| {
+            let configured_by = providers
+                .iter()
+                .filter(|provider| {
+                    provider
+                        .get("media_capabilities")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("capability").and_then(serde_json::Value::as_str)
+                                    == Some(*capability)
+                            })
+                        })
+                })
+                .filter_map(|provider| provider.get("id").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": capability,
+                "default_execution_mode": default_execution_mode(capability),
+                "execution_modes": adapter_execution_modes(&adapters, capability),
+                "adapter_count": adapters.iter().filter(|adapter| {
+                    adapter["capabilities"].as_array().is_some_and(|items| items.iter().any(|item| item == capability))
+                }).count(),
+                "configured_by": configured_by,
+                "configured": !configured_by.is_empty(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let route_plans = SUPPORTED_AI_CAPABILITIES
+        .iter()
+        .map(|capability| capability_route_plan(capability, ""))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(serde_json::json!({
+        "schema_version": "himind.media-provider-catalog.v2",
+        "adapters": adapters,
+        "providers": providers,
+        "capabilities": capabilities,
+        "routes": route_plans,
+        "defaults": selection.media_services,
+        "fallbacks": selection.capability_fallbacks,
+        "image_service_id": selection.image_service_id,
+    }))
+}
 pub(crate) fn upsert(input: CustomAIServiceInput) -> Result<CustomAIService, Box<dyn Error>> {
     upsert_internal(input, None, None, None)
 }
@@ -377,8 +640,13 @@ fn upsert_internal(
     if input.display_name.trim().is_empty() {
         return Err("display_name 不能为空".into());
     }
-    if input.model.trim().is_empty() {
-        return Err("model 不能为空".into());
+    let has_media_model = !input.image_model.trim().is_empty()
+        || input
+            .media
+            .values()
+            .any(|binding| !binding.model.trim().is_empty());
+    if input.model.trim().is_empty() && !has_media_model {
+        return Err("至少配置一个对话或媒体模型".into());
     }
     let now = crate::app::ai_provider_import::unix_now_seconds().to_string();
     let mut services = load_all()?;
@@ -410,8 +678,21 @@ fn upsert_internal(
             || item.encrypted_balance_access_token != encrypted_balance_access_token
             || api_key_replaced
     });
-    // 能力槽位是事实源；`image_model` / `image_adapter` 作为 `image.generate`
-    // 槽位的旧投影一并写回，保证旧版本 Agent 仍能读到生图配置。
+    let unsupported = input
+        .media
+        .keys()
+        .map(|capability| capability.trim())
+        .filter(|capability| !SUPPORTED_MEDIA_CAPABILITIES.contains(capability))
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "不支持的媒体能力槽位：{}；可选 {}",
+            unsupported.join("、"),
+            SUPPORTED_MEDIA_CAPABILITIES.join("、")
+        )
+        .into());
+    } // 能力槽位是事实源；`image_model` / `image_adapter` 作为 `image.generate`
+      // 槽位的旧投影一并写回，保证旧版本 Agent 仍能读到生图配置。
     let mut media = input
         .media
         .iter()
@@ -421,7 +702,7 @@ fn upsert_internal(
                 return None;
             }
             let adapter = if binding.adapter.trim().is_empty() {
-                DEFAULT_MEDIA_ADAPTER.to_string()
+                default_media_adapter(capability).to_string()
             } else {
                 binding.adapter.trim().to_string()
             };
@@ -430,6 +711,7 @@ fn upsert_internal(
                 MediaModelBinding {
                     adapter,
                     model: model.to_string(),
+                    execution_mode: binding.execution_mode,
                 },
             ))
         })
@@ -445,6 +727,7 @@ fn upsert_internal(
             MediaModelBinding {
                 adapter,
                 model: input.image_model.trim().to_string(),
+                execution_mode: None,
             },
         );
     }
@@ -543,32 +826,346 @@ pub(crate) fn load_secret(id: &str) -> Result<(CustomAIService, String), Box<dyn
     Ok((service.clone(), api_key))
 }
 
-/// 取某个服务在指定媒体能力上的「适配器 + 模型」；未配置该能力时返回 `None`。
-///
-/// `image.generate` 会回落到 `image_model` / `image_adapter` 这两个旧字段，
-/// 保证升级前后行为一致。
-pub(crate) fn binding_for(service: &CustomAIService, capability: &str) -> Option<(String, String)> {
-    let capability = capability.trim();
-    if let Some(binding) = service.media.get(capability) {
-        let model = binding.model.trim();
-        if !model.is_empty() {
-            let adapter = if binding.adapter.trim().is_empty() {
-                DEFAULT_MEDIA_ADAPTER.to_string()
-            } else {
-                binding.adapter.trim().to_string()
-            };
-            return Some((adapter, model.to_string()));
-        }
+pub(crate) fn default_media_adapter(capability: &str) -> &'static str {
+    match capability.trim() {
+        CAP_VIDEO_GENERATE => "ark-video",
+        CAP_AUDIO_SPEECH => "openai-speech",
+        CAP_AUDIO_TRANSCRIBE => "openai-audio",
+        _ => DEFAULT_MEDIA_ADAPTER,
     }
-    if capability == CAP_IMAGE_GENERATE && !service.image_model.trim().is_empty() {
+}
+
+/// The strongest persisted routing choice for a capability. Chat keeps using
+/// the active service, while media uses the per-capability default.
+pub(crate) fn configured_capability_service(
+    capability: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if capability.trim() == CAP_CHAT {
+        return active_id();
+    }
+    media_service_id(capability)
+}
+
+/// Explicit fallback order for a capability. An empty list means "do not
+/// silently substitute another provider".
+pub(crate) fn capability_fallbacks(capability: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    Ok(load_selection()?
+        .capability_fallbacks
+        .get(capability.trim())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Persist a same-capability fallback order. Every id must exist and actually
+/// support that capability; duplicates and the primary are ignored in the
+/// returned normalized list.
+pub(crate) fn set_capability_fallbacks(
+    capability: &str,
+    ids: Vec<String>,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let capability = capability.trim();
+    if !SUPPORTED_AI_CAPABILITIES.contains(&capability) {
+        return Err(format!("不支持的能力：{capability}").into());
+    }
+    let services = load_all()?;
+    let primary = configured_capability_service(capability)?.unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || id == primary || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let service = services
+            .get(id)
+            .ok_or_else(|| format!("自定义 AI 服务不存在：{id}"))?;
+        if !service_supports_capability(service, capability) {
+            return Err(format!("服务「{}」不支持能力 {capability}", service.display_name).into());
+        }
+        normalized.push(id.to_string());
+    }
+    let mut selection = load_selection()?;
+    if normalized.is_empty() {
+        selection.capability_fallbacks.remove(capability);
+    } else {
+        selection
+            .capability_fallbacks
+            .insert(capability.to_string(), normalized.clone());
+    }
+    write_selection(&selection)?;
+    Ok(normalized)
+}
+
+pub(crate) fn service_supports_capability(service: &CustomAIService, capability: &str) -> bool {
+    if capability == CAP_CHAT {
+        return !service.model.trim().is_empty();
+    }
+    binding_details_for(service, capability).is_some()
+}
+
+/// The default lifecycle for a media primitive. Providers may override it on the
+/// binding, but callers must not force every media operation into an async job.
+pub(crate) fn default_execution_mode(capability: &str) -> MediaExecutionMode {
+    match capability.trim() {
+        CAP_VIDEO_GENERATE => MediaExecutionMode::Async,
+        _ => MediaExecutionMode::Sync,
+    }
+}
+
+/// Resolve a capability binding without exposing provider credentials.
+pub(crate) fn binding_details_for(
+    service: &CustomAIService,
+    capability: &str,
+) -> Option<ResolvedMediaBinding> {
+    let capability = capability.trim();
+    if !SUPPORTED_MEDIA_CAPABILITIES.contains(&capability) {
+        return None;
+    }
+    let explicit = service.media.get(capability);
+    let (adapter, model, execution_mode) = if let Some(binding) = explicit {
+        let model = binding.model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        let adapter = if binding.adapter.trim().is_empty() {
+            default_media_adapter(capability).to_string()
+        } else {
+            binding.adapter.trim().to_string()
+        };
+        (
+            adapter,
+            model.to_string(),
+            binding
+                .execution_mode
+                .unwrap_or_else(|| default_execution_mode(capability)),
+        )
+    } else if capability == CAP_IMAGE_GENERATE && !service.image_model.trim().is_empty() {
         let adapter = if service.image_adapter.trim().is_empty() {
-            DEFAULT_MEDIA_ADAPTER.to_string()
+            default_media_adapter(capability).to_string()
         } else {
             service.image_adapter.trim().to_string()
         };
-        return Some((adapter, service.image_model.trim().to_string()));
+        (
+            adapter,
+            service.image_model.trim().to_string(),
+            default_execution_mode(capability),
+        )
+    } else {
+        return None;
+    };
+    Some(ResolvedMediaBinding {
+        adapter,
+        model,
+        execution_mode,
+    })
+}
+
+/// 取某个服务在指定媒体能力上的「适配器 + 模型」；未配置该能力时返回 `None`。
+///
+/// `image.generate` 会回落到 `image_model` / `image_adapter` 这两个旧字段，
+/// 保证升级前后行为一致。这是保留给旧调用方的兼容入口；新代码应使用
+/// [`binding_details_for`] 读取执行模式。
+pub(crate) fn binding_for(service: &CustomAIService, capability: &str) -> Option<(String, String)> {
+    binding_details_for(service, capability).map(|binding| (binding.adapter, binding.model))
+}
+
+/// Whether at least one saved service can satisfy a media capability.
+pub(crate) fn media_capability_configured(capability: &str) -> Result<bool, Box<dyn Error>> {
+    Ok(list()?
+        .iter()
+        .any(|service| binding_details_for(service, capability).is_some()))
+}
+
+/// Explain how a capability resolves without decrypting any credential.
+///
+/// This is the read model used by the settings UI and by the capability bus.
+/// It deliberately performs no provider I/O: eligibility here means "saved,
+/// bound, and has a credential", not "the provider is healthy right now".
+pub(crate) fn capability_route_plan(
+    capability: &str,
+    requested_service: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let capability = capability.trim();
+    if !SUPPORTED_AI_CAPABILITIES.contains(&capability) {
+        return Err(format!(
+            "不支持的能力：{capability}；可选 {}",
+            SUPPORTED_AI_CAPABILITIES.join("、")
+        )
+        .into());
     }
-    None
+    let services = list()?;
+    let candidates = services
+        .iter()
+        .filter(|service| service_supports_capability(service, capability))
+        .collect::<Vec<_>>();
+    let requested = requested_service
+        .trim()
+        .strip_prefix("custom:")
+        .unwrap_or(requested_service.trim());
+    let mut reason = "";
+    let mut selected: Option<&CustomAIService> = None;
+    if !requested.is_empty() {
+        let service = candidates
+            .iter()
+            .copied()
+            .find(|service| service.id == requested)
+            .ok_or_else(|| {
+                format!(
+                    "服务 {requested} 不存在或未配置能力 {capability}；请先在 AI 服务中绑定该能力"
+                )
+            })?;
+        selected = Some(service);
+        reason = "explicit_request";
+    } else if let Some(id) = configured_capability_service(capability)? {
+        selected = candidates.iter().copied().find(|service| service.id == id);
+        if selected.is_some() {
+            reason = if capability == CAP_CHAT {
+                "active_service"
+            } else {
+                "configured_default"
+            };
+        }
+    }
+    if selected.is_none() && candidates.len() == 1 {
+        selected = Some(candidates[0]);
+        reason = "only_candidate";
+    }
+    let fallbacks = capability_fallbacks(capability)?
+        .into_iter()
+        .filter(|id| selected.is_none_or(|service| service.id != *id))
+        .filter_map(|id| {
+            candidates
+                .iter()
+                .copied()
+                .find(|service| service.id == id)
+                .map(|service| (id, service))
+        })
+        .collect::<Vec<_>>();
+
+    let candidate_json = candidates
+        .iter()
+        .map(|service| {
+            let credential_ready = !service.encrypted_api_key.trim().is_empty();
+            let (adapter, model, execution_mode) = if capability == CAP_CHAT {
+                (
+                    service.protocol.as_str().to_string(),
+                    service.model.clone(),
+                    "sync".to_string(),
+                )
+            } else {
+                let binding = binding_details_for(service, capability)
+                    .ok_or_else(|| format!("服务 {} 的能力绑定已失效", service.id))?;
+                (
+                    binding.adapter,
+                    binding.model,
+                    match binding.execution_mode {
+                        MediaExecutionMode::Sync => "sync",
+                        MediaExecutionMode::Stream => "stream",
+                        MediaExecutionMode::Async => "async",
+                    }
+                    .to_string(),
+                )
+            };
+            let is_selected = selected.is_some_and(|selected| selected.id == service.id);
+            let fallback_index = fallbacks.iter().position(|(id, _)| id == &service.id);
+            let eligibility = if is_selected {
+                "selected"
+            } else if fallback_index.is_some() {
+                "fallback"
+            } else {
+                "candidate"
+            };
+            Ok(serde_json::json!({
+                "service_id": service.id,
+                "display_name": service.display_name,
+                "eligible": credential_ready,
+                "eligibility": eligibility,
+                "reason": if !credential_ready {
+                    "missing_credential"
+                } else if is_selected {
+                    reason
+                } else if fallback_index.is_some() {
+                    "configured_fallback"
+                } else {
+                    "not_selected"
+                },
+                "adapter": adapter,
+                "model": model,
+                "execution_mode": execution_mode,
+                "credential_present": credential_ready,
+            }))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+    let attempts = selected
+        .into_iter()
+        .map(|service| (service, "primary"))
+        .chain(fallbacks.iter().map(|(_, service)| (*service, "fallback")))
+        .filter(|(service, _)| !service.encrypted_api_key.trim().is_empty())
+        .map(|(service, role)| {
+            serde_json::json!({
+                "service_id": service.id,
+                "display_name": service.display_name,
+                "role": role,
+            })
+        })
+        .collect::<Vec<_>>();
+    let state = if selected.is_some() {
+        "resolved"
+    } else if candidates.is_empty() {
+        "missing"
+    } else {
+        "ambiguous"
+    };
+    let selected_binding = selected.and_then(|service| {
+        if capability == CAP_CHAT {
+            Some((
+                service.protocol.as_str().to_string(),
+                service.model.clone(),
+                "sync".to_string(),
+            ))
+        } else {
+            binding_details_for(service, capability).map(|binding| {
+                (
+                    binding.adapter,
+                    binding.model,
+                    match binding.execution_mode {
+                        MediaExecutionMode::Sync => "sync",
+                        MediaExecutionMode::Stream => "stream",
+                        MediaExecutionMode::Async => "async",
+                    }
+                    .to_string(),
+                )
+            })
+        }
+    });
+    Ok(serde_json::json!({
+        "schema_version": "himind.ai-capability-route.v1",
+        "capability": capability,
+        "state": state,
+        "reason": if selected.is_some() {
+            reason
+        } else if candidates.is_empty() {
+            "no_candidate"
+        } else {
+            "multiple_candidates_without_default"
+        },
+        "selected": selected.map(|service| serde_json::json!({
+            "service_id": service.id,
+            "display_name": service.display_name,
+            "adapter": selected_binding.as_ref().map(|binding| binding.0.clone()),
+            "model": selected_binding.as_ref().map(|binding| binding.1.clone()),
+            "execution_mode": selected_binding.as_ref().map(|binding| binding.2.clone()),
+        })),
+        "fallbacks": fallbacks.iter().map(|(_, service)| serde_json::json!({
+            "service_id": service.id,
+            "display_name": service.display_name,
+        })).collect::<Vec<_>>(),
+        "attempts": attempts,
+        "candidates": candidate_json,
+        "requires_cost_confirmation": capability != CAP_CHAT,
+        "fallback_policy": "same_capability_only",
+    }))
 }
 
 /// 解析某个媒体能力要用的服务与明文 Key。
@@ -788,9 +1385,16 @@ pub(crate) fn fetch_models(
     protocol: AIServiceProtocol,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     validate_base_url(base_url)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    let mut client_builder =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15));
+    if url::Url::parse(base_url.trim())
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+    {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build()?;
     let request = match protocol {
         AIServiceProtocol::Anthropic => client
             .get(anthropic_models_url(base_url))
@@ -840,8 +1444,10 @@ pub(crate) fn list_models(id: &str) -> Result<Vec<String>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_for, validate_base_url, AIServiceProtocol, CustomAIServiceInput, MediaModelBinding,
-        CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE, CAP_VIDEO_GENERATE,
+        binding_details_for, binding_for, default_execution_mode, validate_base_url,
+        AIServiceProtocol, CustomAIServiceInput, MediaExecutionMode, MediaModelBinding,
+        CAP_AUDIO_SPEECH, CAP_AUDIO_TRANSCRIBE, CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE,
+        CAP_VIDEO_GENERATE,
     };
     use std::io::{Read, Write};
     use std::path::PathBuf;
@@ -1162,6 +1768,7 @@ mod tests {
                 MediaModelBinding {
                     adapter: "ark-images".to_string(),
                     model: "doubao-seedream-5-0-pro".to_string(),
+                    execution_mode: None,
                 },
             );
             media.insert(
@@ -1169,6 +1776,7 @@ mod tests {
                 MediaModelBinding {
                     adapter: "ark-images".to_string(),
                     model: "doubao-seededit-4-0-i2i".to_string(),
+                    execution_mode: None,
                 },
             );
             let saved = super::upsert(CustomAIServiceInput {
@@ -1248,6 +1856,7 @@ mod tests {
                             MediaModelBinding {
                                 adapter: "openai-images-edit".to_string(),
                                 model: "edit-model".to_string(),
+                                execution_mode: None,
                             },
                         );
                         media
@@ -1282,6 +1891,243 @@ mod tests {
         });
     }
 
+    #[test]
+    fn builtin_adapter_registry_covers_all_media_capabilities() {
+        let adapters = super::builtin_media_adapters();
+        let serialized = serde_json::to_string(&adapters).unwrap();
+        assert!(serialized.contains("openai-images"));
+        assert!(serialized.contains("ark-video"));
+        assert!(serialized.contains("openai-speech"));
+        assert!(serialized.contains("openai-audio"));
+        assert!(serialized.contains("audio.speech"));
+        assert!(serialized.contains("audio.transcribe"));
+        for adapter in adapters {
+            assert!(adapter["features"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()));
+            assert!(adapter["limits"].is_object());
+            assert!(adapter["pricing"].is_object());
+            assert!(adapter["usage"].is_object());
+        }
+    }
+
+    #[test]
+    fn provider_catalog_reports_media_without_exposing_secrets() {
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_AUDIO_SPEECH.to_string(),
+                MediaModelBinding {
+                    adapter: "openai-speech".to_string(),
+                    model: "tts-1".to_string(),
+                    execution_mode: Some(MediaExecutionMode::Stream),
+                },
+            );
+            super::upsert(CustomAIServiceInput {
+                id: "voice".to_string(),
+                display_name: "Voice".to_string(),
+                base_url: "https://voice.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-catalog-secret".to_string(),
+            })
+            .expect("upsert voice");
+
+            let catalog = super::media_provider_catalog().expect("provider catalog");
+            let serialized = serde_json::to_string(&catalog).expect("serialize catalog");
+            assert!(serialized.contains("audio.speech"));
+            assert!(serialized.contains("openai-speech"));
+            assert!(!serialized.contains("sk-catalog-secret"));
+            let speech_capability = catalog["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == "audio.speech")
+                .unwrap();
+            assert_eq!(speech_capability["configured"], true);
+            assert!(speech_capability["execution_modes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mode| mode == "sync"));
+            assert_eq!(
+                speech_capability["execution_modes"],
+                serde_json::json!(["sync"])
+            );
+            assert_eq!(speech_capability["adapter_count"], 2);
+            let voice = catalog["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == "voice")
+                .unwrap();
+            assert_eq!(voice["health"]["state"], "ready");
+            let binding = &voice["media_capabilities"][0];
+            assert!(binding["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| feature == "text_to_speech"));
+            assert_eq!(binding["limits"]["text_chars"], 4096);
+            assert_eq!(binding["pricing"]["status"], "unknown");
+            assert_eq!(binding["usage"]["status"], "unknown");
+        });
+    }
+    #[test]
+    fn media_only_service_can_save_without_chat_model() {
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_IMAGE_GENERATE.to_string(),
+                MediaModelBinding {
+                    adapter: "openai-images".to_string(),
+                    model: "gpt-image-1".to_string(),
+                    execution_mode: None,
+                },
+            );
+            let saved = super::upsert(CustomAIServiceInput {
+                id: "media-only".to_string(),
+                display_name: "Media Only".to_string(),
+                base_url: "https://media.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: String::new(),
+                models: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-media-only".to_string(),
+            })
+            .expect("media-only service");
+            assert!(saved.model.is_empty());
+            assert_eq!(
+                super::binding_for(&saved, CAP_IMAGE_GENERATE),
+                Some(("openai-images".to_string(), "gpt-image-1".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn service_without_chat_or_media_model_is_rejected() {
+        with_isolated_home(|| {
+            let error = super::upsert(CustomAIServiceInput {
+                id: "empty-models".to_string(),
+                display_name: "Empty Models".to_string(),
+                base_url: "https://empty.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: String::new(),
+                models: Vec::new(),
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: std::collections::BTreeMap::new(),
+                api_key: "sk-empty".to_string(),
+            })
+            .expect_err("empty model service must fail");
+            assert!(error.to_string().contains("至少配置一个对话或媒体模型"));
+        });
+    }
+    #[test]
+    fn media_bindings_reject_unknown_capabilities_and_fields() {
+        let with_business_field: Result<MediaModelBinding, _> =
+            serde_json::from_value(serde_json::json!({
+                "adapter": "openai-speech",
+                "model": "tts-1",
+                "voice_license": "cc0"
+            }));
+        assert!(with_business_field.is_err());
+
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                "audio.mix".to_string(),
+                MediaModelBinding {
+                    adapter: "ffmpeg".to_string(),
+                    model: "mix".to_string(),
+                    execution_mode: None,
+                },
+            );
+            let error = super::upsert(CustomAIServiceInput {
+                id: "bad-media".to_string(),
+                display_name: "Bad Media".to_string(),
+                base_url: "https://bad.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-bad".to_string(),
+            })
+            .expect_err("business binding must be rejected");
+            assert!(error.to_string().contains("不支持的媒体能力槽位"));
+        });
+    }
+    #[test]
+    fn audio_provider_slots_round_trip_without_business_fields() {
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_AUDIO_SPEECH.to_string(),
+                MediaModelBinding {
+                    adapter: "openai-speech".to_string(),
+                    model: "tts-1".to_string(),
+                    execution_mode: Some(MediaExecutionMode::Stream),
+                },
+            );
+            media.insert(
+                CAP_AUDIO_TRANSCRIBE.to_string(),
+                MediaModelBinding {
+                    adapter: "openai-audio".to_string(),
+                    model: "whisper-1".to_string(),
+                    execution_mode: None,
+                },
+            );
+            super::upsert(CustomAIServiceInput {
+                id: "voice".to_string(),
+                display_name: "Voice".to_string(),
+                base_url: "https://voice.example/v1".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "chat".to_string(),
+                models: vec!["chat".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-voice".to_string(),
+            })
+            .expect("upsert audio slots");
+
+            let (service, _) = super::load_secret("voice").expect("load voice service");
+            assert!(super::media_capability_configured(CAP_AUDIO_SPEECH).unwrap());
+            assert!(super::media_capability_configured(CAP_AUDIO_TRANSCRIBE).unwrap());
+            assert_eq!(
+                binding_for(&service, CAP_AUDIO_SPEECH),
+                Some(("openai-speech".to_string(), "tts-1".to_string()))
+            );
+            assert_eq!(
+                binding_for(&service, CAP_AUDIO_TRANSCRIBE),
+                Some(("openai-audio".to_string(), "whisper-1".to_string()))
+            );
+            let speech = binding_details_for(&service, CAP_AUDIO_SPEECH).unwrap();
+            assert_eq!(speech.execution_mode, MediaExecutionMode::Stream);
+            let transcribe = binding_details_for(&service, CAP_AUDIO_TRANSCRIBE).unwrap();
+            assert_eq!(transcribe.execution_mode, MediaExecutionMode::Sync);
+            assert_eq!(
+                default_execution_mode(CAP_VIDEO_GENERATE),
+                MediaExecutionMode::Async
+            );
+            super::set_media_service(CAP_AUDIO_SPEECH, "voice").expect("pin speech");
+            assert_eq!(
+                super::media_service_id(CAP_AUDIO_SPEECH)
+                    .unwrap()
+                    .as_deref(),
+                Some("voice")
+            );
+            assert!(super::set_media_service("audio.mix", "voice").is_err());
+        });
+    }
     #[test]
     fn rejects_invalid_service_input() {
         assert!(validate_base_url("file:///etc/passwd").is_err());

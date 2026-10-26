@@ -1510,6 +1510,7 @@ mod tests {
 
     fn package(required_tools: Vec<&str>) -> WorkflowPackage {
         WorkflowPackage {
+            icon: String::new(),
             schema_version: crate::workflow::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.test".to_string(),
             version: "1.0.0".to_string(),

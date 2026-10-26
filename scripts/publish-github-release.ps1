@@ -171,7 +171,7 @@ try {
         [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_PUBLIC_KEY_PATH", $ExtensionPublicKeyPath, "Process")
         [Environment]::SetEnvironmentVariable("HIMIND_EXTENSION_SIGNING_KEY_ID", $ExtensionSigningKeyId, "Process")
     }
-    $packageArgs = @{ Version = $Version; OutputDirectory = $OutputRoot; Configuration = "release" }
+    $packageArgs = @{ Version = $Version; OutputDirectory = $OutputRoot; Configuration = "release"; RuntimeReleaseDirectory = $RuntimeReleaseDirectory }
     if ($WindowsCodeSigningCertificateThumbprint) {
         $packageArgs.WindowsCodeSigningCertificateThumbprint = $WindowsCodeSigningCertificateThumbprint
     }
@@ -232,7 +232,7 @@ if ($ExtensionPublicKeyPath) {
 
 $signaturePath = Join-Path $ReleaseDirectory "himind-agent-update.signature.json"
 if ($hasSigning) {
-    & (Join-Path (Split-Path -Parent $Root) "scripts\release\sign-artifact.ps1") `
+    & (Join-Path $PSScriptRoot "sign-artifact.ps1") `
         -ArtifactPath (Join-Path $ReleaseDirectory "himind-agent-update.zip") `
         -PrivateKeyPath $PrivateKeyPath -KeyId $SigningKeyId `
         -OutputPath $signaturePath -PackageType "directory-zip"

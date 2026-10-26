@@ -44,6 +44,9 @@ pub(crate) struct SkillManifest {
     pub scope: SkillScope,
     #[serde(default)]
     pub description: String,
+    /// Optional package-local PNG/WebP path used as the extension brand icon.
+    #[serde(default)]
+    pub icon: String,
     #[serde(default)]
     pub release_notes: String,
     #[serde(default)]
@@ -116,6 +119,8 @@ pub(crate) struct SkillRecord {
     pub manifest: SkillManifest,
     pub root: PathBuf,
     pub version_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
     pub current: bool,
     pub previous_version: Option<String>,
 }

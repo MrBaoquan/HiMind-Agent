@@ -41,7 +41,7 @@ impl BuiltinAiEventSync {
         options: Options,
         initial_capabilities: RuntimeCapabilities,
     ) -> (Self, EventObserver) {
-        if !options.mode().dashboard_enabled() {
+        if !crate::app::control_plane_provider::available(&options) {
             let capabilities = Arc::new(Mutex::new(initial_capabilities));
             return (
                 Self {
@@ -74,7 +74,7 @@ impl BuiltinAiEventSync {
             let mut last_outbox_replay = Instant::now();
             let mut heartbeat_target: Option<RuntimeHeartbeatTarget> = None;
             while !worker_shutdown.load(Ordering::Acquire) {
-                if !options.mode().dashboard_enabled() {
+                if !crate::app::control_plane_provider::available(&options) {
                     break;
                 }
                 match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -296,7 +296,7 @@ fn upload_event(
     capabilities: &Arc<Mutex<RuntimeCapabilities>>,
     event: &BuiltinAIRuntimeEvent,
 ) -> Result<Option<RuntimeHeartbeatTarget>, UploadError> {
-    if !options.mode().dashboard_enabled() {
+    if !crate::app::control_plane_provider::available(options) {
         return Err(UploadError {
             message: "当前运行模式不支持会话同步".to_string(),
             transient: false,

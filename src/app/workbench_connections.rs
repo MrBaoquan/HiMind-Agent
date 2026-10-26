@@ -74,11 +74,19 @@ pub(crate) fn add_workbench_connection(
     state: State<'_, AgentState>,
     api_base: String,
     display_name: String,
-    purpose: String,
 ) -> Result<WorkbenchConnectionsSnapshot, String> {
-    store_of(&state)?;
-    let connection = workbenches::add(&state.state_path, &api_base, &display_name, &purpose)
+    let store = store_of(&state)?;
+    let was_unconnected = store.active_connection_id().trim().is_empty();
+    let connection = workbenches::add(&state.state_path, &api_base, &display_name)
         .map_err(|error| error.to_string())?;
+    if was_unconnected {
+        // The first connection after an explicit disconnect becomes active
+        // immediately; otherwise the row would say "当前" without the live
+        // Agent actually following it.
+        workbenches::sync_active(&state.state_path, &state.options.api_base())
+            .map_err(|error| error.to_string())?;
+        apply_connection(&state, &connection)?;
+    }
     state
         .approval_manager
         .add_log("info", &format!("已添加工作台 {}", connection.display_name));
@@ -90,9 +98,8 @@ pub(crate) fn rename_workbench_connection(
     state: State<'_, AgentState>,
     id: String,
     display_name: String,
-    purpose: String,
 ) -> Result<WorkbenchConnectionsSnapshot, String> {
-    workbenches::rename(&state.state_path, &id, &display_name, &purpose)
+    workbenches::rename(&state.state_path, &id, &display_name)
         .map_err(|error| error.to_string())?;
     snapshot(&state)
 }
@@ -101,18 +108,45 @@ pub(crate) fn rename_workbench_connection(
 pub(crate) fn remove_workbench_connection(
     state: State<'_, AgentState>,
     id: String,
+    force: bool,
 ) -> Result<WorkbenchConnectionsSnapshot, String> {
     let store = store_of(&state)?;
-    let name = store
+    let connection = store
         .connections()
         .iter()
         .find(|connection| connection.id == id)
-        .map(|connection| connection.display_name.clone())
-        .unwrap_or_else(|| id.clone());
-    workbenches::remove(&state.state_path, &id).map_err(|error| error.to_string())?;
+        .cloned()
+        .ok_or_else(|| format!("未知的工作台连接: {id}"))?;
+    if connection.id == store.active_connection_id() && !force {
+        if let Some((task_id, task_type, _, _)) = state.options.task_execution() {
+            return Err(format!(
+                "{WORKBENCH_BUSY}: 任务 {task_id}（{task_type}）正在执行，移除当前工作台会中断它的连接"
+            ));
+        }
+    }
+    let replacement =
+        workbenches::remove(&state.state_path, &id).map_err(|error| error.to_string())?;
+    if connection.id == store.active_connection_id() {
+        match replacement {
+            Some(replacement_id) => {
+                let replacement = workbenches::load(&state.state_path)
+                    .map_err(|error| error.to_string())?
+                    .and_then(|store| {
+                        store
+                            .connections()
+                            .iter()
+                            .find(|connection| connection.id == replacement_id)
+                            .cloned()
+                    })
+                    .ok_or_else(|| "替代工作台连接已失效".to_string())?;
+                apply_connection(&state, &replacement)?;
+            }
+            None => disconnect(&state),
+        }
+    }
     state
         .approval_manager
-        .add_log("info", &format!("已移除工作台 {name}"));
+        .add_log("info", &format!("已移除工作台 {}", connection.display_name));
     snapshot(&state)
 }
 
@@ -245,7 +279,11 @@ pub(crate) async fn enroll_workbench_connection(
         let active = workbenches::switch(&state_path, &id).map_err(|error| error.to_string())?;
         options.set_api_base(&active.api_base);
         options.adopt_connection();
-        set_worker_status(&worker_status, &active, options.mode().dashboard_enabled());
+        set_worker_status(
+            &worker_status,
+            &active,
+            crate::app::control_plane_provider::available(&options),
+        );
 
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -264,7 +302,7 @@ pub(crate) async fn enroll_workbench_connection(
                 set_worker_status(
                     &worker_status,
                     &workbenches::active_connection(&state_path).unwrap_or(active),
-                    options.mode().dashboard_enabled(),
+                    crate::app::control_plane_provider::available(&options),
                 );
                 return Err(enrollment_failure(error.as_ref()));
             }
@@ -296,6 +334,19 @@ pub(crate) async fn enroll_workbench_connection(
 fn activate(state: &AgentState, id: &str) -> Result<(), String> {
     let connection =
         workbenches::switch(&state.state_path, id).map_err(|error| error.to_string())?;
+    apply_connection(state, &connection)?;
+    state.approval_manager.add_log(
+        "info",
+        &format!("已切换到工作台 {}", connection.display_name),
+    );
+    Ok(())
+}
+
+/// Apply a connection that the store has already materialised.
+fn apply_connection(
+    state: &AgentState,
+    connection: &workbenches::WorkbenchConnection,
+) -> Result<(), String> {
     state.options.set_api_base(&connection.api_base);
     state.options.adopt_connection();
     // Sessions and approvals were minted for the previous workbench's account.
@@ -306,14 +357,38 @@ fn activate(state: &AgentState, id: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     set_worker_status(
         &state.worker_status,
-        &connection,
-        state.options.mode().dashboard_enabled(),
-    );
-    state.approval_manager.add_log(
-        "info",
-        &format!("已切换到工作台 {}", connection.display_name),
+        connection,
+        crate::app::control_plane_provider::available(&state.options),
     );
     Ok(())
+}
+
+/// Removing the last connection is a real local disconnect, not a hidden
+/// fallback to localhost. Runtime mode must stop starting the remote worker.
+fn disconnect(state: &AgentState) {
+    if let Err(error) = crate::app::runtime_mode::save(
+        &state.state_path,
+        crate::app::runtime_mode::AgentMode::Independent,
+    ) {
+        state
+            .approval_manager
+            .add_log("warn", &format!("移除工作台时无法保存未连接状态: {error}"));
+    }
+    state
+        .options
+        .set_mode(crate::app::runtime_mode::AgentMode::Independent);
+    state.options.adopt_connection();
+    crate::app::ui::stop_builtin_ai_process();
+    let _ = crate::app::identity::cancel_authorization(&state.dashboard_authorization);
+    if let Err(error) = state.approval_manager.clear_identity() {
+        state
+            .approval_manager
+            .add_log("warn", &format!("移除工作台时清理审批身份失败: {error}"));
+    }
+    clear_worker_status(&state.worker_status);
+    state
+        .approval_manager
+        .add_log("info", "已断开本机与所有工作台的连接");
 }
 
 /// Enrollment failures are shown inside the HiMind account card, so the raw
@@ -353,6 +428,17 @@ fn restore(state_path: &std::path::Path, previous_active: &str, options: &crate:
         options.set_api_base(&previous.api_base);
     }
     options.adopt_connection();
+}
+
+fn clear_worker_status(status: &Arc<std::sync::Mutex<crate::store::types::LocalWorkerStatus>>) {
+    let Ok(mut status) = status.lock() else {
+        return;
+    };
+    status.dashboard_worker_online = false;
+    status.dashboard_agent_id.clear();
+    status.dashboard_worker_error.clear();
+    status.dashboard_worker_state = "not_applicable".to_string();
+    status.dashboard_worker_reason_code = "worker_not_managed".to_string();
 }
 
 fn set_worker_status(

@@ -4,7 +4,8 @@ import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
 import { useConfirm } from '../components/ConfirmDialog';
-import { ExtensionKindMark, extensionKindIcons } from '../components/ExtensionKindMark';
+import { extensionKindIcons } from '../components/ExtensionKindMark';
+import { ExtensionIcon } from '../components/ExtensionIcon';
 import { InstructionProjectionPanel } from '../components/InstructionProjectionPanel';
 import { OperationPlanCard } from '../components/OperationPlanCard';
 import { FUNCTIONAL_CATEGORIES } from '../data/categoryCatalog';
@@ -529,7 +530,7 @@ function ProjectListItem({ project, dashboardEnabled, busyAction, selected, onSe
   const state = projectState(project, dashboardEnabled, draft, active);
   const building = Boolean(project.local && busyAction === `build:${project.local.id}`);
   return <button className={`development-project-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(project.key)}>
-    <ExtensionKindMark kind={project.kind} size={16} label={extensionKindLabels[project.kind]} />
+    <ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={40} label={extensionKindLabels[project.kind]} />
     <span className="development-project-copy"><strong>{project.name}</strong><small title={`${extensionKindLabels[project.kind]} · ${projectSourceLabel(project)}${project.local ? ` · v${project.local.version}` : ''}`}>{listMeta(project)}</small>{active ? <small>{submissionStatus(active).label} · v{active.value.version}</small> : null}</span>
     <span className={`skill-state-label ${building ? 'warn' : state.tone}`}>{building ? '构建中' : state.label}</span>
   </button>;
@@ -574,7 +575,7 @@ function ProjectDetail({ project, dashboardEnabled, accountAuthorized, available
 
   return <>
       <header className="development-detail-header">
-      <div className="development-detail-title"><ExtensionKindMark kind={project.kind} size={16} /><div><div><h3>{project.name}</h3><Pill kind={state.tone}>{state.label}</Pill></div><small title={projectSourceIdentity(project)}>{extensionKindLabels[project.kind]} · {projectSourceLabel(project)} · v{version}</small></div></div>
+      <div className="development-detail-title"><ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={46} /><div><div><h3>{project.name}</h3><Pill kind={state.tone}>{state.label}</Pill></div><small title={projectSourceIdentity(project)}>{extensionKindLabels[project.kind]} · {projectSourceLabel(project)} · v{version}</small></div></div>
       <div className="development-detail-actions">
         {/* 这三个动作是这个页面上最常用的操作，图标 + 文字一起给，避免「点之前不知道是什么」。 */}
         {project.local?.workspace_available ? <button className="btn btn-primary" title="在这个项目目录里开一条 AI 会话" disabled={busy} onClick={() => onDevelopWithAi(project.local!)}><MessageCircle size={15} />用 AI 开发</button> : <button className="btn btn-primary" title="选择协作项目的本地目录" disabled={busy} onClick={() => void (project.remote ? onAssociateProject(project.remote) : onOpenProject())}><FolderOpen size={15} />关联本地项目</button>}

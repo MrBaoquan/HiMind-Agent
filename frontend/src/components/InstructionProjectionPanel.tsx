@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { CheckCircle2, CircleAlert, FileCode2, FolderPlus, PackagePlus, RefreshCw, RotateCcw, ShieldCheck, Upload } from 'lucide-react';
 import { BusyIndicator } from './BusyIndicator';
 import { Pill } from './Common';
+import { ExtensionIcon } from './ExtensionIcon';
 import { useConfirm } from './ConfirmDialog';
 import { agentApi, type InstructionPackDraft, type InstructionPackDraftInput, type InstructionPackTestResult, type InstructionProjectionPlan, type InstructionProjectionReceipt, type InstructionTargetDescriptor } from '../services/agentApi';
 
@@ -295,7 +296,7 @@ export function InstructionProjectionPanel({ workspaceRoot, disabled = false, em
       {packDrafts.length ? <div className="instruction-pack-drafts">
         <div className="instruction-section-head"><div><strong>规则版本</strong><small>发布后可在 HiMind 会话中选择，或同步到其他 AI 客户端</small></div><PackagePlus size={16} /></div>
         {packDrafts.slice(0, 5).map(draft => <article className="instruction-pack-draft" key={`${draft.manifest.id}:${draft.manifest.version}`}>
-          <div><strong>{draft.manifest.name}</strong><small>v{draft.manifest.version} · {draft.source}{draft.published_at ? ' · 已发布' : draft.confirmed_at ? ' · 已确认' : draft.tested_at ? ' · 已检查' : ' · 草稿'}</small></div>
+          <div className="instruction-pack-draft-main"><ExtensionIcon kind="instruction" name={draft.manifest.name} icon={draft.icon} size={36} /><div><strong>{draft.manifest.name}</strong><small>v{draft.manifest.version} · {draft.source}{draft.published_at ? ' · 已发布' : draft.confirmed_at ? ' · 已确认' : draft.tested_at ? ' · 已检查' : ' · 草稿'}</small></div></div>
           <div className="instruction-target-actions">
             {!draft.tested_at ? <button type="button" className="btn" disabled={packBusy || disabled} onClick={() => void testInstructionPack(draft)}>检查</button> : null}
             {draft.tested_at && !draft.confirmed_at ? <button type="button" className="btn" disabled={packBusy || disabled} onClick={() => void confirmInstructionPack(draft)}>确认</button> : null}

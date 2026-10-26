@@ -80,20 +80,21 @@ fn foreground_dialog_parent() -> Option<ForegroundDialogParent> {
 // for headless testing but no longer starts a GUI event loop.
 pub(crate) fn run_local_app(options: Options) -> Result<(), Box<dyn Error>> {
     let port = options.local_port;
+    let provider = crate::app::control_plane_provider::status(&options);
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
         dashboard_agent_id: String::new(),
-        dashboard_worker_error: if options.mode().dashboard_enabled() {
+        dashboard_worker_error: if provider.available {
             "正在连接 Dashboard 任务 Worker".to_string()
         } else {
             String::new()
         },
-        dashboard_worker_state: if options.mode().dashboard_enabled() {
+        dashboard_worker_state: if provider.available {
             "connecting".to_string()
         } else {
             "not_applicable".to_string()
         },
-        dashboard_worker_reason_code: if options.mode().dashboard_enabled() {
+        dashboard_worker_reason_code: if provider.available {
             "connected_agent_app_starting".to_string()
         } else {
             "independent_mode_no_control_plane".to_string()
@@ -195,7 +196,7 @@ pub(crate) fn start_background_services(
                 }
             });
     }
-    if options.mode().dashboard_enabled() {
+    if crate::app::control_plane_provider::available(&options) {
         let reconcile_options = options.clone();
         let _ = thread::Builder::new()
             .name("himind-vscode-reconcile-loop".to_string())
@@ -249,7 +250,7 @@ pub(crate) fn start_background_services(
     let _ = thread::Builder::new()
         .name("himind-extension-source-reconcile-loop".to_string())
         .spawn(move || loop {
-            if source_reconcile_options.mode().dashboard_enabled() {
+            if crate::app::control_plane_provider::available(&source_reconcile_options) {
                 if let Err(error) = crate::app::trust::sync(&source_reconcile_options) {
                     eprintln!("distribution trust sync failed: {error}");
                 }
@@ -272,7 +273,7 @@ pub(crate) fn start_background_services(
                 }
                 Err(error) => eprintln!("local extension source reconcile failed: {error}"),
             }
-            if source_reconcile_options.mode().dashboard_enabled() {
+            if crate::app::control_plane_provider::available(&source_reconcile_options) {
                 thread::sleep(Duration::from_secs(60));
             } else {
                 thread::sleep(Duration::from_secs(300));
@@ -335,7 +336,7 @@ pub(crate) fn start_background_services(
                         };
                         loop {
                             // 已对接工作台时更新走工作台通道，本循环让位。
-                            if update_options.mode().dashboard_enabled() {
+                            if crate::app::control_plane_provider::available(&update_options) {
                                 thread::sleep(Duration::from_secs(60));
                                 continue;
                             }
@@ -490,7 +491,7 @@ fn handle_local_http(
     }
     let mut local_principal = None;
     if let Some(operation) = local_operation(method, &path) {
-        if !options.mode().dashboard_enabled() {
+        if !crate::app::control_plane_provider::available(&options) {
             local_principal = Some(LocalAgentTicketPrincipal {
                 user_id: "local-user".to_string(),
                 session_id_hash: "independent-mode".to_string(),
@@ -546,7 +547,7 @@ fn handle_local_http(
     }
     match (method, path.as_str()) {
         ("POST", "/enroll") => {
-            if !options.mode().dashboard_enabled() {
+            if !crate::app::control_plane_provider::status(&options).enabled_by_user {
                 return write_local_response(
                     &mut stream,
                     400,
@@ -632,7 +633,7 @@ fn handle_local_http(
             }
         }
         ("POST", "/vscode/enrollment/exchange") => {
-            if !options.mode().dashboard_enabled() {
+            if !crate::app::control_plane_provider::status(&options).enabled_by_user {
                 return write_local_response(
                     &mut stream,
                     400,
@@ -683,7 +684,7 @@ fn handle_local_http(
                     )
                 }
             };
-            let invocation = if !options.mode().dashboard_enabled() {
+            let invocation = if !crate::app::control_plane_provider::available(&options) {
                 InvocationContext::new(
                     crate::capability::types::InvocationSource::LocalHttp,
                     "local-user",

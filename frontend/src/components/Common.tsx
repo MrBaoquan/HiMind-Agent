@@ -38,7 +38,7 @@ export function PageHeader({ title, description, actions }: { title: string; des
   return (
     <header className={`page-header${actions ? ' has-actions' : ''}`}>
       <div>
-        <h2>{title}</h2>
+        <h1>{title}</h1>
         {description ? <p>{description}</p> : null}
       </div>
       {actions ? <div className="page-actions">{actions}</div> : null}

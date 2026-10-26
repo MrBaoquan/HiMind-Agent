@@ -264,7 +264,15 @@ pub(crate) fn fetch_ai_service_templates_with_token(
     agent_id: &str,
     client_id: &str,
 ) -> Result<Vec<AiProviderTemplate>, Box<dyn Error>> {
-    let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let mut client_builder = Client::builder().timeout(Duration::from_secs(20));
+    if url::Url::parse(api_base.trim())
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+    {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build()?;
     let response = client
         .get(format!(
             "{}/api/integrations/ai/personal-connections/catalog",

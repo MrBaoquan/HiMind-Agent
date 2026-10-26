@@ -29,6 +29,9 @@ const FILLERS = ['帮你', '让你', '可以实现', '需要注意的是', '温�
 // 空值占位句。没有内容就该直接不渲染，而不是印一句「暂无说明」。
 const PLACEHOLDERS = ['暂无说明。', '暂无描述。', '暂无简介。', '未提供更新说明。', '未提供项目说明。', '暂无更新说明。'];
 
+// 工作台只是可选 provider；页面用连接状态表达能力是否可用，不暴露内部运行模式。
+const FORBIDDEN_PRODUCT_CONCEPTS = ['独立模式', '独立运行', '本机模式'];
+
 const han = (text: string) => (text.match(/[\u4e00-\u9fa5]/g) || []).length;
 
 // 去掉注释但保留字符串字面量：注释里出现长句是正常的，不该计入文案。
@@ -183,6 +186,7 @@ for (const file of files) {
     if (length > BUDGET.hardCap) where(file, text, BUDGET.hardCap, '单条文案超出硬上限');
     for (const filler of FILLERS) if (text.includes(filler)) where(file, text, BUDGET.hardCap, `含填充语「${filler}」`);
     for (const placeholder of PLACEHOLDERS) if (text.includes(placeholder)) where(file, text, BUDGET.hardCap, `空值占位句「${placeholder}」`);
+    for (const concept of FORBIDDEN_PRODUCT_CONCEPTS) if (text.includes(concept)) where(file, text, BUDGET.hardCap, `出现过期产品概念「${concept}」`);
     if (length >= 12) {
       const seen = duplicates.get(text);
       if (seen) seen.count++;

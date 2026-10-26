@@ -4,12 +4,23 @@ param(
     [string]$Configuration = "release",
     [switch]$SkipDependencyInstall,
     [switch]$SkipTests,
-    [switch]$SkipIntegration
+    [switch]$SkipIntegration,
+    [string]$RuntimeReleaseDirectory,
+    [switch]$SkipRuntimeBundle,
+    [switch]$EnableIncremental
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+. (Join-Path $PSScriptRoot "runtime-bundle.ps1")
+
+# Release/package builds are not interactive edit loops. Rust incremental data for
+# this crate can grow by several GB per build session, while the release profile
+# does not use it anyway. Keep it opt-in for developers who explicitly want it.
+if (-not $EnableIncremental) {
+    $env:CARGO_INCREMENTAL = "0"
+}
 
 function Invoke-Checked {
     param([string]$Description, [scriptblock]$Command)
@@ -43,7 +54,9 @@ if (-not $SkipIntegration) {
 }
 
 Invoke-Checked "Rust formatting check" { & cargo fmt --check }
-Invoke-Checked "Rust compile check" { & cargo check --locked }
+$CargoCheckArguments = @("check", "--locked")
+if ($Configuration -eq "release") { $CargoCheckArguments += "--release" }
+Invoke-Checked "Rust compile check" { & cargo @CargoCheckArguments }
 if (-not $SkipTests) {
     Invoke-Checked "Rust tests" { & cargo test --locked }
 }
@@ -70,4 +83,9 @@ Invoke-Checked "Agent MCP companion build" {
 }
 
 $TargetDirectory = Join-Path $Root "target\$Configuration"
+if (-not $SkipRuntimeBundle) {
+    $Runtime = Resolve-RuntimeReleaseDirectory $RuntimeReleaseDirectory
+    $RuntimeDestination = Copy-RuntimeBundle -RuntimeReleaseDirectory $Runtime.Directory -DestinationDirectory (Join-Path $TargetDirectory "resources\runtime")
+    Write-Host "Bundled Runtime pinned: $($Runtime.Manifest.version) -> $RuntimeDestination"
+}
 Write-Host "HiMind Agent build completed: $TargetDirectory"

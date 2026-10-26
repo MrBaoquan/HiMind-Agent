@@ -147,7 +147,7 @@ fn save_cache(items: &[AiServiceTemplate], synced_at: &str) -> Result<(), String
 /// 目录读取失败不阻塞 AI 服务页其他数据。
 pub(crate) fn list(options: &Options) -> AiServiceTemplateList {
     let cached = load_cache();
-    if !options.mode().dashboard_enabled() {
+    if !crate::app::control_plane_provider::available(options) {
         return AiServiceTemplateList {
             source: SOURCE_CACHE.to_string(),
             reason: Some("independent".to_string()),

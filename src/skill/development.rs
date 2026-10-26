@@ -115,10 +115,19 @@ fn record_at(root: &Path) -> Option<SkillRecord> {
         return None;
     }
     let manifest = load_skill_manifest(root).ok()?;
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "skill",
+        &manifest.id,
+        root,
+        Some(&manifest.icon),
+    )
+    .ok()
+    .flatten();
     Some(SkillRecord {
         manifest,
         root: root.to_path_buf(),
         version_root: root.to_path_buf(),
+        icon,
         current: true,
         previous_version: None,
     })
@@ -145,6 +154,7 @@ mod tests {
     fn write_skill(root: &Path, id: &str, version: &str) {
         fs::create_dir_all(root).unwrap();
         let manifest = crate::skill::types::SkillManifest {
+            icon: String::new(),
             id: id.to_string(),
             name: "开发直挂测试".to_string(),
             author: "马宝全".to_string(),

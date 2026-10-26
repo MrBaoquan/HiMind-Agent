@@ -5,7 +5,7 @@ import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, Pill, Tags } from '../components/Common';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
 import { PluginCredentialsPanel } from '../components/PluginCredentialsPanel';
-import { ExtensionKindMark } from '../components/ExtensionKindMark';
+import { ExtensionIcon } from '../components/ExtensionIcon';
 import { ExtensionBatchUpdateDialog } from '../components/ExtensionBatchUpdateDialog';
 import { OperationPlanCard } from '../components/OperationPlanCard';
 import { compareSemanticVersions, installActionLabel } from './marketCatalog';
@@ -240,7 +240,7 @@ function PluginDetail({ item, capabilities, catalog, catalogEnabled, onLoadVersi
     <>
       <div className="plugin-detail-header">
         <div className="plugin-detail-title">
-          <ExtensionKindMark kind="plugin" />
+          <ExtensionIcon kind="plugin" name={item.name || item.id} icon={item.icon} size={48} />
           <div className="plugin-title-line"><h3>{item.name || item.id}</h3>{item.kind === 'connector' ? <Pill kind="neutral">连接器</Pill> : null}<Pill kind={item.circuit_open ? 'danger' : item.status === 'installed' && item.enabled ? 'success' : item.status === 'failed' ? 'danger' : 'warn'}>{item.circuit_open || item.status === 'failed' ? '运行异常' : item.enabled ? '已安装' : '已停用'}</Pill>{item.development ? <Pill kind="warn">开发中</Pill> : null}{governanceTag ? <Pill kind={governanceTag.tone}>{governanceTag.label}</Pill> : null}</div>
         </div>
         {/* 回滚暂时不暴露入口（后端与 registry 里的 previous 版本都保留），详情级只留更新、启用与卸载。 */}

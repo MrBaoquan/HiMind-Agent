@@ -9,6 +9,7 @@ use crate::api::client::{
     heartbeat_with_runtime_installations, load_or_register, poll_tasks, register_agent,
 };
 use crate::api::distribution::load_or_register as load_distribution;
+use crate::app::control_plane_provider;
 use crate::approval::manager::ApprovalManager;
 use crate::store::types::LocalWorkerStatus;
 use crate::{execute_task, flush_report_outbox, Options, VERSION};
@@ -60,7 +61,7 @@ pub(crate) fn run_loop(
     worker_status: Option<Arc<Mutex<LocalWorkerStatus>>>,
     approval_mgr: Option<Arc<ApprovalManager>>,
 ) -> Result<(), Box<dyn Error>> {
-    if !options.mode().dashboard_enabled() {
+    if !control_plane_provider::available(&options) {
         set_status(&worker_status, "not_applicable", false, "", "");
         return Ok(());
     }
@@ -171,7 +172,7 @@ pub(crate) fn run_loop(
         let mut last_heartbeat_error = String::new();
         let mut heartbeat_failures: u32 = 0;
         while !heartbeat_stop_for_thread.load(Ordering::Relaxed) {
-            if !heartbeat_options.mode().dashboard_enabled() {
+            if !control_plane_provider::available(&heartbeat_options) {
                 set_status(&heartbeat_status, "not_applicable", false, "", "");
                 break;
             }
@@ -352,7 +353,7 @@ pub(crate) fn run_loop(
     let update_thread = thread::spawn(move || {
         let mut distribution_state = distribution_state;
         while !update_stop_for_thread.load(Ordering::Relaxed) {
-            if !update_options.mode().dashboard_enabled() {
+            if !control_plane_provider::available(&update_options) {
                 break;
             }
             if distribution_state.is_none() {
@@ -401,7 +402,7 @@ pub(crate) fn run_loop(
     let reconcile_thread = thread::spawn(move || {
         let mut generation = String::new();
         while !reconcile_stop_for_thread.load(Ordering::Relaxed) {
-            if !reconcile_options.mode().dashboard_enabled() {
+            if !control_plane_provider::available(&reconcile_options) {
                 break;
             }
             if let Err(error) = crate::app::extension_orchestrator::reconcile(
@@ -427,7 +428,7 @@ pub(crate) fn run_loop(
     let mut poll_retry_delay = Duration::from_secs(2);
     let mut last_poll_error = String::new();
     loop {
-        if !options.mode().dashboard_enabled() {
+        if !control_plane_provider::available(&options) {
             return Ok(());
         }
         if restart_requested.load(Ordering::SeqCst)
@@ -550,7 +551,7 @@ pub(crate) fn run_supervisor(
             approval_mgr.clone(),
         ) {
             Ok(()) => {
-                let independent = !options.mode().dashboard_enabled();
+                let independent = !control_plane_provider::available(&options);
                 set_status(
                     &Some(Arc::clone(&worker_status)),
                     if independent {
@@ -572,7 +573,7 @@ pub(crate) fn run_supervisor(
                 // 关闭「AI 工作台」后保持待命：开关重新打开时自动重新对接，
                 // 不需要重启 Agent。
                 retry_delay = Duration::from_secs(2);
-                while !options.mode().dashboard_enabled() {
+                while !control_plane_provider::available(&options) {
                     thread::sleep(Duration::from_secs(2));
                 }
             }

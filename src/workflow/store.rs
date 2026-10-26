@@ -681,6 +681,9 @@ impl WorkflowStore {
                 "workflow",
                 package_id,
             );
+            crate::app::extension_icons::clear_user_override_after_uninstall(
+                "workflow", package_id,
+            );
             return Ok(None);
         }
         self.save_installation(&installation)?;
@@ -722,6 +725,7 @@ impl WorkflowStore {
             "workflow",
             package_id,
         );
+        crate::app::extension_icons::clear_user_override_after_uninstall("workflow", package_id);
         Ok(true)
     }
 

@@ -643,7 +643,7 @@ fn remove_json_config(content: &str) -> Result<String, Box<dyn Error>> {
 
 fn mcp_arguments(options: &Options) -> Vec<String> {
     let mut arguments = vec!["--mcp".to_string()];
-    if options.mode().dashboard_enabled() {
+    if crate::app::control_plane_provider::available(options) {
         arguments.extend(["--api".to_string(), options.api_base().clone()]);
     }
     // The development launcher can use a process-local mode override.

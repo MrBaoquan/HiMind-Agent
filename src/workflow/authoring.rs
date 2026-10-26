@@ -27,6 +27,8 @@ pub(crate) struct WorkflowDraftManifest {
     pub description: String,
     pub version: String,
     #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
     pub release_notes: String,
     /// 工作流要求的最低 Agent 版本。
     ///
@@ -302,6 +304,7 @@ fn save_from_source_to_root(
             name: package.name,
             description: package.description,
             version: package.version,
+            icon: package.icon,
             release_notes: package.release_notes,
             min_agent_version: package.min_agent_version,
             capabilities: package.capabilities,

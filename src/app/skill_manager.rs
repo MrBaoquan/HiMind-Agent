@@ -727,6 +727,7 @@ mod tests {
 
     fn catalog_skill() -> SkillCatalogItem {
         SkillCatalogItem {
+            icon: None,
             skill_id: "com.himind.skill.unsigned".to_string(),
             name: "未签名 Skill".to_string(),
             description: String::new(),

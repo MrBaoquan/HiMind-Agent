@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X } from 'lucide-react';
 import { SETTINGS_RAIL_GROUPS, settingsRailItemMatch, settingsRailItemMatches, splitSettingsRailLabel, type SettingsRailKey } from '../settingsModel';
 
@@ -36,6 +36,11 @@ export function SettingsWindow({ activeKey, onSelect, children }: SettingsWindow
 function SettingsRail({ activeKey, onSelect }: { activeKey: SettingsRailKey; onSelect: (key: SettingsRailKey) => void }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const clearSearch = () => {
+    setQuery('');
+    searchRef.current?.focus();
+  };
   // 输入即过滤会让左栏每敲一个字都重排一次；200ms 足够盖住连续输入。
   useEffect(() => {
     const timer = window.setTimeout(() => setFilter(query.trim()), 200);
@@ -56,6 +61,7 @@ function SettingsRail({ activeKey, onSelect }: { activeKey: SettingsRailKey; onS
         <Search size={14} aria-hidden="true" />
         <span className="sr-only">搜索设置</span>
         <input
+          ref={searchRef}
           type="search"
           value={query}
           placeholder="搜索设置"
@@ -64,7 +70,7 @@ function SettingsRail({ activeKey, onSelect }: { activeKey: SettingsRailKey; onS
           onKeyDown={event => {
             if (event.key === 'Escape') {
               event.preventDefault();
-              setQuery('');
+              clearSearch();
               return;
             }
             // 回车直接进第一条命中项，省掉「搜索 → 看清 → 再点」这一步。
@@ -74,7 +80,7 @@ function SettingsRail({ activeKey, onSelect }: { activeKey: SettingsRailKey; onS
             }
           }}
         />
-        {query ? <button type="button" className="settings-rail-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setQuery('')}><X size={13} /></button> : null}
+        {query ? <button type="button" className="settings-rail-search-clear" title="清除搜索" aria-label="清除搜索" onClick={clearSearch}><X size={13} /></button> : null}
       </label>
       <nav className="settings-rail-nav" aria-label="设置分类">
         {groups.map(group => (

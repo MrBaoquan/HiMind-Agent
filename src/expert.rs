@@ -77,6 +77,9 @@ pub(crate) struct ExpertDefinition {
     pub min_agent_version: String,
     #[serde(default)]
     pub description: String,
+    /// Optional package-local PNG/WebP path used as the extension brand icon.
+    #[serde(default)]
+    pub icon: String,
     #[serde(default)]
     pub supported_clients: Vec<String>,
     #[serde(default)]
@@ -110,6 +113,8 @@ pub(crate) struct ExpertSummary {
     pub digest: String,
     pub builtin: bool,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -654,6 +659,7 @@ pub(crate) fn save(input: ExpertDraftInput) -> Result<ExpertSummary, Box<dyn Err
         release_notes: "创建初始版本。".into(),
         min_agent_version: crate::VERSION.into(),
         description: input.description,
+        icon: String::new(),
         supported_clients: normalize(input.supported_clients),
         skill_refs: normalize(input.skill_refs),
         workflow_refs: normalize(input.workflow_refs),
@@ -851,6 +857,18 @@ pub(crate) fn export_package(
         "EXPERT.md".to_string(),
         definition.instructions.as_bytes().to_vec(),
     );
+    if !definition.icon.trim().is_empty() {
+        let root = store_version_root(&definition.id, &definition.version);
+        crate::app::extension_icons::resolve_manifest_icon(
+            "expert",
+            &definition.id,
+            &root,
+            Some(&definition.icon),
+        )?
+        .ok_or("专家声明的图标文件不存在")?;
+        let icon_name = definition.icon.trim().replace('\\', "/");
+        files.insert(icon_name.clone(), fs::read(root.join(icon_name))?);
+    }
     let checksums = files
         .iter()
         .map(|(name, bytes)| format!("{:x}  {name}\n", Sha256::digest(bytes)))
@@ -894,19 +912,20 @@ pub(crate) fn import_package(package_path: &Path) -> Result<ExpertSummary, Box<d
     }
     let file = File::open(source)?;
     let mut archive = zip::ZipArchive::new(file)?;
-    if archive.len() != 3 {
-        return Err("专家包必须只包含 expert.json、EXPERT.md 和 checksums.sha256".into());
+    if !(3..=4).contains(&archive.len()) {
+        return Err("专家包必须包含 expert.json、EXPERT.md、checksums.sha256，以及可选图标".into());
     }
     let mut files = std::collections::BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let name = entry.name().replace('\\', "/");
+        let root_file = matches!(
+            name.as_str(),
+            "expert.json" | "EXPERT.md" | "checksums.sha256"
+        );
+        let icon_file = crate::app::extension_icons::validate_icon_reference(&name).is_ok();
         if entry.is_dir()
-            || name.contains('/')
-            || !matches!(
-                name.as_str(),
-                "expert.json" | "EXPERT.md" | "checksums.sha256"
-            )
+            || (!root_file && !icon_file)
             || entry.size() > MAX_EXPERT_CONTENT_BYTES as u64
         {
             return Err("专家包包含不支持的路径或内容".into());
@@ -954,11 +973,35 @@ pub(crate) fn import_package(package_path: &Path) -> Result<ExpertSummary, Box<d
         return Err("expert.json 与 EXPERT.md 内容不一致".into());
     }
     validate(&definition)?;
+    let declared_icon = definition.icon.trim().replace('\\', "/");
+    for name in files.keys() {
+        if matches!(name.as_str(), "expert.json" | "EXPERT.md") {
+            continue;
+        }
+        if declared_icon.is_empty() || name != &declared_icon {
+            return Err("专家包包含未声明的附加文件".into());
+        }
+    }
+    let icon_bytes = if declared_icon.is_empty() {
+        None
+    } else {
+        Some(
+            files
+                .get(&declared_icon)
+                .ok_or("专家包缺少 expert.json 声明的图标")?,
+        )
+    };
     let root = store_version_root(&definition.id, &definition.version);
     if root.exists() {
         let existing: ExpertDefinition =
             serde_json::from_slice(&fs::read(root.join("expert.json"))?)?;
-        if digest(&existing)? != digest(&definition)? {
+        let same_icon = match icon_bytes {
+            Some(bytes) => fs::read(root.join(&declared_icon))
+                .ok()
+                .is_some_and(|value| value == *bytes),
+            None => true,
+        };
+        if digest(&existing)? != digest(&definition)? || !same_icon {
             return Err("本机已存在相同版本的不同专家内容".into());
         }
         return Ok(summary(&existing, active()?.as_ref(), false));
@@ -969,6 +1012,13 @@ pub(crate) fn import_package(package_path: &Path) -> Result<ExpertSummary, Box<d
         serde_json::to_vec_pretty(&definition)?,
     )?;
     fs::write(root.join("EXPERT.md"), instructions)?;
+    if let Some(bytes) = icon_bytes {
+        let icon_path = root.join(&declared_icon);
+        if let Some(parent) = icon_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(icon_path, bytes)?;
+    }
     Ok(summary(&definition, active()?.as_ref(), false))
 }
 
@@ -1099,6 +1149,14 @@ fn summary(
     active: Option<&ExpertActivation>,
     builtin: bool,
 ) -> ExpertSummary {
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "expert",
+        &definition.id,
+        &store_version_root(&definition.id, &definition.version),
+        Some(&definition.icon),
+    )
+    .ok()
+    .flatten();
     ExpertSummary {
         id: definition.id.clone(),
         name: definition.name.clone(),
@@ -1112,6 +1170,7 @@ fn summary(
         capability_count: definition.capability_refs.len(),
         digest: digest(definition).unwrap_or_default(),
         builtin,
+        icon,
         active: active.is_some_and(|item| {
             item.expert_id == definition.id && item.version == definition.version
         }),
@@ -1158,6 +1217,10 @@ fn validate(definition: &ExpertDefinition) -> Result<(), Box<dyn Error>> {
     }
     validate_id(&definition.id)?;
     validate_version(&definition.version)?;
+    if !definition.icon.trim().is_empty() {
+        crate::app::extension_icons::validate_icon_reference(&definition.icon)
+            .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    }
     if definition.instructions.trim().is_empty() {
         return Err("专家说明不能为空".into());
     }
@@ -1274,9 +1337,11 @@ fn yaml_text(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::store::paths::test_env_lock;
+    use image::{ImageBuffer, Rgba};
 
     fn test_definition(id: &str, name: &str, instructions: &str) -> ExpertDefinition {
         ExpertDefinition {
+            icon: String::new(),
             schema_version: EXPERT_SCHEMA_VERSION.into(),
             id: id.into(),
             name: name.into(),
@@ -1320,6 +1385,59 @@ mod tests {
             format!("{DSH_PRESET_FILE_HEADER}[]\n")
         );
         match old {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expert_icon_is_optional_and_package_local() {
+        let mut definition = test_definition(
+            "com.himind.expert.icon",
+            "Icon expert",
+            "Follow the project instructions.",
+        );
+        definition.icon = "assets/icon.png".into();
+        assert!(validate_definition(&definition).is_ok());
+        definition.icon = "../icon.png".into();
+        assert!(validate_definition(&definition).is_err());
+    }
+
+    #[test]
+    fn expert_package_round_trips_the_declared_icon() {
+        let _guard = test_env_lock();
+        let root =
+            std::env::temp_dir().join(format!("himind-expert-icon-package-{}", std::process::id()));
+        let imported_root = root.join("imported-home");
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        let mut definition = test_definition(
+            "com.himind.expert.icon-package",
+            "Icon package expert",
+            "Keep the icon in the package.",
+        );
+        definition.icon = "assets/icon.png".into();
+        store_test_definition(&definition);
+        let version_root = store_version_root(&definition.id, &definition.version);
+        fs::create_dir_all(version_root.join("assets")).unwrap();
+        let image = ImageBuffer::from_pixel(128, 128, Rgba([20u8, 80, 140, 255]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(version_root.join("assets/icon.png"), cursor.into_inner()).unwrap();
+        let package = root.join("icon-package.hmexpert");
+        export_package(&definition.id, &definition.version, &package).unwrap();
+
+        std::env::set_var("HIMIND_AGENT_HOME", &imported_root);
+        let summary = import_package(&package).unwrap();
+        assert_eq!(summary.icon.as_ref().unwrap().source, "author");
+        let imported_icon =
+            store_version_root(&definition.id, &definition.version).join("assets/icon.png");
+        assert!(imported_icon.is_file());
+
+        match previous {
             Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
             None => std::env::remove_var("HIMIND_AGENT_HOME"),
         }

@@ -619,6 +619,7 @@ mod tests {
 
     fn item(url: &str) -> WorkflowCatalogItem {
         WorkflowCatalogItem {
+            icon: None,
             workflow_id: "com.himind.workflow.test".to_string(),
             name: "Test Workflow".to_string(),
             description: String::new(),

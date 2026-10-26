@@ -278,6 +278,7 @@ mod tests {
     #[test]
     fn removes_credential_handles_from_capability_input() {
         let package = WorkflowPackage {
+            icon: String::new(),
             schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.test".to_string(),
             version: "1.0.0".to_string(),

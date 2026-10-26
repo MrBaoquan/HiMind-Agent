@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import {
   BookOpen,
   ArrowLeft,
@@ -25,7 +25,7 @@ import {
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, Pill, Tags } from '../components/Common';
 import { ActionMenu, ActionMenuItem } from '../components/ActionMenu';
-import { ExtensionKindMark } from '../components/ExtensionKindMark';
+import { ExtensionIcon } from '../components/ExtensionIcon';
 import { OperationPlanCard } from '../components/OperationPlanCard';
 import type { ClientCapabilityMatrix, CodexSkillStatusItem, CodexSkillStatusResponse, ExtensionDesiredItem, ExtensionDesiredState, McpTargetDescriptor, OrganizationSkillCatalogItem, PluginCatalogItem, PluginRegistry, SkillCatalogResponse, SkillInstallPlan, SkillWorkspaceStatus } from '../services/agentApi';
 import { compareSemanticVersions, installActionLabel } from './marketCatalog';
@@ -384,7 +384,25 @@ function aggregateClientState(states: CodexSkillStatusItem['client_state'][]): C
 }
 
 function SkillDetailTabs({ value, onChange }: { value: 'details' | 'versions'; onChange: (value: 'details' | 'versions') => void }) {
-  return <div className="extension-detail-tabs" role="tablist"><button role="tab" aria-selected={value === 'details'} className={value === 'details' ? 'active' : ''} onClick={() => onChange('details')}>详情</button><button role="tab" aria-selected={value === 'versions'} className={value === 'versions' ? 'active' : ''} onClick={() => onChange('versions')}>版本</button></div>;
+  const tabOrder: Array<'details' | 'versions'> = ['details', 'versions'];
+  const selectTab = (next: 'details' | 'versions', focus = false) => {
+    onChange(next);
+    if (focus) requestAnimationFrame(() => document.getElementById(`skill-detail-tab-${next}`)?.focus());
+  };
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    let next = index;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % tabOrder.length;
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + tabOrder.length) % tabOrder.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = tabOrder.length - 1;
+    else return;
+    event.preventDefault();
+    selectTab(tabOrder[next], true);
+  };
+  return <div className="extension-detail-tabs" role="tablist" aria-label="技能详情视图" aria-orientation="horizontal">
+    <button id="skill-detail-tab-details" role="tab" aria-selected={value === 'details'} aria-controls="skill-detail-panel" tabIndex={value === 'details' ? 0 : -1} className={value === 'details' ? 'active' : ''} onKeyDown={event => onKeyDown(event, 0)} onClick={() => selectTab('details')}>详情</button>
+    <button id="skill-detail-tab-versions" role="tab" aria-selected={value === 'versions'} aria-controls="skill-detail-panel" tabIndex={value === 'versions' ? 0 : -1} className={value === 'versions' ? 'active' : ''} onKeyDown={event => onKeyDown(event, 1)} onClick={() => selectTab('versions')}>版本</button>
+  </div>;
 }
 
 type SkillVersionDisplay = Pick<OrganizationSkillCatalogItem, 'version' | 'release_notes' | 'published_at'>;
@@ -493,13 +511,14 @@ function SkillDetail({ item, workspace, clientStatus, clientMatrix, availablePlu
     return () => { active = false; };
   }, [catalogPolicy, manifest.id, onLoadVersions, tab]);
   return <>
-    <header className="skill-detail-header"><div className="skill-detail-title"><ExtensionKindMark kind="skill" /><div><div className="skill-title-line"><h3>{manifest.name}</h3><Pill kind={statePill(item.client_state)}>{clientStateLabel(item.client_state)}</Pill></div><small className="skill-detail-source">作者：{manifest.author || '未知作者'}</small></div></div><div className="skill-detail-actions">
+    <header className="skill-detail-header"><div className="skill-detail-title"><ExtensionIcon kind="skill" name={manifest.name || manifest.id} icon={item.record.icon} size={48} /><div><div className="skill-title-line"><h3>{manifest.name}</h3><Pill kind={statePill(item.client_state)}>{clientStateLabel(item.client_state)}</Pill></div><small className="skill-detail-source">作者：{manifest.author || '未知作者'}</small></div></div><div className="skill-detail-actions">
       {/* 详情级动作只留两个：同步这一份技能、卸载。投放范围与安装目录都在对应分区里，
           不在这里重复堆入口——右上角堆成一排按钮会像补丁。 */}
       {item.available_actions.includes('repair') ? <button className="btn" disabled={actionBusy} onClick={() => onRepair(manifest.id)}>{item.client_state === 'modified' ? <><Wrench size={15} />修复并备份</> : <><PlugZap size={15} />重新同步</>}</button> : null}
       {item.available_actions.includes('uninstall') && catalogPolicy?.allow_uninstall !== false ? <button className="btn btn-danger-quiet" disabled={actionBusy} onClick={onUninstall}><Trash2 size={15} />卸载</button> : null}
     </div></header>
     <SkillDetailTabs value={tab} onChange={setTab} />
+    <div id="skill-detail-panel" role="tabpanel" aria-labelledby={`skill-detail-tab-${tab}`} className="skill-detail-panel">
     {item.readiness.state !== 'ready' ? <div className="skill-detail-notice"><CircleAlert size={16} /><div><strong>{item.readiness.state === 'blocked' ? '当前不可安装' : '部分功能不可用'}</strong><span>{readinessReasonText(item) || '请安装所需插件或更新 HiMind Agent。'}</span></div></div> : null}
     {item.client_state === 'modified' ? <div className="skill-detail-notice modified"><Wrench size={16} /><div><strong>检测到技能文件已被修改</strong><span>修复前会自动保留一份备份。</span></div></div> : null}
     {item.client_state === 'render_stale' ? <div className="skill-detail-notice modified"><RefreshCw size={16} /><div><strong>渲染方式与当前设置不一致</strong><span>文件内容与同步记录一致，重新同步即可按当前设置重排。</span></div></div> : null}
@@ -538,6 +557,7 @@ function SkillDetail({ item, workspace, clientStatus, clientMatrix, availablePlu
       })}{!manifest.plugin_dependencies?.length ? <span className="skill-section-empty">无依赖</span> : null}</div></section>
       <details className="plugin-technical-panel"><summary>开发者信息</summary><div className="plugin-technical-grid"><div><span>技能 ID</span><code>{manifest.id}</code></div><div><span>作者</span><strong>{manifest.author || '未知作者'}</strong></div><div><span>来源</span><strong>{scopeLabel(manifest.scope)}</strong></div><div><span>最近同步</span><strong>{formatSyncedAt(item.last_synced_at)}</strong></div><div className="wide"><span>本地目录</span><code>{item.rendered_root || '--'}</code></div></div><div className="skill-file-summary"><span /><button className="text-action" disabled={!item.rendered} onClick={() => onOpenDirectory(item.rendered_root)}><FolderOpen size={14} />打开目录</button></div></details>
     </>}
+    </div>
   </>;
 }
 

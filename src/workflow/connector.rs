@@ -503,6 +503,14 @@ pub(crate) fn resolve_connector_credentials_for_capability_with_redactions(
             let resolved = crate::store::connector_credentials::resolve(handle)?;
             let Some(resolved) = resolved else {
                 if credential.required {
+                    let _ = crate::store::plugin_credentials::record_audit(
+                        "workflow",
+                        &package.id,
+                        handle,
+                        capability_id,
+                        "denied",
+                        "connector_credential_missing",
+                    );
                     return Err(
                         format!("workflow connector credential is missing: {handle}").into(),
                     );
@@ -510,12 +518,28 @@ pub(crate) fn resolve_connector_credentials_for_capability_with_redactions(
                 continue;
             };
             if resolved.connector_id != connector.id {
+                let _ = crate::store::plugin_credentials::record_audit(
+                    "workflow",
+                    &package.id,
+                    handle,
+                    capability_id,
+                    "denied",
+                    "connector_credential_owner_mismatch",
+                );
                 return Err(format!(
                     "workflow connector credential {} belongs to {}, not {}",
                     handle, resolved.connector_id, connector.id
                 )
                 .into());
             }
+            let _ = crate::store::plugin_credentials::record_audit(
+                "workflow",
+                &package.id,
+                handle,
+                capability_id,
+                "allowed",
+                "",
+            );
             input.insert(
                 credential.target.clone(),
                 serde_json::Value::String(resolved.value.clone()),
@@ -609,6 +633,7 @@ mod tests {
             }],
         };
         let package = super::super::WorkflowPackage {
+            icon: String::new(),
             schema_version: super::super::WORKFLOW_PACKAGE_SCHEMA_VERSION.to_string(),
             id: "com.himind.workflow.test".to_string(),
             version: "1.0.0".to_string(),

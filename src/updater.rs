@@ -2,10 +2,11 @@ mod install_layout;
 
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +26,9 @@ struct UpdateArgs {
     staged_launcher: PathBuf,
     #[serde(default)]
     staged_vscode_extension: Option<PathBuf>,
+    staged_runtime_manifest: PathBuf,
+    staged_runtime_package: PathBuf,
+    staged_runtime_signature: PathBuf,
     api_base: String,
     from_version: String,
     target_version: String,
@@ -109,8 +113,26 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
             Ok(canonical)
         })
         .transpose()?;
+    let staged_runtime_manifest = canonical_staged_path(&args.staged_runtime_manifest, &root)?;
+    let staged_runtime_package = canonical_staged_path(&args.staged_runtime_package, &root)?;
+    let staged_runtime_signature = canonical_staged_path(&args.staged_runtime_signature, &root)?;
     let staged_package = canonical_staged_path(&args.staged_package, &root)?;
     wait_for_old_agent_exit(args)?;
+    let runtime_bundle = match install_runtime_bundle(
+        &root,
+        &staged_runtime_manifest,
+        &staged_runtime_package,
+        &staged_runtime_signature,
+    ) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let detail = format!("内置 Runtime 更新失败，已回退到旧 Agent：{error}");
+            let _ = launch_for_recovery(args, &current, &args.from_version);
+            let _ = report_update_result(args, "rolled_back", &detail);
+            let _ = update_local_status(args, "rolled_back", &detail);
+            return Err(detail.into());
+        }
+    };
     let had_active_version = install_layout::read_active_version(&root)?.is_some();
     let target_dir = install_layout::prepare_version_directory(
         &root,
@@ -175,6 +197,7 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
         return Err(detail.into());
     }
     let _ = fs::remove_file(&staged_launcher);
+    runtime_bundle.commit();
     if let Err(error) = schedule_updater_self_replace(&root, &staged_updater, &staged_package) {
         append_warning(
             &mut warning,
@@ -192,6 +215,120 @@ fn run_update(args: &UpdateArgs) -> Result<(), Box<dyn Error>> {
         let _ = report_update_result(args, "update_success", &warning);
     }
     Ok(())
+}
+
+struct RuntimeBundleTransaction {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+    committed: bool,
+}
+
+impl RuntimeBundleTransaction {
+    fn commit(mut self) {
+        self.committed = true;
+        if let Some(backup) = self.backup.take() {
+            let _ = fs::remove_dir_all(backup);
+        }
+    }
+}
+
+impl Drop for RuntimeBundleTransaction {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.target);
+        if let Some(backup) = self.backup.take() {
+            let _ = fs::rename(backup, &self.target);
+        }
+    }
+}
+
+fn install_runtime_bundle(
+    root: &Path,
+    manifest_path: &Path,
+    package_path: &Path,
+    signature_path: &Path,
+) -> Result<RuntimeBundleTransaction, Box<dyn Error>> {
+    let manifest = read_json_value(manifest_path)?;
+    let file_name = manifest
+        .get("file_name")
+        .and_then(|value| value.as_str())
+        .ok_or("bundled Runtime manifest has no file_name")?;
+    if file_name.contains('/')
+        || file_name.contains('\\')
+        || !file_name.ends_with(".zip")
+        || file_name.len() > 180
+    {
+        return Err("bundled Runtime package name is unsafe".into());
+    }
+    let expected_sha = manifest
+        .get("sha256")
+        .and_then(|value| value.as_str())
+        .ok_or("bundled Runtime manifest has no sha256")?;
+    if expected_sha.len() != 64 || !expected_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("bundled Runtime manifest has an invalid sha256".into());
+    }
+    let mut package = fs::File::open(package_path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = package.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual_sha = format!("{:x}", digest.finalize());
+    if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+        return Err("bundled Runtime package SHA-256 mismatch".into());
+    }
+    let signature = read_json_value(signature_path)?;
+    if signature.get("file_name").and_then(|value| value.as_str()) != Some(file_name)
+        || signature.get("sha256").and_then(|value| value.as_str()) != Some(expected_sha)
+    {
+        return Err("bundled Runtime signature metadata does not match its manifest".into());
+    }
+
+    let resources = root.join("resources");
+    fs::create_dir_all(&resources)?;
+    let staging = resources.join(format!(".runtime.installing-{}", std::process::id()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<RuntimeBundleTransaction, Box<dyn Error>> {
+        fs::copy(manifest_path, staging.join("himind-runtime-release.json"))?;
+        fs::copy(package_path, staging.join(file_name))?;
+        fs::copy(
+            signature_path,
+            staging.join(format!("{file_name}.signature.json")),
+        )?;
+        let target = resources.join("runtime");
+        let backup = resources.join(format!(".runtime.previous-{}", std::process::id()));
+        if backup.exists() {
+            fs::remove_dir_all(&backup)?;
+        }
+        let had_target = target.exists();
+        if had_target {
+            fs::rename(&target, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staging, &target) {
+            if had_target {
+                let _ = fs::rename(&backup, &target);
+            }
+            return Err(error.into());
+        }
+        Ok(RuntimeBundleTransaction {
+            target,
+            backup: had_target.then_some(backup),
+            committed: false,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
 }
 
 fn append_warning(target: &mut String, message: &str) {
@@ -968,16 +1105,116 @@ mod tests {
         prepare_version_directory, read_active_version, write_active_version,
     };
     use super::{
-        assess_health, canonical_staged_helper, health_matches_update, plain_path, probe_health,
-        read_json_value, replace_helper, staged_path_allowed,
+        assess_health, canonical_staged_helper, health_matches_update, install_runtime_bundle,
+        plain_path, probe_health, read_json_value, replace_helper, staged_path_allowed,
     };
     use serde_json::json;
+    use sha2::Digest;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn installs_the_bundled_runtime_before_switching_agent_versions() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-runtime-{unique}"));
+        fs::create_dir_all(root.join("resources/runtime")).unwrap();
+        fs::write(root.join("resources/runtime/old.zip"), b"old").unwrap();
+
+        let package = root.join("staged-runtime.zip");
+        let package_bytes = b"runtime-package";
+        fs::write(&package, package_bytes).unwrap();
+        let sha256 = format!("{:x}", sha2::Sha256::digest(package_bytes));
+        let manifest = root.join("staged-runtime.package.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({
+                "version": "1.2.3",
+                "file_name": "himind-runtime.zip",
+                "sha256": sha256,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let signature = root.join("staged-runtime.signature.json");
+        fs::write(
+            &signature,
+            serde_json::to_vec(&json!({
+                "file_name": "himind-runtime.zip",
+                "sha256": sha256,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_runtime_bundle(&root, &manifest, &package, &signature)
+            .unwrap()
+            .commit();
+
+        assert!(root
+            .join("resources/runtime/himind-runtime-release.json")
+            .is_file());
+        assert_eq!(
+            fs::read(root.join("resources/runtime/himind-runtime.zip")).unwrap(),
+            package_bytes
+        );
+        assert!(!root.join("resources/runtime/old.zip").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uncommitted_runtime_bundle_restores_previous_release() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-updater-runtime-rollback-{unique}"));
+        fs::create_dir_all(root.join("resources/runtime")).unwrap();
+        fs::write(root.join("resources/runtime/old.zip"), b"old").unwrap();
+
+        let package = root.join("staged-runtime.zip");
+        let package_bytes = b"runtime-package";
+        fs::write(&package, package_bytes).unwrap();
+        let sha256 = format!("{:x}", sha2::Sha256::digest(package_bytes));
+        let manifest = root.join("staged-runtime.package.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({
+                "version": "1.2.3",
+                "file_name": "himind-runtime.zip",
+                "sha256": sha256,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let signature = root.join("staged-runtime.signature.json");
+        fs::write(
+            &signature,
+            serde_json::to_vec(&json!({
+                "file_name": "himind-runtime.zip",
+                "sha256": sha256,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let transaction = install_runtime_bundle(&root, &manifest, &package, &signature).unwrap();
+        assert!(root.join("resources/runtime/himind-runtime.zip").is_file());
+        drop(transaction);
+
+        assert_eq!(
+            fs::read(root.join("resources/runtime/old.zip")).unwrap(),
+            b"old"
+        );
+        assert!(!root.join("resources/runtime/himind-runtime.zip").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn installs_version_side_by_side_and_switches_pointer() {

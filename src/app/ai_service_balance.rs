@@ -171,6 +171,25 @@ fn balance_endpoint(profile_id: &str, base_url: &str) -> Result<String, String> 
     Ok(url.to_string())
 }
 
+trait LoopbackEndpoint {
+    fn is_loopback_http_url(&self) -> bool;
+}
+
+impl LoopbackEndpoint for str {
+    fn is_loopback_http_url(&self) -> bool {
+        let Ok(url) = url::Url::parse(self) else {
+            return false;
+        };
+        match url.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Domain(host)) => {
+                host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+            }
+            None => false,
+        }
+    }
+}
 fn request_balance_payload(
     profile_id: &str,
     endpoint: &str,
@@ -178,9 +197,13 @@ fn request_balance_payload(
     access_token: &str,
     user_id: Option<&str>,
 ) -> Result<Value, String> {
-    let client = Client::builder()
+    let mut client_builder = Client::builder()
         .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    if endpoint.is_loopback_http_url() {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder
         .build()
         .map_err(|_| "无法初始化余额查询连接".to_string())?;
     let mut builder = client

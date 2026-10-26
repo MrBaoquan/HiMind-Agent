@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
@@ -154,6 +155,107 @@ pub(crate) struct PluginCapabilityManifest {
     pub timeout_seconds: u64,
 }
 
+/// 插件声明的一个凭据字段。
+///
+/// 旧清单使用 `"api_key"` 这样的字符串；新清单使用对象来声明展示名、公开/秘密
+/// 属性和输入类型。反序列化同时接受两种写法，序列化统一输出对象，避免 UI 和
+/// broker 继续猜测字段语义。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PluginCredentialField {
+    pub key: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_credential_field_type")]
+    #[serde(rename = "type")]
+    pub field_type: String,
+    #[serde(default = "default_true")]
+    pub secret: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default)]
+    pub help: String,
+}
+
+impl PluginCredentialField {
+    pub(crate) fn display_label(&self) -> &str {
+        if self.label.trim().is_empty() {
+            self.key.as_str()
+        } else {
+            self.label.as_str()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginCredentialField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(key) => {
+                let key = key.trim().to_string();
+                Ok(Self {
+                    label: key.clone(),
+                    key,
+                    field_type: default_credential_field_type(),
+                    secret: true,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                })
+            }
+            Value::Object(map) => {
+                let key = map
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string();
+                let field_type = map
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("password")
+                    .to_string();
+                Ok(Self {
+                    label: map
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                    key,
+                    field_type,
+                    secret: map.get("secret").and_then(Value::as_bool).unwrap_or(true),
+                    required: map
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    placeholder: map
+                        .get("placeholder")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                    help: map
+                        .get("help")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "credential field must be a string or object",
+            )),
+        }
+    }
+}
+
 /// 插件声明的一条凭据需求。字段尽量少：凭据的语义由 Agent 侧统一解释。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct PluginCredentialRequest {
@@ -162,18 +264,33 @@ pub(crate) struct PluginCredentialRequest {
     /// 展示名（如「微信小程序 AppSecret」）。
     #[serde(default)]
     pub label: String,
-    /// api_key | oauth | userpass | cookie —— 只影响界面提示与字段拆分。
+    /// api_key | oauth | userpass | cookie | file —— 只影响界面提示与字段拆分。
     #[serde(default)]
     pub kind: String,
-    /// 多字段凭据的字段名；留空表示单值。
+    /// 多字段凭据的字段描述；旧版字符串字段仍可读取。
     #[serde(default)]
-    pub fields: Vec<String>,
+    pub fields: Vec<PluginCredentialField>,
     #[serde(default)]
     pub required: bool,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub docs_url: String,
+    /// Optional plugin capability that checks whether the saved profile is usable.
+    #[serde(default)]
+    pub verify_capability: String,
+}
+
+fn default_credential_field_type() -> String {
+    "password".to_string()
+}
+
+pub(crate) fn credential_declaration_fingerprint(
+    credentials: &[PluginCredentialRequest],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(credentials).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -184,6 +301,9 @@ pub(crate) struct PluginManifest {
     pub author: String,
     #[serde(default)]
     pub description: String,
+    /// Optional package-local PNG/WebP path used as the extension brand icon.
+    #[serde(default)]
+    pub icon: String,
     #[serde(default)]
     pub release_notes: String,
     pub version: String,
@@ -206,9 +326,8 @@ pub(crate) struct PluginManifest {
     pub permissions: Vec<String>,
     /// 插件声明的凭据需求（用户自己的账号/密钥）。
     ///
-    /// S1 只做「声明 + Agent 统一保管」：值以 DPAPI 按当前 Windows 用户加密、按插件
-    /// 隔离，插件自己拿不到明文，只能查到「配没配」。凭据的轮换、审计、卸载清理都
-    /// 需要一个统一持有者，散在各插件目录里的配置文件一条都做不到。
+    /// 值以 DPAPI 按当前 Windows 用户加密、按插件隔离；运行时由 Agent 的
+    /// per-invocation broker 校验声明、指纹和权限后按需下发。插件不能直接读取存储。
     #[serde(default)]
     pub credentials: Vec<PluginCredentialRequest>,
     #[serde(default)]
@@ -299,10 +418,13 @@ pub(crate) struct PluginRegistryItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides_installed_version: Option<String>,
     pub capabilities: Vec<PluginCapabilityManifest>,
+    pub credentials: Vec<PluginCredentialRequest>,
     pub permissions: Vec<String>,
     pub plugin_dependencies: Vec<PluginDependencyManifest>,
     pub views: Vec<PluginViewContribution>,
     pub commands: Vec<PluginCommandContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::app::extension_icons::ExtensionIconInfo>,
     pub error: Option<String>,
     pub failure_count: u32,
     pub circuit_open: bool,
@@ -973,7 +1095,9 @@ pub(crate) fn plugin_manifest_dependency_issues(manifest: &PluginManifest) -> Ve
                 previous_version: None,
                 rollback_available: false,
                 overrides_installed_version: None,
+                icon: None,
                 capabilities: manifest.capabilities.clone(),
+                credentials: manifest.credentials.clone(),
                 permissions: manifest.permissions.clone(),
                 plugin_dependencies: manifest.plugin_dependencies.clone(),
                 views: manifest.contributes.views.clone(),
@@ -1016,6 +1140,20 @@ pub(crate) fn builtin_plugin_entry(plugin_id: &str) -> Option<PluginRegistryItem
 
 fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
     vec![
+        builtin_plugin(
+            "com.himind.workbench.dashboard",
+            "AI 工作台",
+            crate::VERSION,
+            "内置控制面 provider：承载工作台连接、授权、任务、同步和远端审批生命周期。",
+            &[
+                "workbench.context.resolve",
+                "workbench.project.context.get",
+                "workbench.exhibit.context.get",
+                "workbench.work.summary.get",
+                "workbench.knowledge.search",
+            ],
+            &["dashboard.business.read", "dashboard.knowledge.search", "oauth.delegated_user"],
+        ),
         // 扩展开发工具以「内置插件」形态存在：注册表里可见（来源 builtin → UI 显示
         // 「系统内置」）、不可卸载；能力由内核实现。同一 ID 的外部副本不加载、
         // 不允许安装，避免同一个插件出现两个实现。
@@ -1023,7 +1161,7 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
             "com.himind.extension-development-tools",
             "扩展开发工具",
             crate::extension_toolchain::DEVELOPMENT_TOOLS_PLUGIN_VERSION,
-            "随 Agent 发布的内置开发工具：新建骨架、校验、构建与打包，独立模式可用。",
+            "随 Agent 发布的内置开发工具：新建骨架、校验、构建与打包，不连接工作台也可用。",
             &crate::extension_toolchain::BUILTIN_CAPABILITIES,
             &[],
         ),
@@ -1093,6 +1231,79 @@ fn builtin_plugin_items() -> Vec<PluginRegistryItem> {
     ]
 }
 
+fn builtin_credential_requests(id: &str) -> Vec<PluginCredentialRequest> {
+    match id {
+        "com.himind.builtin.svn" => vec![PluginCredentialRequest {
+            id: "svn.account".to_string(),
+            label: "SVN 账号".to_string(),
+            kind: "userpass".to_string(),
+            fields: vec![
+                PluginCredentialField {
+                    key: "base_url".to_string(),
+                    label: "仓库地址".to_string(),
+                    field_type: "url".to_string(),
+                    secret: false,
+                    required: true,
+                    placeholder: "https://svn.example.com/repo".to_string(),
+                    help: String::new(),
+                },
+                PluginCredentialField {
+                    key: "username".to_string(),
+                    label: "账号".to_string(),
+                    field_type: "text".to_string(),
+                    secret: false,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                },
+                PluginCredentialField {
+                    key: "password".to_string(),
+                    label: "密码".to_string(),
+                    field_type: "password".to_string(),
+                    secret: true,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                },
+            ],
+            required: true,
+            description: "用于访问当前账号有权限的 SVN 项目仓库。".to_string(),
+            docs_url: String::new(),
+            verify_capability: "svn.connection.test".to_string(),
+        }],
+        "com.himind.builtin.inner-admin" => vec![PluginCredentialRequest {
+            id: "inner-admin.account".to_string(),
+            label: "内网平台账号".to_string(),
+            kind: "userpass".to_string(),
+            fields: vec![
+                PluginCredentialField {
+                    key: "username".to_string(),
+                    label: "账号".to_string(),
+                    field_type: "text".to_string(),
+                    secret: false,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                },
+                PluginCredentialField {
+                    key: "password".to_string(),
+                    label: "密码".to_string(),
+                    field_type: "password".to_string(),
+                    secret: true,
+                    required: true,
+                    placeholder: String::new(),
+                    help: String::new(),
+                },
+            ],
+            required: true,
+            description: "用于内网工程同步、代码上传和展项信息读取。".to_string(),
+            docs_url: String::new(),
+            verify_capability: "network.inner-admin.login.status".to_string(),
+        }],
+        _ => Vec::new(),
+    }
+}
+
 fn builtin_plugin(
     id: &str,
     name: &str,
@@ -1101,7 +1312,10 @@ fn builtin_plugin(
     capability_ids: &[&str],
     permissions: &[&str],
 ) -> PluginRegistryItem {
-    let availability = if matches!(id, "com.himind.dashboard-business" | "com.himind.knowledge") {
+    let availability = if matches!(
+        id,
+        "com.himind.workbench.dashboard" | "com.himind.dashboard-business" | "com.himind.knowledge"
+    ) {
         "control_plane"
     } else {
         "local"
@@ -1111,7 +1325,10 @@ fn builtin_plugin(
         "com.himind.builtin.svn" | "com.himind.builtin.inner-admin"
     ) {
         "connector"
-    } else if matches!(id, "com.himind.dashboard-business" | "com.himind.knowledge") {
+    } else if matches!(
+        id,
+        "com.himind.workbench.dashboard" | "com.himind.dashboard-business" | "com.himind.knowledge"
+    ) {
         "provider"
     } else {
         "plugin"
@@ -1139,6 +1356,7 @@ fn builtin_plugin(
         previous_version: None,
         rollback_available: false,
         overrides_installed_version: None,
+        icon: None,
         capabilities: capability_ids
             .iter()
             .map(|id| PluginCapabilityManifest {
@@ -1150,6 +1368,7 @@ fn builtin_plugin(
                 timeout_seconds: default_plugin_capability_timeout(),
             })
             .collect(),
+        credentials: builtin_credential_requests(id),
         permissions: permissions
             .iter()
             .map(|value| (*value).to_string())
@@ -1297,6 +1516,14 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 });
             let availability = manifest_availability(&manifest);
             // 上一版本与当前版本相同时不算"可回滚"：互换只会让版本号原地不动。
+            let icon = crate::app::extension_icons::resolve_effective_icon(
+                "plugin",
+                &manifest.id,
+                &path,
+                Some(&manifest.icon),
+            )
+            .ok()
+            .flatten();
             let previous_version = previous_plugin_version(&path);
             let rollback_available = previous_version.as_deref().is_some_and(|previous| {
                 crate::skill::resolver::compare_versions(previous, &manifest.version)
@@ -1334,7 +1561,9 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
                 previous_version,
                 rollback_available,
                 overrides_installed_version: None,
+                icon,
                 capabilities: manifest.capabilities,
+                credentials: manifest.credentials,
                 permissions: manifest.permissions,
                 plugin_dependencies: manifest.plugin_dependencies,
                 views: manifest.contributes.views,
@@ -1371,7 +1600,9 @@ fn read_plugin_item(path: PathBuf, development: bool) -> PluginRegistryItem {
             previous_version: None,
             rollback_available: false,
             overrides_installed_version: None,
+            icon: None,
             capabilities: Vec::new(),
+            credentials: Vec::new(),
             permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
             views: Vec::new(),
@@ -1662,6 +1893,26 @@ fn invoke_plugin_capability_for_item(
     result
 }
 
+fn start_credential_broker_for_plugin(
+    plugin: &PluginRegistryItem,
+    capability_id: &str,
+    timeout: Duration,
+) -> Result<Option<crate::capability::credential_broker::BrokerSession>, Box<dyn Error>> {
+    if !plugin
+        .permissions
+        .iter()
+        .any(|permission| permission == crate::capability::credential_broker::BROKER_PERMISSION)
+    {
+        return Ok(None);
+    }
+    crate::capability::credential_broker::BrokerSession::start(
+        &plugin.id,
+        capability_id,
+        &plugin.credentials,
+        timeout,
+    )
+}
+
 fn invoke_plugin_process(
     plugin: &PluginRegistryItem,
     capability: &PluginCapabilityManifest,
@@ -1685,6 +1936,8 @@ fn invoke_plugin_process(
         "params": input,
     });
 
+    let broker_session = start_credential_broker_for_plugin(plugin, capability_id, timeout)?;
+
     let mut command = crate::runtime::process::hidden_command(entry);
     command
         .current_dir(plugin_execution_dir(&plugin))
@@ -1693,7 +1946,20 @@ fn invoke_plugin_process(
         .stderr(Stdio::piped())
         .env_remove("HIMIND_CONTROL_PLANE_URL")
         .env_remove("HIMIND_DASHBOARD_URL")
-        .env_remove("HIMIND_API_BASE");
+        .env_remove("HIMIND_API_BASE")
+        .env_remove(crate::capability::credential_broker::BROKER_URL_ENV)
+        .env_remove(crate::capability::credential_broker::BROKER_TOKEN_ENV);
+    if let Some(broker) = broker_session.as_ref() {
+        command
+            .env(
+                crate::capability::credential_broker::BROKER_URL_ENV,
+                &broker.url,
+            )
+            .env(
+                crate::capability::credential_broker::BROKER_TOKEN_ENV,
+                &broker.token,
+            );
+    }
     if let Some(url) = trusted_plugin_dashboard_url(plugin, capability, trusted_dashboard_url) {
         // The Agent owns the trusted endpoint. Plugins never select or persist
         // an arbitrary control-plane URL supplied by the AI caller.
@@ -1823,6 +2089,7 @@ fn invoke_plugin_process(
         }
         .into());
     }
+    drop(broker_session);
     Ok(response.get("result").cloned().unwrap_or(response))
 }
 
@@ -2092,6 +2359,62 @@ pub(crate) fn validate_manifest_contributions(
             return Err(format!("duplicate plugin command id: {}", command.id).into());
         }
     }
+    if manifest.credentials.len() > 16 {
+        return Err("plugin may declare at most 16 credentials".into());
+    }
+    let mut credential_ids = std::collections::HashSet::new();
+    for credential in &manifest.credentials {
+        if !is_safe_resource_segment(&credential.id) {
+            return Err(format!("invalid credential id: {}", credential.id).into());
+        }
+        if !credential_ids.insert(credential.id.as_str()) {
+            return Err(format!("duplicate credential id: {}", credential.id).into());
+        }
+        if credential.fields.is_empty() || credential.fields.len() > 8 {
+            return Err(format!(
+                "credential {} must declare between 1 and 8 fields",
+                credential.id
+            )
+            .into());
+        }
+        if !matches!(
+            credential.kind.trim(),
+            "" | "api_key" | "oauth" | "userpass" | "cookie" | "file"
+        ) {
+            return Err(format!(
+                "credential {} has unsupported kind: {}",
+                credential.id, credential.kind
+            )
+            .into());
+        }
+        let mut field_keys = std::collections::HashSet::new();
+        for field in &credential.fields {
+            if !is_safe_resource_segment(&field.key) {
+                return Err(format!(
+                    "credential {} has invalid field key: {}",
+                    credential.id, field.key
+                )
+                .into());
+            }
+            if !field_keys.insert(field.key.as_str()) {
+                return Err(format!(
+                    "credential {} has duplicate field: {}",
+                    credential.id, field.key
+                )
+                .into());
+            }
+            if !matches!(
+                field.field_type.trim(),
+                "text" | "password" | "url" | "file" | "cookie"
+            ) {
+                return Err(format!(
+                    "credential {} field {} has unsupported type: {}",
+                    credential.id, field.key, field.field_type
+                )
+                .into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2211,7 +2534,16 @@ fn next_request_id() -> String {
 }
 
 pub(crate) fn parse_plugin_manifest(content: &str) -> Result<PluginManifest, serde_json::Error> {
-    serde_json::from_str(content.trim_start_matches('\u{feff}'))
+    let manifest: PluginManifest = serde_json::from_str(content.trim_start_matches('\u{feff}'))?;
+    if !manifest.icon.trim().is_empty()
+        && crate::app::extension_icons::validate_icon_reference(&manifest.icon).is_err()
+    {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin icon must be a package-local PNG or WebP path",
+        )));
+    }
+    Ok(manifest)
 }
 
 fn default_registry_kind() -> String {
@@ -2305,6 +2637,60 @@ mod tests {
 
     use super::*;
     use std::fs;
+
+    #[test]
+    fn credential_broker_requires_both_declarations_and_explicit_permission() {
+        let mut plugin = builtin_plugin(
+            "com.test.broker-gate",
+            "Broker gate",
+            "1.0.0",
+            "test",
+            &[],
+            &["secret.broker.acquire"],
+        );
+        plugin.credentials = vec![PluginCredentialRequest {
+            id: "demo.api".to_string(),
+            label: "Demo API".to_string(),
+            kind: "api_key".to_string(),
+            fields: vec![PluginCredentialField {
+                key: "api_key".to_string(),
+                label: "API Key".to_string(),
+                field_type: "password".to_string(),
+                secret: true,
+                required: true,
+                placeholder: String::new(),
+                help: String::new(),
+            }],
+            required: true,
+            description: String::new(),
+            docs_url: String::new(),
+            verify_capability: String::new(),
+        }];
+        let session =
+            start_credential_broker_for_plugin(&plugin, "broker-gate.run", Duration::from_secs(5))
+                .unwrap();
+        assert!(session.is_some());
+        drop(session);
+
+        plugin.permissions.clear();
+        assert!(start_credential_broker_for_plugin(
+            &plugin,
+            "broker-gate.run",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .is_none());
+
+        plugin.permissions.push("secret.broker.acquire".to_string());
+        plugin.credentials.clear();
+        assert!(start_credential_broker_for_plugin(
+            &plugin,
+            "broker-gate.run",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .is_none());
+    }
 
     #[test]
     fn plugin_data_directory_is_derived_from_the_plugin_id() {
@@ -2869,6 +3255,9 @@ mod tests {
         assert!(!items
             .iter()
             .any(|item| item["id"] == "com.himind.knowledge"));
+        assert!(!items
+            .iter()
+            .any(|item| item["id"] == "com.himind.workbench.dashboard"));
         assert_eq!(registry["total"].as_u64().unwrap(), items.len() as u64);
     }
 
@@ -2979,6 +3368,7 @@ mod tests {
         fs::create_dir_all(root.join("ui")).unwrap();
         fs::write(root.join("ui/index.html"), "<html></html>").unwrap();
         let manifest = PluginManifest {
+            icon: String::new(),
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
@@ -2992,8 +3382,8 @@ mod tests {
             governance: "optional".to_string(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
-            permissions: Vec::new(),
             credentials: Vec::new(),
+            permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
@@ -3023,6 +3413,7 @@ mod tests {
             std::env::temp_dir().join(format!("agent-plugin-version-test-{}", next_request_id()));
         fs::create_dir_all(&root).unwrap();
         let mut manifest = PluginManifest {
+            icon: String::new(),
             id: "demo.version".to_string(),
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
@@ -3036,8 +3427,8 @@ mod tests {
             governance: "optional".to_string(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
-            permissions: Vec::new(),
             credentials: Vec::new(),
+            permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions::default(),
         };
@@ -3069,6 +3460,7 @@ mod tests {
         fs::create_dir_all(root.join("ui")).unwrap();
         fs::write(root.join("ui/index.js"), "console.log(1)").unwrap();
         let manifest = PluginManifest {
+            icon: String::new(),
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
@@ -3082,8 +3474,8 @@ mod tests {
             governance: "optional".to_string(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
-            permissions: Vec::new(),
             credentials: Vec::new(),
+            permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
@@ -3116,6 +3508,7 @@ mod tests {
         ));
         fs::write(&outside, "<html></html>").unwrap();
         let manifest = PluginManifest {
+            icon: String::new(),
             id: "demo.view".to_string(),
             name: "Demo".to_string(),
             author: "测试作者".to_string(),
@@ -3129,8 +3522,8 @@ mod tests {
             governance: "optional".to_string(),
             capability_namespace: String::new(),
             capabilities: Vec::new(),
-            permissions: Vec::new(),
             credentials: Vec::new(),
+            permissions: Vec::new(),
             plugin_dependencies: Vec::new(),
             contributes: PluginContributions {
                 views: vec![PluginViewContribution {
@@ -3535,5 +3928,49 @@ mod view_external_capability_tests {
         assert!(view_can_invoke_external(&item, "media.image.generate"));
         assert!(!view_can_invoke_external(&item, "media.video.generate"));
         assert!(!view_can_invoke_external(&item, "system.health"));
+    }
+    #[test]
+    fn credential_fields_accept_legacy_strings_and_typed_objects() {
+        let legacy: PluginManifest = serde_json::from_value(json!({
+            "id":"com.test.legacy",
+            "name":"Legacy",
+            "version":"1.0.0",
+            "credentials":[{"id":"demo.api","fields":["api_key"]}]
+        }))
+        .unwrap();
+        assert_eq!(legacy.credentials[0].fields[0].key, "api_key");
+        assert!(legacy.credentials[0].fields[0].secret);
+
+        let typed: PluginManifest = serde_json::from_value(json!({
+            "id":"com.test.typed",
+            "name":"Typed",
+            "version":"1.0.0",
+            "credentials":[{"id":"demo.account","kind":"userpass","fields":[
+                {"key":"username","label":"账号","type":"text","secret":false,"required":true},
+                {"key":"password","label":"密码","type":"password","secret":true,"required":true}
+            ]}]
+        }))
+        .unwrap();
+        assert!(!typed.credentials[0].fields[0].secret);
+        assert_eq!(typed.credentials[0].fields[0].display_label(), "账号");
+        assert_ne!(
+            credential_declaration_fingerprint(&legacy.credentials),
+            credential_declaration_fingerprint(&typed.credentials)
+        );
+    }
+
+    #[test]
+    fn plugin_icon_is_optional_and_package_local() {
+        let valid = parse_plugin_manifest(
+            r#"{"id":"com.test.icon","name":"Icon plugin","version":"1.0.0","icon":"assets/icon.webp"}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.icon, "assets/icon.webp");
+        for invalid in ["../icon.png", "C:/icon.png", "assets/icon.svg"] {
+            let content = format!(
+                r#"{{"id":"com.test.icon","name":"Icon plugin","version":"1.0.0","icon":"{invalid}"}}"#
+            );
+            assert!(parse_plugin_manifest(&content).is_err(), "{invalid}");
+        }
     }
 }

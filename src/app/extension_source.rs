@@ -3115,7 +3115,8 @@ fn fetch_catalog(source: &ExtensionSourceConfig) -> Result<ExtensionSourceCatalo
         validate_catalog(&catalog, source)?;
         return Ok(catalog);
     }
-    let catalog = fetch_remote_catalog(source)?;
+    let mut catalog = fetch_remote_catalog(source)?;
+    normalize_catalog_icons(&mut catalog);
     validate_catalog(&catalog, source)?;
     Ok(catalog)
 }
@@ -4302,12 +4303,57 @@ fn record_source_health_at(path: &Path, source_id: &str, record: serde_json::Val
     }
 }
 
+fn normalize_catalog_icons(catalog: &mut ExtensionSourceCatalog) {
+    fn normalize(
+        icon: &mut Option<crate::app::extension_icons::ExtensionIconInfo>,
+        artifact_url: &str,
+    ) {
+        *icon = icon
+            .as_ref()
+            .and_then(|item| crate::app::extension_icons::cache_remote_icon(item, artifact_url));
+    }
+    for item in &mut catalog.plugins {
+        normalize(&mut item.icon, &item.download_url);
+        if let Some(user) =
+            crate::app::extension_icons::resolve_user_override("plugin", &item.plugin_id)
+        {
+            item.icon = Some(user);
+        }
+    }
+    for item in &mut catalog.skills {
+        normalize(&mut item.icon, &item.download_url);
+        if let Some(user) =
+            crate::app::extension_icons::resolve_user_override("skill", &item.skill_id)
+        {
+            item.icon = Some(user);
+        }
+    }
+    for item in &mut catalog.workflows {
+        normalize(&mut item.icon, &item.download_url);
+        if let Some(user) =
+            crate::app::extension_icons::resolve_user_override("workflow", &item.workflow_id)
+        {
+            item.icon = Some(user);
+        }
+    }
+    for item in &mut catalog.experts {
+        normalize(&mut item.icon, &item.download_url);
+        if let Some(user) =
+            crate::app::extension_icons::resolve_user_override("expert", &item.expert_id)
+        {
+            item.icon = Some(user);
+        }
+    }
+}
+
 fn load_cached_catalog(source_id: &str) -> Result<Option<ExtensionSourceCatalog>, Box<dyn Error>> {
     let path = cache_path(source_id);
     if !path.is_file() {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    let mut catalog: ExtensionSourceCatalog = serde_json::from_slice(&fs::read(path)?)?;
+    normalize_catalog_icons(&mut catalog);
+    Ok(Some(catalog))
 }
 
 fn settings_path() -> PathBuf {
@@ -4449,6 +4495,14 @@ fn build_local_plugin_item(
     // plugin.json 声明了 categories，catalog 项必须原样保留；旧清单没有声明时
     // 才按 Capability 命名空间兜底，否则扩展市场里插件只能落进「未分类」。
     crate::extension_category::fill_missing_categories(&capability_ids, &mut categories);
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "plugin",
+        &manifest.id,
+        dir,
+        Some(&manifest.icon),
+    )
+    .ok()
+    .flatten();
     Ok(PluginCatalogItem {
         plugin_id: manifest.id.clone(),
         name: manifest.name.clone(),
@@ -4481,6 +4535,7 @@ fn build_local_plugin_item(
         capability_ids,
         permissions: manifest.permissions.clone(),
         view_count: manifest.contributes.views.len(),
+        icon,
         plugin_dependencies: manifest
             .plugin_dependencies
             .iter()
@@ -4508,6 +4563,14 @@ fn build_local_skill_item(
     let mut categories = manifest.categories.clone();
     // 同插件：显式分类优先，缺失时按 Capability 命名空间兜底。
     crate::extension_category::fill_missing_categories(&capability_ids, &mut categories);
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "skill",
+        &manifest.id,
+        dir,
+        Some(&manifest.icon),
+    )
+    .ok()
+    .flatten();
     Ok(SkillCatalogItem {
         skill_id: manifest.id.clone(),
         name: manifest.name.clone(),
@@ -4549,6 +4612,7 @@ fn build_local_skill_item(
         managed: false,
         allow_disable: true,
         allow_uninstall: true,
+        icon,
     })
 }
 
@@ -4560,6 +4624,14 @@ fn build_local_workflow_item(
     // Workflow Package 不声明分类，catalog 项按 Capability 命名空间补齐，
     // 否则工作流在整个扩展市场里只能落进「未分类」。
     let categories = crate::extension_category::infer_categories(&package.capabilities);
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "workflow",
+        &package.id,
+        dir,
+        Some(&package.icon),
+    )
+    .ok()
+    .flatten();
     Ok(WorkflowCatalogItem {
         workflow_id: package.id.clone(),
         name: package.name.clone(),
@@ -4591,6 +4663,7 @@ fn build_local_workflow_item(
         allow_disable: true,
         allow_uninstall: true,
         extension_lock: None,
+        icon,
     })
 }
 
@@ -4605,6 +4678,14 @@ fn build_local_expert_item(
     if definition.instructions.as_bytes() != instructions {
         return Err("expert.json 与 EXPERT.md 内容不一致".into());
     }
+    let icon = crate::app::extension_icons::resolve_effective_icon(
+        "expert",
+        &definition.id,
+        dir,
+        Some(&definition.icon),
+    )
+    .ok()
+    .flatten();
     Ok(ExpertCatalogItem {
         expert_id: definition.id,
         name: definition.name,
@@ -4633,6 +4714,7 @@ fn build_local_expert_item(
         managed: false,
         allow_disable: true,
         allow_uninstall: true,
+        icon,
     })
 }
 
@@ -5728,9 +5810,21 @@ fn settings_schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::paths::test_env_lock;
+    use image::{ImageBuffer, Rgba};
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([20u8, 80, 140, 255]));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("png");
+        cursor.into_inner()
+    }
 
     fn plugin_item(url: &str) -> PluginCatalogItem {
         PluginCatalogItem {
+            icon: None,
             plugin_id: "com.himind.test".to_string(),
             name: "测试".to_string(),
             description: String::new(),
@@ -5766,8 +5860,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_catalog_item_exposes_author_icon() {
+        let _guard = test_env_lock();
+        let root =
+            std::env::temp_dir().join(format!("himind-local-catalog-icon-{}", std::process::id()));
+        let package = root.join("plugin");
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        std::fs::create_dir_all(package.join("assets")).unwrap();
+        std::fs::write(package.join("assets/icon.png"), png_bytes(128, 128)).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            r#"{"id":"com.himind.icon-catalog","name":"Icon catalog","author":"Tester","version":"1.0.0","icon":"assets/icon.png"}"#,
+        )
+        .unwrap();
+        let source = ExtensionSourceConfig {
+            id: "local-icon".to_string(),
+            name: "Local icon source".to_string(),
+            kind: ExtensionSourceKind::Local,
+            repository: root.to_string_lossy().to_string(),
+            catalog_path: LOCAL_CATALOG_PATH.to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        let item = build_local_plugin_item(&package, &source).unwrap();
+        let icon = item.icon.expect("catalog icon");
+        assert_eq!(icon.source, "author");
+        assert!(icon.url.starts_with("http://extension-icon.localhost/"));
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_catalog_projection_applies_user_icon_override() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "himind-catalog-override-icon-{}",
+            std::process::id()
+        ));
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("picked.png");
+        std::fs::write(&source, png_bytes(128, 128)).unwrap();
+        crate::app::extension_icons::set_user_override("plugin", "com.himind.test", &source)
+            .unwrap();
+        let mut catalog = ExtensionSourceCatalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            source_id: "github-test".to_string(),
+            generation: String::new(),
+            distribution_id: "owner/repo".to_string(),
+            channel: "stable".to_string(),
+            catalog_id: "public".to_string(),
+            plugins: vec![plugin_item(
+                "https://github.com/owner/repo/releases/download/tag/test.hmpkg",
+            )],
+            skills: Vec::new(),
+            workflows: Vec::new(),
+            experts: Vec::new(),
+            feature_packs: Vec::new(),
+            agent_presets: Vec::new(),
+        };
+        normalize_catalog_icons(&mut catalog);
+        assert_eq!(catalog.plugins[0].icon.as_ref().unwrap().source, "user");
+        match previous {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn workflow_item(url: &str) -> WorkflowCatalogItem {
         WorkflowCatalogItem {
+            icon: None,
             workflow_id: "com.himind.workflow.test".to_string(),
             name: "Workflow Test".to_string(),
             description: String::new(),

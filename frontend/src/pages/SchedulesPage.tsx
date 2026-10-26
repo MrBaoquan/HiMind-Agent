@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { BookOpen, CalendarClock, CircleAlert, FolderOpen, Pause, Pencil, Play, Power, Search, Store, Trash2, X } from 'lucide-react';
 import { BusyIndicator } from '../components/BusyIndicator';
 import { EmptyState, PageHeader, Pill } from '../components/Common';
+import { ThemeBudgetPreview, ThemeMultiSelect, TopicTagsInput } from '../components/WorkflowThemeInputs';
+import { TopicGroupsBudgetPreview, TopicGroupsEditor } from '../components/WorkflowTopicGroups';
 import type { Schedule, ScheduleInput, ScheduleList, SkillRun, WorkflowCenterSnapshot, WorkflowPreflight, WorkflowRunPreset } from '../services/agentApi';
 import { formatCompactStamp, formatCountdown, formatRelativeStamp, formatStamp, formatTimezone, useNowTick } from '../timeFormat';
 import { formatElapsedCn, toEpochSeconds } from './workflowRunView';
@@ -13,6 +15,10 @@ import {
   invalidOptionValue,
   jsonToFormValues,
   normalizeStartField,
+  themeBudgetError,
+  themeSelectionPlan,
+  topicGroupsSelectionPlan,
+  usesFullRow,
   type WorkflowStartField,
 } from './workflowStartForm';
 import { blockerDiagnostics, blockerHeadline, blockerLead, preflightNote } from './preflightNote';
@@ -44,6 +50,7 @@ type SchedulesPageProps = {
 
 type Draft = {
   id: string;
+  displayName: string;
   kind: string;
   targetId: string;
   cron: string;
@@ -58,6 +65,7 @@ type Draft = {
 
 const EMPTY_DRAFT: Draft = {
   id: '',
+  displayName: '',
   kind: 'workflow',
   targetId: '',
   cron: '0 9 * * *',
@@ -168,6 +176,8 @@ function targetLabel(kind: string) {
  * 目标查不到时（工作流/技能已被卸载）才退回计划句柄，保证列表不出现空标题。
  */
 function planDisplayName(item: Schedule, resolveTarget: (kind: string, targetId: string) => string) {
+  const displayName = item.name?.trim() || '';
+  if (displayName) return displayName;
   const handle = item.id?.trim() || '';
   const target = resolveTarget(item.kind, item.target_id);
   // resolveTarget 找不到时会把 target_id 原样返回，那同样是机器串，不如直接用计划句柄。
@@ -289,6 +299,7 @@ function runOutcomeLabel(status?: string) {
 /** 计划里"存在存储里的"字段指纹：只有这些变了，右侧表单才需要跟着刷新。 */
 function scheduleSignature(item: Schedule) {
   return JSON.stringify([
+    item.name || '',
     item.kind || 'workflow',
     item.target_id,
     item.cron,
@@ -418,6 +429,17 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
     [selected, selectedPreset],
   );
   const selectedWorkspace = workspaceOf(selectedResolvedInput);
+  const selectedGroupPlan = useMemo(() => {
+    if (!selected || selected.kind !== 'workflow') return null;
+    const workflow = workflows.find(item => item.package.id === selected.target_id);
+    const fields = (workflow?.view?.sections || []).flatMap(section => (section.fields || []).map(normalizeStartField));
+    return fields.length ? topicGroupsSelectionPlan(fields, jsonToFormValues(fields, selectedResolvedInput)) : null;
+  }, [selected, selectedResolvedInput, workflows]);  const selectedThemePlan = useMemo(() => {
+    if (!selected || selected.kind !== 'workflow') return null;
+    const workflow = workflows.find(item => item.package.id === selected.target_id);
+    const fields = (workflow?.view?.sections || []).flatMap(section => (section.fields || []).map(normalizeStartField));
+    return fields.length ? themeSelectionPlan(fields, jsonToFormValues(fields, selectedResolvedInput)) : null;
+  }, [selected, selectedResolvedInput, workflows]);
   // 这条计划自己覆盖了几项：0 项就是「完全跟着预设跑」，详情里要说清楚。
   const selectedOverrideCount = useMemo(
     () => Object.keys(overrideInput(selected?.input || {}, selectedPreset)).length,
@@ -497,6 +519,7 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
     const input = item.input || {};
     const next: Draft = {
       id: planNameInput(item),
+      displayName: item.name || '',
       kind: item.kind || 'workflow',
       targetId: item.target_id,
       cron: item.cron,
@@ -719,6 +742,12 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
         setFieldErrors({ [invalid.field.id]: `${invalid.field.label}不支持「${invalid.invalidValue}」` });
         throw new Error(`${invalid.field.label}不支持「${invalid.invalidValue}」`);
       }
+      const budgetError = themeBudgetError(workflowFields, draft.form);
+      if (budgetError) {
+        const themeField = workflowFields.find(field => field.type === 'theme-list') || workflowFields[0];
+        setFieldErrors({ [themeField.id]: budgetError });
+        throw new Error(budgetError);
+      }
       return fieldsToInput(workflowFields, draft.form);
     }
     try {
@@ -803,6 +832,7 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
       const preset = draft.kind === 'workflow' ? draftPreset : null;
       const savedId = await onSaveSchedule({
         id: saveId,
+        name: draft.displayName.trim() || undefined,
         kind: draft.kind,
         target_id: draft.targetId,
         preset_id: draft.kind === 'workflow' ? (draft.presetId || undefined) : undefined,
@@ -1200,7 +1230,12 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
               <h3>运行什么</h3>
               <div className="workflow-start-fields">
                 <label>
-                  <span>任务名称（留空自动生成）</span>
+                  <span>计划名称</span>
+                  <input value={draft.displayName} placeholder="例如：自媒体创作日报" onChange={event => setDraft(current => ({ ...current, displayName: event.target.value }))} />
+                  <small className="workflow-start-hint">展示在计划列表和详情中，可随时修改。</small>
+                </label>
+                <label>
+                  <span>计划标识（留空自动生成）</span>
                   <input value={draft.id} placeholder="daily-tech-radar" spellCheck={false} onChange={event => setDraft(current => ({ ...current, id: event.target.value.trimStart() }))} />
                   <small className="workflow-start-hint">
                     {storedId && !draft.id.trim()
@@ -1318,12 +1353,21 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
                                 const fieldError = fieldErrors[field.id];
                                 const label = <span>{field.label}{field.required ? <em>必需</em> : null}</span>;
                                 const footer = <>{fieldError ? <small className="workflow-start-field-error">{fieldError}</small> : null}{field.hint ? <small className="workflow-start-hint">{field.hint}</small> : null}</>;
-                                const fieldClass = field.type === 'textarea' || field.type === 'list' || field.type === 'json' || field.span === 'full' ? 'workflow-start-field-wide' : '';
+                                const fieldClass = usesFullRow(field) ? 'workflow-start-field-wide' : '';
                                 if (field.type === 'boolean') {
                                   return <label key={field.id} className="workflow-start-toggle"><input type="checkbox" checked={Boolean(value)} onChange={event => setWorkflowField(field, event.target.checked)} /><span>{field.label}</span></label>;
                                 }
                                 if (field.type === 'select') {
                                   return <label key={field.id} className={fieldClass}>{label}<select value={String(value ?? '')} onChange={event => setWorkflowField(field, event.target.value)}><option value="">请选择</option>{field.optionEntries.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>{footer}</label>;
+                                }
+                                if (field.type === 'theme-list') {
+                                  return <div key={field.id} className={fieldClass}>{label}<ThemeMultiSelect field={field} value={value} onChange={next => setWorkflowField(field, next)} />{footer}</div>;
+                                }
+                                if (field.type === 'tag-list') {
+                                  return <div key={field.id} className={fieldClass}>{label}<TopicTagsInput field={field} value={value} onChange={next => setWorkflowField(field, next)} />{footer}</div>;
+                                }
+                                if (field.type === 'topic-groups') {
+                                  return <div key={field.id} className={fieldClass}>{label}<TopicGroupsEditor field={field} value={value} onChange={next => setWorkflowField(field, next)} />{footer}</div>;
                                 }
                                 if (field.type === 'textarea' || field.type === 'list' || field.type === 'json') {
                                   return <label key={field.id} className={fieldClass}>{label}<textarea rows={field.type === 'list' ? 3 : 4} value={String(value ?? '')} placeholder={field.placeholder || (field.type === 'list' ? '每行一项' : '')} onChange={event => setWorkflowField(field, event.target.value)} />{footer}</label>;
@@ -1351,6 +1395,7 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
                             </div>
                           </section>
                         ))}
+                        {workflowFields.some(field => field.type === 'topic-groups') ? <TopicGroupsBudgetPreview fields={workflowFields} values={draft.form} /> : <ThemeBudgetPreview fields={workflowFields} values={draft.form} />}
                       </div>
                     ) : (
                       <textarea className="workflow-start-json" value={draft.input} spellCheck={false} rows={8} onChange={event => { setDraft(current => ({ ...current, input: event.target.value })); setPreflight(null); }} />
@@ -1451,6 +1496,28 @@ export function SchedulesPage({ snapshot, skills, onRefreshWorkflows, onLoadSche
                     </div>
                   ) : null}
                   {selectedWorkspace ? <div><span>工作区</span><strong title={selectedWorkspace}>{tailPath(selectedWorkspace)}</strong></div> : null}
+                  {selectedGroupPlan?.groups.length ? (
+                    <div>
+                      <span>采集组</span>
+                      <strong>{selectedGroupPlan.groups.map(group => group.name).join('、')}</strong>
+                      <small className="schedule-fact-note">
+                        {selectedGroupPlan.groups.map(group => `${group.name}：${group.topics.join('、')}`).join('；')}
+                        {' · '}{selectedGroupPlan.resolvedTopics.length} 个唯一 topic
+                      </small>
+                    </div>
+                  ) : selectedThemePlan?.selectedThemeLabels.length ? (
+                    <div>
+                      <span>关注分类</span>
+                      <strong>{selectedThemePlan.selectedThemeLabels.join('、')}</strong>
+                      {selectedThemePlan.customTopics.length ? <small className="schedule-fact-note">额外 topic：{selectedThemePlan.customTopics.join('、')}</small> : null}
+                    </div>
+                  ) : selectedThemePlan?.customTopics.length ? (
+                    <div>
+                      <span>关注标签</span>
+                      <strong>{selectedThemePlan.customTopics.length} 个 topic</strong>
+                      <small className="schedule-fact-note">{selectedThemePlan.customTopics.join('、')}</small>
+                    </div>
+                  ) : null}
                 </div>
                 {selectedPresetMissing ? (
                   <div className="schedule-preset-missing">

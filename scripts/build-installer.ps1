@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$ReleaseDirectory,
@@ -25,6 +25,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+. (Join-Path $PSScriptRoot "runtime-bundle.ps1")
 $ReleasePath = [IO.Path]::GetFullPath($ReleaseDirectory)
 foreach ($Name in @("himind-agent.exe", "himind-agent-mcp.exe", "himind-agent-launcher.exe", "himind-agent-updater.exe")) {
     if (-not (Test-Path -LiteralPath (Join-Path $ReleasePath $Name) -PathType Leaf)) {
@@ -80,6 +81,12 @@ if ($RuntimeReleaseDirectory) {
         throw "Bundled Runtime signature metadata does not match the release manifest."
     }
 }
+
+if (-not $RuntimeRelease) {
+    throw "RuntimeReleaseDirectory is required: the Agent installer must carry the signed Runtime."
+}
+$RuntimeInfo = Assert-RuntimeReleaseDirectory $RuntimeRelease
+$RuntimePackageName = $RuntimeInfo.PackageName
 
 $MakeNsis = Get-Command makensis.exe -ErrorAction SilentlyContinue
 $MakeNsisPath = if ($MakeNsis) { $MakeNsis.Source } else {

@@ -45,6 +45,9 @@ pub(crate) struct ScheduleExecution {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Schedule {
     pub id: String,
+    /// 用户可见的计划名称；为空时界面回退到目标名称或计划句柄。
+    #[serde(default)]
+    pub name: String,
     /// 目标类型，例如 `workflow`。
     #[serde(default = "default_target_kind")]
     pub kind: String,
@@ -143,6 +146,7 @@ pub(crate) fn load() -> Result<Vec<Schedule>, Box<dyn Error>> {
         .into_iter()
         .map(|item| Schedule {
             id: item.id,
+            name: String::new(),
             kind: "workflow".to_string(),
             target_id: item.workflow_id,
             preset_id: String::new(),
@@ -365,6 +369,7 @@ fn validate_target(kind: &str, target_id: &str) -> Result<(), String> {
 fn schedule_json(item: &Schedule) -> Value {
     json!({
         "id": item.id,
+        "name": item.name,
         "kind": item.kind,
         "target_id": item.target_id,
         "preset_id": item.preset_id,
@@ -537,6 +542,12 @@ pub(crate) fn set(input: &Value, now: i64) -> Result<Value, Box<dyn Error>> {
         .filter(|value| !value.is_empty())
         .ok_or("schedule.set 需要 target_id")?
         .to_string();
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
     let preset_id = input
         .get("preset_id")
         .and_then(Value::as_str)
@@ -601,6 +612,7 @@ pub(crate) fn set(input: &Value, now: i64) -> Result<Value, Box<dyn Error>> {
         .cloned()
         .unwrap_or_else(|| Schedule {
             id: id.clone(),
+            name: name.clone(),
             kind: kind.clone(),
             target_id: target_id.clone(),
             preset_id: preset_id.clone(),
@@ -616,6 +628,7 @@ pub(crate) fn set(input: &Value, now: i64) -> Result<Value, Box<dyn Error>> {
             last_error: String::new(),
             next_run_at: String::new(),
         });
+    record.name = name;
     record.kind = kind;
     record.target_id = target_id;
     record.preset_id = preset_id;
@@ -1038,6 +1051,7 @@ mod tests {
     fn plan(input: Value, entrypoint: &str, exitpoint: &str) -> Schedule {
         Schedule {
             id: "plan-1".to_string(),
+            name: "演示计划".to_string(),
             kind: "workflow".to_string(),
             target_id: "wf.demo".to_string(),
             preset_id: "preset-1".to_string(),

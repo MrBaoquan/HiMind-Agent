@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc, Mutex, OnceLock,
@@ -109,6 +109,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     println!("webview user data dir: {}", webview_data_dir.display());
     let main_page_state = Arc::new(AtomicU8::new(0));
     let _ = MAIN_PAGE_STATE.set(Arc::clone(&main_page_state));
+    let provider = crate::app::control_plane_provider::status(&options);
     // Record the launch context before anything can fail to build. A blank or
     // missing main window has no other trace - WebView2 creation failure is
     // silent on Windows - so this line is what lets a support case tell "never
@@ -116,7 +117,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     crate::app::crash::record_event(
         "info",
         &format!(
-            "界面启动：version={} profile={} port={} mode={} webview_user_data_dir={}",
+            "界面启动：version={} profile={} port={} mode={} provider={} webview_user_data_dir={}",
             crate::VERSION,
             crate::store::paths::profile_name(),
             port,
@@ -125,6 +126,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             } else {
                 "independent"
             },
+            provider.state,
             webview_data_dir.display()
         ),
     );
@@ -134,20 +136,20 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
     let worker_status = Arc::new(Mutex::new(LocalWorkerStatus {
         dashboard_worker_online: false,
         dashboard_agent_id: String::new(),
-        dashboard_worker_error: if options.mode().dashboard_enabled() {
+        dashboard_worker_error: if provider.available {
             "正在连接 Dashboard 任务 Worker".to_string()
         } else {
             String::new()
         },
-        dashboard_worker_state: if options.mode().dashboard_enabled() {
+        dashboard_worker_state: if provider.available {
             "connecting".to_string()
         } else {
             "not_applicable".to_string()
         },
-        dashboard_worker_reason_code: if options.mode().dashboard_enabled() {
+        dashboard_worker_reason_code: if provider.available {
             "connected_agent_app_starting".to_string()
         } else {
-            "independent_mode_no_control_plane".to_string()
+            provider.reason.clone()
         },
         worker_transport: "local_http".to_string(),
         local_service_online: false,
@@ -242,6 +244,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
         }))
     };
     let builder = builder
+        .register_uri_scheme_protocol("extension-icon", |_ctx, request| {
+            extension_icon_response(request)
+        })
         .register_uri_scheme_protocol("plugin-ui", |_ctx, request| plugin_ui_response(request))
         // The embedded UI is served from the binary, so a bundle that did not
         // make it in, or an asset the page cannot resolve, shows up as a blank
@@ -431,6 +436,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::test_svn_connection,
             super::commands::get_plugin_registry,
             super::commands::get_workflow_center,
+            super::commands::resolve_workflow_option_source,
             super::commands::list_schedules,
             super::commands::set_schedule,
             super::commands::delete_schedule,
@@ -498,6 +504,10 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::get_projection_sync_status,
             super::commands::requeue_projection_dead_letters,
             super::commands::list_ai_services,
+            super::commands::get_media_provider_catalog,
+            super::commands::plan_ai_capability_route,
+            super::commands::test_ai_capability,
+            super::commands::set_ai_capability_fallbacks,
             super::commands::list_ai_service_templates,
             super::commands::list_acp_runtime_profiles,
             super::commands::save_acp_runtime_profile,
@@ -532,6 +542,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::list_extension_workspaces,
             super::commands::pick_extension_workspace_dir,
             super::commands::pick_instruction_file,
+            super::commands::pick_extension_icon_file,
+            super::commands::set_extension_icon_override,
+            super::commands::clear_extension_icon_override,
             super::commands::add_extension_workspace,
             super::commands::remove_extension_workspace,
             super::commands::open_extension_projects,
@@ -539,7 +552,11 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::create_extension_project,
             super::commands::build_extension_project,
             super::commands::extension_development_readiness,
+            super::credential_center::get_credential_catalog,
+            super::credential_center::open_credential_center,
+            super::credential_center::get_credential_audit,
             super::commands::plugin_credentials,
+            super::commands::save_plugin_credential_profile,
             super::commands::save_plugin_credential,
             super::commands::delete_plugin_credential,
             super::commands::set_extension_project_distribution_targets,
@@ -615,6 +632,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::create_plugin_view_shortcut,
             super::commands::close_plugin_view,
             super::commands::get_plugin_view_context,
+            super::commands::get_plugin_view_schedule_reference_counts,
             super::commands::pick_workspace_directory,
             super::commands::invoke_plugin_view_capability,
         ])
@@ -938,7 +956,7 @@ fn start_mcp_catalog_refresh(state_path: std::path::PathBuf) {
 /// 都跑。修复失败只记日志，不挡窗口。
 fn start_runtime_self_heal(options: crate::Options, approval_manager: Arc<ApprovalManager>) {
     thread::spawn(move || {
-        if let Some(reason) = crate::runtime::builtin::ensure_installed_runtime_healthy(&options) {
+        if let Some(reason) = crate::runtime::builtin::ensure_installed_runtime_matches(&options) {
             approval_manager.add_log("warn", &reason);
         }
     });
@@ -978,10 +996,10 @@ fn setup_tray(app: &tauri::App, port: u16) -> Result<(), Box<dyn std::error::Err
     let mode_label = app
         .try_state::<AgentState>()
         .map(|state| {
-            if state.options.mode().dashboard_enabled() {
+            if crate::app::control_plane_provider::available(&state.options) {
                 "已连接工作台"
             } else {
-                "独立运行"
+                "本机运行"
             }
         })
         .unwrap_or("运行中");
@@ -1272,6 +1290,13 @@ fn open_agent_open_target(app: &tauri::AppHandle, target: crate::AgentOpenTarget
                 eprintln!("deep link open ai failed: {error}");
             }
         }
+        crate::AgentOpenTarget::SettingsAccounts => {
+            if let Err(error) =
+                open_settings_window(app, Some("settings"), Some("accounts"), None, None)
+            {
+                eprintln!("deep link open accounts failed: {error}");
+            }
+        }
     }
 }
 
@@ -1339,7 +1364,7 @@ pub(crate) fn open_settings_window(
         })
         .unwrap_or("");
     let ai_tab = ai_tab
-        .filter(|value| matches!(*value, "mcp" | "services" | "acp"))
+        .filter(|value| matches!(*value, "mcp" | "services" | "routes" | "acp"))
         .unwrap_or("mcp");
     let payload =
         serde_json::json!({ "panel": panel, "section": section, "tab": tab, "aiTab": ai_tab });
@@ -1576,6 +1601,10 @@ fn start_builtin_ai_session_inner(
     workspace: &Path,
     focus_workspace: bool,
 ) -> Result<BuiltinAiSession, String> {
+    let started = Instant::now();
+    if let Some(reason) = crate::runtime::builtin::ensure_installed_runtime_matches(options) {
+        return Err(reason);
+    }
     let startup_budget = builtin_ai_startup_budget(active_builtin_ai_session_count());
     let launch = crate::runtime::builtin::prepare_interactive_launch_allow_degraded(
         options,
@@ -1587,25 +1616,9 @@ fn start_builtin_ai_session_inner(
     crate::app::sandbox_warmup::spawn(&launch.executable, &launch.workspace);
     let notice = (!launch.control_plane_notice.trim().is_empty())
         .then(|| launch.control_plane_notice.clone());
-    let mut command = if launch
-        .executable
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
-    {
-        let mut command = Command::new("cmd.exe");
-        command.arg("/D").arg("/C").arg(&launch.executable);
-        command
-    } else {
-        Command::new(&launch.executable)
-    };
-    // 交互会话和 headless 会话必须给 Runtime 同一套环境：受管的 Office 能力行
-    // 用它定位 Runtime 自带的 skill-office 与 libreoffice-kit 负载。漏掉它时
-    // DSH 在装配配置阶段就抛 ERR_INVALID_ARG_TYPE，Office 条目激活失败，Web
-    // 入口跟着回 502——界面只报「页面认证失败」，看起来像网络或凭据问题。
-    crate::runtime::deepseek_harness::configure_runtime_environment(
-        &mut command,
-        &launch.executable,
-    );
+    // Use Runtime's own node.exe directly when available. The old cmd.exe hop
+    // added a process and console translation for every cold start.
+    let mut command = crate::runtime::deepseek_harness::interactive_command(&launch.executable);
     command
         .args(["--profile", "himind", "--patch"])
         .arg(&launch.agent_patch)
@@ -1698,7 +1711,29 @@ fn start_builtin_ai_session_inner(
             let _ = child.wait();
             error
         })?;
-    if let Err(error) = proxy.control().verify_browser_entry() {
+    // Browser verification and rail preparation are independent once the
+    // proxy is listening. Run them together so project entries do not pay two
+    // serial round trips before the iframe is allowed to load.
+    let control = proxy.control();
+    let verify_control = control.clone();
+    let rail_control = control.clone();
+    let rail_home = launch.home.clone();
+    let rail_workspace = launch.workspace.clone();
+    let (verify_result, rail_result) = std::thread::scope(|scope| {
+        let verify = scope.spawn(move || verify_control.verify_browser_entry());
+        let rail = scope
+            .spawn(move || rail_control.prepare_rail(&rail_home, &rail_workspace, focus_workspace));
+        (
+            verify
+                .join()
+                .map_err(|_| "HiMind AI 页面验证线程异常".to_string())
+                .and_then(|result| result),
+            rail.join()
+                .map_err(|_| "HiMind AI 导航准备线程异常".to_string())
+                .and_then(|result| result),
+        )
+    });
+    if let Err(error) = verify_result {
         proxy.stop();
         crate::runtime::process::terminate_process_tree(&mut child);
         let _ = child.wait();
@@ -1717,24 +1752,37 @@ fn start_builtin_ai_session_inner(
     // claims a Session row in its group; the default entry reuses whatever the
     // rail already remembers. A refused Workspace is a degraded rail, not a
     // reason to keep the user out of HiMind AI.
-    if let Err(error) =
-        proxy
-            .control()
-            .prepare_rail(&launch.home, &launch.workspace, focus_workspace)
-    {
+    if let Err(error) = rail_result {
         append_builtin_ai_diagnostic(&diagnostics, &error);
     }
-    let runtime_capabilities =
-        crate::app::builtin_ai_gateway::probe_builtin_ai_capabilities(&proxy.control());
-    event_sync.set_capabilities(runtime_capabilities);
+    // Capability probing is only consumed by the optional control-plane
+    // bridge. It must not delay rendering the local conversation UI.
+    if crate::app::control_plane_provider::available(options) {
+        let capability_control = control.clone();
+        let capabilities = event_sync.capabilities_state();
+        thread::spawn(move || {
+            let probed =
+                crate::app::builtin_ai_gateway::probe_builtin_ai_capabilities(&capability_control);
+            if let Ok(mut current) = capabilities.lock() {
+                *current = probed;
+            }
+        });
+    }
     // 只有真的拿到工作台凭据时才把目录推给 DSH：降级会话用的是本机 AI 服务，
     // 把它的地址与模型写进工作台的 `himind-proxy` 路由会污染用户 settings.yaml。
+    // The persisted overlay already selects the model; refreshing the optional
+    // catalog can finish after the iframe becomes visible.
     if launch.service_source == "managed" {
-        let _ = proxy.control().sync_model_catalog(
-            &launch.default_model,
-            &launch.base_url,
-            &launch.models,
-        );
+        let sync_control = control.clone();
+        let default_model = launch.default_model.clone();
+        let base_url = launch.base_url.clone();
+        let models = launch.models.clone();
+        thread::spawn(move || {
+            if let Err(error) = sync_control.sync_model_catalog(&default_model, &base_url, &models)
+            {
+                eprintln!("HiMind AI 模型目录同步失败（会话已启动）：{error}");
+            }
+        });
     }
     let model_sync = BuiltinAiModelSync::start(ModelSyncSnapshot {
         user_id: launch.user_id,
@@ -1744,13 +1792,21 @@ fn start_builtin_ai_session_inner(
         credential_fingerprint: launch.credential_fingerprint,
         catalog_fingerprint: launch.catalog_fingerprint,
     });
-    let command_gateway = options.mode().dashboard_enabled().then(|| {
+    let command_gateway = crate::app::control_plane_provider::available(&options).then(|| {
         BuiltinAiCommandGateway::start(
             options.clone(),
             proxy.control(),
             event_sync.capabilities_state(),
         )
     });
+    crate::approval::manager::append_event_log(
+        "info",
+        &format!(
+            "HiMind AI 冷启动完成：{} ms（workspace={}）",
+            started.elapsed().as_millis(),
+            crate::extension_workspace::display_path(&launch.workspace)
+        ),
+    );
     Ok(BuiltinAiSession {
         child,
         home: launch.home.clone(),
@@ -1972,6 +2028,42 @@ fn sanitize_window_label(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn extension_icon_response(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let result = (|| -> Result<Response<Vec<u8>>, String> {
+        let url = url::Url::parse(&request.uri().to_string())
+            .map_err(|error| format!("图标 URL 无效: {error}"))?;
+        if url.host_str() != Some("localhost") {
+            return Err("图标 URL 主机无效".into());
+        }
+        let name = url
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let (bytes, content_type) = crate::app::extension_icons::read_cached_icon(name)?;
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", content_type)
+            .header(
+                "Content-Security-Policy",
+                "default-src 'none'; img-src data:; style-src 'unsafe-inline'",
+            )
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "public, max-age=31536000, immutable")
+            .body(bytes)
+            .map_err(|error| error.to_string())
+    })();
+    result.unwrap_or_else(|error| {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("X-Content-Type-Options", "nosniff")
+            .body(error.into_bytes())
+            .unwrap_or_else(|_| Response::new(Vec::new()))
+    })
 }
 
 fn plugin_ui_response(request: Request<Vec<u8>>) -> Response<Vec<u8>> {

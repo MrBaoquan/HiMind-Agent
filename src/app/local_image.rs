@@ -273,7 +273,7 @@ fn call_generate_api(
             .or_insert_with(|| json!(false));
     }
 
-    let client = Client::builder().timeout(request_timeout()).build()?;
+    let client = provider_client(&url)?;
     let mut payload = Value::Object(body);
     let (mut status, mut body_value) = post_images(&client, &url, api_key, &payload)?;
     // `gpt-image-1` 等新模型不接受 `response_format`（默认就回 b64_json），
@@ -512,7 +512,7 @@ fn call_edit_api(
         .iter()
         .map(|reference| resolve_input_image(reference))
         .collect::<Result<Vec<_>, _>>()?;
-    let client = Client::builder().timeout(request_timeout()).build()?;
+    let client = provider_client(base_url)?;
 
     match adapter {
         ADAPTER_OPENAI_IMAGES_EDIT => {
@@ -691,6 +691,29 @@ fn request_timeout() -> Duration {
         .filter(|value| (10..=900).contains(value))
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
     Duration::from_secs(seconds)
+}
+
+/// Build a provider client while keeping loopback calls off the system proxy.
+///
+/// Windows can expose a machine-wide proxy without setting `HTTP_PROXY`. Reqwest
+/// then routes even tests' `127.0.0.1` calls through it, producing an unrelated
+/// empty 200 response. Local AI services and image endpoints must be reached
+/// directly; external providers still retain normal proxy behaviour.
+fn provider_client(url: &str) -> Result<Client, Box<dyn Error>> {
+    let parsed = url::Url::parse(url)?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+        }
+        None => false,
+    };
+    let mut builder = Client::builder().timeout(request_timeout());
+    if loopback {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
 }
 
 fn read_limited(
@@ -883,7 +906,7 @@ fn sanitize_stem(value: &str) -> String {
 }
 
 /// 显式 `output_dir` 优先；否则落到工作区 `.himind/media`，再退回 Agent 数据目录 `media`。
-fn resolve_output_dir(explicit: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn resolve_output_dir(explicit: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
     if let Some(raw) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
         let path = PathBuf::from(raw);
         if !path.is_absolute() {
@@ -931,22 +954,53 @@ mod tests {
     const TINY_PNG_B64: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-    /// 读取请求直到客户端停止发送为止。
+    /// 读取完整 HTTP 请求，再让测试服务端回包。
     ///
-    /// 服务端若在请求体还没读完时就关连接，Windows 会回 RST，客户端可能拿不到
-    /// 响应体（表现为空 body）。测试里显式把请求读干净再回包，避免偶发失败。
+    /// 只依赖“读到超时”会在 Windows 上偶发把请求体留在内核缓冲里：服务端先
+    /// 回包并关闭连接，客户端随后只收到空 body。这里优先按 `Content-Length`
+    /// 精确读完；没有长度头（例如分块请求）才退回短超时兜底。
     fn read_request(stream: &mut std::net::TcpStream) -> String {
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        let mut raw = Vec::new();
         let mut buffer = [0u8; 8192];
-        let mut text = String::new();
+        let mut header_end = None;
+        let mut content_length = 0usize;
         loop {
+            if header_end.is_none() {
+                if let Some(index) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let end = index + 4;
+                    header_end = Some(end);
+                    let headers = String::from_utf8_lossy(&raw[..index]);
+                    for line in headers.lines() {
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(end) = header_end {
+                if raw.len() >= end + content_length {
+                    break;
+                }
+            }
             match stream.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(read) => text.push_str(&String::from_utf8_lossy(&buffer[..read])),
+                Ok(read) => raw.extend_from_slice(&buffer[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
                 Err(_) => break,
             }
         }
-        text
+        String::from_utf8_lossy(&raw).to_string()
     }
 
     fn drain_request(stream: &mut std::net::TcpStream) {

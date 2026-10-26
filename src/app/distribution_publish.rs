@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::error::Error;
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::app::distribution_state::{
@@ -28,6 +29,8 @@ pub(crate) struct DistributionAsset {
     pub release_notes: String,
     pub min_agent_version: String,
     pub package_path: PathBuf,
+    /// Optional package icon copied to the verified icon cache and published as a Release sidecar.
+    pub icon: Option<DistributionIcon>,
     pub sha256: String,
     pub size_bytes: u64,
     /// 依赖的精确 pin：`version` + `sha256` + 来源定位。
@@ -36,6 +39,15 @@ pub(crate) struct DistributionAsset {
     pub dependency_summary: Value,
     /// 必需依赖无法解析时的阻断原因；非空时不允许发布到 GitHub。
     pub dependency_blocker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DistributionIcon {
+    path: PathBuf,
+    file_name: String,
+    sha256: String,
+    content_type: String,
+    size_bytes: u64,
 }
 
 /// 声明层依赖：来自 Plugin/Skill 的 `plugin_dependencies` 或 Workflow 的依赖锁。
@@ -179,6 +191,7 @@ pub(crate) fn resolve_asset(
                 &draft.manifest.min_agent_version,
                 &draft.candidate_path,
                 &draft.candidate_sha256,
+                &draft.manifest.icon,
                 pin_dependencies(&declared),
             )
         }
@@ -211,6 +224,7 @@ pub(crate) fn resolve_asset(
                 &draft.manifest.min_agent_version,
                 &draft.candidate_path,
                 &draft.candidate_sha256,
+                &draft.manifest.icon,
                 pin_dependencies(&declared),
             )
         }
@@ -245,6 +259,7 @@ pub(crate) fn resolve_asset(
                 &draft.manifest.min_agent_version,
                 &draft.candidate_path,
                 &draft.candidate_sha256,
+                &draft.manifest.icon,
                 pin_dependencies(&declared),
             )
         }
@@ -265,6 +280,7 @@ pub(crate) fn resolve_asset(
                 &draft.definition.min_agent_version,
                 &draft.candidate_path,
                 &draft.candidate_sha256,
+                &draft.definition.icon,
                 PinnedDependencies::default(),
             )
         }
@@ -286,6 +302,7 @@ fn build_asset(
     min_agent_version: &str,
     package_path: &std::path::Path,
     expected_sha256: &str,
+    icon_path: &str,
     dependencies: PinnedDependencies,
 ) -> Result<DistributionAsset, Box<dyn Error>> {
     if !package_path.is_file() {
@@ -293,6 +310,7 @@ fn build_asset(
     }
     let bytes = std::fs::read(package_path)?;
     let sha256 = hex_sha256(&bytes);
+    let icon = build_distribution_icon(package_path, icon_path, id, version)?;
     // 产物被改动过就说明候选与测试过的内容不是同一份，必须重新构建。
     if !expected_sha256.trim().is_empty() && !sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
         return Err("候选制品摘要与构建记录不一致，请重新构建后再发布".into());
@@ -305,6 +323,7 @@ fn build_asset(
         release_notes: release_notes.trim().to_string(),
         min_agent_version: min_agent_version.trim().to_string(),
         package_path: package_path.to_path_buf(),
+        icon,
         sha256,
         size_bytes: bytes.len() as u64,
         dependency_summary: json!({
@@ -316,6 +335,51 @@ fn build_asset(
         dependency_blocker: dependencies.blocker,
         dependencies: json!(dependencies.items),
     })
+}
+
+fn build_distribution_icon(
+    package_path: &std::path::Path,
+    declared: &str,
+    id: &str,
+    version: &str,
+) -> Result<Option<DistributionIcon>, Box<dyn Error>> {
+    let declared = declared.trim();
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    crate::app::extension_icons::validate_icon_reference(declared)?;
+    let file = std::fs::File::open(package_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut entry = match archive.by_name(declared) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
+    };
+    if entry.size() > 256 * 1024 {
+        return Err("扩展图标不能超过 256 KB".into());
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes)?;
+    let icon = crate::app::extension_icons::cache_icon_bytes(&bytes, "author")?
+        .ok_or_else(|| "无法解析扩展图标".to_string())?;
+    let path = crate::app::extension_icons::icon_artifact_path(&icon)
+        .ok_or_else(|| "扩展图标缓存不可用".to_string())?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png")
+        .to_string();
+    Ok(Some(DistributionIcon {
+        path,
+        file_name: format!("{}-{}-icon.{extension}", id.trim(), version.trim()),
+        sha256: icon.sha256,
+        content_type: if extension == "webp" {
+            "image/webp"
+        } else {
+            "image/png"
+        }
+        .to_string(),
+        size_bytes: bytes.len() as u64,
+    }))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -348,6 +412,12 @@ pub(crate) fn preview(
         "id": asset.id,
         "version": asset.version,
         "name": asset.name,
+        "icon": asset.icon.as_ref().map(|icon| json!({
+            "file_name": icon.file_name,
+            "sha256": icon.sha256,
+            "content_type": icon.content_type,
+            "size_bytes": icon.size_bytes,
+        })),
         "targets": targets.iter().map(|target| target.as_str()).collect::<Vec<_>>(),
         "github": {
             "repository": slug,
@@ -520,14 +590,25 @@ fn publish_github(asset: &DistributionAsset) -> Result<TargetOutcome, Box<dyn Er
         size_bytes: asset.size_bytes,
         content_type: "application/octet-stream".to_string(),
     };
+    let icon_artifact = asset.icon.as_ref().map(|icon| GithubArtifact {
+        name: icon.file_name.clone(),
+        path: icon.path.clone(),
+        sha256: icon.sha256.clone(),
+        size_bytes: icon.size_bytes,
+        content_type: icon.content_type.clone(),
+    });
     // 清单与制品一起上传：消费侧只读清单就能确认摘要与依赖。
     let manifest_content = {
         let mut resolved_plan = plan.clone();
         resolved_plan.artifacts = vec![primary.clone()];
+        if let Some(icon) = icon_artifact.clone() {
+            resolved_plan.artifacts.push(icon);
+        }
         let manifest = github_publisher::build_release_manifest(
             &resolved_plan,
             &tag,
             &primary,
+            icon_artifact.as_ref(),
             &asset.dependencies,
             &asset.min_agent_version,
         );
@@ -546,6 +627,9 @@ fn publish_github(asset: &DistributionAsset) -> Result<TargetOutcome, Box<dyn Er
     };
     let mut plan = plan;
     plan.artifacts = vec![primary];
+    if let Some(icon) = icon_artifact {
+        plan.artifacts.push(icon);
+    }
     plan.artifacts.push(manifest_artifact);
     let previous_release = github_publisher::PreviousRelease {
         asset_name: previous

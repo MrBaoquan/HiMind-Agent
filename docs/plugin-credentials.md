@@ -1,63 +1,98 @@
-# 插件凭据（S1 已实现 / S2 契约）
+# 插件凭据
 
-插件经常需要「用户自己的账号或密钥」（API key、OAuth、Cookie、账号密码）。
-这些值**不应该**散落在各插件目录的配置文件里：那样无法轮换、无法审计、插件一升级
-就可能覆盖用户填过的值，卸载后还会留下孤儿秘密。
+插件经常需要用户自己的账号或密钥。凭据由 Agent 统一登记、保管、验证和按需下发；
+插件目录不保存长期秘密，插件清单也不能凭借“声明”自动获得访问权。
 
-## S1：声明 + Agent 统一保管（已实现）
+## 清单声明
 
-- 插件清单声明需求（`plugin.json`）：
+`plugin.json` 的 `credentials` 同时兼容旧字符串字段和新对象字段：
 
-  ```json
+```json
+{
   "credentials": [
     {
-      "id": "media.cookies",
-      "label": "下载站点 Cookie",
-      "kind": "cookie",
-      "fields": ["cookie"],
-      "required": false,
-      "description": "需要登录才能下载的站点：把浏览器里的 Cookie 粘到这里。",
-      "docs_url": "https://example.com/help"
+      "id": "demo.account",
+      "label": "Demo 服务账号",
+      "kind": "userpass",
+      "required": true,
+      "description": "用于 Demo 服务同步。",
+      "docs_url": "https://example.com/help",
+      "verify_capability": "demo.credential.check",
+      "fields": [
+        {
+          "key": "username",
+          "label": "账号",
+          "type": "text",
+          "secret": false,
+          "required": true
+        },
+        {
+          "key": "password",
+          "label": "密码",
+          "type": "password",
+          "secret": true,
+          "required": true
+        }
+      ]
     }
   ]
-  ```
+}
+```
 
-- Agent 侧统一录入（插件详情 → 凭据），值以 **DPAPI 按当前 Windows 用户加密**落盘
-  （`profiles/<profile>/plugin-credentials.json`），**按插件 ID 隔离**。
-- 界面与插件只能看到「配没配 / 配了哪些字段 / 更新时间」，**永远不回显明文**。
-- 删除即失效；插件卸载时调用 `remove_all_for_plugin` 清掉它名下的条目。
-- 内核侧取值入口 `store::plugin_credentials::secret_fields`（仅供内核/未来 broker）。
+旧写法 `"fields": ["api_key"]` 仍可读取，并归一化为秘密密码字段。新清单应使用对象写法。
 
-## S2：插件如何真正拿到值（待实现，两个候选）
+字段规则：
 
-**方案 A（推荐）：反向 broker 调用**
+- `key` 在一条凭据内唯一，只能使用字母、数字、点、短横线和下划线；
+- `secret=false` 的字段可显示为账号名、地址或租户等元数据；
+- `secret=true` 的字段只保存 DPAPI 密文，UI 和 broker 状态接口都不回显；
+- `type` 支持 `text`、`password`、`url`、`file`、`cookie`；
+- 保存时，未在清单声明的字段会被拒绝。
 
-插件运行期向 Agent 申请短期凭据：`secret.broker.acquire(credential_id, purpose)`。
-Agent 校验「该插件是否声明 + 是否获授权 + purpose 是否在范围内」后，返回**短期令牌或
-一次性值**；每次取用写审计（谁、哪个插件、哪条凭据、何时）。
+## 存储与状态
 
-- 前提：插件运行时目前是「Agent → 插件」单向 JSON-RPC，**没有反向通道**。需要新增：
-  1. Agent 启动插件时注入一次性会话令牌（环境变量，进程级）；
-  2. Agent 暴露只监听环回的凭据端点（`127.0.0.1:<port>/plugin-credentials`），按令牌
-     认证、限流、只允许该插件自己的凭据；
-  3. 插件 SDK（`sdk/jsonrpc`）加一个 `acquire` 客户端与缓存（只缓存短期令牌）。
-- 优点：最小下发、可审计、可轮换、插件不落盘；缺点是协议要加一层。
+- 密文落在 profile 的 `plugin-credentials.json`；
+- 每条 profile 记录声明指纹；插件更新后若声明变化，状态变为“需确认”；
+- 状态只暴露配置字段、公开字段、更新时间，不暴露秘密值；
+- 插件卸载时清理其名下所有凭据；
+- `credential-audit.jsonl` 记录 consumer、credential、capability、结果和时间，不记录任何值。
 
-**方案 B（过渡）：启动时一次性注入**
+## 运行时 broker
 
-Agent 在 spawn 插件进程时，把**已授权且插件声明过**的字段解密后注入进程环境变量
-（如 `HIMIND_CRED_<ID>_<FIELD>`），插件启动时读取。
+外部插件按能力调用启动短生命周期进程。若插件声明了凭据且具备
+`secret.broker.acquire` 权限，Agent 会为本次调用启动仅监听 `127.0.0.1` 的 broker：
 
-- 优点：零协议改动、插件只读环境变量；缺点：环境变量对整个进程树可见、只能启动时
-  更新（轮换需重启插件）、审计粒度只到「本次启动」。
-- 仅建议作为短期过渡，且必须：只注入声明过的字段、每次启动写审计、日志里绝不打印值。
+```text
+HIMIND_CREDENTIAL_BROKER_URL=http://127.0.0.1:<port>/acquire
+HIMIND_CREDENTIAL_BROKER_TOKEN=<one-invocation token>
+```
 
-## 落地顺序
+插件请求：
 
-1. 选一个**真正需要用户密钥**的插件（目前仓库里没有：微信小程序读的是项目自带的
-   `project.config.json`，GitHub 令牌由 Agent 自己管理），先确认需求真实存在；
-2. 实现反向 broker（方案 A）+ 该插件的读取改造；
-3. 补审计视图（凭据 → 使用方/最近取用）与轮换策略。
+```http
+POST /acquire
+Authorization: Bearer <token>
+Content-Type: application/json
 
-在此之前，S1 的「声明 + 统一管理 + 状态可见」已经能解决「配置散落、无处审计」的问题，
-并且不会把明文交给任何插件。
+{"credential_id":"demo.account","purpose":"demo.sync"}
+```
+
+`purpose` 必须等于本次调用的 capability ID。成功时返回公开字段和秘密字段；会话在插件
+进程结束后立即关闭，token 不能跨调用复用。
+
+Broker 同时校验：
+
+1. 一次性会话 token 和截止时间；
+2. plugin ID 与 capability；
+3. 凭据 ID 是否由当前插件清单声明；
+4. 保存时的声明指纹是否仍匹配；
+5. 插件是否具备 `secret.broker.acquire`；
+6. 请求次数上限。
+
+## 信任边界
+
+Broker 解决的是最小权限、按次下发、轮换、撤销和审计。它不是对恶意插件的强沙箱：
+插件拿到值以后仍可能泄露。插件安装审查、扩展签名和组织策略仍是信任链的一部分。
+
+共享账号、通用 OAuth 授权引擎和 secretless egress proxy 不在当前阶段范围内。工作流连接器
+使用同一套 consumer 授权与审计语义，但由 Agent 在 workflow capability 执行前解析。
