@@ -529,10 +529,12 @@ function ProjectListItem({ project, dashboardEnabled, busyAction, selected, onSe
   const active = activeSubmission(project);
   const state = projectState(project, dashboardEnabled, draft, active);
   const building = Boolean(project.local && busyAction === `build:${project.local.id}`);
+  // 已构建是开发页的默认健康态；列表只为构建中、未构建和发布例外保留状态位。
+  const showState = building || state.label !== '已构建';
   return <button className={`development-project-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(project.key)}>
     <ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={40} label={extensionKindLabels[project.kind]} />
-    <span className="development-project-copy"><strong>{project.name}</strong><small title={`${extensionKindLabels[project.kind]} · ${projectSourceLabel(project)}${project.local ? ` · v${project.local.version}` : ''}`}>{listMeta(project)}</small>{active ? <small>{submissionStatus(active).label} · v{active.value.version}</small> : null}</span>
-    <span className={`skill-state-label ${building ? 'warn' : state.tone}`}>{building ? '构建中' : state.label}</span>
+    <span className="development-project-copy"><strong>{project.name}</strong><small title={`${extensionKindLabels[project.kind]} · ${projectSourceLabel(project)}${project.local ? ` · v${project.local.version}` : ''}`}>{listMeta(project)}</small></span>
+    {showState ? <span className={`skill-state-label ${building ? 'warn' : state.tone}`}>{building ? '构建中' : state.label}</span> : null}
   </button>;
 }
 
@@ -562,7 +564,6 @@ function ProjectDetail({ project, dashboardEnabled, accountAuthorized, available
   const [buildStage, setBuildStage] = useState<ExtensionBuildStage | null>(null);
   const draft = currentDraft(project);
   const active = activeSubmission(project);
-  const state = projectState(project, dashboardEnabled, draft, active);
   const version = draft ? draftVersion(draft) : project.local?.version || active?.value.version || '--';
   const busy = Boolean(busyAction);
   const dependencies = draftDependencies(draft, availablePlugins);
@@ -575,7 +576,7 @@ function ProjectDetail({ project, dashboardEnabled, accountAuthorized, available
 
   return <>
       <header className="development-detail-header">
-      <div className="development-detail-title"><ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={46} /><div><div><h3>{project.name}</h3><Pill kind={state.tone}>{state.label}</Pill></div><small title={projectSourceIdentity(project)}>{extensionKindLabels[project.kind]} · {projectSourceLabel(project)} · v{version}</small></div></div>
+      <div className="development-detail-title"><ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={46} /><div><div><h3>{project.name}</h3></div><small title={projectSourceIdentity(project)}>{extensionKindLabels[project.kind]} · {projectSourceLabel(project)} · v{version}</small></div></div>
       <div className="development-detail-actions">
         {/* 这三个动作是这个页面上最常用的操作，图标 + 文字一起给，避免「点之前不知道是什么」。 */}
         {project.local?.workspace_available ? <button className="btn btn-primary" title="在这个项目目录里开一条 AI 会话" disabled={busy} onClick={() => onDevelopWithAi(project.local!)}><MessageCircle size={15} />用 AI 开发</button> : <button className="btn btn-primary" title="选择协作项目的本地目录" disabled={busy} onClick={() => void (project.remote ? onAssociateProject(project.remote) : onOpenProject())}><FolderOpen size={15} />关联本地项目</button>}

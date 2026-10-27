@@ -9,6 +9,7 @@ import { ExtensionIcon } from '../components/ExtensionIcon';
 import { ExtensionBatchUpdateDialog } from '../components/ExtensionBatchUpdateDialog';
 import { OperationPlanCard } from '../components/OperationPlanCard';
 import { compareSemanticVersions, installActionLabel } from './marketCatalog';
+import { primaryExtensionStatus, VERSION_CURRENT_LABEL, type ExtensionStatusKey } from '../data/statusPresentation';
 import { pluginFailureState, pluginNeedsRepair } from './pluginHealth';
 
 const governanceLabels: Record<string, string> = {
@@ -133,10 +134,10 @@ export function PluginsPage({ loading, registry, catalog, desired, capabilities,
           <ActionMenuItem icon={<ExternalLink size={15} />} label="从 GitHub 导入" onClick={() => { setGithubError(''); setGithubOpen(true); close(); }} />
           <ActionMenuItem icon={<FolderOpen size={15} />} label="从本地导入" onClick={() => { onImportLocal(); close(); }} />
         </>}</ActionMenu>
-      </div><div className="plugin-toolbar-meta">{updatableCount ? <button type="button" className={`market-update-chip${updatesOnly ? ' active' : ''}`} title="只显示有可用更新的插件" onClick={() => setUpdatesOnly(current => !current)}>{updatableCount} 个可更新</button> : null}{updatableCount ? <button type="button" className="market-update-action" onClick={() => setBatchOpen(true)} title="核对来源后批量更新扩展"><Download size={12} />全部更新</button> : null}<span className={`status-dot ${registry?.registry_ready ? 'success' : 'danger'}`} /><span>{registry?.registry_ready ? '插件可用' : '插件需要处理'}</span></div></div>
+      </div><div className="plugin-toolbar-meta">{updatableCount ? <button type="button" className={`market-update-chip${updatesOnly ? ' active' : ''}`} title="只显示有可用更新的插件" onClick={() => setUpdatesOnly(current => !current)}>{updatableCount} 个可更新</button> : null}{updatableCount ? <button type="button" className="market-update-action" onClick={() => setBatchOpen(true)} title="核对来源后批量更新扩展"><Download size={12} />全部更新</button> : null}{!registry?.registry_ready ? <><span className="status-dot danger" /><span>插件需要处理</span></> : null}</div></div>
       <div className={`plugin-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
         <aside className="plugin-list plugin-list-with-search" aria-label="已安装插件列表">
-          <div className="plugin-list-header"><strong>已安装</strong><span className="section-count">{userPluginItems.length}</span></div>
+          <div className="plugin-list-header"><strong>插件</strong></div>
           <div className="plugin-list-search"><label className="skill-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索插件" /></label></div>
           <div className="plugin-list-body">
             {filteredPlugins.map(item => {
@@ -151,7 +152,7 @@ export function PluginsPage({ loading, registry, catalog, desired, capabilities,
               );
             })}
           {!userPluginItems.length ? <EmptyState icon={Blocks} title="还没有安装插件" text="到「市场」浏览安装，或用上面的「安装插件」导入本机、GitHub 插件。" /> : null}
-{userPluginItems.length > 0 && !filteredPlugins.length ? <EmptyState icon={Search} title={updatesOnly ? '已安装的插件都是最新版' : '没有匹配的插件'} text={updatesOnly ? '可以关掉「可更新」筛选查看全部。' : '换个关键词试试。'} /> : null}
+{userPluginItems.length > 0 && !filteredPlugins.length ? <EmptyState icon={Search} title={updatesOnly ? '没有可更新的插件' : '没有匹配的插件'} text={updatesOnly ? '可以关掉「可更新」筛选查看全部。' : '换个关键词试试。'} /> : null}
           </div>
         </aside>
       <main className="plugin-detail">
@@ -172,9 +173,9 @@ function DetailTabs({ value, onChange }: { value: 'details' | 'versions'; onChan
 
 function PluginVersionList({ versions, currentVersion, lockedLabel, loading, error, onSelect }: { versions: PluginCatalogItem[]; currentVersion?: string; lockedLabel?: string; loading: boolean; error: string; onSelect: (version: string) => void }) {
   const sorted = [...versions].sort((left, right) => compareSemanticVersions(right.version, left.version));
-  // 本机已经是这一版的行只留状态标签：再挂一个禁用按钮只是把「已安装」写两遍。
+  // 已经是这一版的行只留状态标签：再挂一个禁用按钮只是把「当前」写两遍。
   // 安装与升级用主按钮，降级退回普通样式；重新安装走来源管理。
-  return <section className="extension-version-list">{loading ? <div className="extension-version-empty"><BusyIndicator size={15} />正在读取版本</div> : null}{error ? <div className="plugin-local-error">{error}</div> : null}{!loading && sorted.map(version => { const installed = currentVersion === version.version; const action = installActionLabel({ target: version.version, installed: currentVersion, locked: lockedLabel }); return <article className="extension-version-row" key={version.version}><div className="extension-version-main"><div><strong>v{version.version}</strong>{installed ? <Pill kind="success">已安装</Pill> : null}</div><time>{formatPublishedAt(version.published_at)}</time>{version.release_notes ? <p>{version.release_notes}</p> : null}</div>{installed ? null : <button className={compareSemanticVersions(version.version, currentVersion || '') > 0 ? 'btn btn-primary' : 'btn'} disabled={Boolean(lockedLabel)} onClick={() => onSelect(version.version)}>{action}</button>}</article>; })}</section>;
+  return <section className="extension-version-list">{loading ? <div className="extension-version-empty"><BusyIndicator size={15} />正在读取版本</div> : null}{error ? <div className="plugin-local-error">{error}</div> : null}{!loading && sorted.map(version => { const installed = currentVersion === version.version; const action = installActionLabel({ target: version.version, installed: currentVersion, locked: lockedLabel }); return <article className="extension-version-row" key={version.version}><div className="extension-version-main"><div><strong>v{version.version}</strong>{installed ? <Pill kind="success">{VERSION_CURRENT_LABEL}</Pill> : null}</div><time>{formatPublishedAt(version.published_at)}</time>{version.release_notes ? <p>{version.release_notes}</p> : null}</div>{installed ? null : <button className={compareSemanticVersions(version.version, currentVersion || '') > 0 ? 'btn btn-primary' : 'btn'} disabled={Boolean(lockedLabel)} onClick={() => onSelect(version.version)}>{action}</button>}</article>; })}</section>;
 }
 
 function PluginDependencyName({ pluginId, catalog }: { pluginId: string; catalog: PluginCatalogItem[] }) {
@@ -221,6 +222,11 @@ function PluginDetail({ item, capabilities, catalog, catalogEnabled, onLoadVersi
   // 开发中的插件同样给：它们的健康记录写在扩展开发目录里，修复会把两处一起清掉，
   // 而失败提示里既已写明「点修复并重试」，就不能只在开发中插件上留一句空话。
   const needsRepair = pluginNeedsRepair(item);
+  const statusKeys: ExtensionStatusKey[] = [];
+  if (item.circuit_open || item.status === 'failed') statusKeys.push('error');
+  else if (!item.enabled) statusKeys.push('disabled');
+  if (updatable) statusKeys.push('update');
+  const pluginStatus = primaryExtensionStatus(statusKeys);
 
   useEffect(() => {
     if (!catalogEnabled && tab !== 'details') setTab('details');
@@ -241,7 +247,7 @@ function PluginDetail({ item, capabilities, catalog, catalogEnabled, onLoadVersi
       <div className="plugin-detail-header">
         <div className="plugin-detail-title">
           <ExtensionIcon kind="plugin" name={item.name || item.id} icon={item.icon} size={48} />
-          <div className="plugin-title-line"><h3>{item.name || item.id}</h3>{item.kind === 'connector' ? <Pill kind="neutral">连接器</Pill> : null}<Pill kind={item.circuit_open ? 'danger' : item.status === 'installed' && item.enabled ? 'success' : item.status === 'failed' ? 'danger' : 'warn'}>{item.circuit_open || item.status === 'failed' ? '运行异常' : item.enabled ? '已安装' : '已停用'}</Pill>{item.development ? <Pill kind="warn">开发中</Pill> : null}{governanceTag ? <Pill kind={governanceTag.tone}>{governanceTag.label}</Pill> : null}</div>
+          <div className="plugin-title-line"><h3>{item.name || item.id}</h3>{item.kind === 'connector' ? <Pill kind="neutral">连接器</Pill> : null}{pluginStatus ? <Pill kind={pluginStatus.tone}>{pluginStatus.label}</Pill> : null}{item.development ? <Pill kind="warn">开发中</Pill> : null}{governanceTag ? <Pill kind={governanceTag.tone}>{governanceTag.label}</Pill> : null}</div>
         </div>
         {/* 回滚暂时不暴露入口（后端与 registry 里的 previous 版本都保留），详情级只留更新、启用与卸载。 */}
         <div className="plugin-installed-actions">

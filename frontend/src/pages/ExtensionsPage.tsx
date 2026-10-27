@@ -8,7 +8,6 @@ import {
   ImageUp,
   RotateCcw,
   Search,
-  ShieldCheck,
   Store,
   X,
 } from 'lucide-react';
@@ -27,6 +26,7 @@ import {
   resolveFunctionalCategory,
 } from '../data/categoryCatalog';
 import { capabilityKindLabels, extensionKindLabels, type ExtensionKind, type McpKind } from '../data/extensionKinds';
+import { extensionStatus, VERSION_CURRENT_LABEL, type ExtensionStatusPresentation } from '../data/statusPresentation';
 import {
   compareSemanticVersions,
   entryIdentity,
@@ -152,12 +152,14 @@ function assignmentKind(label: string): MarketEntry['policyKind'] {
 /// 列表行角标只回答一件事：这个扩展现在能不能用、要不要动它。
 /// 口径与筛选项一致（未安装 / 已安装 / 可更新），组织策略（必装、禁止）
 /// 因为会改变可用性，优先于安装状态展示。
-function marketStateBadge(entry: MarketEntry): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
-  if (entry.blocked) return { label: entry.policyLabel || '组织已禁止', tone: 'danger' };
-  if (updatableVersion(entry)) return { label: '可更新', tone: 'warn' };
-  if (entry.installedVersion) return { label: '已安装', tone: 'success' };
-  if (entry.policyLabel === '组织必装' || entry.policyLabel === '组织推荐') return { label: entry.policyLabel, tone: 'warn' };
-  return { label: entry.kind === 'instruction' ? '可导入' : '未安装', tone: 'neutral' };
+function marketStateBadge(entry: MarketEntry): ExtensionStatusPresentation | null {
+  if (entry.blocked) return { ...extensionStatus('blocked'), label: entry.policyLabel || '组织已禁止' };
+  if (updatableVersion(entry)) return extensionStatus('update');
+  if (entry.policyLabel === '组织必装' || entry.policyLabel === '组织推荐') return { ...extensionStatus('update'), label: entry.policyLabel };
+  // 已安装和未安装都是市场默认态，不占每行视觉；版本与“管理”动作仍说明当前归属。
+  // 项目规则仍然提示可导入，因为它对应一个明确动作。
+  if (entry.kind === 'instruction') return { ...extensionStatus('not-installed'), label: '可导入' };
+  return null;
 }
 
 /// 组织禁止或组织管理的扩展，市场里不该宣传「可更新」：详情页的安装按钮本来就是
@@ -577,7 +579,7 @@ export function ExtensionsPage({
     [expertCatalog, experts, instructionPacks, installedPlugins, installedSkills, installedWorkflows, plugins, skills, sourceNameById, workflows],
   );
 
-  /// 来源卡片的「待更新」必须和市场列表同一个口径，所以直接把市场算好的更新目标
+  /// 来源卡片的「可更新」必须和市场列表同一个口径，所以直接把市场算好的更新目标
   /// 版本交给它：卡片只负责回答「这条更新是不是我这个来源提供的」。
   /// 组织管理与组织禁止的制品版本由组织推进，`updatableVersion` 已把它们排除，
   /// 卡片自然也不再统计。
@@ -768,7 +770,7 @@ export function ExtensionsPage({
                     <small title={entry.description || `${entry.sourceName} · ${entry.author}`}>{entry.description || `${entry.sourceName} · ${entry.author}`}</small>
                     <small className="catalog-item-author">{entry.sourceName} · {entry.author} · v{displayVersion(entry)}</small>
                   </span>
-                    <span className={`skill-state-label ${badge.tone}`}>{badge.label}</span>
+                    {badge ? <span className={`skill-state-label ${badge.tone}`}>{badge.label}</span> : null}
                   </button>
                 );
               })}
@@ -962,25 +964,23 @@ function MarketDetail({ entry, loadVersions, installing, onInstall, onManage }: 
           <button type="button" className="btn" disabled={iconBusy} title="选择本机 PNG/WebP（64–1024px，不超过 256 KB）" onClick={() => void changeIcon()}><ImageUp size={15} />{iconBusy ? '处理中' : '更换图标'}</button>
           {displayIcon?.source === 'user' ? <button type="button" className="btn" disabled={iconBusy} title="移除本机覆盖，恢复作者图标或类型默认图标" onClick={() => void resetIcon()}><RotateCcw size={15} />恢复默认</button> : null}
           {/* 「管理」单独出现时看不出管的是什么；这个按钮实际跳去「我的能力」的对应页签。 */}
-          {installed ? <button type="button" className="btn" title="在「我的能力」里管理" onClick={onManage}>管理已安装</button> : null}
-          {upToDate && !lockingLabel ? <Pill kind="success">已是最新</Pill> : null}
+          {installed ? <button type="button" className="btn" title="在「我的能力」里管理" onClick={onManage}>管理</button> : null}
           {showHeaderInstall ? <button type="button" className={`btn${headerPrimary ? ' btn-primary' : ''}`} disabled={disabled} onClick={() => onInstall(entryCandidate)}><Download size={15} />{actionLabel}</button> : null}
         </div>
       </header>
       {entry.description ? <p className="plugin-product-description">{entry.description}</p> : null}
       {iconFeedback ? <div className="inline-feedback visible" role="status">{iconFeedback}</div> : null}
-      {installed ? <div className="plugin-product-notice"><ShieldCheck size={16} /><div><strong>已安装 v{installed}{updatableVersion(entry) ? ` · 可更新至 v${entry.updateVersion}` : entry.managed ? ' · 版本由组织推进' : ''}</strong><span>{entry.kind === 'plugin' ? '可在插件页面启用或停用。' : entry.kind === 'skill' ? '可在技能页面同步、更新或卸载。' : entry.kind === 'workflow' ? '可在工作流页面启用、停用或运行。' : entry.kind === 'expert' ? '可在“我的能力 → 专家”中选择和切换。' : '已导入规则库，可在项目中选择。'}</span></div></div> : null}
       <section className="plugin-product-section">
-        <div className="plugin-section-heading"><div><h4>版本</h4></div><span className="market-section-note">{versionsLoading ? '读取中' : `${sortedVersions.length} 个可安装版本`}</span></div>
+        <div className="plugin-section-heading"><div><h4>版本</h4></div><span className="market-section-note">{versionsLoading ? '读取中' : `${sortedVersions.length} 个版本`}</span></div>
         {versionsError ? <div className="market-inline-warning"><CircleAlert size={14} />{versionsError}</div> : null}
         <div className="market-version-list">
           {sortedVersions.map(candidate => <article className="extension-version-row" key={versionIdentity(candidate)}>
             <div className="extension-version-main">
-              <div><strong>v{candidate.version}</strong>{candidate.version === installed ? <Pill kind="success">本机已安装</Pill> : null}</div>
+              <div><strong>v{candidate.version}</strong>{candidate.version === installed ? <Pill kind="success">{VERSION_CURRENT_LABEL}</Pill> : null}</div>
               <time>{[formatPublishedAt(candidate.publishedAt), candidate.sourceName || candidate.sourceLabel, candidate.minAgentVersion ? `需桌面端 v${candidate.minAgentVersion}` : ''].filter(Boolean).join(' · ')}</time>
               {candidate.notes ? <p>{candidate.notes}</p> : null}
             </div>
-            {/* 本机已经是这一版时不再给按钮：行首的「本机已安装」已经说明结果，
+            {/* 已经是这一版时不再给按钮：行首的「当前」已经说明结果，
                 「重新安装 vX」既像补丁，也不是这页推荐的动作；换来源重装走来源管理。
                 其余版本行只有安装和升级用主按钮样式，降级是显式选择。 */}
             {candidate.version === installed ? null : <button type="button" className={compareSemanticVersions(candidate.version, installed) > 0 ? 'btn btn-primary' : 'btn'} disabled={disabled} onClick={() => onInstall(candidate)}>{entry.kind === 'instruction' ? '导入到规则库' : installActionLabel({ target: candidate.version, installed, locked: lockingLabel })}</button>}

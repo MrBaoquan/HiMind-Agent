@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { ChevronDown, CircleAlert, Download, FolderOpen, GitBranch, Info, MessageCircle, MoreHorizontal, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
 import { agentApi, type DistributionStateEntry, type ExtensionDistributionUnit, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceNotice, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionSourceStatus, type ExtensionWorkspaceSettings } from '../services/agentApi';
 import { compareVersions, countUnitUpdates, friendlySourceName, sourceBaseName, type UnitUpdateAsset } from '../pages/marketCatalog';
+import { extensionStatus } from '../data/statusPresentation';
 import { ActionMenu, ActionMenuItem } from './ActionMenu';
 import { BusyIndicator } from './BusyIndicator';
 import { useModalFocus } from './useModalFocus';
@@ -13,7 +14,7 @@ type Props = {
   settings: ExtensionSourceSettings;
   snapshot: ExtensionSourceSnapshot | null;
   /// 制品 ID → 市场认定的更新目标版本（`kind:id` 为键）。用的是市场清单已经
-  /// 算好的那一份，让「来源卡片待更新数」和市场的「可更新」永远同源。
+  /// 算好的那一份，让「来源卡片可更新数」和市场的「可更新」永远同源。
   unitUpdateTargets: Map<string, string>;
   loading: boolean;
   error: string;
@@ -426,7 +427,7 @@ function unitStatus(group: UnitGroup, statuses: Map<string, ExtensionSourceStatu
   if (members.length && !enabled.length) return { dot: '', text: '已停用' };
   const ready = enabled.find(source => statuses.get(source.id)?.state === 'ready');
   if (!ready) return { dot: 'danger', text: enabled.some(source => statuses.has(source.id)) ? '不可用' : '待刷新' };
-  return { dot: 'success', text: statuses.get(ready.id)?.using_cache ? '缓存可用' : '可用' };
+  return { dot: 'success', text: statuses.get(ready.id)?.using_cache ? '缓存可用' : '' };
 }
 
 function unitInstallState(group: UnitGroup, updateTargets: Map<string, string>) {
@@ -459,7 +460,7 @@ function unitInstallState(group: UnitGroup, updateTargets: Map<string, string>) 
       foreign += 1;
     }
   }
-  // 「待更新」与市场同一个口径，规则定义在 marketCatalog.countUnitUpdates 里，
+  // 「可更新」与市场同一个口径，规则定义在 marketCatalog.countUnitUpdates 里，
   // 免得两边各写一份版本判定后再次分叉。
   const updates = countUnitUpdates(unit.assets as UnitUpdateAsset[], updateTargets);
   return { installed: unit.installed.length, attributed, foreign, updates, missing, mismatch, downgrades };
@@ -471,7 +472,7 @@ type UnitInstallState = { installed: number; attributed: number; foreign: number
 function unitSummary(group: UnitGroup, install: UnitInstallState, statuses: Map<string, ExtensionSourceStatus>) {
   const parts = group.unit ? unitAssetCounts(group.unit) : memberAssetCounts(group, statuses);
   if (group.unit?.state === 'empty') parts.push('未提供扩展');
-  if (install.updates) parts.push(`${install.updates} 项待更新`);
+  if (install.updates) parts.push(`${install.updates} 项${extensionStatus('update').label}`);
   // 「本机 N/总数」一个数字说清进度，不再单列「N 项待安装」。
   if (install.installed && group.unit?.assets.length) {
     parts.push(`本机 ${install.installed}/${group.unit.assets.length}`);
@@ -534,9 +535,9 @@ function installTitle(group: UnitGroup, install: UnitInstallState) {
   const base = `从${side}安装插件、技能与工作流`;
   const missing = install.missing;
   const updates = install.updates;
-  if (missing && updates) return `${base}，${missing} 项待安装、${updates} 项待更新`;
+  if (missing && updates) return `${base}，${missing} 项待安装、${updates} 项${extensionStatus('update').label}`;
   if (missing) return `${base}，${missing} 项待安装`;
-  if (updates) return `${base}，${updates} 项待更新`;
+  if (updates) return `${base}，${updates} 项${extensionStatus('update').label}`;
   return base;
 }
 

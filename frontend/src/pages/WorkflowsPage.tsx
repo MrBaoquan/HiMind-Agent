@@ -10,6 +10,7 @@ import { ThemeBudgetPreview, ThemeMultiSelect, TopicTagsInput } from '../compone
 import { TopicGroupsBudgetPreview, TopicGroupsEditor } from '../components/WorkflowTopicGroups';
 import { agentApi, type AcpRuntimeProfile, type WorkflowCenterSnapshot, type WorkflowLocalRun, type WorkflowPreflight, type WorkflowRunPreset, type WorkflowRunPresetInput, type WorkflowRunSnapshot, type WorkflowRunVerification, type WorkflowStep } from '../services/agentApi';
 import { formatStamp } from '../timeFormat';
+import { extensionStatus } from '../data/statusPresentation';
 import {
   WorkflowStartFieldError,
   fieldsToInput,
@@ -1558,18 +1559,17 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
            ) : null}
             </div>
           </> : <>
-              <div className="card-header"><strong>已安装工作流</strong><span className="workflow-library-actions">{libraryIssues.length ? <Pill kind="warn">{libraryIssues.length} 个读取失败</Pill> : null}<Pill kind="neutral">{filteredWorkflows.length}{filteredWorkflows.length !== workflows.length ? ` / ${workflows.length}` : ''}</Pill><button type="button" className="btn btn-icon" title="安装本地工作流包" aria-label="安装本地工作流包" disabled={localInstallBusy} onClick={() => void installLocalArchive()}><Upload size={14} /></button></span></div>
+              <div className="card-header"><strong>工作流</strong><span className="workflow-library-actions">{libraryIssues.length ? <Pill kind="warn">{libraryIssues.length} 个读取失败</Pill> : null}<Pill kind="neutral">{filteredWorkflows.length}{filteredWorkflows.length !== workflows.length ? ` / ${workflows.length}` : ''}</Pill><button type="button" className="btn btn-icon" title="安装本地工作流包" aria-label="安装本地工作流包" disabled={localInstallBusy} onClick={() => void installLocalArchive()}><Upload size={14} /></button></span></div>
               <div className="workflow-library-filters" role="search">
                 <label className="workflow-search">
                   <Search size={14} aria-hidden="true" />
                   <input value={librarySearch} placeholder="搜索工作流" aria-label="搜索工作流" onChange={event => setLibrarySearch(event.target.value)} />
                 </label>
-                {/* 状态词只留一套：列表、筛选、详情都说「已启用 / 已停用」。
-                    详情胶囊原来写「可运行」，和列表里的「已启用」指的是同一件事。 */}
+                {/* 筛选仍需要「已启用」这个选项；列表和详情则只在停用等例外态占用视觉。 */}
                 <select value={libraryStatusFilter} aria-label="筛选工作流启用状态" onChange={event => setLibraryStatusFilter(event.target.value as typeof libraryStatusFilter)}>
                   <option value="all">全部状态</option>
                   <option value="enabled">已启用</option>
-                  <option value="disabled">已停用</option>
+                  <option value="disabled">{extensionStatus('disabled').label}</option>
                 </select>
               </div>
             <div className="workflow-list">
@@ -1639,7 +1639,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                       4 行全挂一枚 62px 的「已启用」等于占着第三列说同一句默认值，还把名字
                       两行挤到 151px。状态与动作合成同一个控件，和「定时计划」列表同一套行结构。
                       详情头部原来还有一枚同样的开关，现在是第二次说同一句话，已删掉——
-                      同一屏上一个布尔值只留一个控件，详情只读状态（标题旁的状态胶囊）。
+                      同一屏上一个布尔值只留一个控件；默认启用态在详情里不再重复说明。
                       停用的连带后果写进 title：停用后不能运行，指向它的定时计划也不会执行。 */}
                   <label className="toggle compact workflow-quick-toggle" title={item.enabled ? '停用工作流（停用后不能运行，指向它的定时计划也不会执行）' : '启用工作流（启用后可以运行，也可以被定时计划调用）'}>
                     <input
@@ -1666,7 +1666,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
               {!loading && workflows.length === 0 && libraryIssues.length === 0 ? (
                 /* 空库时整屏只留一个空态：结论与「下一步」都放在右侧详情区，
                    窄列表这里只用一行浅色文字说明这一列为什么是空的。 */
-                <p className="workflow-library-hint">暂无已安装的工作流。</p>
+                <p className="workflow-library-hint">暂无工作流。</p>
               ) : null}
             </div>
           </>}
@@ -1807,7 +1807,6 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                     <div className="workflow-title-line">
                       <h2>{selectedWorkflow.package.name}</h2>
                       {selectedWorkflow.development ? <span className="workflow-dev-badge">开发</span> : null}
-                      <Pill kind={selectedWorkflow.enabled ? 'success' : 'neutral'}>{selectedWorkflow.enabled ? '已启用' : '已停用'}</Pill>
                     </div>
                     <p>{selectedWorkflow.package.description}</p>
                     {/* 停用说明放在状态这一侧（描述下面），不放进动作区：
@@ -1816,7 +1815,7 @@ export function WorkflowsPage({ snapshot, runtimeProfiles = [], mode, onOpenRun,
                         按钮位置两种状态都一样。 */}
                     {selectedWorkflow.enabled ? null : (
                       <div className="workflow-disabled-note">
-                        <CircleAlert size={13} aria-hidden="true" />已停用 · 打开左侧列表的开关后可以运行
+                        <CircleAlert size={13} aria-hidden="true" />{extensionStatus('disabled').label} · 打开左侧列表的开关后可以运行
                       </div>
                     )}
                   </div>

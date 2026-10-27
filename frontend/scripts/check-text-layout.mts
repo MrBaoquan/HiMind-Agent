@@ -52,6 +52,12 @@ assert.equal(laterNowrap.length, 0,
   `说明两行规则之后又出现了单行省略规则，会重新裁掉说明：${laterNowrap.map((block) => block.selector).join(' / ')}`);
 
 // 14. 工具名不再被挤到 72px 以下：单列宽度下限要容得下最长工具名（GitHub Copilot ≈ 79px）。
+// 首页底部事实格需要足够的上下内边距，避免版本/运行状态贴住卡片边框。
+const overviewFact = lastBlock((block) => block.selector === '.overview-facts > div');
+assert.ok(overviewFact, 'styles.css 缺少首页事实格规则');
+assert.match(overviewFact!.body, /min-height: 60px/, '首页事实格高度不能压到 56px 以下');
+assert.match(overviewFact!.body, /padding: 12px 14px/, '首页事实格上下内边距统一为 12px');
+
 const toolGrid = lastBlock((block) => block.selector === '.skill-client-availability > details > div');
 assert.ok(toolGrid, 'styles.css 缺少投放目标工具网格规则');
 const minTrack = /minmax\((\d+)px, 1fr\)/.exec(toolGrid!.body);
@@ -63,6 +69,19 @@ assert.ok(
 const toolName = lastBlock((block) => block.selector.includes('.skill-client-tool-copy strong'));
 assert.ok(toolName && /overflow-wrap: anywhere/.test(toolName.body), '工具名要允许折词，超长名称不能被切掉半截');
 
+// 16. 工作流标题与「开发」徽标分列：徽标右缘要对齐，不能被标题长度推成锯齿。
+const workflowName = lastBlock((block) => block.selector === '.workflow-list-name');
+assert.ok(workflowName, 'styles.css 缺少工作流列表标题规则');
+assert.match(workflowName!.body, /display: grid/, '工作流标题与开发徽标要用分列布局');
+assert.match(workflowName!.body, /grid-template-columns: minmax\(0, 1fr\) auto/, '标题列可伸缩、开发徽标列按内容固定');
+const workflowBadge = lastBlock((block) => block.selector.includes('.workflow-dev-badge'));
+assert.ok(workflowBadge && /justify-self: end/.test(workflowBadge.body), '开发徽标必须右对齐');
+
+// 17. 扩展详情动作按内容宽度排布，默认窗口下不能把主按钮拉满整行。
+const developmentActions = lastBlock((block) => block.selector === '.development-detail-actions > .btn');
+assert.ok(developmentActions, 'styles.css 缺少扩展详情动作按钮规则');
+assert.match(developmentActions!.body, /flex: 0 0 auto/, '扩展详情动作按钮应按内容宽度排布');
+assert.doesNotMatch(developmentActions!.body, /flex: 1 1 100%/, '扩展详情主按钮不能强制占满整行');
 // 15. 路径整段可读：这组选择器最后一次出现时都不能再强制单行。
 const pathSelectors = [
   '.ai-diagnostic-path code',

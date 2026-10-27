@@ -56,7 +56,7 @@ export function McpConnectionsPanel({ mcp, onBrowseCatalog, note }: {
                     <span title={detail}>{detail}</span>
                     {probeLine(mcp, server.server_name)}
                   </div>
-                  <Pill kind={server.enabled ? 'success' : 'neutral'}>{server.enabled ? '已启用' : '已停用'}</Pill>
+                  {server.enabled ? null : <Pill kind="neutral">已停用</Pill>}
                   <div className="ai-client-registration-actions">
                     {mcp.confirmDelete === server.server_name ? (
                       <span className="builtin-ai-mcp-confirm">
