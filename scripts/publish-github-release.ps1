@@ -16,6 +16,7 @@ param(
     [switch]$SkipWindowsTimestamp,
     [switch]$SkipBuild,
     [switch]$SkipTests,
+    [switch]$SkipDependencyInstall,
     [switch]$SkipGhRelease,
     [switch]$Prerelease
 )
@@ -179,6 +180,7 @@ try {
     if ($SkipWindowsTimestamp) { $packageArgs.SkipWindowsTimestamp = $true }
     if ($SkipBuild) { $packageArgs.SkipBuild = $true }
     if ($SkipTests) { $packageArgs.SkipTests = $true }
+    if ($SkipDependencyInstall) { $packageArgs.SkipDependencyInstall = $true }
     & (Join-Path $PSScriptRoot "package.ps1") @packageArgs | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Agent package build failed." }
 }
