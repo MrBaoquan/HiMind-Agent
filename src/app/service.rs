@@ -42,6 +42,7 @@ use crate::store::credentials::{
     save_local_inner_admin_credentials,
 };
 use crate::store::types::LocalWorkerStatus;
+use crate::store::workbenches;
 use crate::{worker, Options};
 
 use crate::approval::manager::ApprovalManager;
@@ -451,7 +452,12 @@ fn handle_local_http(
         }
     };
     let request = String::from_utf8_lossy(&request_bytes);
-    let security = LocalRequestSecurity::new(&options.api_base(), options.local_port);
+    let configured_bases = workbenches::configured_api_bases(&options.state_path);
+    let security = LocalRequestSecurity::new_with_connections(
+        &options.api_base(),
+        options.local_port,
+        &configured_bases,
+    );
     let response_origin = match security.validate(&request) {
         Ok(origin) => origin,
         Err(message) => {
@@ -574,6 +580,31 @@ fn handle_local_http(
                     "application/json",
                 );
             }
+            // The enrollment token was minted by the browser's workbench, not
+            // necessarily by the Agent's currently active connection. Bind to
+            // the validated Origin so a page from workbench B can enroll even
+            // while connection A is active; manual code entry already does this
+            // by explicitly selecting a connection.
+            let target_api_base = response_origin.unwrap_or_default().trim().trim_end_matches('/').to_string();
+            let previous_api_base = options.api_base();
+            let target = match workbenches::activate_for(&options.state_path, &target_api_base) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return write_local_response(
+                        &mut stream,
+                        409,
+                        &json!({
+                            "ok": false,
+                            "status": "workbench_not_configured",
+                            "error": format!("当前页面不是已配置的工作台：{error}")
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                }
+            };
+            options.set_api_base(&target.api_base);
+            options.adopt_connection();
             match crate::api::client::register_agent(
                 &Client::builder()
                     .timeout(std::time::Duration::from_secs(20))
@@ -586,6 +617,7 @@ fn handle_local_http(
                 Ok(state) => {
                     options.set_agent_credential(&state.credential);
                     crate::api::oauth::cache_registration_access(&options, &state);
+                    workbenches::capture_active_quiet(&options.state_path);
                     if let Ok(mut status) = worker_status.lock() {
                         status.dashboard_agent_id = state.agent_id.clone();
                         status.dashboard_worker_error = "正在完成连接".to_string();
@@ -597,12 +629,17 @@ fn handle_local_http(
                         "application/json",
                     )
                 }
-                Err(error) => write_local_response(
-                    &mut stream,
-                    400,
-                    &json!({ "ok": false, "status": "failed", "error": error.to_string() }).to_string(),
-                    "application/json",
-                ),
+                Err(error) => {
+                    options.set_api_base(&previous_api_base);
+                    options.adopt_connection();
+                    let _ = workbenches::activate_for(&options.state_path, &previous_api_base);
+                    write_local_response(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "status": "failed", "error": error.to_string() }).to_string(),
+                        "application/json",
+                    )
+                }
             }
         }
         ("GET", "/health") => {

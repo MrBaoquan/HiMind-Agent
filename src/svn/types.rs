@@ -63,7 +63,7 @@ pub(crate) struct CloneExhibitRepositoryRequest {
     pub source_repository_url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct ImportLocalExhibitRequest {
     pub project_id: String,
     pub exhibit_id: String,

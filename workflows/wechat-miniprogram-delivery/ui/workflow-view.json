@@ -1,0 +1,30 @@
+{
+  "schema_version": "workflow_view.v1",
+  "title": "微信小程序体验版交付",
+  "sections": [
+    {
+      "id": "target",
+      "title": "交付目标",
+      "fields": [
+        {"id": "workspace_root", "label": "工作区目录", "type": "text", "required": true, "picker": "directory", "hint": "包含小程序工程的 Git 工作区"},
+        {"id": "project_root", "label": "小程序工程目录", "type": "text", "required": true, "picker": "directory", "hint": "必须包含 project.config.json"},
+        {"id": "app_id", "label": "AppID", "type": "text", "required": true, "placeholder": "wx..."},
+        {"id": "version", "label": "体验版版本号", "type": "text", "required": true, "placeholder": "例如 1.0.0"},
+        {"id": "description", "label": "版本说明", "type": "text", "placeholder": "留空使用默认说明"}
+      ]
+    },
+    {
+      "id": "advanced",
+      "title": "高级",
+      "fields": [
+        {"id": "channel", "label": "上传通道", "type": "select", "default": "auto", "options": [{"value": "auto", "label": "自动（推荐）"}, {"value": "ci", "label": "CI 直传"}, {"value": "wechatide", "label": "微信开发者工具"}]},
+        {"id": "package_manager", "label": "包管理器", "type": "select", "default": "npm", "options": [{"value": "npm", "label": "npm"}, {"value": "pnpm", "label": "pnpm"}, {"value": "yarn", "label": "yarn"}]},
+        {"id": "script", "label": "构建脚本", "type": "text", "default": "build", "hint": "传给 package manager 的 run 脚本名"},
+        {"id": "artifact_dir", "label": "产物目录", "type": "text", "placeholder": "留空使用项目内默认产物目录"},
+        {"id": "credential_handles", "label": "CI 上传私钥", "type": "credential", "target": "private_key_path", "default": "wechat-upload-private-key"}
+      ]
+    }
+  ],
+  "actions": ["build", "upload"]
+}
+

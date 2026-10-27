@@ -5,6 +5,7 @@ import { AcpProfilesPanel } from './AcpProfilesPanel';
 import { AiToolsPanel } from './AiToolsPanel';
 import { AiProvidersPanel } from './AiProvidersPanel';
 import { AiServiceRoutesPanel } from './AiServiceRoutesPanel';
+import { GatewayProfilesPanel } from './GatewayProfilesPanel';
 import type {
   AIServiceProtocol,
   AIServiceBalanceSnapshot,
@@ -16,6 +17,8 @@ import type {
   McpConnectionTestResult,
   McpTargetDescriptor,
   InferenceGatewayStatus,
+  GatewayProfile,
+  GatewayProfileInput,
 } from '../services/agentApi';
 
 type AiConnectionsPageProps = {
@@ -28,7 +31,10 @@ type AiConnectionsPageProps = {
   aiServices: AIServiceListResult | null;
   aiServiceTemplates: AIServiceTemplateListResult | null;
   gatewayStatus: InferenceGatewayStatus | null;
-  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) => Promise<void>;
+  gatewayProfiles: GatewayProfile[];
+  onSetBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) => Promise<void>;
+  onSaveGatewayProfile: (input: GatewayProfileInput) => Promise<void>;
+  onRemoveGatewayProfile: (id: string) => Promise<void>;
   gatewayBusy: boolean;
   onRestartGateway: () => void;
   onStopGateway: () => void;
@@ -99,6 +105,9 @@ export function AiConnectionsPage({
   aiServices,
   aiServiceTemplates,
   gatewayStatus,
+  gatewayProfiles,
+  onSaveGatewayProfile,
+  onRemoveGatewayProfile,
   onSetBindingMode,
   gatewayBusy,
   onRestartGateway,
@@ -190,6 +199,16 @@ export function AiConnectionsPage({
             onFetchBalance={onFetchBalance}
           />
         </div>
+      ) : activeTab === 'gateway' ? (
+        <div id="ai-panel-gateway" role="tabpanel" aria-labelledby="ai-tab-gateway">
+          <GatewayProfilesPanel
+            profiles={gatewayProfiles}
+            aiServices={aiServices}
+            busy={Boolean(busyAction)}
+            onSave={onSaveGatewayProfile}
+            onRemove={onRemoveGatewayProfile}
+          />
+        </div>
       ) : activeTab === 'routes' ? (
         <div id="ai-panel-routes" role="tabpanel" aria-labelledby="ai-tab-routes">
           <AiServiceRoutesPanel
@@ -206,6 +225,7 @@ export function AiConnectionsPage({
             aiServices={aiServices}
             acpProfiles={acpProfiles}
             gatewayStatus={gatewayStatus}
+            gatewayProfiles={gatewayProfiles}
             busyAction={busyAction}
             testResult={testResult}
             dashboardEnabled={dashboardEnabled}

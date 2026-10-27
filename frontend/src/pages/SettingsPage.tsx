@@ -838,7 +838,7 @@ export function SettingsPage({
                   <Pill kind={independentMode || settings.owner_user_id ? 'success' : 'neutral'}>{independentMode ? '工作台未连接' : settings.owner_user_id ? '已绑定账号' : '仅本机'}</Pill>
                 </div>
                 {independentMode ? <div className="security-note compact approval-independent-note"><ShieldCheck size={16} /><span>未连接 AI 工作台时，记录与提醒只存在本机；其他工具直接执行的操作不经过这里。</span></div> : null}
-              <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>受控操作不再询问，工作流确认步骤也跳过；工作台侧授权与远程目录限制不受影响。</span></div>
+                {approvalProfile === 'full_access' && settings.risk_acknowledged ? <div className="security-note compact approval-independent-note"><LockKeyhole size={16} /><span>受控操作不再询问，工作流确认步骤也跳过；工作台侧授权与远程目录限制不受影响。</span></div> : null}
 
                 <div className="approval-settings-group">
                   <div className="approval-group-heading"><strong>什么时候需要我确认</strong><span>单项例外会优先于整体设置</span></div>

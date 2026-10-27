@@ -2756,6 +2756,37 @@ export type AIServiceTemplateListResult = {
 
 export type MediaExecutionMode = 'sync' | 'stream' | 'async';
 
+export type GatewayModelRoute = {
+    exposed_model: string;
+    service_id: string;
+    upstream_model: string;
+    enabled: boolean;
+};
+
+export type GatewayProfile = {
+    id: string;
+    name: string;
+    /** 兼容旧版客户端的主协议；新代码应以 entry_protocols 为准。 */
+    entry_protocol: AIServiceProtocol;
+    /** 同一聚合入口可同时服务的客户端协议。 */
+    entry_protocols: AIServiceProtocol[];
+    default_model: string;
+    enabled: boolean;
+    routes: GatewayModelRoute[];
+    created_at: string;
+    updated_at: string;
+};
+
+export type GatewayProfileInput = {
+    id: string;
+    name: string;
+    /** 旧版单协议字段；保存时后端会以 entry_protocols[0] 回填。 */
+    entry_protocol: AIServiceProtocol;
+    entry_protocols: AIServiceProtocol[];
+    default_model: string;
+    enabled: boolean;
+    routes: GatewayModelRoute[];
+};
 export type CustomAIService = {
     id: string;
     display_name: string;
@@ -2983,7 +3014,15 @@ export type InferenceGatewayStatus = {
     last_error: string;
     /** 不足以失败、但用户该知道的事实（例如临时换了端口）。 */
     notice: string;
-    gateway_clients: Array<{ client: string; service: string; protocol: string; models: string[] }>;
+    gateway_clients: Array<{
+        client: string;
+        profile_id: string;
+        profile_name: string;
+        service: string;
+        protocol: string;
+        upstream_protocols: string[];
+        models: string[];
+    }>;
     /** 直连注入的客户端：其用量不计入本机口径。 */
     direct_clients: string[];
 };
@@ -3019,8 +3058,8 @@ export const agentApi = {
     restartInferenceGateway: () => invoke<InferenceGatewayStatus>('restart_inference_gateway'),
     setInferenceGatewayPort: (port: number) => invoke<InferenceGatewayStatus>('set_inference_gateway_port', { port }),
     stopInferenceGatewayAndUnbind: () => invoke<InferenceGatewayStopReport>('stop_inference_gateway_and_unbind'),
-    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string) =>
-        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null }),
+    setProviderBindingMode: (target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) =>
+        invoke<{ ok: boolean; target: string; status: string; model?: string; config_path?: string }>('set_provider_binding_mode', { target, mode, service: service ?? null, profileId: profileId ?? null }),
     startDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('start_dashboard_authorization'),
     dashboardAuthorizationProgress: () => invoke<DashboardAuthorizationProgress>('get_dashboard_authorization_progress'),
     cancelDashboardAuthorization: () => invoke<DashboardAuthorizationProgress>('cancel_dashboard_authorization'),
@@ -3333,7 +3372,7 @@ export const agentApi = {
     openFolder: (path: string) => invoke('open_folder', { path }),
     /// 设置窗口的定位由「面板 + 条目 + 页签」三段组成：条目不适用时传空，
     /// 旧键位（remote / skills / logs……）后端原样透传，由前端统一映射。
-    openSettingsWindow: (panel: 'settings' | 'ai' | 'logs' = 'settings', section?: string, tab?: string, aiTab?: 'mcp' | 'services' | 'routes' | 'acp') => invoke('open_settings_window', { panel, section, tab, aiTab }),
+    openSettingsWindow: (panel: 'settings' | 'ai' | 'logs' = 'settings', section?: string, tab?: string, aiTab?: 'mcp' | 'services' | 'gateway' | 'routes' | 'acp') => invoke('open_settings_window', { panel, section, tab, aiTab }),
     pickWorkspaceDirectory: () => invoke<{ path?: string }>('pick_workspace_directory'),
     installPlugin: (pluginId: string, version?: string, source?: string, artifactId?: string, sha256?: string) => invoke('install_plugin', { pluginId, version, source, artifactId, sha256 }),
     uninstallPlugin: (pluginId: string) => invoke('uninstall_plugin', { pluginId }),
@@ -3345,6 +3384,9 @@ export const agentApi = {
     fetchSavedAIServiceModels: (id: string, baseUrl: string) => invoke<AIServiceModelListResult>('fetch_saved_ai_service_models', { id, baseUrl }),
     fetchSavedAIServiceBalance: (id: string) => invoke<AIServiceBalanceSnapshot>('fetch_saved_ai_service_balance', { id }),
     listAIServices: () => invoke<AIServiceListResult>('list_ai_services'),
+    listGatewayProfiles: () => invoke<GatewayProfile[]>('list_gateway_profiles'),
+    saveGatewayProfile: (input: GatewayProfileInput) => invoke<GatewayProfile>('save_gateway_profile', { input }),
+    removeGatewayProfile: (id: string) => invoke<boolean>('remove_gateway_profile', { id }),
     getMediaProviderCatalog: () => invoke<MediaProviderCatalogResult>('get_media_provider_catalog'),
     planAICapabilityRoute: (input: Record<string, unknown>) => invoke<CapabilityRoutePlan>('plan_ai_capability_route', { input }),
     testAICapability: (input: Record<string, unknown>) => invoke<AICapabilityTestResult>('test_ai_capability', { input }),

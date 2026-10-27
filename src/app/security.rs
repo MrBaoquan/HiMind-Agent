@@ -9,12 +9,27 @@ pub(crate) struct LocalRequestSecurity {
 
 impl LocalRequestSecurity {
     pub(crate) fn new(dashboard_base: &str, local_port: u16) -> Self {
+        Self::new_with_connections(dashboard_base, local_port, &[])
+    }
+
+    /// Trust the active workbench plus every workbench connection already saved
+    /// by the user. Pairing from workbench B must remain possible while A is
+    /// active; otherwise /enroll is rejected before it can switch connections.
+    pub(crate) fn new_with_connections(
+        dashboard_base: &str,
+        local_port: u16,
+        configured_bases: &[String],
+    ) -> Self {
         let mut allowed_origins = HashSet::new();
-        if let Some(origin) = normalized_origin(dashboard_base) {
-            if let Some(peer_origin) = loopback_peer_origin(&origin) {
-                allowed_origins.insert(peer_origin);
+        for base in
+            std::iter::once(dashboard_base.to_string()).chain(configured_bases.iter().cloned())
+        {
+            if let Some(origin) = normalized_origin(&base) {
+                if let Some(peer_origin) = loopback_peer_origin(&origin) {
+                    allowed_origins.insert(peer_origin);
+                }
+                allowed_origins.insert(origin);
             }
-            allowed_origins.insert(origin);
         }
         if let Ok(configured) = env::var("HIMIND_AGENT_ALLOWED_ORIGINS") {
             for value in configured.split(',') {
@@ -123,6 +138,18 @@ mod tests {
     fn accepts_local_script_without_origin() {
         let request = "GET /health HTTP/1.1\r\nHost: localhost:18181\r\n\r\n";
         assert_eq!(security().validate(request), Ok(None));
+    }
+
+    #[test]
+    fn accepts_any_saved_workbench_origin_while_another_is_active() {
+        let security = LocalRequestSecurity::new_with_connections(
+            "https://a.example",
+            18181,
+            &["https://b.example".to_string()],
+        );
+        let request =
+            "POST /enroll HTTP/1.1\r\nHost: 127.0.0.1:18181\r\nOrigin: https://b.example\r\n\r\n";
+        assert_eq!(security.validate(request), Ok(Some("https://b.example")));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from 'react';
-import { Activity, AppWindow, Blocks, BookOpen, Cable, CalendarDays, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, Clapperboard, Clock3, Database, Download, ExternalLink, FileCode2, FileText, FolderOpen, Info, LayoutDashboard, LayoutGrid, LogOut, MessageCircle, Minus, MonitorPlay, Music, Package, PanelLeftClose, PanelLeftOpen, Puzzle, Radar, RefreshCw, Search, Settings, Sparkles, Square, Star, Terminal, Video, Workflow, Wrench, X, type LucideIcon } from 'lucide-react';
+import { Activity, AppWindow, Blocks, BookOpen, Cable, CalendarDays, CheckCircle2, ChevronDown, CircleAlert, CircleUserRound, Clapperboard, Clock3, Database, Download, ExternalLink, Eye, EyeOff, FileCode2, FileText, FolderOpen, Info, LayoutDashboard, LayoutGrid, LogOut, MessageCircle, Minus, MonitorPlay, Music, Package, PanelLeftClose, PanelLeftOpen, Puzzle, Radar, RefreshCw, Search, Settings, Sparkles, Square, Star, Terminal, Video, Workflow, Wrench, X, type LucideIcon } from 'lucide-react';
 // 形变吃的是图标数据，静态图标仍走 lucide-react 组件；两边的图标集版本必须一致，
 // 否则同一个图标在「形变端点」和「静态渲染」下长得不一样（由 check:icon-version 守住）。
 import { Activity as activityIconData, LoaderCircle as loaderCircleIconData } from 'lucide';
@@ -122,12 +122,22 @@ type QuickAccessUsage = Record<string, { count: number; lastUsed: number }>;
 type QuickAccessFilter = 'all' | 'favorites' | 'frequent';
 
 const QUICK_ACCESS_FAVORITES_KEY = 'himind.quick-access.favorites';
+const QUICK_ACCESS_HIDDEN_KEY = 'himind.quick-access.hidden';
 const QUICK_ACCESS_USAGE_KEY = 'himind.quick-access.usage';
 const QUICK_ACCESS_VISIBLE_LIMIT = 4;
 
 function readQuickAccessFavorites(): string[] {
   try {
     const value = JSON.parse(window.localStorage.getItem(QUICK_ACCESS_FAVORITES_KEY) || '[]');
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function readQuickAccessHidden(): string[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(QUICK_ACCESS_HIDDEN_KEY) || '[]');
     return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
   } catch {
     return [];
@@ -160,14 +170,16 @@ function quickViewSearchText(view: PluginQuickAccessView) {
 type QuickAccessDialogProps = {
   views: PluginQuickAccessView[];
   favorites: Set<string>;
+  hidden: Set<string>;
   usage: QuickAccessUsage;
   onToggleFavorite: (view: PluginQuickAccessView) => void;
+  onToggleHidden: (view: PluginQuickAccessView) => void;
   onOpen: (view: PluginQuickAccessView) => void;
   onClose: () => void;
   returnFocusRef: RefObject<HTMLButtonElement | null>;
 };
 
-function QuickAccessDialog({ views, favorites, usage, onToggleFavorite, onOpen, onClose, returnFocusRef }: QuickAccessDialogProps) {
+function QuickAccessDialog({ views, favorites, hidden, usage, onToggleFavorite, onToggleHidden, onOpen, onClose, returnFocusRef }: QuickAccessDialogProps) {
   const dialogRef = useRef<HTMLElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
@@ -202,7 +214,7 @@ function QuickAccessDialog({ views, favorites, usage, onToggleFavorite, onOpen, 
         <header className="quick-access-dialog-head">
           <div>
             <h2 id="quick-access-dialog-title">全部工具</h2>
-            <p>搜索插件入口，收藏常用的工具。</p>
+            <p>搜索插件入口，收藏常用工具；隐藏只影响快捷栏，不会卸载插件。</p>
           </div>
           <button type="button" className="btn btn-icon" aria-label="关闭工具面板" title="关闭" onClick={onClose}><X size={16} /></button>
         </header>
@@ -249,27 +261,41 @@ function QuickAccessDialog({ views, favorites, usage, onToggleFavorite, onOpen, 
             const key = quickAccessKey(view);
             const Icon = quickViewIcon(view.icon);
             const favorite = favorites.has(key);
+            const isHidden = hidden.has(key);
             const viewUsage = usage[key];
             return (
-              <div className="quick-access-dialog-row" role="listitem" key={key} data-quick-access-key={key}>
+              <div className={`quick-access-dialog-row${isHidden ? ' is-hidden' : ''}`} role="listitem" key={key} data-quick-access-key={key}>
                 <button type="button" className="quick-access-dialog-row-main" data-quick-row-main onClick={() => onOpen(view)}>
                   <span className="quick-access-dialog-row-icon"><Icon size={18} strokeWidth={1.8} aria-hidden="true" /></span>
                   <span className="quick-access-dialog-row-copy"><strong>{quickAccessLabel(view)}</strong><small>{view.plugin_name} · {view.title}</small></span>
                 </button>
                 <span className="quick-access-dialog-row-meta">
+                  {isHidden ? <span className="quick-access-dialog-tag hidden"><EyeOff size={11} aria-hidden="true" />已隐藏</span> : null}
                   {favorite ? <span className="quick-access-dialog-tag favorite"><Star size={11} fill="currentColor" aria-hidden="true" />收藏</span> : null}
                   {viewUsage?.count ? <span className="quick-access-dialog-tag">使用 {viewUsage.count} 次</span> : null}
                 </span>
-                <button
-                  type="button"
-                  className={`quick-access-favorite-button${favorite ? ' active' : ''}`}
-                  aria-label={favorite ? `取消收藏 ${quickAccessLabel(view)}` : `收藏 ${quickAccessLabel(view)}`}
-                  aria-pressed={favorite}
-                  title={favorite ? '取消收藏' : '收藏'}
-                  onClick={() => onToggleFavorite(view)}
-                >
-                  <Star size={16} fill={favorite ? 'currentColor' : 'none'} aria-hidden="true" />
-                </button>
+                <div className="quick-access-row-actions">
+                  <button
+                    type="button"
+                    className={`quick-access-favorite-button${favorite ? ' active' : ''}`}
+                    aria-label={favorite ? `取消收藏 ${quickAccessLabel(view)}` : `收藏 ${quickAccessLabel(view)}`}
+                    aria-pressed={favorite}
+                    title={favorite ? '取消收藏' : '收藏'}
+                    onClick={() => onToggleFavorite(view)}
+                  >
+                    <Star size={16} fill={favorite ? 'currentColor' : 'none'} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className={`quick-access-hide-button${isHidden ? ' active' : ''}`}
+                    aria-label={isHidden ? `恢复 ${quickAccessLabel(view)} 到快捷栏` : `从快捷栏隐藏 ${quickAccessLabel(view)}`}
+                    aria-pressed={isHidden}
+                    title={isHidden ? '恢复到快捷栏' : '从快捷栏隐藏（不会卸载插件）'}
+                    onClick={() => onToggleHidden(view)}
+                  >
+                    {isHidden ? <Eye size={16} aria-hidden="true" /> : <EyeOff size={16} aria-hidden="true" />}
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -459,16 +485,22 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [quickAccessOpen, setQuickAccessOpen] = useState(false);
   const [favoriteQuickAccessKeys, setFavoriteQuickAccessKeys] = useState<string[]>(readQuickAccessFavorites);
+  const [hiddenQuickAccessKeys, setHiddenQuickAccessKeys] = useState<string[]>(readQuickAccessHidden);
   const [quickAccessUsage, setQuickAccessUsage] = useState<QuickAccessUsage>(readQuickAccessUsage);
   const sidebarNavRef = useRef<HTMLElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const quickAccessTriggerRef = useRef<HTMLButtonElement>(null);
   const favoriteQuickAccessSet = useMemo(() => new Set(favoriteQuickAccessKeys), [favoriteQuickAccessKeys]);
+  const hiddenQuickAccessSet = useMemo(() => new Set(hiddenQuickAccessKeys), [hiddenQuickAccessKeys]);
   const normalizedQuickPluginViews = useMemo(() => dedupeQuickAccessViews(quickPluginViews), [quickPluginViews]);
+  const quickBarPluginViews = useMemo(
+    () => normalizedQuickPluginViews.filter(view => !hiddenQuickAccessSet.has(quickAccessKey(view))),
+    [hiddenQuickAccessSet, normalizedQuickPluginViews],
+  );
   const visibleQuickPluginViews = useMemo(() => {
     const ordered = [
-      ...normalizedQuickPluginViews.filter(view => favoriteQuickAccessSet.has(quickAccessKey(view))),
-      ...normalizedQuickPluginViews
+      ...quickBarPluginViews.filter(view => favoriteQuickAccessSet.has(quickAccessKey(view))),
+      ...quickBarPluginViews
         .filter(view => (quickAccessUsage[quickAccessKey(view)]?.count || 0) > 0)
         .sort((left, right) => {
           const leftUsage = quickAccessUsage[quickAccessKey(left)];
@@ -477,10 +509,10 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
             || rightUsage.lastUsed - leftUsage.lastUsed
             || compareQuickViews(left, right);
         }),
-      ...[...normalizedQuickPluginViews].sort(compareQuickViews),
+      ...[...quickBarPluginViews].sort(compareQuickViews),
     ];
     return pickUniqueQuickAccessLabels(ordered, QUICK_ACCESS_VISIBLE_LIMIT);
-  }, [favoriteQuickAccessSet, normalizedQuickPluginViews, quickAccessUsage]);
+  }, [favoriteQuickAccessSet, quickBarPluginViews, quickAccessUsage]);
   const quickAccessCountLabel = normalizedQuickPluginViews.length > 99 ? '99+' : String(normalizedQuickPluginViews.length);
   // 常驻运行条优先跟随工作台任务；没有工作台任务时跟随本机在跑的第一个运行，
   // 这样未连接工作台（独立模式）时也能看到「有东西正在执行」和已运行时长。
@@ -505,6 +537,13 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
       // Favorites remain usable in memory if the webview blocks storage.
     }
   }, [favoriteQuickAccessKeys]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(QUICK_ACCESS_HIDDEN_KEY, JSON.stringify(hiddenQuickAccessKeys));
+    } catch {
+      // Hiding remains usable in memory if the webview blocks storage.
+    }
+  }, [hiddenQuickAccessKeys]);
   useEffect(() => {
     try {
       window.localStorage.setItem(QUICK_ACCESS_USAGE_KEY, JSON.stringify(quickAccessUsage));
@@ -564,6 +603,10 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
   const toggleQuickAccessFavorite = (view: PluginQuickAccessView) => {
     const key = quickAccessKey(view);
     setFavoriteQuickAccessKeys(current => current.includes(key) ? current.filter(item => item !== key) : [...current, key]);
+  };
+  const toggleQuickAccessHidden = (view: PluginQuickAccessView) => {
+    const key = quickAccessKey(view);
+    setHiddenQuickAccessKeys(current => current.includes(key) ? current.filter(item => item !== key) : [...current, key]);
   };
   const openDashboardAccount = () => {
     onNavigate('dashboard');
@@ -686,8 +729,10 @@ export function Shell({ currentPage, approvalCount, workflowApprovalCount, ident
             <QuickAccessDialog
               views={normalizedQuickPluginViews}
               favorites={favoriteQuickAccessSet}
+              hidden={hiddenQuickAccessSet}
               usage={quickAccessUsage}
               onToggleFavorite={toggleQuickAccessFavorite}
+              onToggleHidden={toggleQuickAccessHidden}
               onOpen={openQuickAccessView}
               onClose={() => setQuickAccessOpen(false)}
               returnFocusRef={quickAccessTriggerRef}

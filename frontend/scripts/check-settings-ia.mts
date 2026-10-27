@@ -183,4 +183,9 @@ assert.ok(/credential-load-error/.test(credentialPanel) && /DiagnosticDetails/.t
 assert.ok(/warningSummary/.test(credentialPanel) && /credential-warning-details/.test(credentialPanel), '来源读取失败默认只展示摘要，技术详情按需展开');
 assert.ok(/\.credential-center-body\s*\{[^}]*padding:\s*12px 14px 14px/.test(styles), '账号与凭据卡片内容必须与标题共用 14px 横向内边距');
 
+// 审批策略的说明条必须与同卡片内的分组使用一致的横向内边距；只有完全放行且授权有效时，
+// 才能提示「受控操作不再询问」，否则文案会与实际策略矛盾。
+assert.match(styles, /\.approval-independent-note\s*\{[^}]*padding-inline:\s*14px/, '审批说明必须与审批分组共用 14px 横向内边距');
+assert.match(settingsPage, /approvalProfile === 'full_access' && settings\.risk_acknowledged[\s\S]{0,160}受控操作不再询问/, '完全放行说明必须受策略与授权状态约束');
+
 console.log(`settings IA: ${groups.length} 组 / ${totalItems} 条，深链白名单、窄窗折叠、AI 连接约定校验通过`);

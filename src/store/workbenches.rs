@@ -197,6 +197,55 @@ impl WorkbenchStore {
             .map(|connection| WorkbenchConnectionView::of(connection, &self.active_connection_id))
             .collect()
     }
+
+    /// Production builds must not expose development/loopback workbenches as
+    /// selectable connections. The records stay on disk so a developer profile
+    /// can still use them, but ordinary users only see real workbenches.
+    pub(crate) fn production_views(&self) -> Vec<WorkbenchConnectionView> {
+        self.views()
+            .into_iter()
+            .filter(|connection| !api_base_is_loopback(&connection.api_base))
+            .collect()
+    }
+}
+
+pub(crate) fn api_base_is_loopback(api_base: &str) -> bool {
+    let value = api_base.trim();
+    let Some((_, authority)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = authority.split('/').next().unwrap_or_default();
+    let host = if authority.starts_with('[') {
+        authority
+            .split_once(']')
+            .map(|(host, _)| host.trim_start_matches('['))
+            .unwrap_or(authority)
+    } else if authority.matches(':').count() == 1 {
+        authority
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(authority)
+    } else {
+        authority
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+pub(crate) fn configured_api_bases(state_path: &Path) -> Vec<String> {
+    load(state_path)
+        .ok()
+        .flatten()
+        .map(|store| {
+            store
+                .connections()
+                .iter()
+                .map(|connection| connection.api_base.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn path_for(state_path: &Path) -> PathBuf {
@@ -905,8 +954,8 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        add, capture_active, ensure, load, path_for, remove, rename, switch, sync_active,
-        ConnectionIdentity, WorkbenchStore,
+        add, api_base_is_loopback, capture_active, ensure, load, path_for, remove, rename, switch,
+        sync_active, ConnectionIdentity, WorkbenchStore,
     };
     use serde_json::json;
     use std::fs;
@@ -973,6 +1022,24 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn production_views_hide_loopback_connections() {
+        let home = TempHome::new("production-views");
+        let state_path = home.state_path();
+        ensure(&state_path, "http://localhost:8080").unwrap();
+        let prod = add(&state_path, "https://himind.andcrane.com", "生产").unwrap();
+        switch(&state_path, &prod.id).unwrap();
+        let store = load(&state_path).unwrap().unwrap();
+        assert_eq!(store.views().len(), 2);
+        let visible = store.production_views();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].api_base, "https://himind.andcrane.com");
+        assert!(api_base_is_loopback("http://localhost:8080"));
+        assert!(api_base_is_loopback("http://127.0.0.1:18083/path"));
+        assert!(api_base_is_loopback("http://[::1]:8080"));
+        assert!(!api_base_is_loopback("https://himind.andcrane.com"));
     }
 
     #[test]

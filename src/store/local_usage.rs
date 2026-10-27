@@ -28,7 +28,13 @@ pub(crate) struct LocalUsageRecord {
     pub binding_id: String,
     pub client: String,
     pub service: String,
+    /// 网关聚合入口 ID；旧单服务绑定为空。
+    #[serde(default)]
+    pub profile_id: String,
     pub model: String,
+    /// 转发给上游服务的真实模型 ID；旧台账为空时按 `model` 理解。
+    #[serde(default)]
+    pub upstream_model: String,
     pub protocol: String,
     #[serde(default)]
     pub stream: bool,
@@ -45,6 +51,9 @@ pub(crate) struct LocalUsageRecord {
     /// 上游没返回用量：只累加调用次数，不估算 Token。
     #[serde(default)]
     pub usage_unreported: bool,
+    /// 从接收请求到响应结束的本机网关耗时。
+    #[serde(default)]
+    pub latency_ms: u64,
     /// 上游是平台托管服务：以平台口径为准，本机合计排除。
     #[serde(default)]
     pub platform_metered: bool,
@@ -282,7 +291,9 @@ mod tests {
             binding_id: format!("{client}:svc"),
             client: client.to_string(),
             service: "svc".to_string(),
+            profile_id: String::new(),
             model: "m".to_string(),
+            upstream_model: "m".to_string(),
             protocol: "openai-chat".to_string(),
             stream: false,
             input_tokens: input,
@@ -291,6 +302,7 @@ mod tests {
             reasoning_tokens: 0,
             status: "success".to_string(),
             usage_unreported: false,
+            latency_ms: 12,
             platform_metered: false,
         }
     }
@@ -324,6 +336,9 @@ mod tests {
         let parsed = serde_json::from_str::<LocalUsageRecord>(minimal).unwrap();
         assert_eq!(parsed.input_tokens, 3);
         assert!(!parsed.usage_unreported);
+        assert!(parsed.profile_id.is_empty());
+        assert!(parsed.upstream_model.is_empty());
+        assert_eq!(parsed.latency_ms, 0);
         assert_eq!(parsed.total_tokens(), 3);
     }
 

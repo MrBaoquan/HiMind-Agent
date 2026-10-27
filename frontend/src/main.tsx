@@ -33,7 +33,7 @@ import type { WorkbenchConnectionDraft } from './components/WorkbenchConnections
 const TaskCenterPage = lazyNamed(() => import('./pages/TaskCenterPage'), 'TaskCenterPage');
 const WorkflowsPage = lazyNamed(() => import('./pages/WorkflowsPage'), 'WorkflowsPage');
 const SchedulesPage = lazyNamed(() => import('./pages/SchedulesPage'), 'SchedulesPage');
-import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
+import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type GatewayProfile, type GatewayProfileInput, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
 
 import { hydrateWorkflowOptionSources } from './pages/workflowOptionSources';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
@@ -217,6 +217,7 @@ function AgentApp() {
   const [localUsageRange, setLocalUsageRange] = useState<AiUsageRange>('7d');
   const [localUsageBusy, setLocalUsageBusy] = useState(false);
   const [inferenceGateway, setInferenceGateway] = useState<InferenceGatewayStatus | null>(null);
+  const [gatewayProfiles, setGatewayProfiles] = useState<GatewayProfile[]>([]);
   const [bindingModeBusy, setBindingModeBusy] = useState(false);
   const [gatewayBusy, setGatewayBusy] = useState(false);
   const [aiConnectionsTab, setAiConnectionsTab] = useState<AiConnectionsTab>(settingsWindow?.aiTab || 'mcp');
@@ -409,6 +410,9 @@ function AgentApp() {
   async function refreshAIServices() {
     return singleFlight('ai-services', async () => { setAiServices(await agentApi.listAIServices()); });
   }
+  async function refreshGatewayProfiles() {
+    return singleFlight('gateway-profiles', async () => { setGatewayProfiles(await agentApi.listGatewayProfiles()); });
+  }
   /**
    * 本机用量与网关状态一起读：面板需要同时知道「有没有数据」和
    * 「哪些客户端根本没走网关」，否则会把看不见读成没消耗。
@@ -449,9 +453,9 @@ function AgentApp() {
     }
   }
   /** 注入模式切换：客户端配置、网关绑定与用量口径会同时变化，一起回读。 */
-  async function setClientBindingMode(target: string, mode: 'gateway' | 'direct', service?: string) {
+  async function setClientBindingMode(target: string, mode: 'gateway' | 'direct', service?: string, profileId?: string) {
     try {
-      await agentApi.setProviderBindingMode(target, mode, service);
+      await agentApi.setProviderBindingMode(target, mode, service, profileId);
       notify('success', mode === 'gateway' ? `${target} 已切换到本机推理网关` : `${target} 已切回直连`);
       await Promise.all([refreshInferenceGateway(), refreshAIServices(), refreshLocalUsage({ force: true })]);
     } catch (error) {
@@ -1118,6 +1122,7 @@ function AgentApp() {
       refreshWorkbenchConnections(),
       refreshMcpTargets(),
       refreshAIServices(),
+      refreshGatewayProfiles(),
       refreshAIServiceTemplates(),
       refreshApprovals(),
       refreshRemoteExecutionSettings(),
@@ -1154,7 +1159,7 @@ function AgentApp() {
       const route = settingsRoute(event.payload);
       setSettingsSection(route.section);
       setSettingsTab(route.tab);
-      if (aiTab === 'mcp' || aiTab === 'services' || aiTab === 'routes' || aiTab === 'acp') setAiConnectionsTab(aiTab);
+      if (aiTab === 'mcp' || aiTab === 'services' || aiTab === 'gateway' || aiTab === 'routes' || aiTab === 'acp') setAiConnectionsTab(aiTab);
       setPage(route.panel);
     }).then(remove => { unlisten = remove; }).catch(error => console.error('设置窗口导航监听失败', error));
     return () => unlisten?.();
@@ -1225,7 +1230,7 @@ function AgentApp() {
     const operation = page === 'dashboard'
       ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings(), refreshProjectionSyncStatus(), refreshLocalUsage()])
       : page === 'ai'
-        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext(), refreshInferenceGateway()])
+        ? Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshGatewayProfiles(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext(), refreshInferenceGateway()])
         : page === 'inbox'
           ? Promise.all([refreshApprovals(), refreshWorkflowCenter()])
         : page === 'approvals'
@@ -1262,7 +1267,7 @@ function AgentApp() {
       if (page === 'settings' && settingsTab === 'logs') tasks.push(refreshLogs());
       if (page === 'dashboard' || page === 'ai') tasks.push(refreshDashboardIdentity(), refreshMcpTargets(), refreshRemoteExecutionSettings());
       if (page === 'dashboard') tasks.push(refreshLocalUsage({ force: true }));
-      if (page === 'ai') tasks.push(refreshAIServices(), refreshAIServiceTemplates(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext());
+      if (page === 'ai') tasks.push(refreshAIServices(), refreshGatewayProfiles(), refreshAIServiceTemplates(), refreshAcpRuntimeProfiles(), refreshBuiltinAiToolContext());
       if (page === 'ai') tasks.push(refreshInferenceGateway());
       if (page === 'installed') tasks.push(refreshPlugins(), refreshSkills(), refreshExtensionDesiredState());
       if (page === 'extensions') tasks.push(refreshExtensionSurfaces(), refreshExtensionDesiredState());
@@ -2087,6 +2092,7 @@ function AgentApp() {
       aiServices={aiServices}
       aiServiceTemplates={aiServiceTemplates}
       gatewayStatus={inferenceGateway}
+      gatewayProfiles={gatewayProfiles}
       onSetBindingMode={setClientBindingMode}
       gatewayBusy={gatewayBusy}
       onRestartGateway={() => void restartGateway()}
@@ -2095,7 +2101,7 @@ function AgentApp() {
       acpProfiles={acpRuntimeProfiles}
       onOpenAccount={() => setPage('dashboard')}
       targets={mcpTargets}
-      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshAIServiceTemplates(), refreshAcpRuntimeProfiles()]); })}
+      onRefresh={() => run(async () => { await Promise.all([refreshDashboardIdentity(), refreshMcpTargets(), refreshAIServices(), refreshGatewayProfiles(), refreshAIServiceTemplates(), refreshAcpRuntimeProfiles()]); })}
       onApplyTarget={applyMcpTarget}
       onApplyAll={applyAllMcpTargets}
       onRemoveAll={removeAllMcpTargets}
@@ -2125,6 +2131,34 @@ function AgentApp() {
           notify('success', aiClientActionMessage(target, 'remove', result));
         } catch (error) {
           notify('error', formatError(error, '取消分发失败'));
+        }
+      }}
+      onSaveGatewayProfile={async (input) => {
+        if (aiOperation) throw new Error('另一个 AI 操作正在进行，请稍候');
+        setAiOperation('gateway-profile-save');
+        try {
+          await agentApi.saveGatewayProfile(input);
+          await refreshGatewayProfiles();
+          notify('success', '聚合入口已保存');
+        } catch (error) {
+          notify('error', formatError(error, '保存聚合入口失败'));
+          throw error;
+        } finally {
+          setAiOperation(null);
+        }
+      }}
+      onRemoveGatewayProfile={async (id) => {
+        if (aiOperation) throw new Error('另一个 AI 操作正在进行，请稍候');
+        setAiOperation('gateway-profile-remove');
+        try {
+          await agentApi.removeGatewayProfile(id);
+          await refreshGatewayProfiles();
+          notify('success', '聚合入口已删除');
+        } catch (error) {
+          notify('error', formatError(error, '删除聚合入口失败'));
+          throw error;
+        } finally {
+          setAiOperation(null);
         }
       }}
       onSaveAcpProfile={async (input) => { try { await agentApi.saveAcpRuntimeProfile(input); await refreshAcpRuntimeProfiles(); notify('success', '运行环境已保存'); } catch (error) { notify('error', formatError(error, '保存运行环境失败')); throw error; } }}

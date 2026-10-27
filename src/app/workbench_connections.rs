@@ -22,7 +22,8 @@ use tauri::State;
 use super::commands::AgentState;
 use crate::api::client::register_agent;
 use crate::api::types::AgentState as StoredAgentState;
-use crate::store::workbenches::{self, WorkbenchConnectionView};
+use crate::store::paths;
+use crate::store::workbenches::{self, api_base_is_loopback, WorkbenchConnectionView};
 
 /// Prefix of the error returned when a task is executing and `force` was false.
 pub(crate) const WORKBENCH_BUSY: &str = "WORKBENCH_BUSY";
@@ -55,10 +56,47 @@ fn store_of(state: &AgentState) -> Result<workbenches::WorkbenchStore, String> {
 }
 
 fn snapshot(state: &AgentState) -> Result<WorkbenchConnectionsSnapshot, String> {
-    let store = store_of(state)?;
+    let production = paths::is_production_profile(&paths::profile_name());
+    let mut store = store_of(state)?;
+    if production
+        && store
+            .active_connection()
+            .is_some_and(|connection| api_base_is_loopback(&connection.api_base))
+    {
+        let replacement = store
+            .connections()
+            .iter()
+            .find(|connection| {
+                connection.registered() && !api_base_is_loopback(&connection.api_base)
+            })
+            .or_else(|| {
+                store
+                    .connections()
+                    .iter()
+                    .find(|connection| !api_base_is_loopback(&connection.api_base))
+            })
+            .map(|connection| connection.id.clone());
+        match replacement {
+            Some(id) => {
+                activate(state, &id)?;
+                store = store_of(state)?;
+            }
+            None => disconnect(state),
+        }
+    }
+    let connections = if production {
+        store.production_views()
+    } else {
+        store.views()
+    };
+    let api_base = if connections.iter().any(|connection| connection.active) {
+        state.options.api_base()
+    } else {
+        String::new()
+    };
     Ok(WorkbenchConnectionsSnapshot {
-        api_base: state.options.api_base(),
-        connections: store.views(),
+        api_base,
+        connections,
     })
 }
 
@@ -75,6 +113,11 @@ pub(crate) fn add_workbench_connection(
     api_base: String,
     display_name: String,
 ) -> Result<WorkbenchConnectionsSnapshot, String> {
+    if paths::is_production_profile(&paths::profile_name()) && api_base_is_loopback(&api_base) {
+        return Err(
+            "正式版不支持添加 localhost/127.0.0.1 工作台；请使用正式工作台地址".to_string(),
+        );
+    }
     let store = store_of(&state)?;
     let was_unconnected = store.active_connection_id().trim().is_empty();
     let connection = workbenches::add(&state.state_path, &api_base, &display_name)

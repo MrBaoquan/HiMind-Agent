@@ -24,8 +24,9 @@ function service(id: string, model = '', media: Record<string, { adapter: string
   } as unknown as CustomAIService;
 }
 
-assert.deepEqual(AI_CONNECTIONS_TAB_ORDER, ['mcp', 'services', 'routes', 'acp']);
+assert.deepEqual(AI_CONNECTIONS_TAB_ORDER, ['mcp', 'services', 'gateway', 'routes', 'acp']);
 assert.equal(AI_CONNECTIONS_TAB_LABELS.services, 'AI 服务');
+assert.equal(AI_CONNECTIONS_TAB_LABELS.gateway, '模型网关');
 assert.equal(AI_CONNECTIONS_TAB_LABELS.routes, '能力路由');
 
 const imageOnly = service('image-only', '', {
@@ -81,4 +82,3 @@ assert.equal(suggestedServiceId('Fish Audio'), 'fish-audio');
 assert.match(suggestedServiceId('语音服务'), /^service-[a-z0-9]+$/);
 
 console.log('AI service routing checks passed');
-

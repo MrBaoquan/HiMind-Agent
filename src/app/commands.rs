@@ -2657,6 +2657,51 @@ pub(crate) fn get_inference_gateway_status(
 fn inference_gateway_status_value(options: &Options) -> serde_json::Value {
     let (running, url, port, last_error, notice) = crate::app::inference_gateway::status();
     let bindings = crate::app::ai_provider_import::gateway_bindings(options);
+    let mut seen = HashSet::new();
+    let mut gateway_clients = Vec::new();
+    for binding in &bindings {
+        if !seen.insert(binding.client.clone()) {
+            continue;
+        }
+        let scoped = bindings
+            .iter()
+            .filter(|candidate| candidate.client == binding.client)
+            .collect::<Vec<_>>();
+        let mut models = scoped
+            .iter()
+            .map(|candidate| {
+                if candidate.exposed_model.is_empty() {
+                    candidate.default_model.clone()
+                } else {
+                    candidate.exposed_model.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
+        let mut upstream_protocols = scoped
+            .iter()
+            .map(|candidate| candidate.protocol.clone())
+            .collect::<Vec<_>>();
+        upstream_protocols.sort();
+        upstream_protocols.dedup();
+        let profile_name = if binding.profile_id.is_empty() {
+            String::new()
+        } else {
+            crate::store::gateway_profiles::get(&binding.profile_id)
+                .map(|profile| profile.name)
+                .unwrap_or_default()
+        };
+        gateway_clients.push(json!({
+            "client": binding.client,
+            "profile_id": binding.profile_id,
+            "profile_name": profile_name,
+            "service": if binding.profile_id.is_empty() { binding.service.clone() } else { String::new() },
+            "protocol": binding.entry_protocol,
+            "upstream_protocols": upstream_protocols,
+            "models": models,
+        }));
+    }
     json!({
         "running": running,
         "url": url,
@@ -2664,19 +2709,38 @@ fn inference_gateway_status_value(options: &Options) -> serde_json::Value {
         "preferred_port": crate::app::inference_gateway::configured_port(&options.state_path),
         "last_error": last_error,
         "notice": notice,
-        "gateway_clients": bindings
-            .iter()
-            .map(|binding| json!({
-                "client": binding.client,
-                "service": binding.service,
-                "protocol": binding.protocol,
-                "models": binding.models,
-            }))
-            .collect::<Vec<serde_json::Value>>(),
+        "gateway_clients": gateway_clients,
         "direct_clients": crate::app::ai_provider_import::direct_bound_clients(options),
     })
 }
 
+#[tauri::command]
+pub(crate) fn list_gateway_profiles(
+) -> Result<Vec<crate::store::gateway_profiles::GatewayProfile>, String> {
+    crate::store::gateway_profiles::list().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn save_gateway_profile(
+    input: crate::store::gateway_profiles::GatewayProfileInput,
+) -> Result<crate::store::gateway_profiles::GatewayProfile, String> {
+    crate::store::gateway_profiles::save(input).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn remove_gateway_profile(
+    state: State<'_, AgentState>,
+    id: String,
+) -> Result<bool, String> {
+    let clients = crate::app::ai_provider_import::clients_bound_to_profile(&state.options, &id);
+    if !clients.is_empty() {
+        return Err(format!(
+            "聚合入口仍被这些 AI 工具使用：{}。请先切回直连或改用其它入口。",
+            clients.join("、")
+        ));
+    }
+    crate::store::gateway_profiles::remove(&id).map_err(|error| error.to_string())
+}
 /// 重启本机网关：端口被释放、或异常退出后用它恢复。
 #[tauri::command]
 pub(crate) async fn restart_inference_gateway(
@@ -2785,19 +2849,32 @@ pub(crate) async fn set_provider_binding_mode(
     target: String,
     mode: String,
     service: Option<String>,
+    profile_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let options = state.options.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let user_id = crate::app::identity::identity_status(&options).user_id;
         let result = match mode.trim() {
             "gateway" => {
-                let service = service
-                    .filter(|value| !value.trim().is_empty())
-                    .or_else(|| crate::app::ai_provider_import::binding_service(&options, &target))
-                    .unwrap_or_else(|| "managed".to_string());
-                crate::app::ai_provider_import::enable_gateway_binding(
-                    &options, &user_id, &target, &service,
-                )
+                if let Some(profile_id) = profile_id.filter(|value| !value.trim().is_empty()) {
+                    crate::app::ai_provider_import::enable_gateway_profile_binding(
+                        &options,
+                        &user_id,
+                        &target,
+                        &profile_id,
+                        service.as_deref(),
+                    )
+                } else {
+                    let service = service
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| {
+                            crate::app::ai_provider_import::binding_service(&options, &target)
+                        })
+                        .unwrap_or_else(|| "managed".to_string());
+                    crate::app::ai_provider_import::enable_gateway_binding(
+                        &options, &user_id, &target, &service,
+                    )
+                }
             }
             "direct" => {
                 crate::app::ai_provider_import::disable_gateway_binding(&options, &user_id, &target)
@@ -3143,6 +3220,14 @@ pub(crate) fn remove_ai_service(
     state: State<'_, AgentState>,
     id: String,
 ) -> Result<bool, String> {
+    let profiles = crate::store::gateway_profiles::profiles_referencing_service(&id)
+        .map_err(|error| error.to_string())?;
+    if !profiles.is_empty() {
+        return Err(format!(
+            "该服务仍被聚合入口引用：{}。请先修改或删除相关聚合入口。",
+            profiles.join("、")
+        ));
+    }
     crate::app::ai_provider_import::ensure_service_not_in_use(&state.options, &id)
         .map_err(|error| error.to_string())?;
     let removed = crate::store::ai_services::remove(&id).map_err(|e| e.to_string())?;

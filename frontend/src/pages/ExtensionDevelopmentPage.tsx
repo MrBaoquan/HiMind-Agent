@@ -389,7 +389,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
       {failedBatch.length ? <button className="btn" disabled={busy} onClick={() => void buildWorkspace(failedBatch.map(item => item.id))}>重试失败项（{failedBatch.length}）</button> : null}
       <button className="btn" onClick={() => setActionError('')}>关闭</button></div> : null}
     {/* 构建、校验与打包已收回内核：没装扩展开发工具也能干活，但插件类扩展要 Go。 */}
-    {readiness?.provider === 'builtin' ? <p className="muted development-toolchain-note">正在使用内置扩展开发工具（未安装外置插件）：新建骨架、构建、校验与打包由 Agent 内核完成。</p> : null}
+
     {readiness && !readiness.kernel.go.installed ? <div className="development-notice"><CircleAlert size={16} /><div><strong>Go 工具链未就绪</strong><span>插件类扩展需要 go 在 PATH 中；技能、工作流、专家、项目规则不受影响。</span></div></div> : null}
     {props.loading ? <div className="development-body development-body-loading" role="status"><BusyIndicator size={16} /><span>正在读取工作区和扩展</span></div> : <div className={`development-body ${hasRail ? 'has-rail' : ''}`}>
       {hasRail ? <aside className="development-rail" aria-label="开发工作区">

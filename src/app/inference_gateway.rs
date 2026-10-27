@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::store::local_usage::{self, LocalUsageRecord};
 
@@ -228,10 +228,20 @@ pub(crate) struct GatewayBinding {
     pub id: String,
     pub client: String,
     pub service: String,
+    /// 聚合入口 ID；旧单服务绑定为空。
+    pub profile_id: String,
+    /// 客户端看到的入口协议；状态面板与兼容检查使用。
+    pub entry_protocol: String,
+    /// 客户端看到的稳定模型别名。
+    pub exposed_model: String,
     /// 该服务声明的模型目录，用于没有令牌时的模型名兜底归属。
     pub models: Vec<String>,
     /// 绑定的默认模型：翻译请求时作为模型名的兜底。
     pub default_model: String,
+    /// 实际发送给上游的模型 ID。
+    pub upstream_model: String,
+    /// 该路由是否为 Profile 的默认模型。
+    pub is_default: bool,
     pub protocol: String,
     pub base_url: String,
     pub api_key: String,
@@ -246,6 +256,7 @@ type BindingResolver = Arc<dyn Fn() -> Vec<GatewayBinding> + Send + Sync>;
 enum GatewayError {
     UnknownToken,
     AmbiguousModel,
+    UnknownModel,
     ProtocolMismatch,
     UnsupportedPath,
     /// 响应已经写过（例如上游失败时已回 502），调用方不要再补一个响应。
@@ -257,6 +268,7 @@ impl GatewayError {
         match self {
             Self::UnknownToken => "himind_gateway_unknown_token",
             Self::AmbiguousModel => "himind_gateway_ambiguous_binding",
+            Self::UnknownModel => "himind_gateway_unknown_model",
             Self::ProtocolMismatch => "himind_gateway_protocol_mismatch",
             Self::UnsupportedPath => "himind_gateway_unsupported_path",
             Self::Answered => "himind_gateway_answered",
@@ -267,6 +279,7 @@ impl GatewayError {
         match self {
             Self::UnknownToken => "本机令牌无效，请在 AI 连接页重新注入",
             Self::AmbiguousModel => "请求没有携带可识别的本机令牌，且模型名对应多个绑定",
+            Self::UnknownModel => "请求的模型不在当前聚合入口中",
             Self::ProtocolMismatch => "请求协议与绑定的服务协议不一致，本机网关暂不互译",
             Self::UnsupportedPath => {
                 "本机网关只转发 /v1/chat/completions、/v1/responses、/v1/messages 与 /v1/models"
@@ -594,39 +607,87 @@ fn model_from_body(body: &[u8]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// 令牌优先；没有令牌时按模型名兜底，只接受唯一匹配，歧义一律拒绝。
+/// 令牌优先定位客户端/Profile，再按请求模型选择具体路由。
+///
+/// 同一 Profile 的多个模型共享同一个令牌，因此不能再像单服务绑定那样
+/// “令牌命中第一个 binding 就返回”。没有令牌时只保留旧的模型名兜底，
+/// 且仍然要求全局唯一。
 fn authorize(
     bindings: &[GatewayBinding],
     headers: &HashMap<String, String>,
     body: &[u8],
-    required_protocol: &str,
+    _required_protocol: &str,
 ) -> Result<GatewayBinding, GatewayError> {
-    if let Some(token) = token_from_headers(headers) {
-        return bindings
+    let model = model_from_body(body);
+    let token = token_from_headers(headers);
+    let scoped = if let Some(token) = token.as_deref() {
+        let matched = bindings
             .iter()
-            .find(|binding| binding.token == token)
-            .cloned()
-            .ok_or(GatewayError::UnknownToken);
+            .filter(|binding| binding.token == token)
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            return Err(GatewayError::UnknownToken);
+        }
+        matched
+    } else {
+        let model = model.as_deref().ok_or(GatewayError::UnknownToken)?;
+        let matched = bindings
+            .iter()
+            .filter(|binding| binding_has_model(binding, model))
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            return Err(GatewayError::UnknownToken);
+        }
+        matched
+    };
+
+    if let Some(model) = model.as_deref() {
+        let exact = scoped
+            .iter()
+            .filter(|binding| binding_exposed_model(binding) == model)
+            .collect::<Vec<_>>();
+        if token.is_some() {
+            return exact
+                .first()
+                .map(|binding| (**binding).clone())
+                .ok_or(GatewayError::UnknownModel);
+        }
+        if exact.len() == 1 {
+            return Ok((*exact[0]).clone());
+        }
+        if exact.len() > 1 {
+            return Err(GatewayError::AmbiguousModel);
+        }
     }
-    let model = model_from_body(body).ok_or(GatewayError::UnknownToken)?;
-    let mut matches = bindings.iter().filter(|binding| {
-        binding.protocol == required_protocol && binding_has_model(binding, &model)
-    });
-    let first = matches.next().cloned().ok_or(GatewayError::UnknownToken)?;
-    if matches.next().is_some() {
-        return Err(GatewayError::AmbiguousModel);
+    if scoped.len() == 1 {
+        return Ok(scoped[0].clone());
     }
-    Ok(first)
+    if let Some(default) = scoped.iter().find(|binding| binding.is_default) {
+        return Ok((*default).clone());
+    }
+    Err(GatewayError::AmbiguousModel)
 }
 
-/// 绑定的模型目录来自服务定义；P1 用「模型名出现在服务模型列表」判定。
+fn binding_exposed_model(binding: &GatewayBinding) -> &str {
+    if binding.exposed_model.is_empty() {
+        binding
+            .models
+            .first()
+            .map(String::as_str)
+            .unwrap_or(binding.default_model.as_str())
+    } else {
+        binding.exposed_model.as_str()
+    }
+}
+
+/// 绑定的模型目录来自服务定义；旧绑定用模型列表判定，新绑定使用 exposed_model。
 fn binding_has_model(binding: &GatewayBinding, model: &str) -> bool {
-    binding
-        .models
-        .iter()
-        .any(|candidate| candidate.trim() == model)
+    binding_exposed_model(binding) == model
+        || binding
+            .models
+            .iter()
+            .any(|candidate| candidate.trim() == model)
 }
-
 /// 上游地址拼接：base 通常已含 `/v1`，避免拼成 `/v1/v1/...`。
 fn join_upstream(base_url: &str, path: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
@@ -820,40 +881,151 @@ fn route(
     head: &RequestHead,
     body: &[u8],
 ) -> Result<(), GatewayError> {
+    let started = Instant::now();
     let bindings = resolver();
-    // `/v1/models` 不携带模型名，必须有令牌才能定位绑定。
+    // 聚合模型目录由本机生成，不依赖任一上游 `/v1/models` 是否可用。
     if head.method == "GET" && normalize_api_path(&head.path) == "/models" {
-        let binding = bindings
+        let token = token_from_headers(&head.headers).ok_or(GatewayError::UnknownToken)?;
+        let scoped = bindings
             .iter()
-            .find(|binding| {
-                token_from_headers(&head.headers).as_deref() == Some(binding.token.as_str())
-            })
-            .cloned()
-            .ok_or(GatewayError::UnknownToken)?;
-        return forward(stream, &binding, head, body, "models");
+            .filter(|binding| binding.token == token)
+            .collect::<Vec<_>>();
+        if scoped.is_empty() {
+            return Err(GatewayError::UnknownToken);
+        }
+        return write_models_response(stream, &scoped);
     }
     let required_protocol = path_protocol(&head.path).ok_or(GatewayError::UnsupportedPath)?;
     let binding = authorize(&bindings, &head.headers, body, required_protocol)?;
-    // 入口协议与上游协议不一致时走互译。已实现的两对：
-    // Anthropic 入口 → Chat 上游、Responses 入口 → Chat 上游。
-    let translatable = binding.protocol == "openai-chat"
-        && matches!(required_protocol, "anthropic" | "openai-responses");
+    // 入口协议与上游协议不一致时走互译：
+    // Anthropic → Chat/Responses、Responses → Chat。
+    let translatable = matches!(
+        (required_protocol, binding.protocol.as_str()),
+        ("anthropic", "openai-chat" | "openai-responses") | ("openai-responses", "openai-chat")
+    );
     if binding.protocol != required_protocol && !translatable {
         return Err(GatewayError::ProtocolMismatch);
     }
-    forward(stream, &binding, head, body, required_protocol)
+    forward(stream, &binding, head, body, required_protocol, started)
 }
 
+fn models_payload(bindings: &[&GatewayBinding]) -> String {
+    let mut rows = bindings
+        .iter()
+        .map(|binding| {
+            let id = binding_exposed_model(binding).to_string();
+            let owner = if binding.profile_id.is_empty() {
+                binding.service.clone()
+            } else {
+                binding.profile_id.clone()
+            };
+            (id, owner)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows.dedup_by(|left, right| left.0 == right.0);
+    let data = rows
+        .into_iter()
+        .map(|(id, owned_by)| {
+            json!({
+                "id": id,
+                "object": "model",
+                "owned_by": owned_by,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "object": "list", "data": data }).to_string()
+}
+
+fn write_models_response(
+    stream: &mut TcpStream,
+    bindings: &[&GatewayBinding],
+) -> Result<(), GatewayError> {
+    let payload = models_payload(bindings);
+    let binding_id = bindings
+        .first()
+        .map(|binding| binding.id.as_str())
+        .unwrap_or("models");
+    let head = format!(
+        "{}content-length: {}\r\n\r\n",
+        gateway_response_head(200, "application/json", binding_id),
+        payload.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(payload.as_bytes()))
+        .and_then(|_| stream.flush())
+        .map_err(|_| GatewayError::Answered)
+}
+fn rewrite_request_model(body: &[u8], upstream_model: &str) -> Vec<u8> {
+    if body.is_empty() || upstream_model.trim().is_empty() {
+        return body.to_vec();
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.to_vec();
+    };
+    if !object.contains_key("model") {
+        return body.to_vec();
+    }
+    object.insert("model".to_string(), json!(upstream_model));
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn rewrite_json_model(raw: &[u8], exposed_model: &str) -> Vec<u8> {
+    if raw.is_empty() || exposed_model.trim().is_empty() {
+        return raw.to_vec();
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
+        return raw.to_vec();
+    };
+    if value.get("model").is_none() {
+        return raw.to_vec();
+    }
+    value["model"] = json!(exposed_model);
+    serde_json::to_vec(&value).unwrap_or_else(|_| raw.to_vec())
+}
+
+fn rewrite_sse_model_line(line: &str, exposed_model: &str) -> String {
+    let trimmed = line.trim_end_matches('\r');
+    let Some(payload) = trimmed.strip_prefix("data:") else {
+        return line.to_string();
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return line.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
+        return line.to_string();
+    };
+    if value.get("model").is_none() {
+        return line.to_string();
+    }
+    value["model"] = json!(exposed_model);
+    format!("data: {value}")
+}
 fn forward(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
     head: &RequestHead,
     body: &[u8],
     kind: &str,
+    started: Instant,
 ) -> Result<(), GatewayError> {
-    // Claude Code 讲 Anthropic、多数上游讲 OpenAI：这一条走互译而不是直通。
-    if kind == "anthropic" && binding.protocol == "openai-chat" {
-        return forward_translated(stream, binding, body);
+    // 客户端请求使用 exposed_model，上游只能看到真实 upstream_model。
+    let rewritten_body = rewrite_request_model(body, &binding.upstream_model);
+    let body = rewritten_body.as_slice();
+    let display_model = binding_exposed_model(binding).to_string();
+    // Claude Code / Claude Desktop 讲 Anthropic：按上游协议选择互译实现。
+    if kind == "anthropic" {
+        if binding.protocol == "openai-chat" {
+            return forward_translated(stream, binding, body, started);
+        }
+        if binding.protocol == "openai-responses" {
+            return forward_anthropic_responses_translated(stream, binding, body, started);
+        }
     }
     let request_summary = if kind == "openai-responses" {
         summarize_responses_request(body)
@@ -896,6 +1068,7 @@ fn forward(
             normalized_responses
                 .as_ref()
                 .expect("Responses request was normalized above"),
+            started,
         );
     }
     let outgoing_body = match normalized_responses {
@@ -944,7 +1117,6 @@ fn forward(
         .unwrap_or("application/json")
         .to_string();
     let streaming = content_type.contains("text/event-stream");
-    let model = model_from_body(body).unwrap_or_default();
 
     // 上游失败时先完整收下错误体：既便于本机诊断，也避免把空 502
     // 当成正常的流式响应交给客户端，导致真正原因被吞掉。
@@ -977,11 +1149,12 @@ fn forward(
         if kind != "models" {
             record_usage(
                 binding,
-                &model,
+                &display_model,
                 streaming,
                 status.as_u16(),
                 Usage::default(),
                 true,
+                started.elapsed().as_millis() as u64,
             );
         }
         return Ok(());
@@ -992,29 +1165,48 @@ fn forward(
         write_stream_head(stream, status.as_u16(), &content_type, &binding.id)
             .map_err(|_| GatewayError::Answered)?;
         let mut scanner = StreamScanner::new(binding.protocol.clone());
+        let mut pending = String::new();
         let mut chunk = [0_u8; 8192];
+        let mut client_gone = false;
         loop {
             let read = match response.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(_) => break,
             };
-            if stream.write_all(&chunk[..read]).is_err() {
+            scanner.push(&chunk[..read]);
+            pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            while let Some(position) = pending.find('\n') {
+                let line = pending[..position].trim_end_matches('\r').to_string();
+                pending.drain(..=position);
+                let rewritten = rewrite_sse_model_line(&line, &display_model);
+                if stream.write_all(rewritten.as_bytes()).is_err()
+                    || stream.write_all(b"\n").is_err()
+                {
+                    client_gone = true;
+                    break;
+                }
+            }
+            if client_gone {
                 // 客户端断开：已看到的用量仍然记账，再结束这次转发。
                 break;
             }
-            scanner.push(&chunk[..read]);
+        }
+        if !client_gone && !pending.is_empty() {
+            let rewritten = rewrite_sse_model_line(&pending, &display_model);
+            let _ = stream.write_all(rewritten.as_bytes());
         }
         let _ = stream.flush();
         let usage = scanner.usage;
         if kind != "models" {
             record_usage(
                 binding,
-                &model,
+                &display_model,
                 true,
                 status.as_u16(),
                 usage,
                 usage.is_empty(),
+                started.elapsed().as_millis() as u64,
             );
         }
         return Ok(());
@@ -1026,15 +1218,16 @@ fn forward(
     if raw.len() > RESPONSE_BODY_LIMIT {
         raw.truncate(RESPONSE_BODY_LIMIT);
     }
+    let output_raw = rewrite_json_model(&raw, &display_model);
     write_buffered_head(
         stream,
         status.as_u16(),
         &content_type,
         &binding.id,
-        raw.len(),
+        output_raw.len(),
     )
     .map_err(|_| GatewayError::Answered)?;
-    let _ = stream.write_all(&raw);
+    let _ = stream.write_all(&output_raw);
     let _ = stream.flush();
     if kind != "models" {
         let usage = serde_json::from_slice::<Value>(&raw)
@@ -1042,11 +1235,12 @@ fn forward(
             .unwrap_or_default();
         record_usage(
             binding,
-            &model,
+            &display_model,
             false,
             status.as_u16(),
             usage,
             usage.is_empty(),
+            started.elapsed().as_millis() as u64,
         );
     }
     Ok(())
@@ -1057,6 +1251,7 @@ fn forward_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
     body: &[u8],
+    started: Instant,
 ) -> Result<(), GatewayError> {
     let request: Value = match serde_json::from_slice(body) {
         Ok(request) => request,
@@ -1068,13 +1263,7 @@ fn forward_translated(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(binding.default_model.as_str())
-        .to_string();
+    let display_model = binding_exposed_model(binding).to_string();
     let openai_body =
         match crate::app::anthropic_openai::request_to_openai(&request, &binding.default_model) {
             Ok(openai_body) => openai_body,
@@ -1113,11 +1302,12 @@ fn forward_translated(
         let _ = stream.flush();
         record_usage(
             binding,
-            &model,
+            &display_model,
             streaming,
             status.as_u16(),
             Usage::default(),
             true,
+            started.elapsed().as_millis() as u64,
         );
         return Ok(());
     }
@@ -1125,7 +1315,8 @@ fn forward_translated(
     if streaming {
         write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
             .map_err(|_| GatewayError::Answered)?;
-        let mut translator = crate::app::anthropic_openai::AnthropicStream::new(model.clone());
+        let mut translator =
+            crate::app::anthropic_openai::AnthropicStream::new(display_model.clone());
         let mut buffer = String::new();
         let mut chunk = [0_u8; 8192];
         let mut client_gone = false;
@@ -1155,7 +1346,7 @@ fn forward_translated(
         let (input, output) = translator.usage();
         record_usage(
             binding,
-            &model,
+            &display_model,
             true,
             status.as_u16(),
             Usage {
@@ -1165,6 +1356,7 @@ fn forward_translated(
                 reasoning: 0,
             },
             input == 0 && output == 0,
+            started.elapsed().as_millis() as u64,
         );
         return Ok(());
     }
@@ -1172,10 +1364,11 @@ fn forward_translated(
     let mut raw = Vec::new();
     let _ = response.read_to_end(&mut raw);
     let openai: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
-    let anthropic = match crate::app::anthropic_openai::response_to_anthropic(&openai, &model) {
-        Ok(anthropic) => anthropic,
-        Err(error) => return Err(translate_error(stream, &error)),
-    };
+    let anthropic =
+        match crate::app::anthropic_openai::response_to_anthropic(&openai, &display_model) {
+            Ok(anthropic) => anthropic,
+            Err(error) => return Err(translate_error(stream, &error)),
+        };
     let usage = extract_usage("openai-chat", &openai);
     let payload = anthropic.to_string();
     let head = format!(
@@ -1188,11 +1381,177 @@ fn forward_translated(
     let _ = stream.flush();
     record_usage(
         binding,
-        &model,
+        &display_model,
         false,
         status.as_u16(),
         usage,
         usage.is_empty(),
+        started.elapsed().as_millis() as u64,
+    );
+    Ok(())
+}
+
+/// Anthropic 入口 → Responses 上游：参考 cc-switch 的直接转换边界，
+/// 把命名事件 SSE 转换为 Anthropic message/content_block 生命周期。
+fn forward_anthropic_responses_translated(
+    stream: &mut TcpStream,
+    binding: &GatewayBinding,
+    body: &[u8],
+    started: Instant,
+) -> Result<(), GatewayError> {
+    let request: Value = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(_) => return Err(translate_error(stream, "Anthropic 请求体不是合法 JSON")),
+    };
+    let streaming = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let display_model = binding_exposed_model(binding).to_string();
+    let responses_body = match crate::app::anthropic_responses::request_to_responses(
+        &request,
+        &binding.default_model,
+    ) {
+        Ok(body) => body,
+        Err(error) => return Err(translate_error(stream, &error)),
+    };
+    let payload = responses_body.to_string();
+    enforce_outbound_body_limit(stream, payload.len())?;
+    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
+    let mut response = match client
+        .post(join_upstream(&binding.base_url, "/responses"))
+        .header("authorization", format!("Bearer {}", binding.api_key))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "identity")
+        .body(payload)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        let payload = json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": detail },
+        })
+        .to_string();
+        let head = format!(
+            "{}content-length: {}\r\n\r\n",
+            gateway_response_head(status.as_u16(), "application/json", &binding.id),
+            payload.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(payload.as_bytes());
+        let _ = stream.flush();
+        record_usage(
+            binding,
+            &display_model,
+            streaming,
+            status.as_u16(),
+            Usage::default(),
+            true,
+            started.elapsed().as_millis() as u64,
+        );
+        return Ok(());
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    if streaming && content_type.contains("text/event-stream") {
+        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+            .map_err(|_| GatewayError::Answered)?;
+        let mut translator =
+            crate::app::anthropic_responses::AnthropicResponsesStream::new(display_model.clone());
+        let mut buffer = String::new();
+        let mut chunk = [0_u8; 8192];
+        let mut client_gone = false;
+        loop {
+            let read = match response.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            while let Some(position) = buffer.find('\n') {
+                let line = buffer[..position].trim_end_matches('\r').to_string();
+                buffer.drain(..=position);
+                let events = translator.push_line(&line);
+                if !events.is_empty() && stream.write_all(events.concat().as_bytes()).is_err() {
+                    client_gone = true;
+                    break;
+                }
+            }
+            if client_gone {
+                break;
+            }
+        }
+        let tail = translator.finish().concat();
+        let _ = stream.write_all(tail.as_bytes());
+        let _ = stream.flush();
+        let (input, output) = translator.usage();
+        record_usage(
+            binding,
+            &display_model,
+            true,
+            status.as_u16(),
+            Usage {
+                input,
+                output,
+                cached: 0,
+                reasoning: 0,
+            },
+            input == 0 && output == 0,
+            started.elapsed().as_millis() as u64,
+        );
+        return Ok(());
+    }
+
+    let mut raw = Vec::new();
+    let _ = response.read_to_end(&mut raw);
+    let upstream: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
+    let usage = extract_usage("openai-responses", &upstream);
+    if streaming {
+        let payload = match crate::app::anthropic_responses::response_to_anthropic_sse(
+            &upstream,
+            &display_model,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => return Err(translate_error(stream, &error)),
+        };
+        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+            .map_err(|_| GatewayError::Answered)?;
+        let _ = stream.write_all(payload.as_bytes());
+        let _ = stream.flush();
+    } else {
+        let payload =
+            match crate::app::anthropic_responses::response_to_anthropic(&upstream, &display_model)
+            {
+                Ok(payload) => payload.to_string(),
+                Err(error) => return Err(translate_error(stream, &error)),
+            };
+        let head = format!(
+            "{}content-length: {}\r\n\r\n",
+            gateway_response_head(status.as_u16(), "application/json", &binding.id),
+            payload.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(payload.as_bytes());
+        let _ = stream.flush();
+    }
+    record_usage(
+        binding,
+        &display_model,
+        streaming,
+        status.as_u16(),
+        usage,
+        usage.is_empty(),
+        started.elapsed().as_millis() as u64,
     );
     Ok(())
 }
@@ -1205,18 +1564,13 @@ fn forward_responses_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
     request: &Value,
+    started: Instant,
 ) -> Result<(), GatewayError> {
     let streaming = request
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(binding.default_model.as_str())
-        .to_string();
+    let display_model = binding_exposed_model(binding).to_string();
     let chat_body =
         match crate::app::responses_chat::request_to_chat(request, &binding.default_model) {
             Ok(chat_body) => chat_body,
@@ -1250,11 +1604,12 @@ fn forward_responses_translated(
         let _ = stream.flush();
         record_usage(
             binding,
-            &model,
+            &display_model,
             streaming,
             status.as_u16(),
             Usage::default(),
             true,
+            started.elapsed().as_millis() as u64,
         );
         return Ok(());
     }
@@ -1262,7 +1617,8 @@ fn forward_responses_translated(
     if streaming {
         write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
             .map_err(|_| GatewayError::Answered)?;
-        let mut translator = crate::app::responses_chat::ResponsesStream::new(model.clone());
+        let mut translator =
+            crate::app::responses_chat::ResponsesStream::new(display_model.clone());
         let mut buffer = String::new();
         let mut chunk = [0_u8; 8192];
         let mut client_gone = false;
@@ -1292,7 +1648,7 @@ fn forward_responses_translated(
         let (input, output) = translator.usage();
         record_usage(
             binding,
-            &model,
+            &display_model,
             true,
             status.as_u16(),
             Usage {
@@ -1302,6 +1658,7 @@ fn forward_responses_translated(
                 reasoning: translator.reasoning_tokens(),
             },
             input == 0 && output == 0,
+            started.elapsed().as_millis() as u64,
         );
         return Ok(());
     }
@@ -1309,7 +1666,8 @@ fn forward_responses_translated(
     let mut raw = Vec::new();
     let _ = response.read_to_end(&mut raw);
     let chat: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
-    let payload = crate::app::responses_chat::response_to_responses(&chat, &model).to_string();
+    let payload =
+        crate::app::responses_chat::response_to_responses(&chat, &display_model).to_string();
     let head = format!(
         "{}content-length: {}\r\n\r\n",
         gateway_response_head(status.as_u16(), "application/json", &binding.id),
@@ -1321,11 +1679,12 @@ fn forward_responses_translated(
     let usage = extract_usage("openai-chat", &chat);
     record_usage(
         binding,
-        &model,
+        &display_model,
         false,
         status.as_u16(),
         usage,
         usage.is_empty(),
+        started.elapsed().as_millis() as u64,
     );
     Ok(())
 }
@@ -1478,13 +1837,16 @@ fn record_usage(
     status: u16,
     usage: Usage,
     unreported: bool,
+    latency_ms: u64,
 ) {
     let record = LocalUsageRecord {
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         binding_id: binding.id.clone(),
         client: binding.client.clone(),
         service: binding.service.clone(),
+        profile_id: binding.profile_id.clone(),
         model: model.to_string(),
+        upstream_model: binding.upstream_model.clone(),
         protocol: binding.protocol.clone(),
         stream: streaming,
         input_tokens: usage.input,
@@ -1493,6 +1855,7 @@ fn record_usage(
         reasoning_tokens: usage.reasoning,
         status: if status < 400 { "success" } else { "failure" }.to_string(),
         usage_unreported: unreported,
+        latency_ms,
         platform_metered: binding.platform_metered,
     };
     if let Err(error) = local_usage::append(&record) {
@@ -1525,8 +1888,13 @@ mod tests {
             id: format!("{client}:svc"),
             client: client.to_string(),
             service: "svc".to_string(),
+            profile_id: String::new(),
+            entry_protocol: protocol.to_string(),
+            exposed_model: "deepseek-v4-flash".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
             default_model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash".to_string(),
+            is_default: true,
             protocol: protocol.to_string(),
             base_url: "https://api.example.com/v1".to_string(),
             api_key: "real-secret".to_string(),
@@ -1606,6 +1974,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_selects_route_by_exposed_model() {
+        let mut first = binding("codex", "openai-chat", "tok-1");
+        first.id = "codex:profile:alias-a".to_string();
+        first.profile_id = "profile".to_string();
+        first.exposed_model = "service-a/model-a".to_string();
+        first.models = vec![first.exposed_model.clone()];
+        first.upstream_model = "model-a".to_string();
+        first.is_default = true;
+        let mut second = first.clone();
+        second.id = "codex:profile:alias-b".to_string();
+        second.exposed_model = "service-b/model-b".to_string();
+        second.models = vec![second.exposed_model.clone()];
+        second.upstream_model = "model-b".to_string();
+        second.is_default = false;
+        let bindings = vec![first, second];
+
+        let selected = authorize(
+            &bindings,
+            &headers(&[("authorization", "Bearer tok-1")]),
+            br#"{"model":"service-b/model-b"}"#,
+            "openai-chat",
+        )
+        .unwrap();
+        assert_eq!(selected.upstream_model, "model-b");
+
+        assert_eq!(
+            authorize(
+                &bindings,
+                &headers(&[("authorization", "Bearer tok-1")]),
+                br#"{"model":"missing"}"#,
+                "openai-chat",
+            )
+            .unwrap_err(),
+            GatewayError::UnknownModel
+        );
+    }
+
+    #[test]
+    fn aggregated_models_payload_uses_exposed_aliases() {
+        let mut first = binding("codex", "openai-chat", "tok-1");
+        first.profile_id = "profile".to_string();
+        first.exposed_model = "service-a/model-a".to_string();
+        first.models = vec![first.exposed_model.clone()];
+        let mut second = binding("codex", "openai-chat", "tok-1");
+        second.profile_id = "profile".to_string();
+        second.exposed_model = "service-b/model-b".to_string();
+        second.models = vec![second.exposed_model.clone()];
+        let refs = vec![&first, &second];
+        let payload: Value = serde_json::from_str(&models_payload(&refs)).unwrap();
+        let ids = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["service-a/model-a", "service-b/model-b"]);
+    }
+
+    #[test]
+    fn request_and_response_models_are_mapped_to_aliases() {
+        let request =
+            rewrite_request_model(br#"{"model":"service-a/model-a","input":"hi"}"#, "model-a");
+        let request: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(request["model"], "model-a");
+
+        let response =
+            rewrite_json_model(br#"{"model":"model-a","output":"ok"}"#, "service-a/model-a");
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["model"], "service-a/model-a");
+
+        let line = rewrite_sse_model_line(
+            r#"data: {"model":"model-a","delta":"ok"}"#,
+            "service-a/model-a",
+        );
+        assert!(line.contains(r#""model":"service-a/model-a""#));
+    }
     #[test]
     fn upstream_url_does_not_duplicate_v1() {
         assert_eq!(
@@ -1794,6 +2239,73 @@ mod tests {
         assert!(response.contains("24 MiB"));
     }
     #[test]
+    fn gateway_routes_alias_and_rewrites_upstream_model() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (_, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected request"),
+            };
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["model"], "model-a");
+            let response = br#"{"id":"chatcmpl-test","model":"model-a","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let token = "alias-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "codex:profile:service/model-a".to_string(),
+                client: "codex".to_string(),
+                service: "custom:service".to_string(),
+                profile_id: "profile".to_string(),
+                entry_protocol: "openai-chat".to_string(),
+                exposed_model: "service/model-a".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-chat".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body =
+            br#"{"model":"service/model-a","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""model":"service/model-a""#),
+            "response={response}"
+        );
+    }
+    #[test]
     fn responses_request_through_gateway_offloads_large_images_before_upstream() {
         use base64::Engine as _;
         use image::{ImageBuffer, Rgb};
@@ -1838,8 +2350,13 @@ mod tests {
                 id: "codex:test".to_string(),
                 client: "codex".to_string(),
                 service: "test".to_string(),
+                profile_id: String::new(),
+                entry_protocol: "openai-responses".to_string(),
+                exposed_model: "test-model".to_string(),
                 models: vec!["test-model".to_string()],
                 default_model: "test-model".to_string(),
+                upstream_model: "test-model".to_string(),
+                is_default: true,
                 protocol: "openai-responses".to_string(),
                 base_url: format!("http://{upstream_address}"),
                 api_key: "upstream-key".to_string(),
@@ -1971,5 +2488,80 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn anthropic_entry_translates_to_responses_upstream() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (head, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected request"),
+            };
+            assert_eq!(head.path, "/v1/responses");
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "model-a");
+            assert_eq!(request["instructions"], "系统提示");
+            assert_eq!(request["input"][0]["content"][0]["text"], "你好");
+            assert_eq!(request["tools"][0]["strict"], false);
+            let response = br#"{"id":"resp_test","object":"response","model":"model-a","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+        });
+
+        let token = "anthropic-responses-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "claude-desktop:profile:service/model-a".to_string(),
+                client: "claude-desktop".to_string(),
+                service: "custom:service".to_string(),
+                profile_id: "profile".to_string(),
+                entry_protocol: "anthropic".to_string(),
+                exposed_model: "service/model-a".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = r#"{"model":"service/model-a","max_tokens":8,"system":"系统提示","messages":[{"role":"user","content":"你好"}],"tools":[{"name":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}"#.as_bytes();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\nx-api-key: {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        let _ = client.write_all(head.as_bytes());
+        let _ = client.write_all(request_body);
+        let _ = client.flush();
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response);
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""type":"message""#),
+            "response={response}"
+        );
+        assert!(response.contains(r#""text":"ok""#), "response={response}");
+        assert!(
+            response.contains(r#""model":"service/model-a""#),
+            "response={response}"
+        );
     }
 }

@@ -4,6 +4,7 @@ pub(crate) mod ai_provider_import;
 pub(crate) mod ai_service_balance;
 pub(crate) mod ai_service_templates;
 pub(crate) mod anthropic_openai;
+pub(crate) mod anthropic_responses;
 pub(crate) mod backup;
 pub(crate) mod builtin_ai_gateway;
 pub(crate) mod builtin_ai_model_sync;

@@ -125,6 +125,9 @@ assert.ok(
 // 可收藏、可学习常用项的对话框，而不是无限横向堆叠或跳回插件管理页。
 assert.match(shell, /QUICK_ACCESS_VISIBLE_LIMIT = 4/, '顶部快捷工具必须明确限制可见槽位');
 assert.match(shell, /himind\.quick-access\.favorites/, '快捷工具收藏必须持久化');
+assert.match(shell, /himind\.quick-access\.hidden/, '快捷栏隐藏状态必须持久化');
+assert.match(shell, /onToggleHidden/, '全部工具面板必须提供隐藏/恢复快捷入口的操作');
+assert.match(shell, /隐藏只影响快捷栏，不会卸载插件/, '隐藏操作必须明确说明不会卸载插件');
 assert.match(shell, /himind\.quick-access\.usage/, '快捷工具常用频次必须持久化');
 assert.match(shell, /useModalFocus\(dialogRef, true, onClose, searchRef, returnFocusRef\)/, '工具面板必须支持焦点接管与关闭回焦');
 assert.match(shell, /aria-labelledby="quick-access-dialog-title"/, '工具面板必须有可访问名称');
@@ -132,6 +135,6 @@ assert.match(shell, /搜索工具、插件或视图/, '工具面板必须提供�
 assert.ok(!/打开更多插件工具/.test(shell), '超出槽位不能只跳回插件管理页，必须进入完整工具面板');
 const quickDialogListRule = styles.match(/\.quick-access-dialog-list \{[^}]*\}/);
 assert.ok(quickDialogListRule && /overflow-y: auto/.test(quickDialogListRule[0]), '大量工具必须由面板内部滚动，不能撑破窗口');
-const quickFavoriteRule = styles.match(/\.quick-access-favorite-button \{[^}]*\}/);
-assert.ok(quickFavoriteRule && /width: 36px; height: 36px/.test(quickFavoriteRule[0]), '收藏按钮命中区必须至少 36×36');
+const quickFavoriteRule = styles.match(/\.quick-access-favorite-button, \.quick-access-hide-button \{[^}]*\}/);
+assert.ok(quickFavoriteRule && /width: 36px; height: 36px/.test(quickFavoriteRule[0]), '收藏与隐藏按钮命中区必须至少 36×36');
 console.log('shell structure checks passed');

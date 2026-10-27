@@ -1,7 +1,10 @@
+use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::Method;
 use serde_json::Value;
 use std::error::Error;
+use std::fs;
+use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
@@ -590,6 +593,131 @@ pub(crate) fn exhibit_workspace_checkout(
     )
 }
 
+pub(crate) fn exhibit_script_import(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    let local_path = required_string(&input, "local_path")?;
+    let mut path = Vec::new();
+    path.extend_from_slice(&["api", "integrations", "ai", "business", "exhibits"]);
+    path.push(exhibit_id.as_str());
+    path.extend_from_slice(&["development", "scripts"]);
+    upload_local_file(
+        options,
+        &path,
+        &local_path,
+        "parser_version",
+        input
+            .get("parser_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+pub(crate) fn exhibit_artifact_upload(
+    options: &Options,
+    input: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let exhibit_id = required_string(&input, "exhibit_id")?;
+    let local_path = required_string(&input, "local_path")?;
+    let request_key = required_string(&input, "request_key")?;
+    let artifact_kind = required_string(&input, "artifact_kind")?;
+    let mut path = Vec::new();
+    path.extend_from_slice(&["api", "integrations", "ai", "business", "exhibits"]);
+    path.push(exhibit_id.as_str());
+    path.extend_from_slice(&["development", "artifacts"]);
+    let checkpoint_id = input
+        .get("checkpoint_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let spec_revision = input
+        .get("spec_revision")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let requirement_ids = input
+        .get("requirement_ids")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let metadata = input
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !requirement_ids.is_array() {
+        return Err("requirement_ids must be an array".into());
+    }
+    let extra = vec![
+        ("request_key", request_key),
+        ("artifact_kind", artifact_kind),
+        ("checkpoint_id", checkpoint_id.to_string()),
+        ("spec_revision", spec_revision.to_string()),
+        ("requirement_ids", serde_json::to_string(&requirement_ids)?),
+        ("metadata", serde_json::to_string(&metadata)?),
+    ];
+    let mut form = Form::new();
+    let file = fs::File::open(&local_path)
+        .map_err(|error| format!("artifact file cannot be opened: {error}"))?;
+    let file_name = Path::new(&local_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("artifact file name is invalid")?
+        .to_string();
+    let length = file.metadata()?.len();
+    let part = Part::reader_with_length(file, length)
+        .file_name(file_name)
+        .mime_str("application/octet-stream")?;
+    form = form.part("file", part);
+    for (key, value) in extra {
+        form = form.text(key.to_string(), value);
+    }
+    upload_form(options, &path, form)
+}
+
+fn upload_local_file(
+    options: &Options,
+    path: &[&str],
+    local_path: &str,
+    field: &str,
+    value: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let file = fs::File::open(local_path)
+        .map_err(|error| format!("script file cannot be opened: {error}"))?;
+    let file_name = Path::new(local_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("script file name is invalid")?
+        .to_string();
+    let length = file.metadata()?.len();
+    let part = Part::reader_with_length(file, length)
+        .file_name(file_name)
+        .mime_str("application/octet-stream")?;
+    let mut form = Form::new().part("file", part);
+    if !value.trim().is_empty() {
+        form = form.text(field.to_string(), value.to_string());
+    }
+    upload_form(options, path, form)
+}
+
+fn upload_form(options: &Options, path: &[&str], form: Form) -> Result<Value, Box<dyn Error>> {
+    let delegated = platform_access_token(options, BUSINESS_EXHIBIT_WRITE_SCOPE)?;
+    let state = load_agent_state(&options.state_path)?;
+    if delegated.agent_id.trim() != state.agent_id.trim() {
+        return Err("Dashboard 授权与当前 Agent 实例不匹配，请重新授权".into());
+    }
+    let url = api_url(&options.api_base(), path)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    let builder = client
+        .post(url)
+        .bearer_auth(&delegated.token)
+        .header("X-HiMind-Agent-ID", &delegated.agent_id)
+        .header("X-HiMind-AI-Client", BUSINESS_CLIENT_ID)
+        .multipart(form);
+    read_json(builder)
+}
 pub(crate) fn operation_get(options: &Options, input: Value) -> Result<Value, Box<dyn Error>> {
     let operation_id = required_string(&input, "operation_id")?;
     let path = [

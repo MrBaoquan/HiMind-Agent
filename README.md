@@ -90,7 +90,7 @@ Agent 的 Dashboard 用户身份使用 OAuth 设备授权和轮换 refresh token
 cargo run -- --local-app
 ```
 
-本地服务端口按构建类型区分：Debug 默认 `18082`，Release 默认 `18181`，所以直接 `cargo run` 不会撞上已安装的生产 Agent。Agent 连接的 AI 工作台地址不再随构建类型变化（ADR 0008）：全新安装在 `data/workbenches.json` 里只播种 `http://localhost:8080` 一条连接，其余连接在「设置 → 账号 → HiMind 账号」里添加、登记和切换。需要指定进程启动时落在哪条连接，用 `--api http://host:port`——它按地址选中或新建一条连接，不改变其它连接的凭据。端口用 `--local-port` 或 `HIMIND_AGENT_LOCAL_PORT` / `HIMIND_DEVELOPMENT_AGENT_PORT` 覆盖，地址用 `DASHBOARD_API_BASE` / `HIMIND_DEVELOPMENT_AGENT_API_BASE` 覆盖。
+本地服务端口按构建类型区分：Debug 默认 `18082`，Release 默认 `18181`，所以直接 `cargo run` 不会撞上已安装的生产 Agent。Agent 连接的 AI 工作台地址属于存储连接而非构建属性（ADR 0008）：Debug 无参数启动可播种 `http://localhost:8080`，Release 无参数启动使用正式默认工作台（构建时可用 `HIMIND_DEFAULT_DASHBOARD_API_BASE` 覆盖），绝不以 loopback 作为普通用户默认值。Production Profile 的「HiMind 账号」列表只展示正式工作台；开发连接仍保留在数据文件中，但只在开发 Profile/调试构建可见。需要指定进程启动时落在哪条连接，用 `--api http://host:port`——它按地址选中或新建一条连接，不改变其它连接的凭据。端口用 `--local-port` 或 `HIMIND_AGENT_LOCAL_PORT` / `HIMIND_DEVELOPMENT_AGENT_PORT` 覆盖，地址用 `DASHBOARD_API_BASE` / `HIMIND_DEVELOPMENT_AGENT_API_BASE` 覆盖。
 
 ## Worker 调试模式
 

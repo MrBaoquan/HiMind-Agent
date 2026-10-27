@@ -53,6 +53,7 @@ const CLAUDE_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const CLAUDE_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 const CLAUDE_MODEL_ENV: &str = "ANTHROPIC_MODEL";
 const CLAUDE_CUSTOM_MODEL_OPTION: &str = "ANTHROPIC_CUSTOM_MODEL_OPTION";
+const CLAUDE_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 const VSCODE_EXTENSION_ID: &str = "himind.himind-ai";
 const VSCODE_CHAT_PROVIDER_PROPOSAL: &str = "chatProvider";
 // Keep the handoff short-lived, but long enough for a cold VS Code process,
@@ -982,6 +983,9 @@ fn save_import_bindings(
 struct AIProviderGatewayBinding {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     token_protected: String,
+    /// 聚合入口 ID。空串表示旧版单服务网关绑定。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    profile_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     base_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1074,6 +1078,7 @@ pub(crate) fn enable_gateway_binding(
                 token_protected: crate::store::credentials::protect_secret_for_current_user(
                     &token,
                 )?,
+                profile_id: String::new(),
                 base_url: credential.access.base_url.clone(),
                 api_key_protected: crate::store::credentials::protect_secret_for_current_user(
                     &credential.api_key,
@@ -1096,6 +1101,205 @@ pub(crate) fn enable_gateway_binding(
     Ok(result)
 }
 
+fn enabled_profile_routes_for_entry<'a>(
+    profile: &'a crate::store::gateway_profiles::GatewayProfile,
+    entry: &crate::store::ai_services::AIServiceProtocol,
+    service_protocols: &BTreeMap<String, crate::store::ai_services::AIServiceProtocol>,
+) -> Vec<&'a crate::store::gateway_profiles::GatewayModelRoute> {
+    profile
+        .routes
+        .iter()
+        .filter(|route| route.enabled)
+        .filter(|route| {
+            service_protocols
+                .get(&route.service_id)
+                .is_some_and(|protocol| {
+                    crate::store::gateway_profiles::protocol_supported(entry, protocol)
+                })
+        })
+        .collect()
+}
+
+/// 把客户端绑定到聚合 Profile。
+///
+/// `service` 参数保留客户端原本的直连来源，切回直连时沿用现有还原路径；
+/// 真正写入客户端的是 Profile 的入口协议、模型别名和本机令牌。
+pub(crate) fn enable_gateway_profile_binding(
+    options: &Options,
+    expected_user_id: &str,
+    target: &str,
+    profile_id: &str,
+    direct_service: Option<&str>,
+) -> Result<AIProviderImportResult, Box<dyn Error>> {
+    let target = target.trim();
+    let adapter = adapter_for(target).ok_or_else(|| format!("不支持的 AI 客户端：{target}"))?;
+    let profile = crate::store::gateway_profiles::get(profile_id)?;
+    if !profile.enabled {
+        return Err(format!("聚合入口已停用：{}", profile.name).into());
+    }
+    let entry_protocol = profile_client_entry_protocol(adapter.id(), &profile)?;
+    let service_protocols = crate::store::ai_services::list()?
+        .into_iter()
+        .map(|service| (service.id, service.protocol))
+        .collect::<BTreeMap<_, _>>();
+    let routes = enabled_profile_routes_for_entry(&profile, &entry_protocol, &service_protocols);
+    if routes.is_empty() {
+        return Err(format!(
+            "客户端协议 {} 在聚合入口中没有兼容的启用模型",
+            entry_protocol.as_str()
+        )
+        .into());
+    }
+    let gateway_url =
+        crate::app::inference_gateway::url().ok_or("本机推理网关未启动，无法切换到网关模式")?;
+    let service_source = direct_service
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::app::ai_provider_import::binding_service(options, target))
+        .unwrap_or_else(|| format!("custom:{}", routes[0].service_id));
+    let credential = resolve_credential(
+        options,
+        expected_user_id,
+        "gateway-profile-binding",
+        &service_source,
+    )?;
+    let models = routes
+        .iter()
+        .map(|route| route.exposed_model.clone())
+        .collect::<Vec<_>>();
+    let default_model = if !profile.default_model.trim().is_empty()
+        && models.iter().any(|model| model == &profile.default_model)
+    {
+        profile.default_model.clone()
+    } else {
+        models.first().cloned().unwrap_or_default()
+    };
+    let token = new_binding_token();
+    let mut client_access = credential.access.clone();
+    client_access.base_url = gateway_url.clone();
+    client_access.protocol = entry_protocol.as_str().to_string();
+    client_access.model = default_model.clone();
+    client_access.models = models.clone();
+    let mut model_metadata = BTreeMap::new();
+    for route in &routes {
+        if let Some(metadata) = credential.model_metadata.get(&route.upstream_model) {
+            model_metadata.insert(route.exposed_model.clone(), metadata.clone());
+        }
+    }
+    let client_credential = AIClientCredential {
+        access: client_access,
+        api_key: token.clone(),
+        model_metadata,
+    };
+    let mut result = {
+        let _guard = set_gateway_override(&service_source, client_credential);
+        import(
+            options,
+            expected_user_id,
+            &AIProviderImportRequest {
+                target: target.to_string(),
+                service: if service_source == "managed" {
+                    String::new()
+                } else {
+                    service_source.clone()
+                },
+                replace: true,
+            },
+        )?
+    };
+    result.model = default_model.clone();
+    result.model_count = models.len();
+    let previous_reachable = result.verification_status == CLIENT_LOAD_VERIFIED;
+    let verification_status =
+        if previous_reachable || gateway_binding_reachable(&gateway_url, &token) {
+            CLIENT_LOAD_VERIFIED.to_string()
+        } else {
+            result.verification_status.clone()
+        };
+
+    let mut bindings = load_import_bindings(options);
+    bindings.clients.insert(
+        target.to_string(),
+        AIProviderImportBinding {
+            service: service_source.clone(),
+            mode: BINDING_MODE_GATEWAY.to_string(),
+            gateway: Some(AIProviderGatewayBinding {
+                token_protected: crate::store::credentials::protect_secret_for_current_user(
+                    &token,
+                )?,
+                profile_id: profile.id.clone(),
+                base_url: String::new(),
+                api_key_protected: String::new(),
+                protocol: entry_protocol.as_str().to_string(),
+                models,
+                default_model,
+            }),
+            updated_at: now_rfc3339(),
+            restore: bindings
+                .clients
+                .get(target)
+                .and_then(|binding| binding.restore.clone()),
+            verification_status,
+            service_revision: resolve_service_revision(options, expected_user_id, &service_source),
+        },
+    );
+    save_import_bindings(options, &bindings)?;
+    Ok(result)
+}
+
+fn profile_client_entry_protocol(
+    adapter_id: &str,
+    profile: &crate::store::gateway_profiles::GatewayProfile,
+) -> Result<crate::store::ai_services::AIServiceProtocol, Box<dyn Error>> {
+    use crate::store::ai_services::AIServiceProtocol;
+
+    let protocols = if profile.entry_protocols.is_empty() {
+        vec![profile.entry_protocol.clone()]
+    } else {
+        profile.entry_protocols.clone()
+    };
+    if adapter_id == "codex" {
+        return protocols
+            .into_iter()
+            .find(|protocol| matches!(protocol, AIServiceProtocol::OpenaiResponses))
+            .ok_or_else(|| "Codex 绑定的聚合入口必须包含 openai-responses 协议".into());
+    }
+    if matches!(adapter_id, "claude-code" | "claude-desktop" | "zcode") {
+        return protocols
+            .into_iter()
+            .find(|protocol| matches!(protocol, AIServiceProtocol::Anthropic))
+            .ok_or_else(|| "Claude 系客户端绑定的聚合入口必须包含 anthropic 协议".into());
+    }
+    // 通用 OpenAI 兼容客户端优先使用 Chat；只有 Profile 没有 Chat 时才回退到
+    // Responses 或 Anthropic，避免入口主协议顺序改变客户端实际使用的协议。
+    for preferred in [
+        AIServiceProtocol::OpenaiChat,
+        AIServiceProtocol::OpenaiResponses,
+        AIServiceProtocol::Anthropic,
+    ] {
+        if protocols.contains(&preferred) {
+            return Ok(preferred);
+        }
+    }
+    Err("聚合入口没有客户端协议".into())
+}
+
+/// 哪些客户端正在使用某个聚合 Profile。删除前必须为空。
+pub(crate) fn clients_bound_to_profile(options: &Options, profile_id: &str) -> Vec<String> {
+    let mut clients = load_import_bindings(options)
+        .clients
+        .into_iter()
+        .filter(|(_, binding)| {
+            binding
+                .gateway
+                .as_ref()
+                .is_some_and(|gateway| gateway.profile_id == profile_id)
+        })
+        .map(|(client, _)| client)
+        .collect::<Vec<_>>();
+    clients.sort();
+    clients
+}
 /// 探本机网关是否认可这枚绑定令牌（`GET /v1/models`）。
 /// 命中即可证明「客户端走网关」这条链路真实可用（ADR 0114 `client_load_verified`）。
 /// 探测失败只降级验证等级，不影响已经写好的客户端配置。
@@ -1232,44 +1436,127 @@ pub(crate) fn disable_gateway_binding(
 pub(crate) fn gateway_bindings(
     options: &Options,
 ) -> Vec<crate::app::inference_gateway::GatewayBinding> {
-    load_import_bindings(options)
-        .clients
-        .iter()
-        .filter_map(|(client, binding)| {
-            if binding.mode != BINDING_MODE_GATEWAY {
-                return None;
+    use crate::app::inference_gateway::GatewayBinding;
+
+    let mut result = Vec::new();
+    for (client, binding) in load_import_bindings(options).clients {
+        if binding.mode != BINDING_MODE_GATEWAY {
+            continue;
+        }
+        let Some(gateway) = binding.gateway.as_ref() else {
+            continue;
+        };
+        let Ok(token) =
+            crate::store::credentials::unprotect_secret_for_current_user(&gateway.token_protected)
+        else {
+            continue;
+        };
+
+        if !gateway.profile_id.trim().is_empty() {
+            let Ok(profile) = crate::store::gateway_profiles::get(&gateway.profile_id) else {
+                continue;
+            };
+            if !profile.enabled {
+                continue;
             }
-            let gateway = binding.gateway.as_ref()?;
-            let token = crate::store::credentials::unprotect_secret_for_current_user(
-                &gateway.token_protected,
-            )
-            .ok()?;
-            let api_key = crate::store::credentials::unprotect_secret_for_current_user(
-                &gateway.api_key_protected,
-            )
-            .ok()?;
-            Some(crate::app::inference_gateway::GatewayBinding {
-                id: format!("{client}:{}", binding.service),
+            let entry_protocol = if gateway.protocol.trim().is_empty() {
+                profile.entry_protocol.clone()
+            } else {
+                crate::store::ai_services::AIServiceProtocol::parse(&gateway.protocol)
+                    .unwrap_or_else(|_| profile.entry_protocol.clone())
+            };
+            let mut routes = Vec::new();
+            for route in profile.routes.iter().filter(|route| route.enabled) {
+                let Ok((service, api_key)) =
+                    crate::store::ai_services::load_secret(&route.service_id)
+                else {
+                    continue;
+                };
+                if !crate::store::gateway_profiles::protocol_supported(
+                    &entry_protocol,
+                    &service.protocol,
+                ) {
+                    continue;
+                }
+                routes.push((route, service, api_key));
+            }
+            let default_model = routes
+                .iter()
+                .find(|(route, _, _)| route.exposed_model == profile.default_model)
+                .or_else(|| routes.first())
+                .map(|(route, _, _)| route.exposed_model.clone())
+                .unwrap_or_default();
+            for (route, service, api_key) in routes {
+                result.push(GatewayBinding {
+                    id: format!("{client}:{}:{}", profile.id, route.exposed_model),
+                    client: client.clone(),
+                    service: format!("custom:{}", service.id),
+                    profile_id: profile.id.clone(),
+                    entry_protocol: entry_protocol.as_str().to_string(),
+                    exposed_model: route.exposed_model.clone(),
+                    models: vec![route.exposed_model.clone()],
+                    default_model: route.upstream_model.clone(),
+                    upstream_model: route.upstream_model.clone(),
+                    is_default: default_model == route.exposed_model,
+                    protocol: service.protocol.as_str().to_string(),
+                    base_url: service.base_url,
+                    api_key,
+                    token: token.clone(),
+                    platform_metered: false,
+                });
+            }
+            continue;
+        }
+
+        let Ok(api_key) = crate::store::credentials::unprotect_secret_for_current_user(
+            &gateway.api_key_protected,
+        ) else {
+            continue;
+        };
+        let default_model = if gateway.default_model.trim().is_empty() {
+            gateway.models.first().cloned().unwrap_or_default()
+        } else {
+            gateway.default_model.clone()
+        };
+        let mut models = if gateway.models.is_empty() {
+            (!default_model.is_empty())
+                .then_some(default_model.clone())
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            gateway.models.clone()
+        };
+        models.sort();
+        models.dedup();
+        for model in models {
+            result.push(GatewayBinding {
+                id: format!("{client}:{}:{model}", binding.service),
                 client: client.clone(),
                 service: binding.service.clone(),
-                models: gateway.models.clone(),
-                default_model: if gateway.default_model.trim().is_empty() {
-                    gateway.models.first().cloned().unwrap_or_default()
+                profile_id: String::new(),
+                entry_protocol: if gateway.protocol.trim().is_empty() {
+                    "openai-responses".to_string()
                 } else {
-                    gateway.default_model.clone()
+                    gateway.protocol.clone()
                 },
+                exposed_model: model.clone(),
+                models: vec![model.clone()],
+                default_model: model.clone(),
+                upstream_model: model.clone(),
+                is_default: model == default_model,
                 protocol: if gateway.protocol.trim().is_empty() {
                     "openai-responses".to_string()
                 } else {
                     gateway.protocol.clone()
                 },
                 base_url: gateway.base_url.clone(),
-                api_key,
-                token,
+                api_key: api_key.clone(),
+                token: token.clone(),
                 platform_metered: binding.service == "managed",
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    result
 }
 
 /// 直连注入的客户端清单：其用量不计入本机口径，面板据此点名。
@@ -3542,12 +3829,13 @@ fn new_claude_config_library_id() -> String {
     id
 }
 
-fn claude_env_keys() -> [&'static str; 4] {
+fn claude_env_keys() -> [&'static str; 5] {
     [
         CLAUDE_BASE_URL_ENV,
         CLAUDE_AUTH_TOKEN_ENV,
         CLAUDE_MODEL_ENV,
         CLAUDE_CUSTOM_MODEL_OPTION,
+        CLAUDE_CONTEXT_TOKENS_ENV,
     ]
 }
 
@@ -3821,6 +4109,13 @@ fn build_claude_settings(
     env.insert(CLAUDE_AUTH_TOKEN_ENV.to_string(), json!(credential.api_key));
     env.insert(CLAUDE_MODEL_ENV.to_string(), json!(preferred));
     env.insert(CLAUDE_CUSTOM_MODEL_OPTION.to_string(), json!(preferred));
+    let context_tokens = credential_model_metadata(credential, preferred)
+        .and_then(|metadata| metadata.context_window)
+        .unwrap_or(200_000);
+    env.insert(
+        CLAUDE_CONTEXT_TOKENS_ENV.to_string(),
+        json!(context_tokens.to_string()),
+    );
     root.insert("env".to_string(), Value::Object(env));
     Ok(format!(
         "{}\n",
@@ -4102,7 +4397,7 @@ fn read_claude_himind_models(path: &Path, _target: &str) -> Result<Vec<String>, 
     Ok(models)
 }
 
-/// Claude Code 的导入会接管 env 下的 4 个 ANTHROPIC_* 键。用户原本就配过这些键时，
+/// Claude Code 的导入会接管 env 下的 4 个 ANTHROPIC_* 键与上下文窗口键。用户原本就配过这些键时，
 /// 取消导入必须还原原值，而不是直接删除。
 fn claude_owned_snapshot(path: &Path) -> Option<Value> {
     let text = fs::read_to_string(path).ok()?;
@@ -7792,8 +8087,9 @@ mod tests {
         strip_qoder_himind, strip_qwen_code_himind, strip_zcode_himind, strip_zcode_rules_himind,
         vscode_extension_install_required, workbuddy_model_id, workbuddy_models_path_in,
         write_cc_switch_provider, zcode_himind_models, AIClientCredential, AIProviderImportRequest,
-        ProbeVerdict, ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CUSTOM_MODEL_OPTION,
-        PROVIDER_TARGETS, VSCODE_CHAT_PROVIDER_PROPOSAL, VSCODE_EXTENSION_ID,
+        ProbeVerdict, ProviderConfigFormat, CLAUDE_BASE_URL_ENV, CLAUDE_CONTEXT_TOKENS_ENV,
+        CLAUDE_CUSTOM_MODEL_OPTION, PROVIDER_TARGETS, VSCODE_CHAT_PROVIDER_PROPOSAL,
+        VSCODE_EXTENSION_ID,
     };
     use crate::api::ai::{AIModelMetadata, AIUserCredential};
     use semver::Version;
@@ -7904,6 +8200,331 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_gateway_binding_still_expands_declared_models() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-gateway-legacy-binding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let options = crate::Options::from_env();
+        let token = "legacy-token";
+        let mut bindings = super::AIProviderImportBindings::default();
+        bindings.clients.insert(
+            "codex".to_string(),
+            super::AIProviderImportBinding {
+                service: "custom:legacy".to_string(),
+                mode: super::BINDING_MODE_GATEWAY.to_string(),
+                gateway: Some(super::AIProviderGatewayBinding {
+                    token_protected: crate::store::credentials::protect_secret_for_current_user(
+                        token,
+                    )
+                    .unwrap(),
+                    profile_id: String::new(),
+                    base_url: "https://example.com/v1".to_string(),
+                    api_key_protected: crate::store::credentials::protect_secret_for_current_user(
+                        "sk-legacy",
+                    )
+                    .unwrap(),
+                    protocol: "openai-responses".to_string(),
+                    models: vec!["model-a".to_string(), "model-b".to_string()],
+                    default_model: "model-b".to_string(),
+                }),
+                updated_at: String::new(),
+                restore: None,
+                verification_status: String::new(),
+                service_revision: String::new(),
+            },
+        );
+        super::save_import_bindings(&options, &bindings).unwrap();
+
+        let routes = super::gateway_bindings(&options);
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().all(|route| route.profile_id.is_empty()));
+        assert!(routes
+            .iter()
+            .all(|route| route.upstream_model == route.exposed_model));
+        assert!(
+            routes
+                .iter()
+                .find(|route| route.exposed_model == "model-b")
+                .unwrap()
+                .is_default
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+    }
+    #[test]
+    fn client_entry_filters_models_before_registration() {
+        use crate::store::ai_services::AIServiceProtocol;
+        use crate::store::gateway_profiles::{GatewayModelRoute, GatewayProfile};
+
+        let profile = GatewayProfile {
+            id: "mixed".to_string(),
+            name: "混合入口".to_string(),
+            entry_protocol: AIServiceProtocol::OpenaiChat,
+            entry_protocols: vec![
+                AIServiceProtocol::OpenaiChat,
+                AIServiceProtocol::OpenaiResponses,
+                AIServiceProtocol::Anthropic,
+            ],
+            default_model: "chat/model-chat".to_string(),
+            enabled: true,
+            routes: vec![
+                GatewayModelRoute {
+                    exposed_model: "chat/model-chat".to_string(),
+                    service_id: "chat".to_string(),
+                    upstream_model: "model-chat".to_string(),
+                    enabled: true,
+                },
+                GatewayModelRoute {
+                    exposed_model: "responses/model-responses".to_string(),
+                    service_id: "responses".to_string(),
+                    upstream_model: "model-responses".to_string(),
+                    enabled: true,
+                },
+                GatewayModelRoute {
+                    exposed_model: "anthropic/model-anthropic".to_string(),
+                    service_id: "anthropic".to_string(),
+                    upstream_model: "model-anthropic".to_string(),
+                    enabled: true,
+                },
+            ],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let protocols = std::collections::BTreeMap::from([
+            ("chat".to_string(), AIServiceProtocol::OpenaiChat),
+            ("responses".to_string(), AIServiceProtocol::OpenaiResponses),
+            ("anthropic".to_string(), AIServiceProtocol::Anthropic),
+        ]);
+        let models = |entry| {
+            super::enabled_profile_routes_for_entry(&profile, &entry, &protocols)
+                .into_iter()
+                .map(|route| route.exposed_model.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            models(AIServiceProtocol::OpenaiChat),
+            vec!["chat/model-chat"]
+        );
+        assert_eq!(
+            models(AIServiceProtocol::OpenaiResponses),
+            vec!["chat/model-chat", "responses/model-responses"]
+        );
+        assert_eq!(
+            models(AIServiceProtocol::Anthropic),
+            vec![
+                "chat/model-chat",
+                "responses/model-responses",
+                "anthropic/model-anthropic"
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_binding_expands_to_one_gateway_route_per_exposed_model() {
+        let _guard = crate::store::paths::test_env_lock();
+        let previous_home = std::env::var("HIMIND_AGENT_HOME").ok();
+        let root = std::env::temp_dir().join(format!(
+            "himind-gateway-profile-binding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let options = crate::Options::from_env();
+
+        for (id, protocol, model) in [
+            (
+                "service-a",
+                crate::store::ai_services::AIServiceProtocol::OpenaiResponses,
+                "model-a",
+            ),
+            (
+                "service-b",
+                crate::store::ai_services::AIServiceProtocol::OpenaiChat,
+                "model-b",
+            ),
+            (
+                "service-c",
+                crate::store::ai_services::AIServiceProtocol::Anthropic,
+                "model-c",
+            ),
+        ] {
+            crate::store::ai_services::upsert(crate::store::ai_services::CustomAIServiceInput {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                base_url: "https://example.com/v1".to_string(),
+                protocol,
+                model: model.to_string(),
+                models: vec![model.to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media: Default::default(),
+                api_key: format!("sk-{id}"),
+            })
+            .unwrap();
+        }
+        let profile = crate::store::gateway_profiles::save(
+            crate::store::gateway_profiles::GatewayProfileInput {
+                id: "coding".to_string(),
+                name: "编码聚合".to_string(),
+                entry_protocol: "openai-responses".to_string(),
+                entry_protocols: vec![
+                    "openai-responses".to_string(),
+                    "openai-chat".to_string(),
+                    "anthropic".to_string(),
+                ],
+                default_model: "service-a/model-a".to_string(),
+                enabled: true,
+                routes: vec![
+                    crate::store::gateway_profiles::GatewayModelRouteInput {
+                        exposed_model: "service-a/model-a".to_string(),
+                        service_id: "service-a".to_string(),
+                        upstream_model: "model-a".to_string(),
+                        enabled: true,
+                    },
+                    crate::store::gateway_profiles::GatewayModelRouteInput {
+                        exposed_model: "service-b/model-b".to_string(),
+                        service_id: "service-b".to_string(),
+                        upstream_model: "model-b".to_string(),
+                        enabled: true,
+                    },
+                    crate::store::gateway_profiles::GatewayModelRouteInput {
+                        exposed_model: "service-c/model-c".to_string(),
+                        service_id: "service-c".to_string(),
+                        upstream_model: "model-c".to_string(),
+                        enabled: true,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let make_binding = |token: &str, protocol: &str, models: Vec<&str>, default: &str| {
+            super::AIProviderImportBinding {
+                service: "custom:service-a".to_string(),
+                mode: super::BINDING_MODE_GATEWAY.to_string(),
+                gateway: Some(super::AIProviderGatewayBinding {
+                    token_protected: crate::store::credentials::protect_secret_for_current_user(
+                        token,
+                    )
+                    .unwrap(),
+                    profile_id: profile.id.clone(),
+                    base_url: String::new(),
+                    api_key_protected: String::new(),
+                    protocol: protocol.to_string(),
+                    models: models.into_iter().map(str::to_string).collect(),
+                    default_model: default.to_string(),
+                }),
+                updated_at: String::new(),
+                restore: None,
+                verification_status: String::new(),
+                service_revision: String::new(),
+            }
+        };
+        let codex_token = "codex-profile-token";
+        let claude_token = "claude-profile-token";
+        let opencode_token = "opencode-profile-token";
+        let mut bindings = super::AIProviderImportBindings::default();
+        bindings.clients.insert(
+            "codex".to_string(),
+            make_binding(
+                codex_token,
+                "openai-responses",
+                vec!["service-a/model-a", "service-b/model-b"],
+                "service-a/model-a",
+            ),
+        );
+        bindings.clients.insert(
+            "claude-desktop".to_string(),
+            make_binding(
+                claude_token,
+                "anthropic",
+                vec![
+                    "service-a/model-a",
+                    "service-b/model-b",
+                    "service-c/model-c",
+                ],
+                "service-a/model-a",
+            ),
+        );
+        bindings.clients.insert(
+            "opencode".to_string(),
+            make_binding(
+                opencode_token,
+                "openai-chat",
+                vec!["service-b/model-b"],
+                "service-b/model-b",
+            ),
+        );
+        super::save_import_bindings(&options, &bindings).unwrap();
+
+        let routes = super::gateway_bindings(&options);
+        assert_eq!(routes.len(), 6);
+        assert!(routes.iter().all(|route| route.profile_id == "coding"));
+        let codex_routes = routes
+            .iter()
+            .filter(|route| route.client == "codex")
+            .collect::<Vec<_>>();
+        let claude_routes = routes
+            .iter()
+            .filter(|route| route.client == "claude-desktop")
+            .collect::<Vec<_>>();
+        let opencode_routes = routes
+            .iter()
+            .filter(|route| route.client == "opencode")
+            .collect::<Vec<_>>();
+        assert_eq!(codex_routes.len(), 2);
+        assert_eq!(claude_routes.len(), 3);
+        assert_eq!(opencode_routes.len(), 1);
+        assert!(codex_routes.iter().all(|route| route.token == codex_token));
+        assert!(claude_routes
+            .iter()
+            .all(|route| route.token == claude_token));
+        assert!(opencode_routes
+            .iter()
+            .all(|route| route.token == opencode_token));
+        assert!(codex_routes
+            .iter()
+            .all(|route| matches!(route.protocol.as_str(), "openai-responses" | "openai-chat")));
+        assert!(claude_routes
+            .iter()
+            .any(|route| route.protocol == "anthropic"));
+        assert!(claude_routes
+            .iter()
+            .any(|route| route.protocol == "openai-responses"));
+        assert_eq!(opencode_routes[0].exposed_model, "service-b/model-b");
+        assert!(opencode_routes[0].is_default);
+        assert_eq!(
+            codex_routes
+                .iter()
+                .find(|route| route.exposed_model == "service-a/model-a")
+                .unwrap()
+                .upstream_model,
+            "model-a"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+    }
     /// ADR 0118 P1b：心跳上报的客户端注册事实必须是「只读投影」——按 target 排序、
     /// 剔除空 target、携带 service/mode/verification_status/service_revision/synced_at，
     /// 且绝不包含任何凭据字段。
@@ -7931,6 +8552,7 @@ mod tests {
                 mode: "gateway".to_string(),
                 gateway: Some(super::AIProviderGatewayBinding {
                     token_protected: "opaque-token".to_string(),
+                    profile_id: String::new(),
                     base_url: "http://127.0.0.1:18150".to_string(),
                     api_key_protected: "opaque-key".to_string(),
                     protocol: "openai-chat".to_string(),
@@ -9695,6 +10317,7 @@ command = "uvx.exe"
         // credential(helpers) 使用 base_url "https://ai.example.com/v1/"；anthropic 剥掉 /v1
         assert_eq!(root["env"][CLAUDE_BASE_URL_ENV], "https://ai.example.com");
         assert_eq!(root["env"][CLAUDE_CUSTOM_MODEL_OPTION], "claude-sonnet-5");
+        assert_eq!(root["env"][CLAUDE_CONTEXT_TOKENS_ENV], "200000");
     }
 
     #[test]
@@ -10330,6 +10953,72 @@ command = "uvx.exe"
         assert_eq!(
             classify_openai_probe(404, "not found"),
             ProbeVerdict::Unsupported
+        );
+    }
+
+    #[test]
+    fn profile_client_protocol_selects_each_clients_native_entry() {
+        use crate::store::ai_services::AIServiceProtocol;
+        use crate::store::gateway_profiles::GatewayProfile;
+
+        let profile = GatewayProfile {
+            id: "multi".to_string(),
+            name: "多协议入口".to_string(),
+            entry_protocol: AIServiceProtocol::OpenaiResponses,
+            entry_protocols: vec![
+                AIServiceProtocol::OpenaiResponses,
+                AIServiceProtocol::Anthropic,
+                AIServiceProtocol::OpenaiChat,
+            ],
+            default_model: "service/model".to_string(),
+            enabled: true,
+            routes: Vec::new(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+        };
+
+        assert_eq!(
+            super::profile_client_entry_protocol("codex", &profile).unwrap(),
+            AIServiceProtocol::OpenaiResponses
+        );
+        for target in ["claude-code", "claude-desktop", "zcode"] {
+            assert_eq!(
+                super::profile_client_entry_protocol(target, &profile).unwrap(),
+                AIServiceProtocol::Anthropic
+            );
+        }
+        assert_eq!(
+            super::profile_client_entry_protocol("opencode", &profile).unwrap(),
+            AIServiceProtocol::OpenaiChat
+        );
+    }
+
+    #[test]
+    fn profile_client_protocol_reports_missing_required_entry() {
+        use crate::store::ai_services::AIServiceProtocol;
+        use crate::store::gateway_profiles::GatewayProfile;
+
+        let profile = GatewayProfile {
+            id: "chat-only".to_string(),
+            name: "Chat 入口".to_string(),
+            entry_protocol: AIServiceProtocol::OpenaiChat,
+            entry_protocols: vec![AIServiceProtocol::OpenaiChat],
+            default_model: "service/model".to_string(),
+            enabled: true,
+            routes: Vec::new(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+        };
+
+        assert!(super::profile_client_entry_protocol("codex", &profile)
+            .unwrap_err()
+            .to_string()
+            .contains("openai-responses"));
+        assert!(
+            super::profile_client_entry_protocol("claude-code", &profile)
+                .unwrap_err()
+                .to_string()
+                .contains("anthropic")
         );
     }
 

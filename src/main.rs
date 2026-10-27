@@ -91,7 +91,7 @@ use svn::service::{
 };
 use svn::types::{
     ApplyProjectAclRequest, CloneExhibitRepositoryRequest, CreateExhibitRepositoryPathRequest,
-    CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest,
+    CreateRepositoryRequest, EnsureProjectExhibitsAccessRequest, ImportLocalExhibitRequest,
     InitializeExhibitRepositoryRequest, PreviewProjectAclRequest, ReconcileProjectAclRequest,
     SvnCheckoutRequest,
 };
@@ -3547,7 +3547,15 @@ pub(crate) fn api_base_cell(api_base: impl Into<String>) -> Arc<RwLock<String>> 
 /// profile name any more (ADR 0008): a build flag is not something the user can
 /// see or control. Local development passes `--api` explicitly, and every
 /// install can add, enroll and switch workbenches from the UI afterwards.
+#[cfg(debug_assertions)]
 const SHIPPED_DASHBOARD_API_BASE: &str = "http://localhost:8080";
+// Ordinary installed users must never be seeded with a loopback workbench.
+// Packaging may still override the official default at compile time.
+#[cfg(not(debug_assertions))]
+const SHIPPED_DASHBOARD_API_BASE: &str = match option_env!("HIMIND_DEFAULT_DASHBOARD_API_BASE") {
+    Some(value) => value,
+    None => "https://himind.andcrane.com",
+};
 
 fn default_state_path() -> PathBuf {
     store::paths::agent_home()
@@ -3713,7 +3721,10 @@ mod tests {
         // ADR 0008: the workbench address is a stored connection, and the
         // shipped default is the only value the binary contributes. Local
         // development selects `http://127.0.0.1:18083` via `--api` instead.
+        #[cfg(debug_assertions)]
         assert_eq!(SHIPPED_DASHBOARD_API_BASE, "http://localhost:8080");
+        #[cfg(not(debug_assertions))]
+        assert!(!SHIPPED_DASHBOARD_API_BASE.contains("localhost"));
     }
 
     #[test]
@@ -3795,6 +3806,51 @@ mod tests {
         assert_eq!(
             super::legacy_task_capability("upload_code"),
             Some("workspace.code.upload")
+        );
+    }
+
+    #[test]
+    fn local_import_task_payload_is_projected_to_capability_input() {
+        let input = super::import_local_capability_input(json!({
+            "project_id": "project-1",
+            "exhibit_id": "EX-1",
+            "exhibit_name": "Local exhibit",
+            "engine_type": "Unity3D",
+            "template_id": "unity-template",
+            "svn_username": "alice",
+            "prerequisite_task_id": "task-edge-1",
+            "repository_operation_id": "operation-1",
+            "source_path": "C:/workspaces/exhibit",
+            "force_migration": true,
+            "expected_source_fingerprint": "sha256:source",
+            "ignore_policy": {
+                "version": 1,
+                "root_large_file_threshold_bytes": 104857600,
+                "root_archive_patterns": ["*.zip"],
+                "excluded_relative_paths": [],
+                "included_relative_paths": []
+            }
+        }))
+        .unwrap();
+
+        let object = input.as_object().expect("capability input object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "exhibit_id",
+                "expected_source_fingerprint",
+                "force_migration",
+                "ignore_policy",
+                "project_id",
+                "source_path",
+            ]
+        );
+        assert_eq!(input["source_path"], "C:/workspaces/exhibit");
+        assert_eq!(
+            input["ignore_policy"]["root_large_file_threshold_bytes"],
+            104857600
         );
     }
 
@@ -4125,6 +4181,15 @@ fn legacy_task_capability(task_type: &str) -> Option<&'static str> {
         "project_acl_reconcile" => Some("svn.project.repository.acl.reconcile"),
         _ => None,
     }
+}
+
+/// Dashboard task payloads contain orchestration metadata in addition to the
+/// legacy capability input. Project those fields through the typed request so
+/// only `workspace.exhibit.repository.import`'s declared schema reaches the
+/// Capability Gateway.
+fn import_local_capability_input(payload: Value) -> Result<Value, serde_json::Error> {
+    let request = serde_json::from_value::<ImportLocalExhibitRequest>(payload)?;
+    serde_json::to_value(request)
 }
 
 /// Central SVN administration is an Edge Worker-only boundary. Keep this
@@ -4697,7 +4762,9 @@ fn execute_task(
                     None,
                     None,
                 )?;
-                let input = task.payload.clone().unwrap_or_else(|| json!({}));
+                let input = import_local_capability_input(
+                    task.payload.clone().unwrap_or_else(|| json!({})),
+                )?;
                 let mut execution = task_execution_context(
                     client,
                     options,

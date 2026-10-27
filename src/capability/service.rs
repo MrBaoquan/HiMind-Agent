@@ -229,6 +229,8 @@ enum CapabilityHandler {
     DashboardExhibitWorkspaceGet,
     DashboardExhibitWorkspaceBind,
     DashboardExhibitWorkspaceCheckout,
+    DashboardExhibitScriptImport,
+    DashboardExhibitArtifactUpload,
     OperationGet,
     OperationCancel,
     DashboardPeopleSearch,
@@ -2990,6 +2992,12 @@ impl CapabilityGateway {
                 "workbench.business.exhibit.workspace.checkout", "检出展项工作区", "检出展项 SVN 工作区并自动保存到 Dashboard 的工作区绑定。", "network_write", json!({"type":"object","properties":{"project_id":{"type":"string"},"exhibit_id":{"type":"string"},"repository_url":{"type":"string"},"target_path":{"type":"string"},"agent_id":{"type":"string"},"engine_version":{"type":"string"}},"required":["project_id","exhibit_id","target_path","agent_id"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitWorkspaceCheckout,
             ),
             dashboard_business_registration(
+                "workbench.exhibit.script.import", "导入展项脚本", "读取本机脚本文件并上传为不可变展项脚本版本。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"local_path":{"type":"string"},"parser_version":{"type":"string"}},"required":["exhibit_id","local_path"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitScriptImport,
+            ),
+            dashboard_business_registration(
+                "workbench.exhibit.artifact.upload", "上传开发证据", "读取本机截图、演示视频、测试报告或构建包并登记到展项开发证据。", "network_write", json!({"type":"object","properties":{"exhibit_id":{"type":"string"},"local_path":{"type":"string"},"request_key":{"type":"string"},"artifact_kind":{"type":"string"},"checkpoint_id":{"type":"string"},"spec_revision":{"type":"integer","minimum":0},"requirement_ids":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}},"required":["exhibit_id","local_path","request_key","artifact_kind"],"additionalProperties":false}), CapabilityHandler::DashboardExhibitArtifactUpload,
+            ),
+            dashboard_business_registration(
                 "workbench.operation.get",
                 "查看异步操作",
                 "读取由 Dashboard AI 能力创建的异步操作状态、进度和结果。",
@@ -4452,6 +4460,12 @@ impl CapabilityGateway {
             }
             CapabilityHandler::DashboardExhibitWorkspaceCheckout => {
                 crate::api::dashboard_business::exhibit_workspace_checkout(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitScriptImport => {
+                crate::api::dashboard_business::exhibit_script_import(&self.options, input)
+            }
+            CapabilityHandler::DashboardExhibitArtifactUpload => {
+                crate::api::dashboard_business::exhibit_artifact_upload(&self.options, input)
             }
             CapabilityHandler::OperationGet => {
                 crate::api::dashboard_business::operation_get(&self.options, input)
@@ -6626,6 +6640,14 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         | "workbench.business.exhibit.workspace.checkout" => {
             Some(crate::api::oauth::BUSINESS_WORKSPACE_WRITE_SCOPE)
         }
+        "workbench.exhibit.script.import"
+        | "workbench.exhibit.spec.publish"
+        | "workbench.exhibit.artifact.upload" => {
+            Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE)
+        }
+        "workbench.exhibit.script.get"
+        | "workbench.exhibit.spec.get"
+        | "workbench.exhibit.artifact.list" => Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE),
         "workbench.operation.get" => Some(crate::api::oauth::OPERATION_READ_SCOPE),
         "workbench.operation.cancel" => Some(crate::api::oauth::OPERATION_CANCEL_SCOPE),
         "workbench.knowledge.search" => Some(crate::api::oauth::KNOWLEDGE_SEARCH_SCOPE),
@@ -6821,6 +6843,8 @@ fn is_dashboard_provider_handler(handler: &CapabilityHandler) -> bool {
             | CapabilityHandler::DashboardExhibitWorkspaceGet
             | CapabilityHandler::DashboardExhibitWorkspaceBind
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+            | CapabilityHandler::DashboardExhibitScriptImport
+            | CapabilityHandler::DashboardExhibitArtifactUpload
             | CapabilityHandler::OperationGet
             | CapabilityHandler::OperationCancel
             | CapabilityHandler::DashboardPeopleSearch
@@ -6880,6 +6904,8 @@ fn is_business_integration_handler(handler: &CapabilityHandler) -> bool {
             | CapabilityHandler::DashboardExhibitWorkspaceGet
             | CapabilityHandler::DashboardExhibitWorkspaceBind
             | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+            | CapabilityHandler::DashboardExhibitScriptImport
+            | CapabilityHandler::DashboardExhibitArtifactUpload
             | CapabilityHandler::OperationGet
             | CapabilityHandler::OperationCancel
             | CapabilityHandler::DashboardPeopleSearch
@@ -6967,6 +6993,12 @@ fn dashboard_route_for(capability_id: &str) -> Option<String> {
         "workbench.knowledge.search" => "/api/integrations/ai/business/knowledge/search",
         "workbench.business.exhibit.workspace.checkout" => {
             "/api/integrations/ai/business/exhibits/{exhibit_id}/workspace/checkout"
+        }
+        "workbench.exhibit.script.import" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}/development/scripts"
+        }
+        "workbench.exhibit.artifact.upload" => {
+            "/api/integrations/ai/business/exhibits/{exhibit_id}/development/artifacts"
         }
         "workbench.operation.get" => "/api/integrations/ai/operations/{operation_id}",
         "workbench.operation.cancel" => "/api/integrations/ai/operations/{operation_id}/cancel",
@@ -7438,6 +7470,8 @@ fn availability_for_handler(handler: &CapabilityHandler) -> CapabilityAvailabili
         | CapabilityHandler::DashboardExhibitWorkspaceGet
         | CapabilityHandler::DashboardExhibitWorkspaceBind
         | CapabilityHandler::DashboardExhibitWorkspaceCheckout
+        | CapabilityHandler::DashboardExhibitScriptImport
+        | CapabilityHandler::DashboardExhibitArtifactUpload
         | CapabilityHandler::OperationGet
         | CapabilityHandler::OperationCancel
         | CapabilityHandler::DashboardPeopleSearch
@@ -10352,6 +10386,50 @@ mod tests {
             assert_eq!(
                 item.availability,
                 crate::capability::types::CapabilityAvailability::Local
+            );
+        }
+    }
+
+    #[test]
+    fn exhibit_development_provider_capabilities_are_wired() {
+        assert_eq!(
+            dashboard_route_for("workbench.exhibit.script.import").as_deref(),
+            Some("/api/integrations/ai/business/exhibits/{exhibit_id}/development/scripts")
+        );
+        assert_eq!(
+            dashboard_route_for("workbench.exhibit.artifact.upload").as_deref(),
+            Some("/api/integrations/ai/business/exhibits/{exhibit_id}/development/artifacts")
+        );
+        assert!(is_dashboard_provider_handler(
+            &CapabilityHandler::DashboardExhibitScriptImport
+        ));
+        assert!(is_dashboard_provider_handler(
+            &CapabilityHandler::DashboardExhibitArtifactUpload
+        ));
+        assert!(is_business_integration_handler(
+            &CapabilityHandler::DashboardExhibitScriptImport
+        ));
+        assert!(is_business_integration_handler(
+            &CapabilityHandler::DashboardExhibitArtifactUpload
+        ));
+        for id in [
+            "workbench.exhibit.script.import",
+            "workbench.exhibit.spec.publish",
+            "workbench.exhibit.artifact.upload",
+        ] {
+            assert_eq!(
+                required_platform_scope(id),
+                Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE)
+            );
+        }
+        for id in [
+            "workbench.exhibit.script.get",
+            "workbench.exhibit.spec.get",
+            "workbench.exhibit.artifact.list",
+        ] {
+            assert_eq!(
+                required_platform_scope(id),
+                Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE)
             );
         }
     }
