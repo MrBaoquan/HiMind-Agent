@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$ReleaseDirectory,
@@ -188,10 +188,11 @@ if ($Thumbprint) {
     if ($LASTEXITCODE -ne 0) { throw "Installer Authenticode signing failed." }
 }
 
+$ExtensionSigningKeyIdOutput = if ($ExtensionKey) { $ExtensionKey.KeyId } else { "" }
 [pscustomobject]@{
     path = $OutFile
     version = $Version
     default_mode = $DefaultMode
-    extension_signing_key_id = if ($ExtensionKey) { $ExtensionKey.KeyId } else { "" }
+    extension_signing_key_id = $ExtensionSigningKeyIdOutput
     sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $OutFile).Hash.ToLowerInvariant()
 } | ConvertTo-Json
