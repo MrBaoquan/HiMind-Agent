@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = "Stop"
@@ -22,9 +22,13 @@ function Assert-RuntimeReleaseDirectory {
     }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $repo = Read-RepoRuntimeManifest
-    if ([string]$manifest.version -ne [string]$repo.version -or
-        [string]$manifest.sha256 -ne [string]$repo.sha256 -or
-        [string]$manifest.file_name -ne [string]$repo.file_name) {
+    $derivedFileName = ([string]$repo.file_name -replace '\.zip$', '') + '-install-stored.zip'
+    $isExactPackage = [string]$manifest.file_name -eq [string]$repo.file_name -and
+        ([string]$manifest.sha256).ToLowerInvariant() -eq ([string]$repo.sha256).ToLowerInvariant()
+    $isDerivedPackage = [string]$manifest.file_name -eq $derivedFileName -and
+        ([string]$manifest.source_package_file_name) -eq [string]$repo.file_name -and
+        ([string]$manifest.source_package_sha256).ToLowerInvariant() -eq ([string]$repo.sha256).ToLowerInvariant()
+    if ([string]$manifest.version -ne [string]$repo.version -or (-not $isExactPackage -and -not $isDerivedPackage)) {
         throw "Bundled Runtime does not match resources/runtime/himind-runtime-release.json (expected $($repo.version) / $($repo.sha256), got $($manifest.version) / $($manifest.sha256))."
     }
     if ([string]$manifest.product_id -ne "com.himind.runtime.deepseek-harness" -or
