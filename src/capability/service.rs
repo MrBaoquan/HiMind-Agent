@@ -304,6 +304,13 @@ impl CapabilityGateway {
         &self.options
     }
 
+    /// Short-lived CLI processes must prime the remote business catalog before
+    /// building a Workflow preflight, otherwise dynamic Dashboard capabilities
+    /// are absent from the first (and only) registry snapshot.
+    pub(crate) fn refresh_business_catalog(&self) -> Result<(), Box<dyn Error>> {
+        self.business_provider.refresh_catalog()
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_business_catalog_for_test(&self, snapshot: BusinessCatalogSnapshot) {
         let provider = self
@@ -6642,9 +6649,8 @@ fn required_platform_scope(capability_id: &str) -> Option<&'static str> {
         }
         "workbench.exhibit.script.import"
         | "workbench.exhibit.spec.publish"
-        | "workbench.exhibit.artifact.upload" => {
-            Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE)
-        }
+        | "workbench.exhibit.artifact.upload"
+        | "workbench.exhibit.intro.update" => Some(crate::api::oauth::BUSINESS_EXHIBIT_WRITE_SCOPE),
         "workbench.exhibit.script.get"
         | "workbench.exhibit.spec.get"
         | "workbench.exhibit.artifact.list" => Some(crate::api::oauth::BUSINESS_EXHIBIT_READ_SCOPE),
@@ -10416,6 +10422,7 @@ mod tests {
             "workbench.exhibit.script.import",
             "workbench.exhibit.spec.publish",
             "workbench.exhibit.artifact.upload",
+            "workbench.exhibit.intro.update",
         ] {
             assert_eq!(
                 required_platform_scope(id),

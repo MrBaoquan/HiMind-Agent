@@ -258,7 +258,7 @@ fn unity_editor_candidates_all() -> Vec<PathBuf> {
     candidates
 }
 
-fn unity_version_from_path(path: &Path) -> String {
+pub(crate) fn unity_version_from_path(path: &Path) -> String {
     for component in path.components().rev() {
         let raw = component.as_os_str().to_string_lossy().to_string();
         if raw.eq_ignore_ascii_case("Editor")

@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::app::types::{RemoteConnectRequest, WorkspaceBuildRequest};
 use crate::store::credentials::{
     configured_unity_editor_path, configured_unreal_editor_path, discovered_unity_editor_path,
-    unity_editor_environment_path, unity_editor_path_for_version, unreal_editor_environment_path,
+    unity_editor_environment_path, unity_editor_path_for_version, unity_version_from_path,
+    unreal_editor_environment_path,
 };
 use crate::Options;
 
@@ -940,10 +941,15 @@ pub(crate) fn inspect_project_workspace(
     let folder = PathBuf::from(path.trim());
     let path_exists = folder.is_dir();
     let engine = normalized_engine_type(engine_type.unwrap_or_default(), &folder);
-    let (project_file, launcher) = if path_exists {
+    let ProjectLauncherResolution {
+        project_file,
+        open_launcher: launcher,
+        build_launcher,
+        open_warning: editor_version_warning,
+    } = if path_exists {
         resolve_project_launcher(&folder, &engine, engine_version)
     } else {
-        (None, None)
+        ProjectLauncherResolution::default()
     };
     let build_script = path_exists
         .then(|| find_workspace_build_script(&folder))
@@ -958,7 +964,7 @@ pub(crate) fn inspect_project_workspace(
         &engine,
         engine_version,
         project_file.as_deref(),
-        launcher.as_deref(),
+        build_launcher.as_deref(),
     );
     let open_project_reason = if !path_exists {
         "本机工程目录不存在"
@@ -992,6 +998,7 @@ pub(crate) fn inspect_project_workspace(
         "engine_type": engine,
         "project_file": project_file,
         "editor_path": launcher,
+        "editor_version_warning": editor_version_warning,
         "build_script": build_script,
         "build_job": build_job,
         "can_open_folder": path_exists,
@@ -1036,6 +1043,7 @@ pub(crate) fn launch_project_workspace(
                     "editor_path": editor,
                     "project_file": project,
                     "reused": true,
+                    "warning": status["editor_version_warning"],
                 }));
             }
             Some(false) => {
@@ -1058,6 +1066,7 @@ pub(crate) fn launch_project_workspace(
         "project_file": project,
         "reused": false,
         "pid": child.id(),
+        "warning": status["editor_version_warning"],
     }))
 }
 
@@ -1150,8 +1159,9 @@ pub(crate) fn launch_workspace_build(
     if !matches!(provider.as_str(), "auto" | "native" | "script") {
         return Err("provider 只能是 native、script 或 auto".into());
     }
-    let project_file = resolve_project_launcher(&workspace, &engine, requested_version).0;
-    let launcher = resolve_project_launcher(&workspace, &engine, requested_version).1;
+    let resolution = resolve_project_launcher(&workspace, &engine, requested_version);
+    let project_file = resolution.project_file;
+    let launcher = resolution.build_launcher;
     let native = native_build_info(
         &workspace,
         &engine,
@@ -2038,11 +2048,22 @@ fn normalized_engine_type(configured: &str, folder: &Path) -> String {
     String::new()
 }
 
+#[derive(Default)]
+struct ProjectLauncherResolution {
+    project_file: Option<String>,
+    /// Exact/preferred editor used by native build checks.
+    build_launcher: Option<String>,
+    /// Editor used by the open-project action. A user-configured editor may be
+    /// selected here even when its version differs from the project version.
+    open_launcher: Option<String>,
+    open_warning: String,
+}
+
 fn resolve_project_launcher(
     folder: &Path,
     engine: &str,
     requested_engine_version: Option<&str>,
-) -> (Option<String>, Option<String>) {
+) -> ProjectLauncherResolution {
     if engine == "unity" {
         let project_file = is_unity_project(folder).then(|| folder.to_string_lossy().to_string());
         let project_version = read_unity_project_version(folder);
@@ -2050,16 +2071,20 @@ fn resolve_project_launcher(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .or(project_version.as_deref());
-        let launcher = if version.is_some() {
+        let build_launcher = if version.is_some() {
             unity_editor_path_for_version(version)
         } else {
-            unity_editor_environment_path()
-                .filter(|value| Path::new(value).is_file())
-                .or_else(configured_unity_editor_path)
-                .or_else(discovered_unity_editor_path)
-                .filter(|value| Path::new(value).is_file())
+            unity_editor_fallback_path()
         };
-        return (project_file, launcher);
+        let fallback_launcher = unity_editor_fallback_path();
+        let (open_launcher, open_warning) =
+            resolve_unity_open_launcher(build_launcher.clone(), fallback_launcher, version);
+        return ProjectLauncherResolution {
+            project_file,
+            build_launcher,
+            open_launcher,
+            open_warning,
+        };
     }
     if engine == "unreal" {
         let project_file = first_file_with_extension(folder, "uproject")
@@ -2068,9 +2093,52 @@ fn resolve_project_launcher(
             .as_deref()
             .and_then(|value| read_unreal_engine_association(Path::new(value)));
         let launcher = find_unreal_editor_for_association(association.as_deref());
-        return (project_file, launcher);
+        return ProjectLauncherResolution {
+            project_file,
+            build_launcher: launcher.clone(),
+            open_launcher: launcher,
+            open_warning: String::new(),
+        };
     }
-    (None, None)
+    ProjectLauncherResolution::default()
+}
+
+fn unity_editor_fallback_path() -> Option<String> {
+    unity_editor_environment_path()
+        .filter(|value| Path::new(value).is_file())
+        .or_else(configured_unity_editor_path)
+        .or_else(discovered_unity_editor_path)
+        .filter(|value| Path::new(value).is_file())
+}
+
+fn resolve_unity_open_launcher(
+    exact_launcher: Option<String>,
+    fallback_launcher: Option<String>,
+    requested_version: Option<&str>,
+) -> (Option<String>, String) {
+    if exact_launcher.is_some() {
+        return (exact_launcher, String::new());
+    }
+    let Some(required_version) = requested_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (fallback_launcher, String::new());
+    };
+    let Some(path) = fallback_launcher else {
+        return (None, String::new());
+    };
+    let editor_version = unity_version_from_path(Path::new(&path));
+    let warning = if editor_version.is_empty() {
+        format!(
+            "工程使用 Unity {required_version}，当前编辑器路径无法识别版本。仍将尝试启动，Unity 可能提示升级工程。"
+        )
+    } else {
+        format!(
+            "工程使用 Unity {required_version}，当前将使用的编辑器版本为 {editor_version}。仍将尝试启动，Unity 可能提示升级工程。"
+        )
+    };
+    (Some(path), warning)
 }
 
 fn read_unity_project_version(folder: &Path) -> Option<String> {
@@ -3139,6 +3207,39 @@ mod tests {
         std::fs::write(&expected, "@exit /b 0").unwrap();
         assert_eq!(find_workspace_build_script(&root), Some(expected));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mismatched_unity_version_still_uses_fallback_editor_for_open() {
+        let fallback = r"C:\Program Files\Unity\2023.1.0f1\Editor\Unity.exe".to_string();
+        let (launcher, warning) =
+            resolve_unity_open_launcher(None, Some(fallback.clone()), Some("2022.3.40f1"));
+        assert_eq!(launcher.as_deref(), Some(fallback.as_str()));
+        assert!(warning.contains("2022.3.40f1"), "{warning}");
+        assert!(warning.contains("2023.1.0f1"), "{warning}");
+        assert!(warning.contains("仍将尝试启动"), "{warning}");
+    }
+
+    #[test]
+    fn unversioned_configured_editor_is_still_usable_for_open() {
+        let fallback = r"D:\Unity\Editor\Unity.exe".to_string();
+        let (launcher, warning) =
+            resolve_unity_open_launcher(None, Some(fallback.clone()), Some("2022.3.40f1"));
+        assert_eq!(launcher.as_deref(), Some(fallback.as_str()));
+        assert!(warning.contains("无法识别版本"), "{warning}");
+        assert!(warning.contains("仍将尝试启动"), "{warning}");
+    }
+
+    #[test]
+    fn matching_unity_version_opens_without_a_warning() {
+        let exact = r"C:\Program Files\Unity\2022.3.40f1\Editor\Unity.exe".to_string();
+        let (launcher, warning) = resolve_unity_open_launcher(
+            Some(exact.clone()),
+            Some(r"C:\Program Files\Unity\2023.1.0f1\Editor\Unity.exe".to_string()),
+            Some("2022.3.40f1"),
+        );
+        assert_eq!(launcher.as_deref(), Some(exact.as_str()));
+        assert!(warning.is_empty(), "{warning}");
     }
 
     #[test]

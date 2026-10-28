@@ -574,16 +574,16 @@ pub(crate) fn preflight(
     }
 
     for step in &package.steps {
-        if step.capability_id.trim().is_empty() && step.loop_config.is_none() {
+        if !step_has_executor(step) {
             push_warning(
                 &mut diagnostics,
                 "step.executor_missing",
                 "contract",
                 format!(
-                    "workflow step {} requires a Runtime or provider executor",
+                    "workflow step {} requires a Runtime, Capability, Loop or manual executor",
                     step.id
                 ),
-                "为该 Step 配置 capability_id、Runtime 或 Loop 执行器。",
+                "为该 Step 配置 capability_id、Runtime、Loop 或明确 manual/provider_defined 类型。",
                 false,
             );
         } else if let Some(capability) = capability_map.get(step.capability_id.as_str()) {
@@ -807,7 +807,10 @@ fn validate_capability_step_input(
     let mut merged = run_input.as_object().cloned().unwrap_or_default();
     if let Some(step_input) = step.input.as_object() {
         for (name, value) in step_input {
-            merged.insert(name.clone(), value.clone());
+            merged.insert(
+                name.clone(),
+                super::executor::resolve_workflow_input_templates(value, run_input),
+            );
         }
     }
     for (name, value) in super::executor::candidate_freeze_inputs(package, step) {
@@ -1048,6 +1051,14 @@ fn evaluate_connector_credentials(
             }
         })
         .collect()
+}
+
+fn step_has_executor(step: &super::WorkflowStep) -> bool {
+    step.runtime.is_some()
+        || step.loop_config.is_some()
+        || !step.capability_id.trim().is_empty()
+        || step.approval_required
+        || matches!(step.kind.trim(), "manual" | "provider_defined")
 }
 
 fn runtime_requirements(
@@ -1660,6 +1671,31 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("missing-secret")));
+    }
+
+    #[test]
+    fn runtime_and_manual_steps_have_explicit_executors() {
+        let mut package = package(Vec::new());
+        package.steps[0].capability_id.clear();
+        package.steps[0].kind = "runtime".to_string();
+        package.steps[0].runtime = Some(crate::workflow::WorkflowRuntimeStep {
+            provider: "auto".to_string(),
+            prompt: "Do work.".to_string(),
+            workspace_path: String::new(),
+            result_schema: String::new(),
+            allow_network: None,
+            input_artifacts: Vec::new(),
+            tool_policy: String::new(),
+            timeout_seconds: 0,
+        });
+        let mut manual = package.steps[0].clone();
+        manual.id = "STEP-2".to_string();
+        manual.kind = "manual".to_string();
+        manual.runtime = None;
+        manual.approval_required = true;
+        package.steps.push(manual);
+        assert!(super::step_has_executor(&package.steps[0]));
+        assert!(super::step_has_executor(&package.steps[1]));
     }
 
     #[test]

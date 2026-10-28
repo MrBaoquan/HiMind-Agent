@@ -2009,7 +2009,10 @@ fn execution_input_from_context(
     };
     if let Some(step_input) = step.input.as_object() {
         for (name, value) in step_input {
-            input.insert(name.clone(), value.clone());
+            input.insert(
+                name.clone(),
+                super::executor::resolve_workflow_input_templates(value, workflow_input),
+            );
         }
     }
     // Artifact 以文件路径进入步骤输入：数据走文件，提示词只描述任务。

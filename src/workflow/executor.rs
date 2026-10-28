@@ -168,6 +168,48 @@ fn redact_connector_secret_values(value: Value, secrets: &[String]) -> Value {
 
 // 启动前检查复用同一套过滤规则，避免「预检查的输入」和「真正发给能力的输入」
 // 不是同一个对象，导致预检查报的错和运行时报的错对不上。
+/// Resolve `input.*` placeholders embedded in a Workflow step's static input.
+/// The Workflow JSON uses these placeholders for capability inputs, while
+/// runtime steps receive the complete workflow context separately.
+pub(crate) fn resolve_workflow_input_templates(value: &Value, workflow_input: &Value) -> Value {
+    match value {
+        Value::String(template) => match template.strip_prefix("input.") {
+            Some(path) => lookup_workflow_input(workflow_input, path).unwrap_or(Value::Null),
+            None => value.clone(),
+        },
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| resolve_workflow_input_templates(item, workflow_input))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| {
+                    (
+                        key.clone(),
+                        resolve_workflow_input_templates(item, workflow_input),
+                    )
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn lookup_workflow_input(root: &Value, path: &str) -> Option<Value> {
+    let mut current = root;
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        current = match current {
+            Value::Object(object) => object.get(segment)?,
+            Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current.clone())
+}
+
 pub(crate) fn capability_input(schema: &Value, input: &Value) -> Value {
     let Some(input) = input.as_object() else {
         return input.clone();
@@ -338,6 +380,31 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.get("credential_handles").is_none());
+    }
+
+    #[test]
+    fn resolves_nested_input_templates_for_capability_steps() {
+        let input = serde_json::json!({
+            "exhibit_id": "exh_1",
+            "evidence_items": [
+                {"path": "/tmp/shot.png", "kind": "development-screenshot"}
+            ]
+        });
+        let template = serde_json::json!({
+            "exhibit_id": "input.exhibit_id",
+            "items": "input.evidence_items",
+            "nested": {"missing": "input.not_present"}
+        });
+        assert_eq!(
+            resolve_workflow_input_templates(&template, &input),
+            serde_json::json!({
+                "exhibit_id": "exh_1",
+                "items": [
+                    {"path": "/tmp/shot.png", "kind": "development-screenshot"}
+                ],
+                "nested": {"missing": null}
+            })
+        );
     }
 
     #[test]

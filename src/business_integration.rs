@@ -176,6 +176,13 @@ pub(crate) trait BusinessIntegrationProvider: Send + Sync {
 
     fn catalog_snapshot(&self) -> Option<BusinessCatalogSnapshot>;
 
+    /// Refresh the remote catalog synchronously for short-lived CLI entrypoints
+    /// such as `workflow doctor` and `workflow run`. Long-lived services use
+    /// `catalog_snapshot` to refresh in the background.
+    fn refresh_catalog(&self) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
     fn invoke(
         &self,
         contract: &BusinessCapabilityContract,

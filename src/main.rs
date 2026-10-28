@@ -1287,6 +1287,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                     store::types::LocalWorkerStatus::default(),
                 )),
             );
+            gateway.refresh_business_catalog()?;
             let capabilities =
                 gateway.list_capabilities(&capability::types::InvocationContext::new(
                     capability::types::InvocationSource::Cli,
@@ -1306,6 +1307,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                     store::types::LocalWorkerStatus::default(),
                 )),
             );
+            gateway.refresh_business_catalog()?;
             let capabilities =
                 gateway.list_capabilities(&capability::types::InvocationContext::new(
                     capability::types::InvocationSource::Cli,
@@ -1343,6 +1345,7 @@ fn run_workflow_cli(options: &Options, arguments: &[String]) -> Result<(), Box<d
                     store::types::LocalWorkerStatus::default(),
                 )),
             );
+            gateway.refresh_business_catalog()?;
             let context = capability::types::InvocationContext::new(
                 capability::types::InvocationSource::Cli,
                 "workflow-doctor",
@@ -1934,6 +1937,7 @@ fn run_workflow_package(
             store::types::LocalWorkerStatus::default(),
         )),
     );
+    gateway.refresh_business_catalog()?;
     let context = capability::types::InvocationContext::new(
         capability::types::InvocationSource::Workflow,
         "workflow-runner",

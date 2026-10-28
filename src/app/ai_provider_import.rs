@@ -2233,6 +2233,12 @@ fn codex_himind_models_path() -> PathBuf {
 /// 模型的供应商（DeepSeek 等）才生成，从而避免遮蔽内置定义。
 fn is_codex_native_model(model: &str) -> bool {
     let slug = model.trim();
+    // 带命名空间的别名（聚合入口默认 `<service_id>/<upstream_model>`）是按字面量
+    // 对外暴露的新 slug，不是内置模型族：服务 ID 叫 `gpt-yundu` 时，别名
+    // `gpt-yundu/gpt-6.1-sol` 仍会被 Codex 当作未知模型，漏掉它就会在 picker 里消失。
+    if slug.contains('/') {
+        return false;
+    }
     if slug.starts_with("gpt-") || slug.starts_with("codex-") {
         return true;
     }
@@ -9048,6 +9054,13 @@ mod tests {
                 "{slug} 不应视为 Codex 内置模型"
             );
         }
+        // 聚合别名按字面量注册，`gpt-` 只出现在服务命名空间里，不代表内置模型族。
+        for slug in ["gpt-yundu/gpt-6.1-sol", "gpt-yundu/gpt-6-astra"] {
+            assert!(
+                !is_codex_native_model(slug),
+                "{slug} 是聚合别名，不应视为 Codex 内置模型"
+            );
+        }
     }
 
     /// 目录是整体替换语义：官方 slug 一旦进入自建目录，内置能力（图像输入、xhigh/ultra
@@ -9066,6 +9079,17 @@ mod tests {
         );
         // 全为官方模型时不生成目录。
         assert!(codex_catalog_models(&["gpt-6.1-sol".to_string()]).is_empty());
+        // 命名空间别名的模型族前缀不代表内置模型，必须进目录，否则 picker 里看不到。
+        assert_eq!(
+            codex_catalog_models(&[
+                "himind_hd/deepseek-v4.1-flash".to_string(),
+                "gpt-yundu/gpt-6.1-sol".to_string(),
+            ]),
+            vec![
+                "himind_hd/deepseek-v4.1-flash".to_string(),
+                "gpt-yundu/gpt-6.1-sol".to_string()
+            ]
+        );
     }
 
     /// 官方模型供应商（如云渡）沿用 Codex 内置目录：不写 model_catalog_json，

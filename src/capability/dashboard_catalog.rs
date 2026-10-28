@@ -262,6 +262,49 @@ impl DashboardCatalogProvider {
         }
     }
 
+    /// Synchronously refresh the catalog and retain the same validated snapshot
+    /// semantics as the background refresh path.
+    pub(crate) fn refresh_now(&self) -> Result<(), Box<dyn Error>> {
+        if !crate::app::control_plane_provider::available(&self.options) {
+            return Ok(());
+        }
+        if authorization_snapshot(&self.options.state_path)?.is_none() {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "dashboard catalog state lock poisoned")?;
+            state.last_attempt = Some(Instant::now());
+            state.etag.clear();
+            state.snapshot = None;
+            state.updated_at = None;
+            return Ok(());
+        }
+        let etag = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "dashboard catalog state lock poisoned")?;
+            state.last_attempt = Some(Instant::now());
+            state.etag.clone()
+        };
+        let result = fetch_catalog(&self.options, &etag)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "dashboard catalog state lock poisoned")?;
+        match result {
+            FetchResult::NotModified => {
+                state.updated_at = Some(Instant::now());
+            }
+            FetchResult::Modified { snapshot, etag } => {
+                state.etag = etag;
+                state.snapshot = Some(snapshot);
+                state.updated_at = Some(Instant::now());
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the last validated Connected-mode catalog. Independent mode is
     /// a first-class topology and never reads or refreshes Dashboard state.
     pub(crate) fn snapshot(&self) -> Option<DashboardCatalogSnapshot> {
@@ -389,6 +432,10 @@ impl BusinessIntegrationProvider for DashboardCatalogProvider {
 
     fn catalog_snapshot(&self) -> Option<BusinessCatalogSnapshot> {
         DashboardCatalogProvider::snapshot(self)
+    }
+
+    fn refresh_catalog(&self) -> Result<(), Box<dyn Error>> {
+        self.refresh_now()
     }
 
     fn invoke(
