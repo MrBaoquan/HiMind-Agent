@@ -21,10 +21,28 @@ use crate::store::local_usage::{self, LocalUsageRecord};
 const HEADER_LIMIT: usize = 64 * 1024;
 /// 本机是受信任的规格化边界：入口允许容纳客户端已经生成的大历史，
 /// 但出站请求会在媒体外置后严格压到远端网关限制以下。
-const INBOUND_BODY_LIMIT: usize = 96 * 1024 * 1024;
+///
+/// 注意：这条上限必须比“客户端已积累的历史”更大，否则网关会在收到请求前
+/// 就拒绝，根本来不及把图片外置。默认 192 MiB，可用环境变量覆盖。
+const DEFAULT_INBOUND_BODY_MIB: usize = 192;
+const MIN_INBOUND_BODY_MIB: usize = 32;
+const MAX_INBOUND_BODY_MIB: usize = 512;
+const INBOUND_BODY_MIB_ENV: &str = "HIMIND_AGENT_GATEWAY_INBOUND_MIB";
 const OUTBOUND_BODY_LIMIT: usize = 24 * 1024 * 1024;
 const RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
+
+fn inbound_body_limit_mib() -> usize {
+    std::env::var(INBOUND_BODY_MIB_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INBOUND_BODY_MIB)
+        .clamp(MIN_INBOUND_BODY_MIB, MAX_INBOUND_BODY_MIB)
+}
+
+fn inbound_body_limit_bytes() -> usize {
+    inbound_body_limit_mib() * 1024 * 1024
+}
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const SSE_LINE_LIMIT: usize = 1024 * 1024;
@@ -511,10 +529,11 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<RequestRead> {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     // 超限请求在发送 100 Continue 之前直接拒绝，避免客户端继续上传几十 MiB。
-    if content_length > INBOUND_BODY_LIMIT {
+    let inbound_limit = inbound_body_limit_bytes();
+    if content_length > inbound_limit {
         return Ok(RequestRead::TooLarge {
             actual: content_length,
-            limit: INBOUND_BODY_LIMIT,
+            limit: inbound_limit,
         });
     }
     // .NET 系客户端（HttpClient 默认）会先发 `Expect: 100-continue` 再等应答；
@@ -2210,7 +2229,7 @@ mod tests {
         let mut client = TcpStream::connect(address).unwrap();
         let head = format!(
             "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            INBOUND_BODY_LIMIT + 1
+            inbound_body_limit_bytes() + 1
         );
         client.write_all(head.as_bytes()).unwrap();
         let mut response = String::new();
@@ -2218,7 +2237,7 @@ mod tests {
         server.join().unwrap();
         assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
         assert!(response.contains("himind_gateway_request_too_large"));
-        assert!(response.contains("96 MiB"));
+        assert!(response.contains("192 MiB"));
     }
     #[test]
     fn outbound_budget_exceeded_returns_structured_413() {

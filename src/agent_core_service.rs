@@ -52,7 +52,7 @@ impl AgentCoreRunRecorder {
         }
         #[cfg(not(test))]
         Ok(Self {
-            ledger: LocalRunLedger::open_default()?,
+            ledger: LocalRunLedger::open_default_best_effort()?,
         })
     }
 
@@ -298,6 +298,8 @@ fn unix_timestamp_string() -> String {
 mod tests {
     use super::*;
     use crate::agent_core_contracts::LocalRunStatus;
+    use rusqlite::{Connection, TransactionBehavior};
+    use std::time::{Duration, Instant};
 
     fn ledger(name: &str) -> LocalRunLedger {
         LocalRunLedger::new(
@@ -327,6 +329,43 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, LocalRunStatus::Succeeded);
         assert_eq!(recorder.ledger.pending_projections(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recorder_does_not_hold_capability_response_on_a_locked_ledger() {
+        let default_ledger = ledger("busy");
+        default_ledger.projection_outbox_summary().unwrap();
+        let ledger_path = default_ledger.path().to_path_buf();
+        let recorder =
+            AgentCoreRunRecorder::with_ledger(LocalRunLedger::new_best_effort(ledger_path.clone()));
+        let mut blocker = Connection::open(&ledger_path).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        let transaction = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let started = Instant::now();
+        let blocked = recorder.begin(
+            "agent-1",
+            &InvocationContext::local_http(),
+            "media.workbench.candidate.promote",
+        );
+        let elapsed = started.elapsed();
+        assert!(blocked.is_err());
+        assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
+
+        drop(transaction);
+        let run = recorder
+            .begin(
+                "agent-1",
+                &InvocationContext::local_http(),
+                "media.workbench.candidate.promote",
+            )
+            .unwrap();
+        let completed = recorder
+            .complete(run, &serde_json::json!({"promoted": true}))
+            .unwrap();
+        assert_eq!(completed.status, LocalRunStatus::Succeeded);
     }
 
     #[test]

@@ -122,15 +122,19 @@ pub(crate) struct WorkflowLoadIssue {
 
 impl WorkflowStore {
     pub(crate) fn open_default() -> Result<Self, Box<dyn Error>> {
-        let agent_home = crate::store::paths::agent_home();
-        let store = Self {
-            root: agent_home.join("workflows"),
-            extension_state_root: agent_home.join("data"),
-        };
-        // 打开默认仓库时顺手收尾已经下线的工作流。退役只是清理，失败也没有
-        // 理由让整份已安装列表打不开，所以这里不把错误抛回调用方。
+        let store = Self::open_default_read_only()?;
+        // 普通打开工作流仓库时顺手收尾已下线的工作流；纯只读投影使用
+        // open_default_read_only，避免一次列表查询悄悄改写用户安装状态。
         store.retire_removed_workflows();
         Ok(store)
+    }
+
+    pub(crate) fn open_default_read_only() -> Result<Self, Box<dyn Error>> {
+        let agent_home = crate::store::paths::agent_home();
+        Ok(Self {
+            root: agent_home.join("workflows"),
+            extension_state_root: agent_home.join("data"),
+        })
     }
 
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {

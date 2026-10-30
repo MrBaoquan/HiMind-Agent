@@ -7170,6 +7170,86 @@ pub(crate) fn get_workflow_run(run_id: String) -> Result<serde_json::Value, Stri
     workflow_run_snapshot(&run_id).map_err(|error| error.to_string())
 }
 
+fn workflow_canvas_package_summary(
+    package: &crate::workflow::WorkflowPackage,
+    enabled: bool,
+    package_digest: &str,
+) -> serde_json::Value {
+    let steps = package
+        .steps
+        .iter()
+        .map(|step| {
+            json!({
+                "id": step.id,
+                "title": step.title,
+                "kind": step.kind,
+                "capability_id": step.capability_id,
+                "depends_on": step.depends_on,
+                "risk_level": step.risk_level,
+                "approval_required": step.approval_required,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "workflow_id": package.id,
+        "version": package.version,
+        "name": package.name,
+        "description": package.description,
+        "enabled": enabled,
+        "package_digest": package_digest,
+        "capabilities": package.capabilities,
+        "steps": steps,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn list_installed_workflow_packages(
+    window: WebviewWindow,
+) -> Result<serde_json::Value, String> {
+    const MEDIA_WORKBENCH_PLUGIN_ID: &str = "com.himind.media-workbench";
+    let label = window.label();
+    let is_media_workbench_view = crate::capability::plugin::scan_plugins()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .any(|plugin| {
+            plugin.id == MEDIA_WORKBENCH_PLUGIN_ID
+                && plugin.enabled
+                && plugin.views.iter().any(|view| {
+                    crate::app::ui::plugin_view_window_label(&plugin.id, &view.id) == label
+                })
+        });
+    if !is_media_workbench_view {
+        return Err("only the media workbench view can read installed workflow summaries".into());
+    }
+
+    let store = crate::workflow::WorkflowStore::open_default_read_only()
+        .map_err(|error| error.to_string())?;
+    let (installed, issues) = store
+        .list_with_issues()
+        .map_err(|error| error.to_string())?;
+    let items = installed
+        .iter()
+        .map(|item| {
+            workflow_canvas_package_summary(&item.package, item.enabled, &item.package_digest)
+        })
+        .collect::<Vec<_>>();
+    let issues = issues
+        .into_iter()
+        .map(|issue| {
+            json!({
+                "workflow_id": issue.package_id,
+                "version": issue.version,
+                "message": issue.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "source": "agent_workflow_store",
+        "items": items,
+        "issues": issues,
+    }))
+}
+
 #[tauri::command]
 pub(crate) fn verify_workflow_run(run_id: String) -> Result<serde_json::Value, String> {
     workflow_run_verification(&run_id).map_err(|error| error.to_string())
@@ -8111,8 +8191,45 @@ fn workflow_run_verification(
 mod tests {
     use super::{
         dedupe_workflow_catalog, present_builtin_ai_start_error, validate_credential_fields,
+        workflow_canvas_package_summary,
     };
     use crate::api::distribution::WorkflowCatalogItem;
+    use serde_json::json;
+
+    #[test]
+    fn workflow_canvas_projection_exposes_only_read_only_package_metadata() {
+        let package: crate::workflow::WorkflowPackage = serde_json::from_value(json!({
+            "schema_version": "workflow_package.v1",
+            "id": "com.himind.workflow.video-test",
+            "version": "1.2.3",
+            "name": "视频制作",
+            "description": "测试工作流",
+            "min_agent_version": "0.3.0",
+            "capabilities": ["media.workbench.creative.get", "media.workbench.render"],
+            "steps": [{
+                "id": "assemble",
+                "title": "合成成片",
+                "kind": "capability",
+                "capability_id": "media.workbench.render",
+                "execution_mode": "automatic",
+                "risk_level": "local_write",
+                "approval_required": true,
+                "depends_on": ["storyboard"]
+            }],
+            "ui": {"mode": "compact"}
+        }))
+        .expect("workflow package fixture should deserialize");
+
+        let summary = workflow_canvas_package_summary(&package, true, "sha256-test");
+        assert_eq!(summary["workflow_id"], "com.himind.workflow.video-test");
+        assert_eq!(summary["version"], "1.2.3");
+        assert_eq!(summary["enabled"], true);
+        assert_eq!(summary["package_digest"], "sha256-test");
+        assert_eq!(summary["capabilities"][1], "media.workbench.render");
+        assert_eq!(summary["steps"][0]["depends_on"][0], "storyboard");
+        assert!(summary["steps"][0].get("input").is_none());
+        assert!(summary["steps"][0].get("runtime").is_none());
+    }
 
     fn catalog_item(
         workflow_id: &str,

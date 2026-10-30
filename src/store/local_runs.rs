@@ -11,7 +11,9 @@ use crate::agent_core_contracts::{
 };
 
 pub(crate) const LOCAL_RUN_DB_FILE: &str = "local-runs.sqlite3";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const BEST_EFFORT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 // Schema creation is idempotent, but SQLite still takes a write lock for DDL
 // and migration inserts. Serialize initialization inside one Agent process so
 // concurrent readers/writers do not contend while opening the same ledger.
@@ -20,6 +22,8 @@ static SCHEMA_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[derive(Debug, Clone)]
 pub(crate) struct LocalRunLedger {
     path: PathBuf,
+    busy_timeout: Duration,
+    fail_fast_on_schema_lock: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,8 +66,26 @@ impl LocalRunLedger {
         Ok(Self::new(root.join(LOCAL_RUN_DB_FILE)))
     }
 
+    pub(crate) fn open_default_best_effort() -> Result<Self, Box<dyn Error>> {
+        let root = crate::store::paths::agent_home();
+        fs::create_dir_all(&root)?;
+        Ok(Self::new_best_effort(root.join(LOCAL_RUN_DB_FILE)))
+    }
+
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            busy_timeout: DEFAULT_BUSY_TIMEOUT,
+            fail_fast_on_schema_lock: false,
+        }
+    }
+
+    pub(crate) fn new_best_effort(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            busy_timeout: BEST_EFFORT_BUSY_TIMEOUT,
+            fail_fast_on_schema_lock: true,
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -146,7 +168,10 @@ impl LocalRunLedger {
         run.validate().map_err(std::io::Error::other)?;
         let payload = serde_json::to_string(run)?;
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        // save_run performs a read-before-write status check. Start it as an
+        // immediate transaction so concurrent cancellation and runner writes
+        // wait on busy_timeout instead of failing a deferred snapshot upgrade.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing: Option<(String, String)> = transaction
             .query_row(
@@ -602,7 +627,9 @@ impl LocalRunLedger {
         event.validate().map_err(std::io::Error::other)?;
         let payload = serde_json::to_string(event)?;
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        // append_event also reads run existence before inserting. Acquire the
+        // write lock up front for the same reason as save_run.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let run_exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM local_runs WHERE run_id = ?1)",
@@ -1107,7 +1134,7 @@ impl LocalRunLedger {
         let connection = Connection::open(&self.path)?;
         // Set the SQLite busy handler before schema initialization and before
         // any transaction can contend with a concurrent Agent thread.
-        connection.busy_timeout(Duration::from_secs(30))?;
+        connection.busy_timeout(self.busy_timeout)?;
         if !database_exists {
             // Two Agent threads can open a brand-new ledger at the same time.
             // The first connection wins the WAL transition; the loser must
@@ -1119,9 +1146,20 @@ impl LocalRunLedger {
                 }
             }
         }
-        let _schema_guard = SCHEMA_INIT_LOCK
-            .lock()
-            .map_err(|_| std::io::Error::other("local ledger schema lock is poisoned"))?;
+        let _schema_guard = if self.fail_fast_on_schema_lock {
+            SCHEMA_INIT_LOCK.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::Poisoned(_) => {
+                    std::io::Error::other("local ledger schema lock is poisoned")
+                }
+                std::sync::TryLockError::WouldBlock => {
+                    std::io::Error::other("local ledger schema initialization is busy")
+                }
+            })?
+        } else {
+            SCHEMA_INIT_LOCK
+                .lock()
+                .map_err(|_| std::io::Error::other("local ledger schema lock is poisoned"))?
+        };
         initialize_schema(&connection)?;
         Ok(connection)
     }
@@ -1181,10 +1219,6 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
             run_id TEXT PRIMARY KEY,
             next_sequence INTEGER NOT NULL
          );
-         INSERT OR IGNORE INTO runtime_sequence_allocations(run_id, next_sequence)
-            SELECT run_id, COALESCE(MAX(sequence), -1) + 1
-            FROM runtime_events
-            GROUP BY run_id;
          CREATE INDEX IF NOT EXISTS idx_runtime_events_run_sequence
             ON runtime_events(run_id, sequence);
          CREATE TABLE IF NOT EXISTS projection_outbox(
@@ -1203,11 +1237,32 @@ fn initialize_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
          CREATE INDEX IF NOT EXISTS idx_projection_outbox_status
             ON projection_outbox(status, next_attempt_at, id);",
     )?;
+
+    let migration_applied: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM local_schema_migrations WHERE version = ?1
+         )",
+        params![SCHEMA_VERSION],
+        |row| row.get(0),
+    )?;
+    if migration_applied {
+        return Ok(());
+    }
+
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT OR IGNORE INTO local_schema_migrations(version) VALUES (?1)",
         params![SCHEMA_VERSION],
     )?;
+    if inserted > 0 {
+        transaction.execute(
+            "INSERT OR IGNORE INTO runtime_sequence_allocations(run_id, next_sequence)
+             SELECT run_id, COALESCE(MAX(sequence), -1) + 1
+             FROM runtime_events
+             GROUP BY run_id",
+            [],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -1254,6 +1309,7 @@ mod tests {
         RUNTIME_EVENT_SCHEMA_VERSION,
     };
     use serde_json::json;
+    use std::time::Instant;
 
     fn ledger() -> LocalRunLedger {
         let root = std::env::temp_dir().join(format!(
@@ -1351,6 +1407,27 @@ mod tests {
         let interaction = interaction();
         assert!(ledger.record_interaction(&interaction).unwrap());
         assert!(!ledger.record_interaction(&interaction).unwrap());
+    }
+
+    #[test]
+    fn best_effort_ledger_fails_fast_when_schema_initialization_is_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-local-runs-schema-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ledger = LocalRunLedger::new_best_effort(root.join(LOCAL_RUN_DB_FILE));
+        let schema_guard = SCHEMA_INIT_LOCK.lock().unwrap();
+        let started = Instant::now();
+        let result = ledger.connection();
+        let elapsed = started.elapsed();
+        drop(schema_guard);
+
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(1), "waited {elapsed:?}");
     }
 
     #[test]
@@ -1725,5 +1802,92 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing table {table}");
         }
+    }
+
+    #[test]
+    fn schema_backfill_runs_once_and_normal_opens_do_not_need_a_write_lock() {
+        let ledger = ledger();
+        ledger.record_interaction(&interaction()).unwrap();
+        ledger.save_run(&run(LocalRunStatus::Running)).unwrap();
+        ledger.append_event(&event("event-1", 0)).unwrap();
+
+        let connection = ledger.connection().unwrap();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO local_schema_migrations(version) VALUES (1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM runtime_sequence_allocations WHERE run_id = 'run-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM local_schema_migrations WHERE version = ?1",
+                params![SCHEMA_VERSION],
+            )
+            .unwrap();
+        drop(connection);
+
+        let connection = ledger.connection().unwrap();
+        let next_sequence: i64 = connection
+            .query_row(
+                "SELECT next_sequence FROM runtime_sequence_allocations WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_sequence, 1);
+        let migration_versions: Vec<i64> = connection
+            .prepare("SELECT version FROM local_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(migration_versions, vec![1, SCHEMA_VERSION]);
+        drop(connection);
+
+        let connection = ledger.connection().unwrap();
+        connection
+            .execute(
+                "DELETE FROM runtime_sequence_allocations WHERE run_id = 'run-1'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut blocker = Connection::open(ledger.path()).unwrap();
+        blocker.busy_timeout(Duration::from_secs(1)).unwrap();
+        let transaction = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let best_effort = LocalRunLedger::new_best_effort(ledger.path().to_path_buf());
+        let started = Instant::now();
+        let reopened = best_effort.connection();
+        let elapsed = started.elapsed();
+
+        assert!(
+            reopened.is_ok(),
+            "schema initialization waited on a write lock: {reopened:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "waited {elapsed:?}");
+        let connection = reopened.unwrap();
+        let allocation_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_sequence_allocations WHERE run_id = 'run-1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !allocation_exists,
+            "schema v2 unexpectedly reran its backfill"
+        );
+        drop(connection);
+        drop(transaction);
     }
 }

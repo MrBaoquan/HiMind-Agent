@@ -459,6 +459,7 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::set_connector_secret_credential,
             super::commands::remove_connector_credential,
             super::commands::get_workflow_run,
+            super::commands::list_installed_workflow_packages,
             super::commands::verify_workflow_run,
             super::commands::reveal_workflow_artifact,
             super::commands::approve_workflow_step,
