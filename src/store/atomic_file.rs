@@ -85,14 +85,11 @@ fn temporary_path(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default();
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("state");
-    path.with_file_name(format!(
-        ".{file_name}.himind-tmp-{}-{nonce}",
-        std::process::id()
-    ))
+    // Keep the staging name independent of the destination name. Long semantic
+    // names (for example a 64-character SHA plus `.extension-lock.json`) can
+    // otherwise push the temporary path over Windows MAX_PATH only when the
+    // existing file also needs a `.bak` copy.
+    path.with_file_name(format!(".himind-tmp-{}-{nonce}", std::process::id()))
 }
 
 #[cfg(windows)]
@@ -161,7 +158,7 @@ fn fail_before_replace_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{atomic_write, backup_path, restore_backup, FAIL_BEFORE_REPLACE};
+    use super::{atomic_write, backup_path, restore_backup, temporary_path, FAIL_BEFORE_REPLACE};
     use std::fs;
 
     fn test_path(label: &str) -> std::path::PathBuf {
@@ -200,5 +197,21 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"stable");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(backup_path(&path));
+    }
+
+    #[test]
+    fn temporary_path_stays_short_for_long_destination_names() {
+        let destination = std::path::PathBuf::from(r"C:\very\long\agent\state")
+            .join(format!("{}.extension-lock.json", "a".repeat(64)));
+        let temporary = temporary_path(&destination);
+        assert_eq!(temporary.parent(), destination.parent());
+        let name = temporary
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        assert!(
+            name.len() <= 64,
+            "temporary file name should stay bounded: {name}"
+        );
     }
 }

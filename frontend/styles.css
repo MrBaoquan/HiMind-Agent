@@ -3206,12 +3206,16 @@ tr:last-child td { border-bottom: 0; }
 .development-flow > div.current { color: var(--primary); }
 .development-flow > div.current > span { border-color: #93c5fd; background: var(--primary-soft); font-weight: 700; }
 .development-empty-line { min-height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border-left: 3px solid var(--border-strong); background: var(--surface-muted); color: var(--text-muted); font-size: 11px; }
-.development-build-summary { min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid var(--border); border-left: 3px solid var(--success); border-radius: 5px; background: #f8fffb; }
+.development-build-summary { min-height: 54px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid var(--border); border-left: 3px solid var(--success); border-radius: 5px; background: #f8fffb; }
 .development-build-summary > div { min-width: 0; display: flex; align-items: center; gap: 9px; }
 .development-build-summary > div > span { width: 28px; height: 28px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 6px; color: var(--success); background: #ecfdf5; }
 .development-build-summary > div > div { min-width: 0; display: grid; gap: 2px; }
 .development-build-summary strong { font-size: 12px; }
 .development-build-summary small { color: var(--text-muted); font-size: 11px; }
+.development-build-summary > .development-activation-facts { order: 3; flex: 1 0 100%; min-width: 0; display: flex; flex-wrap: wrap; gap: 5px; }
+.development-build-summary > .development-activation-facts > span { width: auto; height: auto; min-width: 0; max-width: 100%; flex: 0 1 auto; display: inline-flex; align-items: center; padding: 3px 7px; overflow: hidden; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); background: var(--surface); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.development-build-summary > .development-activation-facts > span[data-state="ok"] { color: #047857; border-color: #a7f3d0; background: #ecfdf5; }
+.development-build-summary > .development-activation-facts > span[data-state="warn"] { color: #b45309; border-color: #fde68a; background: #fffbeb; }
 .development-build-progress { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 12px; border-bottom: 1px solid var(--primary-border); background: #f8fbff; }
 .development-build-progress-copy { min-width: 0; display: flex; align-items: center; gap: 9px; color: var(--primary); }
 .development-build-progress-copy > div { min-width: 0; display: grid; gap: 2px; }
@@ -3516,6 +3520,16 @@ tr:last-child td { border-bottom: 0; }
   /* 按钮按内容宽度排布：默认 1280 窗口下详情列有 505px，三个动作本来能同排；
      只有真正放不下时才自然换行，不再把主操作拉满整行。 */
   .development-detail-actions > .btn { flex: 0 0 auto; justify-content: center; }
+}
+
+/* At the minimum desktop size the compact header still has enough horizontal
+   room for title plus three 32px actions. Keep them on one row so the vertically
+   constrained detail body retains useful reading height; narrower panes still
+   use the stacked layout above. */
+@container detail-pane (min-width: 500px) and (max-width: 640px) {
+  .development-detail-header { min-height: 64px; flex-direction: row; flex-wrap: nowrap; align-items: center; gap: 10px; padding: 9px 16px; }
+  .development-detail-title { width: auto; flex: 1 1 150px; }
+  .development-detail-actions { width: auto; margin: 0 0 0 auto; flex-wrap: nowrap; justify-content: flex-end; }
 }
 
 @container agent-main (max-width: 520px) {
@@ -4179,6 +4193,28 @@ tr:last-child td { border-bottom: 0; }
   .development-page { height: auto; min-height: 0; overflow: visible; }
   .development-back { margin: 12px 12px 0; }
   .development-toolbar { align-items: stretch; flex-direction: column; }
+}
+
+/* At the desktop minimum width the three development columns become too
+   narrow for project status and build facts. Lift the workspace rail above the
+   list/detail pair while keeping both working panes side by side. */
+@container agent-main (max-width: 880px) {
+  .development-body.has-rail { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .development-rail { flex: 0 0 auto; max-height: 60px; }
+  .development-rail-head { display: none; }
+  .development-rail-body { grid-auto-flow: column; grid-auto-columns: minmax(180px, 1fr); padding: 4px; overflow-x: auto; overflow-y: hidden; }
+  .development-rail-item { min-height: 48px; }
+  .development-rail-select { padding: 4px 8px; }
+  .development-rail-copy { display: flex; align-items: baseline; gap: 6px; }
+  .development-rail-copy small { font-size: 10px; }
+  .development-rail-actions { opacity: 1; }
+  .development-workspace-head { margin-bottom: 8px; padding-bottom: 7px; }
+  .instruction-panel { margin-bottom: 6px; }
+  .instruction-panel-head { min-height: 36px; }
+  .instruction-panel-title small { display: none; }
+  .development-workspace { grid-template-columns: minmax(210px, 240px) minmax(0, 1fr); }
+  .development-project-list { max-height: none; border-right: 1px solid var(--border); border-bottom: 0; }
+  .development-list-body { max-height: none; }
 }
 
 /* Content-container responsive refinements. These breakpoints follow the

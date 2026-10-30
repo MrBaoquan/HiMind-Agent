@@ -289,6 +289,82 @@ pub(crate) fn install_development_archive(
     install_development_archive_into(&store, archive_path, source_root, extension_lock)
 }
 
+fn workflow_development_artifact_root(package_id: &str) -> PathBuf {
+    crate::store::paths::agent_home()
+        .join("workflow-development-artifacts")
+        .join(package_id)
+}
+
+pub(crate) fn archive_development_candidate(
+    archive_path: &Path,
+    package_id: &str,
+    candidate_sha256: &str,
+    extension_lock: Option<&ExtensionLock>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let sha = candidate_sha256
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(candidate_sha256.trim());
+    if sha.is_empty() || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Workflow 开发候选缺少有效 SHA-256".into());
+    }
+    let root = workflow_development_artifact_root(package_id);
+    fs::create_dir_all(&root)?;
+    let _lock = crate::store::atomic_file::lock(&root.join(".archive.lock"))?;
+    let target = root.join(format!("{sha}.hmwf"));
+    if target.is_file() {
+        if !sha256_file(&target)?.eq_ignore_ascii_case(sha) {
+            return Err("Workflow 开发版历史制品摘要不匹配".into());
+        }
+    } else {
+        let staging = root.join(format!(".{sha}.staging-{}", unique_suffix()));
+        fs::copy(archive_path, &staging)?;
+        if !sha256_file(&staging)?.eq_ignore_ascii_case(sha) {
+            let _ = fs::remove_file(&staging);
+            return Err("Workflow 开发候选复制后 SHA-256 不匹配".into());
+        }
+        fs::rename(&staging, &target)?;
+    }
+    if let Some(extension_lock) = extension_lock {
+        crate::store::atomic_file::atomic_write(
+            &root.join(format!("{sha}.extension-lock.json")),
+            &serde_json::to_vec_pretty(extension_lock)?,
+        )?;
+    }
+    Ok(target)
+}
+
+pub(crate) fn development_candidate_archive(
+    package_id: &str,
+    candidate_sha256: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let sha = candidate_sha256
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(candidate_sha256.trim());
+    let path = workflow_development_artifact_root(package_id).join(format!("{sha}.hmwf"));
+    if !path.is_file() {
+        return Err(format!("Workflow 开发版制品不可用，无法恢复版本 {candidate_sha256}").into());
+    }
+    Ok(path)
+}
+
+pub(crate) fn development_candidate_lock(
+    package_id: &str,
+    candidate_sha256: &str,
+) -> Result<Option<ExtensionLock>, Box<dyn Error>> {
+    let sha = candidate_sha256
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(candidate_sha256.trim());
+    let path =
+        workflow_development_artifact_root(package_id).join(format!("{sha}.extension-lock.json"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
 fn install_development_archive_into(
     store: &crate::workflow::WorkflowStore,
     archive_path: &Path,
@@ -788,6 +864,41 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.list().unwrap().is_empty());
+        let _ = fs::remove_dir_all(staging);
+    }
+
+    #[test]
+    fn development_candidates_are_preserved_by_sha_for_rollback() {
+        let _guard = crate::store::paths::test_env_lock();
+        let staging =
+            std::env::temp_dir().join(format!("himind-workflow-artifact-test-{}", unique_suffix()));
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", staging.join("home"));
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/wechat-experience-upload");
+        let package_root = staging.join("package");
+        copy_dir(&fixture, &package_root);
+        write_checksums(&package_root);
+        let archive_path = staging.join("candidate.hmwf");
+        crate::app::local_package::archive_directory(&package_root, &archive_path).unwrap();
+        let package = crate::workflow::load_from_directory(&package_root).unwrap();
+        let sha = sha256_file(&archive_path).unwrap();
+
+        let preserved =
+            archive_development_candidate(&archive_path, &package.id, &sha, None).unwrap();
+        assert!(preserved.is_file());
+        assert_eq!(
+            development_candidate_archive(&package.id, &sha).unwrap(),
+            preserved
+        );
+        assert!(development_candidate_lock(&package.id, &sha)
+            .unwrap()
+            .is_none());
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         let _ = fs::remove_dir_all(staging);
     }
 

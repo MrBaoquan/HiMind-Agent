@@ -13,7 +13,7 @@ import { extensionKindLabels, extensionKindOrder } from '../data/extensionKinds'
 import { agentApi } from '../services/agentApi';
 import { compareVersions } from './marketCatalog';
 import { formatCompactStamp, formatStamp } from '../timeFormat';
-import type { AuthoringPluginDraft, AuthoringSkillDraft, AuthoringWorkflowDraft, CreateExtensionProjectInput, DistributionPreview, DistributionStateEntry, DistributionTarget, ExpertAuthoringDraft, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionDevelopmentReadiness, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, ExtensionSourceConfig, ExtensionWorkspaceEntry, ExtensionWorkspaceSettings, InstructionPackDraft, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
+import type { AuthoringPluginDraft, AuthoringSkillDraft, AuthoringWorkflowDraft, CreateExtensionProjectInput, DistributionPreview, DistributionStateEntry, DistributionTarget, ExpertAuthoringDraft, ExtensionActivationReceipt, ExtensionCollaboration, ExtensionCollaborationInvitation, ExtensionCollaboratorOption, ExtensionDevelopmentReadiness, ExtensionProject, ExtensionProjectKind, ExtensionProjectSourceInput, ExtensionRemoteProject, ExtensionSourceConfig, ExtensionWorkspaceEntry, ExtensionWorkspaceSettings, InstructionPackDraft, PluginCatalogItem, PluginSubmissionStatus, SkillSubmissionStatus } from '../services/agentApi';
 
 type DraftRef =
   | { kind: 'plugin'; value: AuthoringPluginDraft }
@@ -71,8 +71,6 @@ type WorkspaceBuildOutcome = {
 /// 交给父层执行的构建项：依赖声明随行带上，执行侧才能判断先后与跳过。
 type WorkspaceBuildItem = { id: string; name: string; extensionId: string; dependencies: string[] };
 
-/// 「工作台项目」不是目录工作区，但需要一个固定键才能和左栏选中状态共用一套逻辑。
-const UNMANAGED_KEY = '__unmanaged__';
 const WORKSPACE_MEMORY_KEY = 'himind.development.workspace';
 
 function readPreferredWorkspace() {
@@ -103,6 +101,7 @@ type DevelopmentPageProps = {
   workflowDrafts: AuthoringWorkflowDraft[];
   expertDrafts: ExpertAuthoringDraft[];
   instructionDrafts: InstructionPackDraft[];
+  extensionActivations: ExtensionActivationReceipt[];
   pluginSubmissions: PluginSubmissionStatus[];
   skillSubmissions: SkillSubmissionStatus[];
   workflowSubmissions: AuthoringWorkflowDraft[];
@@ -219,28 +218,22 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     return list.sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'));
   }, [models, props.sources, props.workspace.error, props.workspace.extension_count, props.workspace.root, props.workspace.valid, props.workspaces, runningSessions]);
   const busy = Boolean(props.busyAction) || props.loading;
-  // 还没有本地目录的远端项目（作者在工作台上参与过的扩展）单独成一项：
-  // 它们的下一步是「关联本地目录」，塞进任何一个已存在的工作区都不对。
-  const unassigned = useMemo(() => models.filter(project => !workspaceKeyFor(project, workspaceItems)), [models, workspaceItems]);
   // 没有手动选过时：优先有扩展的那个工作区，其次看后端当前绑定的目录
   // （「添加工作区」和「在扩展开发中打开」都会更新绑定，于是刚加完就落在它上面）。
   const boundKey = workspaceItems.find(item => item.key === normalizeFsPath(props.workspace.root))?.key || '';
-  // 「工作台项目」不是目录工作区，不在 workspaceItems 里，所以它必须单独放行，
-  // 否则选中它会被下面的兜底逻辑当成「没选过」而改回某个真实目录，点了没反应。
-  const activeKey = selectedWorkspace === UNMANAGED_KEY || workspaceItems.some(item => item.key === selectedWorkspace)
+  const activeKey = workspaceItems.some(item => item.key === selectedWorkspace)
     ? selectedWorkspace
     : (workspaceItems.find(item => item.extensionCount > 0)?.key || boundKey || workspaceItems[0]?.key || '');
   const activeItem = workspaceItems.find(item => item.key === activeKey) || null;
-  const showingUnmanaged = activeKey === UNMANAGED_KEY;
   const workspaceProjects = useMemo(
-    () => (showingUnmanaged ? unassigned : models.filter(project => workspaceKeyFor(project, workspaceItems) === activeKey)),
-    [activeKey, models, showingUnmanaged, unassigned, workspaceItems],
+    () => models.filter(project => workspaceKeyFor(project, workspaceItems) === activeKey),
+    [activeKey, models, workspaceItems],
   );
-  // 「一键构建」只覆盖源码目录还在的扩展：远端协作项目、目录已被移走的项目没有
-  // 可构建的源码，混进来只会把一次点击变成一串失败。规则库项目也走这条流水线。
+  // 「一键构建」只覆盖源码目录还在的扩展：目录已被移走的项目没有可构建源码，
+  // 混进来只会把一次点击变成一串失败。规则库项目也走这条流水线。
   const buildableProjects = useMemo(
-    () => (showingUnmanaged ? [] : workspaceProjects.filter(project => project.local?.workspace_available)),
-    [showingUnmanaged, workspaceProjects],
+    () => workspaceProjects.filter(project => project.local?.workspace_available),
+    [workspaceProjects],
   );
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -250,7 +243,7 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     });
   }, [kindFilter, query, workspaceProjects]);
   const selected = visible.find(project => project.key === selectedKey) || visible[0] || null;
-  const hasRail = workspaceItems.length > 1 || unassigned.length > 0;
+  const hasRail = workspaceItems.length > 1;
   // 新建扩展默认落在上次选过的目录：连着建几个扩展时不必每次重挑。
   const createRoot = workspaceItems.some(item => item.key === preferredWorkspace) ? preferredWorkspace : activeKey;
   const workspaceChoices = useMemo(() => {
@@ -259,15 +252,13 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
     if (index > 0) list.unshift(list.splice(index, 1)[0]);
     return list;
   }, [createRoot, workspaceItems]);
-  const headPath = showingUnmanaged ? '' : activeItem?.root || '';
-  const headProblem = showingUnmanaged ? '' : activeItem?.problem || '';
-  const headMeta = showingUnmanaged
-    ? `${unassigned.length} 个扩展 · 未关联本地目录`
-    : activeItem
-      ? `${headProblem ? `${headProblem} · ` : ''}${activeItem.root} · ${activeItem.extensionCount} 个扩展`
-      : props.loading
-        ? '正在读取工作区和扩展'
-        : '添加本机目录后开始开发';
+  const headPath = activeItem?.root || '';
+  const headProblem = activeItem?.problem || '';
+  const headMeta = activeItem
+    ? `${headProblem ? `${headProblem} · ` : ''}${activeItem.root} · ${activeItem.extensionCount} 个扩展`
+    : props.loading
+      ? '正在读取工作区和扩展'
+      : '添加本机目录后开始开发';
 
   // 「有没有 AI 会话在这个目录里跑」是工作区行最值得显示的状态，进入页面时取一次即可：
   // 会话的实时状态在 AI 会话页里已经是常驻信息，这里不重复轮询。
@@ -398,29 +389,23 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           {workspaceItems.map(item => <WorkspaceRow
             key={item.key}
             item={item}
-            active={!showingUnmanaged && item.key === activeKey}
+            active={item.key === activeKey}
             busy={busy}
             onSelect={() => { setSelectedWorkspace(item.key); setDetailOpen(false); }}
             onOpenFolder={() => props.onOpenFolder(item.root)}
             onCopyPath={() => void copyPath(item.root)}
             onRemove={() => void removeWorkspace(item.root, item.label)}
           />)}
-          {/* 未关联本地目录的远端项目不是工作区，但需要同一个入口才能被看见和关联。 */}
-          {unassigned.length ? <div className={`development-rail-item ${showingUnmanaged ? 'active' : ''}`}>
-            <button type="button" className="development-rail-select" aria-current={showingUnmanaged} onClick={() => { setSelectedWorkspace(UNMANAGED_KEY); setDetailOpen(false); }}>
-              <span className="development-rail-copy"><strong><span>工作台项目</span></strong><small>{unassigned.length} 个扩展</small></span>
-            </button>
-          </div> : null}
         </div>
       </aside> : null}
       <div className="development-main">
         <header className="development-workspace-head">
           <div className="development-workspace-copy">
-            <strong>{props.loading ? '正在读取…' : showingUnmanaged ? '工作台项目' : activeItem?.label || '还没有工作区'}</strong>
+            <strong>{props.loading ? '正在读取…' : activeItem?.label || '还没有工作区'}</strong>
             <small className={headProblem ? 'is-problem' : undefined} title={headPath || undefined}>{headMeta}</small>
             {workspaceBuild ? <small role="status" title={workspaceBuild.name}>{`正在一键构建 ${workspaceBuild.done}/${workspaceBuild.total}${workspaceBuild.name ? ` · ${workspaceBuild.name}` : ''}`}</small> : null}
           </div>
-          {!showingUnmanaged && activeItem ? <div className="development-workspace-actions">
+          {activeItem ? <div className="development-workspace-actions">
             {/* 这一层是「整个仓库」，下面详情里是「单个扩展」。两个都叫「用 AI 开发」时
                 会话落在哪个目录看不出区别，所以这里写清范围，并按次级动作处理。 */}
             <button className="btn development-workspace-develop" title={activeItem.available ? `在 ${activeItem.root} 里开一条 AI 会话` : '目录当前不可用，先在文件资源管理器里恢复它'} disabled={busy || !activeItem.available} onClick={() => props.onDevelopWorkspaceWithAi(activeItem.root)}><MessageCircle size={15} />在工作区开发</button>
@@ -437,8 +422,8 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           </div> : null}
         </header>
         {/* 规则库是工作区级的：预检、确认、发布和落地都作用在本机规则库，不绑某个扩展项目。 */}
-        {activeItem && !showingUnmanaged ? <InstructionProjectionPanel workspaceRoot={activeItem.root} onMaterializeToWorkspace={(draft) => materializeInstruction(activeItem.root, draft)} /> : null}
-        {activeItem && !showingUnmanaged ? <div className="development-toolbar">
+        {activeItem ? <InstructionProjectionPanel workspaceRoot={activeItem.root} onMaterializeToWorkspace={(draft) => materializeInstruction(activeItem.root, draft)} /> : null}
+        {activeItem ? <div className="development-toolbar">
           <div className="plugin-tabs" role="tablist" aria-label="扩展类型">
             <button className={kindFilter === 'all' ? 'active' : ''} onClick={() => setKindFilter('all')}>全部 <span>{workspaceProjects.length}</span></button>
             {/* 类型页签和市场、我的能力用同一套图标，同一类东西在哪儿都长一个样。 */}
@@ -449,25 +434,25 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
           </div>
           <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索扩展" /></label>
         </div> : null}
-        {!activeItem && !showingUnmanaged ? <div className="development-workspace-empty">
+        {!activeItem ? <div className="development-workspace-empty">
           <EmptyState icon={FolderPlus} title="还没有开发工作区" text="用页头的「添加工作区」挑一个本机目录，就能在里面开发扩展。" />
         </div> : !workspaceProjects.length ? <div className="development-workspace-empty">
-          <EmptyState icon={Blocks} title={showingUnmanaged ? '没有未关联的扩展' : '这个工作区还没有扩展'} text={showingUnmanaged ? '工作台上还没有「未关联本地目录」的扩展。' : '新建一个扩展，或者让 AI 直接在这个目录里开始开发。'} />
-          {showingUnmanaged || !activeItem ? null : <div className="development-workspace-empty-actions">
+          <EmptyState icon={Blocks} title="这个工作区还没有扩展" text="新建一个扩展，或者让 AI 直接在这个目录里开始开发。" />
+          <div className="development-workspace-empty-actions">
             <button className="btn" disabled={busy} onClick={() => setCreateOpen(true)}><Plus size={15} />新建扩展</button>
             <button className="btn" disabled={busy} onClick={() => props.onDevelopWorkspaceWithAi(activeItem.root)}><MessageCircle size={15} />在工作区开发</button>
-          </div>}
+          </div>
         </div> : <section className={`development-workspace compact-master-detail ${detailOpen ? 'detail-open' : ''}`}>
           <aside className="development-project-list">
             <div className="development-list-heading"><strong>扩展</strong><span>{visible.length}</span></div>
             <div className="development-list-body">
-              {visible.map(project => <ProjectListItem key={project.key} project={project} dashboardEnabled={props.dashboardEnabled} busyAction={props.busyAction} selected={project.key === selected?.key} onSelect={key => { setSelectedKey(key); setDetailOpen(true); }} />)}
+             {visible.map(project => <ProjectListItem key={project.key} project={project} activation={activationForProject(project, props.extensionActivations)} dashboardEnabled={props.dashboardEnabled} busyAction={props.busyAction} selected={project.key === selected?.key} onSelect={key => { setSelectedKey(key); setDetailOpen(true); }} />)}
               {!visible.length ? <EmptyState icon={Blocks} title="没有匹配的扩展" text="换个关键词或类型再试。" /> : null}
             </div>
           </aside>
           <main className="development-project-detail">
             <button className="workspace-back development-back" onClick={() => setDetailOpen(false)}><ArrowLeft size={15} />返回扩展列表</button>
-            {selected ? <ProjectDetail key={selected.key} project={selected} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={props.onSubmit} onPublishInstruction={props.onPublishInstruction} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onSetDistributionTargets={props.onSetDistributionTargets} onPublishDistribution={props.onPublishDistribution} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个扩展" text={props.dashboardEnabled ? '查看本地项目、构建和发布进度。' : '查看本地项目、构建和版本。'} />}
+            {selected ? <ProjectDetail key={selected.key} project={selected} activation={activationForProject(selected, props.extensionActivations)} dashboardEnabled={props.dashboardEnabled} accountAuthorized={props.accountAuthorized} availablePlugins={props.availablePlugins} busyAction={props.busyAction} onOpenProject={props.onOpenProject} onAssociateProject={props.onAssociateProject} onBuild={props.onBuild} onDevelopWithAi={props.onDevelopWithAi} onSubmit={props.onSubmit} onPublishInstruction={props.onPublishInstruction} onOpenFolder={props.onOpenFolder} onRequestRemove={setRemoveProject} onUpdateSource={props.onUpdateSource} onSetDistributionTargets={props.onSetDistributionTargets} onPublishDistribution={props.onPublishDistribution} onLoadCollaboration={props.onLoadCollaboration} onSearchCollaborators={props.onSearchCollaborators} onInviteCollaborator={props.onInviteCollaborator} onRemoveCollaborator={props.onRemoveCollaborator} /> : <EmptyState icon={Hammer} title="选择一个扩展" text={props.dashboardEnabled ? '查看本地项目、构建和发布进度。' : '查看本地项目、构建和版本。'} />}
           </main>
         </section>}
       </div>
@@ -524,22 +509,23 @@ function InvitationInbox({ invitations, busyAction, onRespond }: { invitations: 
   </section>;
 }
 
-function ProjectListItem({ project, dashboardEnabled, busyAction, selected, onSelect }: { project: ProjectModel; dashboardEnabled: boolean; busyAction: string | null; selected: boolean; onSelect: (key: string) => void }) {
+function ProjectListItem({ project, activation, dashboardEnabled, busyAction, selected, onSelect }: { project: ProjectModel; activation?: ExtensionActivationReceipt; dashboardEnabled: boolean; busyAction: string | null; selected: boolean; onSelect: (key: string) => void }) {
   const draft = currentDraft(project);
   const active = activeSubmission(project);
-  const state = projectState(project, dashboardEnabled, draft, active);
+  const state = projectState(project, dashboardEnabled, draft, active, activation);
   const building = Boolean(project.local && busyAction === `build:${project.local.id}`);
   // 已构建是开发页的默认健康态；列表只为构建中、未构建和发布例外保留状态位。
   const showState = building || state.label !== '已构建';
-  return <button className={`development-project-item ${selected ? 'selected' : ''}`} onClick={() => onSelect(project.key)}>
+  return <button className={`development-project-item ${selected ? 'selected' : ''}`} title={`${project.name} · ${listMeta(project)}`} onClick={() => onSelect(project.key)}>
     <ExtensionIcon kind={project.kind} name={project.name} icon={project.local?.icon} size={40} label={extensionKindLabels[project.kind]} />
     <span className="development-project-copy"><strong>{project.name}</strong><small title={`${extensionKindLabels[project.kind]} · ${projectSourceLabel(project)}${project.local ? ` · v${project.local.version}` : ''}`}>{listMeta(project)}</small></span>
     {showState ? <span className={`skill-state-label ${building ? 'warn' : state.tone}`}>{building ? '构建中' : state.label}</span> : null}
   </button>;
 }
 
-function ProjectDetail({ project, dashboardEnabled, accountAuthorized, availablePlugins, busyAction, onOpenProject, onAssociateProject, onBuild, onDevelopWithAi, onSubmit, onPublishInstruction, onOpenFolder, onRequestRemove, onUpdateSource, onSetDistributionTargets, onPublishDistribution, onLoadCollaboration, onSearchCollaborators, onInviteCollaborator, onRemoveCollaborator }: {
+function ProjectDetail({ project, activation, dashboardEnabled, accountAuthorized, availablePlugins, busyAction, onOpenProject, onAssociateProject, onBuild, onDevelopWithAi, onSubmit, onPublishInstruction, onOpenFolder, onRequestRemove, onUpdateSource, onSetDistributionTargets, onPublishDistribution, onLoadCollaboration, onSearchCollaborators, onInviteCollaborator, onRemoveCollaborator }: {
   project: ProjectModel;
+  activation?: ExtensionActivationReceipt;
   dashboardEnabled: boolean;
   accountAuthorized: boolean;
   availablePlugins: PluginCatalogItem[];
@@ -594,7 +580,7 @@ function ProjectDetail({ project, dashboardEnabled, accountAuthorized, available
         {project.description || draft ? <section className="development-section"><h4>项目说明</h4><p>{project.description || (draft ? draftDescription(draft) : '')}</p></section> : null}
         {/* 源码目录拿不到时，本机残留的构建记录与当前代码已经对不上，展示它只会
             让人以为这个项目还有一份可用的测试制品；等内容源恢复后再显示。 */}
-        {project.local?.workspace_available ? <section className="development-section"><h4>最近构建</h4>{draft ? <BuildSummary project={project} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} onPublishInstruction={onPublishInstruction} /> : <div className="development-empty-line"><span>尚未构建</span></div>}</section> : null}
+        {project.local?.workspace_available ? <section className="development-section"><h4>最近构建</h4>{draft ? <BuildSummary project={project} activation={activation} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} onPublishInstruction={onPublishInstruction} /> : <div className="development-empty-line"><span>尚未构建</span></div>}</section> : null}
         <section className="development-section"><h4>依赖</h4>{dependencies.length ? <div className="development-dependency-list">{dependencies.map(item => <div key={item.id}><strong>{item.name}</strong><small>{item.required ? '必需' : '可选'}{item.version ? ` · ${item.version}` : ''}</small></div>)}</div> : <p className="muted">无依赖</p>}</section>
       </> : null}
       {tab === 'release' ? <ReleasePanel project={project} dashboardEnabled={dashboardEnabled} draft={draft} active={active} busy={busy} onSubmit={onSubmit} onPublish={onPublishDistribution} /> : null}
@@ -695,22 +681,44 @@ function collaborationErrorMessage(reason: unknown) {
   return message || '暂时无法读取协作者，请稍后重试。';
 }
 
-function BuildSummary({ project, dashboardEnabled, draft, active, busy, onSubmit, onPublishInstruction }: { project: ProjectModel; dashboardEnabled: boolean; draft: DraftRef; active?: SubmissionRef; busy: boolean; onSubmit: DevelopmentPageProps['onSubmit']; onPublishInstruction: DevelopmentPageProps['onPublishInstruction'] }) {
+function BuildSummary({ project, activation, dashboardEnabled, draft, active, busy, onSubmit, onPublishInstruction }: { project: ProjectModel; activation?: ExtensionActivationReceipt; dashboardEnabled: boolean; draft: DraftRef; active?: SubmissionRef; busy: boolean; onSubmit: DevelopmentPageProps['onSubmit']; onPublishInstruction: DevelopmentPageProps['onPublishInstruction'] }) {
   const id = project.extensionId;
   const version = draftVersion(draft);
-  // 项目规则不进工作台审核：构建即生成并确认候选，收敛动作是发布到本机规则库。
+  const developmentActive = Boolean(activation && activationMatchesDraft(activation, draft));
+  const confirmed = Boolean((draft.value as { confirmed_at?: string | null }).confirmed_at);
+  const developmentLabel = developmentActive
+    ? activation?.status === 'partial' ? '开发版已激活 · 部分目标待验证' : '开发版已激活'
+    : '候选已确认 · 开发版未激活';
   if (draft.kind === 'instruction') {
     const published = Boolean(draft.value.published_at);
-    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '已发布到本机规则库' : draft.value.confirmed_at ? '规则制品 · 待发布' : '规则制品已生成'} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div>{published ? <small>可在「AI 对话 → 项目规则」里选择并同步到客户端。</small> : <button className="btn btn-primary" disabled={busy} onClick={() => void onPublishInstruction(id, version)}><Send size={15} />发布到规则库</button>}</div>;
+    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '已发布到本机规则库' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} active={developmentActive} activation={activation} published={published} />{published ? <small>可在「AI 对话 → 项目规则」里选择并同步到客户端。</small> : <button className="btn btn-primary" disabled={busy} onClick={() => void onPublishInstruction(id, version)}><Send size={15} />发布到规则库</button>}</div>;
   }
   if (!dashboardEnabled) {
-    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{draft.value.tested_at ? '测试制品 · 已启用' : '测试制品已生成'} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><small>{draft.value.tested_at ? '当前制品只在本机生效，可以继续调试或通过来源、安装包分发。' : '测试制品已生成，可以继续测试。'}</small></div>;
+    return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} active={developmentActive} activation={activation} /><small>{developmentActive ? `作用范围：${activation?.target.profile || '--'} · ${activation?.target.scope === 'workspace' ? '当前工作区' : activation?.target.deployment_id || '已有安装目标'}` : '候选已生成，但未找到与当前候选 SHA 匹配的本机开发激活记录。'}</small></div>;
   }
   const published = active?.value.version === version && active.value.release_status === 'published';
   const submitted = buildMatchesSubmission(draft, active) || (project.kind === 'workflow' && Boolean(draft.value.submitted_at));
   const canSubmit = projectCanSubmit(project);
   const sourceReady = projectSourceReady(project);
-  return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '组织发布版' : submitted ? '工作台审核中' : '测试制品 · 待提交'} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div>{published ? <small>该制品已发布并可供安装，请更新版本号后继续开发。</small> : submitted ? <Pill kind="warn">已提交，等待审核</Pill> : canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, id, version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : <small>{project.kind === 'workflow' ? (draft.kind === 'workflow' && draft.value.lock ? '测试制品已通过检查，等待提交审核' : '工作流还未完成检查') : sourceReady ? '当前账号不能提交审核' : '未能读取代码版本，请确认项目位于 Git 仓库中'}</small>}</div>;
+  return <div className="development-build-summary"><div><span><CheckCircle2 size={16} /></span><div><strong>{published ? '组织发布版' : submitted ? '工作台审核中' : developmentLabel} · v{version}</strong><small>{formatStamp(draft.value.updated_at)} · SHA {shortSha(draft.value.candidate_sha256)}</small></div></div><ActivationFactStrip confirmed={confirmed} active={developmentActive} activation={activation} published={published} submitted={submitted} />{published ? <small>该制品已发布并可供安装，请更新版本号后继续开发。</small> : submitted ? <Pill kind="warn">已提交，等待审核</Pill> : canSubmit && sourceReady ? <button className="btn btn-primary" disabled={busy} onClick={() => void onSubmit(project.kind, id, version)}><Send size={15} />{active ? '更新提交' : '提交审核'}</button> : <small>{project.kind === 'workflow' ? (draft.kind === 'workflow' && draft.value.lock ? '开发版已激活；需要发布时可提交审核' : '工作流还未完成检查') : sourceReady ? '当前账号不能提交审核' : '未能读取代码版本，请确认项目位于 Git 仓库中'}</small>}</div>;
+}
+
+function ActivationFactStrip({ confirmed, active, activation, published = false, submitted = false }: { confirmed: boolean; active: boolean; activation?: ExtensionActivationReceipt; published?: boolean; submitted?: boolean }) {
+  const visibleSurfaces = (activation?.surfaces || [])
+    .filter(surface => surface.state === 'visible')
+    .map(surface => surface.id === 'mcp' ? 'MCP' : surface.id.startsWith('client:') ? surface.id.slice(7) : '')
+    .filter(Boolean);
+  const hasMcp = visibleSurfaces.includes('MCP');
+  const clients = visibleSurfaces.filter(surface => surface !== 'MCP');
+  const visibility = [hasMcp ? 'MCP' : '', clients.length ? `${clients.length} 个客户端` : ''].filter(Boolean).join(' · ');
+  const visibilityTitle = [hasMcp ? 'MCP' : '', ...clients].filter(Boolean).join('、');
+  const release = published ? '已发布' : submitted ? '审核中' : '未发布';
+  return <div className="development-activation-facts" aria-label="扩展状态事实">
+    <span data-state={confirmed ? 'ok' : 'waiting'}>候选：{confirmed ? '已确认' : '未确认'}</span>
+    <span data-state={active ? 'ok' : 'waiting'}>运行时：{active ? '已激活' : '未激活'}</span>
+    <span title={visibilityTitle || undefined} data-state={visibility ? 'ok' : activation?.status === 'partial' ? 'warn' : 'waiting'}>可见性：{visibility || (activation?.status === 'partial' ? '部分失败' : '未验证')}</span>
+    <span data-state={published ? 'ok' : submitted ? 'warn' : 'neutral'}>发布：{release}</span>
+  </div>;
 }
 
 function ReleasePanel({ project, dashboardEnabled, draft, active, busy, onSubmit, onPublish }: { project: ProjectModel; dashboardEnabled: boolean; draft?: DraftRef; active?: SubmissionRef; busy: boolean; onSubmit: DevelopmentPageProps['onSubmit']; onPublish: DevelopmentPageProps['onPublishDistribution'] }) {
@@ -942,11 +950,10 @@ function buildProjectModels(props: Pick<DevelopmentPageProps, 'projects' | 'remo
     project.drafts.sort((left, right) => compareVersions(draftVersion(right), draftVersion(left)) || right.value.updated_at.localeCompare(left.value.updated_at));
     project.submissions.sort((left, right) => right.value.updated_at.localeCompare(left.value.updated_at));
   }
-  // 只剩草稿或提交记录的项目，说明本机（或工作台）已经没有这个扩展：要么被改名，
-  // 要么退出了扩展源清单。它们既没有源码也没有可发布对象，列出来只会变成一串
-  // 「未关联」幽灵条目，因此不进入项目列表。
+  // 开发工作区只承载本机有源码目录的项目。远端 Workbench 项目只用于给匹配上的
+  // 本地项目补充协作/审核信息，不能单独生成项目或虚拟工作区。
   return [...map.values()]
-    .filter(project => Boolean(project.local || project.remote))
+    .filter(project => Boolean(project.local))
     .sort((left, right) => projectUpdatedAt(right).localeCompare(projectUpdatedAt(left)) || left.name.localeCompare(right.name, 'zh-CN'));
 }
 
@@ -985,7 +992,7 @@ function projectSourceReady(project: ProjectModel) {
 }
 function projectUpdatedAt(project: ProjectModel) { const values = [project.local?.updated_at || '', project.remote?.updated_at || '', ...project.drafts.map(item => item.value.updated_at), ...project.submissions.map(item => item.value.updated_at)].sort(); return values[values.length - 1] || ''; }
 
-function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: DraftRef, submission?: SubmissionRef): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
+function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: DraftRef, submission?: SubmissionRef, activation?: ExtensionActivationReceipt): { label: string; tone: 'success' | 'warn' | 'danger' | 'neutral' } {
   if (!project.local) return { label: '未关联', tone: 'warn' };
   if (!project.local.workspace_available) return { label: '目录不可用', tone: 'danger' };
   // 有本机目录但当前版本还没构建过：说「开发中」等于什么都没说，
@@ -993,9 +1000,10 @@ function projectState(project: ProjectModel, dashboardEnabled: boolean, draft?: 
   if (!draft || draftVersion(draft) !== project.local.version) return { label: '未构建', tone: 'neutral' };
   // 候选与本机启用是两件事：确认那一步没过时要说清，否则用户以为本地已经能用。
   if (!dashboardEnabled) {
-    return draftIsActivated(draft)
-      ? { label: '已构建', tone: 'success' }
-      : { label: '已构建·未启用', tone: 'warn' };
+    if (!activation || !activationMatchesDraft(activation, draft)) return { label: '已构建·未激活', tone: 'warn' };
+    return activation.status === 'partial'
+      ? { label: '部分激活', tone: 'warn' }
+      : { label: '开发版已激活', tone: 'success' };
   }
   if (draft) {
     const currentRelease = project.submissions.find(item => item.value.version === draftVersion(draft) && item.value.release_status === 'published');
@@ -1055,11 +1063,19 @@ function retryableFailure(message: string): boolean {
   return /(dial tcp|connection attempt failed|timed out|timeout|TLS handshake|connection reset|proxy\.golang\.org|502 Bad Gateway|503|504|下载失败|请稍后重试|拉取|network)/i.test(message);
 }
 
-/// 候选建出来 ≠ 本机已经能用了：试运行 + 确认那一步失败时，只报「已构建」会误导。
-function draftIsActivated(draft: DraftRef | undefined): boolean {
-  if (!draft) return false;
-  if (draft.kind === 'workflow') return draft.value.state === 'confirmed' || draft.value.state === 'submitted';
-  return Boolean(draft.value.confirmed_at);
+function activationForProject(project: ProjectModel, activations: ExtensionActivationReceipt[]) {
+  if (!project.local) return undefined;
+  const workspace = normalizeFsPath(project.local.workspace_path);
+  return activations.find(item =>
+    item.kind === project.kind
+    && item.extension_id === project.extensionId
+    && normalizeFsPath(item.target.workspace_root) === workspace,
+  );
+}
+
+function activationMatchesDraft(activation: ExtensionActivationReceipt, draft: DraftRef) {
+  const draftSha = String(draft.value.candidate_sha256 || '').replace(/^sha256:/i, '').toLowerCase();
+  return Boolean(draftSha) && activation.candidate_sha256.toLowerCase() === draftSha;
 }
 
 function draftDependencies(draft: DraftRef | undefined, available: PluginCatalogItem[]) {
@@ -1188,7 +1204,7 @@ function projectWorkspaceRoot(project: ProjectModel) {
 }
 
 /// 项目归属哪个工作区：取「目录包含这个扩展」的工作区根目录（最长匹配优先，
-/// 因为工作区可以互相嵌套）。返回空字符串表示它还没有本地目录（工作台项目）。
+/// 因为工作区可以互相嵌套）。返回空字符串表示它没有可归属的本地目录。
 function workspaceKeyFor(project: ProjectModel, items: { key: string }[]) {
   const own = normalizeFsPath(projectWorkspaceRoot(project));
   if (!own) return '';
@@ -1219,7 +1235,11 @@ function looksLikeLocalPath(value: string) {
 }
 
 function normalizeFsPath(value: string) {
-  return value.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  let normalized = value.trim().replace(/\\/g, '/');
+  // Windows canonicalize() returns extended-length paths. The backend uses
+  // the same normalization when it keys activation receipts and workspaces.
+  normalized = normalized.replace(/^\/\/\?\/UNC\//i, '//').replace(/^\/\/\?\//, '');
+  return normalized.replace(/\/+$/, '').toLowerCase();
 }
 
 /// 列表副行只保留「类型 + 版本」：类型已由左侧图标表达，完整信息在悬停提示里。

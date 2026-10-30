@@ -99,14 +99,50 @@ impl McpSessionState {
 /// comma, semicolon or whitespace separated; unknown IDs are ignored so a
 /// stale config never breaks MCP startup.
 fn default_activation_ids(gateway: &CapabilityGateway) -> BTreeSet<String> {
-    let Ok(raw) = std::env::var("HIMIND_MCP_DEFAULT_ACTIVATE") else {
-        return BTreeSet::new();
-    };
     let known = gateway
         .list_capabilities(&mcp_invocation_context())
         .map(|caps| caps.into_iter().map(|cap| cap.id).collect::<BTreeSet<_>>())
         .unwrap_or_default();
-    parse_default_activation_ids(&raw, &known)
+    let mut activated = std::env::var("HIMIND_MCP_DEFAULT_ACTIVATE")
+        .ok()
+        .map(|raw| parse_default_activation_ids(&raw, &known))
+        .unwrap_or_default();
+    activated.extend(active_development_plugin_capabilities(gateway));
+    activated
+}
+
+fn active_development_plugin_capabilities(gateway: &CapabilityGateway) -> BTreeSet<String> {
+    let path = std::env::var_os("HIMIND_EXTENSION_ACTIVATION_STORE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            crate::store::paths::agent_home()
+                .join("data")
+                .join("extension-activations.json")
+        });
+    let store = crate::app::extension_activation::ActivationStore::new(path);
+    let Ok(receipts) = store.load() else {
+        return BTreeSet::new();
+    };
+    let profile = crate::store::paths::profile_name();
+    let plugin_ids = receipts
+        .values()
+        .filter(|receipt| {
+            receipt.kind == crate::app::extension_activation::ActivationKind::Plugin
+                && receipt.status == crate::app::extension_activation::ActivationStatus::Active
+                && receipt.target.profile == profile
+        })
+        .map(|receipt| format!("plugin:{}", receipt.extension_id))
+        .collect::<BTreeSet<_>>();
+    if plugin_ids.is_empty() {
+        return BTreeSet::new();
+    }
+    gateway
+        .list_capabilities(&mcp_invocation_context())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|capability| plugin_ids.contains(&capability.source))
+        .map(|capability| capability.id)
+        .collect()
 }
 
 fn parse_default_activation_ids(raw: &str, known: &BTreeSet<String>) -> BTreeSet<String> {

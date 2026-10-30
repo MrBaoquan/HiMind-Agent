@@ -71,24 +71,24 @@ impl SkillStore {
     pub(crate) fn new() -> Self {
         #[cfg(not(test))]
         let agent_home = crate::store::paths::agent_home();
-        // Tests run in parallel inside one process. Point the default store at a
-        // per-instance unique temp root: parallel skill tests bootstrap/install/
-        // remove skill packages under a shared root, which mutates
-        // registry-generation hashes between two computations inside one MCP
-        // activate call under `cargo test`. Generation hashes only depend on
-        // record content, so a fresh root that bootstraps the same seed stays
-        // deterministic while test stores never collide. HIMIND_AGENT_HOME is a
-        // process-global env var that parallel tests may flip (ai_services
-        // isolation) — never honor it here, or this store silently lands in
-        // another test's scratch root and gets deleted mid-test.
+        // Tests run in parallel inside one process. Each test thread gets one
+        // stable store root, so multiple SkillStore::new() calls inside the same
+        // test observe the same install/cleanup state while different tests do
+        // not collide. HIMIND_AGENT_HOME is process-global and deliberately not
+        // used here because parallel tests may flip it.
         #[cfg(test)]
         let agent_home = {
-            static NONCE: AtomicU64 = AtomicU64::new(0);
-            let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
-            std::env::temp_dir().join(format!(
-                "himind-agent-test-home-{}-{nonce}",
-                std::process::id()
-            ))
+            thread_local! {
+                static TEST_HOME: PathBuf = {
+                    static NONCE: AtomicU64 = AtomicU64::new(0);
+                    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+                    std::env::temp_dir().join(format!(
+                        "himind-agent-test-home-{}-{nonce}",
+                        std::process::id()
+                    ))
+                };
+            }
+            TEST_HOME.with(PathBuf::clone)
         };
         Self {
             root: agent_home.join("skills"),

@@ -1702,6 +1702,11 @@ export type InstructionPackDraft = {
     updated_at: string;
 };
 
+export type InstructionPackActivationResult = {
+  draft: InstructionPackDraft;
+  activation: ExtensionActivationReceipt;
+};
+
 export type InstructionPackTestResult = {
     draft: InstructionPackDraft;
     readiness: 'ready' | 'blocked' | string;
@@ -2102,6 +2107,43 @@ export type AuthoringPluginDraft = {
     updated_at: string;
 };
 
+export type ExtensionActivationReceipt = {
+    schema_version: string;
+    kind: 'plugin' | 'skill' | 'workflow' | 'expert' | 'instruction';
+    extension_id: string;
+    version: string;
+    candidate_sha256: string;
+    project_id: string;
+    workspace_key: string;
+    target: {
+        profile: string;
+        workspace_root: string;
+        scope: 'workspace' | 'managed_deployment';
+        deployment_id?: string;
+        clients?: string[];
+    };
+    status: 'staged' | 'active' | 'partial' | 'rolled_back' | 'failed';
+    previous_sha256?: string | null;
+    surfaces: Array<{
+        id: string;
+        state: 'pending' | 'visible' | 'conflict' | 'failed' | 'skipped';
+        detail?: string;
+    }>;
+    activated_at: string;
+    updated_at: string;
+};
+
+export type PluginActivationResult = {
+    draft: AuthoringPluginDraft;
+    activation: ExtensionActivationReceipt;
+};
+
+export type SkillActivationResult = {
+    draft: AuthoringSkillDraft;
+    activation: ExtensionActivationReceipt;
+    development_path: string;
+};
+
 export type AuthoringWorkflowDraft = {
     id?: string;
     product_key?: string;
@@ -2210,6 +2252,12 @@ export type ExpertAuthoringDraft = {
   submitted_at?: string | null;
   dashboard_release_id?: string | null;
   test_report?: Record<string, unknown> | null;
+  workspace_path?: string | null;
+};
+
+export type ExpertActivationResult = {
+  draft: ExpertAuthoringDraft;
+  activation: ExtensionActivationReceipt;
 };
 
 export type ExpertDefinitionSnapshot = {
@@ -3086,6 +3134,7 @@ export const agentApi = {
     expertDrafts: () => invoke<ExpertAuthoringDraft[]>('list_expert_drafts'),
     testExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('test_expert_draft', { expertId, version }),
     confirmExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('confirm_expert_draft', { expertId, version }),
+    activateExpertDraft: (expertId: string, version: string) => invoke<ExpertActivationResult>('activate_expert_draft', { expertId, version }),
     submitExpertDraft: (expertId: string, version: string) => invoke<ExpertAuthoringDraft>('submit_expert_draft', { expertId, version }),
     expertCatalog: () => invoke<ExpertCatalogItem[]>('get_expert_catalog'),
     pickExtensionIconFile: () => invoke<string | null>('pick_extension_icon_file'),
@@ -3113,6 +3162,7 @@ export const agentApi = {
     importInstructionPackage: (path: string) => invoke<InstructionPackDraft>('import_instruction_package', { path }),
     testInstructionPackDraft: (id: string, version: string) => invoke<InstructionPackTestResult>('test_instruction_pack_draft', { id, version }),
     confirmInstructionPackDraft: (id: string, version: string) => invoke<InstructionPackDraft>('confirm_instruction_pack_draft', { id, version }),
+    activateInstructionPackDraft: (id: string, version: string) => invoke<InstructionPackActivationResult>('activate_instruction_pack_draft', { id, version }),
     publishInstructionPackLocally: (id: string, version: string) => invoke<InstructionPackDraft>('publish_instruction_pack_locally', { id, version }),
     planInstructionProjection: (workspaceRoot: string, target: InstructionProjectionTarget) =>
         invoke<InstructionProjectionPlan>('plan_instruction_projection', { workspaceRoot, target }),
@@ -3247,6 +3297,8 @@ export const agentApi = {
     pluginDrafts: () => invoke<AuthoringPluginDraft[]>('list_plugin_drafts'),
     pluginSubmissions: () => invoke<PluginSubmissionStatus[]>('list_plugin_submissions'),
     extensionProjects: () => invoke<ExtensionProject[]>('list_extension_projects'),
+    extensionActivations: () => invoke<ExtensionActivationReceipt[]>('list_extension_activations'),
+    rollbackExtensionActivation: (kind: ExtensionProjectKind, extensionId: string, workspaceRoot: string) => invoke<{ activation: ExtensionActivationReceipt }>('rollback_extension_activation', { kind, extensionId, workspaceRoot }),
     extensionWorkspace: () => invoke<ExtensionWorkspaceSettings>('get_extension_workspace'),
     setExtensionWorkspace: (root: string) => invoke<ExtensionWorkspaceSettings>('set_extension_workspace', { root }),
     extensionWorkspaces: () => invoke<ExtensionWorkspaceEntry[]>('list_extension_workspaces'),
@@ -3325,6 +3377,7 @@ export const agentApi = {
     createPluginRevision: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('create_plugin_revision', { pluginId, version }),
     testPluginDraft: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('test_plugin_draft', { pluginId, version }),
     confirmPluginDraft: (pluginId: string, version: string) => invoke<AuthoringPluginDraft>('confirm_plugin_draft', { pluginId, version }),
+    activatePluginDraft: (pluginId: string, version: string) => invoke<PluginActivationResult>('activate_plugin_draft', { pluginId, version }),
     workflowDrafts: () => invoke<AuthoringWorkflowDraft[]>('list_workflow_drafts'),
     testWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('test_workflow_draft', { workflowId, version }),
     confirmWorkflowDraft: (workflowId: string, version: string) => invoke<AuthoringWorkflowDraft>('confirm_workflow_draft', { workflowId, version }),
@@ -3351,6 +3404,7 @@ export const agentApi = {
     createSkillRevision: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('create_skill_revision', { skillId, version }),
     testSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillTestResult>('test_skill_draft', { skillId, version }),
     confirmSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('confirm_skill_draft', { skillId, version }),
+    activateSkillDraft: (skillId: string, version: string) => invoke<SkillActivationResult>('activate_skill_draft', { skillId, version }),
     submitSkillDraft: (skillId: string, version: string) => invoke<AuthoringSkillDraft>('submit_skill_draft', { skillId, version }),
     codexSkillStatus: () => invoke<CodexSkillStatusResponse>('get_codex_skill_status'),
     /** 客户端 × 作用域 × 能力矩阵：功能开关的唯一答案来源。 */

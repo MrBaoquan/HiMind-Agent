@@ -203,6 +203,8 @@ pub(crate) struct InstructionPackDraft {
     /// This makes a later source edit explicit instead of silently publishing stale content.
     #[serde(default)]
     pub source_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<PathBuf>,
     pub source: String,
     pub tested_at: Option<String>,
     pub confirmed_at: Option<String>,
@@ -222,6 +224,12 @@ pub(crate) struct InstructionPackTestResult {
     pub readiness: String,
     pub issues: Vec<String>,
     pub client_status: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InstructionPackActivationResult {
+    pub draft: InstructionPackDraft,
+    pub activation: crate::app::extension_activation::ActivationReceipt,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +486,7 @@ pub(crate) fn save(
         candidate_sha256,
         source_path: None,
         source_sha256: None,
+        workspace_path: None,
         source: if input.source.trim().is_empty() {
             "local_workspace".to_string()
         } else {
@@ -520,6 +529,13 @@ pub(crate) fn build_workspace_candidate(
     let manifest: InstructionPackManifest =
         serde_json::from_slice(&fs::read(workspace.join("instruction.json"))?)?;
     manifest.validate()?;
+    if let Ok(previous) = read(&manifest.id, &manifest.version) {
+        crate::app::extension_activation::ensure_workspace_identity(
+            previous.workspace_path.as_deref(),
+            workspace,
+            crate::app::extension_activation::ActivationKind::Instruction,
+        )?;
+    }
     let instructions = fs::read_to_string(workspace.join("INSTRUCTIONS.md"))?;
     if instructions.trim().is_empty() {
         return Err("INSTRUCTIONS.md 内容不能为空".into());
@@ -542,7 +558,7 @@ pub(crate) fn build_workspace_candidate(
             fs::read_to_string(workspace.join(&normalized))?,
         );
     }
-    save(InstructionPackDraftInput {
+    let mut draft = save(InstructionPackDraftInput {
         id: manifest.id,
         name: manifest.name,
         author: manifest.author,
@@ -560,7 +576,10 @@ pub(crate) fn build_workspace_candidate(
         workflow_refs: manifest.workflow_refs,
         capability_refs: manifest.capability_refs,
         source: "extension_workspace".to_string(),
-    })
+    })?;
+    draft.workspace_path = Some(workspace.canonicalize()?);
+    persist(&draft)?;
+    Ok(draft)
 }
 
 pub(crate) fn import_file(path: &Path) -> Result<InstructionPackDraft, Box<dyn Error>> {
@@ -637,6 +656,13 @@ pub(crate) fn import_package(
             extracted_root.join("instruction.json"),
         )?)?;
         manifest.validate()?;
+        if let Ok(previous) = read(&manifest.id, &manifest.version) {
+            crate::app::extension_activation::ensure_workspace_identity(
+                previous.workspace_path.as_deref(),
+                source.parent().unwrap_or(source.as_path()),
+                crate::app::extension_activation::ActivationKind::Instruction,
+            )?;
+        }
         verify_package_integrity(&extracted_root, &manifest)?;
         let instructions = fs::read_to_string(extracted_root.join("INSTRUCTIONS.md"))?;
         if instructions.len() > MAX_CONTENT_BYTES {
@@ -673,6 +699,7 @@ pub(crate) fn import_package(
             candidate_sha256: sha256_file(&candidate_path)?,
             source_path: Some(source.clone()),
             source_sha256: None,
+            workspace_path: source.parent().map(Path::to_path_buf),
             source: if input.source.trim().is_empty() {
                 "local_package".to_string()
             } else {
@@ -730,7 +757,13 @@ pub(crate) fn read_published(
 ) -> Result<PublishedInstructionPack, Box<dyn Error>> {
     validate_skill_id(id)?;
     validate_version(version)?;
-    let root = store_version_root(id, version);
+    let development = development_version_root(id, version);
+    let development_active = development.is_dir();
+    let root = if development_active {
+        development
+    } else {
+        store_version_root(id, version)
+    };
     let manifest: InstructionPackManifest =
         serde_json::from_str(&fs::read_to_string(root.join("instruction.json"))?)?;
     manifest.validate()?;
@@ -740,10 +773,12 @@ pub(crate) fn read_published(
         return Err("已发布指令包超过 manifest.max_bytes".into());
     }
     let digest = format!("sha256:{}", sha256_directory(&root, &manifest)?);
-    let expected = fs::read_to_string(root.join("published.sha256"))
-        .map_err(|_| "已发布指令包缺少发布摘要")?;
-    if !digest.eq_ignore_ascii_case(expected.trim()) {
-        return Err("已发布指令包摘要不匹配".into());
+    if !development_active {
+        let expected = fs::read_to_string(root.join("published.sha256"))
+            .map_err(|_| "已发布指令包缺少发布摘要")?;
+        if !digest.eq_ignore_ascii_case(expected.trim()) {
+            return Err("已发布指令包摘要不匹配".into());
+        }
     }
     Ok(PublishedInstructionPack {
         manifest,
@@ -962,6 +997,208 @@ pub(crate) fn confirm(id: &str, version: &str) -> Result<InstructionPackDraft, B
     Ok(draft)
 }
 
+pub(crate) fn activate(
+    id: &str,
+    version: &str,
+) -> Result<InstructionPackActivationResult, Box<dyn Error>> {
+    let draft = read(id, version)?;
+    ensure_candidate_unchanged(&draft)?;
+    if draft.tested_at.is_none() {
+        return Err("请先完成指令包本地预检".into());
+    }
+    if draft.confirmed_at.is_none() {
+        return Err("请先确认指令包候选版本".into());
+    }
+    let package_root = draft_version_root(id, version).join("package");
+    verify_package_integrity(&package_root, &draft.manifest)?;
+    let target_root = development_version_root(id, version);
+    let staging = target_root.with_file_name(format!(".{id}-{version}.staging-{}", now_stamp()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    copy_tree(&package_root, &staging)?;
+    verify_package_integrity(&staging, &draft.manifest)?;
+
+    let workspace = draft
+        .workspace_path
+        .as_deref()
+        .or_else(|| draft.candidate_path.parent())
+        .ok_or("指令包候选缺少工作区")?;
+    let workspace_key = crate::extension_projects::workspace_key_of(workspace);
+    let target = crate::app::extension_activation::resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace,
+        &draft.manifest.supported_clients,
+        None,
+    )?;
+    let store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    let previous = store
+        .active_for(
+            &target,
+            crate::app::extension_activation::ActivationKind::Instruction,
+            id,
+        )?
+        .filter(|receipt| {
+            receipt.status == crate::app::extension_activation::ActivationStatus::Active
+        });
+    let previous_sha256 = previous.as_ref().map(|item| item.candidate_sha256.clone());
+    if let Some(previous) = previous.as_ref() {
+        let previous_root = development_version_root(id, &previous.version);
+        let archive = development_archive_root(id).join(&previous.candidate_sha256);
+        if previous_root.exists() && !archive.exists() {
+            copy_tree(&previous_root, &archive)?;
+        }
+    }
+    let timestamp = now_stamp();
+    let receipt = crate::app::extension_activation::ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: crate::app::extension_activation::ActivationKind::Instruction,
+        extension_id: id.to_string(),
+        version: version.to_string(),
+        candidate_sha256: draft.candidate_sha256.clone(),
+        project_id: format!("instruction:{id}@{workspace_key}"),
+        workspace_key,
+        target,
+        status: crate::app::extension_activation::ActivationStatus::Active,
+        previous_sha256,
+        surfaces: vec![
+            crate::app::extension_activation::ActivationSurface::visible("runtime"),
+            crate::app::extension_activation::ActivationSurface::visible("workspace_instructions"),
+        ],
+        activated_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+    };
+    let mut transaction = store.stage(&receipt)?;
+    let retired = match retire_development_versions(id, &timestamp) {
+        Ok(retired) => retired,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            let _ = store.rollback(&mut transaction);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::rename(&staging, &target_root) {
+        restore_development_versions(&retired);
+        let _ = store.rollback(&mut transaction);
+        return Err(error.into());
+    }
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = fs::remove_dir_all(&target_root);
+        restore_development_versions(&retired);
+        let _ = store.rollback(&mut transaction);
+        return Err(error);
+    }
+    remove_retired_development_versions(&retired);
+    Ok(InstructionPackActivationResult {
+        draft,
+        activation: receipt,
+    })
+}
+
+pub(crate) fn rollback(
+    id: &str,
+    workspace_root: &Path,
+) -> Result<crate::app::extension_activation::ActivationRollbackResult, Box<dyn Error>> {
+    let target = crate::app::extension_activation::resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace_root,
+        &[],
+        None,
+    )?;
+    let store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    let active = store
+        .active_for(
+            &target,
+            crate::app::extension_activation::ActivationKind::Instruction,
+            id,
+        )?
+        .filter(|receipt| {
+            receipt.status == crate::app::extension_activation::ActivationStatus::Active
+        })
+        .ok_or("项目规则没有可回滚的开发激活记录")?;
+    crate::app::extension_activation::ensure_receipt_workspace(&active, workspace_root)?;
+    let previous_sha = active
+        .previous_sha256
+        .clone()
+        .ok_or("项目规则没有可回滚的上一开发版")?;
+    let archive = development_archive_root(id).join(&previous_sha);
+    let manifest: InstructionPackManifest =
+        serde_json::from_slice(&fs::read(archive.join("instruction.json"))?)?;
+    manifest.validate()?;
+    verify_package_integrity(&archive, &manifest)?;
+    let active_root = development_version_root(id, &active.version);
+    if active_root.exists() {
+        let current_archive = development_archive_root(id).join(&active.candidate_sha256);
+        if !current_archive.exists() {
+            copy_tree(&active_root, &current_archive)?;
+        }
+    }
+    let target_root = development_version_root(id, &manifest.version);
+    let staging = target_root.with_file_name(format!(
+        ".{id}-{}.rollback-{}",
+        manifest.version,
+        now_stamp()
+    ));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    copy_tree(&archive, &staging)?;
+    verify_package_integrity(&staging, &manifest)?;
+    let timestamp = now_stamp();
+    let receipt = crate::app::extension_activation::ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: crate::app::extension_activation::ActivationKind::Instruction,
+        extension_id: id.to_string(),
+        version: manifest.version,
+        candidate_sha256: previous_sha,
+        project_id: active.project_id.clone(),
+        workspace_key: active.workspace_key.clone(),
+        target: active.target.clone(),
+        status: crate::app::extension_activation::ActivationStatus::Active,
+        previous_sha256: Some(active.candidate_sha256.clone()),
+        surfaces: vec![
+            crate::app::extension_activation::ActivationSurface::visible("runtime"),
+            crate::app::extension_activation::ActivationSurface::visible("workspace_instructions"),
+        ],
+        activated_at: timestamp.clone(),
+        updated_at: timestamp.clone(),
+    };
+    let mut transaction = store.stage(&receipt)?;
+    let retired = match retire_development_versions(id, &timestamp) {
+        Ok(retired) => retired,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            let _ = store.rollback(&mut transaction);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::rename(&staging, &target_root) {
+        restore_development_versions(&retired);
+        let _ = store.rollback(&mut transaction);
+        return Err(error.into());
+    }
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = fs::remove_dir_all(&target_root);
+        restore_development_versions(&retired);
+        let _ = store.rollback(&mut transaction);
+        return Err(error);
+    }
+    remove_retired_development_versions(&retired);
+    Ok(crate::app::extension_activation::ActivationRollbackResult {
+        activation: receipt,
+    })
+}
+
 pub(crate) fn publish_local(
     id: &str,
     version: &str,
@@ -1150,6 +1387,62 @@ fn draft_version_root(id: &str, version: &str) -> PathBuf {
 fn store_version_root(id: &str, version: &str) -> PathBuf {
     store_root().join(id).join("versions").join(version)
 }
+fn development_id_root(id: &str) -> PathBuf {
+    store_root().join("development").join(id)
+}
+fn development_version_root(id: &str, version: &str) -> PathBuf {
+    development_id_root(id).join(version)
+}
+fn development_archive_root(id: &str) -> PathBuf {
+    development_id_root(id).join("versions")
+}
+
+/// Move every visible development version aside so exactly one version remains
+/// discoverable.  Callers restore the returned pairs if the subsequent pointer
+/// switch fails.
+fn retire_development_versions(
+    id: &str,
+    suffix: &str,
+) -> Result<Vec<(PathBuf, PathBuf)>, Box<dyn Error>> {
+    let root = development_id_root(id);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut retired = Vec::new();
+    for entry in fs::read_dir(&root)?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_dir() || name == "versions" || name.starts_with('.') {
+            continue;
+        }
+        let target = root.join(format!(".{name}.retired-{suffix}"));
+        if target.exists() {
+            fs::remove_dir_all(&target)?;
+        }
+        if let Err(error) = fs::rename(&path, &target) {
+            restore_development_versions(&retired);
+            return Err(error.into());
+        }
+        retired.push((path, target));
+    }
+    Ok(retired)
+}
+
+fn restore_development_versions(retired: &[(PathBuf, PathBuf)]) {
+    for (original, moved) in retired.iter().rev() {
+        if moved.exists() && !original.exists() {
+            let _ = fs::rename(moved, original);
+        }
+    }
+}
+
+fn remove_retired_development_versions(retired: &[(PathBuf, PathBuf)]) {
+    for (_, moved) in retired {
+        if moved.exists() {
+            let _ = fs::remove_dir_all(moved);
+        }
+    }
+}
 fn now_stamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1223,6 +1516,12 @@ mod tests {
             capability_refs: Vec::new(),
             source: "test".to_string(),
         }
+    }
+
+    fn input_version(instructions: &str, version: &str) -> InstructionPackDraftInput {
+        let mut value = input(instructions);
+        value.version = version.to_string();
+        value
     }
 
     #[test]
@@ -1312,6 +1611,61 @@ mod tests {
         assert!(manifest.validate().is_ok());
         manifest.icon = "../icon.png".to_string();
         assert!(manifest.validate().is_err());
+        env::remove_var("HIMIND_INSTRUCTION_PACK_DRAFTS_DIR");
+        env::remove_var("HIMIND_INSTRUCTION_PACK_STORE_DIR");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_previous_instruction_pack_development_bytes() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!(
+            "himind-instruction-rollback-{}-{}",
+            std::process::id(),
+            now_stamp()
+        ));
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        env::set_var("HIMIND_INSTRUCTION_PACK_DRAFTS_DIR", root.join("drafts"));
+        env::set_var("HIMIND_INSTRUCTION_PACK_STORE_DIR", root.join("store"));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let mut first = save(input("# Rules\n- first build\n")).unwrap();
+        first.workspace_path = Some(workspace.clone());
+        persist(&first).unwrap();
+        test(&first.manifest.id, &first.manifest.version).unwrap();
+        confirm(&first.manifest.id, &first.manifest.version).unwrap();
+        let first_activation = activate(&first.manifest.id, &first.manifest.version).unwrap();
+
+        let mut second = save(input_version("# Rules\n- second build\n", "1.0.1")).unwrap();
+        second.workspace_path = Some(workspace.clone());
+        persist(&second).unwrap();
+        test(&second.manifest.id, &second.manifest.version).unwrap();
+        confirm(&second.manifest.id, &second.manifest.version).unwrap();
+        let second_activation = activate(&second.manifest.id, &second.manifest.version).unwrap();
+        assert_eq!(
+            second_activation.activation.previous_sha256.as_deref(),
+            Some(first_activation.activation.candidate_sha256.as_str())
+        );
+        assert!(!development_version_root(&first.manifest.id, "1.0.0").exists());
+        assert!(development_version_root(&first.manifest.id, "1.0.1").exists());
+
+        let rolled_back = rollback(&first.manifest.id, &workspace).unwrap();
+        assert_eq!(
+            rolled_back.activation.candidate_sha256,
+            first_activation.activation.candidate_sha256
+        );
+        let restored = read_published(&first.manifest.id, &first.manifest.version).unwrap();
+        assert_eq!(restored.instructions, "# Rules\n- first build\n");
+        assert!(development_version_root(&first.manifest.id, "1.0.0").exists());
+        assert!(!development_version_root(&first.manifest.id, "1.0.1").exists());
+        assert!(read_published(&first.manifest.id, "1.0.1").is_err());
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
         env::remove_var("HIMIND_INSTRUCTION_PACK_DRAFTS_DIR");
         env::remove_var("HIMIND_INSTRUCTION_PACK_STORE_DIR");
         let _ = fs::remove_dir_all(root);

@@ -1,3 +1,7 @@
+use crate::app::extension_activation::{
+    resolve_activation_target, ActivationKind, ActivationReceipt, ActivationStatus,
+    ActivationStore, ActivationSurface,
+};
 use crate::app::plugin_manager::verify_plugin_checksums;
 use crate::capability::plugin::{
     parse_plugin_manifest, validate_development_entry, validate_manifest_contributions,
@@ -49,6 +53,12 @@ pub(crate) struct PluginDraft {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PluginActivationResult {
+    pub draft: PluginDraft,
+    pub activation: ActivationReceipt,
+}
+
 pub(crate) fn list() -> Result<Vec<PluginDraft>, Box<dyn Error>> {
     let root = drafts_root();
     if !root.exists() {
@@ -82,6 +92,13 @@ pub(crate) fn save(input: PluginDraftInput) -> Result<PluginDraft, Box<dyn Error
     let root = draft_version_root(&manifest.id, &manifest.version);
     let candidate_sha256 = sha256_file(&source)?;
     let previous = read(&manifest.id, &manifest.version).ok();
+    crate::app::extension_activation::ensure_workspace_identity(
+        previous
+            .as_ref()
+            .and_then(|draft| draft.workspace_path.as_deref()),
+        source.parent().unwrap_or(source.as_path()),
+        crate::app::extension_activation::ActivationKind::Plugin,
+    )?;
     let unchanged = previous
         .as_ref()
         .map(|draft| draft.candidate_sha256 == candidate_sha256)
@@ -117,7 +134,6 @@ pub(crate) fn save(input: PluginDraftInput) -> Result<PluginDraft, Box<dyn Error
             format!("解包并校验插件候选失败 {}: {error}", package_root.display()).into()
         },
     )?;
-    crate::capability::plugin::register_development_plugin(&package_root)?;
     let draft = PluginDraft {
         manifest,
         candidate_path,
@@ -218,12 +234,6 @@ pub(crate) fn create_revision(
         updated_at: now_stamp(),
     };
     persist(&draft)?;
-    crate::capability::plugin::register_development_plugin(
-        draft
-            .development_path
-            .as_deref()
-            .ok_or("新版本工作区无效")?,
-    )?;
     Ok(draft)
 }
 
@@ -428,7 +438,11 @@ struct DevelopmentRegistrySnapshot {
 
 impl DevelopmentRegistrySnapshot {
     fn capture(plugin_id: &str) -> Result<Self, Box<dyn Error>> {
-        let path = development_registry_path_for_test();
+        Self::capture_at(plugin_id, &development_registry_path_for_test())
+    }
+
+    fn capture_at(plugin_id: &str, registry_path: &Path) -> Result<Self, Box<dyn Error>> {
+        let path = registry_path.to_path_buf();
         // A candidate test registers the draft as a development plugin.  Any
         // health record left behind by that attempt would otherwise make the
         // next real activation look like a previously failing plugin, so it is
@@ -443,6 +457,10 @@ impl DevelopmentRegistrySnapshot {
             path,
             armed: true,
         })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 
     fn restore(&mut self) -> Result<(), Box<dyn Error>> {
@@ -532,6 +550,208 @@ pub(crate) fn confirm(plugin_id: &str, version: &str) -> Result<PluginDraft, Box
     draft.updated_at = now_stamp();
     persist(&draft)?;
     Ok(draft)
+}
+
+/// Activate a tested plugin candidate as the current development build.
+///
+/// This is deliberately separate from `confirm`: candidate review and runtime
+/// activation are different lifecycles. The candidate is copied to a
+/// SHA-addressed slot, the explicit development registry entry is switched, and
+/// only then is the activation ledger committed.
+pub(crate) fn activate(
+    plugin_id: &str,
+    version: &str,
+) -> Result<PluginActivationResult, Box<dyn Error>> {
+    let draft = read(plugin_id, version)?;
+    let versions_root = development_versions_root();
+    let registry_path = activation_registry_path();
+    let store = ActivationStore::new(activation_store_path());
+    let mut result = activate_draft_with_paths(draft, &versions_root, &registry_path, &store)?;
+    result.draft.updated_at = now_stamp();
+    persist(&result.draft)?;
+    Ok(result)
+}
+
+pub(crate) fn rollback(
+    plugin_id: &str,
+    workspace_root: &Path,
+) -> Result<crate::app::extension_activation::ActivationRollbackResult, Box<dyn Error>> {
+    let store = ActivationStore::new(activation_store_path());
+    let target = resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace_root,
+        &[],
+        None,
+    )?;
+    let active = store
+        .active_for(&target, ActivationKind::Plugin, plugin_id)?
+        .filter(|receipt| receipt.status == ActivationStatus::Active)
+        .ok_or("插件没有可回滚的开发激活记录")?;
+    crate::app::extension_activation::ensure_receipt_workspace(&active, workspace_root)?;
+    let previous_sha = active
+        .previous_sha256
+        .clone()
+        .ok_or("插件没有可回滚的上一开发版")?;
+    let slot = development_versions_root()
+        .join(plugin_id)
+        .join(&previous_sha);
+    let manifest = parse_plugin_manifest(&fs::read_to_string(slot.join("plugin.json"))?)?;
+    verify_plugin_checksums(&slot)?;
+    let registry_path = activation_registry_path();
+    let mut registry_snapshot = DevelopmentRegistrySnapshot::capture_at(plugin_id, &registry_path)?;
+    let timestamp = now_stamp();
+    let receipt = ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: ActivationKind::Plugin,
+        extension_id: plugin_id.to_string(),
+        version: manifest.version,
+        candidate_sha256: previous_sha,
+        project_id: active.project_id.clone(),
+        workspace_key: active.workspace_key.clone(),
+        target: active.target.clone(),
+        status: ActivationStatus::Active,
+        previous_sha256: Some(active.candidate_sha256.clone()),
+        surfaces: vec![
+            ActivationSurface::visible("runtime"),
+            ActivationSurface::visible("mcp"),
+        ],
+        activated_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    let mut transaction = store.stage(&receipt)?;
+    if let Err(error) =
+        crate::capability::plugin::activate_development_plugin_at(&slot, &registry_path)
+    {
+        let _ = store.rollback(&mut transaction);
+        let _ = registry_snapshot.restore();
+        return Err(error);
+    }
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = store.rollback(&mut transaction);
+        let _ = registry_snapshot.restore();
+        return Err(error);
+    }
+    registry_snapshot.disarm();
+    Ok(crate::app::extension_activation::ActivationRollbackResult {
+        activation: receipt,
+    })
+}
+
+fn activate_draft_with_paths(
+    mut draft: PluginDraft,
+    versions_root: &Path,
+    registry_path: &Path,
+    activation_store: &ActivationStore,
+) -> Result<PluginActivationResult, Box<dyn Error>> {
+    ensure_candidate_unchanged(&draft)?;
+    if draft.tested_at.is_none() {
+        return Err("请先完成插件候选包测试".into());
+    }
+    let source = draft
+        .development_path
+        .as_deref()
+        .filter(|path| path.is_dir())
+        .ok_or("插件候选没有可启动的开发目录")?;
+    verify_plugin_checksums(source)?;
+    validate_manifest_contributions(source, &draft.manifest)?;
+    validate_development_entry(source, &draft.manifest)?;
+
+    let slot = versions_root
+        .join(&draft.manifest.id)
+        .join(&draft.candidate_sha256);
+    let staging = versions_root
+        .join(&draft.manifest.id)
+        .join(format!(".staging-{}", now_stamp()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    let stage_result = (|| -> Result<(), Box<dyn Error>> {
+        copy_directory(source, &staging)?;
+        verify_plugin_checksums(&staging)?;
+        validate_manifest_contributions(&staging, &draft.manifest)?;
+        validate_development_entry(&staging, &draft.manifest)?;
+        if slot.exists() {
+            fs::remove_dir_all(&slot)?;
+        }
+        if let Some(parent) = slot.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&staging, &slot)?;
+        Ok(())
+    })();
+    if let Err(error) = stage_result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    let workspace = draft
+        .workspace_path
+        .as_deref()
+        .or_else(|| source.parent())
+        .ok_or("插件候选缺少工作区")?;
+    let workspace_key = crate::extension_projects::workspace_key_of(workspace);
+    let target =
+        resolve_activation_target(&crate::store::paths::profile_name(), workspace, &[], None)?;
+    let previous = activation_store
+        .active_for(&target, ActivationKind::Plugin, &draft.manifest.id)?
+        .filter(|receipt| receipt.status == ActivationStatus::Active);
+    let now = now_stamp();
+    let receipt = ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: ActivationKind::Plugin,
+        extension_id: draft.manifest.id.clone(),
+        version: draft.manifest.version.clone(),
+        candidate_sha256: draft.candidate_sha256.clone(),
+        project_id: format!("plugin:{}@{}", draft.manifest.id, workspace_key),
+        workspace_key,
+        target,
+        status: ActivationStatus::Active,
+        previous_sha256: previous.map(|item| item.candidate_sha256),
+        surfaces: vec![
+            ActivationSurface::visible("runtime"),
+            ActivationSurface::visible("mcp"),
+        ],
+        activated_at: now.clone(),
+        updated_at: now,
+    };
+    let mut transaction = activation_store.stage(&receipt)?;
+    let mut registry_snapshot =
+        DevelopmentRegistrySnapshot::capture_at(&draft.manifest.id, registry_path)?;
+    let activation_result =
+        crate::capability::plugin::activate_development_plugin_at(&slot, registry_path);
+    if let Err(error) = activation_result {
+        let rollback = activation_store.rollback(&mut transaction);
+        let restore = registry_snapshot.restore();
+        let _ = fs::remove_dir_all(&slot);
+        return match (rollback, restore) {
+            (Ok(()), Ok(())) => Err(error),
+            (rollback, restore) => Err(format!(
+                "插件激活失败且回滚不完整: {error}; ledger={rollback:?}; registry={restore:?}"
+            )
+            .into()),
+        };
+    }
+    if let Err(error) = activation_store.commit(&mut transaction) {
+        let rollback = activation_store.rollback(&mut transaction);
+        let restore = registry_snapshot.restore();
+        let _ = fs::remove_dir_all(&slot);
+        return match (rollback, restore) {
+            (Ok(()), Ok(())) => Err(error),
+            (rollback, restore) => Err(format!(
+                "插件激活台账提交失败且回滚不完整: {error}; ledger={rollback:?}; registry={restore:?}"
+            )
+            .into()),
+        };
+    }
+    registry_snapshot.disarm();
+    draft.development_path = Some(slot);
+    draft.updated_at = now_stamp();
+    Ok(PluginActivationResult {
+        draft,
+        activation: receipt,
+    })
 }
 
 pub(crate) fn submit(
@@ -707,6 +927,29 @@ fn drafts_root() -> PathBuf {
     crate::store::paths::agent_home().join("plugin-drafts")
 }
 
+fn development_versions_root() -> PathBuf {
+    if let Some(root) = env::var_os("HIMIND_PLUGIN_DEVELOPMENT_VERSIONS_DIR") {
+        return PathBuf::from(root);
+    }
+    crate::store::paths::agent_home().join("plugin-development-versions")
+}
+
+fn activation_registry_path() -> PathBuf {
+    if let Some(path) = env::var_os("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY") {
+        return PathBuf::from(path);
+    }
+    crate::store::paths::agent_home().join("plugin-development.json")
+}
+
+fn activation_store_path() -> PathBuf {
+    if let Some(path) = env::var_os("HIMIND_EXTENSION_ACTIVATION_STORE") {
+        return PathBuf::from(path);
+    }
+    crate::store::paths::agent_home()
+        .join("data")
+        .join("extension-activations.json")
+}
+
 fn draft_version_root(plugin_id: &str, version: &str) -> PathBuf {
     drafts_root().join(plugin_id).join(version)
 }
@@ -721,6 +964,7 @@ fn now_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::paths::test_env_lock;
     use std::io::Write;
     use zip::write::FileOptions;
 
@@ -733,13 +977,95 @@ mod tests {
     }
 
     #[test]
+    fn activation_writes_sha_slot_explicit_registry_and_ledger() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("himind-plugin-activation-test-{}", now_stamp()));
+        let previous_home = env::var_os("HIMIND_AGENT_HOME");
+        let home = root.join("home");
+        env::set_var("HIMIND_AGENT_HOME", &home);
+        let distribution_state = home.join("data/distribution-state.json");
+        fs::create_dir_all(distribution_state.parent().unwrap()).unwrap();
+        fs::write(&distribution_state, b"{\"sentinel\":true}").unwrap();
+        let package = root.join("package");
+        fs::create_dir_all(package.join("bin")).unwrap();
+        let manifest_text = r#"{"id":"com.himind.activation-test","name":"激活测试插件","author":"测试用户","description":"验证开发版激活","release_notes":"验证激活链路。","version":"1.0.0","entry":"bin/plugin.exe","runtime":"process-jsonrpc-stdio","min_agent_version":"0.3.0","governance":"optional","capabilities":[],"permissions":[],"contributes":{"commands":[],"views":[]}}"#;
+        fs::write(package.join("plugin.json"), manifest_text).unwrap();
+        fs::write(package.join("bin/plugin.exe"), "test-binary").unwrap();
+        write_checksums(&package).unwrap();
+        let candidate = root.join("candidate.hmpkg");
+        fs::write(&candidate, "candidate-archive").unwrap();
+        let manifest = parse_plugin_manifest(manifest_text).unwrap();
+        let draft = PluginDraft {
+            candidate_sha256: sha256_file(&candidate).unwrap(),
+            candidate_path: candidate,
+            manifest,
+            development_path: Some(package),
+            workspace_path: Some(root.clone()),
+            source: "workspace".to_string(),
+            revision_of: None,
+            parent_submission_id: None,
+            tested_at: Some(now_stamp()),
+            confirmed_at: None,
+            submitted_at: None,
+            dashboard_submission_id: None,
+            test_report: Some(json!({"state":"passed"})),
+            updated_at: now_stamp(),
+        };
+        let store = ActivationStore::new(root.join("activations.json"));
+        let result = activate_draft_with_paths(
+            draft,
+            &root.join("development-versions"),
+            &root.join("plugin-development.json"),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(result.activation.status, ActivationStatus::Active);
+        assert!(result.draft.submitted_at.is_none());
+        assert!(result.draft.dashboard_submission_id.is_none());
+        assert_eq!(
+            fs::read(&distribution_state).unwrap(),
+            b"{\"sentinel\":true}"
+        );
+        assert!(result.draft.development_path.as_ref().unwrap().is_dir());
+        let registry: Value =
+            serde_json::from_slice(&fs::read(root.join("plugin-development.json")).unwrap())
+                .unwrap();
+        assert_eq!(registry[0]["explicit_active"], true);
+        assert_eq!(
+            store
+                .active_for(
+                    &result.activation.target,
+                    ActivationKind::Plugin,
+                    "com.himind.activation-test"
+                )
+                .unwrap()
+                .unwrap()
+                .candidate_sha256,
+            result.activation.candidate_sha256
+        );
+        match previous_home {
+            Some(value) => env::set_var("HIMIND_AGENT_HOME", value),
+            None => env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn saves_tests_and_confirms_complete_plugin_candidate() {
+        let _guard = test_env_lock();
         let root = env::temp_dir().join(format!("himind-plugin-authoring-test-{}", now_stamp()));
         let drafts = root.join("drafts");
         let development_registry = root.join("plugin-development.json");
         fs::create_dir_all(&root).unwrap();
         env::set_var("HIMIND_PLUGIN_DRAFTS_DIR", &drafts);
         env::set_var("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY", &development_registry);
+        let active_registry = serde_json::to_vec_pretty(&json!([{
+            "id": "com.himind.authoring-test",
+            "path": root.join("previous-active-build"),
+            "explicit_active": true
+        }]))
+        .unwrap();
+        fs::write(&development_registry, &active_registry).unwrap();
         let package = root.join("candidate.hmpkg");
         let manifest = r#"{"id":"com.himind.authoring-test","name":"候选测试插件","author":"测试用户","description":"测试插件候选链路","release_notes":"新增候选包保存、测试与修订验证。","version":"1.0.0","entry":"plugin.exe","runtime":"process-jsonrpc-stdio","min_agent_version":"0.3.0","governance":"optional","capabilities":[],"permissions":[],"contributes":{"commands":[],"views":[]}}"#
             .as_bytes();
@@ -773,12 +1099,11 @@ mod tests {
             .development_path
             .as_ref()
             .is_some_and(|path| path.exists()));
-        assert!(fs::read_to_string(&development_registry)
-            .unwrap()
-            .contains("com.himind.authoring-test"));
+        assert_eq!(fs::read(&development_registry).unwrap(), active_registry);
         assert!(ensure_ready_to_submit(&saved).is_err());
         let tested = test(&saved.manifest.id, &saved.manifest.version).unwrap();
         assert!(tested.tested_at.is_some());
+        assert_eq!(fs::read(&development_registry).unwrap(), active_registry);
         assert!(ensure_ready_to_submit(&tested).is_err());
         let confirmed = confirm(&saved.manifest.id, &saved.manifest.version).unwrap();
         assert!(confirmed.confirmed_at.is_some());
@@ -787,6 +1112,7 @@ mod tests {
         assert_eq!(revision.manifest.version, "1.0.1");
         assert_eq!(revision.revision_of.as_deref(), Some("1.0.0"));
         assert!(revision.tested_at.is_none());
+        assert_eq!(fs::read(&development_registry).unwrap(), active_registry);
         extract_and_validate(
             &revision.candidate_path,
             &root.join("revision-check"),
@@ -796,6 +1122,89 @@ mod tests {
 
         env::remove_var("HIMIND_PLUGIN_DRAFTS_DIR");
         env::remove_var("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_previous_sha_and_development_registry() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("himind-plugin-rollback-test-{}", now_stamp()));
+        let drafts = root.join("drafts");
+        let versions = root.join("development-versions");
+        let registry = root.join("plugin-development.json");
+        let activation_store = root.join("activations.json");
+        env::set_var("HIMIND_PLUGIN_DRAFTS_DIR", &drafts);
+        env::set_var("HIMIND_PLUGIN_DEVELOPMENT_VERSIONS_DIR", &versions);
+        env::set_var("HIMIND_PLUGIN_DEVELOPMENT_REGISTRY", &registry);
+        env::set_var("HIMIND_EXTENSION_ACTIVATION_STORE", &activation_store);
+
+        let manifest_text = r#"{"id":"com.himind.rollback-test","name":"回滚测试插件","author":"测试用户","description":"验证开发版回滚","release_notes":"验证回滚。","version":"1.0.0","entry":"plugin.exe","runtime":"process-jsonrpc-stdio","min_agent_version":"0.3.0","governance":"optional","capabilities":[],"permissions":[],"contributes":{"commands":[],"views":[]}}"#;
+        let manifest = parse_plugin_manifest(manifest_text).unwrap();
+        let store = ActivationStore::new(&activation_store);
+        let mut shas = Vec::new();
+        for marker in ["first-build", "second-build"] {
+            let package = root.join(marker).join("package");
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("plugin.json"), manifest_text).unwrap();
+            fs::write(package.join("plugin.exe"), marker).unwrap();
+            write_checksums(&package).unwrap();
+            let candidate = root.join(format!("{marker}.hmpkg"));
+            fs::write(&candidate, marker).unwrap();
+            let sha = sha256_file(&candidate).unwrap();
+            shas.push(sha.clone());
+            let draft = PluginDraft {
+                candidate_sha256: sha,
+                candidate_path: candidate,
+                manifest: manifest.clone(),
+                development_path: Some(package),
+                workspace_path: Some(root.clone()),
+                source: "workspace".to_string(),
+                revision_of: None,
+                parent_submission_id: None,
+                tested_at: Some(now_stamp()),
+                confirmed_at: None,
+                submitted_at: None,
+                dashboard_submission_id: None,
+                test_report: Some(json!({"state":"passed"})),
+                updated_at: now_stamp(),
+            };
+            activate_draft_with_paths(draft, &versions, &registry, &store).unwrap();
+        }
+
+        let target =
+            resolve_activation_target(&crate::store::paths::profile_name(), &root, &[], None)
+                .unwrap();
+        assert_eq!(
+            store
+                .active_for(&target, ActivationKind::Plugin, &manifest.id)
+                .unwrap()
+                .unwrap()
+                .candidate_sha256,
+            shas[1]
+        );
+
+        let rolled_back = rollback(&manifest.id, &root).unwrap();
+        assert_eq!(rolled_back.activation.candidate_sha256, shas[0]);
+        assert!(versions.join(&manifest.id).join(&shas[0]).is_dir());
+        let registry_value: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        let active_path = PathBuf::from(registry_value[0]["path"].as_str().unwrap());
+        assert_eq!(
+            active_path.canonicalize().unwrap(),
+            versions
+                .join(&manifest.id)
+                .join(&shas[0])
+                .canonicalize()
+                .unwrap()
+        );
+
+        for key in [
+            "HIMIND_PLUGIN_DRAFTS_DIR",
+            "HIMIND_PLUGIN_DEVELOPMENT_VERSIONS_DIR",
+            "HIMIND_PLUGIN_DEVELOPMENT_REGISTRY",
+            "HIMIND_EXTENSION_ACTIVATION_STORE",
+        ] {
+            env::remove_var(key);
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -10,8 +10,8 @@
 //   2. npm run generate:ai-service-presets -- catalog.json
 //
 // 映射规则必须与 Rust 侧 src/app/ai_service_templates.rs 的 from_catalog 一致：
-// 无接入地址跳过、协议只认识 openai_compatible/anthropic、模型取 upstream_model
-// 并去重、默认模型取第一个 recommended。
+// 无接入地址跳过、优先按 api_mode 判定 Chat/Responses/Anthropic、模型取
+// upstream_model 并去重、默认模型取第一个 recommended。
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +31,7 @@ type CatalogItem = {
   category?: string;
   description?: string;
   protocol?: string;
+  api_mode?: string;
   base_url?: string;
   model_catalog_version?: string;
   models?: CatalogModel[];
@@ -47,12 +48,17 @@ type Preset = {
   models: string[];
 };
 
-function protocolFor(value: string): string | null {
-  switch ((value ?? '').trim()) {
-    case 'anthropic':
+function protocolFor(protocol: string, apiMode: string): string | null {
+  switch (`${(protocol ?? '').trim()}:${(apiMode ?? '').trim()}`) {
+    case 'anthropic:':
+    case 'anthropic:anthropic':
       return 'anthropic';
-    case 'openai_compatible':
-    case '':
+    case 'openai_compatible:openai_chat':
+      return 'openai-chat';
+    case 'openai_compatible:openai_responses':
+      return 'openai-responses';
+    case 'openai_compatible:':
+    case ':':
       return 'openai-responses';
     default:
       return null;
@@ -72,7 +78,7 @@ function mapCatalog(items: CatalogItem[]): { presets: Preset[]; catalogVersion: 
     const id = (item.id ?? '').trim();
     const baseUrl = (item.base_url ?? '').trim();
     if (!id || !baseUrl || seen.has(id)) continue;
-    const protocol = protocolFor(item.protocol ?? '');
+    const protocol = protocolFor(item.protocol ?? '', item.api_mode ?? '');
     if (!protocol) continue;
     seen.add(id);
     const models: string[] = [];

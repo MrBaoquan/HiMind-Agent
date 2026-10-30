@@ -22,6 +22,13 @@ pub(crate) fn confirm(id: &str, version: &str) -> Result<ExpertAuthoringDraft, B
     crate::expert::confirm_authoring_draft(id, version)
 }
 
+pub(crate) fn activate(
+    id: &str,
+    version: &str,
+) -> Result<crate::expert::ExpertActivationResult, Box<dyn Error>> {
+    crate::expert::activate_authoring_draft(id, version)
+}
+
 pub(crate) fn submit(
     options: &Options,
     agent_id: &str,

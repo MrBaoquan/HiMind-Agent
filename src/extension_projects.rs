@@ -2127,6 +2127,150 @@ mod tests {
     use super::*;
     use crate::app::extension_source::LocalSourceWorkspace;
 
+    #[test]
+    #[ignore = "requires HIMIND_EXT_E2E_ROOT pointing at himind-ext-projects"]
+    fn external_workspace_plugin_build_activates_without_install() {
+        let _guard = crate::store::paths::test_env_lock();
+        let source_root = PathBuf::from(
+            std::env::var("HIMIND_EXT_E2E_ROOT")
+                .expect("set HIMIND_EXT_E2E_ROOT to the extension workspace"),
+        );
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        let staging = env::temp_dir().join(format!("himind-ext-e2e-{}", now_stamp()));
+        std::env::set_var("HIMIND_AGENT_HOME", staging.join("home"));
+        let project = register(&source_root.join("plugins/exhibit-development-tools")).unwrap();
+        let candidate = build(&project.id).unwrap();
+        let ExtensionCandidate::Plugin(draft) = candidate else {
+            panic!("expected plugin candidate");
+        };
+        let tested =
+            crate::plugin_authoring::test(&draft.manifest.id, &draft.manifest.version).unwrap();
+        crate::plugin_authoring::confirm(&tested.manifest.id, &tested.manifest.version).unwrap();
+        let activated =
+            crate::plugin_authoring::activate(&tested.manifest.id, &tested.manifest.version)
+                .unwrap();
+        assert_eq!(
+            activated.activation.candidate_sha256,
+            tested.candidate_sha256
+        );
+        assert_eq!(
+            activated.activation.target.profile,
+            crate::store::paths::profile_name()
+        );
+        assert!(activated
+            .activation
+            .surfaces
+            .iter()
+            .any(|surface| surface.id == "runtime"));
+        assert!(activated
+            .activation
+            .surfaces
+            .iter()
+            .any(|surface| surface.id == "mcp"));
+        assert!(activated.draft.confirmed_at.is_some());
+        assert!(activated.draft.submitted_at.is_none());
+        assert!(activated
+            .draft
+            .development_path
+            .as_ref()
+            .is_some_and(|path| path.is_dir()));
+        let registry: Value = serde_json::from_slice(
+            &fs::read(staging.join("home/plugin-development.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry[0]["explicit_active"], true);
+
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = fs::remove_dir_all(staging);
+    }
+
+    #[test]
+    #[ignore = "requires HIMIND_EXT_E2E_ROOT pointing at himind-ext-projects"]
+    fn external_workspace_skill_build_activates_without_install() {
+        let _guard = crate::store::paths::test_env_lock();
+        let source_root = PathBuf::from(
+            std::env::var("HIMIND_EXT_E2E_ROOT")
+                .expect("set HIMIND_EXT_E2E_ROOT to the extension workspace"),
+        );
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        let previous_userprofile = std::env::var_os("USERPROFILE");
+        let previous_home_env = std::env::var_os("HOME");
+        let previous_codex_dir = std::env::var_os("HIMIND_CODEX_SKILL_DIR");
+        let previous_registry = std::env::var_os("HIMIND_SKILL_DEVELOPMENT_REGISTRY");
+        let previous_versions = std::env::var_os("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR");
+        let staging = env::temp_dir().join(format!("himind-ext-skill-e2e-{}", now_stamp()));
+        std::env::set_var("HIMIND_AGENT_HOME", staging.join("home"));
+        std::env::set_var("USERPROFILE", staging.join("userprofile"));
+        std::env::set_var("HOME", staging.join("userprofile"));
+        std::env::set_var("HIMIND_CODEX_SKILL_DIR", staging.join("codex-skills"));
+        std::env::set_var(
+            "HIMIND_SKILL_DEVELOPMENT_REGISTRY",
+            staging.join("home/skill-development.json"),
+        );
+        std::env::set_var(
+            "HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR",
+            staging.join("home/skill-development-versions"),
+        );
+        let project = register(&source_root.join("skills/upm-package-development")).unwrap();
+        let candidate = build(&project.id).unwrap();
+        let ExtensionCandidate::Skill(draft) = candidate else {
+            panic!("expected skill candidate");
+        };
+        let tested =
+            crate::skill::authoring::test(&draft.manifest.id, &draft.manifest.version, &[])
+                .unwrap();
+        crate::skill::authoring::confirm(&tested.draft.manifest.id, &tested.draft.manifest.version)
+            .unwrap();
+        let activated = crate::skill::authoring::activate(
+            &tested.draft.manifest.id,
+            &tested.draft.manifest.version,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            activated.activation.candidate_sha256,
+            tested.draft.candidate_sha256
+        );
+        assert_eq!(
+            activated.activation.target.profile,
+            crate::store::paths::profile_name()
+        );
+        assert!(activated
+            .activation
+            .surfaces
+            .iter()
+            .any(|surface| surface.id == "runtime"));
+        assert!(activated
+            .activation
+            .surfaces
+            .iter()
+            .any(|surface| surface.id == "mcp"));
+        assert!(activated.draft.confirmed_at.is_some());
+        assert!(activated.draft.submitted_at.is_none());
+        let registry: Value =
+            serde_json::from_slice(&fs::read(staging.join("home/skill-development.json")).unwrap())
+                .unwrap();
+        assert_eq!(registry[0]["explicit_active"], true);
+
+        for (key, value) in [
+            ("HIMIND_AGENT_HOME", previous_home),
+            ("USERPROFILE", previous_userprofile),
+            ("HOME", previous_home_env),
+            ("HIMIND_CODEX_SKILL_DIR", previous_codex_dir),
+            ("HIMIND_SKILL_DEVELOPMENT_REGISTRY", previous_registry),
+            ("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR", previous_versions),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(staging);
+    }
+
     /// 提交号是「候选制品 ↔ 源码」的溯源锚点，补号逻辑必须足够保守：
     /// 没有声明仓库、已记录过提交号、或工作区根本不是仓库时，都不能凭空造一个。
     #[test]

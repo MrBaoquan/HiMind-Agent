@@ -704,6 +704,25 @@ impl LaunchContract {
         }
     }
 
+    /// Step 的显式入参映射也会把启动表单字段改名后交给能力。
+    /// 例如表单字段 `workspace_root` 映射成能力的 `project_root`，判断
+    /// `project_root` 是否有启动来源时必须沿着这条映射回到原字段。
+    fn coverage_for_step(&self, name: &str, step: &super::WorkflowStep) -> InputCoverage {
+        if let Some(bound_field) = step
+            .input
+            .get(name)
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("input."))
+            .and_then(|path| path.split('.').find(|segment| !segment.is_empty()))
+        {
+            let bound = self.coverage(bound_field);
+            if !matches!(bound, InputCoverage::Missing) {
+                return bound;
+            }
+        }
+        self.coverage(name)
+    }
+
     fn coverage(&self, name: &str) -> InputCoverage {
         if self.connector_targets.contains(name)
             || self.entry_requirements.contains(name)
@@ -807,10 +826,13 @@ fn validate_capability_step_input(
     let mut merged = run_input.as_object().cloned().unwrap_or_default();
     if let Some(step_input) = step.input.as_object() {
         for (name, value) in step_input {
-            merged.insert(
-                name.clone(),
-                super::executor::resolve_workflow_input_templates(value, run_input),
-            );
+            let resolved = super::executor::resolve_workflow_input_templates(value, run_input);
+            // 启动输入尚未提供时，`input.*` 模板会解析成 null。这里不能把 null
+            // 塞进能力入参：它会被 schema 当成“提供了错误类型”，从而掩盖真正的
+            // 启动契约判断。缺失值交由 required_properties_without_value 统一处理。
+            if !resolved.is_null() {
+                merged.insert(name.clone(), resolved);
+            }
         }
     }
     for (name, value) in super::executor::candidate_freeze_inputs(package, step) {
@@ -839,7 +861,7 @@ fn validate_capability_step_input(
     // 先用运行期的过滤规则对齐输入，再校验：预检查的对象与真正下发给能力的对象一致。
     let filtered = super::executor::capability_input(&capability.input_schema, &merged);
     for (name, coverage) in
-        required_properties_without_value(&capability.input_schema, &filtered, launch)
+        required_properties_without_value(&capability.input_schema, &filtered, launch, step)
     {
         match coverage {
             // 分段执行时用户按入口逐次启动，表单声明的可选项就是调用方契约；
@@ -870,7 +892,7 @@ fn validate_capability_step_input(
     }
     // 第二道校验负责取值合法性（类型、枚举、列表写法）。它内部的 required 判定
     // 不认启动契约，会把表单/入口提供的属性重复判成缺失，所以先按启动契约重算 required。
-    let runtime_schema = schema_for_runtime_validation(&capability.input_schema, launch);
+    let runtime_schema = schema_for_runtime_validation(&capability.input_schema, launch, step);
     if let Err(error) =
         crate::capability::service::validate_capability_input_schema(&runtime_schema, &filtered)
     {
@@ -890,6 +912,7 @@ fn required_properties_without_value(
     schema: &Value,
     input: &Value,
     launch: &LaunchContract,
+    step: &super::WorkflowStep,
 ) -> Vec<(String, InputCoverage)> {
     let Some(required) = schema.get("required").and_then(Value::as_array) else {
         return Vec::new();
@@ -898,21 +921,26 @@ fn required_properties_without_value(
         .iter()
         .filter_map(Value::as_str)
         .filter(|name| input.get(*name).is_none_or(Value::is_null))
-        .map(|name| (name.to_string(), launch.coverage(name)))
+        .map(|name| (name.to_string(), launch.coverage_for_step(name, step)))
         .filter(|(_, coverage)| !matches!(coverage, InputCoverage::Guaranteed))
         .collect()
 }
 
 /// 从 schema 的 `required` 中剔除启动契约已经覆盖的属性，只留下必须由 Workflow 自己补齐的部分。
-fn schema_for_runtime_validation(schema: &Value, launch: &LaunchContract) -> Value {
+fn schema_for_runtime_validation(
+    schema: &Value,
+    launch: &LaunchContract,
+    step: &super::WorkflowStep,
+) -> Value {
     let Some(required) = schema.get("required").and_then(Value::as_array) else {
         return schema.clone();
     };
     let remaining: Vec<Value> = required
         .iter()
         .filter(|name| {
-            name.as_str()
-                .is_none_or(|name| matches!(launch.coverage(name), InputCoverage::Missing))
+            name.as_str().is_none_or(|name| {
+                matches!(launch.coverage_for_step(name, step), InputCoverage::Missing)
+            })
         })
         .cloned()
         .collect();
@@ -2150,6 +2178,42 @@ mod tests {
         let capability = {
             let mut capability = capability("system.health");
             capability.input_schema = input_requiring(vec!["workspace_root"]);
+            capability
+        };
+        let report = preflight(&package, "0.3.47", &[capability], &json!({}));
+        assert!(report.ready, "{:?}", report.blockers);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_form_field_mapping_covers_renamed_capability_property() {
+        let view = json!({
+            "schema_version": "workflow_view.v1",
+            "title": "Test",
+            "sections": [{
+                "id": "main",
+                "title": "Main",
+                "fields": [{"id": "workspace_root", "label": "Workspace", "type": "text", "required": true}]
+            }]
+        });
+        let (mut package, root) = launch_form_package(view, "segmented");
+        package.steps[0].input = json!({"project_root": "input.workspace_root"});
+        let fields = crate::workflow::launch_form_fields(&package);
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].guaranteed);
+        let launch = LaunchContract::for_package(&package);
+        assert!(matches!(
+            launch.coverage_for_step("project_root", &package.steps[0]),
+            InputCoverage::Guaranteed
+        ));
+        let capability = {
+            let mut capability = capability("system.health");
+            capability.input_schema = json!({
+                "type": "object",
+                "properties": {"project_root": {"type": "string"}},
+                "required": ["project_root"],
+                "additionalProperties": false
+            });
             capability
         };
         let report = preflight(&package, "0.3.47", &[capability], &json!({}));

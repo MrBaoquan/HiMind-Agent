@@ -1,3 +1,4 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -963,6 +964,8 @@ fn handle_local_http(
                         "file_name": result.file_name,
                         "relative_path": result.relative_path,
                         "file_size": result.file_size,
+                        "sha256": result.sha256,
+                        "last_modified_at": result.last_modified_at,
                         "action": result.action,
                         "final": result.complete,
                     })
@@ -1547,6 +1550,8 @@ struct StreamedSMBFile {
     file_name: String,
     relative_path: String,
     file_size: u64,
+    sha256: String,
+    last_modified_at: String,
     action: &'static str,
     complete: bool,
 }
@@ -1713,11 +1718,17 @@ fn stream_smb_file_chunk(
     let temporary = parent.join(format!(".{file_name}.{upload_id}.uploading"));
     let destination_existed = destination.exists();
     if conflict_policy == "skip" && destination_existed && !temporary.exists() {
+        let (existing_size, existing_sha256, existing_modified_at) =
+            streamed_smb_digest(&destination).map_err(|error| {
+                StreamSMBError::io("计算 SMB 文件摘要", error, upload_offset, upload_size)
+            })?;
         return Ok(StreamedSMBFile {
             bytes_received: upload_size,
             file_name: file_name.to_string(),
             relative_path: clean_relative,
-            file_size: upload_size,
+            file_size: existing_size,
+            sha256: existing_sha256,
+            last_modified_at: existing_modified_at,
             action: "skipped",
             complete: true,
         });
@@ -1731,11 +1742,17 @@ fn stream_smb_file_chunk(
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == upload_size)
         && file_range_matches(&destination, upload_offset, body)
     {
+        let (existing_size, existing_sha256, existing_modified_at) =
+            streamed_smb_digest(&destination).map_err(|error| {
+                StreamSMBError::io("计算 SMB 文件摘要", error, upload_offset, upload_size)
+            })?;
         return Ok(StreamedSMBFile {
             bytes_received: upload_size,
             file_name: file_name.to_string(),
             relative_path: clean_relative,
-            file_size: upload_size,
+            file_size: existing_size,
+            sha256: existing_sha256,
+            last_modified_at: existing_modified_at,
             action: "replaced",
             complete: true,
         });
@@ -1802,16 +1819,24 @@ fn stream_smb_file_chunk(
         error.expected_size = Some(upload_size);
         return Err(error);
     }
-    if final_chunk {
+    let (result_sha256, result_modified_at) = if final_chunk {
         commit_streamed_file(&temporary, &destination).map_err(|error| {
             StreamSMBError::io("提交 SMB 文件", error, upload_offset, upload_size)
         })?;
-    }
+        let (_, sha256, modified_at) = streamed_smb_digest(&destination).map_err(|error| {
+            StreamSMBError::io("校验 SMB 文件摘要", error, upload_offset, upload_size)
+        })?;
+        (sha256, modified_at)
+    } else {
+        (String::new(), String::new())
+    };
     Ok(StreamedSMBFile {
         bytes_received,
         file_name: file_name.to_string(),
         relative_path: clean_relative,
         file_size: upload_size,
+        sha256: result_sha256,
+        last_modified_at: result_modified_at,
         action: if destination_existed {
             "replaced"
         } else {
@@ -1821,6 +1846,26 @@ fn stream_smb_file_chunk(
     })
 }
 
+fn streamed_smb_digest(path: &Path) -> std::io::Result<(u64, String, String)> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size = size.saturating_add(read as u64);
+    }
+    let modified: DateTime<Utc> = fs::metadata(path)?.modified()?.into();
+    Ok((
+        size,
+        format!("{:x}", digest.finalize()),
+        modified.to_rfc3339_opts(SecondsFormat::Nanos, true),
+    ))
+}
 fn file_range_matches(path: &Path, offset: u64, expected: &[u8]) -> bool {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
@@ -2114,6 +2159,11 @@ mod local_operation_tests {
         .expect("final chunk");
         assert!(completed.complete);
         assert_eq!(completed.action, "new");
+        assert_eq!(
+            completed.sha256,
+            "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"
+        );
+        assert!(!completed.last_modified_at.is_empty());
         assert_eq!(
             fs::read(root.join("后期").join(name)).expect("destination"),
             b"abcdef"

@@ -78,7 +78,7 @@ mod tests {
             let mut buffer = [0u8; 4096];
             let read = stream.read(&mut buffer).unwrap_or(0);
             *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..read]).to_string();
-            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"按量付费","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true}]}]}"#;
+            let body = r#"{"items":[{"id":"anthropic","name":"Anthropic Claude","vendor_name":"Anthropic","category":"按量付费","description":"Anthropic 官方 API","service_type":"token","protocol":"anthropic","api_mode":"anthropic","base_url":"https://api.anthropic.com","models":[{"display_name":"Claude Sonnet 4","model_alias":"claude-sonnet-4","upstream_model":"claude-sonnet-4-20250514","recommended":true}]}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -103,6 +103,7 @@ mod tests {
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].protocol, "anthropic");
+        assert_eq!(templates[0].api_mode, "anthropic");
         assert_eq!(templates[0].base_url, "https://api.anthropic.com");
         assert_eq!(
             templates[0].models[0].upstream_model,
@@ -121,6 +122,7 @@ mod tests {
         assert_eq!(catalog.items[0].name, "自定义");
         assert!(catalog.items[0].models.is_empty());
         assert_eq!(catalog.items[1].protocol, "");
+        assert_eq!(catalog.items[1].api_mode, "");
         assert!(catalog.items[1].base_url.is_empty());
     }
 
@@ -182,6 +184,10 @@ pub(crate) struct AiProviderTemplate {
     /// GCMP 协议名：`openai_compatible` / `anthropic`（`async_http` 不可用于本机推理）。
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub protocol: String,
+    /// 精确线协议：`openai_chat` / `openai_responses` / `anthropic`。
+    /// 旧目录没有该字段时由 Agent 按 `protocol` 兼容推断。
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub api_mode: String,
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub base_url: String,
     #[serde(default, deserialize_with = "deserialize_nullable_vec_models")]

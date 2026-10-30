@@ -1,3 +1,7 @@
+use crate::app::extension_activation::{
+    resolve_activation_target, ActivationKind, ActivationReceipt, ActivationStatus,
+    ActivationStore, ActivationSurface,
+};
 use crate::skill::manifest::{
     validate_relative_package_path, validate_skill_id, validate_skill_manifest,
 };
@@ -99,6 +103,13 @@ pub(crate) struct AuthoringTestResult {
     pub cleanup: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SkillActivationResult {
+    pub draft: AuthoringDraft,
+    pub activation: ActivationReceipt,
+    pub development_path: PathBuf,
+}
+
 pub(crate) fn list() -> Result<Vec<AuthoringDraft>, Box<dyn Error>> {
     let root = drafts_root();
     if !root.exists() {
@@ -193,8 +204,6 @@ pub(crate) fn save(input: SkillDraftInput) -> Result<AuthoringDraft, Box<dyn Err
     let candidate_path = root.join(format!("{}-{}.hmskill", manifest.id, manifest.version));
     build_archive(&candidate_path, &package_files, checksums.as_bytes())?;
     let candidate_sha256 = sha256_file(&candidate_path)?;
-    // 构建即生效：候选包同时登记为开发直挂 Skill，本机无需安装即可测试。
-    crate::skill::development::register_skill(&package_root)?;
     let unchanged = previous
         .as_ref()
         .map(|draft| draft.candidate_sha256 == candidate_sha256)
@@ -282,6 +291,13 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
 
         let candidate_sha256 = sha256_file(&source)?;
         let previous = read(&manifest.id, &manifest.version).ok();
+        crate::app::extension_activation::ensure_workspace_identity(
+            previous
+                .as_ref()
+                .and_then(|draft| draft.workspace_path.as_deref()),
+            source.parent().unwrap_or(source.as_path()),
+            crate::app::extension_activation::ActivationKind::Skill,
+        )?;
         let unchanged = previous
             .as_ref()
             .is_some_and(|draft| draft.candidate_sha256 == candidate_sha256);
@@ -306,9 +322,6 @@ pub(crate) fn import_package(input: SkillPackageInput) -> Result<AuthoringDraft,
             fs::remove_dir_all(&package_root)?;
         }
         fs::rename(&staging, &package_root)?;
-        // 构建即生效：候选包同时登记为开发直挂 Skill，本机无需安装即可测试。
-        crate::skill::development::register_skill(&package_root)?;
-
         let readme = fs::read_to_string(package_root.join("SKILL.md"))?;
         let mut files = BTreeMap::new();
         for relative in &manifest.contents {
@@ -660,6 +673,8 @@ struct SkillTestSnapshot {
     skill_backup: Option<PathBuf>,
     rendered_backups: Vec<(PathBuf, PathBuf)>,
     lock_entry: Option<crate::app::extension_lock::ExtensionLockEntry>,
+    development_registry_path: PathBuf,
+    development_registry_content: Option<Vec<u8>>,
 }
 
 impl SkillTestSnapshot {
@@ -730,6 +745,8 @@ impl SkillTestSnapshot {
             skill_backup,
             rendered_backups,
             lock_entry: crate::app::extension_lock::read("skill", &manifest.id)?,
+            development_registry_path: crate::skill::development::registry_path(),
+            development_registry_content: fs::read(crate::skill::development::registry_path()).ok(),
         })
     }
 
@@ -752,6 +769,11 @@ impl SkillTestSnapshot {
             }
         }
         crate::app::extension_lock::restore("skill", &self.skill_id, self.lock_entry)?;
+        if let Some(content) = self.development_registry_content {
+            fs::write(&self.development_registry_path, content)?;
+        } else if self.development_registry_path.exists() {
+            fs::remove_file(&self.development_registry_path)?;
+        }
         Ok(())
     }
 }
@@ -805,6 +827,328 @@ pub(crate) fn confirm(skill_id: &str, version: &str) -> Result<AuthoringDraft, B
     draft.updated_at = now_stamp();
     persist(&draft)?;
     Ok(draft)
+}
+
+/// Persist a tested Skill candidate as the current development build.  The
+/// package is copied to a SHA-addressed slot so the draft workspace may be
+/// edited or removed without changing the active version.
+pub(crate) fn activate(
+    skill_id: &str,
+    version: &str,
+    capability_facts: &[CapabilityFact],
+) -> Result<SkillActivationResult, Box<dyn Error>> {
+    let draft = read(skill_id, version)?;
+    let result = activate_draft_with_paths(
+        draft,
+        &development_versions_root(),
+        &crate::skill::development::registry_path(),
+        &ActivationStore::new(activation_store_path()),
+        capability_facts,
+    )?;
+    persist(&result.draft)?;
+    Ok(result)
+}
+
+pub(crate) fn rollback(
+    skill_id: &str,
+    workspace_root: &Path,
+    capability_facts: &[CapabilityFact],
+) -> Result<crate::app::extension_activation::ActivationRollbackResult, Box<dyn Error>> {
+    let store = ActivationStore::new(activation_store_path());
+    let target = resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace_root,
+        &[],
+        None,
+    )?;
+    let active = store
+        .active_for(&target, ActivationKind::Skill, skill_id)?
+        .filter(|receipt| receipt.status == ActivationStatus::Active)
+        .ok_or("Skill 没有可回滚的开发激活记录")?;
+    crate::app::extension_activation::ensure_receipt_workspace(&active, workspace_root)?;
+    let previous_sha = active
+        .previous_sha256
+        .clone()
+        .ok_or("Skill 没有可回滚的上一开发版")?;
+    let slot = development_versions_root()
+        .join(skill_id)
+        .join(&previous_sha);
+    let manifest = crate::skill::manifest::validate_skill_package_root(&slot)?;
+    let record = crate::skill::development::record_at(&slot).ok_or("Skill 上一开发版无法读取")?;
+    let registry_path = crate::skill::development::registry_path();
+    let registry_before = fs::read(&registry_path).ok();
+    let timestamp = now_stamp();
+    let mut receipt = ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: ActivationKind::Skill,
+        extension_id: skill_id.to_string(),
+        version: manifest.version,
+        candidate_sha256: previous_sha,
+        project_id: active.project_id.clone(),
+        workspace_key: active.workspace_key.clone(),
+        target: active.target.clone(),
+        status: ActivationStatus::Active,
+        previous_sha256: Some(active.candidate_sha256.clone()),
+        surfaces: vec![
+            ActivationSurface::visible("runtime"),
+            ActivationSurface::visible("mcp"),
+        ],
+        activated_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    if let Err(error) = crate::skill::development::activate_skill_at(&slot, &registry_path) {
+        restore_registry_file(&registry_path, registry_before.as_deref());
+        return Err(error);
+    }
+    let clients = receipt.target.clients.clone();
+    if !clients.is_empty() {
+        match crate::skill::sync_development_record_to_clients(
+            &record,
+            VERSION,
+            capability_facts,
+            Some(&clients),
+        ) {
+            Ok(rendered) => {
+                for client in rendered.keys() {
+                    receipt
+                        .surfaces
+                        .push(ActivationSurface::visible(format!("client:{client}")));
+                }
+            }
+            Err(error) => {
+                receipt.status = ActivationStatus::Partial;
+                receipt.surfaces.push(ActivationSurface {
+                    id: "clients".to_string(),
+                    state: crate::app::extension_activation::ActivationSurfaceState::Failed,
+                    detail: error.to_string(),
+                });
+            }
+        }
+    }
+    let mut transaction = match store.stage(&receipt) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            restore_registry_file(&registry_path, registry_before.as_deref());
+            return Err(error);
+        }
+    };
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = store.rollback(&mut transaction);
+        restore_registry_file(&registry_path, registry_before.as_deref());
+        return Err(error);
+    }
+    Ok(crate::app::extension_activation::ActivationRollbackResult {
+        activation: receipt,
+    })
+}
+
+fn activate_draft_with_paths(
+    mut draft: AuthoringDraft,
+    versions_root: &Path,
+    registry_path: &Path,
+    activation_store: &ActivationStore,
+    capability_facts: &[CapabilityFact],
+) -> Result<SkillActivationResult, Box<dyn Error>> {
+    ensure_candidate_unchanged(&draft)?;
+    if draft.tested_at.is_none() {
+        return Err("请先安装到声明的 AI 客户端并完成本地测试".into());
+    }
+    let package_root =
+        draft_version_root(&draft.manifest.id, &draft.manifest.version).join("package");
+    let manifest = crate::skill::manifest::validate_skill_package_root(&package_root)?;
+    if manifest.id != draft.manifest.id || manifest.version != draft.manifest.version {
+        return Err("Skill 候选包身份与草稿不一致".into());
+    }
+    crate::app::skill_manager::verify_checksums(&package_root)?;
+    crate::app::skill_manager::verify_declared_contents(&package_root)?;
+
+    let slot = versions_root
+        .join(&draft.manifest.id)
+        .join(&draft.candidate_sha256);
+    let staging = versions_root
+        .join(&draft.manifest.id)
+        .join(format!(".staging-{}", now_stamp()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    let staged = (|| -> Result<(), Box<dyn Error>> {
+        copy_package_tree(&package_root, &staging)?;
+        crate::app::skill_manager::verify_checksums(&staging)?;
+        crate::skill::manifest::validate_skill_package_root(&staging)?;
+        if slot.exists() {
+            fs::remove_dir_all(&slot)?;
+        }
+        if let Some(parent) = slot.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&staging, &slot)?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    let workspace = draft
+        .workspace_path
+        .as_deref()
+        .or_else(|| package_root.parent())
+        .ok_or("Skill 候选缺少工作区")?;
+    let workspace_key = crate::extension_projects::workspace_key_of(workspace);
+    let target = resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace,
+        &draft.client_targets.keys().cloned().collect::<Vec<_>>(),
+        None,
+    )?;
+    let previous = activation_store
+        .active_for(&target, ActivationKind::Skill, &draft.manifest.id)?
+        .filter(|receipt| receipt.status == ActivationStatus::Active);
+    let previous_record = previous.as_ref().and_then(|receipt| {
+        crate::skill::development::record_at(
+            &versions_root
+                .join(&draft.manifest.id)
+                .join(&receipt.candidate_sha256),
+        )
+    });
+    let previous_sha256 = previous.map(|item| item.candidate_sha256);
+    let now = now_stamp();
+    let mut receipt = ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: ActivationKind::Skill,
+        extension_id: draft.manifest.id.clone(),
+        version: draft.manifest.version.clone(),
+        candidate_sha256: draft.candidate_sha256.clone(),
+        project_id: format!("skill:{}@{}", draft.manifest.id, workspace_key),
+        workspace_key,
+        target,
+        status: ActivationStatus::Active,
+        previous_sha256,
+        surfaces: vec![
+            ActivationSurface::visible("runtime"),
+            ActivationSurface::visible("mcp"),
+        ],
+        activated_at: now.clone(),
+        updated_at: now,
+    };
+    let registry_before = fs::read(registry_path).ok();
+    let active = crate::skill::development::activate_skill_at(&slot, registry_path);
+    if let Err(error) = active {
+        restore_registry_file(registry_path, registry_before.as_deref());
+        let _ = fs::remove_dir_all(&slot);
+        return Err(error);
+    }
+    let record = crate::skill::development::record_at(&slot).ok_or("Skill 开发槽写入后无法读取")?;
+    let clients = receipt.target.clients.clone();
+    if !clients.is_empty() {
+        match crate::skill::sync_development_record_to_clients(
+            &record,
+            VERSION,
+            capability_facts,
+            Some(&clients),
+        ) {
+            Ok(rendered) => {
+                for client in rendered.keys() {
+                    receipt
+                        .surfaces
+                        .push(ActivationSurface::visible(format!("client:{client}")));
+                }
+            }
+            Err(error) => {
+                let surface_rollback = if let Some(previous_record) = previous_record.as_ref() {
+                    crate::skill::sync_development_record_to_clients(
+                        previous_record,
+                        VERSION,
+                        capability_facts,
+                        Some(&clients),
+                    )
+                    .map(|_| ())
+                } else {
+                    crate::skill::remove_development_record_from_clients(&record, &clients)
+                        .map(|_| ())
+                };
+                let registry_rollback =
+                    try_restore_registry_file(registry_path, registry_before.as_deref());
+                let _ = fs::remove_dir_all(&slot);
+                return match (surface_rollback, registry_rollback) {
+                    (Ok(()), Ok(())) => {
+                        Err(format!(
+                            "Skill 客户端投影失败，已回滚开发版投影与激活指针: {error}"
+                        )
+                        .into())
+                    }
+                    (surface, registry) => Err(format!(
+                        "Skill 客户端投影失败且自动回滚不完整: {error}; clients={surface:?}; registry={registry:?}"
+                    )
+                    .into()),
+                };
+            }
+        }
+    }
+    let mut transaction = match activation_store.stage(&receipt) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            restore_registry_file(registry_path, registry_before.as_deref());
+            let _ = fs::remove_dir_all(&slot);
+            return Err(error);
+        }
+    };
+    if let Err(error) = activation_store.commit(&mut transaction) {
+        let rollback = activation_store.rollback(&mut transaction);
+        restore_registry_file(registry_path, registry_before.as_deref());
+        let _ = fs::remove_dir_all(&slot);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => {
+                Err(format!("Skill 激活台账提交失败且回滚失败: {error}; {rollback_error}").into())
+            }
+        };
+    }
+    draft.updated_at = now_stamp();
+    Ok(SkillActivationResult {
+        draft,
+        activation: receipt,
+        development_path: slot,
+    })
+}
+
+fn restore_registry_file(path: &Path, content: Option<&[u8]>) {
+    match content {
+        Some(content) => {
+            let _ = crate::store::atomic_file::atomic_write(path, content);
+        }
+        None => {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn try_restore_registry_file(path: &Path, content: Option<&[u8]>) -> Result<(), Box<dyn Error>> {
+    match content {
+        Some(content) => crate::store::atomic_file::atomic_write(path, content)?,
+        None if path.exists() => fs::remove_file(path)?,
+        None => {}
+    }
+    Ok(())
+}
+
+fn copy_package_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    for entry in walkdir::WalkDir::new(source).min_depth(1) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(source)?;
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn mark_submitted(
@@ -980,6 +1324,22 @@ fn drafts_root() -> PathBuf {
     crate::store::paths::agent_home().join("skill-drafts")
 }
 
+fn development_versions_root() -> PathBuf {
+    if let Some(root) = env::var_os("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR") {
+        return PathBuf::from(root);
+    }
+    crate::store::paths::agent_home().join("skill-development-versions")
+}
+
+fn activation_store_path() -> PathBuf {
+    if let Some(path) = env::var_os("HIMIND_EXTENSION_ACTIVATION_STORE") {
+        return PathBuf::from(path);
+    }
+    crate::store::paths::agent_home()
+        .join("data")
+        .join("extension-activations.json")
+}
+
 fn draft_version_root(skill_id: &str, version: &str) -> PathBuf {
     drafts_root().join(skill_id).join(version)
 }
@@ -1001,6 +1361,7 @@ fn default_clients() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::paths::test_env_lock;
 
     fn input(readme: &str) -> SkillDraftInput {
         SkillDraftInput {
@@ -1023,6 +1384,7 @@ mod tests {
 
     #[test]
     fn creates_deterministic_candidate_and_invalidates_confirmation_after_edit() {
+        let _guard = test_env_lock();
         let root = env::temp_dir().join(format!("himind-authoring-test-{}", now_stamp()));
         env::set_var("HIMIND_SKILL_DRAFTS_DIR", &root);
         let mut first = save(input("# Demo")).unwrap();
@@ -1079,6 +1441,299 @@ mod tests {
         assert!(rebuilt.submitted_at.is_none());
         assert!(rebuilt.dashboard_draft_id.is_none());
         env::remove_var("HIMIND_SKILL_DRAFTS_DIR");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_previous_skill_sha_and_registry() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("himind-skill-rollback-test-{}", now_stamp()));
+        let versions = root.join("development-versions");
+        let registry = root.join("skill-development.json");
+        let activation_store = root.join("activations.json");
+        env::set_var("HIMIND_SKILL_DRAFTS_DIR", root.join("drafts"));
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR", &versions);
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_REGISTRY", &registry);
+        env::set_var("HIMIND_EXTENSION_ACTIVATION_STORE", &activation_store);
+
+        let store = ActivationStore::new(&activation_store);
+        let mut shas = Vec::new();
+        for readme in ["# First build", "# Second build"] {
+            let mut draft = save(input(readme)).unwrap();
+            draft.tested_at = Some(now_stamp());
+            persist(&draft).unwrap();
+            shas.push(draft.candidate_sha256.clone());
+            activate_draft_with_paths(draft, &versions, &registry, &store, &[]).unwrap();
+        }
+
+        let draft = read(&input("# current").id, "1.0.0").unwrap();
+        let workspace = draft.workspace_path.as_deref().unwrap();
+        let target =
+            resolve_activation_target(&crate::store::paths::profile_name(), workspace, &[], None)
+                .unwrap();
+        assert_eq!(
+            store
+                .active_for(&target, ActivationKind::Skill, &draft.manifest.id)
+                .unwrap()
+                .unwrap()
+                .candidate_sha256,
+            shas[1]
+        );
+
+        let rolled_back = rollback(&draft.manifest.id, workspace, &[]).unwrap();
+        assert_eq!(rolled_back.activation.candidate_sha256, shas[0]);
+        let registry_value: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        let active_path = PathBuf::from(registry_value[0]["path"].as_str().unwrap());
+        assert_eq!(
+            active_path.canonicalize().unwrap(),
+            versions
+                .join(&draft.manifest.id)
+                .join(&shas[0])
+                .canonicalize()
+                .unwrap()
+        );
+        assert!(crate::skill::development::record_at(&active_path).is_some());
+        assert!(rolled_back
+            .activation
+            .surfaces
+            .iter()
+            .any(|surface| surface.id == "runtime"));
+
+        for key in [
+            "HIMIND_SKILL_DRAFTS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_REGISTRY",
+            "HIMIND_EXTENSION_ACTIVATION_STORE",
+        ] {
+            env::remove_var(key);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_client_projection_restores_previous_skill_and_registry() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("s-{}-{}", std::process::id(), now_stamp()));
+        let drafts = root.join("drafts");
+        let versions = root.join("development-versions");
+        let registry = root.join("skill-development.json");
+        let activation_store = root.join("activations.json");
+        let codex_skills = root.join("codex-skills");
+        env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        env::set_var("HIMIND_SKILL_DRAFTS_DIR", &drafts);
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR", &versions);
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_REGISTRY", &registry);
+        env::set_var("HIMIND_EXTENSION_ACTIVATION_STORE", &activation_store);
+        env::set_var("HIMIND_CODEX_SKILL_DIR", &codex_skills);
+
+        let store = ActivationStore::new(&activation_store);
+        let mut first = save(input("# First projection")).unwrap();
+        first.tested_at = Some(now_stamp());
+        first.client_targets.insert(
+            "codex".to_string(),
+            codex_skills.to_string_lossy().to_string(),
+        );
+        persist(&first).unwrap();
+        let first_activation =
+            activate_draft_with_paths(first.clone(), &versions, &registry, &store, &[]).unwrap();
+
+        let mut second = save(input("# Second projection")).unwrap();
+        second.tested_at = Some(now_stamp());
+        second.client_targets.insert(
+            "codex".to_string(),
+            codex_skills.to_string_lossy().to_string(),
+        );
+        persist(&second).unwrap();
+        assert_eq!(
+            store
+                .active_for(
+                    &first_activation.activation.target,
+                    ActivationKind::Skill,
+                    &first.manifest.id
+                )
+                .unwrap()
+                .unwrap()
+                .candidate_sha256,
+            first_activation.activation.candidate_sha256
+        );
+        let registry_before_second_activation: Value =
+            serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        assert!(registry_before_second_activation[0]["path"]
+            .as_str()
+            .unwrap()
+            .contains(&first_activation.activation.candidate_sha256));
+        env::set_var("HIMIND_TEST_FAIL_SKILL_SYNC_CLIENT", "himind-ai");
+        let error = activate_draft_with_paths(second.clone(), &versions, &registry, &store, &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("已回滚"));
+        assert_eq!(
+            store
+                .active_for(
+                    &first_activation.activation.target,
+                    ActivationKind::Skill,
+                    &first.manifest.id
+                )
+                .unwrap()
+                .unwrap()
+                .candidate_sha256,
+            first_activation.activation.candidate_sha256
+        );
+        let registry_value: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        assert!(registry_value[0]["path"]
+            .as_str()
+            .unwrap()
+            .contains(&first_activation.activation.candidate_sha256));
+        let projected = walkdir::WalkDir::new(&codex_skills)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(projected.contains("First projection"));
+        assert!(!projected.contains("Second projection"));
+        assert!(!versions
+            .join(&second.manifest.id)
+            .join(&second.candidate_sha256)
+            .exists());
+
+        for key in [
+            "HIMIND_AGENT_HOME",
+            "HIMIND_SKILL_DRAFTS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_REGISTRY",
+            "HIMIND_EXTENSION_ACTIVATION_STORE",
+            "HIMIND_CODEX_SKILL_DIR",
+            "HIMIND_TEST_FAIL_SKILL_SYNC_CLIENT",
+        ] {
+            env::remove_var(key);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_first_projection_removes_partial_client_copy() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("f-{}-{}", std::process::id(), now_stamp()));
+        let versions = root.join("development-versions");
+        let registry = root.join("skill-development.json");
+        let activation_store = root.join("activations.json");
+        let codex_skills = root.join("codex-skills");
+        env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        env::set_var("HIMIND_SKILL_DRAFTS_DIR", root.join("drafts"));
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR", &versions);
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_REGISTRY", &registry);
+        env::set_var("HIMIND_EXTENSION_ACTIVATION_STORE", &activation_store);
+        env::set_var("HIMIND_CODEX_SKILL_DIR", &codex_skills);
+
+        let mut draft = save(input("# First failed projection")).unwrap();
+        draft.tested_at = Some(now_stamp());
+        draft.client_targets.insert(
+            "codex".to_string(),
+            codex_skills.to_string_lossy().to_string(),
+        );
+        persist(&draft).unwrap();
+        let store = ActivationStore::new(&activation_store);
+        env::set_var("HIMIND_TEST_FAIL_SKILL_SYNC_CLIENT", "himind-ai");
+        let error = activate_draft_with_paths(draft.clone(), &versions, &registry, &store, &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("已回滚"));
+        assert!(store
+            .active_for(
+                &resolve_activation_target(
+                    &crate::store::paths::profile_name(),
+                    &draft.workspace_path.clone().unwrap(),
+                    &[],
+                    None,
+                )
+                .unwrap(),
+                ActivationKind::Skill,
+                &draft.manifest.id,
+            )
+            .unwrap()
+            .is_none());
+        assert!(!codex_skills.join("authoring-test").exists());
+        if registry.exists() {
+            assert!(!fs::read_to_string(&registry)
+                .unwrap()
+                .contains(&versions.to_string_lossy().to_string()));
+        }
+
+        for key in [
+            "HIMIND_AGENT_HOME",
+            "HIMIND_SKILL_DRAFTS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_REGISTRY",
+            "HIMIND_EXTENSION_ACTIVATION_STORE",
+            "HIMIND_CODEX_SKILL_DIR",
+            "HIMIND_TEST_FAIL_SKILL_SYNC_CLIENT",
+        ] {
+            env::remove_var(key);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_refuses_to_overwrite_an_unmanaged_client_skill() {
+        let _guard = test_env_lock();
+        let root = env::temp_dir().join(format!("u-{}-{}", std::process::id(), now_stamp()));
+        let versions = root.join("development-versions");
+        let registry = root.join("skill-development.json");
+        let activation_store = root.join("activations.json");
+        let codex_skills = root.join("codex-skills");
+        let user_skill = codex_skills.join("authoring-test");
+        fs::create_dir_all(&user_skill).unwrap();
+        let user_file = user_skill.join("SKILL.md");
+        fs::write(&user_file, "user-owned skill").unwrap();
+        env::set_var("HIMIND_AGENT_HOME", root.join("home"));
+        env::set_var("HIMIND_SKILL_DRAFTS_DIR", root.join("drafts"));
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR", &versions);
+        env::set_var("HIMIND_SKILL_DEVELOPMENT_REGISTRY", &registry);
+        env::set_var("HIMIND_EXTENSION_ACTIVATION_STORE", &activation_store);
+        env::set_var("HIMIND_CODEX_SKILL_DIR", &codex_skills);
+
+        let mut draft = save(input("# Managed candidate")).unwrap();
+        draft.tested_at = Some(now_stamp());
+        draft.client_targets.insert(
+            "codex".to_string(),
+            codex_skills.to_string_lossy().to_string(),
+        );
+        persist(&draft).unwrap();
+        let store = ActivationStore::new(&activation_store);
+        assert!(
+            activate_draft_with_paths(draft.clone(), &versions, &registry, &store, &[]).is_err()
+        );
+        assert_eq!(fs::read_to_string(&user_file).unwrap(), "user-owned skill");
+        assert!(store
+            .active_for(
+                &resolve_activation_target(
+                    &crate::store::paths::profile_name(),
+                    &draft.workspace_path.clone().unwrap(),
+                    &[],
+                    None,
+                )
+                .unwrap(),
+                ActivationKind::Skill,
+                &draft.manifest.id,
+            )
+            .unwrap()
+            .is_none());
+        if registry.exists() {
+            assert!(!fs::read_to_string(&registry)
+                .unwrap()
+                .contains(&versions.to_string_lossy().to_string()));
+        }
+
+        for key in [
+            "HIMIND_AGENT_HOME",
+            "HIMIND_SKILL_DRAFTS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_VERSIONS_DIR",
+            "HIMIND_SKILL_DEVELOPMENT_REGISTRY",
+            "HIMIND_EXTENSION_ACTIVATION_STORE",
+            "HIMIND_CODEX_SKILL_DIR",
+        ] {
+            env::remove_var(key);
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -4767,14 +4767,11 @@ fn build_opencode_config(
         .iter()
         .map(|model| {
             let metadata = model_metadata_or_known(credential, model);
+            // OpenCode 2.2.2 遇到“带 `/` 的网关模型 ID + limit”时会静默丢弃
+            // 整个 provider。模型 key 必须保持网关暴露 ID 原样，否则请求会带
+            // 本地别名发送并被网关拒绝为 unknown_model；因此只保留 ID/名称与
+            // capabilities，不在 OpenCode 侧声明上下文 limit。
             let mut entry = json!({ "name": model });
-            if let Some(context) = metadata.context_window {
-                let mut limit = json!({ "context": context });
-                if let Some(output) = metadata.max_output_tokens {
-                    limit["output"] = json!(output);
-                }
-                entry["limit"] = limit;
-            }
             if !metadata.input_modalities.is_empty() {
                 entry["capabilities"] = json!({
                     "input": metadata.input_modalities,
@@ -9377,8 +9374,7 @@ command = "uvx.exe"
             build_opencode_config("", &credential, &["deepseek-v4.1-flash".to_string()]).unwrap();
         let opencode: Value = serde_json::from_str(&opencode).unwrap();
         let model = &opencode["provider"]["himind"]["models"]["deepseek-v4.1-flash"];
-        assert_eq!(model["limit"]["context"], 1_000_000);
-        assert_eq!(model["limit"]["output"], 64_000);
+        assert!(model.get("limit").is_none());
         assert_eq!(model["capabilities"]["input"], json!(["text", "image"]));
 
         let rules = build_zcode_provider_rules(
@@ -10178,6 +10174,36 @@ command = "uvx.exe"
         assert_eq!(
             provider["models"]["deepseek-v4-pro"]["name"],
             "deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn opencode_namespaced_models_keep_gateway_id_without_limit() {
+        let models = vec![
+            "himind_hd/deepseek-v4.1-flash".to_string(),
+            "gpt-yundu/gpt-6-astra".to_string(),
+        ];
+        let mut credential =
+            credential(&["himind_hd/deepseek-v4.1-flash", "gpt-yundu/gpt-6-astra"]);
+        credential.model_metadata.insert(
+            "himind_hd/deepseek-v4.1-flash".to_string(),
+            AIModelMetadata {
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(64_000),
+                input_modalities: vec!["text".to_string(), "image".to_string()],
+            },
+        );
+        let updated = build_opencode_config("", &credential, &models).unwrap();
+        let root: Value = serde_json::from_str(&updated).unwrap();
+        let catalog = &root["provider"]["himind"]["models"];
+        let flash = &catalog["himind_hd/deepseek-v4.1-flash"];
+        assert_eq!(flash["name"], "himind_hd/deepseek-v4.1-flash");
+        assert!(flash.get("modelID").is_none());
+        assert!(flash.get("limit").is_none());
+        assert_eq!(flash["capabilities"]["input"], json!(["text", "image"]));
+        assert_eq!(
+            catalog["gpt-yundu/gpt-6-astra"]["name"],
+            "gpt-yundu/gpt-6-astra"
         );
     }
 

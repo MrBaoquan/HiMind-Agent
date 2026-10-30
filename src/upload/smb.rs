@@ -1,5 +1,7 @@
+use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Write};
@@ -163,7 +165,7 @@ pub(crate) fn execute_smb_upload_with_context(
                 ),
             )
         });
-        let size = match copy_result {
+        let (size, source_sha256) = match copy_result {
             Ok(size) => size,
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
@@ -175,10 +177,17 @@ pub(crate) fn execute_smb_upload_with_context(
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
+        let destination_sha256 = file_sha256(&destination)?;
+        if destination_sha256 != source_sha256 {
+            return Err("SMB destination SHA-256 does not match the source".into());
+        }
+        let destination_modified_at = file_modified_at(&destination)?;
         files.push(json!({
             "file_name": file_name,
             "relative_path": relative_path.replace('\\', "/"),
             "file_size": size,
+            "sha256": destination_sha256,
+            "last_modified_at": destination_modified_at,
             "action": if existed { "replaced" } else { "new" },
         }));
         let progress = transfer_progress(transferred_bytes, total_bytes, index + 1, sources.len());
@@ -210,13 +219,14 @@ fn copy_with_progress<F>(
     source: &Path,
     target: &Path,
     mut progress: F,
-) -> Result<u64, Box<dyn Error>>
+) -> Result<(u64, String), Box<dyn Error>>
 where
     F: FnMut(u64) -> Result<(), Box<dyn Error>>,
 {
     const BUFFER_SIZE: usize = 1024 * 1024;
     let mut reader = fs::File::open(source)?;
     let mut writer = fs::File::create(target)?;
+    let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; BUFFER_SIZE];
     let mut copied = 0_u64;
     let mut last_report = Instant::now()
@@ -228,6 +238,7 @@ where
             break;
         }
         writer.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
         copied = copied.saturating_add(read as u64);
         if last_report.elapsed() >= Duration::from_secs(1) {
             progress(copied)?;
@@ -236,9 +247,27 @@ where
     }
     writer.flush()?;
     progress(copied)?;
-    Ok(copied)
+    Ok((copied, format!("{:x}", digest.finalize())))
 }
 
+fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
+    let mut reader = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn file_modified_at(path: &Path) -> Result<String, Box<dyn Error>> {
+    let modified: DateTime<Utc> = fs::metadata(path)?.modified()?.into();
+    Ok(modified.to_rfc3339_opts(SecondsFormat::Nanos, true))
+}
 fn commit_temporary_file(
     temporary: &Path,
     destination: &Path,
@@ -360,7 +389,7 @@ fn collect_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_temporary_file, transfer_detail, transfer_progress};
+    use super::{commit_temporary_file, file_sha256, transfer_detail, transfer_progress};
     use std::fs;
 
     #[test]
@@ -384,6 +413,21 @@ mod tests {
         assert!(detail.contains("5.0 MB/10.0 MB"));
         assert!(detail.contains("1.0 MB/s"));
         assert!(detail.contains("剩余 5 秒"));
+    }
+
+    #[test]
+    fn computes_the_sha256_of_written_content() {
+        let root =
+            std::env::temp_dir().join(format!("himind-smb-hash-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("asset.bin");
+        fs::write(&path, b"resource content").unwrap();
+        assert_eq!(
+            file_sha256(&path).unwrap(),
+            "f402747844782ce0bcf07272c0edbc361ad315856c3f746f13367ac3ae5aaa70"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

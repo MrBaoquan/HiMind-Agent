@@ -385,7 +385,31 @@ pub(crate) fn sync_record_to_clients(
     capability_facts: &[CapabilityFact],
     targets: Option<&[String]>,
 ) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
-    ensure_workspace_record_is_current(record)?;
+    sync_record_to_clients_internal(record, agent_version, capability_facts, targets, true)
+}
+
+/// Development activation is an explicit replacement of the current
+/// workspace version. It bypasses the normal workspace pin gate, then writes a
+/// new lock entry through the client renderers.
+pub(crate) fn sync_development_record_to_clients(
+    record: &SkillRecord,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+    targets: Option<&[String]>,
+) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    sync_record_to_clients_internal(record, agent_version, capability_facts, targets, false)
+}
+
+fn sync_record_to_clients_internal(
+    record: &SkillRecord,
+    agent_version: &str,
+    capability_facts: &[CapabilityFact],
+    targets: Option<&[String]>,
+    enforce_workspace_pin: bool,
+) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    if enforce_workspace_pin {
+        ensure_workspace_record_is_current(record)?;
+    }
     let selected = targets.map(|values| {
         values
             .iter()
@@ -405,6 +429,15 @@ pub(crate) fn sync_record_to_clients(
         if clients.contains_key(&normalized) {
             continue;
         }
+        #[cfg(test)]
+        if std::env::var("HIMIND_TEST_FAIL_SKILL_SYNC_CLIENT")
+            .ok()
+            .as_deref()
+            == Some(normalized.as_str())
+        {
+            std::env::remove_var("HIMIND_TEST_FAIL_SKILL_SYNC_CLIENT");
+            return Err(format!("injected Skill projection failure: {normalized}").into());
+        }
         let rendered = match normalized.as_str() {
             "codex" => codex::sync_record_json(record, agent_version, capability_facts)?,
             "himind-ai" => himind_ai_sync_record_json(record, agent_version, capability_facts)?,
@@ -413,6 +446,24 @@ pub(crate) fn sync_record_to_clients(
         clients.insert(normalized, rendered);
     }
     Ok(clients)
+}
+
+/// Best-effort removal of a failed first development activation from the
+/// selected clients.  Only receipt-backed HiMind projections are touched.
+pub(crate) fn remove_development_record_from_clients(
+    record: &SkillRecord,
+    targets: &[String],
+) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    let mut removed = BTreeMap::new();
+    for normalized in sync_client_ids_for_targets(record, targets) {
+        let value = match normalized.as_str() {
+            "himind-ai" => continue,
+            "codex" => codex::uninstall_json(&record.manifest.id)?,
+            _ => direct::uninstall_for_client(&normalized, &record.manifest.id)?,
+        };
+        removed.insert(normalized, value);
+    }
+    Ok(removed)
 }
 
 /// A regular per-Skill sync is a repair operation for the current target.  In

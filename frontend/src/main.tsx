@@ -33,7 +33,7 @@ import type { WorkbenchConnectionDraft } from './components/WorkbenchConnections
 const TaskCenterPage = lazyNamed(() => import('./pages/TaskCenterPage'), 'TaskCenterPage');
 const WorkflowsPage = lazyNamed(() => import('./pages/WorkflowsPage'), 'WorkflowsPage');
 const SchedulesPage = lazyNamed(() => import('./pages/SchedulesPage'), 'SchedulesPage');
-import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type GatewayProfile, type GatewayProfileInput, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
+import { agentApi, type AIServiceListResult, type AIServiceTemplateListResult, type AcpRuntimeProfileSnapshot, type AgentStatus, type AgentUpdateStatus, type AiUsageRange, type ApprovalFact, type ApprovalItem, type ApprovalSettings, type BuiltinAIToolContextSummary, type BuiltinAiWorkspaceTarget, type CapabilityItem, type ClientCapabilityMatrix, type CodexSkillStatusResponse, type CreateExtensionProjectInput, type DashboardAuthorizationProgress, type DashboardIdentityStatus, type ExpertCatalogItem, type ExpertSummary, type ExtensionActivationReceipt, type ExtensionCollaborationInvitation, type ExtensionProject, type ExtensionProjectKind, type ExtensionProjectSourceInput, type ExtensionRemoteProject, type ExtensionSourceAcquisition, type ExtensionSourceConfig, type ExtensionSourceSettings, type ExtensionSourceSnapshot, type ExtensionWorkspaceEntry, type ExtensionWorkspaceSettings, type InferenceGatewayStatus, type GatewayProfile, type GatewayProfileInput, type InstructionPackCatalogItem, type InstructionPackDraft, type LocalUsageOverview, type McpConnectionTestResult, type McpTargetDescriptor, type ProjectionSyncStatus, type SkillCatalogResponse, type OrganizationSkillCatalogItem, type AuthoringPluginDraft, type AuthoringSkillDraft, type AuthoringWorkflowDraft, type PluginSubmissionStatus, type SkillSubmissionStatus, type LogItem, type LoginState, type PluginQuickAccessView, type PluginRegistry, type RemoteClientOverview, type RemoteExecutionSettings, type SkillSyncSettings, type SkillWorkspaceStatus, type SvnConnection, type SvnConnectionInput, type WorkbenchConnection, type WorkbenchConnectionsSnapshot, type WorkbenchProbe, type WorkflowCenterSnapshot, type WorkflowRunSnapshot, type WorkflowRunVerification } from './services/agentApi';
 
 import { hydrateWorkflowOptionSources } from './pages/workflowOptionSources';
 import { errorDetail, formatError, type InstalledKind, type NavigationTarget, type PageKey, type UiMessage } from './types';
@@ -282,6 +282,7 @@ function AgentApp() {
   useEffect(() => { skillStatusSnapshot.current = skillStatus; }, [skillStatus]);
   const [skillOperation, setSkillOperation] = useState<string | null>(null);
   const [extensionProjects, setExtensionProjects] = useState<ExtensionProject[]>([]);
+  const [extensionActivations, setExtensionActivations] = useState<ExtensionActivationReceipt[]>([]);
   const [extensionWorkspace, setExtensionWorkspace] = useState<ExtensionWorkspaceSettings>({ configured: false, valid: false, root: '', catalog_path: '', repository: '', default_branch: '', extension_count: 0, error: '' });
   /// 登记过的本机开发目录清单。扩展开发页的左栏就是它，和市场无关，因此单独持有。
   const [extensionWorkspaces, setExtensionWorkspaces] = useState<ExtensionWorkspaceEntry[]>([]);
@@ -932,8 +933,9 @@ function AgentApp() {
   async function refreshDevelopment(force = false) {
     return singleFlight('development', async () => {
       try {
-      const [projects, pluginDraftResult, skillDraftResult, workflowDraftResult, expertDraftResult, instructionDraftResult] = await Promise.allSettled([
+      const [projects, activations, pluginDraftResult, skillDraftResult, workflowDraftResult, expertDraftResult, instructionDraftResult] = await Promise.allSettled([
       withTimeout(agentApi.extensionProjects(), '扩展项目'),
+      withTimeout(agentApi.extensionActivations(), '扩展激活状态'),
       withTimeout(agentApi.pluginDrafts(), '插件草稿'),
       withTimeout(agentApi.skillDrafts(), '技能草稿'),
       withTimeout(agentApi.workflowDrafts(), '工作流草稿'),
@@ -957,6 +959,7 @@ function AgentApp() {
         formatError(projects.reason, '扩展项目读取失败'),
       );
     }
+    if (activations.status === 'fulfilled') setExtensionActivations(activations.value || []);
     if (pluginDraftResult.status === 'fulfilled') setPluginDrafts(pluginDraftResult.value || []);
     if (skillDraftResult.status === 'fulfilled') setSkillDrafts(skillDraftResult.value || []);
     if (workflowDraftResult.status === 'fulfilled') setWorkflowDrafts(workflowDraftResult.value || []);
@@ -1568,25 +1571,29 @@ function AgentApp() {
     if (candidate.kind === 'plugin') {
       await agentApi.testPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
       await agentApi.confirmPluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      await agentApi.activatePluginDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
     } else if (candidate.kind === 'skill') {
       await agentApi.testSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
       await agentApi.confirmSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      await agentApi.activateSkillDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
     } else if (candidate.kind === 'workflow') {
       await agentApi.testWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
       await agentApi.confirmWorkflowDraft(candidate.draft.package_id, candidate.draft.version);
     } else if (candidate.kind === 'expert') {
       await agentApi.testExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
       await agentApi.confirmExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
+      await agentApi.activateExpertDraft(candidate.draft.definition.id, candidate.draft.definition.version);
     } else {
       await agentApi.testInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
       await agentApi.confirmInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
+      await agentApi.activateInstructionPackDraft(candidate.draft.manifest.id, candidate.draft.manifest.version);
     }
     onProgress?.('refreshing');
     if (deferCapabilityRefresh) {
-      await refreshDevelopment();
+      await refreshDevelopment(true);
     } else {
       await Promise.all([
-        refreshDevelopment(),
+        refreshDevelopment(true),
         refreshPlugins(),
         refreshSkills(),
         refreshWorkflowCenter(false, true),
@@ -2553,6 +2560,7 @@ function AgentApp() {
       workflowDrafts={workflowDrafts}
       expertDrafts={expertDrafts}
       instructionDrafts={instructionDrafts}
+      extensionActivations={extensionActivations}
       workflowSubmissions={workflowSubmissions}
       pluginSubmissions={pluginSubmissions}
       skillSubmissions={skillSubmissions}
@@ -2576,7 +2584,7 @@ function AgentApp() {
       }}
       onOpenProject={() => runDevelopmentOperation('open', async () => { await agentApi.openExtensionProjects(); await refreshDevelopment(); }, '已添加到扩展开发', '打开扩展项目失败')}
       onAssociateProject={(project: ExtensionRemoteProject) => runDevelopmentOperation(`associate:${project.product_key}`, async () => { await agentApi.associateExtensionProject(project); await refreshDevelopment(); }, '本地项目已关联', '关联本地项目失败')}
-      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, () => buildOneProject(projectId, onProgress), '构建完成，已在本机启用', '构建或启用失败')}
+      onBuild={(projectId, onProgress) => runDevelopmentOperation(`build:${projectId}`, () => buildOneProject(projectId, onProgress), '构建完成，已执行本地开发版激活', '构建或开发版激活失败')}
       // 工作区级「一键构建」：页面按依赖排好序后交过来，这里逐个执行。
       // 单个失败不打断后面的；被依赖的项没成功就跳过依赖者（跳过不是失败）。
       // 失败与跳过都以值的形式交回页面，由页面在同一条提示里说明是谁、为什么。
@@ -2606,6 +2614,7 @@ function AgentApp() {
           }
           // 派生视图整批刷一次：逐项各刷一遍，在 28 项的批次里就是上百次全量刷新。
           await Promise.all([
+            refreshDevelopment(true),
             refreshPlugins(),
             refreshSkills(),
             refreshWorkflowCenter(false, true),
@@ -2614,7 +2623,7 @@ function AgentApp() {
           if (failures.length) {
             notify('error', `一键构建：${succeeded.size}/${projects.length} 成功，${failures.length} 项失败，${skipped.length} 项跳过`);
           } else {
-            notify('success', `已构建并启用 ${succeeded.size} 个扩展${skipped.length ? `，跳过 ${skipped.length} 项` : ''}`);
+            notify('success', `已构建并激活 ${succeeded.size} 个本机开发版${skipped.length ? `，跳过 ${skipped.length} 项` : ''}`);
           }
           return { succeeded: succeeded.size, failures, skipped };
         } finally {

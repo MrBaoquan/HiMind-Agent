@@ -165,12 +165,20 @@ pub(crate) struct ExpertAuthoringDraft {
     pub definition: ExpertDefinition,
     pub candidate_path: PathBuf,
     pub candidate_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<PathBuf>,
     pub updated_at: String,
     pub tested_at: Option<String>,
     pub confirmed_at: Option<String>,
     pub submitted_at: Option<String>,
     pub dashboard_release_id: Option<String>,
     pub test_report: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExpertActivationResult {
+    pub draft: ExpertAuthoringDraft,
+    pub activation: crate::app::extension_activation::ActivationReceipt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -638,6 +646,14 @@ pub(crate) fn list() -> Result<Vec<ExpertSummary>, Box<dyn Error>> {
 
 pub(crate) fn get(id: &str, version: Option<&str>) -> Result<ExpertDefinition, Box<dyn Error>> {
     let id = validate_id(id)?;
+    if let Some(definition) = development_definition(&id)? {
+        if version
+            .map(|value| value == definition.version)
+            .unwrap_or(true)
+        {
+            return Ok(definition);
+        }
+    }
     let candidates = stored_definitions()?
         .into_iter()
         .filter(|item| item.id == id && version.map(|v| v == item.version).unwrap_or(true))
@@ -723,6 +739,13 @@ pub(crate) fn build_workspace_candidate(
     let definition: ExpertDefinition =
         serde_json::from_slice(&fs::read(workspace.join("expert.json"))?)?;
     validate(&definition)?;
+    if let Ok(previous) = read_authoring_draft(&definition.id, &definition.version) {
+        crate::app::extension_activation::ensure_workspace_identity(
+            previous.workspace_path.as_deref(),
+            workspace,
+            crate::app::extension_activation::ActivationKind::Expert,
+        )?;
+    }
     let instructions = fs::read(workspace.join("EXPERT.md"))?;
     if definition.instructions.as_bytes() != instructions {
         return Err("expert.json 与 EXPERT.md 内容不一致".into());
@@ -741,12 +764,13 @@ pub(crate) fn build_workspace_candidate(
         serde_json::to_vec_pretty(&definition)?,
     )?;
     fs::write(root.join("EXPERT.md"), &instructions)?;
-    export_package(&definition.id, &definition.version, &candidate_path)?;
+    export_definition_package(&definition, &root, &candidate_path)?;
     let sha = format!("sha256:{:x}", Sha256::digest(fs::read(&candidate_path)?));
     let draft = ExpertAuthoringDraft {
         definition,
         candidate_path,
         candidate_sha256: sha,
+        workspace_path: Some(workspace.canonicalize()?),
         updated_at: now_stamp(),
         tested_at: None,
         confirmed_at: None,
@@ -818,6 +842,249 @@ pub(crate) fn confirm_authoring_draft(
     Ok(draft)
 }
 
+pub(crate) fn activate_authoring_draft(
+    id: &str,
+    version: &str,
+) -> Result<ExpertActivationResult, Box<dyn Error>> {
+    let draft = read_authoring_draft(id, version)?;
+    ensure_candidate_unchanged(&draft)?;
+    if draft.tested_at.is_none() {
+        return Err("请先完成专家候选包测试".into());
+    }
+    validate(&draft.definition)?;
+    let development = development_root().join(id);
+    let staging = development.with_file_name(format!(".{id}.staging-{}", now_stamp()));
+    let backup = development.with_file_name(format!(".{id}.backup-{}", now_stamp()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    fs::write(
+        staging.join("expert.json"),
+        serde_json::to_vec_pretty(&draft.definition)?,
+    )?;
+    fs::write(
+        staging.join("EXPERT.md"),
+        draft.definition.instructions.as_bytes(),
+    )?;
+
+    let workspace = draft
+        .workspace_path
+        .as_deref()
+        .or_else(|| draft.candidate_path.parent())
+        .ok_or("专家候选缺少工作区")?;
+    let workspace_key = crate::extension_projects::workspace_key_of(workspace);
+    let target = crate::app::extension_activation::resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace,
+        &draft.definition.supported_clients,
+        None,
+    )?;
+    let store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    let previous = store
+        .active_for(
+            &target,
+            crate::app::extension_activation::ActivationKind::Expert,
+            id,
+        )?
+        .filter(|receipt| {
+            receipt.status == crate::app::extension_activation::ActivationStatus::Active
+        });
+    let previous_sha256 = previous.as_ref().map(|item| item.candidate_sha256.clone());
+    if let Some(previous_sha) = previous_sha256.as_deref() {
+        if development.exists() {
+            let archive = development_version_root(id, previous_sha);
+            if !archive.exists() {
+                copy_development_tree(&development, &archive)?;
+            }
+        }
+    }
+    let timestamp = now_stamp();
+    let candidate_sha256 = draft
+        .candidate_sha256
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(draft.candidate_sha256.trim())
+        .to_string();
+    let receipt = crate::app::extension_activation::ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: crate::app::extension_activation::ActivationKind::Expert,
+        extension_id: id.to_string(),
+        version: version.to_string(),
+        candidate_sha256,
+        project_id: format!("expert:{id}@{workspace_key}"),
+        workspace_key,
+        target,
+        status: crate::app::extension_activation::ActivationStatus::Active,
+        previous_sha256,
+        surfaces: vec![
+            crate::app::extension_activation::ActivationSurface::visible("runtime"),
+            crate::app::extension_activation::ActivationSurface::visible("mcp"),
+            crate::app::extension_activation::ActivationSurface::visible("dsh"),
+        ],
+        activated_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    let mut transaction = store.stage(&receipt)?;
+    let had_development = development.exists();
+    if had_development {
+        fs::rename(&development, &backup)?;
+    }
+    if let Err(error) = fs::rename(&staging, &development) {
+        if had_development {
+            let _ = fs::rename(&backup, &development);
+        }
+        let _ = store.rollback(&mut transaction);
+        return Err(error.into());
+    }
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = fs::remove_dir_all(&development);
+        if had_development {
+            let _ = fs::rename(&backup, &development);
+        }
+        let _ = store.rollback(&mut transaction);
+        return Err(error);
+    }
+    if backup.exists() {
+        let _ = fs::remove_dir_all(backup);
+    }
+    Ok(ExpertActivationResult {
+        draft,
+        activation: receipt,
+    })
+}
+
+pub(crate) fn rollback_authoring_draft(
+    id: &str,
+    workspace_root: &Path,
+) -> Result<crate::app::extension_activation::ActivationRollbackResult, Box<dyn Error>> {
+    let target = crate::app::extension_activation::resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace_root,
+        &[],
+        None,
+    )?;
+    let store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    let active = store
+        .active_for(
+            &target,
+            crate::app::extension_activation::ActivationKind::Expert,
+            id,
+        )?
+        .filter(|receipt| {
+            receipt.status == crate::app::extension_activation::ActivationStatus::Active
+        })
+        .ok_or("专家没有可回滚的开发激活记录")?;
+    crate::app::extension_activation::ensure_receipt_workspace(&active, workspace_root)?;
+    let previous_sha = active
+        .previous_sha256
+        .clone()
+        .ok_or("专家没有可回滚的上一开发版")?;
+    let archive = development_version_root(id, &previous_sha);
+    let definition: ExpertDefinition =
+        serde_json::from_slice(&fs::read(archive.join("expert.json"))?)?;
+    validate(&definition)?;
+    let development = development_root().join(id);
+    if development.exists() {
+        let current_archive = development_version_root(id, &active.candidate_sha256);
+        if !current_archive.exists() {
+            copy_development_tree(&development, &current_archive)?;
+        }
+    }
+    let staging = development.with_file_name(format!(".{id}.rollback-{}", now_stamp()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    copy_development_tree(&archive, &staging)?;
+    let timestamp = now_stamp();
+    let receipt = crate::app::extension_activation::ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: crate::app::extension_activation::ActivationKind::Expert,
+        extension_id: id.to_string(),
+        version: definition.version,
+        candidate_sha256: previous_sha,
+        project_id: active.project_id.clone(),
+        workspace_key: active.workspace_key.clone(),
+        target: active.target.clone(),
+        status: crate::app::extension_activation::ActivationStatus::Active,
+        previous_sha256: Some(active.candidate_sha256.clone()),
+        surfaces: vec![
+            crate::app::extension_activation::ActivationSurface::visible("runtime"),
+            crate::app::extension_activation::ActivationSurface::visible("mcp"),
+            crate::app::extension_activation::ActivationSurface::visible("dsh"),
+        ],
+        activated_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    let mut transaction = store.stage(&receipt)?;
+    let backup = development.with_file_name(format!(".{id}.rollback-backup-{}", now_stamp()));
+    if development.exists() {
+        fs::rename(&development, &backup)?;
+    }
+    if let Err(error) = fs::rename(&staging, &development) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &development);
+        }
+        let _ = store.rollback(&mut transaction);
+        return Err(error.into());
+    }
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = fs::remove_dir_all(&development);
+        if backup.exists() {
+            let _ = fs::rename(&backup, &development);
+        }
+        let _ = store.rollback(&mut transaction);
+        return Err(error);
+    }
+    if backup.exists() {
+        let _ = fs::remove_dir_all(backup);
+    }
+    Ok(crate::app::extension_activation::ActivationRollbackResult {
+        activation: receipt,
+    })
+}
+
+fn development_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("HIMIND_EXPERT_DEVELOPMENT_DIR") {
+        return PathBuf::from(root);
+    }
+    store_root().join("development")
+}
+
+fn development_version_root(id: &str, sha256: &str) -> PathBuf {
+    // History must be a sibling of the live development directory.  Putting
+    // versions/<sha> below development/<id> makes archiving the previous build
+    // copy the archive into itself recursively.
+    store_root()
+        .join("development-versions")
+        .join(id)
+        .join(sha256)
+}
+
+fn copy_development_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let destination = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_development_tree(&entry.path(), &destination)?;
+        } else {
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
 fn authoring_root(id: &str, version: &str) -> PathBuf {
     crate::store::paths::agent_home()
         .join("expert-drafts")
@@ -848,17 +1115,26 @@ pub(crate) fn export_package(
 ) -> Result<ExpertPackageResult, Box<dyn Error>> {
     let definition = get(id, Some(version))?;
     validate(&definition)?;
+    let root = store_version_root(&definition.id, &definition.version);
+    export_definition_package(&definition, &root, package_path)
+}
+
+fn export_definition_package(
+    definition: &ExpertDefinition,
+    root: &Path,
+    package_path: &Path,
+) -> Result<ExpertPackageResult, Box<dyn Error>> {
+    validate(definition)?;
     let mut files = std::collections::BTreeMap::new();
     files.insert(
         "expert.json".to_string(),
-        serde_json::to_vec_pretty(&definition)?,
+        serde_json::to_vec_pretty(definition)?,
     );
     files.insert(
         "EXPERT.md".to_string(),
         definition.instructions.as_bytes().to_vec(),
     );
     if !definition.icon.trim().is_empty() {
-        let root = store_version_root(&definition.id, &definition.version);
         crate::app::extension_icons::resolve_manifest_icon(
             "expert",
             &definition.id,
@@ -889,7 +1165,7 @@ pub(crate) fn export_package(
     archive.write_all(checksums.as_bytes())?;
     archive.finish()?;
     Ok(ExpertPackageResult {
-        expert: summary(&definition, active()?.as_ref(), false),
+        expert: summary(definition, active()?.as_ref(), false),
         package_sha256: format!("sha256:{:x}", Sha256::digest(fs::read(package_path)?)),
         package_path: package_path.to_path_buf(),
     })
@@ -1178,11 +1454,17 @@ fn summary(
 }
 
 fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for definition in development_definitions()? {
+        if seen.insert(definition.id.clone()) {
+            items.push(definition);
+        }
+    }
     let root = store_root();
     if !root.is_dir() {
-        return Ok(Vec::new());
+        return Ok(items);
     }
-    let mut items = Vec::new();
     for id_dir in fs::read_dir(root)?
         .flatten()
         .filter(|entry| entry.path().is_dir())
@@ -1204,11 +1486,41 @@ fn stored_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
             if path.is_file() {
                 let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
                 validate(&definition)?;
-                items.push(definition);
+                if seen.insert(definition.id.clone()) {
+                    items.push(definition);
+                }
             }
         }
     }
     Ok(items)
+}
+
+fn development_definitions() -> Result<Vec<ExpertDefinition>, Box<dyn Error>> {
+    let root = development_root();
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    for entry in fs::read_dir(root)?.flatten() {
+        let path = entry.path().join("expert.json");
+        if !path.is_file() {
+            continue;
+        }
+        let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
+        validate(&definition)?;
+        items.push(definition);
+    }
+    Ok(items)
+}
+
+fn development_definition(id: &str) -> Result<Option<ExpertDefinition>, Box<dyn Error>> {
+    let path = development_root().join(id).join("expert.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let definition: ExpertDefinition = serde_json::from_slice(&fs::read(path)?)?;
+    validate(&definition)?;
+    Ok(Some(definition))
 }
 
 fn validate(definition: &ExpertDefinition) -> Result<(), Box<dyn Error>> {
@@ -1373,6 +1685,21 @@ mod tests {
         fs::write(root.join("EXPERT.md"), definition.instructions.as_bytes()).unwrap();
     }
 
+    fn write_expert_workspace(workspace: &Path, instructions: &str) {
+        let definition = test_definition(
+            "com.himind.expert.rollback",
+            "Rollback expert",
+            instructions,
+        );
+        fs::create_dir_all(workspace).unwrap();
+        fs::write(
+            workspace.join("expert.json"),
+            serde_json::to_vec_pretty(&definition).unwrap(),
+        )
+        .unwrap();
+        fs::write(workspace.join("EXPERT.md"), instructions).unwrap();
+    }
+
     #[test]
     fn experts_are_empty_until_an_extension_is_installed() {
         let _guard = test_env_lock();
@@ -1385,6 +1712,64 @@ mod tests {
             format!("{DSH_PRESET_FILE_HEADER}[]\n")
         );
         match old {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expert_rollback_restores_previous_development_definition() {
+        let _guard = test_env_lock();
+        let root = std::env::temp_dir().join(format!("e-{}-{}", std::process::id(), now_stamp()));
+        let previous = std::env::var_os("HIMIND_AGENT_HOME");
+        std::env::set_var("HIMIND_AGENT_HOME", &root);
+        let workspace = root.join("workspace");
+        write_expert_workspace(&workspace, "first expert build");
+        let first = build_workspace_candidate(&workspace).unwrap();
+        test_authoring_draft(&first.definition.id, &first.definition.version).unwrap();
+        let first_activation =
+            activate_authoring_draft(&first.definition.id, &first.definition.version).unwrap();
+        assert_eq!(
+            first_activation.activation.status,
+            crate::app::extension_activation::ActivationStatus::Active
+        );
+
+        write_expert_workspace(&workspace, "second expert build");
+        let second = build_workspace_candidate(&workspace).unwrap();
+        assert_ne!(first.candidate_sha256, second.candidate_sha256);
+        test_authoring_draft(&second.definition.id, &second.definition.version).unwrap();
+        let second_activation =
+            activate_authoring_draft(&second.definition.id, &second.definition.version).unwrap();
+        assert_eq!(
+            second_activation.activation.previous_sha256.as_deref(),
+            Some(first.candidate_sha256.trim_start_matches("sha256:"))
+        );
+
+        let rolled_back = rollback_authoring_draft(&first.definition.id, &workspace).unwrap();
+        assert_eq!(
+            rolled_back.activation.candidate_sha256,
+            first.candidate_sha256.trim_start_matches("sha256:")
+        );
+        let restored: ExpertDefinition = serde_json::from_slice(
+            &fs::read(
+                development_root()
+                    .join(&first.definition.id)
+                    .join("expert.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.instructions, "first expert build");
+        assert_eq!(
+            development_definition(&first.definition.id)
+                .unwrap()
+                .unwrap()
+                .instructions,
+            "first expert build"
+        );
+
+        match previous {
             Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
             None => std::env::remove_var("HIMIND_AGENT_HOME"),
         }

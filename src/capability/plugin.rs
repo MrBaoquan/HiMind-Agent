@@ -457,6 +457,30 @@ fn register_development_plugin_at(
     path: &std::path::Path,
     registry_path: &std::path::Path,
 ) -> Result<String, Box<dyn Error>> {
+    register_development_plugin_with_mode_at(path, registry_path, false)
+}
+
+/// Register a build candidate as the explicitly active development plugin in
+/// the current profile. Unlike legacy manual registration, this bypasses the
+/// semver takeover heuristic because the active pointer is an explicit choice.
+pub(crate) fn activate_development_plugin(
+    path: &std::path::Path,
+) -> Result<String, Box<dyn Error>> {
+    activate_development_plugin_at(path, &development_registry_path())
+}
+
+pub(crate) fn activate_development_plugin_at(
+    path: &std::path::Path,
+    registry_path: &std::path::Path,
+) -> Result<String, Box<dyn Error>> {
+    register_development_plugin_with_mode_at(path, registry_path, true)
+}
+
+fn register_development_plugin_with_mode_at(
+    path: &std::path::Path,
+    registry_path: &std::path::Path,
+    explicit_active: bool,
+) -> Result<String, Box<dyn Error>> {
     let root = path.canonicalize()?;
     let content = fs::read_to_string(root.join("plugin.json"))?;
     let manifest = parse_plugin_manifest(content.trim_start_matches('\u{feff}'))?;
@@ -470,6 +494,7 @@ fn register_development_plugin_at(
     entries.push(DevelopmentPlugin {
         id: manifest.id.clone(),
         path: root.to_string_lossy().to_string(),
+        explicit_active,
     });
     write_development_plugins_at(registry_path, &entries)?;
     // A development registration changes the discoverable capability set, and
@@ -507,6 +532,8 @@ fn unregister_development_plugin_at(
 struct DevelopmentPlugin {
     id: String,
     path: String,
+    #[serde(default)]
+    explicit_active: bool,
 }
 
 fn development_plugins() -> Vec<DevelopmentPlugin> {
@@ -557,7 +584,20 @@ fn merge_development_items(
     items: &mut Vec<PluginRegistryItem>,
     development_items: Vec<PluginRegistryItem>,
 ) {
-    for development_item in development_items {
+    merge_development_items_with_mode(
+        items,
+        development_items
+            .into_iter()
+            .map(|item| (item, false))
+            .collect(),
+    );
+}
+
+fn merge_development_items_with_mode(
+    items: &mut Vec<PluginRegistryItem>,
+    development_items: Vec<(PluginRegistryItem, bool)>,
+) {
+    for (development_item, explicitly_active) in development_items {
         let mut installed_versions = items
             .iter()
             .filter(|item| item.id == development_item.id)
@@ -574,8 +614,9 @@ fn merge_development_items(
                 current
             }
         });
-        if compare_plugin_versions(&development_item.version, &installed_version)
-            != std::cmp::Ordering::Greater
+        if !explicitly_active
+            && compare_plugin_versions(&development_item.version, &installed_version)
+                != std::cmp::Ordering::Greater
         {
             continue;
         }
@@ -809,15 +850,15 @@ pub(crate) fn scan_plugins() -> Result<Vec<PluginRegistryItem>, Box<dyn Error>> 
     // 只有开发版本严格更高时才接管，否则已安装副本是唯一真源。
     let development_items = development_plugins()
         .into_iter()
-        .map(|entry| PathBuf::from(entry.path))
+        .map(|entry| (PathBuf::from(entry.path), entry.explicit_active))
         // 目录已被删除或移动时登记已失效，直接跳过，不要用一条读不出来的记录
         // 去顶掉用户真正安装在 plugins/ 下的副本。
-        .filter(|path| path.is_dir())
-        .map(|path| read_plugin_item(path, true))
+        .filter(|(path, _)| path.is_dir())
+        .map(|(path, explicit_active)| (read_plugin_item(path, true), explicit_active))
         // 内置身份不允许被开发副本覆盖：同一 ID 只能对应一个插件。
-        .filter(|item| !builtin_ids.contains(&item.id))
+        .filter(|(item, _)| !builtin_ids.contains(&item.id))
         .collect();
-    merge_development_items(&mut items, development_items);
+    merge_development_items_with_mode(&mut items, development_items);
     // 同一 ID 只对应一个插件：内置条目是唯一身份，外部同 ID 副本一律忽略。
     // 不能反过来让外置覆盖内置，否则同一个 ID 会同时存在两个实现，能力归属、
     // 升级和卸载语义都会变得不可判定。这里独立成函数，便于用单测锁住优先级。
@@ -3771,6 +3812,40 @@ mod tests {
         assert!(items[0].development);
         assert!(items[0].overrides_installed_version.is_none());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_development_activation_overrides_same_installed_version() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-plugin-explicit-activation-test-{}",
+            next_request_id()
+        ));
+        let installed_dir = root.join("plugins/demo.explicit");
+        let development_dir = root.join("draft/demo.explicit");
+        let write_package = |dir: &std::path::Path| {
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::write(dir.join("bin/demo.exe"), "test executable").unwrap();
+            fs::write(
+                dir.join("plugin.json"),
+                r#"{"id":"demo.explicit","name":"Demo","version":"1.0.0","runtime":"process-jsonrpc-stdio","entry":"bin/demo.exe"}"#,
+            )
+            .unwrap();
+        };
+        write_package(&installed_dir);
+        write_package(&development_dir);
+        let mut items = vec![read_plugin_item(installed_dir, false)];
+        merge_development_items_with_mode(
+            &mut items,
+            vec![(read_plugin_item(development_dir, true), true)],
+        );
+        assert_eq!(items.len(), 1);
+        assert!(items[0].development);
+        assert_eq!(items[0].version, "1.0.0");
+        assert_eq!(
+            items[0].overrides_installed_version.as_deref(),
+            Some("1.0.0")
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

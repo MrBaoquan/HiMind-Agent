@@ -917,6 +917,11 @@ fn validate_workflow_extension_lock(
                 .into_iter()
                 .map(|scope| store.skill_version_dir(&scope, &dependency.id, &dependency.version))
                 .find(|path| path.is_dir())
+                .or_else(|| {
+                    crate::skill::development::record(&dependency.id)
+                        .filter(|record| record.manifest.version == dependency.version)
+                        .map(|record| record.version_root)
+                })
                 .ok_or_else(|| {
                     format!(
                         "workflow lock requires missing Skill {}@{}",
@@ -972,7 +977,7 @@ fn validate_workflow_extension_lock(
         })?;
     }
     for runtime in &lock.environment.runtimes {
-        if !package.supported_runtimes.contains(&runtime.id) {
+        if runtime.required && !package.supported_runtimes.contains(&runtime.id) {
             return Err(format!(
                 "workflow environment lock contains undeclared Runtime {}",
                 runtime.id
@@ -1689,6 +1694,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("undeclared Capability"));
+    }
+
+    #[test]
+    fn install_accepts_optional_detected_runtime_in_environment_lock() {
+        let store = store();
+        let source = source_package();
+        let package = load_from_directory(&source).unwrap();
+        let artifact_sha256 = "a".repeat(64);
+        let lock = ExtensionLock {
+            schema_version: crate::extension_contracts::EXTENSION_LOCK_SCHEMA_VERSION.to_string(),
+            root: crate::extension_contracts::ExtensionAssetIdentity {
+                kind: ExtensionAssetKind::Workflow,
+                id: package.id.clone(),
+                version: package.version.clone(),
+                sha256: artifact_sha256.clone(),
+            },
+            dependencies: Vec::new(),
+            environment: crate::extension_contracts::ExtensionLockEnvironment {
+                runtimes: vec![crate::extension_contracts::ExtensionLockRuntime {
+                    id: "acp.codex".to_string(),
+                    status: "ready".to_string(),
+                    version: "1.0.0".to_string(),
+                    required: false,
+                }],
+                ..Default::default()
+            },
+            generated_at: "2026-09-17T00:00:00Z".to_string(),
+        };
+        let installed = store
+            .install_from_directory_with_metadata(
+                &source,
+                false,
+                &artifact_sha256,
+                Some(lock),
+                true,
+            )
+            .unwrap();
+        assert_eq!(installed.package.id, package.id);
     }
 
     #[test]

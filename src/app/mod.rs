@@ -19,6 +19,7 @@ pub(crate) mod credential_center;
 pub(crate) mod diagnostics;
 pub(crate) mod distribution_publish;
 pub(crate) mod distribution_state;
+pub(crate) mod extension_activation;
 pub(crate) mod extension_icons;
 pub(crate) mod extension_lock;
 pub(crate) mod extension_orchestrator;

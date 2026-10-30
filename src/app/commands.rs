@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::error::Error;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -177,6 +177,14 @@ pub(crate) fn confirm_expert_draft(
     version: String,
 ) -> Result<crate::expert::ExpertAuthoringDraft, String> {
     crate::expert_authoring::confirm(&expert_id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn activate_expert_draft(
+    expert_id: String,
+    version: String,
+) -> Result<crate::expert::ExpertActivationResult, String> {
+    crate::expert_authoring::activate(&expert_id, &version).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -3790,6 +3798,14 @@ pub(crate) fn confirm_instruction_pack_draft(
 }
 
 #[tauri::command]
+pub(crate) fn activate_instruction_pack_draft(
+    id: String,
+    version: String,
+) -> Result<crate::instruction_pack::InstructionPackActivationResult, String> {
+    crate::instruction_pack::activate(&id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(crate) fn publish_instruction_pack_locally(
     id: String,
     version: String,
@@ -4719,6 +4735,151 @@ pub(crate) fn confirm_plugin_draft(
 }
 
 #[tauri::command]
+pub(crate) fn activate_plugin_draft(
+    plugin_id: String,
+    version: String,
+) -> Result<crate::plugin_authoring::PluginActivationResult, String> {
+    crate::plugin_authoring::activate(&plugin_id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn list_extension_activations(
+) -> Result<Vec<crate::app::extension_activation::ActivationReceipt>, String> {
+    let store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    extension_activation_receipts_for_profile(&store, &crate::store::paths::profile_name())
+        .map_err(|error| error.to_string())
+}
+
+fn extension_activation_receipts_for_profile(
+    store: &crate::app::extension_activation::ActivationStore,
+    profile: &str,
+) -> Result<Vec<crate::app::extension_activation::ActivationReceipt>, Box<dyn Error>> {
+    let mut receipts = store
+        .load()?
+        .into_values()
+        .filter(|receipt| {
+            receipt.target.profile == profile
+                && matches!(
+                    receipt.status,
+                    crate::app::extension_activation::ActivationStatus::Active
+                        | crate::app::extension_activation::ActivationStatus::Partial
+                )
+        })
+        .collect::<Vec<_>>();
+    receipts.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(receipts)
+}
+
+#[tauri::command]
+pub(crate) fn rollback_extension_activation(
+    kind: String,
+    extension_id: String,
+    workspace_root: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::app::extension_activation::ActivationRollbackResult, String> {
+    let workspace = crate::extension_workspace::validate_authoring_root(workspace_root.trim())?;
+    match kind.trim() {
+        "plugin" => crate::plugin_authoring::rollback(&extension_id, &workspace)
+            .map_err(|error| error.to_string()),
+        "skill" => {
+            let location = workspace.to_string_lossy().to_string();
+            with_skill_location(Some(&location), || {
+                let facts = skill_capability_facts(&state)?;
+                crate::skill::authoring::rollback(&extension_id, &workspace, &facts)
+                    .map_err(|error| error.to_string())
+            })
+        }
+        "expert" => crate::expert::rollback_authoring_draft(&extension_id, &workspace)
+            .map_err(|error| error.to_string()),
+        "instruction" => crate::instruction_pack::rollback(&extension_id, &workspace)
+            .map_err(|error| error.to_string()),
+        "workflow" => rollback_workflow_development(&extension_id, &workspace)
+            .map_err(|error| error.to_string()),
+        other => Err(format!("{other} 的显式回滚尚未实现")),
+    }
+}
+
+fn rollback_workflow_development(
+    package_id: &str,
+    workspace_root: &Path,
+) -> Result<crate::app::extension_activation::ActivationRollbackResult, Box<dyn Error>> {
+    let target = crate::app::extension_activation::resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        workspace_root,
+        &[],
+        None,
+    )?;
+    let store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    let active = store
+        .active_for(
+            &target,
+            crate::app::extension_activation::ActivationKind::Workflow,
+            package_id,
+        )?
+        .filter(|receipt| {
+            receipt.status == crate::app::extension_activation::ActivationStatus::Active
+        })
+        .ok_or("Workflow 没有可回滚的开发激活记录")?;
+    crate::app::extension_activation::ensure_receipt_workspace(&active, workspace_root)?;
+    let previous_sha = active
+        .previous_sha256
+        .clone()
+        .ok_or("Workflow 没有可回滚的上一开发版")?;
+    let previous_archive =
+        crate::app::workflow_manager::development_candidate_archive(package_id, &previous_sha)?;
+    let previous_lock =
+        crate::app::workflow_manager::development_candidate_lock(package_id, &previous_sha)?;
+    let installed = crate::app::workflow_manager::install_development_archive(
+        &previous_archive,
+        workspace_root,
+        previous_lock,
+    )?;
+    let now = chrono::Local::now().to_rfc3339();
+    let receipt = crate::app::extension_activation::ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: crate::app::extension_activation::ActivationKind::Workflow,
+        extension_id: package_id.to_string(),
+        version: installed.package.version,
+        candidate_sha256: previous_sha,
+        project_id: active.project_id.clone(),
+        workspace_key: active.workspace_key.clone(),
+        target: active.target.clone(),
+        status: crate::app::extension_activation::ActivationStatus::Active,
+        previous_sha256: Some(active.candidate_sha256.clone()),
+        surfaces: vec![
+            crate::app::extension_activation::ActivationSurface::visible("runtime"),
+            crate::app::extension_activation::ActivationSurface::visible("workflow"),
+        ],
+        activated_at: now.clone(),
+        updated_at: now,
+    };
+    let mut transaction = match store.stage(&receipt) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let _ = restore_workflow_development_receipt(Some(&active), package_id, workspace_root);
+            return Err(error);
+        }
+    };
+    if let Err(error) = store.commit(&mut transaction) {
+        let _ = restore_workflow_development_receipt(Some(&active), package_id, workspace_root);
+        let _ = store.rollback(&mut transaction);
+        return Err(error);
+    }
+    Ok(crate::app::extension_activation::ActivationRollbackResult {
+        activation: receipt,
+    })
+}
+
+#[tauri::command]
 pub(crate) fn list_workflow_drafts() -> Result<Vec<crate::workflow::WorkflowDraft>, String> {
     crate::workflow::list_authoring_drafts().map_err(|error| error.to_string())
 }
@@ -4757,13 +4918,102 @@ pub(crate) fn confirm_workflow_draft(
         &capabilities,
     )
     .map_err(|error| error.to_string())?;
-    crate::app::workflow_manager::install_development_archive(
+    let workspace_key = crate::extension_projects::workspace_key_of(&draft.source_root);
+    let target = crate::app::extension_activation::resolve_activation_target(
+        &crate::store::paths::profile_name(),
+        &draft.source_root,
+        &[],
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let activation_store = crate::app::extension_activation::ActivationStore::new(
+        crate::store::paths::agent_home()
+            .join("data")
+            .join("extension-activations.json"),
+    );
+    let previous = activation_store
+        .active_for(
+            &target,
+            crate::app::extension_activation::ActivationKind::Workflow,
+            &draft.package_id,
+        )
+        .map_err(|error| error.to_string())?
+        .filter(|receipt| {
+            receipt.status == crate::app::extension_activation::ActivationStatus::Active
+        });
+    let previous_receipt = previous.clone();
+    let previous_sha256 = previous.map(|item| item.candidate_sha256);
+    let now = chrono::Local::now().to_rfc3339();
+    let receipt = crate::app::extension_activation::ActivationReceipt {
+        schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+            .to_string(),
+        kind: crate::app::extension_activation::ActivationKind::Workflow,
+        extension_id: draft.package_id.clone(),
+        version: draft.version.clone(),
+        candidate_sha256: draft.candidate_sha256.clone(),
+        project_id: format!("workflow:{}@{}", draft.package_id, workspace_key),
+        workspace_key,
+        target,
+        status: crate::app::extension_activation::ActivationStatus::Active,
+        previous_sha256,
+        surfaces: vec![
+            crate::app::extension_activation::ActivationSurface::visible("runtime"),
+            crate::app::extension_activation::ActivationSurface::visible("workflow"),
+        ],
+        activated_at: now.clone(),
+        updated_at: now,
+    };
+    let mut transaction = activation_store
+        .stage(&receipt)
+        .map_err(|error| format!("Workflow 激活暂存失败: {error}"))?;
+    if let Err(error) = crate::app::workflow_manager::archive_development_candidate(
+        &draft.candidate_path,
+        &draft.package_id,
+        &draft.candidate_sha256,
+        draft.lock.as_ref(),
+    ) {
+        let _ = activation_store.rollback(&mut transaction);
+        return Err(format!("Workflow 开发版归档失败: {error}"));
+    }
+    if let Err(error) = crate::app::workflow_manager::install_development_archive(
         &draft.candidate_path,
         &draft.source_root,
         draft.lock.clone(),
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        let _ = activation_store.rollback(&mut transaction);
+        return Err(format!("Workflow 开发版安装失败: {error}"));
+    }
+    if let Err(error) = activation_store.commit(&mut transaction) {
+        let _ = restore_workflow_development_receipt(
+            previous_receipt.as_ref(),
+            &draft.package_id,
+            Path::new(&receipt.target.workspace_root),
+        );
+        let _ = activation_store.rollback(&mut transaction);
+        return Err(format!("Workflow 激活提交失败: {error}"));
+    }
     Ok(draft)
+}
+
+fn restore_workflow_development_receipt(
+    receipt: Option<&crate::app::extension_activation::ActivationReceipt>,
+    package_id: &str,
+    workspace_root: &Path,
+) -> Result<Option<crate::workflow::InstalledWorkflow>, Box<dyn Error>> {
+    let Some(receipt) = receipt else {
+        let store = crate::workflow::WorkflowStore::open_default()?;
+        return store.remove_development(package_id);
+    };
+    let archive = crate::app::workflow_manager::development_candidate_archive(
+        package_id,
+        &receipt.candidate_sha256,
+    )?;
+    let lock = crate::app::workflow_manager::development_candidate_lock(
+        package_id,
+        &receipt.candidate_sha256,
+    )?;
+    crate::app::workflow_manager::install_development_archive(&archive, workspace_root, lock)
+        .map(Some)
 }
 
 #[tauri::command]
@@ -4939,6 +5189,25 @@ pub(crate) fn confirm_skill_draft(
     version: String,
 ) -> Result<crate::skill::authoring::AuthoringDraft, String> {
     crate::skill::authoring::confirm(&skill_id, &version).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn activate_skill_draft(
+    skill_id: String,
+    version: String,
+    state: State<'_, AgentState>,
+) -> Result<crate::skill::authoring::SkillActivationResult, String> {
+    let draft =
+        crate::skill::authoring::read(&skill_id, &version).map_err(|error| error.to_string())?;
+    let location = draft
+        .workspace_path
+        .as_deref()
+        .map(|path| path.to_string_lossy().to_string());
+    with_skill_location(location.as_deref(), || {
+        let facts = skill_capability_facts(&state)?;
+        crate::skill::authoring::activate(&skill_id, &version, &facts)
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[tauri::command]
@@ -8190,7 +8459,8 @@ fn workflow_run_verification(
 #[cfg(test)]
 mod tests {
     use super::{
-        dedupe_workflow_catalog, present_builtin_ai_start_error, validate_credential_fields,
+        dedupe_workflow_catalog, extension_activation_receipts_for_profile,
+        present_builtin_ai_start_error, validate_credential_fields,
         workflow_canvas_package_summary,
     };
     use crate::api::distribution::WorkflowCatalogItem;
@@ -8229,6 +8499,62 @@ mod tests {
         assert_eq!(summary["steps"][0]["depends_on"][0], "storyboard");
         assert!(summary["steps"][0].get("input").is_none());
         assert!(summary["steps"][0].get("runtime").is_none());
+    }
+
+    fn activation_receipt(
+        profile: &str,
+        status: crate::app::extension_activation::ActivationStatus,
+        updated_at: &str,
+    ) -> crate::app::extension_activation::ActivationReceipt {
+        crate::app::extension_activation::ActivationReceipt {
+            schema_version: crate::app::extension_activation::EXTENSION_ACTIVATION_SCHEMA_VERSION
+                .to_string(),
+            kind: crate::app::extension_activation::ActivationKind::Plugin,
+            extension_id: format!("com.example.{profile}.{updated_at}"),
+            version: "1.0.0".to_string(),
+            candidate_sha256: "a".repeat(64),
+            project_id: format!("plugin:{profile}"),
+            workspace_key: "f:/work/project".to_string(),
+            target: crate::app::extension_activation::ActivationTarget::workspace(
+                profile,
+                "f:/work/project",
+                &[],
+            )
+            .unwrap(),
+            status,
+            previous_sha256: None,
+            surfaces: vec![crate::app::extension_activation::ActivationSurface::visible("runtime")],
+            activated_at: updated_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn activation_list_is_limited_to_the_current_profile() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("himind-activation-list-{nonce}"));
+        let store =
+            crate::app::extension_activation::ActivationStore::new(root.join("activations.json"));
+        use crate::app::extension_activation::ActivationStatus;
+        for item in [
+            activation_receipt("development", ActivationStatus::Active, "3"),
+            activation_receipt("development", ActivationStatus::Partial, "2"),
+            activation_receipt("production", ActivationStatus::Active, "1"),
+            activation_receipt("development", ActivationStatus::Failed, "4"),
+        ] {
+            store.record(&item).unwrap();
+        }
+        let receipts = extension_activation_receipts_for_profile(&store, "development").unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|item| item.target.profile == "development"));
+        assert_eq!(receipts[0].updated_at, "3");
+        assert_eq!(receipts[1].updated_at, "2");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn catalog_item(

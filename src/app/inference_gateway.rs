@@ -723,6 +723,64 @@ fn join_upstream(base_url: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+/// 将 Responses 输入里的工具调用轨迹降级成普通消息。
+///
+/// 有些声称为 Responses 兼容的上游（例如 VectorTide）不接受
+/// `function_call` / `function_call_output` 作为输入项。工具定义本身可以保留，
+/// 只要把历史轨迹改成普通 assistant/user 消息即可继续对话。
+fn response_tool_history_fallback(body: &[u8]) -> Option<Vec<u8>> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let input = value.get_mut("input")?.as_array_mut()?;
+    let mut changed = false;
+    let mut downgraded = Vec::with_capacity(input.len());
+    for item in input.drain(..) {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                changed = true;
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                downgraded.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": format!("[历史工具调用] {name} {arguments}")
+                    }]
+                }));
+            }
+            Some("function_call_output") => {
+                changed = true;
+                let output = item
+                    .get("output")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| value.to_string())
+                    })
+                    .unwrap_or_default();
+                downgraded.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!("[历史工具结果] {output}")
+                    }]
+                }));
+            }
+            _ => downgraded.push(item),
+        }
+    }
+    if !changed {
+        return None;
+    }
+    *input = downgraded;
+    serde_json::to_vec(&value).ok()
+}
+
 fn summarize_responses_request(body: &[u8]) -> String {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return "invalid-json".to_string();
@@ -1103,31 +1161,55 @@ fn forward(
     let client = upstream_client(&upstream_url).map_err(|_| GatewayError::Answered)?;
     let method =
         reqwest::Method::from_bytes(head.method.as_bytes()).unwrap_or(reqwest::Method::POST);
-    let mut request = client
-        .request(method, &upstream_url)
-        .header("accept-encoding", "identity");
-    for (name, value) in &head.headers {
-        if is_forwarded_request_header(name) {
-            request = request.header(name.as_str(), value.as_str());
+    let send_upstream = |payload: Vec<u8>| {
+        let mut request = client
+            .request(method.clone(), &upstream_url)
+            .header("accept-encoding", "identity");
+        for (name, value) in &head.headers {
+            if is_forwarded_request_header(name) {
+                request = request.header(name.as_str(), value.as_str());
+            }
         }
-    }
-    // Anthropic 只用 `x-api-key`；同时发 Authorization 会被部分上游判为无效凭据。
-    request = if binding.protocol == "anthropic" {
-        request
-            .header("x-api-key", binding.api_key.as_str())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-    } else {
-        request.header("authorization", format!("Bearer {}", binding.api_key))
+        // Anthropic 只用 `x-api-key`；同时发 Authorization 会被部分上游判为无效凭据。
+        request = if binding.protocol == "anthropic" {
+            request
+                .header("x-api-key", binding.api_key.as_str())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+        } else {
+            request.header("authorization", format!("Bearer {}", binding.api_key))
+        };
+        if kind != "models" {
+            request = request.body(payload);
+        }
+        request.send()
     };
-    if kind != "models" {
-        request = request.body(outgoing_body);
-    }
-    let mut response = match request.send() {
+    let mut response = match send_upstream(outgoing_body.clone()) {
         Ok(response) => response,
         Err(error) => {
             return Err(write_upstream_failure(stream, &error.to_string()));
         }
     };
+    // 部分 Responses 兼容上游���接受 message 输入，不接受 OpenAI 原生
+    // `function_call` / `function_call_output` 历史。OpenCode 在同一会话切换到
+    // 这类上游时会携带上一模型的工具轨迹，表现为一个与参数名无关的 400。
+    // 首轮仅在 400/422 且确实存在工具历史时降级为普通消息并重试一次。
+    if kind == "openai-responses"
+        && binding.protocol == "openai-responses"
+        && matches!(response.status().as_u16(), 400 | 422)
+    {
+        if let Some(fallback_body) = response_tool_history_fallback(&outgoing_body) {
+            crate::approval::manager::append_event_log(
+                "info",
+                "本机网关兼容回退：上游不接受 Responses 工具调用历史，已将历史调用降级为普通消息后重试",
+            );
+            response = match send_upstream(fallback_body) {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(write_upstream_failure(stream, &error.to_string()));
+                }
+            };
+        }
+    }
     let status = response.status();
     let content_type = response
         .headers()
@@ -2169,6 +2251,39 @@ mod tests {
     }
 
     #[test]
+    fn downgrades_responses_tool_history_to_messages() {
+        let original = json!({
+            "model": "model-a",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "read", "arguments": "{\"path\":\"a\"}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "file body"}
+            ],
+            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+        });
+        let fallback = response_tool_history_fallback(original.to_string().as_bytes()).unwrap();
+        let value: Value = serde_json::from_slice(&fallback).unwrap();
+        let types = value["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(types, vec!["message", "message", "message"]);
+        assert_eq!(value["input"][1]["role"], "assistant");
+        assert!(value["input"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("read"));
+        assert_eq!(value["input"][2]["role"], "user");
+        assert!(value["input"][2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("file body"));
+        assert!(value.get("tools").is_some());
+    }
+
+    #[test]
     fn sse_scanner_merges_split_anthropic_usage() {
         let mut scanner = StreamScanner::new("anthropic".to_string());
         scanner.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":30}}}\n\n");
@@ -2324,6 +2439,102 @@ mod tests {
             "response={response}"
         );
     }
+    #[test]
+    fn responses_gateway_retries_when_upstream_rejects_native_tool_history() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut first, _) = upstream.accept().unwrap();
+            let (_, first_body) = match read_request(&mut first).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected first request"),
+            };
+            let first_value: Value = serde_json::from_slice(&first_body).unwrap();
+            assert!(first_value["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "function_call"));
+            let rejected = br#"{"error":{"message":"tool history unsupported","type":"invalid_request_error"}}"#;
+            let rejected_head = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                rejected.len()
+            );
+            first.write_all(rejected_head.as_bytes()).unwrap();
+            first.write_all(rejected).unwrap();
+            first.flush().unwrap();
+
+            let (mut second, _) = upstream.accept().unwrap();
+            let (_, second_body) = match read_request(&mut second).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected fallback request"),
+            };
+            let second_value: Value = serde_json::from_slice(&second_body).unwrap();
+            assert!(second_value["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] == "message"));
+            let accepted = br#"{"id":"resp-test","usage":{"input_tokens":3,"output_tokens":1}}"#;
+            let accepted_head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                accepted.len()
+            );
+            second.write_all(accepted_head.as_bytes()).unwrap();
+            second.write_all(accepted).unwrap();
+            second.flush().unwrap();
+        });
+
+        let token = "responses-fallback-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "opencode:profile:service/model-a".to_string(),
+                client: "opencode".to_string(),
+                service: "custom:service".to_string(),
+                profile_id: "profile".to_string(),
+                entry_protocol: "openai-responses".to_string(),
+                exposed_model: "service/model-a".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = json!({
+            "model": "service/model-a",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "ok"}
+            ],
+            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/responses HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        client.write_all(head.as_bytes()).unwrap();
+        client.write_all(request_body.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "response={response}"
+        );
+    }
+
     #[test]
     fn responses_request_through_gateway_offloads_large_images_before_upstream() {
         use base64::Engine as _;

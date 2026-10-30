@@ -54,10 +54,13 @@ pub(crate) struct AiServiceTemplateList {
 ///
 /// `async_http` 是工作台的异步媒体执行协议，不是可用于本机推理的接入方式；
 /// 协议为空来自旧版工作台，按既有默认 `openai-responses` 处理。
-fn protocol_for(value: &str) -> Option<&'static str> {
-    match value.trim() {
-        "anthropic" => Some("anthropic"),
-        "openai_compatible" | "" => Some("openai-responses"),
+fn protocol_for(protocol: &str, api_mode: &str) -> Option<&'static str> {
+    match (protocol.trim(), api_mode.trim()) {
+        ("anthropic", "" | "anthropic") => Some("anthropic"),
+        ("openai_compatible", "openai_chat") => Some("openai-chat"),
+        ("openai_compatible", "openai_responses") => Some("openai-responses"),
+        // 旧版工作台没有 api_mode；保留既有默认，避免目录升级中断服务。
+        ("openai_compatible" | "", "") => Some("openai-responses"),
         _ => None,
     }
 }
@@ -82,7 +85,7 @@ pub(crate) fn from_catalog(items: &[AiProviderTemplate]) -> Vec<AiServiceTemplat
         if id.is_empty() || base_url.is_empty() || !seen.insert(id.to_string()) {
             continue;
         }
-        let Some(protocol) = protocol_for(&item.protocol) else {
+        let Some(protocol) = protocol_for(&item.protocol, &item.api_mode) else {
             continue;
         };
         let mut models: Vec<String> = Vec::new();
@@ -209,6 +212,7 @@ mod tests {
             description: format!("{id} 描述"),
             service_type: "token".to_string(),
             protocol: protocol.to_string(),
+            api_mode: String::new(),
             base_url: base_url.to_string(),
             models: Vec::new(),
         }
@@ -247,6 +251,39 @@ mod tests {
             mapped[1].models,
             vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]
         );
+    }
+
+    #[test]
+    fn preserves_explicit_chat_and_responses_modes() {
+        let mut chat = template(
+            "groq",
+            "openai_compatible",
+            "https://api.groq.com/openai/v1",
+        );
+        chat.api_mode = "openai_chat".to_string();
+        chat.models = vec![model("openai/gpt-oss-120b", "openai/gpt-oss-120b", true)];
+
+        let mut responses = template(
+            "deepseek",
+            "openai_compatible",
+            "https://api.deepseek.com/v1",
+        );
+        responses.api_mode = "openai_responses".to_string();
+        responses.models = vec![model("deepseek-flash", "deepseek-flash", true)];
+
+        let mapped = from_catalog(&[chat, responses]);
+        assert_eq!(mapped[0].protocol, "openai-chat");
+        assert_eq!(mapped[1].protocol, "openai-responses");
+    }
+
+    #[test]
+    fn rejects_conflicting_or_unknown_api_modes() {
+        let mut conflicted = template("anthropic", "anthropic", "https://api.anthropic.com");
+        conflicted.api_mode = "openai_chat".to_string();
+        let mut unknown = template("future", "openai_compatible", "https://api.example.com/v1");
+        unknown.api_mode = "gemini_native".to_string();
+
+        assert!(from_catalog(&[conflicted, unknown]).is_empty());
     }
 
     #[test]

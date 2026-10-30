@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 struct DevelopmentSkill {
     id: String,
     path: String,
+    #[serde(default)]
+    explicit_active: bool,
 }
 
 pub(crate) fn registry_path() -> PathBuf {
@@ -52,10 +54,26 @@ fn fallback_registry_path() -> PathBuf {
 }
 
 pub(crate) fn register_skill(path: &Path) -> Result<String, Box<dyn Error>> {
-    register_skill_at(path, &registry_path())
+    register_skill_with_mode_at(path, &registry_path(), false)
+}
+
+pub(crate) fn activate_skill(path: &Path) -> Result<String, Box<dyn Error>> {
+    activate_skill_at(path, &registry_path())
+}
+
+pub(crate) fn activate_skill_at(path: &Path, registry: &Path) -> Result<String, Box<dyn Error>> {
+    register_skill_with_mode_at(path, registry, true)
 }
 
 fn register_skill_at(path: &Path, registry: &Path) -> Result<String, Box<dyn Error>> {
+    register_skill_with_mode_at(path, registry, false)
+}
+
+fn register_skill_with_mode_at(
+    path: &Path,
+    registry: &Path,
+    explicit_active: bool,
+) -> Result<String, Box<dyn Error>> {
     let root = path.canonicalize()?;
     let manifest = load_skill_manifest(&root)?;
     validate_skill_id(&manifest.id)?;
@@ -67,6 +85,7 @@ fn register_skill_at(path: &Path, registry: &Path) -> Result<String, Box<dyn Err
     entries.push(DevelopmentSkill {
         id: manifest.id.clone(),
         path: root.to_string_lossy().to_string(),
+        explicit_active,
     });
     write_entries_at(registry, &entries)?;
     Ok(manifest.id)
@@ -110,7 +129,7 @@ pub(crate) fn is_development_skill(skill_id: &str) -> bool {
     entries().iter().any(|(id, _)| id == skill_id)
 }
 
-fn record_at(root: &Path) -> Option<SkillRecord> {
+pub(crate) fn record_at(root: &Path) -> Option<SkillRecord> {
     if !root.is_dir() {
         return None;
     }
@@ -199,6 +218,24 @@ mod tests {
 
         unregister_skill_at("com.himind.skill.demo", &registry).unwrap();
         assert!(entries_at(&registry).is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn explicit_activation_is_recorded_for_same_id() {
+        let base = std::env::temp_dir().join(format!(
+            "himind-skill-explicit-activation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let registry = base.join("skill-development.json");
+        let source = base.join("workspace").join("skills").join("demo");
+        write_skill(&source, "com.himind.skill.explicit", "1.0.0");
+        activate_skill_at(&source, &registry).unwrap();
+        let entries = entries_at(&registry);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "com.himind.skill.explicit");
+        assert!(entries[0].explicit_active);
         let _ = fs::remove_dir_all(&base);
     }
 

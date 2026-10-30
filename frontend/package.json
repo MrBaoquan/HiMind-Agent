@@ -13,6 +13,8 @@
     "check:icon-version": "node --experimental-strip-types scripts/check-icon-version.mts",
     "check:quick-access": "node --experimental-strip-types scripts/check-quick-access.mts",
     "check:status-copy": "node --experimental-strip-types scripts/check-status-copy.mts",
+    "check:extension-activation-status": "node --experimental-strip-types scripts/check-extension-activation-status.mts",
+    "check:development-local-only": "node --experimental-strip-types scripts/check-development-local-only.mts",
     "check:ai-service-presets": "node --experimental-strip-types scripts/check-ai-service-presets.mts",
     "check:ai-balance-matching": "node --experimental-strip-types scripts/check-ai-balance-matching.mts",
     "check:gateway-profile-ui": "node --experimental-strip-types scripts/check-gateway-profile-ui.mts",
@@ -28,7 +30,7 @@
     "check:engine": "node --experimental-strip-types scripts/check-engine.mts",
     "check:copy": "node --experimental-strip-types scripts/check-copy.mts",
     "check:design-tokens": "node scripts/check-design-tokens.mjs",
-    "check:ui": "npm run check:start-form && npm run check:workflow-option-sources && npm run check:run-view && npm run check:workflow-graph && npm run check:workflow-process && npm run check:market-catalog && npm run check:task-view && npm run check:shell-structure && npm run check:icon-version && npm run check:quick-access && npm run check:status-copy && npm run check:ai-service-presets && npm run check:ai-balance-matching && npm run check:ai-service-routing && npm run check:gateway-profile-ui && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:engine && npm run check:copy && npm run check:design-tokens"
+    "check:ui": "npm run check:start-form && npm run check:workflow-option-sources && npm run check:run-view && npm run check:workflow-graph && npm run check:workflow-process && npm run check:market-catalog && npm run check:task-view && npm run check:shell-structure && npm run check:icon-version && npm run check:quick-access && npm run check:status-copy && npm run check:extension-activation-status && npm run check:development-local-only && npm run check:ai-service-presets && npm run check:ai-balance-matching && npm run check:ai-service-routing && npm run check:gateway-profile-ui && npm run check:text-layout && npm run check:operation-plan && npm run check:projection-requeue && npm run check:acp-profiles && npm run check:runtime-providers && npm run check:mcp-servers && npm run check:settings-ia && npm run check:engine && npm run check:copy && npm run check:design-tokens"
   },
   "dependencies": {
     "@tauri-apps/api": "latest",
