@@ -1358,6 +1358,9 @@ fn forward(
             normalized_responses
                 .as_ref()
                 .expect("Responses request was normalized above"),
+            head.headers
+                .get(OPENCODE_SESSION_HEADER)
+                .map(String::as_str),
             started,
         );
     }
@@ -1892,6 +1895,7 @@ fn forward_responses_translated(
     stream: &mut TcpStream,
     binding: &GatewayBinding,
     request: &Value,
+    client_session: Option<&str>,
     started: Instant,
 ) -> Result<(), GatewayError> {
     let streaming = request
@@ -1912,7 +1916,7 @@ fn forward_responses_translated(
         .header("authorization", format!("Bearer {}", binding.api_key))
         .header("content-type", "application/json")
         .header("accept-encoding", "identity");
-    if let Some(session) = opencode_session_for_value(binding, None, request) {
+    if let Some(session) = opencode_session_for_value(binding, client_session, request) {
         upstream_request = upstream_request.header(OPENCODE_SESSION_HEADER, session);
     }
     let mut response = match upstream_request.body(chat_payload).send() {
