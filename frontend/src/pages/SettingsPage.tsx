@@ -10,6 +10,7 @@ import { useModalFocus } from '../components/useModalFocus';
 import { WorkbenchConnectionsPanel, type WorkbenchConnectionDraft } from '../components/WorkbenchConnectionsPanel';
 import { CredentialCenterPanel } from '../components/CredentialCenterPanel';
 import { LogsPage } from './LogsPage';
+import { StoragePage } from './StoragePage';
 import { localRuntimeMeta } from './runtimeProviderView';
 import { settingsSectionMeta, settingsSectionTabFor, settingsSectionTabs, type SettingsSection, type SettingsTab } from '../settingsModel';
 
@@ -117,6 +118,8 @@ export function SettingsPage({
   section,
   tab = null,
   onTabChange,
+  extensionAutoInstall,
+  onToggleExtensionAutoInstall,
 }: {
   settings: ApprovalSettings | null;
   remoteExecutionSettings: RemoteExecutionSettings | null;
@@ -180,6 +183,9 @@ export function SettingsPage({
   /** 页内页签：条目把无先后关系的板块并在一处，默认落到第一块。 */
   tab?: SettingsTab | null;
   onTabChange?: (tab: SettingsTab) => void;
+  /// 扩展开发偏好：构建成功后是否直接装到本机。
+  extensionAutoInstall: boolean;
+  onToggleExtensionAutoInstall: (next: boolean) => void;
 }) {
   const confirm = useConfirm();
   const [builtinAIRuntimeStatus, setBuiltinAIRuntimeStatus] = useState<BuiltinAIRuntimeStatus | null>(null);
@@ -1096,6 +1102,8 @@ export function SettingsPage({
 
           {section === 'diagnostics' && activeTab === 'logs' ? <LogsPage embedded logs={logs} onExport={onExportDiagnostics} /> : null}
 
+          {section === 'diagnostics' && activeTab === 'storage' ? <StoragePage /> : null}
+
           {section === 'diagnostics' && activeTab === 'backup' ? <>
             <section className="card settings-section">
               <div className="card-header"><span>备份包</span><Pill kind="neutral">配置与凭据</Pill></div>
@@ -1190,7 +1198,7 @@ export function SettingsPage({
             <section className="card settings-section">
               <div className="card-header">软件更新</div>
               <div className="software-update-summary">
-                <div><span>当前版本</span><strong>v{updateStatus?.current_version || '—'}</strong></div>
+                <div><span>当前版本</span><strong>v{updateStatus?.current_version || '—'}{updateStatus?.build_channel && updateStatus.build_channel !== 'release' ? <small className="update-build-mark">本地构建{updateStatus.build_commit ? ` ${updateStatus.build_commit}` : ''}</small> : null}</strong></div>
                 <div><span>最近检查</span><strong>{formatUpdateTime(updateStatus?.last_checked_at)}</strong></div>
               </div>
               <div className="card-body setting-list">
@@ -1216,6 +1224,14 @@ export function SettingsPage({
               <div className="card-header">启动设置</div>
               <div className="card-body setting-list">
                 <SettingRow title="开机自启"><label className="toggle"><input type="checkbox" checked={settings.auto_start} onChange={event => onAutoStartChange(event.target.checked)} /><span className="slider"></span></label></SettingRow>
+              </div>
+            </section>
+            <section className="card settings-section">
+              <div className="card-header">扩展开发</div>
+              <div className="card-body setting-list">
+                <SettingRow title="构建后自动安装" description="关掉后只保留候选，装不装由你决定。">
+                  <label className="toggle"><input type="checkbox" checked={extensionAutoInstall} onChange={event => onToggleExtensionAutoInstall(event.target.checked)} /><span className="slider"></span></label>
+                </SettingRow>
               </div>
             </section>
           </> : null}

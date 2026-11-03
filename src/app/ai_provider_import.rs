@@ -1057,15 +1057,10 @@ pub(crate) fn enable_gateway_binding(
             },
         )?
     };
-    // 网关模式的意义就是请求真的经过本机网关：探一次绑定令牌能否命中，
-    // 能命中才能升级为 `client_load_verified`（ADR 0114）。
-    let verification_status = if gateway_binding_reachable(&gateway_url, &token) {
-        result.sync_status = "file_written".to_string();
-        result.verification_status = CLIENT_LOAD_VERIFIED.to_string();
-        CLIENT_LOAD_VERIFIED.to_string()
-    } else {
-        result.verification_status.clone()
-    };
+    // 网关模式的意义就是请求真的经过本机网关。探针必须放在绑定落盘之后：
+    // 网关每次请求都从绑定文件重建令牌表，先探后存只会稳定得到 401，
+    // 让状态永远停在 file_verified（ADR 0114）。
+    let verification_status = result.verification_status.clone();
 
     // 客户端配置已写好，再把绑定事实改成网关模式：真实凭据只留在 Agent。
     let mut bindings = load_import_bindings(options);
@@ -1098,6 +1093,7 @@ pub(crate) fn enable_gateway_binding(
         },
     );
     save_import_bindings(options, &bindings)?;
+    confirm_gateway_binding(options, target, &gateway_url, &token, &mut result);
     Ok(result)
 }
 
@@ -1209,13 +1205,9 @@ pub(crate) fn enable_gateway_profile_binding(
     };
     result.model = default_model.clone();
     result.model_count = models.len();
-    let previous_reachable = result.verification_status == CLIENT_LOAD_VERIFIED;
-    let verification_status =
-        if previous_reachable || gateway_binding_reachable(&gateway_url, &token) {
-            CLIENT_LOAD_VERIFIED.to_string()
-        } else {
-            result.verification_status.clone()
-        };
+    // 探针排在绑定落盘之后（见 confirm_gateway_binding）：这里先沿用 import 的
+    // 文件级结论，网关真的认这枚令牌时再升级。
+    let verification_status = result.verification_status.clone();
 
     let mut bindings = load_import_bindings(options);
     bindings.clients.insert(
@@ -1244,6 +1236,7 @@ pub(crate) fn enable_gateway_profile_binding(
         },
     );
     save_import_bindings(options, &bindings)?;
+    confirm_gateway_binding(options, target, &gateway_url, &token, &mut result);
     Ok(result)
 }
 
@@ -1318,6 +1311,30 @@ fn gateway_binding_reachable(gateway_url: &str, token: &str) -> bool {
         .send()
         .map(|response| response.status().is_success())
         .unwrap_or(false)
+}
+
+/// 绑定落盘之后再探一次网关，命中才升级为 `client_load_verified`。
+///
+/// 顺序不能反：网关按绑定文件重建令牌表，先探后存只能拿到 401。探测失败只降级
+/// 验证等级，不影响已经写好的客户端配置。
+fn confirm_gateway_binding(
+    options: &Options,
+    target: &str,
+    gateway_url: &str,
+    token: &str,
+    result: &mut AIProviderImportResult,
+) {
+    if !gateway_binding_reachable(gateway_url, token) {
+        return;
+    }
+    result.sync_status = "file_written".to_string();
+    result.verification_status = CLIENT_LOAD_VERIFIED.to_string();
+    let mut bindings = load_import_bindings(options);
+    let Some(binding) = bindings.clients.get_mut(target) else {
+        return;
+    };
+    binding.verification_status = CLIENT_LOAD_VERIFIED.to_string();
+    let _ = save_import_bindings(options, &bindings);
 }
 
 /// 客户端要求的入口协议与上游真实协议的组合是否有互译实现。
@@ -8320,7 +8337,7 @@ mod tests {
         };
         assert_eq!(
             models(AIServiceProtocol::OpenaiChat),
-            vec!["chat/model-chat"]
+            vec!["chat/model-chat", "responses/model-responses"]
         );
         assert_eq!(
             models(AIServiceProtocol::OpenaiResponses),
@@ -8478,7 +8495,7 @@ mod tests {
         super::save_import_bindings(&options, &bindings).unwrap();
 
         let routes = super::gateway_bindings(&options);
-        assert_eq!(routes.len(), 6);
+        assert_eq!(routes.len(), 7);
         assert!(routes.iter().all(|route| route.profile_id == "coding"));
         let codex_routes = routes
             .iter()
@@ -8494,7 +8511,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(codex_routes.len(), 2);
         assert_eq!(claude_routes.len(), 3);
-        assert_eq!(opencode_routes.len(), 1);
+        assert_eq!(opencode_routes.len(), 2);
         assert!(codex_routes.iter().all(|route| route.token == codex_token));
         assert!(claude_routes
             .iter()
@@ -8511,8 +8528,15 @@ mod tests {
         assert!(claude_routes
             .iter()
             .any(|route| route.protocol == "openai-responses"));
-        assert_eq!(opencode_routes[0].exposed_model, "service-b/model-b");
+        assert_eq!(opencode_routes[0].exposed_model, "service-a/model-a");
+        assert_eq!(opencode_routes[0].protocol, "openai-responses");
         assert!(opencode_routes[0].is_default);
+        let opencode_chat = opencode_routes
+            .iter()
+            .find(|route| route.exposed_model == "service-b/model-b")
+            .unwrap();
+        assert!(!opencode_chat.is_default);
+        assert_eq!(opencode_chat.protocol, "openai-chat");
         assert_eq!(
             codex_routes
                 .iter()

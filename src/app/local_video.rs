@@ -42,7 +42,7 @@ pub(crate) fn generate(input: &Value) -> Result<Value, Box<dyn Error>> {
                 "服务「{}」尚未配置「{CAP_VIDEO_GENERATE}」能力；请填写生视频模型后重试",
                 service.display_name
             )
-            .into())
+            .into());
         }
     };
     if adapter != ADAPTER_ARK_VIDEO && adapter != ADAPTER_WAN_VIDEO {
@@ -135,8 +135,8 @@ pub(crate) fn job_cancel(input: &Value) -> Result<Value, Box<dyn Error>> {
     if job.terminal() {
         return Ok(job.to_json());
     }
-    let (service, api_key) = crate::store::ai_services::load_secret(&job.service_id)?;
     if !job.provider_job_id.trim().is_empty() {
+        let (service, api_key) = crate::store::ai_services::load_secret(&job.service_id)?;
         cancel_task(
             &service.base_url,
             &api_key,
@@ -949,6 +949,55 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn cancel_queued_job_without_provider_task_is_idempotent() {
+        let _guard = crate::store::paths::test_env_lock();
+        let home = temp_dir("cancel-home");
+        let workspace = temp_dir("cancel-ws");
+        let output = workspace.join("media-out");
+        let previous_home = std::env::var_os("HIMIND_AGENT_HOME");
+        let previous_ws = std::env::var_os("HIMIND_AI_WORKSPACE");
+        std::env::set_var("HIMIND_AGENT_HOME", &home);
+        std::env::set_var("HIMIND_AI_WORKSPACE", &workspace);
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            media_jobs::create(
+                "video.generate",
+                "test-only",
+                "local",
+                "ark-video",
+                "test-model",
+                "test",
+                &output.to_string_lossy(),
+            )?;
+            let job = media_jobs::list(10)?
+                .into_iter()
+                .next()
+                .ok_or("created job missing")?;
+            assert_eq!(job.status, media_jobs::STATUS_QUEUED);
+            assert!(job.provider_job_id.is_empty());
+            let canceled = job_cancel(&json!({"job_id": job.id}))?;
+            assert_eq!(canceled["status"], media_jobs::STATUS_CANCELED);
+            let second = job_cancel(&json!({"job_id": job.id}))?;
+            assert_eq!(second["status"], media_jobs::STATUS_CANCELED);
+            assert_eq!(
+                media_jobs::get(&job.id)?.unwrap().status,
+                media_jobs::STATUS_CANCELED
+            );
+            Ok(())
+        })();
+        match previous_home {
+            Some(value) => std::env::set_var("HIMIND_AGENT_HOME", value),
+            None => std::env::remove_var("HIMIND_AGENT_HOME"),
+        };
+        match previous_ws {
+            Some(value) => std::env::set_var("HIMIND_AI_WORKSPACE", value),
+            None => std::env::remove_var("HIMIND_AI_WORKSPACE"),
+        };
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&workspace);
+        result.expect("cancel local queued job");
     }
 
     #[test]

@@ -6,11 +6,29 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LocalAppData = [Environment]::GetFolderPath("LocalApplicationData")
-$AgentHome = Join-Path $LocalAppData "HiMindAgent"
+$InstallRoot = Join-Path $LocalAppData "HiMindAgent"
+# 用户把数据搬到别的盘以后，完整性修复要跟着数据走；程序目录单独保留。
+$AgentHome = $InstallRoot
+$Pointer = Join-Path $InstallRoot "data-location.json"
+if (Test-Path -LiteralPath $Pointer) {
+    try {
+        $location = Get-Content -LiteralPath $Pointer -Raw | ConvertFrom-Json
+        if ($location.data_root -and [System.IO.Path]::IsPathRooted($location.data_root)) {
+            $AgentHome = $location.data_root
+        }
+    } catch {
+        Write-Warning "数据位置指针无法解析，按默认位置处理：$Pointer"
+    }
+}
 $WebView = Join-Path $LocalAppData "com.himind.agent"
 
 $running = Get-Process -Name "himind-agent*" -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.StartsWith($AgentHome, [StringComparison]::OrdinalIgnoreCase) }
+    Where-Object {
+        $_.Path -and (
+            $_.Path.StartsWith($AgentHome, [StringComparison]::OrdinalIgnoreCase) -or
+            $_.Path.StartsWith($InstallRoot, [StringComparison]::OrdinalIgnoreCase)
+        )
+    }
 if ($running) {
     $ids = ($running | ForEach-Object Id) -join ", "
     throw "请先退出 HiMind Agent 后再修复存储完整性（仍在运行的 PID：$ids）。"

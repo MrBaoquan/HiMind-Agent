@@ -3035,6 +3035,8 @@ tr:last-child td { border-bottom: 0; }
 .development-workspace-copy small { min-width: 0; overflow: hidden; color: var(--text-subtle); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .development-workspace-copy small.is-problem { color: #b45309; }
 .development-workspace-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.development-toolbar-actions { display: flex; align-items: center; gap: 14px; }
+.development-build-split { display: inline-flex; align-items: center; gap: 4px; }
 .instruction-panel { flex: 0 0 auto; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); overflow: hidden; }
 .instruction-panel-head { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 8px 0 10px; }
 .instruction-panel-toggle { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 8px; padding: 6px 0; border: 0; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
@@ -3386,6 +3388,7 @@ tr:last-child td { border-bottom: 0; }
 .software-update-summary > div:last-child { border-right: 0; }
 .software-update-summary span { color: var(--text-muted); font-size: 11px; }
 .software-update-summary strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.update-build-mark { margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: var(--surface-muted); border: 1px solid var(--border); color: var(--text-muted); font-size: 10px; font-weight: 500; vertical-align: 1px; }
 .software-update-state { min-width: 0; min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 13px; border-top: 1px solid var(--border); }
 .software-update-state > div:first-child { min-width: 0; display: grid; gap: 3px; }
 .software-update-state strong { font-size: 12px; }
@@ -3417,6 +3420,30 @@ tr:last-child td { border-bottom: 0; }
 .backup-scope li { display: grid; gap: 1px; font-size: 12px; }
 .backup-scope li small { color: var(--text-muted); font-size: 11px; }
 
+/* 存储占用：先给结论（谁占了空间），再给动作（哪些能删）。 */
+.storage-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-bottom: 1px solid var(--border); background: var(--surface-muted); }
+.storage-summary > div { min-width: 0; display: grid; gap: 3px; padding: 10px 13px; border-right: 1px solid var(--border); }
+.storage-summary > div:nth-child(2n) { border-right: 0; }
+.storage-summary span { color: var(--text-muted); font-size: 11px; }
+.storage-summary strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.storage-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.storage-toolbar > small { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.storage-warning { padding: 8px 10px; border: 1px solid var(--warning-border); border-radius: 6px; background: var(--warning-soft); color: var(--warning-strong); font-size: 12px; }
+.storage-breakdown { display: grid; }
+.storage-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 9px 13px; border-bottom: 1px solid var(--border); }
+.storage-row:last-child { border-bottom: 0; }
+.storage-row > div { min-width: 0; display: grid; gap: 1px; }
+.storage-row strong { font-size: 12px; font-weight: 600; }
+.storage-row small { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.storage-row > span { color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.storage-cleanup-control { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.storage-keep { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 11px; }
+.storage-keep select { height: var(--control-h); }
+.storage-pending { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; border-top: 1px solid var(--border); }
+.storage-pending > div:first-child { display: grid; gap: 2px; min-width: 0; }
+.storage-pending strong { font-size: 12px; }
+.storage-pending small { overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+
 @media (max-width: 740px) {
   .agent-update-banner { grid-template-columns: 34px minmax(0, 1fr); }
   .agent-update-actions { grid-column: 1 / -1; justify-content: flex-end; }
@@ -3427,6 +3454,9 @@ tr:last-child td { border-bottom: 0; }
   .software-update-state .actions-row { justify-content: flex-end; flex-wrap: wrap; }
   .backup-scope { grid-template-columns: 1fr; }
   .backup-scope > div + div { border-left: 0; border-top: 1px solid var(--border); }
+  .storage-summary { grid-template-columns: 1fr; }
+  .storage-summary > div { border-right: 0; border-bottom: 1px solid var(--border); }
+  .storage-summary > div:last-child { border-bottom: 0; }
 }
 
 @container agent-main (max-width: 720px) {

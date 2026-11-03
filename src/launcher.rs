@@ -39,7 +39,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         .ok_or("Agent launcher directory is unavailable")?
         .to_path_buf();
     let executable = install_layout::resolve_agent_path(&root)?;
-    let state_path = root.join("data").join("agent-state.json");
+    // 数据位置指针：用户把数据搬到别的盘以后，launcher 仍然从安装根启动，
+    // 但状态文件必须跟着数据走，否则整个 Agent 会被劈成"程序在 C、状态在 D"。
+    let relocated = data_root(&root);
+    let state_path = relocated
+        .clone()
+        .unwrap_or_else(|| root.clone())
+        .join("data")
+        .join("agent-state.json");
     if let Some(parent) = state_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -84,7 +91,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         executable
     };
     let mut command = Command::new(executable);
-    let command_arguments = arguments_with_default_state(&arguments, state_path);
+    let command_arguments =
+        arguments_with_default_state(&arguments, state_path, relocated.is_some());
     command.args(&command_arguments).current_dir(&root);
     if trusted_keys.is_dir() && env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR").is_none() {
         command.env("HIMIND_TRUSTED_SIGNING_KEYS_DIR", trusted_keys);
@@ -270,13 +278,23 @@ fn is_cli_launch(arguments: &[String]) -> bool {
 /// `diagnostics check` made the Agent reject its own documented support command
 /// with “diagnostics check 不接受其它参数”. GUI launches have no subcommand,
 /// so they continue to receive the default at the end of their argument list.
+///
+/// `relocated` 为真表示数据位置指针存在：那时连调用方带来的 `--state` 也要
+/// 换掉。AI 客户端里登记的启动行会活过迁移，继续沿用旧路径就等于又把状态
+/// 写回 C 盘。
 fn arguments_with_default_state(
     arguments: &[String],
     state_path: std::path::PathBuf,
+    relocated: bool,
 ) -> Vec<String> {
-    if arguments.iter().any(|argument| argument == "--state") {
+    if !relocated && arguments.iter().any(|argument| argument == "--state") {
         return arguments.to_vec();
     }
+    let arguments = if relocated {
+        without_flag_value(arguments, "--state")
+    } else {
+        arguments.to_vec()
+    };
     let value_flags = ["--api", "--profile", "--local-port", "--mode"];
     let mut command_index = arguments.len();
     let mut index = 0;
@@ -293,7 +311,7 @@ fn arguments_with_default_state(
         command_index = index;
         break;
     }
-    let mut updated = arguments.to_vec();
+    let mut updated = arguments;
     updated.splice(
         command_index..command_index,
         [
@@ -302,6 +320,35 @@ fn arguments_with_default_state(
         ],
     );
     updated
+}
+
+/// 去掉所有 `flag value` 组合。用于"以指针为准"时覆盖调用方带来的参数。
+fn without_flag_value(arguments: &[String], flag: &str) -> Vec<String> {
+    let mut updated = Vec::with_capacity(arguments.len());
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == flag {
+            index += 2;
+            continue;
+        }
+        updated.push(arguments[index].clone());
+        index += 1;
+    }
+    updated
+}
+
+/// `data-location.json` 指向的完整数据根。指针只接受绝对路径：安装根是唯一
+/// 能定位它的地方，相对路径没有意义。
+fn data_root(install_root: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(install_root.join("data-location.json")).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
+    let root = PathBuf::from(value.get("data_root")?.as_str()?.trim());
+    if root.is_absolute() {
+        Some(root)
+    } else {
+        None
+    }
 }
 
 fn show_error(title: &str, message: &str) {
@@ -597,8 +644,8 @@ fn is_safe_open_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        arguments_with_default_state, command_requests_background, launch_registration_matches,
-        protocol_registration_command, validated_arguments,
+        arguments_with_default_state, command_requests_background, data_root,
+        launch_registration_matches, protocol_registration_command, validated_arguments,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -647,10 +694,61 @@ mod tests {
     }
 
     #[test]
+    fn relocated_state_replaces_the_state_recorded_by_old_launch_lines() {
+        // AI 客户端里登记的启动行会活过迁移：它仍然带着旧的 `--state`。
+        // 指针存在时必须以指针为准，否则状态又写回 C 盘。
+        let args = vec![
+            "--state".to_string(),
+            r"C:\Old\data\agent-state.json".to_string(),
+            "--local-app".to_string(),
+        ];
+        assert_eq!(
+            arguments_with_default_state(
+                &args,
+                PathBuf::from(r"D:\Data\data\agent-state.json"),
+                true
+            ),
+            vec![
+                "--local-app".to_string(),
+                "--state".to_string(),
+                r"D:\Data\data\agent-state.json".to_string(),
+            ]
+        );
+        // 没有指针时保持原样：调用方显式给的 --state 不能被动。
+        assert_eq!(
+            arguments_with_default_state(
+                &args,
+                PathBuf::from(r"D:\Data\data\agent-state.json"),
+                false
+            ),
+            args
+        );
+    }
+
+    #[test]
+    fn data_root_reads_only_absolute_pointers() {
+        let root = installed_root("data-root");
+        fs::write(
+            root.join("data-location.json"),
+            r#"{"version":1,"data_root":"D:\\HiMindData"}"#,
+        )
+        .unwrap();
+        assert_eq!(data_root(&root), Some(PathBuf::from(r"D:\HiMindData")));
+
+        fs::write(
+            root.join("data-location.json"),
+            r#"{"version":1,"data_root":"relative"}"#,
+        )
+        .unwrap();
+        assert_eq!(data_root(&root), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn default_state_precedes_cli_subcommand() {
         let args = vec!["diagnostics".to_string(), "check".to_string()];
         assert_eq!(
-            arguments_with_default_state(&args, PathBuf::from(r"C:\state.json")),
+            arguments_with_default_state(&args, PathBuf::from(r"C:\state.json"), false),
             vec![
                 "--state".to_string(),
                 r"C:\state.json".to_string(),

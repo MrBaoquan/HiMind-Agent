@@ -79,7 +79,7 @@ route        -> upstream service + upstream model + protocol
 
 | 客户端入口 | 直通上游 | 转换上游 |
 | --- | --- | --- |
-| OpenAI Chat | OpenAI Chat | 暂无 |
+| OpenAI Chat | OpenAI Chat | OpenAI Responses |
 | OpenAI Responses | OpenAI Responses | OpenAI Chat |
 | Anthropic Messages | Anthropic Messages | OpenAI Chat、OpenAI Responses |
 
@@ -87,7 +87,7 @@ route        -> upstream service + upstream model + protocol
 
 | 客户端入口 | 可进入该客户端目录的上游 |
 | --- | --- |
-| OpenAI Chat | OpenAI Chat |
+| OpenAI Chat | OpenAI Chat、OpenAI Responses |
 | OpenAI Responses | OpenAI Responses、OpenAI Chat |
 | Anthropic Messages | Anthropic Messages、OpenAI Chat、OpenAI Responses |
 
@@ -99,7 +99,9 @@ route        -> upstream service + upstream model + protocol
 - 绑定客户端时只注册该客户端兼容的模型；
 - 运行时按令牌解析后也只返回该客户端兼容的模型路由。
 
-Profile 保存时即拒绝当前矩阵之外的入口/上游组合；运行期仍保留协议不兼容错误，任何情况下都不得静默更换协议或模型。Anthropic ↔ Responses 的请求、非流式响应、命名事件 SSE、图片和函数工具转换参考 cc-switch 的成熟实现；web search、thinking signature、prompt cache 等高级能力不在本轮自动等价。
+Profile 保存时即拒绝当前矩阵之外的入口/上游组合；运行期仍保留协议不兼容错误，任何情况下都不得静默更换协议或模型。Anthropic ↔ Responses、Responses ↔ Chat 的请求、非流式响应、命名事件 SSE、图片和函数工具转换参考 cc-switch 的成熟实现；web search、thinking signature、prompt cache 等高级能力不在本轮自动等价。
+
+OpenCode Go（`opencode.ai`）要求每个请求带 `x-opencode-session`，官方文档的口径是「每个会话一个稳定 ID，用于优化路由与 prompt 缓存」，缺失时上游直接 400 `MissingSessionID`。网关在转发到该域名时自动补齐：客户端自己带了就透传，没带就按「客户端令牌 + 会话锚点（`instructions`/`system` + 第一条 user 消息）」派生一个稳定值——同一会话的多轮请求得到同一 ID，不同会话互不混用，且网关不需要保存会话状态。
 
 ### Credentials and security
 

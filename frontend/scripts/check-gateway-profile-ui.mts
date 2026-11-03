@@ -13,10 +13,10 @@ import {
 import type { AIServiceProtocol, GatewayModelRoute } from '../src/services/agentApi.ts';
 
 const allEntries: AIServiceProtocol[] = ['openai-chat', 'openai-responses', 'anthropic'];
-assert.deepEqual(compatibleUpstreamProtocols(['openai-chat']), ['openai-chat']);
+assert.deepEqual(compatibleUpstreamProtocols(['openai-chat']), ['openai-responses', 'openai-chat']);
 assert.deepEqual(compatibleUpstreamProtocols(['openai-responses']), ['openai-responses', 'openai-chat']);
 assert.deepEqual(compatibleUpstreamProtocols(['anthropic']), ['openai-responses', 'anthropic', 'openai-chat']);
-assert.deepEqual(compatibleUpstreamProtocols(allEntries), ['openai-chat']);
+assert.deepEqual(compatibleUpstreamProtocols(allEntries), ['openai-responses', 'openai-chat']);
 assert.match(gatewayCompatibilityMessage(allEntries), /至少保留一个启用模型/);
 
 const responsesAndAnthropic = setGatewayEntryProtocol(['openai-responses'], 'anthropic', true);
@@ -33,6 +33,7 @@ assert.equal(serviceSupportsGatewayProtocols({ protocol: 'openai-responses' }, r
 assert.deepEqual(compatibleEntryProtocolsForUpstream('anthropic', responsesAndAnthropic), ['anthropic']);
 assert.deepEqual(compatibleEntryProtocolsForUpstream('openai-responses', responsesAndAnthropic), ['openai-responses', 'anthropic']);
 assert.deepEqual(supportedUpstreamProtocolsForEntry('anthropic'), ['openai-responses', 'anthropic', 'openai-chat']);
+assert.deepEqual(supportedUpstreamProtocolsForEntry('openai-chat'), ['openai-responses', 'openai-chat']);
 
 const routes: GatewayModelRoute[] = Array.from({ length: 5 }, (_, index) => ({
   exposed_model: 'service/model-' + index,

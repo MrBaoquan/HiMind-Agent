@@ -9,7 +9,7 @@ use std::error::Error;
 
 use crate::store::ai_services::{
     self, CAP_AUDIO_SPEECH, CAP_AUDIO_TRANSCRIBE, CAP_CHAT, CAP_IMAGE_EDIT, CAP_IMAGE_GENERATE,
-    CAP_VIDEO_GENERATE,
+    CAP_VIDEO_GENERATE, CAP_VISION,
 };
 
 const SCHEMA_VERSION: &str = "himind.ai-capability-result.v1";
@@ -461,7 +461,7 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
         .get("confirm_cost")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if capability != CAP_CHAT && !confirm_cost {
+    if capability != CAP_CHAT && capability != CAP_VISION && !confirm_cost {
         return Ok(json!({
             "state": "confirmation_required",
             "capability": capability,
@@ -470,7 +470,7 @@ pub(crate) fn test(input: &Value) -> Result<Value, Box<dyn Error>> {
             "route": plan,
         }));
     }
-    if capability == CAP_CHAT {
+    if capability == CAP_CHAT || capability == CAP_VISION {
         let models = ai_services::list_models(service_id)?;
         return Ok(json!({
             "state": "healthy",
@@ -573,6 +573,41 @@ mod tests {
                 .unwrap();
             assert_eq!(wan["eligibility"], "fallback");
             assert_eq!(wan["adapter"], "wan-video");
+        });
+    }
+
+    #[test]
+    fn vision_capability_binds_like_chat_and_reports_route() {
+        with_isolated_home(|| {
+            let mut media = std::collections::BTreeMap::new();
+            media.insert(
+                CAP_VIDEO_GENERATE.to_string(),
+                MediaModelBinding {
+                    adapter: "ark-video".to_string(),
+                    model: "seedance".to_string(),
+                    execution_mode: None,
+                },
+            );
+            ai_services::upsert(CustomAIServiceInput {
+                id: "vision-a".to_string(),
+                display_name: "Vision A".to_string(),
+                base_url: "https://vision.example".to_string(),
+                protocol: AIServiceProtocol::OpenaiResponses,
+                model: "vision-model".to_string(),
+                models: vec!["vision-model".to_string()],
+                image_model: String::new(),
+                image_adapter: String::new(),
+                media,
+                api_key: "sk-vision-a".to_string(),
+            })
+            .unwrap();
+            ai_services::set_media_service(CAP_VISION, "vision-a").unwrap();
+            let plan = route_plan(&json!({"capability": CAP_VISION})).unwrap();
+            assert_eq!(plan["state"], "resolved");
+            assert_eq!(plan["selected"]["service_id"], "vision-a");
+            // 视觉与对话一样按服务自身模型解析，不需要额外的 media 绑定。
+            assert_eq!(plan["selected"]["model"], "vision-model");
+            assert_eq!(plan["selected"]["adapter"], "openai-responses");
         });
     }
 

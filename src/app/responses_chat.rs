@@ -9,6 +9,7 @@
 //! 对应概念，保留只会让请求非法。
 
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 
 /// Responses 请求体 → Chat Completions 请求体。
 pub(crate) fn request_to_chat(body: &Value, default_model: &str) -> Result<Value, String> {
@@ -44,6 +45,7 @@ pub(crate) fn request_to_chat(body: &Value, default_model: &str) -> Result<Value
 
     let mut translated = Map::new();
     translated.insert("model".to_string(), json!(model));
+    repair_tool_pairing(&mut messages);
     translated.insert("messages".to_string(), Value::Array(messages));
     for key in ["temperature", "top_p"] {
         if let Some(value) = object.get(key) {
@@ -53,8 +55,9 @@ pub(crate) fn request_to_chat(body: &Value, default_model: &str) -> Result<Value
     if let Some(value) = object.get("max_output_tokens") {
         translated.insert("max_tokens".to_string(), value.clone());
     }
+    let mut translated_tools = Vec::<Value>::new();
     if let Some(tools) = object.get("tools").and_then(Value::as_array) {
-        let tools = tools
+        translated_tools = tools
             .iter()
             .filter_map(|tool| {
                 let name = tool.get("name").and_then(Value::as_str)?;
@@ -67,13 +70,15 @@ pub(crate) fn request_to_chat(body: &Value, default_model: &str) -> Result<Value
                     }
                 }))
             })
-            .collect::<Vec<Value>>();
-        if !tools.is_empty() {
-            translated.insert("tools".to_string(), Value::Array(tools));
-        }
+            .collect();
     }
-    if let Some(choice) = translate_tool_choice(object.get("tool_choice")) {
-        translated.insert("tool_choice".to_string(), choice);
+    // 一批工具都没翻译出来时不发 tools；此时也不能发 tool_choice，
+    // 否则 OpenCode Go 等上游会直接 400「tool_choice requires at least one available tool」。
+    if !translated_tools.is_empty() {
+        translated.insert("tools".to_string(), Value::Array(translated_tools));
+        if let Some(choice) = translate_tool_choice(object.get("tool_choice")) {
+            translated.insert("tool_choice".to_string(), choice);
+        }
     }
     let streaming = object
         .get("stream")
@@ -115,11 +120,26 @@ fn translate_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), String
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
+            let call = json!({ "id": call_id, "type": "function",
+                               "function": { "name": name, "arguments": arguments } });
+            // Responses 把并行工具调用拆成多个 `function_call` 项，Chat 要求它们
+            // 合并在**同一条** assistant 消息里：每个带 `tool_calls` 的 assistant
+            // 消息后面必须紧跟对应数量的 tool 消息，拆开发会被上游判成
+            // 「insufficient tool messages following tool_calls message」。
+            if let Some(last) = out.last_mut() {
+                let mergeable = last.get("role").and_then(Value::as_str) == Some("assistant")
+                    && last.get("tool_calls").and_then(Value::as_array).is_some();
+                if mergeable {
+                    if let Some(calls) = last.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                        calls.push(call);
+                        return Ok(());
+                    }
+                }
+            }
             out.push(json!({
                 "role": "assistant",
                 "content": Value::Null,
-                "tool_calls": [{ "id": call_id, "type": "function",
-                                 "function": { "name": name, "arguments": arguments } }],
+                "tool_calls": [call],
             }));
             Ok(())
         }
@@ -149,6 +169,88 @@ fn translate_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), String
         }
         // reasoning / 其它 Responses 专有项在 Chat 里没有对应概念。
         _ => Ok(()),
+    }
+}
+
+/// Chat 侧对工具消息有硬性配对要求：每条带 `tool_calls` 的 assistant 消息后面
+/// 必须紧跟每个 `tool_call_id` 的 tool 消息。
+///
+/// Codex 的历史里可能出现「调用没有结果」（工具被中止、上下文被裁剪）或
+/// 「结果没有调用」（历史被裁剪到只剩尾部），上游会直接 400。这里做两件事：
+/// 缺失的结果补一条说明性的 tool 消息，没有对应调用的 tool 消息丢弃。
+/// 只修结构，不臆造工具返回内容。
+fn repair_tool_pairing(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let call_ids = messages[index]
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if call_ids.is_empty() {
+            index += 1;
+            continue;
+        }
+        let known = call_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut cursor = index + 1;
+        let mut answered = HashSet::<String>::new();
+        while cursor < messages.len()
+            && messages[cursor].get("role").and_then(Value::as_str) == Some("tool")
+        {
+            let matched = messages[cursor]
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|id| known.contains(*id))
+                .map(str::to_string);
+            match matched {
+                Some(id) => {
+                    answered.insert(id);
+                    cursor += 1;
+                }
+                // 与本条 assistant 无关的 tool 消息：Chat 侧非法，直接丢掉。
+                None => {
+                    messages.remove(cursor);
+                }
+            }
+        }
+        let missing = call_ids
+            .iter()
+            .filter(|id| !answered.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (offset, id) in missing.iter().enumerate() {
+            messages.insert(
+                cursor + offset,
+                json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": "工具调用没有返回结果（会话中断或结果已被裁剪）。",
+                }),
+            );
+        }
+        index = cursor + missing.len() + 1;
+    }
+    // 前面没有 tool_calls 的 tool 消息同样非法（例如历史被裁剪到只剩结果）。
+    let mut position = 0;
+    while position < messages.len() {
+        let is_tool = messages[position].get("role").and_then(Value::as_str) == Some("tool");
+        let follows_call = position > 0
+            && (messages[position - 1].get("role").and_then(Value::as_str) == Some("tool")
+                || messages[position - 1]
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some());
+        if is_tool && !follows_call {
+            messages.remove(position);
+            continue;
+        }
+        position += 1;
     }
 }
 
@@ -618,6 +720,96 @@ fn event(name: &str, payload: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_drops_tool_choice_when_no_tool_survives_translation() {
+        // Codex 每个请求都带 `tool_choice`，但 `web_search` / `namespace` 这类工具
+        // 翻译不到 Chat 的函数工具；此时再发 tool_choice 会被 OpenCode Go 判成
+        // 「tool_choice requires at least one available tool」。
+        let request = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": "你好",
+            "tool_choice": "auto",
+            "tools": [{ "type": "web_search" }, { "type": "namespace" }]
+        });
+        let chat = request_to_chat(&request, "fallback").unwrap();
+        assert!(chat.get("tools").is_none(), "chat={chat}");
+        assert!(chat.get("tool_choice").is_none(), "chat={chat}");
+
+        // 有真正的函数工具时，`tool_choice` 仍然要翻译过去。
+        let request = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": "你好",
+            "tool_choice": "auto",
+            "tools": [
+                { "type": "web_search" },
+                { "type": "function", "name": "read", "parameters": { "type": "object" } }
+            ]
+        });
+        let chat = request_to_chat(&request, "fallback").unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "read");
+        assert_eq!(chat["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn missing_tool_output_is_repaired_and_orphans_dropped() {
+        // 调用没有结果：补一条说明性 tool 消息，保证 assistant 的每个 id 都有应答。
+        let request = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "读文件" }] },
+                { "type": "function_call", "call_id": "call_x", "name": "read", "arguments": "{\"path\":\"a\"}" },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "算了" }] }
+            ]
+        });
+        let chat = request_to_chat(&request, "fallback").unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_x");
+        assert_eq!(messages[3]["role"], "user");
+
+        // 结果没有调用：孤立的 tool 消息要丢掉，否则上游同样 400。
+        let request = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "读文件" }] },
+                { "type": "function_call_output", "call_id": "call_missing", "output": "A" }
+            ]
+        });
+        let chat = request_to_chat(&request, "fallback").unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "chat={chat}");
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn parallel_function_calls_share_one_assistant_message() {
+        // Responses 把并行调用拆成多个 function_call 项；Chat 要求它们合并到同一条
+        // assistant 消息，否则上游会报 insufficient tool messages。
+        let request = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "并行读两个文件" }] },
+                { "type": "function_call", "call_id": "call_a", "name": "read", "arguments": "{\"path\":\"a\"}" },
+                { "type": "function_call", "call_id": "call_b", "name": "read", "arguments": "{\"path\":\"b\"}" },
+                { "type": "function_call_output", "call_id": "call_a", "output": "A" },
+                { "type": "function_call_output", "call_id": "call_b", "output": "B" }
+            ]
+        });
+        let chat = request_to_chat(&request, "fallback").unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "chat={chat}");
+        assert_eq!(messages[1]["role"], "assistant");
+        let calls = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[1]["id"], "call_b");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_a");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_b");
+    }
 
     #[test]
     fn request_maps_instructions_and_message_items() {

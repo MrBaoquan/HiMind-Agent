@@ -511,7 +511,7 @@ fn validate_plugin_path(path: &Path) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let entries = read_archive_entries(path)?;
-    let content = entries.get("plugin.json").ok_or("插件包缺少 plugin.json")?;
+    let content = entry_text(&entries, "plugin.json")?;
     let manifest = crate::capability::plugin::parse_plugin_manifest(content)?;
     for name in entries.keys() {
         // checksums.sha256 是打包时自己生成的清单，不算「非载荷文件」。
@@ -662,7 +662,14 @@ fn collect_payload_files(
 fn plugin_skips_directory(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        ".git" | ".github" | "node_modules" | "dist" | "target" | "test-output" | ".cache"
+        ".git"
+            | ".github"
+            | ".cache"
+            | "__pycache__"
+            | "node_modules"
+            | "dist"
+            | "target"
+            | "test-output"
     )
 }
 
@@ -734,7 +741,7 @@ fn validate_skill_path(path: &Path) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let entries = read_archive_entries(path)?;
-    let content = entries.get("skill.json").ok_or("技能包缺少 skill.json")?;
+    let content = entry_text(&entries, "skill.json")?;
     let manifest = crate::skill::manifest::parse_skill_manifest(content)?;
     crate::skill::manifest::validate_skill_manifest(&manifest)?;
     for name in manifest.contents.iter() {
@@ -788,7 +795,7 @@ fn package_skill(directory: &Path, output: &Path) -> Result<(), Box<dyn Error>> 
 
 fn read_archive_entries(
     path: &Path,
-) -> Result<std::collections::BTreeMap<String, String>, Box<dyn Error>> {
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, Box<dyn Error>> {
     let mut archive = ZipArchive::new(File::open(path)?)?;
     let mut entries = std::collections::BTreeMap::new();
     for index in 0..archive.len() {
@@ -801,28 +808,41 @@ fn read_archive_entries(
             .ok_or("归档包含非法路径")?
             .to_string_lossy()
             .replace('\\', "/");
-        let mut content = String::new();
-        if std::io::Read::read_to_string(&mut entry, &mut content).is_ok() {
-            entries.insert(name, content);
-        }
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content)?;
+        entries.insert(name, content);
     }
     Ok(entries)
 }
 
+fn entry_text<'a>(
+    entries: &'a std::collections::BTreeMap<String, Vec<u8>>,
+    name: &str,
+) -> Result<&'a str, Box<dyn Error>> {
+    std::str::from_utf8(
+        entries
+            .get(name)
+            .ok_or_else(|| format!("归档缺少文件: {name}"))?,
+    )
+    .map_err(|_| format!("归档文件不是有效 UTF-8: {name}").into())
+}
+
 /// 归档自带的 checksums.sha256 必须与内容吻合：写包时算一遍，读包时也要验一遍。
-/// 这里每次读原始字节重算，不依赖文本编码，二进制载荷同样适用。
+/// 这里对归档条目的原始字节重算，二进制载荷同样适用。
 fn verify_checksums(
-    entries: &std::collections::BTreeMap<String, String>,
+    entries: &std::collections::BTreeMap<String, Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
     let Some(content) = entries.get("checksums.sha256") else {
         return Ok(());
     };
+    let content =
+        std::str::from_utf8(content).map_err(|_| "checksums.sha256 不是有效 UTF-8".to_string())?;
     let expected = crate::skill::manifest::parse_checksums(content)?;
     for (name, digest) in expected.iter() {
         let Some(value) = entries.get(name) else {
             return Err(format!("checksums.sha256 指向不存在的文件: {name}").into());
         };
-        let actual = format!("{:x}", Sha256::digest(value.as_bytes()));
+        let actual = format!("{:x}", Sha256::digest(value));
         if actual != *digest {
             return Err(format!("校验和不匹配: {name}").into());
         }
@@ -861,7 +881,8 @@ mod tests {
             &root.join("plugin.json"),
             r#"{"id":"com.test.fixture","name":"测试插件","version":"1.0.0","release_notes":"初始版本。","runtime":"process-jsonrpc-stdio","entry":"bin/fixture.exe","capabilities":[]}"#,
         );
-        write(&root.join("bin/fixture.exe"), "binary-payload");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin").join("fixture.exe"), [0, 159, 146, 150]).unwrap();
         write(&root.join("ui/app.js"), "console.log(1)");
         // 构建输入与生成物：都不该进包。
         write(&root.join("main.go"), "package main");
@@ -870,6 +891,10 @@ mod tests {
         write(&root.join("dist/bundle.js"), "generated");
         write(&root.join(".cache/webpack/0.pack"), "cached");
         write(&root.join("ui/node_modules/react/index.js"), "dependency");
+        write(
+            &root.join("dev/__pycache__/verify.cpython-312.pyc"),
+            "cached-bytecode",
+        );
     }
 
     fn skill_fixture(root: &Path) {

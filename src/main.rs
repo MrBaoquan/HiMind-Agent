@@ -27,6 +27,7 @@ mod agent_core_service;
 mod api;
 mod app;
 mod approval;
+mod build_info;
 mod business_integration;
 mod capability;
 mod development_checkpoint;
@@ -179,6 +180,16 @@ fn main() {
             && !acp_mode
             && cli_subcommand(&arguments).is_none(),
     );
+    // 数据位置迁移必须在任何 store 打开之前完成：它决定 `agent_home()` 的落点，
+    // 也决定 state 路径。失败时保留旧数据根，本进程照常启动。
+    if let Some(result) = app::data_location::run_pending() {
+        if result.status != "done" {
+            eprintln!(
+                "HiMind Agent: 数据位置迁移未完成：{}",
+                result.error.unwrap_or_default()
+            );
+        }
+    }
     let options = Options::from_env();
     if let Err(error) = app::extension_lock::recover() {
         eprintln!("extension transaction recovery failed: {error}");
@@ -3427,6 +3438,10 @@ impl Options {
                 }
                 "--state" if i + 1 < args.len() => {
                     let requested = PathBuf::from(&args[i + 1]);
+                    // 数据位置搬过之后，旧启动行仍然写着原路径；先跟到新根，
+                    // 再判断它是否属于别的 profile。
+                    let requested =
+                        store::paths::remap_relocated_state(&requested).unwrap_or(requested);
                     // MCP registrations outlive the build that wrote them, and
                     // an old one still names the production state file. Taking
                     // it at face value would point this profile at the

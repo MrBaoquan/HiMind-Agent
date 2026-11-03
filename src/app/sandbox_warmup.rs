@@ -182,6 +182,12 @@ fn protected_workspace_reason(executable: &Path, workspace: &Path) -> Option<Str
 
 fn protected_roots(executable: &Path) -> Vec<PathBuf> {
     let mut roots = vec![crate::store::paths::agent_home()];
+    // 用户把数据搬到别的盘以后，安装根仍然属于 Agent（程序、运行时、信任根），
+    // 不能被工作区或沙箱预热当成外部目录。
+    let install_root = crate::store::paths::shared_agent_root();
+    if !roots.iter().any(|root| install_root.starts_with(root)) {
+        roots.push(install_root);
+    }
 
     // Production WebView2 data lives beside (rather than under) agent_home.
     // Protect both the selected instance and its stable parent so an old

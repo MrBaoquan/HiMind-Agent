@@ -1,7 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_AGENT_DIRECTORY: &str = "HiMindAgent";
+/// 数据位置指针。它必须留在程序目录里：数据搬走以后，这是唯一能找回新位置的锚点。
+const DATA_LOCATION_FILE: &str = "data-location.json";
+pub(crate) const DATA_LOCATION_VERSION: u32 = 1;
 /// The shipped profile. Anything that is not a named, non-production profile
 /// resolves to this one, so the historical data root never moves.
 pub(crate) const PRODUCTION_PROFILE: &str = "production";
@@ -22,24 +26,123 @@ const PROFILE_WEBVIEW_DIRECTORY: &str = "ebwebview";
 ///
 /// `HIMIND_AGENT_HOME` is an explicit, complete root and therefore takes
 /// precedence over the profile selector. The installed production Agent
-/// keeps the historical default path; development profiles are nested below
+/// keeps the historical default path until the user moves it: a
+/// `data-location.json` pointer next to the launcher makes a chosen data root
+/// win over the default. Development profiles are nested below
 /// `profiles/<name>` without changing production data.
 pub(crate) fn agent_home() -> PathBuf {
-    if let Some(explicit) = explicit_agent_home() {
+    resolve_agent_home(
+        explicit_agent_home(),
+        &profile_name(),
+        &agent_install_root(),
+    )
+}
+
+fn resolve_agent_home(explicit: Option<PathBuf>, profile: &str, install_root: &Path) -> PathBuf {
+    if let Some(explicit) = explicit {
         return explicit;
     }
-
-    let base = local_app_data_base().join(DEFAULT_AGENT_DIRECTORY);
-    let profile = env::var("HIMIND_AGENT_PROFILE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| is_safe_profile_name(value));
-    match profile {
-        Some(profile) if profile != "production" && profile != "default" => {
-            base.join("profiles").join(profile)
+    if is_production_profile(profile) {
+        if let Some(location) = read_data_location_at(install_root) {
+            return PathBuf::from(location.data_root);
         }
-        _ => base,
+        return install_root.to_path_buf();
     }
+    install_root.join("profiles").join(profile)
+}
+
+/// 安装根：程序文件（`versions/`、`runtimes/`、`resources/`、launcher）所在位置。
+///
+/// 它不随数据位置变化——数据可以搬到别的盘，程序还得留在 `%LOCALAPPDATA%`，
+/// 否则升级器、协议注册和快捷方式都要跟着重写一遍。
+pub(crate) fn agent_install_root() -> PathBuf {
+    local_app_data_base().join(DEFAULT_AGENT_DIRECTORY)
+}
+
+/// 数据位置指针文件。`shared_agent_root()` 在没有显式 `HIMIND_AGENT_HOME`
+/// 时就是安装根，也就是指针该待的地方。
+pub(crate) fn data_location_file() -> PathBuf {
+    shared_agent_root().join(DATA_LOCATION_FILE)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DataLocation {
+    pub version: u32,
+    /// 完整的数据根，例如 `D:\HiMindData`。
+    pub data_root: String,
+    #[serde(default)]
+    pub previous_root: Option<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// 读取并校验指针。
+///
+/// 校验只接受「绝对路径、没有 `..`」：指针是用户手选的位置，读坏了要按
+/// "没有指针"处理，而不是把一个相对路径当数据根到处写。
+pub(crate) fn read_data_location_at(install_root: &Path) -> Option<DataLocation> {
+    let content = std::fs::read_to_string(install_root.join(DATA_LOCATION_FILE)).ok()?;
+    let location: DataLocation =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
+    let root = PathBuf::from(location.data_root.trim());
+    if location.data_root.trim().is_empty() || !root.is_absolute() {
+        return None;
+    }
+    if root
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(DataLocation {
+        data_root: root.to_string_lossy().to_string(),
+        ..location
+    })
+}
+
+pub(crate) fn read_data_location() -> Option<DataLocation> {
+    read_data_location_at(&shared_agent_root())
+}
+
+/// 写入指针。写失败要让调用方知道：数据已经拷过去了但指针没落盘，等于迁移白做。
+pub(crate) fn write_data_location(location: &DataLocation) -> Result<PathBuf, std::io::Error> {
+    let path = data_location_file();
+    let content = serde_json::to_vec_pretty(location)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    crate::store::atomic_file::atomic_write(&path, &content)?;
+    Ok(path)
+}
+
+/// 用户显式指定并生效的数据根；没迁移过时为 `None`。
+pub(crate) fn configured_data_root() -> Option<PathBuf> {
+    if explicit_agent_home().is_some() || !is_production_profile(&profile_name()) {
+        return None;
+    }
+    read_data_location().map(|location| PathBuf::from(location.data_root))
+}
+
+/// 数据位置迁移之后，旧启动行里的 `--state` 要跟到新数据根。
+///
+/// AI 客户端和快捷方式里存着旧路径，它们会活过迁移；继续采信旧路径就等于把
+/// 状态文件写回已经搬空的原目录。只重写落在 `previous_root` 里的路径，其余
+/// 显式 `--state` 保持原样。
+pub(crate) fn remap_relocated_state(path: &Path) -> Option<PathBuf> {
+    let location = read_data_location()?;
+    let data_root = PathBuf::from(location.data_root);
+    // 两个来源都要认：安装根（迁移前的位置）和 `previous_root`（多跳迁移后的
+    // 上一站）。只认前者会让第二次迁移之后的旧启动行落空。
+    let mut sources = vec![agent_install_root()];
+    if let Some(previous) = location.previous_root.as_deref() {
+        let previous = PathBuf::from(previous);
+        if !previous.as_os_str().is_empty() && previous != sources[0] {
+            sources.push(previous);
+        }
+    }
+    sources.into_iter().find_map(|source| {
+        path.strip_prefix(&source)
+            .ok()
+            .map(|rest| data_root.join(rest))
+    })
 }
 /// Machine-wide Agent installation root.
 ///
@@ -219,16 +322,21 @@ pub(crate) fn explicit_agent_home() -> Option<PathBuf> {
 }
 
 /// `true` when `path` sits inside the installed Agent's data root.
+///
+/// 数据位置搬过之后，生产根有两个可能的落点：默认安装根和 `data-location.json`
+/// 指向的位置。跨 profile 的 `--state` 护栏必须把两者都算进去，否则旧启动行
+/// 在迁移后仍能把开发进程带回生产数据。
 fn is_inside_production_root(path: &Path) -> bool {
     if explicit_agent_home().is_some() {
         return false;
     }
-    let root = local_app_data_base().join(DEFAULT_AGENT_DIRECTORY);
-    if !path.starts_with(&root) {
-        return false;
+    let mut roots = vec![agent_install_root()];
+    if let Some(location) = read_data_location_at(&agent_install_root()) {
+        roots.push(PathBuf::from(location.data_root));
     }
-    // `<root>/profiles/<name>` 是别的 profile 自己的地盘，不属于生产。
-    !path.starts_with(root.join("profiles"))
+    roots
+        .into_iter()
+        .any(|root| path.starts_with(&root) && !path.starts_with(root.join("profiles")))
 }
 
 /// `true` when an explicit `--state` would cross from this profile into the
@@ -361,6 +469,86 @@ mod tests {
         assert!(directory.is_dir(), "agent_temp_dir should create its root");
         let _ = fs::remove_dir_all(&root);
         restore("HIMIND_AGENT_HOME", previous_home);
+    }
+
+    /// 数据位置指针只影响生产 profile：开发 profile 仍然落在安装根下的
+    /// `profiles/<name>`，否则一次迁移会把开发数据也拽到别的盘上。
+    /// 指针读坏时按"没有指针"处理，绝不让相对路径或 `..` 变成数据根。
+    #[test]
+    fn data_location_pointer_moves_only_the_production_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "himind-paths-location-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let write = |value: &str| fs::write(root.join("data-location.json"), value).unwrap();
+
+        write(r#"{"version":1,"data_root":"D:\\HiMindData"}"#);
+        assert_eq!(
+            super::resolve_agent_home(None, "production", &root),
+            std::path::PathBuf::from(r"D:\HiMindData")
+        );
+        assert_eq!(
+            super::resolve_agent_home(None, "development", &root),
+            root.join("profiles").join("development")
+        );
+        let explicit = std::env::temp_dir().join("himind-explicit-home");
+        assert_eq!(
+            super::resolve_agent_home(Some(explicit.clone()), "production", &root),
+            explicit,
+            "显式 HIMIND_AGENT_HOME 高于数据位置指针"
+        );
+
+        write(r#"{"version":1,"data_root":"relative\\path"}"#);
+        assert_eq!(super::resolve_agent_home(None, "production", &root), root);
+
+        write(r#"{"version":1,"data_root":"D:\\HiMindData\\..\\Other"}"#);
+        assert_eq!(super::resolve_agent_home(None, "production", &root), root);
+
+        write("not json");
+        assert_eq!(super::resolve_agent_home(None, "production", &root), root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 迁移之后，旧启动行里的 `--state` 必须跟到新数据根；不在旧根里的显式路径
+    /// 不能被动。
+    #[test]
+    fn relocated_state_remaps_only_paths_under_the_previous_root() {
+        let _guard = test_env_lock();
+        let previous_home = env::var_os("HIMIND_AGENT_HOME");
+        let root = std::env::temp_dir().join(format!(
+            "himind-paths-remap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("data-location.json"),
+            r#"{"version":1,"data_root":"D:\\HiMindData","previous_root":"C:\\Old"}"#,
+        )
+        .unwrap();
+        env::set_var("HIMIND_AGENT_HOME", &root);
+
+        assert_eq!(
+            super::remap_relocated_state(Path::new(r"C:\Old\data\agent-state.json")),
+            Some(std::path::PathBuf::from(
+                r"D:\HiMindData\data\agent-state.json"
+            ))
+        );
+        assert_eq!(
+            super::remap_relocated_state(Path::new(r"C:\Other\data\agent-state.json")),
+            None
+        );
+
+        restore("HIMIND_AGENT_HOME", previous_home);
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn restore(key: &str, value: Option<std::ffi::OsString>) {

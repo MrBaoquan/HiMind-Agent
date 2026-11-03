@@ -7,7 +7,7 @@ mod mcp_pipe;
 
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(error) = run() {
@@ -77,10 +77,20 @@ fn agent_home(profile: &str) -> PathBuf {
         .join("HiMindAgent");
     let profile = profile.trim();
     if profile.is_empty() || matches!(profile, "production" | "default") {
-        base
-    } else {
-        base.join("profiles").join(safe_profile(profile))
+        // 数据位置指针：MCP 伴生进程和 Agent 必须算出同一个数据根，
+        // 否则服务作用域和运行时目录会落在两份不同的数据上。
+        return data_root(&base).unwrap_or(base);
     }
+    base.join("profiles").join(safe_profile(profile))
+}
+
+/// `data-location.json` 指向的完整数据根；只接受绝对路径。
+fn data_root(install_root: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(install_root.join("data-location.json")).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
+    let root = PathBuf::from(value.get("data_root")?.as_str()?.trim());
+    root.is_absolute().then_some(root)
 }
 
 fn safe_profile(profile: &str) -> String {

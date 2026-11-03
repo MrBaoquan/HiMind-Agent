@@ -435,6 +435,16 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::export_agent_backup,
             super::commands::inspect_agent_backup,
             super::commands::import_agent_backup,
+            super::commands::get_agent_storage_report,
+            super::commands::cleanup_agent_drafts,
+            super::commands::cleanup_agent_versions,
+            super::commands::cleanup_agent_cache,
+            super::commands::pick_storage_location,
+            super::commands::plan_storage_migration,
+            super::commands::queue_storage_migration,
+            super::commands::cancel_storage_migration,
+            super::commands::dismiss_storage_migration_result,
+            super::commands::restart_agent,
             super::commands::get_svn_connections,
             super::commands::save_svn_connection,
             super::commands::remove_svn_connection,
@@ -557,6 +567,9 @@ pub(crate) fn run_tauri_app(options: Options) -> Result<(), Box<dyn std::error::
             super::commands::associate_extension_project,
             super::commands::create_extension_project,
             super::commands::build_extension_project,
+            super::commands::install_extension_candidate,
+            super::commands::get_extension_dev_settings,
+            super::commands::set_extension_dev_settings,
             super::commands::extension_development_readiness,
             super::credential_center::get_credential_catalog,
             super::credential_center::open_credential_center,
@@ -1369,7 +1382,13 @@ pub(crate) fn open_settings_window(
         .filter(|value| {
             matches!(
                 *value,
-                "connectors" | "remote-clients" | "tools" | "skills" | "backup" | "logs"
+                "connectors"
+                    | "remote-clients"
+                    | "tools"
+                    | "skills"
+                    | "backup"
+                    | "logs"
+                    | "storage"
             )
         })
         .unwrap_or("");
@@ -1472,7 +1491,11 @@ pub(crate) fn open_plugin_view(
     let label = plugin_view_window_label(plugin_id, view_id);
     if let Some(window) = app.get_webview_window(&label) {
         let _ = window.unminimize();
-        if window.is_visible().unwrap_or(false) {
+        // 页面里 window.close() 关掉窗口后，Tauri 有时仍留有窗口对象且 is_visible()
+        // 仍返回 true；此时 show/reload 都是空操作，再点导航看起来像“打不开”。
+        // 用一次 eval 确认 webview 还活着，不活就销毁重建。
+        let alive = window.is_visible().unwrap_or(false) && window.eval("void 0").is_ok();
+        if alive {
             let _ = window.show();
             let _ = window.set_focus();
             // 插件源码可能在窗口保持打开期间被重新构建；再次打开同一视图时

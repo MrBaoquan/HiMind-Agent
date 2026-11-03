@@ -409,7 +409,8 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
             {/* 这一层是「整个仓库」，下面详情里是「单个扩展」。两个都叫「用 AI 开发」时
                 会话落在哪个目录看不出区别，所以这里写清范围，并按次级动作处理。 */}
             <button className="btn development-workspace-develop" title={activeItem.available ? `在 ${activeItem.root} 里开一条 AI 会话` : '目录当前不可用，先在文件资源管理器里恢复它'} disabled={busy || !activeItem.available} onClick={() => props.onDevelopWorkspaceWithAi(activeItem.root)}><MessageCircle size={15} />在工作区开发</button>
-            {/* 工作区级的批量动作：整个目录一个个点构建太费事，这里一次跑完。 */}
+            {/* 工作区级的批量动作：整个目录一个个点构建太费事，这里一次跑完。
+                「构建后是否自动安装」是 Agent 设置项（设置 → 通用 → 扩展开发），这里不再重复放开关。 */}
             <button className="btn" title={buildableProjects.length ? `构建并启用这个工作区里的 ${buildableProjects.length} 个扩展` : '这个工作区里还没有可构建的扩展'} disabled={busy || !buildableProjects.length} onClick={() => void buildWorkspace()}>{workspaceBuild ? <BusyIndicator size={15} /> : <Hammer size={15} />}{workspaceBuild ? `构建 ${workspaceBuild.done}/${workspaceBuild.total}` : '一键构建'}</button>
             {/* 有左栏时，每个工作区的操作在它自己那一行；没有左栏时只能放到这里。 */}
             {hasRail ? null : <ActionMenu variant="icon" icon={<MoreHorizontal size={16} />} title="工作区操作">
@@ -432,7 +433,9 @@ export function ExtensionDevelopmentPage(props: DevelopmentPageProps) {
               return <button key={kind} className={kindFilter === kind ? 'active' : ''} onClick={() => setKindFilter(kind)}><KindIcon size={14} />{extensionKindLabels[kind]} <span>{workspaceProjects.filter(item => item.kind === kind).length}</span></button>;
             })}
           </div>
-          <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索扩展" /></label>
+          <div className="development-toolbar-actions">
+            <label className="development-search"><Search size={15} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索扩展" /></label>
+          </div>
         </div> : null}
         {!activeItem ? <div className="development-workspace-empty">
           <EmptyState icon={FolderPlus} title="还没有开发工作区" text="用页头的「添加工作区」挑一个本机目录，就能在里面开发扩展。" />

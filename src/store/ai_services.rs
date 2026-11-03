@@ -80,12 +80,15 @@ pub(crate) const CAP_IMAGE_EDIT: &str = "image.edit";
 pub(crate) const CAP_VIDEO_GENERATE: &str = "video.generate";
 pub(crate) const CAP_AUDIO_SPEECH: &str = "audio.speech";
 pub(crate) const CAP_AUDIO_TRANSCRIBE: &str = "audio.transcribe";
+/// 视觉理解（看图说话/打标/OCR）。插件只表达“要打标”，由 Agent 决定用哪个服务。
+pub(crate) const CAP_VISION: &str = "vision.describe";
 pub(crate) const SUPPORTED_MEDIA_CAPABILITIES: &[&str] = &[
     CAP_IMAGE_GENERATE,
     CAP_IMAGE_EDIT,
     CAP_VIDEO_GENERATE,
     CAP_AUDIO_SPEECH,
     CAP_AUDIO_TRANSCRIBE,
+    CAP_VISION,
 ];
 pub(crate) const SUPPORTED_AI_CAPABILITIES: &[&str] = &[
     CAP_CHAT,
@@ -94,6 +97,7 @@ pub(crate) const SUPPORTED_AI_CAPABILITIES: &[&str] = &[
     CAP_VIDEO_GENERATE,
     CAP_AUDIO_SPEECH,
     CAP_AUDIO_TRANSCRIBE,
+    CAP_VISION,
 ];
 /// 未显式声明适配器时的默认值（OpenAI Images 兼容协议）。
 pub(crate) const DEFAULT_MEDIA_ADAPTER: &str = "openai-images";
@@ -897,7 +901,7 @@ pub(crate) fn set_capability_fallbacks(
 }
 
 pub(crate) fn service_supports_capability(service: &CustomAIService, capability: &str) -> bool {
-    if capability == CAP_CHAT {
+    if capability == CAP_CHAT || capability == CAP_VISION {
         return !service.model.trim().is_empty();
     }
     binding_details_for(service, capability).is_some()
@@ -1046,26 +1050,27 @@ pub(crate) fn capability_route_plan(
         .iter()
         .map(|service| {
             let credential_ready = !service.encrypted_api_key.trim().is_empty();
-            let (adapter, model, execution_mode) = if capability == CAP_CHAT {
-                (
-                    service.protocol.as_str().to_string(),
-                    service.model.clone(),
-                    "sync".to_string(),
-                )
-            } else {
-                let binding = binding_details_for(service, capability)
-                    .ok_or_else(|| format!("服务 {} 的能力绑定已失效", service.id))?;
-                (
-                    binding.adapter,
-                    binding.model,
-                    match binding.execution_mode {
-                        MediaExecutionMode::Sync => "sync",
-                        MediaExecutionMode::Stream => "stream",
-                        MediaExecutionMode::Async => "async",
-                    }
-                    .to_string(),
-                )
-            };
+            let (adapter, model, execution_mode) =
+                if capability == CAP_CHAT || capability == CAP_VISION {
+                    (
+                        service.protocol.as_str().to_string(),
+                        service.model.clone(),
+                        "sync".to_string(),
+                    )
+                } else {
+                    let binding = binding_details_for(service, capability)
+                        .ok_or_else(|| format!("服务 {} 的能力绑定已失效", service.id))?;
+                    (
+                        binding.adapter,
+                        binding.model,
+                        match binding.execution_mode {
+                            MediaExecutionMode::Sync => "sync",
+                            MediaExecutionMode::Stream => "stream",
+                            MediaExecutionMode::Async => "async",
+                        }
+                        .to_string(),
+                    )
+                };
             let is_selected = selected.is_some_and(|selected| selected.id == service.id);
             let fallback_index = fallbacks.iter().position(|(id, _)| id == &service.id);
             let eligibility = if is_selected {
@@ -1118,7 +1123,7 @@ pub(crate) fn capability_route_plan(
         "ambiguous"
     };
     let selected_binding = selected.and_then(|service| {
-        if capability == CAP_CHAT {
+        if capability == CAP_CHAT || capability == CAP_VISION {
             Some((
                 service.protocol.as_str().to_string(),
                 service.model.clone(),

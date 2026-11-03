@@ -8,6 +8,7 @@ pub(crate) mod backup_crypto;
 pub(crate) mod connector_credentials;
 pub(crate) mod connector_state;
 pub mod credentials;
+pub(crate) mod extension_dev_settings;
 pub(crate) mod gateway_profiles;
 pub(crate) mod github_credentials;
 #[allow(dead_code)]

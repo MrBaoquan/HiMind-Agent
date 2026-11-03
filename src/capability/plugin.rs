@@ -2020,6 +2020,14 @@ fn invoke_plugin_process(
         .into());
     }
     command.env("HIMIND_PLUGIN_DATA_ROOT", &data_dir);
+    // 媒体预览由 Agent 统一提供 Range 端点；插件进程是短生命周期，不能自己常驻
+    // 回环服务。票据用每台 Agent 独立的密钥签发，插件只拿到 URL。
+    if let Some(base) = crate::app::media_stream::base_url() {
+        command.env("HIMIND_MEDIA_STREAM_BASE", base).env(
+            "HIMIND_MEDIA_STREAM_SECRET",
+            crate::app::media_stream::secret(),
+        );
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start plugin {}: {error}", plugin.id))?;

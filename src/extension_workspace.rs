@@ -439,10 +439,20 @@ pub(crate) fn is_agent_managed_path(path: &Path) -> bool {
     let Ok(canonical) = path.canonicalize() else {
         return false;
     };
-    let data_dir = crate::store::paths::agent_home().canonicalize().ok();
-    if data_dir
-        .as_ref()
-        .is_some_and(|root| canonical == *root || canonical.starts_with(root))
+    // 数据位置搬过之后，Agent 管理的目录有两个：数据根和安装根（程序、运行时、
+    // 信任根）。两者都不能被选成工作区，否则扫描/清理会把 Agent 自己卷进去。
+    let mut managed = vec![crate::store::paths::agent_home()];
+    let install_root = crate::store::paths::shared_agent_root();
+    if !crate::store::paths::agent_home().starts_with(&install_root) {
+        managed.push(install_root);
+    }
+    let managed = managed
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect::<Vec<_>>();
+    if managed
+        .iter()
+        .any(|root| canonical == *root || canonical.starts_with(root))
     {
         return true;
     }

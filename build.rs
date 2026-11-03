@@ -17,6 +17,7 @@ fn main() {
     }
     write_embedded_update_key();
     write_embedded_extension_key();
+    write_embedded_build();
 
     let icon_path = Path::new("icons/icon.ico");
     if !icon_path.exists() {
@@ -52,6 +53,36 @@ fn write_embedded_extension_key() {
         if configured { key_id } else { String::new() },
     )
     .expect("failed to write embedded extension key id");
+}
+
+/// 构建来源标记：区分正式发版与本地构建。
+///
+/// 本地构建和正式版常常同为 `0.3.91`，只看版本号无法判断「现在跑的是哪一版」，
+/// 排查问题会先浪费在确认二进制上。这里把渠道与提交号写进二进制，供
+/// `/health` 与「关于」显示。
+fn write_embedded_build() {
+    println!("cargo:rerun-if-env-changed=HIMIND_BUILD_CHANNEL");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR is required"));
+    let channel = std::env::var("HIMIND_BUILD_CHANNEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "release".to_string());
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    let payload = format!(
+        "{{\"channel\":\"{}\",\"commit\":\"{}\"}}",
+        channel.replace('"', ""),
+        commit.replace('"', "")
+    );
+    fs::write(out_dir.join("embedded-build.json"), payload)
+        .expect("failed to write embedded build marker");
 }
 
 fn write_embedded_update_key() {

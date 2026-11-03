@@ -182,7 +182,8 @@ pub(crate) fn trusted_signing_public_key(key_id: &str) -> Result<String, Box<dyn
     // 始终是内嵌信任根的覆盖层（见 embedded_signing_public_key 的说明）。
     let trusted_dir = env::var_os("HIMIND_TRUSTED_SIGNING_KEYS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::store::paths::agent_home().join("trusted-keys"));
+        // 信任根属于安装，不属于用户数据：数据位置搬到 D 盘后，公钥仍在安装根。
+        .unwrap_or_else(|| crate::store::paths::shared_agent_root().join("trusted-keys"));
     // 撤销优先于任何其它来源：目录里的公钥文件与内嵌公钥都不能让撤销过的
     // key ID 重新生效，否则「轮换后旧签名继续可验」就是必然发生的。
     if signing_key_is_revoked(&trusted_dir, key_id)? {

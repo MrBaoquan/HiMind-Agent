@@ -631,6 +631,59 @@ fn model_from_body(body: &[u8]) -> Option<String> {
 /// 同一 Profile 的多个模型共享同一个令牌，因此不能再像单服务绑定那样
 /// “令牌命中第一个 binding 就返回”。没有令牌时只保留旧的模型名兜底，
 /// 且仍然要求全局唯一。
+/// 客户端声明的接入表面。Claude Desktop 的选择器只保留 Anthropic 形态的模型名，
+/// 所以网关必须对这一个表面把聚合模型名换成 `claude-himind-*` 别名，并在请求
+/// 进来时按别名反查回原始绑定。只写不读的标记头等于没实现。
+const SURFACE_HEADER: &str = "x-himind-surface";
+const CLAUDE_DESKTOP_SURFACE: &str = "claude-desktop";
+
+fn is_claude_desktop_surface(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get(SURFACE_HEADER)
+        .map(|value| value.trim().eq_ignore_ascii_case(CLAUDE_DESKTOP_SURFACE))
+        .unwrap_or(false)
+}
+
+/// 聚合模型名 → Claude Desktop 可接受的 Anthropic 形态别名。
+///
+/// Claude Desktop 的模型过滤器会**丢弃** id 里出现 `deepseek`/`gpt`/`glm`/`kimi`/
+/// `qwen` 等第三方家族词的名字（见其 `app.asar` 里的 `Do()`）。所以别名不能把
+/// 原始模型名嵌进去，只能用中性后缀；可读名称通过 `display_name` 单独给出。
+/// 后缀取纯十进制哈希：数字不会命中任何家族词，同一 exposed 名字也永远得到同一别名。
+pub(crate) fn claude_desktop_model_alias(exposed: &str) -> String {
+    format!("claude-himind-{}", stable_alias_suffix(exposed))
+}
+
+/// FNV-1a 64 位，转十进制。只用来生成稳定别名，不承担密码学职责。
+fn stable_alias_suffix(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Claude Desktop 的展示名：保留原始聚合名，让用户在模型选择器里认得出是哪一个。
+fn claude_desktop_display_name(exposed: &str) -> String {
+    format!("HiMind · {exposed}")
+}
+
+/// 请求用的模型名是不是某个绑定的 Claude Desktop 别名。
+fn is_claude_desktop_alias(binding: &GatewayBinding, model: &str) -> bool {
+    claude_desktop_model_alias(binding_exposed_model(binding)) == model
+}
+
+/// 别名命中时把绑定对外暴露的名字换成别名：下游所有 `model` 回写都从
+/// `binding_exposed_model` 取，这样响应里回显的也是客户端认识的名字。
+fn with_requested_alias(mut binding: GatewayBinding, model: &str) -> GatewayBinding {
+    if is_claude_desktop_alias(&binding, model) {
+        binding.exposed_model = model.to_string();
+        binding.models = vec![model.to_string()];
+    }
+    binding
+}
+
 fn authorize(
     bindings: &[GatewayBinding],
     headers: &HashMap<String, String>,
@@ -652,7 +705,9 @@ fn authorize(
         let model = model.as_deref().ok_or(GatewayError::UnknownToken)?;
         let matched = bindings
             .iter()
-            .filter(|binding| binding_has_model(binding, model))
+            .filter(|binding| {
+                binding_has_model(binding, model) || is_claude_desktop_alias(binding, model)
+            })
             .collect::<Vec<_>>();
         if matched.is_empty() {
             return Err(GatewayError::UnknownToken);
@@ -663,16 +718,18 @@ fn authorize(
     if let Some(model) = model.as_deref() {
         let exact = scoped
             .iter()
-            .filter(|binding| binding_exposed_model(binding) == model)
+            .filter(|binding| {
+                binding_exposed_model(binding) == model || is_claude_desktop_alias(binding, model)
+            })
             .collect::<Vec<_>>();
         if token.is_some() {
             return exact
                 .first()
-                .map(|binding| (**binding).clone())
+                .map(|binding| with_requested_alias((**binding).clone(), model))
                 .ok_or(GatewayError::UnknownModel);
         }
         if exact.len() == 1 {
-            return Ok((*exact[0]).clone());
+            return Ok(with_requested_alias((*exact[0]).clone(), model));
         }
         if exact.len() > 1 {
             return Err(GatewayError::AmbiguousModel);
@@ -813,6 +870,138 @@ fn summarize_responses_request(body: &[u8]) -> String {
         body.len()
     )
 }
+/// OpenCode Go（`opencode.ai`）要求每个会话带稳定的 `x-opencode-session`。
+///
+/// 官方文档写明「每个会话发送一个稳定的 session ID，用于优化路由与 prompt 缓存」，
+/// 没带就直接 400 `MissingSessionID`。客户端自己带了就原样透传；没有就由网关
+/// 按「令牌 + 会话锚点（system/instructions + 第一条 user 消息）」派生一个稳定值：
+/// 同一会话的多轮请求得到同一个 ID，不同会话互不串味，也不需要网关保存状态。
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+fn upstream_requires_opencode_session(binding: &GatewayBinding) -> bool {
+    url::Url::parse(binding.base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
+}
+
+fn opencode_session_for(
+    binding: &GatewayBinding,
+    client_session: Option<&str>,
+    body: &[u8],
+) -> Option<String> {
+    if !upstream_requires_opencode_session(binding) {
+        return None;
+    }
+    if let Some(value) = client_session
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    Some(derive_opencode_session(binding, &conversation_anchor(body)))
+}
+
+fn opencode_session_for_value(
+    binding: &GatewayBinding,
+    client_session: Option<&str>,
+    value: &Value,
+) -> Option<String> {
+    if !upstream_requires_opencode_session(binding) {
+        return None;
+    }
+    if let Some(value) = client_session
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    Some(derive_opencode_session(
+        binding,
+        &conversation_anchor_value(value),
+    ))
+}
+
+/// 把会话头挂到上游请求上：非 OpenCode 上游原样返回，不额外发送陌生头。
+fn with_opencode_session(
+    request: reqwest::blocking::RequestBuilder,
+    binding: &GatewayBinding,
+    client_session: Option<&str>,
+    body: &[u8],
+) -> reqwest::blocking::RequestBuilder {
+    match opencode_session_for(binding, client_session, body) {
+        Some(session) => request.header(OPENCODE_SESSION_HEADER, session),
+        None => request,
+    }
+}
+
+/// FNV-1a：只求稳定，不求密码学强度；同一输入跨进程结果一致。
+fn derive_opencode_session(binding: &GatewayBinding, anchor: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in binding
+        .token
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0x1f))
+        .chain(anchor.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("ses_himind_{hash:016x}")
+}
+
+/// 会话锚点：只取「开头不会变」的部分，否则每轮请求都会换 ID。
+fn conversation_anchor(body: &[u8]) -> String {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => conversation_anchor_value(&value),
+        Err(_) => String::new(),
+    }
+}
+
+fn conversation_anchor_value(value: &Value) -> String {
+    let mut parts = Vec::<String>::new();
+    for key in ["instructions", "system"] {
+        if let Some(system) = value.get(key) {
+            let text = anchor_text(system);
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+    }
+    let items = value
+        .get("messages")
+        .or_else(|| value.get("input"))
+        .and_then(Value::as_array);
+    if let Some(items) = items {
+        for role in ["system", "developer", "user"] {
+            let found = items
+                .iter()
+                .find(|item| item.get("role").and_then(Value::as_str) == Some(role));
+            if let Some(item) = found {
+                let text = anchor_text(item.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+        }
+    }
+    parts.join("\u{1f}")
+}
+
+fn anchor_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 fn upstream_client(base_url: &str) -> Result<reqwest::blocking::Client, reqwest::Error> {
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -970,15 +1159,23 @@ fn route(
         if scoped.is_empty() {
             return Err(GatewayError::UnknownToken);
         }
-        return write_models_response(stream, &scoped);
+        // 表面判定优先看令牌归属：Claude Desktop 的发现请求未必带自定义头，
+        // 令牌属于谁比请求头可靠。
+        let claude_desktop = is_claude_desktop_surface(&head.headers)
+            || scoped
+                .iter()
+                .all(|binding| binding.client == "claude-desktop");
+        return write_models_response(stream, &scoped, claude_desktop);
     }
     let required_protocol = path_protocol(&head.path).ok_or(GatewayError::UnsupportedPath)?;
     let binding = authorize(&bindings, &head.headers, body, required_protocol)?;
     // 入口协议与上游协议不一致时走互译：
-    // Anthropic → Chat/Responses、Responses → Chat。
+    // Anthropic → Chat/Responses、Responses → Chat、Chat → Responses。
     let translatable = matches!(
         (required_protocol, binding.protocol.as_str()),
-        ("anthropic", "openai-chat" | "openai-responses") | ("openai-responses", "openai-chat")
+        ("anthropic", "openai-chat" | "openai-responses")
+            | ("openai-responses", "openai-chat")
+            | ("openai-chat", "openai-responses")
     );
     if binding.protocol != required_protocol && !translatable {
         return Err(GatewayError::ProtocolMismatch);
@@ -986,29 +1183,44 @@ fn route(
     forward(stream, &binding, head, body, required_protocol, started)
 }
 
-fn models_payload(bindings: &[&GatewayBinding]) -> String {
+fn models_payload(bindings: &[&GatewayBinding], claude_desktop: bool) -> String {
     let mut rows = bindings
         .iter()
         .map(|binding| {
-            let id = binding_exposed_model(binding).to_string();
+            let exposed = binding_exposed_model(binding);
             let owner = if binding.profile_id.is_empty() {
                 binding.service.clone()
             } else {
                 binding.profile_id.clone()
             };
-            (id, owner)
+            if claude_desktop {
+                // id 必须中性（见 claude_desktop_model_alias 的说明），可读名字走
+                // display_name：Claude 的过滤器只看 id。
+                (
+                    claude_desktop_model_alias(exposed),
+                    owner,
+                    Some(claude_desktop_display_name(exposed)),
+                )
+            } else {
+                (exposed.to_string(), owner, None)
+            }
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     rows.dedup_by(|left, right| left.0 == right.0);
     let data = rows
         .into_iter()
-        .map(|(id, owned_by)| {
-            json!({
+        .map(|(id, owned_by, display_name)| {
+            let mut item = json!({
                 "id": id,
                 "object": "model",
                 "owned_by": owned_by,
-            })
+            });
+            if let Some(display_name) = display_name {
+                item["display_name"] = json!(display_name);
+                item["description"] = json!("HiMind 聚合模型");
+            }
+            item
         })
         .collect::<Vec<_>>();
     json!({ "object": "list", "data": data }).to_string()
@@ -1017,8 +1229,9 @@ fn models_payload(bindings: &[&GatewayBinding]) -> String {
 fn write_models_response(
     stream: &mut TcpStream,
     bindings: &[&GatewayBinding],
+    claude_desktop: bool,
 ) -> Result<(), GatewayError> {
-    let payload = models_payload(bindings);
+    let payload = models_payload(bindings, claude_desktop);
     let binding_id = bindings
         .first()
         .map(|binding| binding.id.as_str())
@@ -1148,6 +1361,10 @@ fn forward(
             started,
         );
     }
+    // OpenCode 等通用客户端讲 Chat，落在只提供 Responses 的上游上。
+    if kind == "openai-chat" && binding.protocol == "openai-responses" {
+        return forward_chat_responses_translated(stream, binding, body, started);
+    }
     let outgoing_body = match normalized_responses {
         Some(request) => serde_json::to_vec(&request)
             .map_err(|error| media_normalize_error(stream, &error.to_string()))?,
@@ -1178,18 +1395,26 @@ fn forward(
         } else {
             request.header("authorization", format!("Bearer {}", binding.api_key))
         };
+        request = with_opencode_session(
+            request,
+            binding,
+            head.headers
+                .get(OPENCODE_SESSION_HEADER)
+                .map(String::as_str),
+            body,
+        );
         if kind != "models" {
             request = request.body(payload);
         }
         request.send()
     };
     let mut response = match send_upstream(outgoing_body.clone()) {
+        // 部分 Responses 兼容上游���接受 message 输入，不接受 OpenAI 原生
         Ok(response) => response,
         Err(error) => {
             return Err(write_upstream_failure(stream, &error.to_string()));
         }
     };
-    // 部分 Responses 兼容上游���接受 message 输入，不接受 OpenAI 原生
     // `function_call` / `function_call_output` 历史。OpenCode 在同一会话切换到
     // 这类上游时会携带上一模型的工具轨迹，表现为一个与参数名无关的 400。
     // 首轮仅在 400/422 且确实存在工具历史时降级为普通消息并重试一次。
@@ -1373,11 +1598,12 @@ fn forward_translated(
     let openai_payload = openai_body.to_string();
     enforce_outbound_body_limit(stream, openai_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut response = match client
+    let request = client
         .post(join_upstream(&binding.base_url, "/v1/chat/completions"))
         .header("authorization", format!("Bearer {}", binding.api_key))
         .header("content-type", "application/json")
-        .header("accept-encoding", "identity")
+        .header("accept-encoding", "identity");
+    let mut response = match with_opencode_session(request, binding, None, body)
         .body(openai_payload)
         .send()
     {
@@ -1519,11 +1745,12 @@ fn forward_anthropic_responses_translated(
     let payload = responses_body.to_string();
     enforce_outbound_body_limit(stream, payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut response = match client
+    let request_builder = client
         .post(join_upstream(&binding.base_url, "/responses"))
         .header("authorization", format!("Bearer {}", binding.api_key))
         .header("content-type", "application/json")
-        .header("accept-encoding", "identity")
+        .header("accept-encoding", "identity");
+    let mut response = match with_opencode_session(request_builder, binding, None, body)
         .body(payload)
         .send()
     {
@@ -1680,20 +1907,32 @@ fn forward_responses_translated(
     let chat_payload = chat_body.to_string();
     enforce_outbound_body_limit(stream, chat_payload.len())?;
     let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
-    let mut response = match client
+    let mut upstream_request = client
         .post(join_upstream(&binding.base_url, "/chat/completions"))
         .header("authorization", format!("Bearer {}", binding.api_key))
         .header("content-type", "application/json")
-        .header("accept-encoding", "identity")
-        .body(chat_payload)
-        .send()
-    {
+        .header("accept-encoding", "identity");
+    if let Some(session) = opencode_session_for_value(binding, None, request) {
+        upstream_request = upstream_request.header(OPENCODE_SESSION_HEADER, session);
+    }
+    let mut response = match upstream_request.body(chat_payload).send() {
         Ok(response) => response,
         Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
     };
     let status = response.status();
     if !status.is_success() {
         let detail = response.text().unwrap_or_default();
+        // 翻译路径的失败要留痕：只看上游报错无法判断是哪条消息结构不合法。
+        crate::approval::manager::append_event_log(
+            "warn",
+            &format!(
+                "本机网关上游返回失败：status={} path=/chat/completions binding={} model={} detail={}",
+                status.as_u16(),
+                binding.id,
+                binding.exposed_model,
+                detail.replace('\n', " "),
+            ),
+        );
         let payload = json!({ "error": { "type": "api_error", "message": detail } }).to_string();
         let head = format!(
             "{}content-length: {}\r\n\r\n",
@@ -1778,6 +2017,148 @@ fn forward_responses_translated(
     let _ = stream.write_all(payload.as_bytes());
     let _ = stream.flush();
     let usage = extract_usage("openai-chat", &chat);
+    record_usage(
+        binding,
+        &display_model,
+        false,
+        status.as_u16(),
+        usage,
+        usage.is_empty(),
+        started.elapsed().as_millis() as u64,
+    );
+    Ok(())
+}
+
+/// Chat 入口 → Responses 上游：请求翻译、响应翻译，用量照记。
+///
+/// OpenCode 等通用客户端只讲 Chat Completions，而上游服务可能只声明
+/// `openai-responses`；没有这条路，这些上游在 Chat 入口里就是不可用的。
+fn forward_chat_responses_translated(
+    stream: &mut TcpStream,
+    binding: &GatewayBinding,
+    body: &[u8],
+    started: Instant,
+) -> Result<(), GatewayError> {
+    let request: Value = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(_) => return Err(translate_error(stream, "Chat 请求体不是合法 JSON")),
+    };
+    let streaming = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let display_model = binding_exposed_model(binding).to_string();
+    let responses_body =
+        match crate::app::chat_responses::request_to_responses(&request, &binding.default_model) {
+            Ok(body) => body,
+            Err(error) => return Err(translate_error(stream, &error)),
+        };
+    let payload = responses_body.to_string();
+    enforce_outbound_body_limit(stream, payload.len())?;
+    let client = upstream_client(&binding.base_url).map_err(|_| GatewayError::Answered)?;
+    let upstream_request = client
+        .post(join_upstream(&binding.base_url, "/responses"))
+        .header("authorization", format!("Bearer {}", binding.api_key))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "identity");
+    let mut response = match with_opencode_session(upstream_request, binding, None, body)
+        .body(payload)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return Err(write_upstream_failure(stream, &error.to_string())),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        let payload = json!({ "error": { "type": "api_error", "message": detail } }).to_string();
+        let head = format!(
+            "{}content-length: {}\r\n\r\n",
+            gateway_response_head(status.as_u16(), "application/json", &binding.id),
+            payload.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(payload.as_bytes());
+        let _ = stream.flush();
+        record_usage(
+            binding,
+            &display_model,
+            streaming,
+            status.as_u16(),
+            Usage::default(),
+            true,
+            started.elapsed().as_millis() as u64,
+        );
+        return Ok(());
+    }
+
+    if streaming {
+        write_stream_head(stream, status.as_u16(), "text/event-stream", &binding.id)
+            .map_err(|_| GatewayError::Answered)?;
+        let mut translator = crate::app::chat_responses::ChatStream::new(display_model.clone());
+        let mut buffer = String::new();
+        let mut chunk = [0_u8; 8192];
+        let mut client_gone = false;
+        loop {
+            let read = match response.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            while let Some(position) = buffer.find('\n') {
+                let line = buffer[..position].trim_end_matches('\r').to_string();
+                buffer.drain(..=position);
+                let events = translator.push_line(&line);
+                if !events.is_empty() && stream.write_all(events.concat().as_bytes()).is_err() {
+                    client_gone = true;
+                    break;
+                }
+            }
+            if client_gone {
+                break;
+            }
+        }
+        let tail = translator.finish().concat();
+        let _ = stream.write_all(tail.as_bytes());
+        let _ = stream.flush();
+        let (input, output) = translator.usage();
+        record_usage(
+            binding,
+            &display_model,
+            true,
+            status.as_u16(),
+            Usage {
+                input,
+                output,
+                cached: translator.cached_tokens(),
+                reasoning: translator.reasoning_tokens(),
+            },
+            input == 0 && output == 0,
+            started.elapsed().as_millis() as u64,
+        );
+        return Ok(());
+    }
+
+    let mut raw = Vec::new();
+    let _ = response.read_to_end(&mut raw);
+    let upstream: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
+    let usage = extract_usage("openai-responses", &upstream);
+    let payload = match crate::app::chat_responses::response_to_chat(&upstream, &display_model) {
+        Ok(payload) => payload.to_string(),
+        Err(error) => {
+            let _ = write_json_error(stream, 502, "himind_gateway_translation_failed", &error);
+            return Err(GatewayError::Answered);
+        }
+    };
+    let head = format!(
+        "{}content-length: {}\r\n\r\n",
+        gateway_response_head(status.as_u16(), "application/json", &binding.id),
+        payload.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(payload.as_bytes());
+    let _ = stream.flush();
     record_usage(
         binding,
         &display_model,
@@ -2012,6 +2393,45 @@ mod tests {
     }
 
     #[test]
+    fn opencode_session_header_is_stable_per_conversation() {
+        let mut opencode = binding("opencode", "openai-chat", "tok-oc");
+        opencode.base_url = "https://opencode.ai/zen/go/v1".to_string();
+        let first = br#"{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hello"}]}"#;
+        // 同一会话的第二轮：prefix 不变、后面多了历史，必须复用同一个 session。
+        let second = br#"{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"tool","tool_call_id":"c1","content":"ok"},{"role":"user","content":"next"}]}"#;
+        let other = br#"{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"another"}]}"#;
+        let session = opencode_session_for(&opencode, None, first).expect("session header");
+        assert!(session.starts_with("ses_himind_"));
+        assert_eq!(
+            session,
+            opencode_session_for(&opencode, None, first).unwrap()
+        );
+        assert_eq!(
+            session,
+            opencode_session_for(&opencode, None, second).unwrap()
+        );
+        assert_ne!(
+            session,
+            opencode_session_for(&opencode, None, other).unwrap()
+        );
+        // 客户端自己带 session 时原样透传，网关不覆盖。
+        assert_eq!(
+            opencode_session_for(&opencode, Some("ses_client"), first).as_deref(),
+            Some("ses_client")
+        );
+        // 其它上游不额外发送陌生头。
+        assert!(
+            opencode_session_for(&binding("codex", "openai-chat", "tok-1"), None, first).is_none()
+        );
+        // Anthropic / Responses 入口同样按会话锚点派生。
+        let anthropic = br#"{"system":"rules","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        assert_eq!(
+            session,
+            opencode_session_for(&opencode, None, anthropic).unwrap()
+        );
+    }
+
+    #[test]
     fn head_parsing_keeps_method_path_and_lowercase_headers() {
         let head = parse_head("POST /v1/chat/completions?x=1 HTTP/1.1\r\nAuthorization: Bearer abc\r\nContent-Type: application/json")
             .unwrap();
@@ -2124,7 +2544,7 @@ mod tests {
         second.exposed_model = "service-b/model-b".to_string();
         second.models = vec![second.exposed_model.clone()];
         let refs = vec![&first, &second];
-        let payload: Value = serde_json::from_str(&models_payload(&refs)).unwrap();
+        let payload: Value = serde_json::from_str(&models_payload(&refs, false)).unwrap();
         let ids = payload["data"]
             .as_array()
             .unwrap()
@@ -2132,6 +2552,166 @@ mod tests {
             .filter_map(|item| item["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["service-a/model-a", "service-b/model-b"]);
+    }
+
+    /// Claude Desktop 表面：`/v1/models` 必须给 Anthropic 形态的名字，否则
+    /// 客户端能发现模型、选择器却为空。
+    #[test]
+    fn claude_desktop_models_payload_uses_anthropic_aliases() {
+        let mut first = binding("claude-desktop", "anthropic", "tok-1");
+        first.exposed_model = "service-a/model-a".to_string();
+        first.models = vec![first.exposed_model.clone()];
+        let mut second = binding("claude-desktop", "anthropic", "tok-1");
+        second.exposed_model = "service-b/model-b".to_string();
+        second.models = vec![second.exposed_model.clone()];
+        let refs = vec![&first, &second];
+
+        let payload: Value = serde_json::from_str(&models_payload(&refs, true)).unwrap();
+        let items = payload["data"].as_array().unwrap();
+        let ids = items
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                claude_desktop_model_alias("service-a/model-a").as_str(),
+                claude_desktop_model_alias("service-b/model-b").as_str(),
+            ]
+        );
+        for item in items {
+            let id = item["id"].as_str().unwrap();
+            assert!(id.starts_with("claude-"), "别名必须是 Anthropic 形态：{id}");
+            assert!(
+                id.chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+                "别名只能包含字母、数字和连字符：{id}"
+            );
+            assert!(
+                claude_accepts_model_id(id),
+                "别名必须能过 Claude 的家族词过滤：{id}"
+            );
+            assert!(
+                item["display_name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("service-a") || name.contains("service-b")),
+                "可读名字要留在 display_name 里"
+            );
+        }
+    }
+
+    /// 别名要稳定且互不碰撞：可读部分相同的两个不同 exposed 名不能共用一个
+    /// 别名，否则请求会被路由到另一个服务的同名模型上。
+    #[test]
+    fn claude_desktop_alias_is_stable_and_collision_resistant() {
+        let first = claude_desktop_model_alias("service-a/model-a");
+        assert_eq!(first, claude_desktop_model_alias("service-a/model-a"));
+        assert_ne!(first, claude_desktop_model_alias("service-a-model-a"));
+        assert_ne!(
+            claude_desktop_model_alias("himind-v41flash/deepseek-v4.1-flash"),
+            claude_desktop_model_alias("opencode-go/deepseek-v4.1-flash")
+        );
+    }
+
+    /// Claude 的模型过滤器（`app.asar` 里的 `Do()`）：id 含第三方家族词就丢弃，
+    /// 否则必须像 Anthropic 模型。这里复刻同一判据，防止别名再退回可读但被丢弃的写法。
+    fn claude_accepts_model_id(id: &str) -> bool {
+        const FOREIGN: &[&str] = &[
+            "ark-code",
+            "astron",
+            "command-r",
+            "deepseek",
+            "doubao",
+            "gemini",
+            "gemma",
+            "glm",
+            "gpt",
+            "grok",
+            "hermes",
+            "hy3",
+            "kimi",
+            "lfm",
+            "ling",
+            "llama",
+            "longcat",
+            "mimo",
+            "minimax",
+            "mistral",
+            "mixtral",
+            "moonshot",
+            "nemotron",
+            "openai",
+            "phi-",
+            "qianfan",
+            "qwen",
+            "tc-code",
+            "unic",
+            "yi-",
+            "stepfun",
+            "step-3",
+            "seed-",
+            "bytedance",
+            "hunyuan",
+            "granite",
+            "nova",
+            "devstral",
+            "ministral",
+            "ernie",
+            "codex",
+            "arcee",
+            "trinity",
+            "abab",
+            "k2.",
+            "m2.",
+            "jamba",
+            "arctic",
+            "solar",
+            "mercury",
+            "zamba",
+            "kat-coder",
+            "ds-",
+            "dpsk",
+        ];
+        let lower = id.to_lowercase();
+        if FOREIGN.iter().any(|token| lower.contains(token)) {
+            return false;
+        }
+        [
+            "claude",
+            "sonnet",
+            "opus",
+            "haiku",
+            "fable",
+            "mythos",
+            "anthropic",
+        ]
+        .iter()
+        .any(|token| lower.contains(token))
+    }
+
+    /// 客户端拿别名请求时，网关要反查回原始绑定，并把「对外名字」换成别名，
+    /// 这样响应里的 `model` 回显的也是客户端认识的那个名字。
+    #[test]
+    fn claude_desktop_alias_resolves_back_to_the_route() {
+        let mut route = binding("claude-desktop", "anthropic", "tok-1");
+        route.exposed_model = "service-a/model-a".to_string();
+        route.models = vec![route.exposed_model.clone()];
+        route.upstream_model = "model-a".to_string();
+        let bindings = vec![route];
+        let alias = claude_desktop_model_alias("service-a/model-a");
+        let body = format!(r#"{{"model":"{alias}","max_tokens":1}}"#);
+        let headers = headers(&[("authorization", "Bearer tok-1")]);
+
+        let selected = authorize(&bindings, &headers, body.as_bytes(), "anthropic").unwrap();
+        assert_eq!(selected.upstream_model, "model-a");
+        assert_eq!(selected.exposed_model, alias);
+        assert_eq!(selected.models, vec![alias.clone()]);
+
+        let unknown = format!(r#"{{"model":"claude-himind-not-a-route-00000000"}}"#);
+        assert_eq!(
+            authorize(&bindings, &headers, unknown.as_bytes(), "anthropic").unwrap_err(),
+            GatewayError::UnknownModel
+        );
     }
 
     #[test]
@@ -2789,6 +3369,91 @@ mod tests {
             "response={response}"
         );
         assert!(response.contains(r#""text":"ok""#), "response={response}");
+        assert!(
+            response.contains(r#""model":"service/model-a""#),
+            "response={response}"
+        );
+    }
+
+    #[test]
+    fn chat_entry_translates_to_responses_upstream() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let (head, body) = match read_request(&mut stream).unwrap() {
+                RequestRead::Request(head, body) => (head, body),
+                _ => panic!("expected request"),
+            };
+            assert_eq!(head.path, "/v1/responses");
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "model-a");
+            assert_eq!(request["instructions"], "系统提示");
+            assert_eq!(request["input"][0]["content"][0]["text"], "你好");
+            assert_eq!(request["max_output_tokens"], 16);
+            assert_eq!(request["store"], false);
+            assert_eq!(request["tools"][0]["name"], "read");
+            let response = r#"{"id":"resp_chat_test","object":"response","model":"model-a","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好，我在"}]},{"type":"function_call","call_id":"call_7","name":"read","arguments":"{\"path\":\"a\"}"}],"usage":{"input_tokens":3,"output_tokens":2}}"#.as_bytes();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+        });
+
+        let token = "chat-responses-token".to_string();
+        let resolver_token = token.clone();
+        let resolver: Box<dyn Fn() -> Vec<GatewayBinding> + Send + Sync> = Box::new(move || {
+            vec![GatewayBinding {
+                id: "opencode:profile:service/model-a".to_string(),
+                client: "opencode".to_string(),
+                service: "custom:service".to_string(),
+                profile_id: "profile".to_string(),
+                entry_protocol: "openai-chat".to_string(),
+                exposed_model: "service/model-a".to_string(),
+                models: vec!["service/model-a".to_string()],
+                default_model: "model-a".to_string(),
+                upstream_model: "model-a".to_string(),
+                is_default: true,
+                protocol: "openai-responses".to_string(),
+                base_url: format!("http://{upstream_address}"),
+                api_key: "upstream-key".to_string(),
+                token: resolver_token.clone(),
+                platform_metered: false,
+            }]
+        });
+        let mut gateway = InferenceGateway::start(Some(0), resolver, false).unwrap();
+        let request_body = r#"{"model":"service/model-a","max_tokens":8,"messages":[{"role":"system","content":"系统提示"},{"role":"user","content":"你好"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}]}"#.as_bytes();
+        let mut client = TcpStream::connect(("127.0.0.1", gateway.port())).unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            request_body.len()
+        );
+        let _ = client.write_all(head.as_bytes());
+        let _ = client.write_all(request_body);
+        let _ = client.flush();
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response);
+        gateway.stop();
+        upstream_thread.join().unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""object":"chat.completion""#),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""content":"你好，我在""#),
+            "response={response}"
+        );
+        assert!(
+            response.contains(r#""finish_reason":"tool_calls""#),
+            "response={response}"
+        );
         assert!(
             response.contains(r#""model":"service/model-a""#),
             "response={response}"

@@ -244,6 +244,7 @@ pub(crate) fn start_background_services(
         state.local_service_online = true;
         state.local_service_error.clear();
     }
+    crate::app::media_stream::set_local_port(options.local_port);
 
     // GitHub extension sources and DSH presets are local Agent concerns. Run
     // this loop for both modes so a connected Dashboard Worker outage cannot
@@ -453,6 +454,24 @@ fn handle_local_http(
         }
     };
     let request = String::from_utf8_lossy(&request_bytes);
+    // 插件媒体流用短时签名票据鉴权，不再要求浏览器 Origin/ticket；必须在通用
+    // 本地请求安全校验之前分流，否则 <video> 的请求会被当作跨域调用拒绝。
+    {
+        let request_line = request.lines().next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let early_method = parts.next().unwrap_or_default();
+        let early_target = parts.next().unwrap_or("/");
+        let (early_path, early_query) = split_target(early_target);
+        if early_path == "/plugin-media" {
+            set_response_origin(None);
+            return crate::app::media_stream::serve(
+                &mut stream,
+                early_method,
+                &request,
+                &early_query,
+            );
+        }
+    }
     let configured_bases = workbenches::configured_api_bases(&options.state_path);
     let security = LocalRequestSecurity::new_with_connections(
         &options.api_base(),

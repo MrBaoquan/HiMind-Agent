@@ -171,17 +171,18 @@ fn service_has_model(service: &CustomAIService, model: &str) -> bool {
 pub(crate) fn protocol_supported(entry: &AIServiceProtocol, upstream: &AIServiceProtocol) -> bool {
     matches!(
         (entry, upstream),
-        (AIServiceProtocol::OpenaiChat, AIServiceProtocol::OpenaiChat)
-            | (
-                AIServiceProtocol::OpenaiResponses,
-                AIServiceProtocol::OpenaiResponses | AIServiceProtocol::OpenaiChat
-            )
-            | (
-                AIServiceProtocol::Anthropic,
-                AIServiceProtocol::Anthropic
-                    | AIServiceProtocol::OpenaiChat
-                    | AIServiceProtocol::OpenaiResponses
-            )
+        (
+            AIServiceProtocol::OpenaiChat,
+            AIServiceProtocol::OpenaiChat | AIServiceProtocol::OpenaiResponses
+        ) | (
+            AIServiceProtocol::OpenaiResponses,
+            AIServiceProtocol::OpenaiResponses | AIServiceProtocol::OpenaiChat
+        ) | (
+            AIServiceProtocol::Anthropic,
+            AIServiceProtocol::Anthropic
+                | AIServiceProtocol::OpenaiChat
+                | AIServiceProtocol::OpenaiResponses
+        )
     )
 }
 
@@ -595,7 +596,7 @@ mod tests {
             &AIServiceProtocol::Anthropic,
             &AIServiceProtocol::OpenaiChat
         ));
-        assert!(!protocol_supported(
+        assert!(protocol_supported(
             &AIServiceProtocol::OpenaiChat,
             &AIServiceProtocol::OpenaiResponses
         ));

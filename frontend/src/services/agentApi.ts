@@ -177,6 +177,9 @@ export type AgentUpdateStatus = {
     last_error: string;
     auto_check: boolean;
     auto_download: boolean;
+    /** `release` 正式发版，`local` 本地构建（开发期辨识二进制用）。 */
+    build_channel?: string;
+    build_commit?: string;
 };
 
 export type ApprovalItem = {
@@ -953,6 +956,87 @@ export type AgentBackupRestoreReport = {
 export type AgentBackupExportResult = { canceled: true } | { canceled: false; report: AgentBackupExportReport };
 export type AgentBackupInspectResult = { canceled: true } | { canceled: false; report: AgentBackupInspectReport };
 export type AgentBackupRestoreResult = { canceled: true } | { canceled: false; report: AgentBackupRestoreReport };
+
+/** 存储盘点的一条明细：某一类数据占了多少空间。 */
+export type AgentStorageEntry = {
+    key: string;
+    label: string;
+    path: string;
+    bytes: number;
+    note: string;
+};
+
+/** 可以清理的一项：预计删除多少目录、释放多少空间。 */
+export type AgentStorageCleanup = {
+    key: string;
+    label: string;
+    path: string;
+    bytes: number;
+    entries: number;
+    note: string;
+};
+
+/** 迁移一条排队中的请求。 */
+export type AgentStoragePending = {
+    target: string;
+    queued_at: string;
+};
+
+/** 上一次迁移的结果（成功或失败）。 */
+export type AgentStorageMigrationResult = {
+    status: 'done' | 'failed' | string;
+    source: string;
+    target: string;
+    entries: number;
+    bytes: number;
+    rewrites: number;
+    finished_at: string;
+    error?: string | null;
+};
+
+/** 数据位置：当前、默认、能否更改，以及排队与上次结果。 */
+export type AgentDataLocation = {
+    profile: string;
+    data_root: string;
+    install_root: string;
+    custom: boolean;
+    default_root: string;
+    pointer_file: string;
+    can_move: boolean;
+    blocked_reason: string;
+    pending: AgentStoragePending | null;
+    last_result: AgentStorageMigrationResult | null;
+};
+
+/** 目标位置校验结果。`blocker` 非空时不能迁移。 */
+export type AgentStorageMigrationPlan = {
+    source: string;
+    target: string;
+    bytes: number;
+    entries: number;
+    blocker: string | null;
+    warnings: string[];
+};
+
+export type AgentStorageReport = {
+    profile: string;
+    root: string;
+    install_root: string;
+    total_bytes: number;
+    free_bytes: number;
+    other_profiles_bytes: number;
+    entries: AgentStorageEntry[];
+    cleanup: AgentStorageCleanup[];
+    draft_keep: number;
+    location: AgentDataLocation;
+};
+
+export type AgentStorageCleanupResult = {
+    report: AgentStorageReport;
+    removed: number;
+    freed_bytes: number;
+    failures: string[];
+};
 
 export type PluginRegistry = {
     registry_ready: boolean;
@@ -3335,6 +3419,9 @@ export const agentApi = {
         }),
     createExtensionProject: (input: CreateExtensionProjectInput, parentDir?: string) => invoke<ExtensionProject>('create_extension_project', { input, parentDir: parentDir ?? null }),
     buildExtensionProject: (projectId: string) => invoke<ExtensionCandidate>('build_extension_project', { projectId }),
+    installExtensionCandidate: (kind: string, id: string, version: string) => invoke<string>('install_extension_candidate', { kind, id, version }),
+    getExtensionDevSettings: () => invoke<{ auto_install_after_build: boolean }>('get_extension_dev_settings'),
+    setExtensionDevSettings: (autoInstallAfterBuild: boolean) => invoke<{ auto_install_after_build: boolean }>('set_extension_dev_settings', { autoInstallAfterBuild }),
     /** 设置项目级分发目标；`targets = null` 表示回到分发单元默认。 */
     setExtensionProjectDistributionTargets: (kind: ExtensionProjectKind, extensionId: string, targets: DistributionTarget[] | null) =>
       invoke<ExtensionProject>('set_extension_project_distribution_targets', { kind, extensionId, targets }),
@@ -3498,6 +3585,16 @@ export const agentApi = {
     openDashboard: () => invoke('open_dashboard_page'),
     openInnerAdmin: () => invoke('open_inner_admin_page'),
     openAgentDirectory: () => invoke('open_agent_directory'),
+    storageReport: (keep?: number) => invoke<{ report: AgentStorageReport }>('get_agent_storage_report', { keep: keep ?? null }),
+    cleanupDrafts: (keep: number) => invoke<AgentStorageCleanupResult>('cleanup_agent_drafts', { keep }),
+    cleanupVersions: () => invoke<AgentStorageCleanupResult>('cleanup_agent_versions'),
+    cleanupCache: () => invoke<AgentStorageCleanupResult>('cleanup_agent_cache'),
+    pickStorageLocation: () => invoke<{ canceled: true } | { canceled: false; path: string }>('pick_storage_location'),
+    planStorageMigration: (target: string) => invoke<{ plan: AgentStorageMigrationPlan }>('plan_storage_migration', { target }),
+    queueStorageMigration: (target: string) => invoke<{ queued: boolean; plan: AgentStorageMigrationPlan }>('queue_storage_migration', { target }),
+    cancelStorageMigration: () => invoke<boolean>('cancel_storage_migration'),
+    dismissStorageResult: () => invoke<boolean>('dismiss_storage_migration_result'),
+    restartAgent: () => invoke('restart_agent'),
     quitAgent: () => invoke('quit_agent'),
     openPluginDirectory: () => invoke('open_plugin_directory'),
     registerDevelopmentPlugin: () => invoke<string>('register_development_plugin'),

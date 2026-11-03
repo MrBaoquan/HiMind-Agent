@@ -764,6 +764,8 @@ pub(crate) fn build_workspace_candidate(
         serde_json::to_vec_pretty(&definition)?,
     )?;
     fs::write(root.join("EXPERT.md"), &instructions)?;
+    // 先把工作区声明的图标复制到版本目录，再沿用本分支的导出实现。
+    copy_manifest_icon(workspace, &root, &definition.icon)?;
     export_definition_package(&definition, &root, &candidate_path)?;
     let sha = format!("sha256:{:x}", Sha256::digest(fs::read(&candidate_path)?));
     let draft = ExpertAuthoringDraft {
@@ -1082,6 +1084,28 @@ fn copy_development_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Err
             fs::copy(entry.path(), destination)?;
         }
     }
+    Ok(())
+}
+
+/// 把工作区里声明的图标复制到版本目录，供 `export_package` 打包。
+fn copy_manifest_icon(
+    workspace: &Path,
+    version_root: &Path,
+    icon: &str,
+) -> Result<(), Box<dyn Error>> {
+    let icon = icon.trim().replace('\\', "/");
+    if icon.is_empty() {
+        return Ok(());
+    }
+    let source = workspace.join(&icon);
+    if !source.is_file() {
+        return Err(format!("专家声明的图标文件不存在：{icon}").into());
+    }
+    let target = version_root.join(&icon);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&source, &target)?;
     Ok(())
 }
 

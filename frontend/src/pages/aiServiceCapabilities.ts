@@ -7,7 +7,8 @@ export type AIServiceCapability =
   | 'image.edit'
   | 'video.generate'
   | 'audio.speech'
-  | 'audio.transcribe';
+  | 'audio.transcribe'
+  | 'vision.describe';
 
 export type RouteResolutionState = 'explicit' | 'active' | 'unique' | 'ambiguous' | 'missing';
 
@@ -24,6 +25,7 @@ export const AI_SERVICE_CAPABILITIES: AIServiceCapability[] = [
   'video.generate',
   'audio.speech',
   'audio.transcribe',
+  'vision.describe',
 ];
 
 export const AI_SERVICE_CAPABILITY_LABELS: Record<AIServiceCapability, string> = {
@@ -33,6 +35,7 @@ export const AI_SERVICE_CAPABILITY_LABELS: Record<AIServiceCapability, string> =
   'video.generate': '视频',
   'audio.speech': '语音合成',
   'audio.transcribe': '语音转写',
+  'vision.describe': '视觉理解',
 };
 
 export const MEDIA_CAPABILITIES: Array<Exclude<AIServiceCapability, 'chat'>> = [
@@ -41,6 +44,7 @@ export const MEDIA_CAPABILITIES: Array<Exclude<AIServiceCapability, 'chat'>> = [
   'video.generate',
   'audio.speech',
   'audio.transcribe',
+  'vision.describe',
 ];
 
 export function capabilityModel(service: CustomAIService, capability: AIServiceCapability): string {
@@ -58,6 +62,10 @@ export function capabilityModel(service: CustomAIService, capability: AIServiceC
   }
   if (capability === 'image.generate') {
     return service.media?.[capability]?.model?.trim() || service.image_model?.trim() || '';
+  }
+  if (capability === 'vision.describe') {
+    // 只有显式绑定 vision.describe 模型才开放该能力，避免把普通对话模型推导为视觉理解。
+    return service.media?.[capability]?.model?.trim() || '';
   }
   return service.media?.[capability]?.model?.trim() ?? '';
 }
@@ -84,6 +92,7 @@ export function defaultAdapterForCapability(capability: AIServiceCapability): st
     case 'video.generate': return 'ark-video';
     case 'audio.speech': return 'openai-speech';
     case 'audio.transcribe': return 'openai-audio';
+    case 'vision.describe': return '';
     default: return '';
   }
 }

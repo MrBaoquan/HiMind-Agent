@@ -2227,6 +2227,145 @@ pub(crate) fn import_agent_backup(
 }
 
 #[tauri::command]
+pub(crate) async fn get_agent_storage_report(
+    keep: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let keep = keep
+        .map(|value| value as usize)
+        .unwrap_or(crate::app::storage::DRAFT_KEEP_DEFAULT);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::app::storage::report(keep)
+            .map(|report| json!({ "report": report }))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_agent_drafts(
+    state: State<'_, AgentState>,
+    keep: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let keep = keep.unwrap_or(crate::app::storage::DRAFT_KEEP_DEFAULT as u32) as usize;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        crate::app::storage::cleanup_drafts(keep).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    log_storage_cleanup(&state, "拓展开发草稿", &report);
+    Ok(
+        json!({ "report": report.report, "removed": report.removed, "freed_bytes": report.freed_bytes, "failures": report.failures }),
+    )
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_agent_versions(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let report = tauri::async_runtime::spawn_blocking(|| {
+        crate::app::storage::cleanup_versions().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    log_storage_cleanup(&state, "程序旧版本", &report);
+    Ok(
+        json!({ "report": report.report, "removed": report.removed, "freed_bytes": report.freed_bytes, "failures": report.failures }),
+    )
+}
+
+#[tauri::command]
+pub(crate) async fn cleanup_agent_cache(
+    state: State<'_, AgentState>,
+) -> Result<serde_json::Value, String> {
+    let report = tauri::async_runtime::spawn_blocking(|| {
+        crate::app::storage::cleanup_cache().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    log_storage_cleanup(&state, "缓存与临时文件", &report);
+    Ok(
+        json!({ "report": report.report, "removed": report.removed, "freed_bytes": report.freed_bytes, "failures": report.failures }),
+    )
+}
+
+/// 清理结果只写进日志：这一屏的结论由界面展示，日志留给排查「空间为什么没变」。
+fn log_storage_cleanup(
+    state: &State<'_, AgentState>,
+    label: &str,
+    outcome: &crate::app::storage::CleanupOutcome,
+) {
+    state.approval_manager.add_log(
+        if outcome.failures.is_empty() {
+            "info"
+        } else {
+            "warn"
+        },
+        &format!(
+            "已清理{label}：{} 项，释放 {} 字节{}",
+            outcome.removed,
+            outcome.freed_bytes,
+            if outcome.failures.is_empty() {
+                String::new()
+            } else {
+                format!("，{} 项失败", outcome.failures.len())
+            }
+        ),
+    );
+}
+
+#[tauri::command]
+pub(crate) fn pick_storage_location() -> Result<serde_json::Value, String> {
+    let Some(picked) = rfd::FileDialog::new()
+        .set_title("选择 HiMind Agent 数据位置")
+        .pick_folder()
+    else {
+        return Ok(json!({ "canceled": true }));
+    };
+    Ok(json!({ "canceled": false, "path": picked.to_string_lossy() }))
+}
+
+#[tauri::command]
+pub(crate) fn plan_storage_migration(target: String) -> Result<serde_json::Value, String> {
+    let plan =
+        crate::app::data_location::plan(Path::new(&target)).map_err(|error| error.to_string())?;
+    Ok(json!({ "plan": plan }))
+}
+
+#[tauri::command]
+pub(crate) fn queue_storage_migration(
+    state: State<'_, AgentState>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    let plan =
+        crate::app::data_location::queue(Path::new(&target)).map_err(|error| error.to_string())?;
+    state.approval_manager.add_log(
+        "info",
+        &format!(
+            "已排队数据位置迁移：{} → {}（{} 项，{} 字节）",
+            plan.source, plan.target, plan.entries, plan.bytes
+        ),
+    );
+    Ok(json!({ "queued": true, "plan": plan }))
+}
+
+#[tauri::command]
+pub(crate) fn cancel_storage_migration() -> Result<bool, String> {
+    Ok(crate::app::data_location::cancel())
+}
+
+#[tauri::command]
+pub(crate) fn dismiss_storage_migration_result() -> Result<bool, String> {
+    Ok(crate::app::data_location::dismiss_result())
+}
+
+/// 重启当前进程。数据迁移的复制阶段只在启动早期做，队列落盘后必须重启才生效。
+#[tauri::command]
+pub(crate) fn restart_agent(app: AppHandle) -> Result<(), String> {
+    app.restart()
+}
+
+#[tauri::command]
 pub(crate) fn get_svn_connections() -> Result<serde_json::Value, String> {
     let items = crate::svn::service::list_connections().map_err(|error| error.to_string())?;
     Ok(json!({ "items": items }))
@@ -4256,11 +4395,89 @@ pub(crate) fn extension_development_readiness() -> serde_json::Value {
     crate::extension_toolchain::readiness()
 }
 
+/// 扩展开发偏好：目前只有「构建后自动安装」。
+#[tauri::command]
+pub(crate) fn get_extension_dev_settings(
+) -> crate::store::extension_dev_settings::ExtensionDevSettings {
+    crate::store::extension_dev_settings::load()
+}
+
+#[tauri::command]
+pub(crate) fn set_extension_dev_settings(
+    auto_install_after_build: bool,
+) -> Result<crate::store::extension_dev_settings::ExtensionDevSettings, String> {
+    let settings = crate::store::extension_dev_settings::ExtensionDevSettings {
+        auto_install_after_build,
+    };
+    crate::store::extension_dev_settings::save(&settings).map_err(|error| error.to_string())?;
+    Ok(settings)
+}
+
 #[tauri::command]
 pub(crate) fn build_extension_project(
     project_id: String,
 ) -> Result<crate::extension_projects::ExtensionCandidate, String> {
     crate::extension_projects::build(&project_id).map_err(|error| error.to_string())
+}
+
+/// 构建后一键装到本机：把刚构建出的候选包按类型安装（插件额外确保启用）。
+///
+/// 开发者的循环是「改代码 → 构建 → 立刻在会话里用」。构建只产出候选包，
+/// 不装进运行时的话，还得去 `%LOCALAPPDATA%` 里翻候选文件再「从本地导入」，
+/// 所以这里把最后一步接上：安装成功后扩展立即可用。
+#[tauri::command]
+pub(crate) fn install_extension_candidate(
+    kind: String,
+    id: String,
+    version: String,
+) -> Result<String, String> {
+    use crate::extension_projects::ExtensionProjectKind;
+
+    let kind = ExtensionProjectKind::parse(&kind).map_err(|error| error.to_string())?;
+    let id = id.trim().to_string();
+    let version = version.trim().to_string();
+    match kind {
+        ExtensionProjectKind::Plugin => {
+            let draft =
+                crate::plugin_authoring::read(&id, &version).map_err(|error| error.to_string())?;
+            crate::app::plugin_manager::install_local_package_from_source(
+                &draft.candidate_path,
+                ADHOC_SOURCE,
+            )
+            .map_err(|error| error.to_string())?;
+            // 安装后默认是启用态；显式再确认一次，避免历史上被停用过的同名插件装完仍然不生效。
+            crate::app::plugin_manager::set_enabled(&id, true)
+                .map_err(|error| error.to_string())?;
+            Ok("已安装并启用".to_string())
+        }
+        ExtensionProjectKind::Skill => {
+            let draft =
+                crate::skill::authoring::read(&id, &version).map_err(|error| error.to_string())?;
+            crate::app::skill_manager::install_local_package_from_source(
+                &draft.candidate_path,
+                ADHOC_SOURCE,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok("已安装".to_string())
+        }
+        ExtensionProjectKind::Workflow => {
+            let draft = crate::workflow::read_authoring_draft(&id, &version)
+                .map_err(|error| error.to_string())?;
+            crate::app::workflow_manager::install_local_archive(&draft.candidate_path, false)
+                .map_err(|error| error.to_string())?;
+            Ok("已安装".to_string())
+        }
+        ExtensionProjectKind::Expert => {
+            let draft = crate::expert::read_authoring_draft(&id, &version)
+                .map_err(|error| error.to_string())?;
+            crate::expert::import_package(&draft.candidate_path)
+                .map_err(|error| error.to_string())?;
+            Ok("已安装".to_string())
+        }
+        ExtensionProjectKind::Instruction => {
+            Err("项目规则通过「应用」生效，不需要安装到本机".to_string())
+        }
+    }
 }
 
 /// 设置扩展项目的分发目标覆盖；`targets = None` 表示回到分发单元默认。

@@ -43,7 +43,9 @@ export function upstreamSupportsEntry(
 ): boolean {
   if (upstream === 'openai-chat') return true;
   if (upstream === 'openai-responses') {
-    return entry === 'openai-responses' || entry === 'anthropic';
+    return (
+      entry === 'openai-chat' || entry === 'openai-responses' || entry === 'anthropic'
+    );
   }
   return upstream === 'anthropic' && entry === 'anthropic';
 }

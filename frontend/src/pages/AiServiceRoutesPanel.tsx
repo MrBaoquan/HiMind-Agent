@@ -27,6 +27,7 @@ const CAPABILITY_HINTS: Record<AIServiceCapability, string> = {
   'video.generate': '文生视频/图生视频，异步任务',
   'audio.speech': '单次语音合成',
   'audio.transcribe': '单次语音转写',
+  'vision.describe': '看图打标、OCR 与画面理解（素材库与视觉类插件共用）',
 };
 
 type TestView = {
@@ -43,6 +44,7 @@ function testPayload(capability: AIServiceCapability): Record<string, unknown> {
     case 'video.generate': return { prompt: '一张纸飞机缓慢飞过桌面', duration_seconds: 2, resolution: '720P' };
     case 'audio.speech': return { text: 'HiMind 能力自检', format: 'mp3' };
     case 'audio.transcribe': return {};
+    case 'vision.describe': return {};
   }
 }
 

@@ -11,7 +11,7 @@ export type SettingsWindowPanel = 'settings' | 'ai';
 export type SettingsSection = 'accounts' | 'services' | 'automation' | 'approval' | 'general' | 'tooling' | 'diagnostics';
 
 /** 页内页签：一个条目里并列的几个板块，互相之间没有先后关系。 */
-export type SettingsTab = 'connectors' | 'remote-clients' | 'tools' | 'skills' | 'backup' | 'logs';
+export type SettingsTab = 'connectors' | 'remote-clients' | 'tools' | 'skills' | 'backup' | 'storage' | 'logs';
 
 /** Rail key: a settings section, or the standalone AI-connections surface. */
 export type SettingsRailKey = SettingsSection | 'ai';
@@ -73,6 +73,7 @@ const SETTINGS_SECTION_TABS: Partial<Record<SettingsSection, Array<{ key: Settin
   ],
   diagnostics: [
     { key: 'backup', label: '备份与恢复' },
+    { key: 'storage', label: '存储占用' },
     { key: 'logs', label: '运行日志' },
   ],
 };
@@ -93,7 +94,7 @@ const LEGACY_SETTINGS_SECTIONS: Record<string, { section: SettingsSection; tab?:
 
 export const SETTINGS_SECTIONS: SettingsSection[] = ['accounts', 'services', 'automation', 'approval', 'general', 'tooling', 'diagnostics'];
 
-export const SETTINGS_TABS: SettingsTab[] = ['connectors', 'remote-clients', 'tools', 'skills', 'backup', 'logs'];
+export const SETTINGS_TABS: SettingsTab[] = ['connectors', 'remote-clients', 'tools', 'skills', 'backup', 'storage', 'logs'];
 
 export function isSettingsSection(value: string): value is SettingsSection {
   return (SETTINGS_SECTIONS as string[]).includes(value);

@@ -173,13 +173,19 @@ pub(crate) fn speech(input: &Value) -> Result<Value, Box<dyn Error>> {
             body["reference_id"] = json!(reference_id);
         }
         if let Some(speed) = request.speed {
-            body["speed"] = json!(speed);
+            let mut prosody = body
+                .get("prosody")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            prosody.insert("speed".to_string(), json!(speed));
+            body["prosody"] = Value::Object(prosody.into_iter().collect());
         }
         if let Some(options) = request.provider_options {
             for (key, value) in options {
                 if !matches!(
                     key.as_str(),
-                    "text" | "reference_id" | "format" | "speed" | "model"
+                    "text" | "reference_id" | "format" | "speed" | "model" | "prosody"
                 ) {
                     body[key] = value;
                 }
@@ -903,7 +909,7 @@ mod tests {
         assert!(request.contains("\"text\":\"你好，fish audio\""));
         assert!(request.contains("\"reference_id\":\"voice-reference-1\""));
         assert!(request.contains("\"format\":\"mp3\""));
-        assert!(request.contains("\"speed\":1.2"));
+        assert!(request.contains("\"prosody\":{\"speed\":1.2}"));
         assert!(!result.to_string().contains("sk-fish-test"));
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&out_dir);

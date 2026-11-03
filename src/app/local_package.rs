@@ -47,7 +47,14 @@ pub(crate) fn is_portable_payload_path(relative: &str) -> bool {
 fn is_skipped_payload_directory(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        ".git" | ".github" | "node_modules" | "dist" | "target" | "test-output"
+        ".git"
+            | ".github"
+            | ".cache"
+            | "__pycache__"
+            | "node_modules"
+            | "dist"
+            | "target"
+            | "test-output"
     )
 }
 
@@ -86,20 +93,17 @@ fn is_skipped_payload_file(name: &str) -> bool {
     )
 }
 
-/// 本地扩展源直接指向开发工作区，包体必须在安装时现场物化。依赖缓存与点前缀条目
-/// （node_modules、.git、.idea、.vs 等）永远不属于扩展包，否则包体会随依赖缓存失控。
-const PRUNED_COMPONENTS: [&str; 1] = ["node_modules"];
-
 pub(crate) struct PackageLimits {
     pub(crate) max_files: usize,
     pub(crate) max_bytes: u64,
     pub(crate) label: &'static str,
 }
 
+/// 本地物化与归档校验共用载荷规则；点前缀条目、构建缓存与依赖树均不进入包。
 fn is_pruned(relative: &str) -> bool {
     relative
         .split('/')
-        .any(|component| component.starts_with('.') || PRUNED_COMPONENTS.contains(&component))
+        .any(|component| component.starts_with('.') || is_skipped_payload_directory(component))
 }
 
 /// 把开发工作区目录物化成可安装的扩展包：按 `select` 收集文件复制到 `staging`，
@@ -274,6 +278,7 @@ mod tests {
         fixture.write("src/main.go", "package main");
         fixture.write("node_modules/dep/index.js", "module.exports = {}");
         fixture.write(".git/config", "[core]");
+        fixture.write("dev/__pycache__/verify.cpython-312.pyc", "cached");
         let staged = stage_local_package(
             &fixture.source,
             &fixture.staging,
@@ -284,6 +289,7 @@ mod tests {
         assert_eq!(staged, vec!["plugin.json", "src/main.go"]);
         assert!(!fixture.staging.join("node_modules").exists());
         assert!(!fixture.staging.join(".git").exists());
+        assert!(!fixture.staging.join("dev/__pycache__").exists());
         let manifest = fs::read_to_string(fixture.staging.join(CHECKSUMS_FILE)).unwrap();
         assert!(manifest.ends_with('\n'));
         assert_eq!(manifest.lines().count(), 2);

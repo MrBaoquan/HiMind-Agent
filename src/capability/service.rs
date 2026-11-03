@@ -251,6 +251,12 @@ enum CapabilityHandler {
     MediaVideoGenerateLocal,
     MediaAudioSpeechLocal,
     MediaAudioTranscribeLocal,
+    MediaAIDescribe,
+    MediaAITagBatchStart,
+    MediaAITagBatchStatus,
+    MediaAITagBatchCancel,
+    MediaAITagBatchResume,
+    MediaAITagBatchList,
     MediaJobGetLocal,
     MediaJobWaitLocal,
     MediaJobCancelLocal,
@@ -3092,6 +3098,12 @@ impl CapabilityGateway {
             local_media_registration("media.video.generate", "生成视频（本机）", "用本机配置的生视频模型提交文生视频 / 图生视频任务（可选参考图，来源同改图）；视频为异步任务，立即返回 job_id，用 media.job.get / media.job.wait 查询、media.job.cancel 取消。不依赖 AI 工作台。", "local_write", media_video_generate_local_schema(), CapabilityHandler::MediaVideoGenerateLocal),
             local_media_registration("media.audio.speech", "生成语音（本机）", "用本机配置的 OpenAI 兼容语音服务完成一次同步语音合成，返回本地音频路径、MIME 和 SHA；逐 beat 配音、许可证、混音与 QA 仍由音频制作拓展负责。", "local_write", media_audio_speech_local_schema(), CapabilityHandler::MediaAudioSpeechLocal),
             local_media_registration("media.audio.transcribe", "语音转写（本机）", "用本机配置的 OpenAI 兼容语音服务转写一个音频文件，返回文本与 Provider 元数据；断句、字幕对齐和业务 QA 由音频智能或 Workflow 负责。", "local_write", media_audio_transcribe_local_schema(), CapabilityHandler::MediaAudioTranscribeLocal),
+            local_media_registration("media.ai.describe", "描述图片内容", "使用已接入的多模态模型分析一张本地图片，返回标签、描述与画面质量；用于素材打标、精选评分与 OCR 兜底。", "local_action", media_ai_describe_schema(), CapabilityHandler::MediaAIDescribe),
+            local_media_registration("media.ai.tag.batch.start", "后台批量打标", "提交多条素材，Agent 在后台并发调用多模态模型；返回 job_id，可轮询状态、取消或关闭视图后继续。", "local_action", media_ai_tag_batch_start_schema(), CapabilityHandler::MediaAITagBatchStart),
+            local_media_registration("media.ai.tag.batch.status", "查看批量打标进度", "按 job_id 返回批量打标进度、每条结果、tokens 与错误。", "read_only", media_ai_tag_batch_status_schema(), CapabilityHandler::MediaAITagBatchStatus),
+            local_media_registration("media.ai.tag.batch.cancel", "取消批量打标", "取消正在运行的批量视觉打标作业。", "local_write", media_ai_tag_batch_status_schema(), CapabilityHandler::MediaAITagBatchCancel),
+            local_media_registration("media.ai.tag.batch.resume", "继续批量打标", "Agent 重启或作业中断后，把未完成条目重新排队继续跑。", "local_action", media_ai_tag_batch_resume_schema(), CapabilityHandler::MediaAITagBatchResume),
+            local_media_registration("media.ai.tag.batch.list", "列出批量打标作业", "列出本进程内的批量视觉打标作业摘要。", "read_only", json!({"type":"object","properties":{},"required":[],"additionalProperties":false}), CapabilityHandler::MediaAITagBatchList),
             local_media_registration("media.job.get", "查看本机媒体任务", "查询本机媒体任务（生视频等）的状态、进度与产物。", "read_only", media_job_local_schema(), CapabilityHandler::MediaJobGetLocal),
             local_media_registration("media.job.wait", "等待本机媒体任务", "轮询等待本机媒体任务到达终态或超时；适合在对话里等待短视频生成。", "read_only", media_job_wait_local_schema(), CapabilityHandler::MediaJobWaitLocal),
             local_media_registration("media.job.cancel", "取消本机媒体任务", "取消仍在排队或执行中的本机媒体任务。", "local_write", media_job_local_schema(), CapabilityHandler::MediaJobCancelLocal),
@@ -4543,6 +4555,12 @@ impl CapabilityGateway {
                     &input,
                 )
             }
+            CapabilityHandler::MediaAIDescribe => crate::app::vision_describe::describe(&input),
+            CapabilityHandler::MediaAITagBatchStart => crate::app::vision_batch::start(&input),
+            CapabilityHandler::MediaAITagBatchStatus => crate::app::vision_batch::status(&input),
+            CapabilityHandler::MediaAITagBatchCancel => crate::app::vision_batch::cancel(&input),
+            CapabilityHandler::MediaAITagBatchResume => crate::app::vision_batch::resume(&input),
+            CapabilityHandler::MediaAITagBatchList => crate::app::vision_batch::list(),
             CapabilityHandler::MediaJobGetLocal => crate::app::local_video::job_get(&input),
             CapabilityHandler::MediaJobWaitLocal => crate::app::local_video::job_wait(&input),
             CapabilityHandler::MediaJobCancelLocal => crate::app::local_video::job_cancel(&input),
@@ -4765,6 +4783,10 @@ impl CapabilityGateway {
             "runtime_schema_version": 1,
             "dashboard_worker_online_semantics": "legacy_boolean_use_expected_state",
             "version": VERSION,
+            "build": {
+                "channel": crate::build_info::current().channel,
+                "commit": crate::build_info::current().commit,
+            },
             "mode": self.options.mode().as_str(),
             "dashboard_enabled": provider.enabled_by_user,
             "provider": provider.clone(),
@@ -6472,6 +6494,11 @@ fn validate_delete_target(target: &Path) -> Result<(), Box<dyn Error>> {
     }
     let target_key = target.to_string_lossy().to_ascii_lowercase();
     let mut protected = vec![crate::store::paths::agent_home()];
+    // 数据搬走以后安装根仍然属于 Agent（程序、运行时、信任根），删除同样要拒绝。
+    let install_root = crate::store::paths::shared_agent_root();
+    if !protected.iter().any(|root| install_root.starts_with(root)) {
+        protected.push(install_root);
+    }
     for variable in [
         "SystemRoot",
         "ProgramFiles",
@@ -8232,6 +8259,84 @@ fn media_generate_schema(reference_required: bool) -> Value {
             "agent_run_id":{"type":"string"}
         },
         "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn media_ai_tag_batch_start_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array", "minItems": 1, "maxItems": 500,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "minLength": 1, "maxLength": 100},
+                        "path": {"type": "string", "maxLength": 2000},
+                        "image": {"type": "string", "maxLength": 12000000}
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            "profile": {"enum": ["fast", "full", "ocr"], "description": "批量建议 fast；ocr 用于画面文字"},
+            "service": {"type": "string", "maxLength": 120},
+            "model": {"type": "string", "maxLength": 200},
+            "max_edge": {"type": "integer", "minimum": 128, "maximum": 1536},
+            "max_output_tokens": {"type": "integer", "minimum": 64, "maximum": 2000},
+            "concurrency": {"type": "integer", "minimum": 1, "maximum": 4},
+            "attempts": {"type": "integer", "minimum": 1, "maximum": 3, "description": "单条失败重试次数，默认 2"},
+            "reasoning_effort": {"enum": ["none", "low", "medium", "high"]},
+            "budget_tokens": {"type": "integer", "minimum": 0, "description": "作业 token 上限，0 表示不限"},
+            "prompt": {"type": "string", "maxLength": 4000}
+        },
+        "required": ["items"],
+        "additionalProperties": false
+    })
+}
+
+fn media_ai_tag_batch_resume_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "minLength": 1, "maxLength": 120},
+            "max_edge": {"type": "integer", "minimum": 128, "maximum": 1536},
+            "max_output_tokens": {"type": "integer", "minimum": 64, "maximum": 2000},
+            "attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+            "concurrency": {"type": "integer", "minimum": 1, "maximum": 4}
+        },
+        "required": ["job_id"],
+        "additionalProperties": false
+    })
+}
+
+fn media_ai_tag_batch_status_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "minLength": 1, "maxLength": 120}
+        },
+        "required": ["job_id"],
+        "additionalProperties": false
+    })
+}
+
+fn media_ai_describe_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {"type":"string", "minLength":1, "maxLength":2000, "description":"本地图片绝对路径"},
+            "image": {"type":"string", "maxLength":12000000, "description":"data URL 形式的图片；与 path 二选一"},
+            "prompt": {"type":"string", "maxLength":4000},
+            "profile": {"enum":["fast","full","ocr"], "description":"fast 只出标签，full 出标签+描述+质量，ocr 只出文字"},
+            "max_edge": {"type":"integer", "minimum":128, "maximum":1536, "description":"图片最长边；批量建议 320–512"},
+            "max_output_tokens": {"type":"integer", "minimum":64, "maximum":2000},
+            "reasoning_effort": {"enum":["none","low","medium","high"], "description":"部分网关支持；不支持会返回错误"},
+            "service": {"type":"string", "maxLength":120, "description":"custom:<id>；留空使用激活服务"},
+            "model": {"type":"string", "maxLength":200}
+        },
+        "required": [],
         "additionalProperties": false
     })
 }

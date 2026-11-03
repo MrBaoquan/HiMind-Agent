@@ -114,6 +114,11 @@ pub(crate) struct AgentUpdateStatus {
     pub auto_check: bool,
     #[serde(default = "default_true")]
     pub auto_download: bool,
+    /// 构建来源：`release` 正式发版，`local` 本地构建（开发期辨识二进制用）。
+    #[serde(default)]
+    pub build_channel: String,
+    #[serde(default)]
+    pub build_commit: String,
 }
 
 impl Default for AgentUpdateStatus {
@@ -151,6 +156,8 @@ impl Default for AgentUpdateStatus {
             last_error: String::new(),
             auto_check: true,
             auto_download: true,
+            build_channel: crate::build_info::current().channel,
+            build_commit: crate::build_info::current().commit,
         }
     }
 }
@@ -204,6 +211,15 @@ pub(crate) fn load(agent_state_path: &Path) -> Result<AgentUpdateStatus, Box<dyn
     };
     let mut changed = status.current_version != crate::VERSION;
     status.current_version = crate::VERSION.to_string();
+    let build = crate::build_info::current();
+    if status.build_channel != build.channel {
+        status.build_channel = build.channel;
+        changed = true;
+    }
+    if status.build_commit != build.commit {
+        status.build_commit = build.commit;
+        changed = true;
+    }
     if status.channel.trim().is_empty() {
         status.channel = default_channel();
         changed = true;
